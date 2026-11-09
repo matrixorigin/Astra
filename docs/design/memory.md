@@ -348,6 +348,27 @@ head using direct owner, generation and cursor predicates and validates immutabl
 content and fork lineage. Dispatch resolves fresh authority again. Concurrent
 Append/Replace cannot substitute a newer transcript for the captured watermark.
 
+Successful acknowledgement also retains the canonical head metadata (no messages)
+as the next observation boundary. Within a generation, the canonical coordinator
+reads only `after.conversation_seq < sequence <= captured.conversation_seq` using
+the existing physical key. It verifies the exact parent-root chain, cursor
+advance, immutable content and cumulative byte/message totals against that
+acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
+completions are coalesced without skipping nodes. The first observation, legacy
+checkpoints without a head, and a compaction-generation change use the existing
+complete fork-aware materializer once. Later child turns do not reload an already
+acknowledged inherited prefix, including after ancestor deletion. Corrupt or
+divergent boundaries fail rather than silently falling back or acknowledging.
+Thus ordinary repeated turns read/send new content, rather than reprocessing
+`1 + ... + N` turns. A replacement can resend the new summary/context; this is
+consistent with at-least-once delivery, not an exactly-once extraction promise.
+The acknowledgement also carries the existing filter's memory-operation segment
+flag. Assistant/tool continuations after an excluded memory operation stay
+excluded until a real human message starts a new segment. The flag advances only
+with successful acknowledgement; retries preserve the prior flag. Denied work
+loads no content and conservatively suppresses continuations; a generation reset
+recomputes filtering from the replacement snapshot.
+
 The canonical head owns the observed-turn checkpoint, revision, receipt and
 independent 5–960-second backoff. A single token/revision/expiry-fenced UPDATE
 writes the checkpoint and next due state; a same-connection receipt read confirms
@@ -358,6 +379,16 @@ repeat. Session deletion removes the head through existing lifecycle cleanup.
 
 The ordinary non-fork attempt uses two claim/receipt statements, selective
 materialization and two checkpoint/receipt statements, plus fresh authority SQL.
+These five statements are an explicit durability cost over the former volatile
+in-memory dispatch: claim read-back proves this owner's token; the content read
+follows write admission; checkpoint read-back proves the exact fenced receipt.
+MatrixOne affected-row counts alone cannot establish either receipt. Discovery
+and losing claims across replicas add fleet cost. Background execution reduces
+response-path coupling, not total database work; the revised scoped SQL ceilings
+must not be described as an improvement over the former 20-statement raw budget.
+`CanonicalObservationRead` records returned manifest/content JSON rows and bytes
+(excluding wire-protocol overhead), separately from prompt context work. HTTP
+encoding retains the existing extraction payload byte/message instrumentation.
 Fleet due-index polling is measured separately from the scoped chat probe.
 Unconfigured deployments run no observation polling or dispatch, while canonical
 completion still records its due fact in the existing write for later recovery.

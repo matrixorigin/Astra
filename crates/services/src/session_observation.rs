@@ -1,9 +1,8 @@
 //! Observation recovery owned by canonical completion facts.
 //! Completion sets a due marker in its existing head write. Idle discovery reads
 //! only the due index: no historical sweep, extra per-turn SQL or transcript copy.
-use crate::MaterializedConversationV1;
 use crate::session_context_coordinator::{
-    DatabaseSessionContextCoordinator, SessionContextCoordinator,
+    DatabaseSessionContextCoordinator, MaterializedConversationDeltaV1,
 };
 use astra_core::SharedPool;
 use astra_turn_types::SessionContextHeadV1;
@@ -14,6 +13,8 @@ use sqlx::Row;
 #[serde(default)]
 pub struct ObservationCheckpoint {
     pub observed_turn: u32,
+    pub observed_head: Option<SessionContextHeadV1>,
+    pub memory_operation_segment: bool,
     pub attempts: u32,
     pub retry_at_ms: i64,
     pub revision: u64,
@@ -26,6 +27,7 @@ pub struct ObservationCandidate {
     head: Result<SessionContextHeadV1, String>,
     pub checkpoint: ObservationCheckpoint,
     lease_token: String,
+    pub next_memory_operation_segment: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -136,18 +138,34 @@ impl SessionObservationStore {
             head,
             checkpoint,
             lease_token,
+            next_memory_operation_segment: None,
         }))
     }
 
     pub async fn materialize(
         &self,
         candidate: &ObservationCandidate,
-    ) -> Result<MaterializedConversationV1, String> {
+    ) -> Result<MaterializedConversationDeltaV1, String> {
         let head = candidate.head.as_ref().map_err(Clone::clone)?;
-        DatabaseSessionContextCoordinator::new(self.pool.clone())
-            .materialize(head)
+        if candidate
+            .checkpoint
+            .observed_head
+            .as_ref()
+            .is_some_and(|base| base.cursor.completed_turn != candidate.checkpoint.observed_turn)
+        {
+            return Err("observation checkpoint head and watermark disagree".into());
+        }
+        let value = DatabaseSessionContextCoordinator::new(self.pool.clone())
+            .materialize_after(head, candidate.checkpoint.observed_head.as_ref())
             .await
-            .map_err(|_| "observation canonical context could not be materialized".into())
+            .map_err(|_| "observation canonical context could not be materialized".to_owned())?;
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::CanonicalObservationRead,
+            value.loaded_manifest_json_bytes,
+            value.loaded_manifest_count,
+            0,
+        );
+        Ok(value)
     }
 
     /// The checkpoint and next due state change in the same fenced head write.
@@ -167,6 +185,11 @@ impl SessionObservationStore {
             .ok_or("observation revision overflow")?;
         if success {
             checkpoint.observed_turn = checkpoint.observed_turn.max(candidate.turn);
+            checkpoint.observed_head = candidate.head.as_ref().ok().cloned();
+            // No payload is loaded on denial: conservatively suppress any
+            // continuation until the next real human message opens a segment.
+            checkpoint.memory_operation_segment =
+                candidate.next_memory_operation_segment.unwrap_or(true);
             checkpoint.attempts = 0;
             checkpoint.retry_at_ms = 0;
         } else {
@@ -213,6 +236,7 @@ impl SessionObservationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionContextCoordinator;
 
     // Inspect the actual storage operator, not just the query's LIMIT/output.
     fn assert_scans_bounded(plan: &[String], maximum: u64) {
@@ -326,7 +350,7 @@ mod tests {
         let store = SessionObservationStore::new(pool.clone());
         let mut cursor = None;
         let mut captured = None;
-        for turn in 1..=4 {
+        for turn in 1..=20 {
             let reservation = match coordinator
                 .acquire_writer_and_reserve_turn(
                     &key,
@@ -373,7 +397,43 @@ mod tests {
             if let Some(candidate) = captured.take() {
                 let materialized = store.materialize(&candidate).await.unwrap();
                 assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
-                assert_eq!(materialized.messages.len(), (turn - 1) as usize);
+                let expected_nodes = if turn == 11 { 3 } else { 1 };
+                assert_eq!(materialized.messages.len(), expected_nodes);
+                assert_eq!(materialized.loaded_manifest_count, expected_nodes as u64);
+                if turn == 6 {
+                    let head = candidate.head.as_ref().unwrap();
+                    let base = candidate.checkpoint.observed_head.as_ref().unwrap();
+                    let mut divergent = base.clone();
+                    divergent.latest_manifest_root = "a".repeat(64);
+                    assert!(
+                        coordinator
+                            .materialize_after(head, Some(&divergent))
+                            .await
+                            .is_err()
+                    );
+                    let mut corrupted = base.clone();
+                    corrupted.total_message_count += 1;
+                    assert!(
+                        coordinator
+                            .materialize_after(head, Some(&corrupted))
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        coordinator
+                            .materialize_after(head, Some(head))
+                            .await
+                            .is_err()
+                    );
+                    let mut wrong_owner = base.clone();
+                    wrong_owner.key.owner_user_id = "other-owner".into();
+                    assert!(
+                        coordinator
+                            .materialize_after(head, Some(&wrong_owner))
+                            .await
+                            .is_err()
+                    );
+                }
                 assert_eq!(
                     materialized.messages.last().unwrap()["content"],
                     format!("turn-{}", turn - 1)
@@ -395,6 +455,11 @@ mod tests {
             }
             // Finishing an older turn leaves new work pending. After a fully
             // acknowledged idle head, a later completion must re-arm it too.
+            if turn == 8 || turn == 9 {
+                // Simulate an idle/crashed consumer across several completions.
+                // The next suffix must contain all three unacknowledged nodes.
+                continue;
+            }
             let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     if let Some(candidate) = store
@@ -430,10 +495,7 @@ mod tests {
         let candidate = captured.unwrap();
         assert_eq!(
             store.materialize(&candidate).await.unwrap().messages,
-            vec![
-                json!({"role":"assistant", "content":"turn-3"}),
-                json!({"role":"assistant", "content":"turn-4"})
-            ]
+            vec![json!({"role":"assistant", "content":"turn-20"})]
         );
         store.finish(&candidate, true).await.unwrap();
         assert!(
@@ -598,6 +660,27 @@ mod tests {
         )
         .await;
         assert_scans_bounded(&materialization, 8192);
+        // Same-generation history must be pruned at the sequence boundary too.
+        // Selecting only the last suffix row must not scan all 100,000 nodes.
+        sqlx::query("UPDATE conversation_manifest_nodes SET compaction_generation=0 WHERE session_id='retained-generations'")
+            .execute(pool.get()).await.unwrap();
+        let suffix = prepared_plan(
+            &pool,
+            &crate::session_context_coordinator::canonical_suffix_materialization_sql(),
+            serde_json::json!([
+                "server",
+                "synthetic-owner",
+                "retained-generations",
+                "main",
+                0,
+                99999,
+                100000
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .await;
+        assert_scans_bounded(&suffix, 8192);
         // Never send the malformed synthetic plan bodies through the decoder.
         // Use a distinct Session with valid canonical commits for the race check.
         assert_captured_head_is_materialized(&pool).await;

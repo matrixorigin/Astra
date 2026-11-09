@@ -1408,6 +1408,15 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     .unwrap();
     let nested_head = context.load_head(&nested_key).await.unwrap().unwrap();
     let exact_nested = context.materialize(&nested_head).await.unwrap();
+    assert_eq!(
+        context
+            .materialize_after(&nested_head, None)
+            .await
+            .unwrap()
+            .messages,
+        exact_nested.messages,
+        "first observation must include the validated inherited fork prefix"
+    );
     sessions
         .delete_session(child.clone(), owner.into())
         .await
@@ -1502,6 +1511,18 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .unwrap();
     let after_middle_head = context.load_head(&nested_key).await.unwrap().unwrap();
     let exact_after_middle = context.materialize(&after_middle_head).await.unwrap();
+    let nested_suffix = context
+        .materialize_after(&after_middle_head, Some(&nested_head))
+        .await
+        .unwrap();
+    assert_eq!(
+        nested_suffix.loaded_manifest_count, 1,
+        "an acknowledged fork prefix must not be reloaded for each child turn"
+    );
+    assert_eq!(
+        nested_suffix.messages,
+        exact_after_middle.messages[exact_nested.messages.len()..]
+    );
     sessions
         .delete_session(parent.clone(), owner.into())
         .await
@@ -1528,6 +1549,15 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     assert_eq!(
         after_middle_history, exact_after_middle,
         "ancestor deletion and GC preserve the complete exact child history"
+    );
+    assert_eq!(
+        context
+            .materialize_after(&after_middle_head, Some(&nested_head))
+            .await
+            .unwrap()
+            .messages,
+        nested_suffix.messages,
+        "suffix recovery survives ancestor deletion and collection"
     );
     let after_ancestor = moi
         .chat(

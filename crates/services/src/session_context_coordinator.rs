@@ -514,6 +514,20 @@ pub struct MaterializedConversationV1 {
     pub authorized_session_ids: HashSet<String>,
     pub logical_segment_count: u64,
     pub canonical_segment_bytes: u64,
+    pub loaded_manifest_count: u64,
+    /// Serialized manifest/content JSON returned by storage, excluding protocol overhead.
+    pub loaded_manifest_json_bytes: u64,
+}
+
+/// Validated content after an acknowledged canonical head. A generation reset
+/// returns the current complete generation, including its retained fork prefix.
+/// Unlike MaterializedConversationV1, messages and byte counts may be a suffix.
+pub struct MaterializedConversationDeltaV1 {
+    pub head: SessionContextHeadV1,
+    pub messages: Vec<Value>,
+    pub canonical_segment_bytes: u64,
+    pub loaded_manifest_count: u64,
+    pub loaded_manifest_json_bytes: u64,
 }
 
 /// Read-only facts used to prepare a canonical turn. Mutating admission still
@@ -3950,6 +3964,89 @@ impl DatabaseSessionContextCoordinator {
             .transpose()
     }
 
+    /// Materialize a captured head relative to a previously acknowledged head.
+    /// The boundary is durable metadata, never an independently cached transcript.
+    /// Same-generation reads validate the exact parent-root chain and cumulative
+    /// totals against that boundary without loading its content or fork ancestors.
+    pub async fn materialize_after(
+        &self,
+        head: &SessionContextHeadV1,
+        after: Option<&SessionContextHeadV1>,
+    ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
+        validate_head(head)?;
+        if let Some(base) = after {
+            validate_head(base)?;
+            if base.key != head.key
+                || base.cursor.compaction_generation > head.cursor.compaction_generation
+                || base.cursor.completed_turn >= head.cursor.completed_turn
+                || base.cursor.conversation_seq >= head.cursor.conversation_seq
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+            if base.cursor.compaction_generation == head.cursor.compaction_generation {
+                let mut rows =
+                    sqlx::query(sqlx::AssertSqlSafe(canonical_suffix_materialization_sql()))
+                        .bind(&head.key.isolation_domain)
+                        .bind(&head.key.owner_user_id)
+                        .bind(&head.key.session_id)
+                        .bind(&head.key.branch_id)
+                        .bind(i64_from_u64(
+                            "suffix generation",
+                            head.cursor.compaction_generation,
+                        )?)
+                        .bind(i64_from_u64(
+                            "suffix lower bound",
+                            base.cursor.conversation_seq,
+                        )?)
+                        .bind(i64_from_u64(
+                            "suffix upper bound",
+                            head.cursor.conversation_seq,
+                        )?)
+                        .fetch(self.pool.get());
+                let mut nodes = std::collections::HashMap::new();
+                while let Some(row) = rows
+                    .try_next()
+                    .await
+                    .map_err(|source| database_error("load_manifest_suffix_contents", source))?
+                {
+                    let content = decode_stored_manifest_content(&row, &head.key)?;
+                    if nodes
+                        .insert(content.node.manifest_root.clone(), content)
+                        .is_some()
+                    {
+                        return Err(SessionContextCoordinatorError::NeedsRepair(
+                            "duplicate manifest identity".into(),
+                        ));
+                    }
+                }
+                return materialize_nodes_after(
+                    head,
+                    order_manifest_chain_after(head, nodes, Some(&base.latest_manifest_root))?,
+                    HashSet::from([head.key.session_id.clone()]),
+                    Some(base),
+                )
+                .map(|value| MaterializedConversationDeltaV1 {
+                    head: value.head,
+                    messages: value.messages,
+                    canonical_segment_bytes: value.canonical_segment_bytes,
+                    loaded_manifest_count: value.loaded_manifest_count,
+                    loaded_manifest_json_bytes: value.loaded_manifest_json_bytes,
+                });
+            }
+        }
+        // Replacement invalidates the old chain. Reconstruct the new generation
+        // once through the canonical fork-aware owner, then resume suffix reads.
+        self.materialize(head)
+            .await
+            .map(|value| MaterializedConversationDeltaV1 {
+                head: value.head,
+                messages: value.messages,
+                canonical_segment_bytes: value.canonical_segment_bytes,
+                loaded_manifest_count: value.loaded_manifest_count,
+                loaded_manifest_json_bytes: value.loaded_manifest_json_bytes,
+            })
+    }
+
     /// Validate the immutable nodes selected for a captured canonical head.
     /// Background consumers use the same public materialization entrypoint.
     async fn materialize_loaded(
@@ -4134,12 +4231,21 @@ impl DatabaseSessionContextCoordinator {
 
 fn order_manifest_chain(
     head: &SessionContextHeadV1,
+    nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
+    order_manifest_chain_after(head, nodes, None)
+}
+
+fn order_manifest_chain_after(
+    head: &SessionContextHeadV1,
     mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+    boundary: Option<&str>,
 ) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
     let mut root = Some(head.latest_manifest_root.clone());
     let mut seen = HashSet::new();
     let mut reverse = Vec::new();
-    while let Some(current) = root {
+    while root.as_deref() != boundary {
+        let current = root.ok_or(SessionContextCoordinatorError::DivergentManifest)?;
         if !seen.insert(current.clone()) {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "manifest cycle detected".into(),
@@ -4273,10 +4379,25 @@ fn materialize_nodes(
     nodes: Vec<StoredManifestContent>,
     authorized_session_ids: HashSet<String>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+    materialize_nodes_after(head, nodes, authorized_session_ids, None)
+}
+
+// Private accumulator: only the complete-view wrapper above exposes this as a
+// MaterializedConversationV1; incremental callers return the explicit delta type.
+fn materialize_nodes_after(
+    head: &SessionContextHeadV1,
+    nodes: Vec<StoredManifestContent>,
+    authorized_session_ids: HashSet<String>,
+    base: Option<&SessionContextHeadV1>,
+) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+    let loaded_manifest_count = nodes.len() as u64;
+    let loaded_manifest_json_bytes = nodes.iter().map(|node| node.serialized_bytes).sum();
     let mut messages = Vec::new();
     let mut logical_segment_count = 0_u64;
-    let mut canonical_segment_bytes = 0_u64;
-    let mut prior_cursor = None;
+    let base_bytes = base.map_or(0, |head| head.total_canonical_bytes);
+    let base_messages = base.map_or(0, |head| head.total_message_count);
+    let mut canonical_segment_bytes = base_bytes;
+    let mut prior_cursor = base.map(|head| head.cursor.clone());
     for content in nodes {
         validate_manifest_advance(prior_cursor.as_ref(), &content.node)?;
         for segment in content.segments {
@@ -4295,7 +4416,8 @@ fn materialize_nodes(
             messages.extend(segment.messages);
         }
         if content.total_canonical_bytes != canonical_segment_bytes
-            || content.total_message_count != u64::try_from(messages.len()).unwrap_or(u64::MAX)
+            || Some(content.total_message_count)
+                != base_messages.checked_add(u64::try_from(messages.len()).unwrap_or(u64::MAX))
         {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "manifest totals do not match its content".into(),
@@ -4304,7 +4426,8 @@ fn materialize_nodes(
         prior_cursor = Some(content.node.cursor());
     }
     if canonical_segment_bytes != head.total_canonical_bytes
-        || u64::try_from(messages.len()).ok() != Some(head.total_message_count)
+        || base_messages.checked_add(u64::try_from(messages.len()).unwrap_or(u64::MAX))
+            != Some(head.total_message_count)
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "materialized totals do not match the canonical head".into(),
@@ -4315,7 +4438,9 @@ fn materialize_nodes(
         messages,
         authorized_session_ids,
         logical_segment_count,
-        canonical_segment_bytes,
+        canonical_segment_bytes: canonical_segment_bytes - base_bytes,
+        loaded_manifest_count,
+        loaded_manifest_json_bytes,
     })
 }
 
@@ -6458,6 +6583,15 @@ fn validate_stored_manifest(
 
 /// Keep direct storage predicates: a derived key joined to the catalog does
 /// not receive selective predicate pushdown on MatrixOne.
+pub(crate) fn canonical_suffix_materialization_sql() -> String {
+    format!(
+        "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+        WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+          AND compaction_generation = ? AND reachable = 1
+          AND conversation_seq > ? AND conversation_seq <= ?"
+    )
+}
+
 pub(crate) fn canonical_materialization_sql() -> String {
     let columns = qualified_manifest_content_columns("m");
     format!(
@@ -6547,6 +6681,7 @@ impl LoadedCanonicalContext {
 }
 
 struct StoredManifestContent {
+    serialized_bytes: u64,
     node: ContextManifestNodeV1,
     segments: Vec<ConversationSegmentV1>,
     total_canonical_bytes: u64,
@@ -6668,6 +6803,7 @@ fn decode_stored_manifest_content(
         total_message_count,
     )?;
     Ok(StoredManifestContent {
+        serialized_bytes: (json.len() + content_json.len()) as u64,
         node,
         segments,
         total_canonical_bytes,

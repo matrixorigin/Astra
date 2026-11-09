@@ -272,7 +272,7 @@ impl SessionObservationRecovery {
             tokio::time::timeout(Duration::from_secs(5), self.store.claim(&key.0, &key.1))
                 .await
                 .map_err(|_| "observation claim timed out")??;
-        let Some(candidate) = candidate else {
+        let Some(mut candidate) = candidate else {
             // Another owner already took this Session; continue to other due
             // identities instead of sleeping or discarding a whole shard.
             return Ok(self.scope.is_none());
@@ -293,11 +293,24 @@ impl SessionObservationRecovery {
                 return Ok(());
             }
             let materialized = self.store.materialize(&candidate).await?;
-            let messages =
-                astra_turn_core::observer::filter_memory_operation_turns(&materialized.messages)
-                    .into_iter()
-                    .filter_map(|message| message.as_object().cloned())
-                    .collect();
+            let same_generation = candidate
+                .checkpoint
+                .observed_head
+                .as_ref()
+                .is_some_and(|head| {
+                    head.cursor.compaction_generation
+                        == materialized.head.cursor.compaction_generation
+                });
+            let (messages, memory_operation_segment) =
+                astra_turn_core::observer::filter_memory_operation_turns_after(
+                    &materialized.messages,
+                    same_generation && candidate.checkpoint.memory_operation_segment,
+                );
+            candidate.next_memory_operation_segment = Some(memory_operation_segment);
+            let messages = messages
+                .into_iter()
+                .filter_map(|message| message.as_object().cloned())
+                .collect();
             crate::server::run::lifecycle::run_server_loop_observer_request(
                 self.state.turn_persistence.observer_worker.as_ref(),
                 &candidate.key.session_id,
