@@ -226,11 +226,22 @@ and the session-memory port before runtime initialization. Credential publicatio
 invalidates the preceding private cache even if registration later fails. The
 event loop replaces its own registry, MCP and observer references and restarts
 discovery; signed-out onboarding installs the memory port for the first time.
+The memory service uses the canonical account ID already returned by password
+authentication or UC binding. Credential settlement does not repeat `/auth/me`;
+optional startup identity discovery has a ten-second overall deadline. Cancelling
+browser waiting reattaches the exact retired memory service only while its
+original credential binding remains current, without another network request.
 Post-login preference/outbox delivery and model discovery use the existing
 catalog task owner independently. Their completion carries the originating
 identity and session epoch; stale completions cannot modify another login, and
 model completion cannot replace a newer explicit model selection. Preference
-application and journal enqueue are local; the durable outbox owner delivers the
+seeding compares local edit versions (including changes back to the starting
+value) and merges only settings unchanged since the read began. Earlier edits
+do not permanently suppress a later resync.
+Automatic model discovery never opens a picker over an active form, pending
+explicit model request, or composer draft; it leaves an actionable `/model` hint.
+An already resolved concrete model can still enable a waiting first message.
+Preference application and journal enqueue are local; the durable outbox owner delivers the
 new marker in the background. Slow sync neither holds terminal borrows nor
 delays model selection, and read cancellation/shutdown aborts these waits.
 If registration fails, the saved login and model preference remain available;

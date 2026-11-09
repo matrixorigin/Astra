@@ -774,24 +774,25 @@ mod tests {
                 });
                 let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
                 let previous = heartbeat.as_ref().unwrap().abort_handle();
-                let error = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    super::rebind_after_login_with_timeout(
-                        &api,
-                        "token",
-                        None,
-                        &mut heartbeat,
-                        owner_changed,
-                        Duration::from_millis(500),
-                    ),
-                )
-                .await
-                .expect("login must return without waiting for the peer")
-                .unwrap_err();
-                tokio::time::timeout(Duration::from_secs(1), received)
-                    .await
-                    .expect("the request must reach the peer before timing out")
-                    .expect("the registration reached the stalled peer");
+                // Keep a generous real dispatch budget. Only advance the
+                // virtual clock once the peer has observed the request and
+                // (for the body case) delivered headers.
+                let mut registration = Box::pin(super::rebind_after_login_with_timeout(
+                    &api,
+                    "token",
+                    None,
+                    &mut heartbeat,
+                    owner_changed,
+                    Duration::from_secs(60),
+                ));
+                tokio::select! {
+                    result = &mut registration => panic!("registration completed before the stalled peer barrier: {result:?}"),
+                    ready = tokio::time::timeout(Duration::from_secs(10), received) => ready.expect("peer dispatch barrier").expect("request reached peer"),
+                }
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                let error = registration.await.unwrap_err();
+                tokio::time::resume();
                 assert!(error.contains("timed out"));
                 assert!(error.contains("Your login is saved"));
                 assert_eq!(previous.is_finished(), owner_changed);

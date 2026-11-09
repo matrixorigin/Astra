@@ -325,6 +325,8 @@ pub(crate) struct SessionState {
     /// Suggested next prompt shown after a completed turn when the next action is obvious.
     pub pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
+    /// Local edit versions fence delayed cloud reads, including ABA edits.
+    pub(crate) local_preference_revisions: std::collections::BTreeMap<&'static str, u64>,
     pub verbose_mode: bool,
     /// User preference: enable background memory-extraction agent.
     /// Synced via `pref_keys::AUTO_MEMORY_ENABLED`.
@@ -589,6 +591,7 @@ impl Default for SessionState {
             queued_message: None,
             pending_followup_suggestion: None,
             explain: ExplainMode::Off,
+            local_preference_revisions: Default::default(),
             verbose_mode: true,
             auto_memory_enabled: true,
             notifications_enabled: true,
@@ -722,6 +725,16 @@ impl SessionState {
         &self,
     ) -> crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle {
         self.native_delivery_refresh.clone()
+    }
+
+    /// Record local edits so an already pending cloud read cannot erase them.
+    pub(crate) fn set_explain_mode(&mut self, mode: ExplainMode) {
+        self.explain = mode;
+        let revision = self
+            .local_preference_revisions
+            .entry(astra_services::state_sync::pref_keys::EXPLAIN_MODE)
+            .or_default();
+        *revision = revision.wrapping_add(1);
     }
 
     /// Apply a format selected through `/explain` and remember its precedence
@@ -902,7 +915,7 @@ pub(crate) fn apply_initial_explain_mode(
     initial_explain: Option<ExplainMode>,
 ) {
     if let Some(mode) = initial_explain {
-        state.explain = mode;
+        state.set_explain_mode(mode);
     }
 }
 

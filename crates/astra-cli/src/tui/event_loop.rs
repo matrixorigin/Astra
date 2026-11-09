@@ -119,6 +119,7 @@ enum ModelCatalogEffect {
         attachment_epoch: u64,
         profile: Option<String>,
         cloud: crate::cli::cloud_sync::PostAuthCloudResync,
+        baseline: crate::cli::cloud_sync::CloudPreferenceSnapshot,
     },
     PostAuthModel {
         owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
@@ -421,7 +422,12 @@ fn spawn_password_registration(
         let result = crate::cli::edge_lifecycle::register_after_login(&api, &prepared.token).await;
         let services = if result.is_ok() {
             Some(Box::new(
-                crate::cli::auth_flow::build_identity_services(&api, profile.as_deref()).await,
+                crate::cli::auth_flow::build_identity_services(
+                    &api,
+                    profile.as_deref(),
+                    &prepared.user_id,
+                )
+                .await,
             ))
         } else {
             None
@@ -525,18 +531,25 @@ fn cancel_login_on_key(
     Some(cancelled)
 }
 
-async fn restore_login_identity_services(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+type RetiredLoginMemory = (
+    crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    Option<Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
+);
+
+fn restore_login_identity_services(
     state: &mut crate::cli::session::session_state::SessionState,
+    retired: &mut Option<RetiredLoginMemory>,
     discovery: &mut tokio::task::JoinHandle<
         crate::cli::session::session_runtime::ExternalPipelineDiscoveryReport,
     >,
     discovery_pending: &mut bool,
 ) {
-    if state.session_memory_port.is_none() {
-        state.session_memory_port =
-            crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
+    // Cancellation retains the original authority. Reattach its exact service
+    // without another network probe; never attach it after credential changes.
+    if let Some((owner, memory)) = retired.take() {
+        if owner.is_current() {
+            state.session_memory_port = memory;
+        }
     }
     if !*discovery_pending {
         *discovery = tokio::spawn(
@@ -1514,6 +1527,7 @@ fn apply_model_catalog_effect(
             attachment_epoch,
             profile,
             cloud,
+            baseline,
         } => {
             if attachment_epoch != state.session_attachment_epoch || !owner.is_current() {
                 return false;
@@ -1522,7 +1536,9 @@ fn apply_model_catalog_effect(
                 profile.as_deref(),
                 state,
                 cloud,
+                &baseline,
             );
+            sync_explain_presentation(chat_widget, state);
             if let Some(notice) = report.user_notice() {
                 chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
             }
@@ -3006,6 +3022,21 @@ fn apply_model_after_auth(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> Option<String> {
+    // Automatic setup must not replace a form, a pending user request, or a
+    // composer draft. Keep discovery available for an explicit `/model`.
+    if matches!(&model, Ok(PostAuthModel::Choose(_) | PostAuthModel::Empty))
+        && (bottom_pane.has_active_view()
+            || bottom_pane.pending_model_setup_read.is_some()
+            || !bottom_pane.composer.text().is_empty())
+    {
+        if let Ok(PostAuthModel::Choose(catalog)) = model {
+            bottom_pane.cache_model_catalog(catalog);
+        }
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            "Model discovery completed. Use /model when you are ready to choose a model.",
+        ));
+        return None;
+    }
     match model {
         Ok(PostAuthModel::Selected(selection)) => {
             if let Some(context_window) = selection.context_window {
@@ -3057,6 +3088,7 @@ fn spawn_post_auth_sync(
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let attachment_epoch = state.session_attachment_epoch;
     let requested = state.model.clone();
+    let baseline = crate::cli::cloud_sync::cloud_preference_snapshot(state);
     let cloud_tx = tx.clone();
     let cloud_owner = owner.clone();
     tasks.spawn(async move {
@@ -3067,6 +3099,7 @@ fn spawn_post_auth_sync(
                 attachment_epoch,
                 profile,
                 cloud,
+                baseline,
             })
             .await;
     });
@@ -9317,6 +9350,7 @@ pub(crate) async fn run_tui_session(
     let (login_progress_tx, mut login_progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let login_phase = Arc::new(super::login_control::LoginControl::default());
     let mut login_view_open = false;
+    let mut login_retired_memory: Option<RetiredLoginMemory> = None;
     let mut model_catalog_loading = false;
     let mut model_picker_scope: Option<ModelPickerScope> = None;
     if state.model.is_none() {
@@ -9812,11 +9846,8 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        if let Err(error) = auth_flow::begin_browser_session_login(&mut state).await {
-                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
-                            frame_requester.schedule_frame();
-                            continue 'main;
-                        }
+                        login_retired_memory = Some((crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(), state.session_memory_port.clone()));
+                        loop_try!(auth_flow::begin_browser_session_login(&mut state).await);
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -9928,6 +9959,7 @@ pub(crate) async fn run_tui_session(
                         schedule_queued_handoff(&handoff, &state, |event| event_stream.push_front(event), &mut followup_replay_armed);
                     }
                     Ok(LoginEffect::Completed { uc }) => {
+                        login_retired_memory = None;
                         auth_flow::invalidate_identity_services(&mut state);
                         skill_registry = Arc::clone(&state.unified_skill_registry);
                         mcp_manager = Arc::clone(&state.mcp_manager);
@@ -9971,9 +10003,9 @@ pub(crate) async fn run_tui_session(
                     }
                     Err(error) => {
                         // Cancellation before publication retains the old identity.
-                        // Recreate its retired memory service using the still-pinned
-                        // API; a committed account change cannot reuse this client.
-                        restore_login_identity_services(api, profile, &mut state, &mut external_skill_discovery, &mut external_skill_discovery_pending).await;
+                        // Reattach its retired service only while the original
+                        // credential binding is current, without an identity read.
+                        restore_login_identity_services(&mut state, &mut login_retired_memory, &mut external_skill_discovery, &mut external_skill_discovery_pending);
                         recover_queued_followups_after_cancelled_read(
                             &mut queued_followup_submissions,
                             &mut bottom_pane,
@@ -10257,9 +10289,8 @@ pub(crate) async fn run_tui_session(
                 }
             }
             Some(effect) = model_catalog_rx.recv() => {
-                if !matches!(&effect, ModelCatalogEffect::PostAuthCloud { .. }) {
-                    model_catalog_loading = false;
-                }
+                let cloud_only = matches!(&effect, ModelCatalogEffect::PostAuthCloud { .. });
+                if !cloud_only { model_catalog_loading = false; }
                 let scope = match &effect {
                     ModelCatalogEffect::Ready { scope, .. } => Some(scope.clone()),
                     ModelCatalogEffect::PostAuthModel { owner, attachment_epoch, .. } => Some(ModelPickerScope {
@@ -10269,13 +10300,16 @@ pub(crate) async fn run_tui_session(
                     ModelCatalogEffect::PostAuthCloud { .. } => None,
                 };
 
-                pending_deferred_slash_flush = apply_model_catalog_effect(
+                let deferred = apply_model_catalog_effect(
                     effect,
                     &mut state,
                     &mut bottom_pane,
                     &mut chat_widget,
                 );
-                model_picker_scope = scope.filter(|_| pending_deferred_slash_flush);
+                if !cloud_only {
+                    pending_deferred_slash_flush = deferred;
+                    model_picker_scope = scope.filter(|_| deferred);
+                }
                 if !pending_deferred_slash_flush {
                     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                     flush_chat_widget(&mut guard, &mut chat_widget, width);
@@ -15329,7 +15363,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"user_id": "old-owner"})),
             )
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(path("/skills"))
@@ -15356,6 +15390,10 @@ mod tests {
         state.session_memory_port =
             crate::cli::session::session_startup::build_cli_session_memory_port(&api, None).await;
         assert!(state.session_memory_port.is_some());
+        let mut retired = Some((
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            state.session_memory_port.clone(),
+        ));
         auth_flow::begin_browser_session_login(&mut state)
             .await
             .unwrap();
@@ -15409,13 +15447,11 @@ mod tests {
         let result = tasks.join_next().await.unwrap();
         assert!(result.as_ref().is_err_and(|error| error.is_cancelled()));
         restore_login_identity_services(
-            &api,
-            None,
             &mut state,
+            &mut retired,
             &mut discovery,
             &mut discovery_pending,
-        )
-        .await;
+        );
         assert!(discovery_pending);
         let report = discovery.await.unwrap();
         assert!(report.skills.unwrap().failures.is_empty());
@@ -27936,7 +27972,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn default_model_after_auth_offers_setup_for_retained_but_unavailable_intent() {
+    async fn default_model_after_auth_preserves_draft_and_offers_explicit_setup() {
         use crate::cli::session::session_state::SessionModelChoice;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -27982,15 +28018,15 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(matches!(
-            pane.pending_model_setup_read,
-            Some(super::super::model_setup::Action::Sources)
-        ));
+        assert!(pane.pending_model_setup_read.is_none());
+        assert!(!pane.has_active_view());
         assert_eq!(pane.composer.text(), "unsent conversation");
         assert!(
             matches!(state.model, Some(SessionModelChoice::Requested(ref name)) if name == "previous-owner-model")
         );
-        assert!(widget.history().is_empty());
+        assert!(
+            matches!(widget.history()[0].to_persist(), Some(crate::tui::turn_event::TurnEvent::System { text, .. }) if text.contains("Use /model"))
+        );
     }
 
     #[tokio::test]
@@ -28024,6 +28060,258 @@ mod tests {
             }) if text.contains("503") && !text.contains("missing_model_selection")
         ));
         assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn delayed_post_auth_model_result_keeps_the_active_api_key_form_and_draft() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _creds = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get({
+                let reached = reached.clone();
+                let release = release.clone();
+                move || {
+                    let reached = reached.clone();
+                    let release = release.clone();
+                    async move {
+                        reached.notify_one();
+                        release.notified().await;
+                        axum::Json(crate::test_utils::mock_model_catalog_json(&[
+                            "available-model",
+                        ]))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = crate::SessionState::default();
+        state.model = Some("old-model".into());
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let requested = state.model.clone();
+        let mut pending = Box::pin(load_model_after_auth(&api, "token", Some("old-model")));
+        tokio::select! {
+            _ = &mut pending => panic!("catalog response is held"),
+            ready = tokio::time::timeout(Duration::from_secs(10),reached.notified()) => ready.unwrap(),
+        }
+        let mut pane = BottomPane::new();
+        pane.replace_composer_text("unsent conversation");
+        super::super::model_setup::model_form(&mut pane, "openai".into(), None, None);
+        for ch in "personal-draft".chars() {
+            pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let mut widget = chat_widget::ChatWidget::new("");
+        release.notify_one();
+        let model = pending.await;
+        apply_model_catalog_effect(
+            ModelCatalogEffect::PostAuthModel {
+                owner,
+                attachment_epoch: state.session_attachment_epoch,
+                requested,
+                model,
+            },
+            &mut state,
+            &mut pane,
+            &mut widget,
+        );
+        // Complete the very same form after the late result; Enter must still
+        // submit the typed draft, rather than choosing an unexpected model.
+        pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "fixture-model".chars() {
+            pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        pane.handle_paste("synthetic-key");
+        let BottomPaneAction::ViewCompleted {
+            result:
+                Some(super::super::bottom_pane::view::ViewResult::ModelSetup(
+                    super::super::model_setup::Action::Create { request, .. },
+                )),
+            ..
+        } = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("late discovery stole form focus");
+        };
+        assert_eq!(request.name, "personal-draft");
+        assert_eq!(request.model, "fixture-model");
+        assert_eq!(pane.composer.text(), "unsent conversation");
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cancelled_login_cannot_restore_another_credential_generations_memory() {
+        let _creds = crate::tests::isolate_credentials();
+        let _old = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("old-owner"),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let mut retired = Some((
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            Some(
+                crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+                    &api,
+                    None,
+                    "old-owner",
+                ),
+            ),
+        ));
+        let _new = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("new-owner"),
+        )
+        .unwrap();
+        let mut state = crate::SessionState::default();
+        let mut discovery = tokio::spawn(std::future::pending());
+        let mut pending = true;
+        restore_login_identity_services(&mut state, &mut retired, &mut discovery, &mut pending);
+        assert!(state.session_memory_port.is_none());
+        assert!(retired.is_none());
+        discovery.abort();
+        let _ = discovery.await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_completion_and_shutdown_do_not_wait_for_an_optional_identity_probe() {
+        use crate::cli::auth_flow;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        for browser in [false, true] {
+            for shutdown in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST")).and(path("/auth/login")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"user_id":"owner","access_token":"saved-access","refresh_token":"refresh"}))).mount(&server).await;
+                Mock::given(method("POST"))
+                    .and(path("/agents/edge"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(path("/auth/me"))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+                let mut state = crate::SessionState::default();
+                let mut tasks = tokio::task::JoinSet::new();
+                let phase = super::super::login_control::LoginControl::default();
+                phase.begin_exchange().unwrap();
+                if browser {
+                    auth_flow::save_profile_auth_tokens(
+                        None,
+                        "user",
+                        &auth_flow::AuthTokenPayload {
+                            user_id: "owner".into(),
+                            access_token: "saved-access".into(),
+                            refresh_token: "refresh".into(),
+                        },
+                    )
+                    .unwrap();
+                    tasks.spawn(async move {
+                        Ok(LoginEffect::BrowserRegistered {
+                            result: auth_flow::prepare_browser_session_login(&api, None, false)
+                                .await
+                                .map(Box::new),
+                        })
+                    });
+                } else {
+                    let auth =
+                        auth_flow::request_password_authentication(&api, "user", "password", None)
+                            .await
+                            .unwrap();
+                    let prepared =
+                        auth_flow::prepare_password_session_login(None, "user", auth, &mut state)
+                            .await
+                            .unwrap();
+                    spawn_password_registration(
+                        &mut tasks,
+                        api,
+                        PasswordLoginContext {
+                            username: "user".into(),
+                            register: false,
+                            session_id: None,
+                            attachment_epoch: state.session_attachment_epoch,
+                        },
+                        prepared,
+                        None,
+                    );
+                }
+                if shutdown {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        settle_login_tasks_for_shutdown(&phase, &mut tasks, None, &mut state),
+                    )
+                    .await
+                    .expect("optional probe cannot hold shutdown");
+                } else {
+                    let effect = tokio::time::timeout(Duration::from_secs(10), tasks.join_next())
+                        .await
+                        .expect("optional probe cannot hold sign-in")
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    match effect {
+                        LoginEffect::PasswordRegistered {
+                            prepared,
+                            result,
+                            services,
+                            ..
+                        } => {
+                            let (_, result) = apply_password_registration(
+                                &prepared, result, services, &mut state,
+                            );
+                            result.unwrap();
+                        }
+                        LoginEffect::BrowserRegistered { result } => {
+                            auth_flow::commit_browser_session_login(*result.unwrap(), &mut state)
+                                .unwrap();
+                        }
+                        _ => panic!("unexpected completion"),
+                    }
+                    assert!(state.session_memory_port.is_some());
+                }
+                assert_eq!(
+                    crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
+                        .account_id
+                        .as_deref(),
+                    Some("owner")
+                );
+                server.verify().await;
+            }
+        }
     }
 
     #[serial_test::serial]
@@ -28065,7 +28353,7 @@ mod tests {
                     ResponseTemplate::new(200)
                         .set_body_json(serde_json::json!({"user_id":username})),
                 )
-                .expect(1)
+                .expect(0)
                 .mount(&server)
                 .await;
             let name = format!("private-{username}");
