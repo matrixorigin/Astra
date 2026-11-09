@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -34,6 +35,8 @@ static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 static STARTUP_CANCELLED: AtomicBool = AtomicBool::new(false);
 static PARENT_RELEASED: AtomicBool = AtomicBool::new(false);
+/// The parent disappeared before it accepted readiness. The child must exit.
+static READY_REJECTED: AtomicBool = AtomicBool::new(false);
 static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState {
     epoch: 0,
     connected: None,
@@ -155,6 +158,10 @@ pub fn signal_ready_for_epoch(epoch: u64) {
         .and_then(|raw| raw.parse::<i32>().ok())
         .filter(|fd| *fd >= 0);
     signal_ready_for_epoch_with(&PHASE_STATE, epoch, dir.as_deref(), ready_fd);
+    if READY_REJECTED.load(Ordering::SeqCst) {
+        eprintln!("Error: the starting command is gone; runner startup was not accepted.");
+        std::process::exit(1);
+    }
 }
 
 fn phase_epoch(state: &Mutex<PhaseState>) -> u64 {
@@ -210,18 +217,28 @@ fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
     static NOTIFIED: Once = Once::new();
     NOTIFIED.call_once(|| {
         if let Some(fd) = ready_fd {
-            notify_parent_ready_fd(fd);
-            PARENT_RELEASED.store(true, Ordering::SeqCst);
+            match notify_parent_ready_fd(fd) {
+                Ok(()) => PARENT_RELEASED.store(true, Ordering::SeqCst),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra.edge",
+                        error = %error,
+                        "the starting command did not accept readiness"
+                    );
+                    READY_REJECTED.store(true, Ordering::SeqCst);
+                }
+            }
         }
     });
 }
 
-fn notify_parent_ready_fd(fd: i32) {
+fn notify_parent_ready_fd(fd: i32) -> io::Result<()> {
     // The parent created this pipe end and passed its number. This process is
-    // the only remaining owner after the parent drops its copy.
+    // the only remaining owner after the parent drops its copy. A closed read
+    // end means the starting command is gone, so startup was not accepted.
     let mut file = unsafe { File::from_raw_fd(fd) };
-    let _ = file.write_all(b"1");
-    let _ = file.flush();
+    file.write_all(b"1")?;
+    file.flush()
 }
 
 pub fn prepare_child() -> io::Result<()> {
@@ -249,6 +266,11 @@ pub fn management_exit_code(args: &[String], root: &Path) -> Option<i32> {
 }
 
 pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
+    // The canonical parser is the only command check. An unknown option must
+    // not queue a credential or start a runner.
+    if let Err(code) = crate::validate_managed_command(args) {
+        return code;
+    }
     let identity = match user_runner_identity(args) {
         Ok(Some(identity)) => identity,
         Ok(None) => {
@@ -273,6 +295,17 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
         }
     };
     let _start_guard = Unlock(&start);
+    match lock_names_file(&dir, &start) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("Error: runner startup was cancelled before the runner started.");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("Error: cannot confirm runner startup: {error}");
+            return 1;
+        }
+    }
     let token = option_value(args, "--token").unwrap_or("");
     match instance_is_locked(&dir) {
         Ok(true) => return running_instance(&dir, &identity, token, executable),
@@ -286,6 +319,10 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     // credential this command starts with.
     if let Err(error) = discard_handoff(&dir) {
         eprintln!("Error: cannot clear the previous runner's credential: {error}");
+        return 1;
+    }
+    if let Err(error) = clear_stop_request(&dir) {
+        eprintln!("Error: cannot clear the previous stop: {error}");
         return 1;
     }
     if let Err(error) = write_metadata(&dir, &identity) {
@@ -371,13 +408,29 @@ pub fn queue_pending_credential(dir: &Path, token: &str) -> io::Result<()> {
 
 fn discard_handoff(dir: &Path) -> io::Result<()> {
     for path in [pending_credential_path(dir), claimed_credential_path(dir)] {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        remove_if_present(&path)?;
     }
     Ok(())
+}
+
+fn stop_requested_path(dir: &Path) -> PathBuf {
+    dir.join("stop.requested")
+}
+
+fn stop_is_requested(dir: &Path) -> bool {
+    stop_requested_path(dir).is_file()
+}
+
+fn clear_stop_request(dir: &Path) -> io::Result<()> {
+    remove_if_present(&stop_requested_path(dir))
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// State directory through which connect commands hand credentials to this
@@ -520,7 +573,7 @@ fn wait_for_ready(
     let started = Instant::now();
     loop {
         match read_ready_byte(read)? {
-            ReadyByte::Ready => return Ok(()),
+            ReadyByte::Ready => return accept_ready(child, cancelled),
             ReadyByte::Pending => {}
         }
         if cancelled.load(Ordering::Relaxed) {
@@ -530,8 +583,10 @@ fn wait_for_ready(
             .try_wait()
             .map_err(|error| format!("cannot observe the runner: {error}"))?
         {
+            // A byte left in the pipe by a child that has already exited is
+            // not a running runner.
             if read_ready_byte(read)? == ReadyByte::Ready {
-                return Ok(());
+                return accept_ready(child, cancelled);
             }
             return Err(format!("runner exited before it was ready ({status})"));
         }
@@ -546,6 +601,19 @@ fn wait_for_ready(
 enum ReadyByte {
     Ready,
     Pending,
+}
+
+fn accept_ready(child: &mut Child, cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("startup cancelled before the runner was ready".into());
+    }
+    match child
+        .try_wait()
+        .map_err(|error| format!("cannot observe the runner: {error}"))?
+    {
+        Some(status) => Err(format!("runner exited before it was ready ({status})")),
+        None => Ok(()),
+    }
 }
 
 fn read_ready_byte(read: &mut File) -> Result<ReadyByte, String> {
@@ -570,6 +638,7 @@ extern "C" fn handle_startup_cancel(_signal: std::os::raw::c_int) {
 struct StartupCancel {
     previous_int: nix::sys::signal::SigAction,
     previous_term: nix::sys::signal::SigAction,
+    previous_hup: nix::sys::signal::SigAction,
 }
 
 impl StartupCancel {
@@ -589,9 +658,20 @@ impl StartupCancel {
                 return Err(io_error(error));
             }
         };
+        // Closing the terminal delivers SIGHUP to the waiting supervisor.
+        // The child has left the session, so the supervisor has to cancel it.
+        let previous_hup = match unsafe { sigaction(Signal::SIGHUP, &action) } {
+            Ok(previous) => previous,
+            Err(error) => {
+                let _ = unsafe { sigaction(Signal::SIGINT, &previous_int) };
+                let _ = unsafe { sigaction(Signal::SIGTERM, &previous_term) };
+                return Err(io_error(error));
+            }
+        };
         Ok(Self {
             previous_int,
             previous_term,
+            previous_hup,
         })
     }
 
@@ -606,6 +686,7 @@ impl Drop for StartupCancel {
         unsafe {
             let _ = sigaction(Signal::SIGINT, &self.previous_int);
             let _ = sigaction(Signal::SIGTERM, &self.previous_term);
+            let _ = sigaction(Signal::SIGHUP, &self.previous_hup);
         }
         STARTUP_CANCELLED.store(false, Ordering::SeqCst);
     }
@@ -693,6 +774,11 @@ fn run_management(root: &Path, request: Management) -> i32 {
             return 1;
         }
     };
+    if matches!(request.action, Action::Stop)
+        && let Some(code) = stop_pending_starts(&request, &instances)
+    {
+        return code;
+    }
     let uninspectable = report_uninspectable(
         &instances.unreadable,
         request.edge_id.as_deref(),
@@ -778,6 +864,129 @@ fn select_instances<'a>(
     Ok(matched)
 }
 
+/// Stop a start that has created its state directory but has not published
+/// metadata yet. Returns `Some` when this request is that start, so the
+/// caller does not report the runner absent.
+fn stop_pending_starts(request: &Management, instances: &Instances) -> Option<i32> {
+    let mut pending = Vec::new();
+    for (dir, _) in &instances.unreadable {
+        if !dir_selected(
+            dir,
+            request.edge_id.as_deref(),
+            request.server_url.as_deref(),
+        ) {
+            continue;
+        }
+        // Only a held `start.lock` is an in-progress start. An unlocked
+        // directory with unreadable metadata is a stopped runner's state;
+        // deleting it would throw away its logs.
+        match (instance_is_locked(dir), start_lock_is_held(dir)) {
+            (Ok(false), Ok(true)) => pending.push(dir.clone()),
+            (Ok(_), Ok(_)) => {}
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("Error: cannot inspect the runner lock: {error}");
+                return Some(1);
+            }
+        }
+    }
+    if pending.is_empty() {
+        return None;
+    }
+    let readable = instances
+        .records
+        .iter()
+        .filter(|record| {
+            request
+                .edge_id
+                .as_ref()
+                .is_none_or(|id| record.edge_id == *id)
+        })
+        .filter(|record| {
+            request
+                .server_url
+                .as_deref()
+                .is_none_or(|url| same_destination(&record.server_url, url))
+        })
+        .count();
+    if readable > 0 {
+        return None;
+    }
+    if pending.len() > 1 {
+        eprintln!("Error: more than one runner startup; pass --edge-id and --server-url");
+        return Some(2);
+    }
+    Some(stop_unpublished(&pending[0]))
+}
+
+fn dir_selected(dir: &Path, edge_id: Option<&str>, server_url: Option<&str>) -> bool {
+    let Some((edge_id, server_url)) = edge_id.zip(server_url) else {
+        return true;
+    };
+    let Ok(server_url) = astra_edge::edge_ws_url(server_url) else {
+        return false;
+    };
+    let key = identity_key(&Identity {
+        edge_id: edge_id.to_string(),
+        server_url,
+        workspace: PathBuf::new(),
+    });
+    dir.file_name() == Some(std::ffi::OsStr::new(&key))
+}
+
+/// Called with no readable metadata and no instance owner visible yet.
+/// Waits for the start's `start.lock`, then either stops the runner that
+/// start published or removes the unpublished directory so the start cannot
+/// launch after this stop returns.
+fn stop_unpublished(dir: &Path) -> i32 {
+    let start = match lock_start(dir) {
+        Ok(start) => start,
+        Err(error) => {
+            eprintln!("Error: cannot lock runner startup: {error}");
+            return 1;
+        }
+    };
+    match lock_names_file(dir, &start) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("Runner is already stopped.");
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("Error: cannot confirm runner startup: {error}");
+            return 1;
+        }
+    }
+    match instance_owner(dir) {
+        Ok(Some(pid)) => stop_owner(dir, pid, start, true),
+        Ok(None) if dir.join("metadata.json").is_file() => {
+            eprintln!("Runner is already stopped.");
+            0
+        }
+        Ok(None) => {
+            let removed = std::fs::remove_dir_all(dir);
+            drop(start);
+            match removed {
+                Ok(()) => {
+                    eprintln!("Runner is already stopped.");
+                    0
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    eprintln!("Runner is already stopped.");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("Error: cannot discard the unpublished runner: {error}");
+                    1
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("Error: cannot inspect the runner lock: {error}");
+            1
+        }
+    }
+}
+
 fn phase_label(dir: &Path) -> io::Result<String> {
     let recorded = match std::fs::read_to_string(dir.join("phase")) {
         Ok(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
@@ -790,6 +999,12 @@ fn phase_label(dir: &Path) -> io::Result<String> {
         } else {
             "stopped".to_string()
         });
+    }
+    // Written by `stop` under `start.lock`, before the runner's signal handler
+    // can release `connected.lock`. A connect command must observe it even
+    // while the runner still looks connected.
+    if stop_is_requested(dir) {
+        return Ok("stopping".to_string());
     }
     if connected_lock_is_held(dir)? {
         return Ok("connected".to_string());
@@ -850,6 +1065,17 @@ fn stop_instance_with(record: &Record, announce: bool) -> i32 {
             return 1;
         }
     };
+    stop_owner(&record.dir, pid, start, announce)
+}
+
+/// `start` is the held `start.lock`. The stop marker is published before the
+/// signal and before the lock is released, so a connect command cannot observe
+/// the runner as connected after the stop has been decided.
+fn stop_owner(dir: &Path, pid: u32, start: File, announce: bool) -> i32 {
+    if let Err(error) = write_private(&stop_requested_path(dir), b"") {
+        eprintln!("Error: cannot record the stop: {error}");
+        return 1;
+    }
     match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGTERM,
@@ -860,12 +1086,15 @@ fn stop_instance_with(record: &Record, announce: bool) -> i32 {
             return 1;
         }
     }
-    // The runner may need the lock to finish its final decision.
+    // The runner may need the lock to finish its final decision. The stop
+    // marker stays until the process is gone, so a connect command that takes
+    // the lock next still refuses the handoff.
     drop(start);
     let started = Instant::now();
     while started.elapsed() < STOP_TIMEOUT {
-        match instance_is_locked(&record.dir) {
+        match instance_is_locked(dir) {
             Ok(false) => {
+                let _ = clear_stop_request(dir);
                 if announce {
                     eprintln!("Runner stopped.");
                 }
@@ -983,7 +1212,17 @@ fn report_uninspectable(
             continue;
         }
         match instance_is_locked(dir) {
-            Ok(false) => continue,
+            Ok(false) => match start_lock_is_held(dir) {
+                Ok(false) => continue,
+                Ok(true) => eprintln!(
+                    "Error: a runner start is in progress in {}: its state is not published yet",
+                    dir.display()
+                ),
+                Err(lock_error) => eprintln!(
+                    "Error: cannot inspect runner startup in {}: {error}; lock: {lock_error}",
+                    dir.display()
+                ),
+            },
             Ok(true) => eprintln!(
                 "Error: cannot read the state of a running runner in {}: {error}",
                 dir.display()
@@ -1251,6 +1490,31 @@ fn instance_owner(dir: &Path) -> io::Result<Option<u32>> {
 
 fn instance_is_locked(dir: &Path) -> io::Result<bool> {
     Ok(instance_owner(dir)?.is_some())
+}
+
+fn lock_names_file(dir: &Path, file: &File) -> io::Result<bool> {
+    let Some(current) = open_existing_lock(&dir.join("start.lock"))? else {
+        return Ok(false);
+    };
+    let held = file.metadata()?;
+    let named = current.metadata()?;
+    Ok(held.dev() == named.dev() && held.ino() == named.ino())
+}
+
+fn start_lock_is_held(dir: &Path) -> io::Result<bool> {
+    let Some(file) = open_existing_lock(&dir.join("start.lock"))? else {
+        return Ok(false);
+    };
+    // Same flock as `lock_start`. std's `File::try_lock` is a different API
+    // and must not be used to observe this lock.
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn connected_lock_is_held(dir: &Path) -> io::Result<bool> {
@@ -1729,7 +1993,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("printf 1")
+            .arg("printf 1; sleep 30")
             .env(READY_FD_ENV, "1")
             .stdout(Stdio::from(write_fd));
         let mut child = command.spawn().unwrap();
@@ -1742,6 +2006,11 @@ mod tests {
             &cancelled,
         )
         .unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "readiness was accepted after the child exited"
+        );
+        let _ = child.kill();
         let _ = child.wait();
 
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
@@ -1903,6 +2172,15 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(delay));
         }
+        if std::env::var("ASTRA_EDGE_TEST_HOLD_IGNORE_TERM").as_deref() == Ok("1") {
+            // SAFETY: SIG_IGN is a valid handler and SIGTERM is a valid signal.
+            unsafe {
+                let _ = nix::sys::signal::signal(
+                    nix::sys::signal::Signal::SIGTERM,
+                    nix::sys::signal::SigHandler::SigIgn,
+                );
+            }
+        }
         let _instance = acquire_instance_lock(&dir).unwrap();
         let connected = open_lock_file(&dir.join("connected.lock")).unwrap();
         if std::env::var(HOLD_CONNECTED_ENV).as_deref() != Ok("0") {
@@ -1912,7 +2190,7 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
         {
-            notify_parent_ready_fd(fd);
+            let _ = notify_parent_ready_fd(fd);
         }
         println!("{HOLDER_READY}");
         std::io::stdout().flush().unwrap();
@@ -1923,15 +2201,26 @@ mod tests {
 
     impl Holder {
         fn spawn(dir: &Path, connected: bool) -> Self {
-            let mut child = Command::new(std::env::current_exe().unwrap())
+            Self::spawn_inner(dir, connected, false)
+        }
+
+        fn spawn_ignoring_term(dir: &Path, connected: bool) -> Self {
+            Self::spawn_inner(dir, connected, true)
+        }
+
+        fn spawn_inner(dir: &Path, connected: bool, ignore_term: bool) -> Self {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([HOLDER_TEST, "--exact", "--nocapture", "--test-threads=1"])
                 .env(HOLD_DIR_ENV, dir)
                 .env(HOLD_CONNECTED_ENV, if connected { "1" } else { "0" })
                 .env_remove(READY_FD_ENV)
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stdout(Stdio::piped());
+            if ignore_term {
+                command.env("ASTRA_EDGE_TEST_HOLD_IGNORE_TERM", "1");
+            }
+            let mut child = command.spawn().unwrap();
             let stdout = child.stdout.take().unwrap();
             let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
             loop {
@@ -2231,6 +2520,243 @@ mod tests {
             None,
             "a runner started during stop remained running"
         );
+    }
+
+    #[test]
+    fn stop_claims_a_start_that_has_not_published_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        let held = lock_start(&dir).unwrap();
+        let stop_root = root.path().to_path_buf();
+        let stop = std::thread::spawn(move || {
+            management(
+                &stop_root,
+                &[
+                    "stop",
+                    "--edge-id",
+                    "runner-abc",
+                    "--server-url",
+                    "https://example.test",
+                ],
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stop.is_finished(),
+            "stop returned while startup still held start.lock"
+        );
+        write_metadata(&dir, &identity).unwrap();
+        let mut runner = Holder::spawn(&dir, true);
+        drop(held);
+        assert_eq!(stop.join().unwrap(), 0);
+        assert!(
+            !runner.is_alive(),
+            "the runner published by the in-progress start survived stop"
+        );
+    }
+
+    #[test]
+    fn stop_discards_an_unpublished_start_that_has_no_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        let held = lock_start(&dir).unwrap();
+        let stop_root = root.path().to_path_buf();
+        let stop = std::thread::spawn(move || {
+            management(
+                &stop_root,
+                &[
+                    "stop",
+                    "--edge-id",
+                    "runner-abc",
+                    "--server-url",
+                    "https://example.test",
+                ],
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stop.is_finished(),
+            "stop returned while startup still held start.lock"
+        );
+        drop(held);
+        assert_eq!(stop.join().unwrap(), 0);
+        assert!(
+            !dir.exists(),
+            "the unpublished start can still launch after stop"
+        );
+    }
+
+    #[test]
+    fn stop_does_not_delete_unreadable_state_that_is_not_starting() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        std::fs::write(dir.join("metadata.json"), b"not json").unwrap();
+        std::fs::write(dir.join("edge.log"), b"kept").unwrap();
+        assert_eq!(
+            management(
+                root.path(),
+                &[
+                    "stop",
+                    "--edge-id",
+                    "runner-abc",
+                    "--server-url",
+                    "https://example.test",
+                ],
+            ),
+            0
+        );
+        assert_eq!(std::fs::read(dir.join("edge.log")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn a_stop_rejects_a_credential_while_the_runner_is_still_connected() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        write_metadata(&dir, &identity).unwrap();
+        let runner = Holder::spawn_ignoring_term(&dir, true);
+        let stop_root = root.path().to_path_buf();
+        let stop = std::thread::spawn(move || {
+            management(
+                &stop_root,
+                &[
+                    "stop",
+                    "--edge-id",
+                    "runner-abc",
+                    "--server-url",
+                    "https://example.test",
+                ],
+            )
+        });
+        for _ in 0..100 {
+            if stop_is_requested(&dir) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stop_is_requested(&dir), "stop did not record its decision");
+        assert_eq!(phase_label(&dir).unwrap(), "stopping");
+        assert_eq!(
+            running_instance(&dir, &identity, "fresh-token", Path::new("astra-edge")),
+            1
+        );
+        assert!(!pending_credential_path(&dir).exists());
+        drop(runner);
+        assert_eq!(stop.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_invalid_connect_option_does_not_hand_off_a_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        write_metadata(&dir, &identity).unwrap();
+        let _runner = Holder::spawn(&dir, true);
+        let mut invalid = command;
+        invalid.push("--typoed-option".into());
+        let code = supervise(Path::new("astra-edge"), &invalid, root.path());
+        assert_ne!(code, 0);
+        assert!(!pending_credential_path(&dir).exists());
+    }
+
+    #[test]
+    fn a_buffered_ready_byte_is_not_success_after_the_child_exits() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let mut read = File::from(read_fd);
+        let mut write = File::from(write_fd);
+        assert!(child.wait().unwrap().success());
+        write.write_all(b"1").unwrap();
+        drop(write);
+        let error = wait_for_ready(
+            &mut child,
+            &mut read,
+            Duration::from_secs(2),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("exited"), "{error}");
+    }
+
+    #[test]
+    fn a_buffered_ready_byte_does_not_override_startup_cancellation() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let mut read = File::from(read_fd);
+        let mut write = File::from(write_fd);
+        write.write_all(b"1").unwrap();
+        drop(write);
+        let error = wait_for_ready(
+            &mut child,
+            &mut read,
+            Duration::from_secs(2),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn hangup_cancels_startup() {
+        let startup = StartupCancel::arm().unwrap();
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).unwrap();
+        let mut seen = false;
+        for _ in 0..50 {
+            if startup.flag().load(Ordering::SeqCst) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen, "SIGHUP did not cancel startup");
+    }
+
+    #[test]
+    fn a_closed_readiness_pipe_is_not_accepted() {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        drop(read_fd);
+        use std::os::fd::IntoRawFd;
+        let error = notify_parent_ready_fd(write_fd.into_raw_fd()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
     }
 
     #[test]

@@ -86,6 +86,9 @@ next connection attempt, including an attempt whose old credential was just
 rejected; work already admitted keeps running. If a new credential cannot
 authenticate, the runner continues with the credential that last authenticated,
 and the same command can be run again later. A runner that is stopping does not
-accept a new credential; run the command again after it stops. `stop` waits for
-a start that is in progress and stops the runner it started. The token is not
-written to the runner metadata.
+accept a new credential, including before it has finished leaving the connected
+state; run the command again after it stops. `stop` waits for a start that is
+in progress, including one that has not recorded its metadata yet, and stops
+the runner it started. Closing the terminal before the command reports the
+runner connected cancels that startup. The token is not written to the runner
+metadata.

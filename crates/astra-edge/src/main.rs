@@ -931,6 +931,21 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+/// Reject argv that the canonical parser rejects, before a managed connect
+/// command can hand a credential to a running runner or start one.
+pub(crate) fn validate_managed_command(args: &[String]) -> Result<(), i32> {
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(env!("CARGO_PKG_NAME").to_string());
+    full.extend(args.iter().cloned());
+    match Args::try_parse_from(full) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = error.print();
+            Err(error.exit_code())
+        }
+    }
+}
+
 fn main() {
     // Protocol probes stay ahead of the runtime and of background startup.
     let executable = std::env::current_exe().expect("current executable");

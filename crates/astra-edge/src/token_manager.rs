@@ -116,8 +116,20 @@ impl TokenManager {
     /// newer persisted token; ties go to the proven token; non-MOI tokens
     /// never touch the file). When the file already contains exactly `proven`,
     /// rewrite it if needed to enforce private credential-file permissions.
+    ///
+    /// A renewal can install that newer token while this connection is still
+    /// authenticating. Proving the pre-renewal snapshot must not rewind the
+    /// in-memory fallback behind the token the process is using now.
     pub async fn mark_proven(&self, proven: &str) {
         let mut state = self.state.lock().await;
+        let renewed_current = state.proven.as_deref() == Some(state.current.as_str())
+            && proven != state.current
+            && !should_persist_proven(Some(&state.current), proven);
+        if renewed_current {
+            // The snapshot is older than the credential renewal installed.
+            // Leave both the in-memory fallback and the token file alone.
+            return;
+        }
         state.proven = Some(proven.to_string());
         // Expired file tokens are treated as absent: a dead token must not win
         // the generation comparison against a token that just proved itself.
@@ -166,11 +178,11 @@ impl TokenManager {
         if state.current != requested_with {
             return RenewApply::Discarded;
         }
-        // The renewal endpoint accepted the proven credential, so its
-        // replacement remains the credential to fall back to.
-        if state.proven.as_deref() == Some(requested_with) {
-            state.proven = Some(new_token.clone());
-        }
+        // The renewal endpoint accepted the token this process presented and
+        // issued its replacement. That replacement is the credential to fall
+        // back to, including when the connection that presented the old token
+        // has not observed AuthOk yet.
+        state.proven = Some(new_token.clone());
         state.current = new_token;
         if let Err(error) = write_token_atomic(&self.token_file, &state.current) {
             tracing::warn!(
@@ -625,6 +637,27 @@ mod tests {
             RenewApply::Applied
         );
         assert!(manager.stage_unproven_candidate("handed-off".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, renewed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_authentication_does_not_rewind_a_renewed_credential() {
+        let old = make_moi_token(100, 200, "old");
+        let renewed = make_moi_token(150, 250, "renewed");
+        let path = temp_token_path("late-auth");
+        let manager = TokenManager::new(old.clone(), None, path.clone());
+        manager.mark_proven(&old).await;
+        assert_eq!(
+            manager.apply_renewed(&old, renewed.clone()).await,
+            RenewApply::Applied
+        );
+        // The connection that authenticated with the pre-renewal token
+        // observes AuthOk only after the replacement is installed.
+        manager.mark_proven(&old).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renewed);
+        assert!(manager.stage_unproven_candidate("rejected".into()).await);
         assert!(manager.swap_to_fallback().await);
         assert_eq!(manager.snapshot().await, renewed);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
