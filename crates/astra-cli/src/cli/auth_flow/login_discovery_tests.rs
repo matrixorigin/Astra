@@ -70,7 +70,13 @@ async fn browser_login_completion_requires_registered_checkout_before_runtime_re
             let body: serde_json::Value = serde_json::from_slice(&registered.body).unwrap();
             assert!(!body["materialization_id"].as_str().unwrap().is_empty());
             assert!(!body["worktree_path"].as_str().unwrap().is_empty());
-            retire_auth_runtime(&mut state).await;
+            SessionAuthRetirement {
+                runtime: state.agent_spawner.take(),
+                finalization: None,
+            }
+            .run()
+            .await
+            .unwrap();
         }
         crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
     }

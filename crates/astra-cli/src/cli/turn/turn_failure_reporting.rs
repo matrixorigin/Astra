@@ -78,6 +78,18 @@ pub(crate) fn report_admission_rejection(
 ) {
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
+    if !is_llm_provider_auth_error(&failure.error)
+        && (failure.partial.failure_kind == Some(astra_core::ErrorKind::Auth)
+            || is_auth_error(&failure.error))
+    {
+        let mut message = String::from("Session expired. Run /login to refresh.\n");
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        }
+        message.push_str("  No model or tool ran.");
+        ui.show_error(&message);
+        return;
+    }
     if failure.partial.error_code.as_deref() == Some("execution_binding_provider_required") {
         let mut message = String::from(
             "[execution_binding_provider_required] Execution provider registration or selection is required\n",
@@ -141,17 +153,18 @@ pub(crate) fn report_admission_rejection(
         ui.show_error(&message);
         return;
     }
-    let mut message = admission_rejection_message(draft_restored);
+    let mut message = format!("{}\n", failure.error);
+    message.push_str(&admission_rejection_message(draft_restored));
     message.push_str("  No model or tool ran.");
     ui.show_error(&message);
 }
 
 fn admission_rejection_message(draft_restored: bool) -> String {
-    let mut message = String::from("Session execution is busy\n");
+    let mut message = String::from("Request rejected before execution\n");
     if draft_restored {
         message.push_str("  Your message was not sent; the draft is back in the composer.\n");
     } else {
-        message.push_str("  Your message was not sent; retry it after the conflict clears.\n");
+        message.push_str("  Your message was not sent; review the error before retrying.\n");
     }
     message
 }
@@ -343,7 +356,7 @@ mod tests {
             Some("session-current"),
         ));
         let message = admission_rejection_message(false);
-        assert!(message.contains("retry it after the conflict clears"));
+        assert!(message.contains("review the error before retrying"));
         assert!(!message.contains("back in the composer"));
     }
 

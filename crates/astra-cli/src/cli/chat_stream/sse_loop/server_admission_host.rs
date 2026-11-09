@@ -358,12 +358,10 @@ pub(crate) struct CliServerAdmissionHost<'a> {
 }
 
 pub(crate) fn is_pre_admission_rejection(
-    error_code: Option<&str>,
     error_metadata: Option<&Value>,
     physical_run_id: Option<&str>,
 ) -> bool {
-    error_code.is_some()
-        && physical_run_id.is_none_or(|run_id| run_id.trim().is_empty())
+    physical_run_id.is_none_or(|run_id| run_id.trim().is_empty())
         && error_metadata.is_some_and(|metadata| {
             metadata.get("admission_state").and_then(Value::as_str) == Some("rejected")
                 || metadata
@@ -813,7 +811,6 @@ impl CliServerAdmissionHost<'_> {
     pub(super) fn pre_admission_rejected(&self) -> bool {
         !self.prior_admission_ambiguous
             && is_pre_admission_rejection(
-                self.last_error_code.as_deref(),
                 self.last_error_metadata.as_ref(),
                 self.last_physical_run_id.as_deref(),
             )
@@ -1795,18 +1792,12 @@ mod tests {
             "admission_state": "rejected",
             "recovery_action": "retry_session",
         });
-        assert!(is_pre_admission_rejection(
-            Some("execution_binding_busy"),
-            Some(&metadata),
-            None,
-        ));
+        assert!(is_pre_admission_rejection(Some(&metadata), None,));
         assert!(!is_pre_admission_rejection(
-            Some("execution_binding_busy"),
             Some(&metadata),
             Some("run-admitted"),
         ));
         assert!(!is_pre_admission_rejection(
-            Some("execution_binding_busy"),
             Some(&json!({"admission_state": "accepted"})),
             None,
         ));
@@ -1828,17 +1819,11 @@ mod tests {
             Some("execution_binding_provider_required")
         );
         assert!(is_pre_admission_rejection(
-            accum.error_code.as_deref(),
             accum.error_metadata.as_ref(),
             None
         ));
+        assert!(!is_pre_admission_rejection(None, None));
         assert!(!is_pre_admission_rejection(
-            accum.error_code.as_deref(),
-            None,
-            None
-        ));
-        assert!(!is_pre_admission_rejection(
-            accum.error_code.as_deref(),
             accum.error_metadata.as_ref(),
             Some("already-admitted")
         ));
@@ -1862,7 +1847,6 @@ mod tests {
         );
 
         assert!(is_pre_admission_rejection(
-            accum.error_code.as_deref(),
             accum.error_metadata.as_ref(),
             accum.run_id.as_deref(),
         ));

@@ -20,6 +20,65 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
 
 #[tokio::test]
 #[serial_test::serial]
+async fn early_auth_sse_rejection_requires_explicit_attempt_evidence() {
+    let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+    for (message, proven) in [
+        ("Invalid token", false),
+        ("Not authenticated", false),
+        ("Invalid token", true),
+        ("Not authenticated", true),
+    ] {
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || async move {
+                // The real early HTTP handler uses HTTP 200, AUTH_ERROR and no
+                // domain error_code. Authentication alone is not admission proof.
+                let mut error = serde_json::json!({
+                    "type":"error", "code":"AUTH_ERROR", "error_kind":"auth",
+                    "message":message, "retryable":false
+                });
+                if proven {
+                    error["metadata"] = serde_json::json!({"attempt_admission_state":"rejected"});
+                }
+                (TEST_SSE_HEADERS, format!("data: {error}\n\n"))
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "unsent draft");
+        let mut permission = PermissionManager::new(true);
+        let params = ChatTurnParams::basic_cli(&context, "revoked-token", None, &mut permission);
+        let failure = stream_chat_sse(params).await.unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::Auth)
+        );
+        assert!(failure.partial.run_id.is_none());
+        assert_eq!(failure.partial.admission_rejected, proven);
+        assert_eq!(failure.partial.prior_admission_ambiguous, !proven);
+        if proven {
+            let mut state = crate::SessionState::default();
+            let mut ui = crate::tests::TestUi::default();
+            crate::cli::turn::turn_failure_reporting::report_admission_rejection(
+                &mut state,
+                "unsent draft",
+                &failure,
+                &mut ui,
+            );
+            assert_eq!(ui.restored_inputs, ["unsent draft"]);
+            let message = ui.errors.join("\n");
+            assert!(message.contains("/login") && message.contains("No model or tool ran"));
+            assert!(!message.contains("busy") && !message.contains("unknown"));
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn admitted_attempt_with_lost_headers_is_not_replayed_even_if_next_admission_would_succeed() {
     assert_lost_admission("lost_headers").await;
 }

@@ -137,6 +137,18 @@ pub(super) fn sse_error_response_with_retryable_and_context(
     sse_json_response(vec![event])
 }
 
+/// Evidence for this physical request only. Call exclusively before the Run
+/// lifecycle has been invoked or before a new Run has been persisted.
+pub(super) fn mark_attempt_rejected(error: &mut ErrorResponse) {
+    let metadata = error.metadata.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(fields) = metadata.as_object_mut() {
+        fields.insert(
+            "attempt_admission_state".into(),
+            serde_json::json!("rejected"),
+        );
+    }
+}
+
 pub(super) fn sse_error_response_from_error_with_context(
     status: StatusCode,
     mut error: ErrorResponse,

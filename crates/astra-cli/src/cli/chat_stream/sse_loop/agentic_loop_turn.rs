@@ -1793,7 +1793,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         .as_deref()
         .is_some_and(|id| !id.trim().is_empty())
         || super::server_admission_host::is_pre_admission_rejection(
-            turn.core.error_code.as_deref(),
             turn.core.error_metadata.as_ref(),
             turn.core.run_id.as_deref(),
         )

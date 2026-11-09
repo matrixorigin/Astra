@@ -920,11 +920,25 @@ fn ensure_shells_can_rebind(state: &SessionState) -> Result<(), String> {
     Ok(())
 }
 
-async fn retire_auth_runtime(state: &mut SessionState) {
-    if let Some(spawner) = state.agent_spawner.take() {
-        spawner
-            .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
-            .await;
+pub(crate) struct SessionAuthRetirement {
+    runtime: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    finalization: Option<crate::cli::session::session_cleanup::SessionFinalization>,
+}
+
+impl SessionAuthRetirement {
+    pub(crate) async fn run(self) -> Result<(), String> {
+        if let Some(spawner) = self.runtime {
+            spawner
+                .shutdown_and_wait_with_reason(
+                    AUTH_RUNTIME_SHUTDOWN_WAIT,
+                    AUTH_RUNTIME_REPLACED_REASON,
+                )
+                .await;
+        }
+        if let Some(finalization) = self.finalization {
+            finalization.run(Duration::from_secs(5)).await?;
+        }
+        Ok(())
     }
 }
 
@@ -935,11 +949,11 @@ struct PreparedAuthTransition {
     runtime_config: Option<(astra_config::RuntimeConfig, String)>,
 }
 
-async fn prepare_session_auth_transition(
+fn prepare_session_auth_transition(
     profile: Option<&str>,
     account_id: &str,
     state: &mut SessionState,
-) -> Result<PreparedAuthTransition, String> {
+) -> Result<(PreparedAuthTransition, SessionAuthRetirement), String> {
     let credentials = load_credentials();
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
@@ -953,23 +967,27 @@ async fn prepare_session_auth_transition(
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
-        retire_auth_runtime(state).await;
-        crate::cli::session::session_cleanup::finalize_session(state).await?;
         Some(prepared)
     } else {
-        if runtime_needs_initialization {
-            // A same-owner login after `/logout`, or a partially initialized
-            // runtime, is not a session boundary. Retire any incomplete half and
-            // rebuild it after the new credentials have been saved.
-            retire_auth_runtime(state).await;
-        }
         None
     };
-    Ok(PreparedAuthTransition {
-        owner_changed,
-        runtime_needs_initialization: owner_changed || runtime_needs_initialization,
-        runtime_config,
-    })
+    let retirement = SessionAuthRetirement {
+        runtime: if owner_changed || runtime_needs_initialization {
+            state.agent_spawner.take()
+        } else {
+            None
+        },
+        finalization: owner_changed
+            .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
+    };
+    Ok((
+        PreparedAuthTransition {
+            owner_changed,
+            runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+            runtime_config,
+        },
+        retirement,
+    ))
 }
 
 fn commit_session_auth_transition(
@@ -990,27 +1008,38 @@ fn commit_session_auth_transition(
 }
 
 /// End the old owner's runtime before browser login can publish new credentials.
-/// Cancellation retains credentials, but starts a fresh local conversation.
-pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
-    ensure_shells_can_rebind(state)?;
-    let (config, version) =
-        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
-    retire_auth_runtime(state).await;
-    if state.session_id.is_some() {
-        crate::cli::session::session_cleanup::finalize_session(state).await?;
-    }
+/// Cancellation retains the active attachment, model and conversation context.
+pub(crate) fn prepare_browser_session_retirement(
+    state: &mut SessionState,
+) -> SessionAuthRetirement {
+    let retirement = SessionAuthRetirement {
+        runtime: state.agent_spawner.take(),
+        finalization: state
+            .session_id
+            .is_some()
+            .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
+    };
     state.session_memory_port = None;
-    state.reset_for_new_session();
-    state.clear_session_id();
-    state.model = None;
-    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
-    Ok(())
+    retirement
+}
+
+#[cfg(test)]
+pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
+    prepare_browser_session_retirement(state).run().await
 }
 
 pub(crate) struct PreparedBrowserLogin {
     api: astra_thin_client::ThinClient,
     token: String,
     services: IdentityServices,
+    registration: Result<(), String>,
+}
+
+pub(crate) struct BrowserLoginCompletion {
+    pub(crate) api: astra_thin_client::ThinClient,
+    pub(crate) token: String,
+    pub(crate) modules: crate::cli::session::session_runtime::PipelineModules,
+    pub(crate) registration: Result<(), String>,
 }
 
 pub(crate) async fn prepare_browser_session_login(
@@ -1021,41 +1050,49 @@ pub(crate) async fn prepare_browser_session_login(
     let api = if uc {
         crate::cli::native_auth::bind_after_login(api)?
     } else {
-        api.clone()
+        api.clone().without_bearer_provider()
     };
     let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
         .await
         .ok_or("Login completed but no usable session credential is available")?;
-    crate::cli::edge_lifecycle::register_after_login(&api, &token).await?;
     let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
         .ok_or("Login completed but no authenticated account identity is available")?;
+    let registration = crate::cli::edge_lifecycle::register_after_login(&api, &token).await;
     let services = build_identity_services(&api, profile, &user_id).await;
     Ok(PreparedBrowserLogin {
         api,
         token,
         services,
+        registration,
     })
 }
 
 pub(crate) fn commit_browser_session_login(
     prepared: PreparedBrowserLogin,
     state: &mut SessionState,
-) -> Result<
-    (
-        astra_thin_client::ThinClient,
-        String,
-        crate::cli::session::session_runtime::PipelineModules,
-    ),
-    String,
-> {
+) -> BrowserLoginCompletion {
+    let modules = prepared.services.apply(state);
+    let registration = finish_authenticated_session_login(true, prepared.registration, state);
+    BrowserLoginCompletion {
+        api: prepared.api,
+        token: prepared.token,
+        modules,
+        registration,
+    }
+}
+
+/// The browser has published credentials. Retire the previous attachment now,
+/// including when subsequent execution registration will fail.
+pub(crate) fn commit_browser_session_identity(state: &mut SessionState) -> Result<(), String> {
+    state.reset_for_new_session();
+    state.clear_session_id();
+    state.model = None;
+    state.ingestion_user_id = Some(crate::cli::cli_config::cli_utils::cli_user_id());
+    invalidate_identity_services(state);
     let (config, version) =
         crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
-    state.ingestion_user_id = Some(crate::cli::cli_config::cli_utils::cli_user_id());
     crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
-    let modules = prepared.services.apply(state);
-    state.native_delivery_refresh.request();
-    crate::cli::agent_runtime::initialize_agent_projection(state);
-    Ok((prepared.api, prepared.token, modules))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1074,8 +1111,15 @@ async fn finish_browser_session_login(
     String,
 > {
     crate::cli::edge_lifecycle::stop_heartbeat(edge_heartbeat).await;
+    commit_browser_session_identity(state)?;
     let prepared = prepare_browser_session_login(api, profile, uc).await?;
-    let (api, token, modules) = commit_browser_session_login(prepared, state)?;
+    let BrowserLoginCompletion {
+        api,
+        token,
+        modules,
+        registration,
+    } = commit_browser_session_login(prepared, state);
+    registration?;
     crate::cli::edge_lifecycle::complete_login_rebind(&api, &token, profile, edge_heartbeat).await;
     Ok((api, token, modules))
 }
@@ -1084,7 +1128,8 @@ async fn finish_browser_session_login(
 /// local execution later fails. No subsequent lazy runtime may inherit them.
 pub(crate) fn invalidate_identity_services(state: &mut SessionState) {
     state.session_memory_port = None;
-    state.unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
+    state.unified_skill_registry =
+        std::sync::Arc::new(astra_runtime::skills::UnifiedSkillRegistry::new());
     state.mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
         crate::mcp_client::McpClientManager::new(),
     ));
@@ -1142,6 +1187,11 @@ pub(crate) struct PreparedPasswordLogin {
     initialize_runtime: bool,
 }
 
+pub(crate) struct PreparedPasswordPublication {
+    authentication: PasswordAuthentication,
+    transition: PreparedAuthTransition,
+}
+
 /// Network-only authentication phase, owned by the TUI's existing login task.
 /// Do not publish credentials until the active environment identity is checked.
 pub(crate) async fn request_password_authentication(
@@ -1173,8 +1223,42 @@ pub(crate) async fn prepare_password_session_login(
     authentication: PasswordAuthentication,
     state: &mut SessionState,
 ) -> Result<PreparedPasswordLogin, String> {
-    let transition =
-        prepare_session_auth_transition(profile, &authentication.tokens.user_id, state).await?;
+    let publication = prepare_password_session_login_task(profile, authentication, state)?.await?;
+    publish_password_session_login(profile, username, publication, state)
+}
+
+pub(crate) fn prepare_password_session_login_task(
+    profile: Option<&str>,
+    authentication: PasswordAuthentication,
+    state: &mut SessionState,
+) -> Result<
+    impl std::future::Future<Output = Result<PreparedPasswordPublication, String>>
+    + Send
+    + 'static
+    + use<>,
+    String,
+> {
+    let (transition, retirement) =
+        prepare_session_auth_transition(profile, &authentication.tokens.user_id, state)?;
+    Ok(async move {
+        retirement.run().await?;
+        Ok(PreparedPasswordPublication {
+            authentication,
+            transition,
+        })
+    })
+}
+
+pub(crate) fn publish_password_session_login(
+    profile: Option<&str>,
+    username: &str,
+    publication: PreparedPasswordPublication,
+    state: &mut SessionState,
+) -> Result<PreparedPasswordLogin, String> {
+    let PreparedPasswordPublication {
+        authentication,
+        transition,
+    } = publication;
     tracing::debug!(
         owner_changed = transition.owner_changed,
         runtime_needs_initialization = transition.runtime_needs_initialization,
@@ -1200,9 +1284,17 @@ pub(crate) fn finish_password_session_login(
     registration: Result<(), String>,
     state: &mut SessionState,
 ) -> Result<(), String> {
+    finish_authenticated_session_login(prepared.initialize_runtime, registration, state)
+}
+
+fn finish_authenticated_session_login(
+    initialize_runtime: bool,
+    registration: Result<(), String>,
+    state: &mut SessionState,
+) -> Result<(), String> {
     state.native_delivery_refresh.request();
     registration?;
-    if prepared.initialize_runtime {
+    if initialize_runtime {
         crate::cli::agent_runtime::initialize_agent_projection(state);
     }
     Ok(())
@@ -1281,6 +1373,98 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn invalidated_login_registry_cannot_share_mcp_instructions_with_another_identity() {
+        let mut state = SessionState::default();
+        super::invalidate_identity_services(&mut state);
+        let first = state.unified_skill_registry.clone();
+        first.register_mcp_skill("synthetic-owner-a", "---\nname: identity-private-probe\ndescription: Synthetic private skill\n---\nOwner A only instructions.")
+            .await.unwrap();
+        assert!(
+            first
+                .load("identity-private-probe")
+                .await
+                .unwrap()
+                .instructions
+                .contains("Owner A only")
+        );
+
+        super::invalidate_identity_services(&mut state);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first,
+            &state.unified_skill_registry
+        ));
+        // No replacement MCP server is available to overwrite the old cache.
+        state.unified_skill_registry.discover_all().await.unwrap();
+        assert!(
+            state
+                .unified_skill_registry
+                .load("identity-private-probe")
+                .await
+                .is_err()
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &state.unified_skill_registry,
+            astra_runtime::skills::empty_unified_registry()
+        ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_login_completion_replaces_the_previous_transport_generation() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        super::save_profile_auth_tokens(
+            None,
+            "current",
+            &super::AuthTokenPayload {
+                user_id: "current-owner".into(),
+                access_token: "current-token".into(),
+                refresh_token: "refresh".into(),
+            },
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .and(header("authorization", "Bearer current-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/skills"))
+            .and(header("authorization", "Bearer current-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "skills":[],"limit":100,"total":0,"next_cursor":null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(GenerationBearer("obsolete-token")));
+        let mut state = SessionState::default();
+        let mut heartbeat = None;
+        let (_, _, modules) =
+            super::finish_browser_session_login(&api, None, false, &mut state, &mut heartbeat)
+                .await
+                .unwrap();
+        modules.unified_skill_registry.discover_all().await.unwrap();
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+    }
+
     #[derive(Debug)]
     struct GenerationBearer(&'static str);
 
@@ -1351,6 +1535,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(state.session_memory_port.is_none());
+            assert_eq!(state.runtime_config.memory.retrieval_top_k, 42);
+            super::commit_browser_session_identity(&mut state).unwrap();
             assert_eq!(
                 state.runtime_config.memory.retrieval_top_k,
                 astra_config::RuntimeConfig::load().memory.retrieval_top_k

@@ -198,8 +198,10 @@ not a local password form. Discovery errors never select password authentication
 The workbench remains responsive during discovery and browser waiting. Escape
 can cancel before credential exchange starts; once exchange starts it awaits
 the bounded result instead of claiming cancellation after a possible commit.
-Browser authentication closes the previous local conversation before credentials
-are replaced. Successful login binds the identity and refreshing transport,
+Browser authentication retires the old execution authority before credentials
+are replaced, while retaining the active attachment, model and local history
+through cancellation. The workbench resets only after credentials commit.
+Successful login binds the identity and refreshing transport,
 resynchronizes capabilities and resolves the server default model in the current
 workbench, without requiring a manual restart. Browser waiting and cancellation
 retain the previous identity-pinned Edge heartbeat. On completion, the workbench
@@ -221,9 +223,17 @@ queue, so network waiting does not block keyboard handling or redraw. Password
 authentication (including any environment-identity check) also has a 15-second
 deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
 instead of claiming cancellation after credentials may have committed.
+Runtime retirement and session finalization also run on this supervised owner
+from an owned snapshot of the canonical finalizer's inputs. The terminal does
+not await optional memory maintenance; credentials remain unpublished until the
+old owner's durable boundary settles. Graceful shutdown settles the resulting
+prepared publication through the same credential owner.
 Both password and browser completion rebuild identity-owned Skill/MCP services
 and the session-memory port before runtime initialization. Credential publication
-invalidates the preceding private cache even if registration later fails. The
+invalidates the preceding private cache with a fresh registry, never the writable
+process-wide empty registry. Password completion rebuilds these identity services
+even when execution registration fails; a same-account runtime and heartbeat can
+continue with the current memory and Skill providers. The
 event loop replaces its own registry, MCP and observer references and restarts
 discovery; signed-out onboarding installs the memory port for the first time.
 The memory service uses the canonical account ID already returned by password
@@ -231,19 +241,22 @@ authentication or UC binding. Credential settlement does not repeat `/auth/me`;
 optional startup identity discovery has a ten-second overall deadline. Cancelling
 browser waiting reattaches the exact retired memory service only while its
 original credential binding remains current, without another network request.
-Post-login preference/outbox delivery and model discovery use the existing
-catalog task owner independently. Their completion carries the originating
-identity and session epoch; stale completions cannot modify another login, and
-model completion cannot replace a newer explicit model selection. Preference
+Post-login preference reads and model discovery use the existing catalog task
+owner independently. Account preferences are fenced by the originating identity,
+not the Session attachment epoch: first-session binding and same-account `/new`
+must not discard them. Model completion additionally retains its Session scope
+and cannot replace a newer explicit model selection. Preference
 seeding compares local edit versions (including changes back to the starting
 value) and merges only settings unchanged since the read began. Earlier edits
 do not permanently suppress a later resync.
 Automatic model discovery never opens a picker over an active form, pending
 explicit model request, or composer draft; it leaves an actionable `/model` hint.
 An already resolved concrete model can still enable a waiting first message.
-Preference application and journal enqueue are local; the durable outbox owner delivers the
-new marker in the background. Slow sync neither holds terminal borrows nor
-delays model selection, and read cancellation/shutdown aborts these waits.
+Preference results are published immediately after the read. Existing queued
+uploads and the new local journal marker are delivered independently by the
+canonical supervised outbox owner. Slow sync neither holds terminal borrows nor
+delays model selection. Read-task cancellation/shutdown does not wait for
+background delivery; pending writes remain durable for normal outbox recovery.
 If registration fails, the saved login and model preference remain available;
 queued messages return to the composer for manual review and are not sent
 automatically. Local-state failures ask users to check workspace/state write
@@ -286,6 +299,11 @@ teardown does not discard newly issued tokens or start a new runtime/heartbeat.
 
 An absent agent projection is not a registration-readiness gate: the first turn
 can initialize it lazily. The Server remains the execution admission authority.
+Authentication, request parsing, Session resolution and runtime-context failures
+before the handler calls the Run lifecycle carry the same explicit per-attempt
+rejection evidence, including errors without a domain `error_code`. The CLI uses
+the evidence, not an auth/error-name allowlist, to settle the unsent draft and
+retain `/login` recovery for expired credentials.
 When execution selection rejects a new turn with
 `execution_binding_provider_required` before durable run creation, it includes
 `metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
