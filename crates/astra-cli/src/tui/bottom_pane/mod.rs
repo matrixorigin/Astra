@@ -460,6 +460,42 @@ impl BottomPane {
             .filter(|intent| self.intent_is_visible(intent))
     }
 
+    pub(crate) fn next_recoverable_guidance(&self, after: &str) -> Option<PendingUserIntent> {
+        let candidates: Vec<_> = self
+            .visible_pending_intents()
+            .filter(|intent| match &intent.target {
+                PendingUserIntentTarget::ActiveRun => {
+                    intent.custody == PendingUserIntentCustody::Unconfirmed
+                }
+                PendingUserIntentTarget::AgentRun { .. } => {
+                    intent.custody == PendingUserIntentCustody::Unconfirmed
+                        || intent.status == astra_turn_types::UserIntentStatus::Returned
+                }
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return None;
+        }
+        let next = candidates
+            .iter()
+            .position(|intent| intent.intent_id == after)
+            .map_or(0, |index| (index + 1) % candidates.len());
+        Some(candidates[next].clone())
+    }
+
+    pub(crate) fn activate_recoverable_guidance(&mut self, intent: &PendingUserIntent) -> bool {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.is_recoverable_guidance(intent))
+        else {
+            return false;
+        };
+        let view = self.view_stack.remove(index);
+        self.view_stack.push(view);
+        true
+    }
+
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
         self.queued_next_turn_submissions
             .iter()

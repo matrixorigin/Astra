@@ -162,6 +162,9 @@ pub(crate) enum BottomPaneViewAction {
         target: AgentControlTarget,
     },
     OpenReturnedAgentGuide,
+    NextRecoverableGuidance {
+        after_intent_id: String,
+    },
     RecoverReturnedRootGuidance,
     OpenUnconfirmedRootGuidance,
     CopyUnconfirmedRootGuidance {
@@ -266,6 +269,10 @@ pub(crate) trait BottomPaneView: Send {
     fn desired_height(&self, width: u16) -> u16;
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
+
+    fn is_recoverable_guidance(&self, _intent: &super::PendingUserIntent) -> bool {
+        false
+    }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::Escalate

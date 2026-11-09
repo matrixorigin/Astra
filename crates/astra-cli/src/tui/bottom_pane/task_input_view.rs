@@ -259,6 +259,21 @@ impl TaskInputView {
 }
 
 impl BottomPaneView for TaskInputView {
+    fn is_recoverable_guidance(&self, intent: &super::PendingUserIntent) -> bool {
+        match (&self.purpose, &intent.target) {
+            (
+                InputPurpose::RootUnconfirmed { intent_id },
+                super::PendingUserIntentTarget::ActiveRun,
+            ) => intent_id == &intent.intent_id,
+            (
+                InputPurpose::Returned {
+                    intent_id, target, ..
+                },
+                super::PendingUserIntentTarget::AgentRun { target: owner },
+            ) => intent_id == &intent.intent_id && target.same_execution(owner),
+            _ => false,
+        }
+    }
     fn resolve_agent_guide(
         &mut self,
         target: &crate::tui::event_loop::AgentGuideTarget,
@@ -426,6 +441,22 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.modifiers == crossterm::event::KeyModifiers::ALT && key.code == KeyCode::Char('n') {
+            let intent_id = match &self.purpose {
+                InputPurpose::RootUnconfirmed { intent_id }
+                | InputPurpose::Returned { intent_id, .. } => Some(intent_id),
+                _ => None,
+            };
+            if let Some(intent_id) = intent_id {
+                self.pending_action = Some(ViewActionRequest {
+                    action: BottomPaneViewAction::NextRecoverableGuidance {
+                        after_intent_id: intent_id.clone(),
+                    },
+                    disposition: ViewActionDisposition::KeepOpen,
+                });
+                return;
+            }
+        }
         if let InputPurpose::RootUnconfirmed { intent_id } = &self.purpose
             && key.modifiers == crossterm::event::KeyModifiers::ALT
         {
@@ -566,9 +597,9 @@ impl BottomPaneView for TaskInputView {
                     }
                 )
             {
-                "Alt+C copy · Alt+D discard · Esc keep"
+                "Alt+N next · Alt+C copy · Alt+D discard · Esc keep"
             } else if matches!(self.purpose, InputPurpose::Returned { .. }) {
-                "Enter retry · Alt+C copy · Alt+D discard · Esc keep original"
+                "Enter retry · Alt+N next · Alt+C copy · Alt+D discard · Esc keep original"
             } else if matches!(self.purpose, InputPurpose::Shell { .. }) {
                 "Enter send line · Ctrl+D close input · Esc cancel"
             } else if !self.acknowledged_unknown.is_empty() {

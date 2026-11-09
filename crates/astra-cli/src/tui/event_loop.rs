@@ -6063,6 +6063,79 @@ struct ViewActionBackends {
 /// event loop as the sole owner of effects while allowing an already-open
 /// transcript to upgrade itself when later typed metadata makes a durable
 /// read possible.
+fn open_recoverable_guidance(
+    intent: bottom_pane::PendingUserIntent,
+    backends: &ViewActionBackends,
+    bottom_pane: &mut BottomPane,
+) {
+    if bottom_pane.activate_recoverable_guidance(&intent) {
+        return;
+    }
+    match intent.target {
+        bottom_pane::PendingUserIntentTarget::ActiveRun => bottom_pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                intent.intent_id,
+                &intent.text,
+            ),
+        )),
+        bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
+            let recipient = AgentGuideTarget::capture(
+                target.agent_name().to_owned(),
+                target.run_id().to_owned(),
+                target.0.target.clone(),
+                backends.api.clone(),
+                backends.session_id.clone(),
+                backends.session_attachment_epoch,
+                backends.turn_auth.clone(),
+            );
+            let uncertain = intent.status != astra_turn_types::UserIntentStatus::Returned;
+            if uncertain
+                && matches!(
+                    &recipient.0.target,
+                    crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
+                )
+            {
+                let lookup_target = recipient.clone();
+                let original_target = target.clone();
+                let intent_id = intent.intent_id.clone();
+                let outcome_tx = backends.agent_workbench_tx.clone();
+                tokio::spawn(async move {
+                    let status =
+                        authorized_guide_status(&lookup_target, None, None, &intent_id).await;
+                    if !lookup_target.0.owner.is_current() {
+                        return;
+                    }
+                    let outcome = match status {
+                        Ok(Some(AgentGuideDisposition::Applied)) => {
+                            AgentWorkbenchOutcome::GuideApplied {
+                                target: original_target,
+                                intent_id,
+                            }
+                        }
+                        Ok(Some(AgentGuideDisposition::Returned)) => {
+                            AgentWorkbenchOutcome::GuideReturned {
+                                target: original_target,
+                                intent_id,
+                            }
+                        }
+                        _ => return,
+                    };
+                    let _ = outcome_tx.send(outcome).await;
+                });
+            }
+            bottom_pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::returned(
+                    target,
+                    recipient,
+                    intent.intent_id,
+                    &intent.text,
+                    uncertain,
+                ),
+            ));
+        }
+    }
+}
+
 // Central event-loop dispatch deliberately exposes every mutable subsystem it
 // may advance, avoiding an ambient bag that could be retained across awaits.
 #[allow(clippy::too_many_arguments)]
@@ -7883,12 +7956,7 @@ async fn dispatch_bottom_pane_view_action(
         }
         BottomPaneViewAction::OpenUnconfirmedRootGuidance => {
             if let Some(intent) = bottom_pane.unconfirmed_root_guidance(None).cloned() {
-                bottom_pane.push_view(Box::new(
-                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                        intent.intent_id,
-                        &intent.text,
-                    ),
-                ));
+                open_recoverable_guidance(intent, &backends, bottom_pane);
             }
             frame_requester.schedule_frame();
         }
@@ -7922,66 +7990,18 @@ async fn dispatch_bottom_pane_view_action(
                     None,
                 )
                 .cloned();
-            if let Some(intent) = intent
-                && let bottom_pane::PendingUserIntentTarget::AgentRun { target } = intent.target
-            {
-                let recipient = AgentGuideTarget::capture(
-                    target.agent_name().to_owned(),
-                    target.run_id().to_owned(),
-                    target.0.target.clone(),
-                    backends.api.clone(),
-                    backends.session_id.clone(),
-                    backends.session_attachment_epoch,
-                    backends.turn_auth.clone(),
-                );
-                let uncertain = intent.status != astra_turn_types::UserIntentStatus::Returned;
-                if uncertain
-                    && matches!(
-                        &recipient.0.target,
-                        crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
-                    )
-                {
-                    let lookup_target = recipient.clone();
-                    let original_target = target.clone();
-                    let intent_id = intent.intent_id.clone();
-                    let outcome_tx = backends.agent_workbench_tx.clone();
-                    tokio::spawn(async move {
-                        let status =
-                            authorized_guide_status(&lookup_target, None, None, &intent_id).await;
-                        if !lookup_target.0.owner.is_current() {
-                            return;
-                        }
-                        let outcome = match status {
-                            Ok(Some(AgentGuideDisposition::Applied)) => {
-                                AgentWorkbenchOutcome::GuideApplied {
-                                    target: original_target,
-                                    intent_id,
-                                }
-                            }
-                            Ok(Some(AgentGuideDisposition::Returned)) => {
-                                AgentWorkbenchOutcome::GuideReturned {
-                                    target: original_target,
-                                    intent_id,
-                                }
-                            }
-                            _ => return,
-                        };
-                        let _ = outcome_tx.send(outcome).await;
-                    });
-                }
-                bottom_pane.push_view(Box::new(
-                    bottom_pane::task_input_view::TaskInputView::returned(
-                        target,
-                        recipient,
-                        intent.intent_id,
-                        &intent.text,
-                        uncertain,
-                    ),
-                ));
+            if let Some(intent) = intent {
+                open_recoverable_guidance(intent, &backends, bottom_pane);
             } else {
                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "No unsent agent message belongs to this session.",
                 ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::NextRecoverableGuidance { after_intent_id } => {
+            if let Some(intent) = bottom_pane.next_recoverable_guidance(&after_intent_id) {
+                open_recoverable_guidance(intent, &backends, bottom_pane);
             }
             frame_requester.schedule_frame();
         }
@@ -22879,6 +22899,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn recoverable_messages_cycle_without_losing_edits_or_crossing_sessions() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("recovery-owner"),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let backends = ViewActionBackends {
+            agent_spawner: None,
+            api,
+            profile: None,
+            session_id: Some("session".into()),
+            session_attachment_epoch: 3,
+            turn_auth: None,
+            file_writer: None,
+            agent_workbench_tx: tx,
+            native_delivery_refresh: Default::default(),
+        };
+        let first = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let second = first.for_delivery();
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        pane.try_accept_user_intent(
+            "root",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedLocal,
+            "root draft",
+        )
+        .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("root"));
+        assert!(pane.accept_agent_guide("first".into(), first, "first draft".into()));
+        assert!(pane.mark_user_intent_unconfirmed("first"));
+        assert!(pane.accept_agent_guide("second".into(), second.clone(), "second draft".into()));
+        assert!(pane.mark_agent_guide_returned("second", &second));
+        let root = pane
+            .unconfirmed_root_guidance(Some("root"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(root, &backends, &mut pane);
+        pane.handle_paste(" edited");
+        for (after, expected) in [("root", "first"), ("first", "second"), ("second", "root")] {
+            assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('n'), crossterm::event::KeyModifiers::ALT,
+            )), BottomPaneAction::ViewAction(BottomPaneViewAction::NextRecoverableGuidance { after_intent_id }) if after_intent_id == after));
+            let next = pane.next_recoverable_guidance(after).unwrap();
+            assert_eq!(next.intent_id, expected);
+            open_recoverable_guidance(next, &backends, &mut pane);
+        }
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft edited"));
+        pane.set_session_attachment(Some("other"), 4);
+        assert!(pane.next_recoverable_guidance("root").is_none());
     }
 
     #[serial_test::serial]
