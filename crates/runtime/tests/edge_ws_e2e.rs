@@ -29,6 +29,10 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
+fn parse_dispatch_payload(json: &str) -> serde_json::Value {
+    serde_json::from_str(json).expect("valid dispatch fixture")
+}
+
 // ── Stubs ────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -558,12 +562,15 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         Some(&self.limits)
     }
 
-    async fn insert_dispatch(
+    async fn admit_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
-    ) -> Result<(), String> {
+        payload_json: &serde_json::Value,
+    ) -> Result<
+        astra_services::multi_agent::EdgeDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
         self.rows.lock().expect("test edge dispatch rows").insert(
             identity.clone(),
             TestDispatchRow {
@@ -575,7 +582,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             },
         );
         self.wake(&identity.user_id, edge_agent_id);
-        Ok(())
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
     }
 
     async fn subscribe_pending_wakeup(
@@ -681,7 +688,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
+        payload_json: &serde_json::Value,
     ) -> Result<
         astra_services::multi_agent::EdgeDirectDispatchAdmission,
         astra_services::multi_agent::EdgeDispatchAdmissionError,
@@ -697,25 +704,6 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             },
         );
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
-    }
-
-    async fn claim_direct_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        let mut rows = self.rows.lock().expect("test edge dispatch rows");
-        let Some(row) = rows.get_mut(identity) else {
-            return Err("direct dispatch row missing".to_string());
-        };
-        if row.edge_agent_id != edge_agent_id {
-            return Err("direct dispatch edge owner conflict".to_string());
-        }
-        if row.status != "pending" {
-            return Ok(false);
-        }
-        row.status = "dispatched".to_string();
-        Ok(true)
     }
 
     async fn deliver_result(
@@ -1007,7 +995,7 @@ async fn spawn_admitted_pool_invocation(
     );
     assert_eq!(
         dispatch
-            .admit_and_claim_direct_dispatch(&dispatch_identity, edge_agent_id, "{}")
+            .admit_and_claim_direct_dispatch(&dispatch_identity, edge_agent_id, &json!({}))
             .await
             .expect("durable direct dispatch admission"),
         astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed
@@ -1203,8 +1191,13 @@ async fn durable_relay_wakes_without_idle_polling() {
     );
 
     let (identity, payload) = test_relay_request(51);
+    let mut payload = parse_dispatch_payload(&payload);
+    payload["args"]["fraction"] = json!(51.248178375505404_f64);
+    payload["args"]["large"] = json!(8.949943645992772e17_f64);
+    payload["args"]["negative_zero"] = json!(-0.0_f64);
+    let admitted_payload = payload.to_string();
     dispatch
-        .insert_dispatch(&identity, edge, &payload)
+        .admit_dispatch(&identity, edge, &payload)
         .await
         .unwrap();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
@@ -1216,6 +1209,16 @@ async fn durable_relay_wakes_without_idle_polling() {
         .unwrap();
     let message: serde_json::Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(message["request_id"], identity.request_id);
+    assert_eq!(
+        message["args"]["fraction"].as_f64().unwrap().to_bits(),
+        payload["args"]["fraction"].as_f64().unwrap().to_bits(),
+        "the receiving decoder must preserve the admitted number"
+    );
+    assert_eq!(
+        frame.as_str(),
+        admitted_payload,
+        "relay must forward the admitted JSON bytes"
+    );
 
     // Removing the notification source must close the actual connection,
     // rather than leaving an apparently healthy but undeliverable Edge.
@@ -1250,7 +1253,7 @@ async fn durable_relay_keeps_wake_arriving_during_empty_claim() {
     .expect("initial empty claim must start");
     let (identity, payload) = test_relay_request(52);
     dispatch
-        .insert_dispatch(&identity, edge, &payload)
+        .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
         .await
         .unwrap();
     dispatch.release_poll.notify_one();
@@ -1277,7 +1280,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     requests[1].1 = "{}".into();
     for (identity, payload) in &requests {
         dispatch
-            .insert_dispatch(identity, edge, payload)
+            .admit_dispatch(identity, edge, &parse_dispatch_payload(payload))
             .await
             .unwrap();
     }
@@ -1362,11 +1365,11 @@ async fn disconnected_relay_keeps_claim_owner_until_all_unsent_rows_settle() {
     let (first, first_payload) = test_relay_request(53);
     let (second, second_payload) = test_relay_request(54);
     dispatch
-        .insert_dispatch(&first, edge, &first_payload)
+        .admit_dispatch(&first, edge, &parse_dispatch_payload(&first_payload))
         .await
         .unwrap();
     dispatch
-        .insert_dispatch(&second, edge, &second_payload)
+        .admit_dispatch(&second, edge, &parse_dispatch_payload(&second_payload))
         .await
         .unwrap();
     let mut socket = ws_auth(addr, edge, "disconnect-host").await;
@@ -1422,7 +1425,7 @@ async fn disconnect_during_unsent_settlement_does_not_keep_socket_open() {
     let edge = "edge-disconnect-during-settlement";
     let (identity, _) = test_relay_request(92);
     dispatch
-        .insert_dispatch(&identity, edge, "{}")
+        .admit_dispatch(&identity, edge, &parse_dispatch_payload("{}"))
         .await
         .unwrap();
     let mut socket = ws_auth(addr, edge, "settlement-host").await;
@@ -1464,7 +1467,7 @@ async fn failed_settlements_do_not_block_other_edges() {
             .insert(edge.clone());
         let (identity, _) = test_relay_request(1000 + index);
         dispatch
-            .insert_dispatch(&identity, &edge, "{}")
+            .admit_dispatch(&identity, &edge, &parse_dispatch_payload("{}"))
             .await
             .unwrap();
         sockets.push(ws_auth(addr, &edge, "failure-host").await);
@@ -1490,7 +1493,7 @@ async fn failed_settlements_do_not_block_other_edges() {
 
     let (identity, payload) = test_relay_request(2000);
     dispatch
-        .insert_dispatch(&identity, "edge-healthy", &payload)
+        .admit_dispatch(&identity, "edge-healthy", &parse_dispatch_payload(&payload))
         .await
         .unwrap();
     let mut healthy = ws_auth(addr, "edge-healthy", "healthy-host").await;
@@ -1506,7 +1509,7 @@ async fn failed_settlements_do_not_block_other_edges() {
     assert_eq!(request["request_id"], identity.request_id);
     let (other, _) = test_relay_request(2001);
     dispatch
-        .insert_dispatch(&other, "edge-other-reject", "{}")
+        .admit_dispatch(&other, "edge-other-reject", &parse_dispatch_payload("{}"))
         .await
         .unwrap();
     let _other = ws_auth(addr, "edge-other-reject", "healthy-host").await;
@@ -1551,7 +1554,7 @@ async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let (identity, _) = test_relay_request(2002);
     dispatch
-        .insert_dispatch(&identity, "edge-saturated", "{}")
+        .admit_dispatch(&identity, "edge-saturated", &parse_dispatch_payload("{}"))
         .await
         .unwrap();
     let _socket = ws_auth(addr, "edge-saturated", "saturated-host").await;
@@ -1595,7 +1598,7 @@ async fn slow_sockets_do_not_block_an_independent_edge() {
     }
     for (identity, edge, payload) in &work {
         dispatch
-            .insert_dispatch(identity, edge, payload)
+            .admit_dispatch(identity, edge, &parse_dispatch_payload(payload))
             .await
             .unwrap();
     }
@@ -1625,7 +1628,11 @@ async fn slow_sockets_do_not_block_an_independent_edge() {
     }
     let (identity, payload) = test_relay_request(4000);
     dispatch
-        .insert_dispatch(&identity, "edge-fast-peer", &payload)
+        .admit_dispatch(
+            &identity,
+            "edge-fast-peer",
+            &parse_dispatch_payload(&payload),
+        )
         .await
         .unwrap();
     let mut healthy = ws_auth(addr, "edge-fast-peer", "healthy-host").await;
@@ -1678,10 +1685,10 @@ async fn progressing_large_relay_survives_the_old_send_deadline() {
     let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     payload["args"]["command"] = "x".repeat(15 * 1024 * 1024).into();
     dispatch
-        .insert_dispatch(
+        .admit_dispatch(
             &identity,
             "edge-progressing",
-            &serde_json::to_string(&payload).unwrap(),
+            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
         )
         .await
         .unwrap();
@@ -1751,7 +1758,7 @@ async fn disconnected_relay_retries_unconfirmed_settlement_without_redelivery() 
     let edge = "edge-settlement-outage";
     let (identity, payload) = test_relay_request(58);
     dispatch
-        .insert_dispatch(&identity, edge, &payload)
+        .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
         .await
         .unwrap();
     let socket = ws_auth(addr, edge, "outage-host").await;
@@ -1864,7 +1871,11 @@ async fn failed_relay_preserves_a_direct_result_already_being_persisted() {
     let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
     dispatch
-        .insert_dispatch(&identity, edge, &serde_json::to_string(&payload).unwrap())
+        .admit_dispatch(
+            &identity,
+            edge,
+            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
+        )
         .await
         .unwrap();
     dispatch.wake("test-user-1", edge);
@@ -1928,7 +1939,11 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
         payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
         dispatch
-            .insert_dispatch(&identity, edge, &serde_json::to_string(&payload).unwrap())
+            .admit_dispatch(
+                &identity,
+                edge,
+                &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
+            )
             .await
             .unwrap();
     }
@@ -1974,7 +1989,11 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
     assert_eq!(dispatch.limits.claim.available_permits(), 1);
     let (other_identity, other_payload) = test_relay_request(57);
     dispatch
-        .insert_dispatch(&other_identity, "edge-fairness", &other_payload)
+        .admit_dispatch(
+            &other_identity,
+            "edge-fairness",
+            &parse_dispatch_payload(&other_payload),
+        )
         .await
         .unwrap();
     let mut other = ws_auth(addr, "edge-fairness", "fair-host").await;
@@ -2097,10 +2116,18 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
     let edge = "edge-matrixone-cross-server";
     let seed = uuid::Uuid::new_v4().as_u128() as usize;
     let mut identities = Vec::new();
+    let mut expected_first_payload = String::new();
     for offset in 0..51 {
         let (identity, payload) = test_relay_request(seed.wrapping_add(offset));
+        let mut payload = parse_dispatch_payload(&payload);
+        if offset == 0 {
+            payload["args"]["fraction"] = json!(51.248178375505404_f64);
+            payload["args"]["large"] = json!(8.949943645992772e17_f64);
+            payload["args"]["negative_zero"] = json!(-0.0_f64);
+            expected_first_payload = payload.to_string();
+        }
         service_a
-            .insert_dispatch(&identity, edge, &payload)
+            .admit_dispatch(&identity, edge, &payload)
             .await
             .unwrap();
         identities.push(identity);
@@ -2113,6 +2140,7 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
         .map(|identity| identity.request_id.clone())
         .collect();
     let mut first_request = None;
+    let mut first_frame = None;
     tokio::time::timeout(Duration::from_secs(15), async {
         while !expected.is_empty() {
             let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
@@ -2124,12 +2152,17 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
                 "unexpected or duplicate dispatch"
             );
             if request_id == identity.request_id {
+                first_frame = Some(frame.to_string());
                 first_request = Some(request);
             }
         }
     })
     .await
     .expect("other Server must drain durable backlog beyond one claim batch");
+    assert_eq!(
+        first_frame.as_deref(),
+        Some(expected_first_payload.as_str())
+    );
     let request = first_request.unwrap();
     // The Edge may complete after its original socket disappears. Replay the
     // result on a replacement connection, including a lost-ACK retry.
@@ -2284,7 +2317,7 @@ async fn cancellation_skips_unattempted_work_and_follows_forwarded_work() {
     );
     assert_eq!(
         dispatch
-            .admit_and_claim_direct_dispatch(&durable_identity, "edge-order", "{}")
+            .admit_and_claim_direct_dispatch(&durable_identity, "edge-order", &json!({}))
             .await
             .unwrap(),
         astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed
@@ -2343,7 +2376,7 @@ async fn cancellation_skips_unattempted_work_and_follows_forwarded_work() {
         forwarded.storage_key(),
     );
     dispatch
-        .admit_and_claim_direct_dispatch(&forwarded_durable, "edge-order", "{}")
+        .admit_and_claim_direct_dispatch(&forwarded_durable, "edge-order", &json!({}))
         .await
         .unwrap();
     let mut invocation = Box::pin(
@@ -2404,7 +2437,11 @@ async fn queued_direct_request_does_not_outlive_writer(replace: bool) {
     let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
     dispatch
-        .insert_dispatch(&relay, edge, &serde_json::to_string(&payload).unwrap())
+        .admit_dispatch(
+            &relay,
+            edge,
+            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
+        )
         .await
         .unwrap();
     dispatch.wake("test-user-1", edge);
@@ -2431,7 +2468,7 @@ async fn queued_direct_request_does_not_outlive_writer(replace: bool) {
         identity.storage_key(),
     );
     dispatch
-        .admit_and_claim_direct_dispatch(&durable, edge, "{}")
+        .admit_and_claim_direct_dispatch(&durable, edge, &json!({}))
         .await
         .unwrap();
     let args = json!({"command":"true"});
@@ -2561,7 +2598,7 @@ async fn replacement_after_first_relay_poll_settles_only_the_unsent_suffix() {
     requests[0].1 = serde_json::to_string(&payload).unwrap();
     for (identity, payload) in &requests {
         dispatch
-            .insert_dispatch(identity, edge, payload)
+            .admit_dispatch(identity, edge, &parse_dispatch_payload(payload))
             .await
             .unwrap();
     }
@@ -2640,7 +2677,7 @@ async fn replacement_claims_new_work_without_polling_the_superseded_socket() {
     let polls_before = dispatch.polls.load(Ordering::SeqCst);
     let (identity, payload) = test_relay_request(4005);
     dispatch
-        .insert_dispatch(&identity, edge, &payload)
+        .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
         .await
         .unwrap();
     let received: serde_json::Value = serde_json::from_str(
@@ -2706,10 +2743,10 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         tracestate: None,
     };
     dispatch
-        .insert_dispatch(
+        .admit_dispatch(
             &identity,
             "edge-disconnect",
-            &serde_json::to_string(&payload).expect("payload json"),
+            &parse_dispatch_payload(&serde_json::to_string(&payload).expect("payload json")),
         )
         .await
         .expect("insert pending dispatch");
@@ -2774,10 +2811,10 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         tracestate: None,
     };
     dispatch
-        .insert_dispatch(
+        .admit_dispatch(
             &dispatch_identity,
             "edge-replay",
-            &serde_json::to_string(&payload).unwrap(),
+            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
         )
         .await
         .unwrap();

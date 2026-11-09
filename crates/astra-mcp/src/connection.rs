@@ -717,7 +717,11 @@ async fn connect_streamable_http(
         transport_config = transport_config.custom_headers(custom);
     }
 
-    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let transport = StreamableHttpClientTransport::with_client(
+        crate::streamable_http::BoundedHttpClient::new()
+            .map_err(|e| McpError::Initialize(format!("HTTP client: {e}")))?,
+        transport_config,
+    );
     let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(roots);
     let running = tokio::time::timeout(
         std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),

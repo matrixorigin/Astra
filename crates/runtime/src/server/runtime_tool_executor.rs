@@ -11471,13 +11471,20 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl astra_services::multi_agent::EdgeDispatchService for PanicEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("MCP tools must not be routed through edge dispatch".to_string())
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            Err(
+                astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(
+                    "MCP tools must not be routed through edge dispatch".to_string(),
+                ),
+            )
         }
 
         async fn poll_pending(
@@ -11577,13 +11584,28 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl astra_services::multi_agent::EdgeDispatchService for NoResultEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Ok(())
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
         }
 
         async fn poll_pending(
@@ -11632,13 +11654,28 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Ok(())
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
         }
 
         async fn poll_pending(

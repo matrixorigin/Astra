@@ -1472,20 +1472,21 @@ mod tests {
     #[test]
     fn explicit_selection_materializes_conditional_required_fields() {
         let schemas = crate::schemas::all_tool_schemas();
-
-        let selected = tool_search(&schemas, &json!({"query": "select:agent"}));
-        let selected: Value = serde_json::from_str(&selected).expect("valid json");
-        let parameters = &selected["matches"][0]["parameters"];
-        let description = parameters["description"]
-            .as_str()
-            .expect("compact parameters must explain action requirements");
-        assert!(
-            description.contains("spawn requires description + prompt"),
-            "conditional spawn fields must survive compact discovery: {selected}"
-        );
-        assert!(
-            parameters.get("x-astra-per-action-required").is_none(),
-            "internal action metadata must remain hidden from the model schema"
-        );
+        for (query, required) in [
+            ("select:agent", "spawn requires description + prompt"),
+            ("select:worktree", "enter requires branch"),
+        ] {
+            let selected = tool_search(&schemas, &json!({"query": query}));
+            let selected: Value = serde_json::from_str(&selected).expect("valid json");
+            let parameters = &selected["matches"][0]["parameters"];
+            let description = parameters["description"]
+                .as_str()
+                .expect("compact parameters must explain action requirements");
+            assert!(description.contains(required), "{selected}");
+            assert!(
+                parameters.get("x-astra-per-action-required").is_none(),
+                "internal action metadata must remain hidden from the model schema"
+            );
+        }
     }
 }

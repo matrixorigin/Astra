@@ -2332,6 +2332,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
                     },
                     "required": ["action"],
+                    "x-astra-per-action-required": {"enter": ["branch"]},
                     "additionalProperties": false
                 }
             }
@@ -2974,6 +2975,34 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn worktree_branch_is_required_only_for_enter() {
+        for branch in [None, Some(Value::Null), Some(json!("")), Some(json!("  "))] {
+            let mut args = json!({"action": "enter"});
+            if let Some(branch) = branch {
+                args["branch"] = branch;
+            }
+            let error = validate_tool_arguments("worktree", &args).unwrap_err();
+            assert!(
+                error.issues.iter().any(|issue| {
+                    issue.code == ValidationCode::Required && issue.location == ["branch"]
+                }),
+                "{error:?}"
+            );
+        }
+        assert!(
+            validate_tool_arguments(
+                "worktree",
+                &json!({"action":"enter", "branch":"feature/test"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_arguments("worktree", &json!({"action":"enter", "branch":42})).is_err()
+        );
+        assert!(validate_tool_arguments("worktree", &json!({"action":"exit"})).is_ok());
+    }
 
     #[test]
     fn bash_checks_use_the_ordinary_command_contract() {

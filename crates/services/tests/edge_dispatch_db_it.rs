@@ -10,13 +10,18 @@ use std::sync::Arc;
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
-    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchFailure,
+    EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchService,
     EdgeRegistrationLease, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+fn parse_dispatch_payload(json: &str) -> serde_json::Value {
+    serde_json::from_str(json).expect("valid dispatch fixture")
+}
 
 fn unique_suffix() -> String {
     Uuid::new_v4().to_string()
@@ -138,7 +143,7 @@ async fn edge_dispatch_full_lifecycle() {
 
     // 1. Insert dispatch
     let payload = r#"{"tool":"bash","args":{"command":"echo hi"}}"#;
-    svc.insert_dispatch(&identity, &agent_id, payload)
+    svc.admit_dispatch(&identity, &agent_id, &parse_dispatch_payload(payload))
         .await
         .expect("insert_dispatch");
 
@@ -194,7 +199,7 @@ async fn edge_dispatch_large_result_survives_cross_instance_recovery() {
         serde_json::json!({"status":"completed", "output":"日志\\n".repeat(20_000)}).to_string();
     assert!(result.len() > 100_000);
     producer
-        .insert_dispatch(&identity, &agent, payload)
+        .admit_dispatch(&identity, &agent, &parse_dispatch_payload(payload))
         .await
         .unwrap();
     assert!(
@@ -216,7 +221,7 @@ async fn edge_dispatch_large_result_survives_cross_instance_recovery() {
     assert_eq!(batched.as_deref(), Some(result.as_str()));
     assert_eq!(
         reader
-            .admit_dispatch(&identity, &agent, payload)
+            .admit_dispatch(&identity, &agent, &parse_dispatch_payload(payload))
             .await
             .unwrap(),
         EdgeDispatchAdmission::Terminal(result.clone()),
@@ -255,30 +260,32 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
     let payload = r#"{"tool":"bash","args":{"command":"echo once"}}"#;
 
     assert_eq!(
-        svc.admit_dispatch(&identity, &agent_id, payload)
+        svc.admit_dispatch(&identity, &agent_id, &parse_dispatch_payload(payload))
             .await
             .expect("first admission"),
         EdgeDispatchAdmission::Pending
     );
     assert!(matches!(
-        svc.admit_dispatch(&identity, "different-agent", payload)
+        svc.admit_dispatch(&identity, "different-agent", &parse_dispatch_payload(payload))
             .await,
         Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
     ));
     assert!(matches!(
-        svc.admit_dispatch(&identity, &agent_id, r#"{"tool":"different"}"#)
+        svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"tool":"different"}))
             .await,
         Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
     ));
-    assert!(
-        svc.claim_direct_dispatch(&identity, &agent_id)
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&identity, &agent_id, &parse_dispatch_payload(payload))
             .await
-            .expect("first direct claim")
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Claimed,
     );
-    assert!(
-        !svc.claim_direct_dispatch(&identity, &agent_id)
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&identity, &agent_id, &parse_dispatch_payload(payload))
             .await
-            .expect("duplicate direct claim"),
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Observing,
         "only one delivery path may own the durable dispatch boundary"
     );
 
@@ -289,7 +296,7 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
             .expect("terminal result")
     );
     let EdgeDispatchAdmission::Terminal(replayed_json) = svc
-        .admit_dispatch(&identity, &agent_id, payload)
+        .admit_dispatch(&identity, &agent_id, &parse_dispatch_payload(payload))
         .await
         .expect("terminal replay admission")
     else {
@@ -301,6 +308,283 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
         serde_json::from_str::<serde_json::Value>(result_json)
             .expect("fixture terminal result must be valid JSON"),
         "durable replay preserves JSON meaning independently of object-key storage order"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_admission_reports_database_access_denied_without_secrets() {
+    require_env();
+    let (_pool, settings) = common::setup_pool_and_settings().await;
+    let options = sqlx::mysql::MySqlConnectOptions::new()
+        .host(&settings.host)
+        .port(settings.port)
+        .username(&settings.user)
+        .password("fixture-invalid-password")
+        .database(&settings.database);
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect_lazy_with(options);
+    let service = DatabaseEdgeDispatchService::new(pool.clone());
+    let identity = dispatch_identity("auth-test-user", "auth-test-request");
+    let error = service
+        .admit_dispatch(&identity, "edge", &serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        EdgeDispatchAdmissionError::OutcomeUnknown(EdgeDispatchFailure {
+            stage: EdgeDispatchFailureStage::Begin,
+            cause: EdgeDispatchFailureCause::AccessDenied,
+        })
+    );
+    assert!(!error.to_string().contains("fixture-invalid-password"));
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_concurrent_direct_admission_has_one_owner() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let service = Arc::new(DatabaseEdgeDispatchService::new(pool.get().clone()));
+    let identity = dispatch_identity(&format!("ed-race-{}", unique_suffix()), "request");
+    let payload = Arc::new(parse_dispatch_payload(
+        r#"{"tool":"bash","args":{"fraction":2.291712365432881e-9}}"#,
+    ));
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (service, identity, payload, barrier) = (
+            service.clone(),
+            identity.clone(),
+            payload.clone(),
+            barrier.clone(),
+        );
+        tasks.spawn(async move {
+            barrier.wait().await;
+            service
+                .admit_and_claim_direct_dispatch(&identity, "edge", &payload)
+                .await
+        });
+    }
+    let (mut claimed, mut observing) = (0, 0);
+    while let Some(result) = tasks.join_next().await {
+        match result.unwrap().unwrap() {
+            EdgeDirectDispatchAdmission::Claimed => claimed += 1,
+            EdgeDirectDispatchAdmission::Observing => observing += 1,
+            other => panic!("unexpected admission: {other:?}"),
+        }
+    }
+    assert_eq!((claimed, observing), (1, 7));
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&identity.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-numeric-{}", unique_suffix());
+    let edge = format!("edge-numeric-{}", unique_suffix());
+    let direct = dispatch_identity(&user, &unique_suffix());
+    let relay = dispatch_identity(&user, &unique_suffix());
+    let payload = parse_dispatch_payload(
+        r#"{"tool":"bash","args":{"command":"git status","timeout":120.0,"fraction":2.291712365432881e-9,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"large":9007199254740993,"max":18446744073709551615}}"#,
+    );
+    let reordered = parse_dispatch_payload(
+        r#"{"args":{"max":18446744073709551615,"large":9007199254740993,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"fraction":2.291712365432881e-9,"timeout":120.0,"command":"git status"},"tool":"bash"}"#,
+    );
+    let replay = parse_dispatch_payload(&payload.to_string());
+    assert_eq!(
+        replay, payload,
+        "persisted JSON must replay the same numbers"
+    );
+    let fraction = payload["args"]["fraction"].as_f64().unwrap();
+    assert_eq!(
+        replay["args"]["fraction"].as_f64().unwrap().to_bits(),
+        fraction.to_bits()
+    );
+    let mut different_large = payload.clone();
+    different_large["args"]["large"] = serde_json::json!(9007199254740992_u64);
+    let mut different_type = payload.clone();
+    different_type["args"]["timeout"] = serde_json::json!(120);
+    let mut different_zero = payload.clone();
+    different_zero["args"]["nested"][1] = serde_json::json!(0.0);
+    let mut different_fraction = payload.clone();
+    different_fraction["args"]["fraction"] =
+        serde_json::json!(f64::from_bits(fraction.to_bits() + 1));
+
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&direct, &edge, &payload)
+            .await
+            .expect("first direct admission"),
+        EdgeDirectDispatchAdmission::Claimed
+    );
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&direct, &edge, &replay)
+            .await
+            .expect("serialized direct replay"),
+        EdgeDirectDispatchAdmission::Observing
+    );
+    for changed in [
+        &different_large,
+        &different_type,
+        &different_zero,
+        &different_fraction,
+    ] {
+        assert!(matches!(
+            svc.admit_and_claim_direct_dispatch(&direct, &edge, changed)
+                .await,
+            Err(EdgeDispatchAdmissionError::Rejected(_))
+        ));
+    }
+    assert!(matches!(
+        svc.admit_and_claim_direct_dispatch(&direct, "different-edge", &payload)
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(_))
+    ));
+
+    assert_eq!(
+        svc.admit_dispatch(&relay, &edge, &payload).await.unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    assert_eq!(
+        svc.admit_dispatch(&relay, &edge, &replay).await.unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    let rows = svc.poll_pending(&user, &edge).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, relay.request_id);
+    assert_eq!(
+        rows[0].payload_json,
+        payload.to_string(),
+        "relay must retain the exact serialized request"
+    );
+
+    let result = r#"{"status":"completed","output":"ok"}"#;
+    for identity in [&direct, &relay] {
+        assert!(svc.deliver_result(identity, &edge, result).await.unwrap());
+        assert_eq!(
+            svc.admit_dispatch(identity, &edge, &reordered)
+                .await
+                .unwrap(),
+            EdgeDispatchAdmission::Terminal(result.to_owned())
+        );
+    }
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn rejected_relay_admission_never_publishes_the_candidate() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let service = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-rejected-{}", unique_suffix());
+    let identity = dispatch_identity(&user, &unique_suffix());
+    // MatrixOne's INSERT IGNORE truncates this owner; verification must roll
+    // back before a relay can observe the truncated row.
+    let oversized_edge = "e".repeat(256);
+    let stored_edge = &oversized_edge[..255];
+    let payload = serde_json::json!({"tool":"bash","args":{"command":"printf once"}});
+    let barrier = tokio::sync::Barrier::new(2);
+    let (admission, observed) = tokio::join!(
+        async {
+            barrier.wait().await;
+            service
+                .admit_dispatch(&identity, &oversized_edge, &payload)
+                .await
+        },
+        async {
+            barrier.wait().await;
+            let mut observed = Vec::new();
+            for _ in 0..8 {
+                observed.extend(service.poll_pending(&user, stored_edge).await.unwrap());
+                tokio::task::yield_now().await;
+            }
+            observed
+        }
+    );
+    assert!(matches!(
+        admission,
+        Err(EdgeDispatchAdmissionError::Rejected(_))
+    ));
+    assert!(observed.is_empty(), "a rejected request became claimable");
+    assert!(
+        service
+            .poll_pending(&user, stored_edge)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(&user)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "rejection must roll back the inserted row");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn uncommitted_relay_candidate_is_not_visible_to_poll() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let user = format!("ed-uncommitted-{}", unique_suffix());
+    let edge = format!("edge-uncommitted-{}", unique_suffix());
+    let identity = dispatch_identity(&user, &unique_suffix());
+    let mut tx = pool.get().begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO edge_pending_dispatch \
+         (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .bind(&identity.run_id)
+    .bind(&identity.turn_chain_id)
+    .bind(&edge)
+    .bind(&identity.request_id)
+    .bind(r#"{"tool":"bash"}"#)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let ready = Arc::new(tokio::sync::Barrier::new(2));
+    let mut poll = {
+        let service = DatabaseEdgeDispatchService::new(pool.get().clone());
+        let ready = ready.clone();
+        tokio::spawn(async move {
+            ready.wait().await;
+            service.poll_pending(&user, &edge).await
+        })
+    };
+    ready.wait().await;
+    let before_rollback =
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut poll).await;
+    tx.rollback().await.unwrap();
+    let rows = match before_rollback {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(3), poll)
+            .await
+            .expect("poll must finish after rollback")
+            .unwrap()
+            .unwrap(),
+    };
+    assert!(
+        rows.is_empty(),
+        "an uncommitted candidate must never be claimed"
     );
 }
 
@@ -318,19 +602,19 @@ async fn edge_dispatch_large_request_preserves_admission_and_replay() {
             .to_string();
 
     assert_eq!(
-        svc.admit_dispatch(&identity, &edge, &payload)
+        svc.admit_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
             .unwrap(),
         EdgeDispatchAdmission::Pending
     );
     assert_eq!(
-        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
             .unwrap(),
         EdgeDirectDispatchAdmission::Claimed
     );
     assert_eq!(
-        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
             .unwrap(),
         EdgeDirectDispatchAdmission::Observing
@@ -338,13 +622,13 @@ async fn edge_dispatch_large_request_preserves_admission_and_replay() {
     let result = r#"{"status":"completed","output":"written"}"#;
     assert!(svc.deliver_result(&identity, &edge, result).await.unwrap());
     assert_eq!(
-        svc.admit_dispatch(&identity, &edge, &payload)
+        svc.admit_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
             .unwrap(),
         EdgeDispatchAdmission::Terminal(result.to_string())
     );
     assert_eq!(
-        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
             .unwrap(),
         EdgeDirectDispatchAdmission::Terminal(result.to_string())
@@ -373,7 +657,11 @@ async fn edge_dispatch_batched_wait_converges_across_pods_under_concurrency() {
     for identity in identities.clone() {
         let producer = producer.clone();
         let agent_id = agent_id.clone();
-        inserts.spawn(async move { producer.insert_dispatch(&identity, &agent_id, "{}").await });
+        inserts.spawn(async move {
+            producer
+                .admit_dispatch(&identity, &agent_id, &serde_json::json!({}))
+                .await
+        });
     }
     while let Some(insert) = inserts.join_next().await {
         insert.unwrap().expect("concurrent dispatch insert");
@@ -454,7 +742,7 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
     let identity = dispatch_identity(&user_id, &request_id);
 
     // Insert dispatch with agent_id
-    svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+    svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"test":true}))
         .await
         .expect("insert_dispatch");
 
@@ -490,7 +778,7 @@ async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
     let agent_id = format!("ed-fail-owner-agent-{}", unique_suffix());
     let identity = dispatch_identity(&user_id, &Uuid::new_v4().to_string());
 
-    svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+    svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"test":true}))
         .await
         .expect("insert dispatch");
 
@@ -501,7 +789,7 @@ async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
         "a different edge owner must not terminate the dispatch"
     );
     assert_eq!(
-        svc.admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"test":true}))
             .await
             .expect("dispatch remains replayable"),
         EdgeDispatchAdmission::Pending,
@@ -514,7 +802,7 @@ async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
         "the owning edge may terminate its own dispatch"
     );
     let EdgeDispatchAdmission::Terminal(result_json) = svc
-        .admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        .admit_dispatch(&identity, &agent_id, &serde_json::json!({"test":true}))
         .await
         .expect("failed dispatch replay")
     else {
@@ -539,7 +827,7 @@ async fn edge_dispatch_wait_result_timeout() {
     let request_id = Uuid::new_v4().to_string();
     let identity = dispatch_identity(&user_id, &request_id);
 
-    svc.insert_dispatch(&identity, &agent_id, "{}")
+    svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({}))
         .await
         .expect("insert_dispatch");
 
@@ -565,7 +853,7 @@ async fn edge_dispatch_poll_isolation() {
 
     let request_id = Uuid::new_v4().to_string();
     let identity = dispatch_identity(&user_a, &request_id);
-    svc.insert_dispatch(&identity, &agent, "{}")
+    svc.admit_dispatch(&identity, &agent, &serde_json::json!({}))
         .await
         .expect("insert for user A");
 
@@ -593,10 +881,10 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     let identity_a = dispatch_identity(&user_a, &request_id);
     let identity_b = dispatch_identity(&user_b, &request_id);
 
-    svc.insert_dispatch(&identity_a, &agent_a, r#"{"owner":"a"}"#)
+    svc.admit_dispatch(&identity_a, &agent_a, &serde_json::json!({"owner":"a"}))
         .await
         .expect("insert user A dispatch");
-    svc.insert_dispatch(&identity_b, &agent_b, r#"{"owner":"b"}"#)
+    svc.admit_dispatch(&identity_b, &agent_b, &serde_json::json!({"owner":"b"}))
         .await
         .expect("insert user B dispatch with same request_id");
     let owner_scope = sqlx::query(
@@ -668,7 +956,7 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
     let request_id = Uuid::new_v4().to_string();
     let identity = dispatch_identity(&user_id, &request_id);
 
-    svc.insert_dispatch(&identity, &agent_id, "{}")
+    svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({}))
         .await
         .expect("insert_dispatch");
 
@@ -732,7 +1020,7 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
         .unwrap();
     service
         .admit_and_claim_direct_dispatch(&identity, "cleanup-edge",
-            &serde_json::json!({"identity":{"user_id":user,"session_id":run.session_id,"run_id":run.run_id}}).to_string())
+            &serde_json::json!({"identity":{"user_id":user,"session_id":run.session_id,"run_id":run.run_id}}))
         .await
         .unwrap();
     sqlx::query("UPDATE edge_pending_dispatch SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
@@ -1927,7 +2215,7 @@ async fn edge_dispatch_concurrent_poll_single_winner() {
     let identity = dispatch_identity(&user_id, &request_id);
 
     let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
-    svc.insert_dispatch(&identity, &agent_id, r#"{"tool":"bash"}"#)
+    svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"tool":"bash"}))
         .await
         .expect("insert_dispatch");
 
@@ -1996,7 +2284,7 @@ async fn edge_dispatch_concurrent_poll_multi_row_multi_poller() {
     for i in 0..3 {
         let rid = format!("{}-{}", Uuid::new_v4(), i);
         let identity = dispatch_identity(&user_id, &rid);
-        svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        svc.admit_dispatch(&identity, &agent_id, &serde_json::json!({"test":true}))
             .await
             .expect("insert_dispatch");
         request_ids.push(rid);

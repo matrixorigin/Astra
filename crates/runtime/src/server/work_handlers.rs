@@ -5248,12 +5248,11 @@ async fn attest_edge_workspace(
             traceparent: None,
             tracestate: None,
         };
-        let payload_json =
-            serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;
+        let payload = serde_json::to_value(&payload).map_err(|_| "attestation_payload_invalid")?;
         let dispatch = &state.execution.edge_dispatch_service;
         let admission = tokio::time::timeout(
             std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload_json),
+            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
         )
         .await;
         let result_json = match admission {

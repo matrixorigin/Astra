@@ -15097,13 +15097,13 @@ impl ServerAgenticLoopHost {
     fn edge_action_outcome_unknown_result(
         &mut self,
         tool_call: &Value,
+        output: &str,
     ) -> astra_turn_core::sse_stream_host::EdgeToolExecResult {
         use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
         use astra_turn_core::stream_events::build_tool_call_end_event;
 
         let (request_id, tool_name, args) = parse_flat_tool_call_event(tool_call);
-        let output = "This tool request was durably committed before recovery, but no result or active callback custody could be proven. It was not dispatched again because doing so could repeat a side effect.";
         self.emit_progress_event(Value::Object(build_tool_call_end_event(
             &request_id,
             json!({
@@ -16185,7 +16185,6 @@ impl ServerAgenticLoopHost {
                     Ok(outcome)
                 });
                 dispatch_event["work_attribution"] = json!(frozen_work_attribution);
-                let dispatch_payload = dispatch_event.to_string();
                 let mut committed_event = match admission {
                     Ok(
                         GuardedToolRequestCommitOutcome::Committed { event }
@@ -16201,7 +16200,10 @@ impl ServerAgenticLoopHost {
                         if self.edge_request_has_custody_or_result(&identity).await {
                             None
                         } else {
-                            let unknown = self.edge_action_outcome_unknown_result(tc);
+                            let unknown = self.edge_action_outcome_unknown_result(
+                                tc,
+                                "This tool request was durably committed before recovery, but no result or active callback custody could be proven. It was not dispatched again because doing so could repeat a side effect.",
+                            );
                             results_by_id.insert(unknown.request_id.clone(), unknown);
                             let remaining = tool_calls
                                 .iter()
@@ -16349,7 +16351,7 @@ impl ServerAgenticLoopHost {
                         .admit_and_claim_direct_dispatch(
                             &identity,
                             &selected_edge_agent_id,
-                            &dispatch_payload,
+                            &dispatch_event,
                         )
                         .await;
                     let dispatch_error = match dispatch_admission {
@@ -16380,9 +16382,9 @@ impl ServerAgenticLoopHost {
                                     committed_event = None;
                                     None
                                 }
-                                Err(error) => {
-                                    Some(EdgeDispatchAdmissionError::OutcomeUnknown(error))
-                                }
+                                Err(_) => Some(EdgeDispatchAdmissionError::OutcomeUnknown(
+                                    astra_services::multi_agent::EdgeDispatchFailureStage::TerminalResult.into(),
+                                )),
                             }
                         }
                         Err(error) => Some(error),
@@ -16392,9 +16394,33 @@ impl ServerAgenticLoopHost {
                             &self.edge_callback_ledger,
                             &callback_key,
                         );
-                        if matches!(error, EdgeDispatchAdmissionError::OutcomeUnknown(_)) {
-                            let unknown = self.edge_action_outcome_unknown_result(tc);
-                            results_by_id.insert(unknown.request_id.clone(), unknown);
+                        match &error {
+                            EdgeDispatchAdmissionError::OutcomeUnknown(failure) => {
+                                tracing::warn!(
+                                    target: "astra::tool_admission",
+                                    run_id,
+                                    request_id,
+                                    stage = %failure.stage,
+                                    cause = %failure.cause,
+                                    "edge dispatch admission outcome unknown"
+                                );
+                                let unknown = self.edge_action_outcome_unknown_result(
+                                    tc,
+                                    &format!("Tool admission could not be confirmed during {failure}. The execution outcome is unknown; the request was not dispatched again because that could repeat a side effect."),
+                                );
+                                results_by_id.insert(unknown.request_id.clone(), unknown);
+                            }
+                            EdgeDispatchAdmissionError::Rejected(_) => {
+                                for result in self.edge_action_blocked_results(
+                                    std::slice::from_ref(tc),
+                                    "action_admission_failed",
+                                    &format!(
+                                        "Durable Edge dispatch could not be established: {error}"
+                                    ),
+                                ) {
+                                    results_by_id.insert(result.request_id.clone(), result);
+                                }
+                            }
                         }
                         let remaining = tool_calls
                             .iter()
@@ -16407,7 +16433,7 @@ impl ServerAgenticLoopHost {
                         for result in self.edge_action_blocked_results(
                             &remaining,
                             "action_admission_failed",
-                            &format!("Durable Edge dispatch could not be established: {error}"),
+                            "The batch stopped at a preceding tool request; this request was not started.",
                         ) {
                             results_by_id.insert(result.request_id.clone(), result);
                         }
@@ -30620,6 +30646,7 @@ mod tests {
         Claimed,
         Rejected,
         OutcomeUnknown,
+        OutcomeUnknownCommit,
     }
 
     struct RecordingHostEdgeDispatch {
@@ -30631,30 +30658,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EdgeDispatchService for RecordingHostEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("host fixture uses atomic direct admission".to_string())
-        }
-
         async fn admit_and_claim_direct_dispatch(
             &self,
             identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             edge_agent_id: &str,
-            payload_json: &str,
+            payload_json: &serde_json::Value,
         ) -> Result<
             astra_services::multi_agent::EdgeDirectDispatchAdmission,
             astra_services::multi_agent::EdgeDispatchAdmissionError,
         > {
             assert!(!edge_agent_id.is_empty());
             assert_eq!(
-                serde_json::from_str::<Value>(payload_json)
-                    .expect("host must admit its canonical request payload")
-                    .get("request_id")
-                    .and_then(Value::as_str),
+                payload_json.get("request_id").and_then(Value::as_str),
                 Some(identity.request_id.as_str())
             );
             self.events.lock().expect("host events").push("admit");
@@ -30670,7 +30685,16 @@ mod tests {
                 ),
                 HostAdmissionFixture::OutcomeUnknown => Err(
                     astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                        "simulated ambiguous admission".to_string(),
+                        astra_services::multi_agent::EdgeDispatchFailureStage::Adapter.into(),
+                    ),
+                ),
+                HostAdmissionFixture::OutcomeUnknownCommit => Err(
+                    astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
+                        astra_services::multi_agent::EdgeDispatchFailure {
+                            stage: astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                            cause:
+                                astra_services::multi_agent::EdgeDispatchFailureCause::Connection,
+                        },
                     ),
                 ),
             }
@@ -30778,15 +30802,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("not used".to_string())
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,
@@ -40846,6 +40861,7 @@ mod tests {
         for mode in [
             HostAdmissionFixture::Rejected,
             HostAdmissionFixture::OutcomeUnknown,
+            HostAdmissionFixture::OutcomeUnknownCommit,
         ] {
             let events = Arc::new(std::sync::Mutex::new(Vec::new()));
             let dispatch = Arc::new(RecordingHostEdgeDispatch {
@@ -40879,25 +40895,77 @@ mod tests {
                 events: events.clone(),
                 durable_delivery: None,
             }));
-            let call = json!({
-                "id": "read-host-denied",
-                "type": "function",
-                "function": {"name": "read_file", "arguments": r#"{"path":"a.txt"}"#}
-            });
+            let calls = [
+                json!({
+                    "id": "read-host-denied",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": r#"{"path":"a.txt"}"#}
+                }),
+                json!({
+                    "id": "read-host-not-started",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": r#"{"path":"b.txt"}"#}
+                }),
+            ];
             let context = test_edge_action_context("u-host-denied", "run-host-denied").await;
 
             let outcome = host
                 .deliver_edge_tools_via_ledger(
                     "run-host-denied",
                     "chain-host-denied",
-                    &[call],
+                    &calls,
                     &context,
                 )
                 .await;
 
             assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
-            assert_eq!(outcome.results.len(), 1);
+            assert_eq!(outcome.results.len(), 2);
             assert!(outcome.results[0].execution_completion.is_none());
+            assert_eq!(outcome.results[0].request_id, "read-host-denied");
+            assert_eq!(outcome.results[1].request_id, "read-host-not-started");
+            assert_eq!(outcome.results[1].status, "blocked");
+            assert!(outcome.results[1].output.contains("not started"));
+            assert!(!outcome.results[1].output.contains("simulated admission"));
+            assert_eq!(
+                outcome.results[1].tool_result_fields.as_ref().unwrap()["executed"],
+                false
+            );
+            match mode {
+                HostAdmissionFixture::Rejected => {
+                    assert!(
+                        outcome.results[0]
+                            .output
+                            .contains("simulated admission rejection")
+                    );
+                    assert_eq!(outcome.results[0].status, "blocked");
+                }
+                HostAdmissionFixture::OutcomeUnknown
+                | HostAdmissionFixture::OutcomeUnknownCommit => {
+                    assert_eq!(outcome.results[0].status, "unknown");
+                    assert_eq!(
+                        outcome.results[0].tool_result_fields.as_ref().unwrap()["executed"],
+                        Value::Null
+                    );
+                    assert!(!outcome.results[0].output.contains("before recovery"));
+                    let expected_stage =
+                        if matches!(mode, HostAdmissionFixture::OutcomeUnknownCommit) {
+                            "database commit: database connection failed"
+                        } else {
+                            "dispatch adapter"
+                        };
+                    assert!(outcome.results[0].output.contains(expected_stage));
+                    let terminal = host
+                        .emitted_events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "tool_call_end"
+                                && event["call_id"] == "read-host-denied"
+                        })
+                        .expect("unknown outcome must be emitted to the client");
+                    assert!(terminal.to_string().contains(expected_stage));
+                }
+                HostAdmissionFixture::Claimed => unreachable!(),
+            }
             assert_eq!(
                 events.lock().expect("host events").as_slice(),
                 ["admit"],

@@ -796,15 +796,6 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for RecordingEdgeDispatchService {
-        async fn insert_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            unreachable!("insert_dispatch is not used in cleanup tests")
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,

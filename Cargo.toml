@@ -83,7 +83,8 @@ nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+# Requests can be serialized, replayed, and decoded by a separate Edge process.
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1.20"
 serde_yaml_ng = "0.10.0"
 sha2 = "0.10.9"
@@ -152,4 +153,11 @@ strip = "symbols"
 crossterm = { path = "vendor/crossterm" }
 # Preserve TCP_NODELAY and cancel pending return health checks on pool close.
 # Based directly on upstream 6e57d05; see docs/design/data-and-storage.md.
+sqlx-core = { git = "https://github.com/XuPeng-SH/sqlx", rev = "718ace3156fa67cf639a872e016cabd95796e6fc" }
+# SQLx 0.9.0 retains its optional SQLite driver in Cargo.lock; use the
+# upstream bound fix so the lockfile can select the patched SQLite release.
+sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+
+# The upstream SQLite package must share the same patched core as MySQL.
+[patch."https://github.com/transact-rs/sqlx"]
 sqlx-core = { git = "https://github.com/XuPeng-SH/sqlx", rev = "718ace3156fa67cf639a872e016cabd95796e6fc" }
