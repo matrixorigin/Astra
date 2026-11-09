@@ -749,7 +749,7 @@ history policy to the existing personal model row. It rejects earlier databases 
 fresh-database contract; no implicit migration runs. Operators must make an
 explicit data and deployment decision before moving an existing database.
 
-Fresh schema contract `2026-11-09-v123` gives `session_context_heads` a due-time
+Fresh schema contract `2026-11-09-v124` gives `session_context_heads` a due-time
 leading physical key and a UNIQUE full SessionKey. The existing completion write
 marks observation due; the same row owns per-Session claim, retry and checkpoint
 state. Idle heads use a far-future due timestamp, so storage can prune completed

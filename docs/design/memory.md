@@ -393,8 +393,8 @@ Fleet due-index polling is measured separately from the scoped chat probe.
 Unconfigured deployments run no observation polling or dispatch, while canonical
 completion still records its due fact in the existing write for later recovery.
 
-This layout requires core schema `2026-11-09-v123`, after main's
-`2026-11-08-v122`. Bootstrap does not migrate older databases. Deployment requires
+This layout requires core schema `2026-11-09-v124`, after main's
+`2026-11-09-v123`. Bootstrap does not migrate older databases. Deployment requires
 a separately reviewed migration or fresh-schema cutover; historical pending
 facts and receipt transfer must be addressed in that plan before enabling workers.
 
