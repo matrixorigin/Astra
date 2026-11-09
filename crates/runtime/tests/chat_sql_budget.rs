@@ -126,6 +126,24 @@ async fn assert_observer_acknowledged(ctx: &MatrixE2eCtx, expected_turn: i64) {
     );
 }
 
+// A newly committed database NOW(6) marker need not be eligible to the very
+// next statement. Match managed recovery's two-second cadence; only no-work
+// results are retried. Authority, materialization and receipt errors still fail.
+async fn drive_scoped_observation_when_due(
+    owner: &astra_runtime::server::provider_test_support::ObservationRecoveryForTest,
+) -> Result<(), String> {
+    tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            if owner.drive_one().await? {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    .map_err(|_| "scoped observation did not become due and finish within its budget".to_owned())?
+}
+
 fn observer_metrics(
     queued: u64,
     successes: u64,
@@ -1706,13 +1724,22 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     let store = astra_services::session_observation::SessionObservationStore::new(
         b.ctx.shared_pool.clone(),
     );
-    let stale = store
-        .claim(&b.ctx.user_id, &b.ctx.session_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let stale = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(candidate) = store
+                .claim(&b.ctx.user_id, &b.ctx.session_id)
+                .await
+                .unwrap()
+            {
+                break candidate;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    .expect("canonical completion must become claimable");
     store.expire_leases_for_test().await;
-    assert!(owner.drive_one().await.unwrap());
+    drive_scoped_observation_when_due(&owner).await.unwrap();
     assert!(store.finish(&stale, true).await.is_err());
     let work: sqlx::types::Json<astra_services::session_observation::ObservationCheckpoint> =
         sqlx::query_scalar("SELECT observation_json FROM session_context_heads WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
@@ -1757,7 +1784,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     )
     .await
     .unwrap();
-    assert!(restarted.drive_one().await.unwrap());
+    drive_scoped_observation_when_due(&restarted).await.unwrap();
     assert_observer_acknowledged(&b.ctx, 2).await;
     assert_eq!(
         worker
@@ -2310,9 +2337,13 @@ async fn denied_recovery_never_reads_manifest_payloads() {
     )
     .await
     .unwrap();
+    // Exercise deferred eligibility deliberately, even on databases where a
+    // just-committed NOW(6) marker is immediately visible to the next claim.
+    sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 2 SECOND) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+        .bind(&b.ctx.user_id).bind(&session).execute(&b.ctx.pool).await.unwrap();
     *capture.0.lock().unwrap() = Some(Vec::new());
     let history = astra_core::history_work::HistoryWorkScenario::begin("denied-recovery").unwrap();
-    assert!(owner.drive_one().await.unwrap());
+    drive_scoped_observation_when_due(&owner).await.unwrap();
     let samples = capture.0.lock().unwrap().take().unwrap();
     let report = history.finish().unwrap();
     assert_eq!(admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2369,7 +2400,7 @@ async fn observer_expiry_during_dispatch_does_not_acknowledge_progress() {
         .unwrap(),
     );
     let active = owner.clone();
-    let attempt = tokio::spawn(async move { active.drive_one().await });
+    let attempt = tokio::spawn(async move { drive_scoped_observation_when_due(&active).await });
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         worker.entered.notified(),
@@ -2403,7 +2434,7 @@ async fn observer_expiry_during_dispatch_does_not_acknowledge_progress() {
     .await
     .unwrap();
     worker.permits.add_permits(1);
-    assert!(restarted.drive_one().await.unwrap());
+    drive_scoped_observation_when_due(&restarted).await.unwrap();
     assert!(!restarted.drive_one().await.unwrap());
     b.ctx.close().await;
 }
