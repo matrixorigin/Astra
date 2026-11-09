@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
-    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchFailure,
+    EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchService,
     EdgeRegistrationLease, EdgeRegistryService,
 };
 use sqlx::Row;
@@ -312,6 +313,79 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_admission_reports_database_access_denied_without_secrets() {
+    require_env();
+    let (_pool, settings) = common::setup_pool_and_settings().await;
+    let options = sqlx::mysql::MySqlConnectOptions::new()
+        .host(&settings.host)
+        .port(settings.port)
+        .username(&settings.user)
+        .password("fixture-invalid-password")
+        .database(&settings.database);
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect_lazy_with(options);
+    let service = DatabaseEdgeDispatchService::new(pool.clone());
+    let identity = dispatch_identity("auth-test-user", "auth-test-request");
+    let error = service
+        .admit_dispatch(&identity, "edge", &serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        EdgeDispatchAdmissionError::OutcomeUnknown(EdgeDispatchFailure {
+            stage: EdgeDispatchFailureStage::Begin,
+            cause: EdgeDispatchFailureCause::AccessDenied,
+        })
+    );
+    assert!(!error.to_string().contains("fixture-invalid-password"));
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_concurrent_direct_admission_has_one_owner() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let service = Arc::new(DatabaseEdgeDispatchService::new(pool.get().clone()));
+    let identity = dispatch_identity(&format!("ed-race-{}", unique_suffix()), "request");
+    let payload = Arc::new(parse_dispatch_payload(
+        r#"{"tool":"bash","args":{"fraction":2.291712365432881e-9}}"#,
+    ));
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (service, identity, payload, barrier) = (
+            service.clone(),
+            identity.clone(),
+            payload.clone(),
+            barrier.clone(),
+        );
+        tasks.spawn(async move {
+            barrier.wait().await;
+            service
+                .admit_and_claim_direct_dispatch(&identity, "edge", &payload)
+                .await
+        });
+    }
+    let (mut claimed, mut observing) = (0, 0);
+    while let Some(result) = tasks.join_next().await {
+        match result.unwrap().unwrap() {
+            EdgeDirectDispatchAdmission::Claimed => claimed += 1,
+            EdgeDirectDispatchAdmission::Observing => observing += 1,
+            other => panic!("unexpected admission: {other:?}"),
+        }
+    }
+    assert_eq!((claimed, observing), (1, 7));
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&identity.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
     require_env();
     let pool = common::setup_pool().await;
@@ -321,10 +395,20 @@ async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
     let direct = dispatch_identity(&user, &unique_suffix());
     let relay = dispatch_identity(&user, &unique_suffix());
     let payload = parse_dispatch_payload(
-        r#"{"tool":"bash","args":{"command":"git status","timeout":120.0,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"large":9007199254740993,"max":18446744073709551615}}"#,
+        r#"{"tool":"bash","args":{"command":"git status","timeout":120.0,"fraction":2.291712365432881e-9,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"large":9007199254740993,"max":18446744073709551615}}"#,
     );
     let reordered = parse_dispatch_payload(
-        r#"{"args":{"max":18446744073709551615,"large":9007199254740993,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"timeout":120.0,"command":"git status"},"tool":"bash"}"#,
+        r#"{"args":{"max":18446744073709551615,"large":9007199254740993,"nested":[-120.0,-0.0,0.125,1e2,1e20,8.949943645992772e17],"fraction":2.291712365432881e-9,"timeout":120.0,"command":"git status"},"tool":"bash"}"#,
+    );
+    let replay = parse_dispatch_payload(&payload.to_string());
+    assert_eq!(
+        replay, payload,
+        "persisted JSON must replay the same numbers"
+    );
+    let fraction = payload["args"]["fraction"].as_f64().unwrap();
+    assert_eq!(
+        replay["args"]["fraction"].as_f64().unwrap().to_bits(),
+        fraction.to_bits()
     );
     let mut different_large = payload.clone();
     different_large["args"]["large"] = serde_json::json!(9007199254740992_u64);
@@ -332,6 +416,9 @@ async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
     different_type["args"]["timeout"] = serde_json::json!(120);
     let mut different_zero = payload.clone();
     different_zero["args"]["nested"][1] = serde_json::json!(0.0);
+    let mut different_fraction = payload.clone();
+    different_fraction["args"]["fraction"] =
+        serde_json::json!(f64::from_bits(fraction.to_bits() + 1));
 
     assert_eq!(
         svc.admit_and_claim_direct_dispatch(&direct, &edge, &payload)
@@ -340,12 +427,17 @@ async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
         EdgeDirectDispatchAdmission::Claimed
     );
     assert_eq!(
-        svc.admit_and_claim_direct_dispatch(&direct, &edge, &reordered)
+        svc.admit_and_claim_direct_dispatch(&direct, &edge, &replay)
             .await
-            .expect("reordered direct replay"),
+            .expect("serialized direct replay"),
         EdgeDirectDispatchAdmission::Observing
     );
-    for changed in [&different_large, &different_type, &different_zero] {
+    for changed in [
+        &different_large,
+        &different_type,
+        &different_zero,
+        &different_fraction,
+    ] {
         assert!(matches!(
             svc.admit_and_claim_direct_dispatch(&direct, &edge, changed)
                 .await,
@@ -363,7 +455,7 @@ async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
         EdgeDispatchAdmission::Pending
     );
     assert_eq!(
-        svc.admit_dispatch(&relay, &edge, &reordered).await.unwrap(),
+        svc.admit_dispatch(&relay, &edge, &replay).await.unwrap(),
         EdgeDispatchAdmission::Pending
     );
     let rows = svc.poll_pending(&user, &edge).await.unwrap();

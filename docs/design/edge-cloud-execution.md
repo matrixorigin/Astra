@@ -175,6 +175,8 @@ relay admission verify the request inside the same transaction; a relay becomes
 visible and wakes its Edge only after commit. If admission fails in a batch,
 the failing call retains its own error and later unstarted calls report that
 they did not run; an uncertain outcome is not retried as a known failure.
+Server and Edge use the same round-trip-safe floating-point parser. Deploy them
+together; requests produced with an older parser are not rewritten on replay.
 There is no per-socket periodic dispatch query during normal observation.
 The observer batches up to 1,024 connected targets and uses the
 status-leading dispatch index. Its SQL can match cross-pairs; only exact local

@@ -1461,7 +1461,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
 
         struct ControlledExecutor {
-            started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            started: std::sync::Mutex<Option<oneshot::Sender<u64>>>,
             executions: std::sync::atomic::AtomicUsize,
             inputs: std::sync::atomic::AtomicUsize,
             cancellations: std::sync::atomic::AtomicUsize,
@@ -1476,7 +1476,8 @@ mod tests {
                     self.executions
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if let Some(started) = self.started.lock().unwrap().take() {
-                        let _ = started.send(());
+                        let _ =
+                            started.send(invocation.args["fraction"].as_f64().unwrap().to_bits());
                     }
                     loop {
                         tokio::select! {
@@ -1552,7 +1553,7 @@ mod tests {
             identity: Box::new(identity),
             delivery_generation: 1,
             tool: "native_provider".into(),
-            args: serde_json::json!({}),
+            args: serde_json::json!({"fraction": 51.248178375505404_f64}),
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: Some(60),
@@ -1570,10 +1571,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), started_rx)
+        let observed_bits = tokio::time::timeout(Duration::from_secs(3), started_rx)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(observed_bits, 51.248178375505404_f64.to_bits());
         first_socket.close(None).await.unwrap();
         let (mut second_socket, _) = tokio::time::timeout(
             Duration::from_secs(3),

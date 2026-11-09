@@ -16383,7 +16383,7 @@ impl ServerAgenticLoopHost {
                                     None
                                 }
                                 Err(_) => Some(EdgeDispatchAdmissionError::OutcomeUnknown(
-                                    astra_services::multi_agent::EdgeDispatchFailureStage::TerminalResult,
+                                    astra_services::multi_agent::EdgeDispatchFailureStage::TerminalResult.into(),
                                 )),
                             }
                         }
@@ -16395,17 +16395,18 @@ impl ServerAgenticLoopHost {
                             &callback_key,
                         );
                         match &error {
-                            EdgeDispatchAdmissionError::OutcomeUnknown(stage) => {
+                            EdgeDispatchAdmissionError::OutcomeUnknown(failure) => {
                                 tracing::warn!(
                                     target: "astra::tool_admission",
                                     run_id,
                                     request_id,
-                                    stage = %stage,
+                                    stage = %failure.stage,
+                                    cause = %failure.cause,
                                     "edge dispatch admission outcome unknown"
                                 );
                                 let unknown = self.edge_action_outcome_unknown_result(
                                     tc,
-                                    &format!("Tool admission could not be confirmed during {stage}. The execution outcome is unknown; the request was not dispatched again because that could repeat a side effect."),
+                                    &format!("Tool admission could not be confirmed during {failure}. The execution outcome is unknown; the request was not dispatched again because that could repeat a side effect."),
                                 );
                                 results_by_id.insert(unknown.request_id.clone(), unknown);
                             }
@@ -30684,12 +30685,16 @@ mod tests {
                 ),
                 HostAdmissionFixture::OutcomeUnknown => Err(
                     astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                        astra_services::multi_agent::EdgeDispatchFailureStage::Adapter,
+                        astra_services::multi_agent::EdgeDispatchFailureStage::Adapter.into(),
                     ),
                 ),
                 HostAdmissionFixture::OutcomeUnknownCommit => Err(
                     astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                        astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                        astra_services::multi_agent::EdgeDispatchFailure {
+                            stage: astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                            cause:
+                                astra_services::multi_agent::EdgeDispatchFailureCause::Connection,
+                        },
                     ),
                 ),
             }
@@ -40942,10 +40947,9 @@ mod tests {
                         Value::Null
                     );
                     assert!(!outcome.results[0].output.contains("before recovery"));
-                    assert!(!outcome.results[0].output.contains("fixture-secret"));
                     let expected_stage =
                         if matches!(mode, HostAdmissionFixture::OutcomeUnknownCommit) {
-                            "database commit"
+                            "database commit: database connection failed"
                         } else {
                             "dispatch adapter"
                         };
@@ -40958,7 +40962,6 @@ mod tests {
                                 && event["call_id"] == "read-host-denied"
                         })
                         .expect("unknown outcome must be emitted to the client");
-                    assert!(!terminal.to_string().contains("fixture-secret"));
                     assert!(terminal.to_string().contains(expected_stage));
                 }
                 HostAdmissionFixture::Claimed => unreachable!(),

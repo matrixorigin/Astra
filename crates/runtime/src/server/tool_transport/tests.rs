@@ -200,7 +200,10 @@ impl StaticEdgeDispatch {
         Self {
             admission_error: Some(
                 astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                    astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                    astra_services::multi_agent::EdgeDispatchFailure {
+                        stage: astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                        cause: astra_services::multi_agent::EdgeDispatchFailureCause::Connection,
+                    },
                 ),
             ),
             ..Self::default()
@@ -2975,7 +2978,11 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
 
 #[tokio::test]
 async fn revoked_provider_executor_authorization_closes_claim_before_socket_dispatch() {
-    for fail_result in [Ok(true), Ok(false), Err("terminal response lost")] {
+    for fail_result in [
+        Ok(true),
+        Ok(false),
+        Err("fixture-secret-in-settlement-error"),
+    ] {
         revoked_provider_executor_authorization_case(fail_result).await;
     }
 }
@@ -3051,6 +3058,8 @@ async fn revoked_provider_executor_authorization_case(fail_result: Result<bool, 
         .await;
 
     assert!(result.is_error, "{result:?}");
+    assert!(!result.output.contains("fixture-secret-in-settlement-error"));
+    assert!(!format!("{:?}", result.metadata).contains("fixture-secret-in-settlement-error"));
     if !matches!(fail_result, Ok(true)) {
         let metadata = result.metadata.as_ref().unwrap();
         assert_eq!(metadata["outcome_certainty"], "unknown");
@@ -3972,9 +3981,10 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert_eq!(metadata["side_effects_maybe"], true);
     assert!(result.output.contains("reconcile its durable invocation"));
+    assert!(result.output.contains("database connection failed"));
     assert_eq!(
         metadata["diagnostics"][0],
-        "edge-dispatch: admission outcome is unknown: database commit"
+        "edge-dispatch: admission outcome is unknown: database commit: database connection failed"
     );
     assert_eq!(
         local.calls(),

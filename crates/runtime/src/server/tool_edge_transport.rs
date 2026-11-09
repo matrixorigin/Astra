@@ -105,13 +105,19 @@ pub(crate) async fn execute_edge_bound(
                 diagnostics.push(format!(
                     "edge-dispatch: admission outcome is unknown: {error}"
                 ));
-                return edge_transport_failure_result(&request, binding, diagnostics, true);
+                return edge_transport_failure_result(
+                    &request,
+                    binding,
+                    diagnostics,
+                    true,
+                    Some(&error),
+                );
             }
             EdgeTransportAttempt::TransportDisconnected => {
                 diagnostics.push(
                     "edge-dispatch: outcome may be unknown after durable dispatch".to_string(),
                 );
-                return edge_transport_failure_result(&request, binding, diagnostics, true);
+                return edge_transport_failure_result(&request, binding, diagnostics, true, None);
             }
             EdgeTransportAttempt::Unavailable => {
                 diagnostics
@@ -151,7 +157,13 @@ pub(crate) async fn execute_edge_bound(
             diagnostics.push(format!(
                 "edge-websocket: admission outcome is unknown: {error}"
             ));
-            return edge_transport_failure_result(&request, binding, diagnostics, true);
+            return edge_transport_failure_result(
+                &request,
+                binding,
+                diagnostics,
+                true,
+                Some(&error),
+            );
         }
         EdgeTransportAttempt::TransportDisconnected => {
             diagnostics
@@ -163,7 +175,7 @@ pub(crate) async fn execute_edge_bound(
         }
     }
 
-    edge_transport_failure_result(&request, binding, diagnostics, outcome_may_be_unknown)
+    edge_transport_failure_result(&request, binding, diagnostics, outcome_may_be_unknown, None)
 }
 
 async fn try_edge_websocket(
@@ -423,9 +435,10 @@ async fn try_edge_websocket(
                         "provider authorization was denied but the durable claim was no longer fail-able"
                             .to_string(),
                     ),
-                    Err(fail_error) => EdgeTransportAttempt::AdmissionOutcomeUnknown(format!(
-                        "provider authorization was denied but the durable claim could not be closed: {fail_error}"
-                    )),
+                    Err(_) => EdgeTransportAttempt::AdmissionOutcomeUnknown(
+                        "provider authorization was denied but the durable claim could not be closed"
+                            .to_string(),
+                    ),
                 };
             }
         }
@@ -885,8 +898,14 @@ fn edge_unavailable_result(
 fn edge_transport_failure_message(
     request: &ToolExecutionRequest,
     outcome_may_be_unknown: bool,
+    admission_detail: Option<&str>,
 ) -> String {
-    if outcome_may_be_unknown {
+    if let Some(detail) = admission_detail {
+        format!(
+            "Error: durable edge admission for tool '{}' on executor '{}' could not be confirmed ({detail}). The request may have reached the edge; reconcile its durable invocation before any retry.",
+            request.tool_name, request.executor.display_name
+        )
+    } else if outcome_may_be_unknown {
         format!(
             "Error: transport '{}' disconnected or timed out after dispatching tool '{}' to executor '{}'. The request may have reached the edge; reconcile its durable invocation before any retry. No alternate execution provider is available for this file environment.",
             serde_json::to_value(request.executor.transport)
@@ -947,12 +966,13 @@ fn edge_transport_failure_result(
     binding: &astra_runtime_env::RunBinding,
     diagnostics: Vec<String>,
     outcome_may_be_unknown: bool,
+    admission_detail: Option<&str>,
 ) -> astra_tools::ToolResult {
     let mut degraded_executor = request.executor.clone();
     degraded_executor.status = ExecutorStatus::Degraded;
     let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
-    let message = edge_transport_failure_message(request, outcome_may_be_unknown);
+    let message = edge_transport_failure_message(request, outcome_may_be_unknown, admission_detail);
     let error = if outcome_may_be_unknown {
         astra_runtime_env::RuntimeError::transport_disconnected(&message)
     } else {

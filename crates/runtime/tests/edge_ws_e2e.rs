@@ -1210,6 +1210,11 @@ async fn durable_relay_wakes_without_idle_polling() {
     let message: serde_json::Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(message["request_id"], identity.request_id);
     assert_eq!(
+        message["args"]["fraction"].as_f64().unwrap().to_bits(),
+        payload["args"]["fraction"].as_f64().unwrap().to_bits(),
+        "the receiving decoder must preserve the admitted number"
+    );
+    assert_eq!(
         frame.as_str(),
         admitted_payload,
         "relay must forward the admitted JSON bytes"

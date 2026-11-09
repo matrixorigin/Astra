@@ -274,17 +274,102 @@ impl std::fmt::Display for EdgeDispatchFailureStage {
     }
 }
 
+/// Only fixed, non-secret information may cross the admission boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeDispatchFailureCause {
+    Unspecified,
+    PoolTimeout,
+    PoolClosed,
+    Connection,
+    Tls,
+    AccessDenied,
+    Database(Option<u16>),
+    InvalidData,
+}
+
+impl std::fmt::Display for EdgeDispatchFailureCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unspecified => formatter.write_str("unspecified cause"),
+            Self::PoolTimeout => formatter.write_str("connection acquisition timed out"),
+            Self::PoolClosed => formatter.write_str("connection pool is closed"),
+            Self::Connection => formatter.write_str("database connection failed"),
+            Self::Tls => formatter.write_str("database TLS failed"),
+            Self::AccessDenied => formatter.write_str("database access denied"),
+            Self::Database(Some(code)) => write!(formatter, "database error (code {code})"),
+            Self::Database(None) => formatter.write_str("database error"),
+            Self::InvalidData => formatter.write_str("invalid database response"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeDispatchFailure {
+    pub stage: EdgeDispatchFailureStage,
+    pub cause: EdgeDispatchFailureCause,
+}
+
+impl From<EdgeDispatchFailureStage> for EdgeDispatchFailure {
+    fn from(stage: EdgeDispatchFailureStage) -> Self {
+        Self {
+            stage,
+            cause: EdgeDispatchFailureCause::Unspecified,
+        }
+    }
+}
+
+impl std::fmt::Display for EdgeDispatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.stage)?;
+        if self.cause != EdgeDispatchFailureCause::Unspecified {
+            write!(formatter, ": {}", self.cause)?;
+        }
+        Ok(())
+    }
+}
+
+fn edge_admission_database_error(
+    stage: EdgeDispatchFailureStage,
+    error: sqlx::Error,
+) -> EdgeDispatchAdmissionError {
+    use EdgeDispatchFailureCause as Cause;
+    let cause = match &error {
+        sqlx::Error::PoolTimedOut => Cause::PoolTimeout,
+        sqlx::Error::PoolClosed => Cause::PoolClosed,
+        sqlx::Error::Io(_) => Cause::Connection,
+        sqlx::Error::Tls(_) => Cause::Tls,
+        sqlx::Error::Database(database) => {
+            let number = database
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .map(|error| error.number());
+            if matches!(number, Some(1044 | 1045 | 1142 | 1143 | 1227))
+                || matches!(database.code().as_deref(), Some("28000" | "42501"))
+            {
+                Cause::AccessDenied
+            } else {
+                Cause::Database(number)
+            }
+        }
+        sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::Protocol(_) => Cause::InvalidData,
+        _ => Cause::Unspecified,
+    };
+    EdgeDispatchAdmissionError::OutcomeUnknown(EdgeDispatchFailure { stage, cause })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeDispatchAdmissionError {
     Rejected(String),
-    OutcomeUnknown(EdgeDispatchFailureStage),
+    OutcomeUnknown(EdgeDispatchFailure),
 }
 
 impl std::fmt::Display for EdgeDispatchAdmissionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(message) => formatter.write_str(message),
-            Self::OutcomeUnknown(stage) => write!(formatter, "{stage}"),
+            Self::OutcomeUnknown(failure) => write!(formatter, "{failure}"),
         }
     }
 }
@@ -370,7 +455,7 @@ impl DatabaseEdgeDispatchService {
             .pool
             .begin()
             .await
-            .map_err(|_| OutcomeUnknown(Stage::Begin))?;
+            .map_err(|error| edge_admission_database_error(Stage::Begin, error))?;
         let insert = match mode {
             EdgeAdmissionMode::Relay => {
                 "INSERT IGNORE INTO edge_pending_dispatch \
@@ -393,7 +478,7 @@ impl DatabaseEdgeDispatchService {
             .bind(&payload_json)
             .execute(&mut *tx)
             .await
-            .map_err(|_| OutcomeUnknown(Stage::Insert))?
+            .map_err(|error| edge_admission_database_error(Stage::Insert, error))?
             .rows_affected()
             > 0;
         let row = sqlx::query(
@@ -409,18 +494,18 @@ impl DatabaseEdgeDispatchService {
         .bind(&identity.request_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| OutcomeUnknown(Stage::Verify))?
-        .ok_or(OutcomeUnknown(Stage::Verify))?;
+        .map_err(|error| edge_admission_database_error(Stage::Verify, error))?
+        .ok_or(OutcomeUnknown(Stage::Verify.into()))?;
         let stored_edge: String = row
             .try_get("edge_agent_id")
-            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+            .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
         let stored_payload: String = row
             .try_get("payload_json")
-            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+            .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
         if stored_edge != edge_agent_id || stored_payload != payload_json {
             tx.rollback()
                 .await
-                .map_err(|_| OutcomeUnknown(Stage::Rollback))?;
+                .map_err(|error| edge_admission_database_error(Stage::Rollback, error))?;
             return Err(Rejected(format!(
                 "edge_dispatch identity {} conflicts with its durable edge owner or payload",
                 identity.request_id
@@ -428,7 +513,7 @@ impl DatabaseEdgeDispatchService {
         }
         let status: String = row
             .try_get("status")
-            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+            .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
         let wake = mode == EdgeAdmissionMode::Relay && status == "pending";
         let outcome = match status.as_str() {
             "pending" if mode == EdgeAdmissionMode::Direct => {
@@ -445,9 +530,9 @@ impl DatabaseEdgeDispatchService {
                 .bind(edge_agent_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|_| OutcomeUnknown(Stage::Claim))?;
+                .map_err(|error| edge_admission_database_error(Stage::Claim, error))?;
                 if updated.rows_affected() != 1 {
-                    return Err(OutcomeUnknown(Stage::Claim));
+                    return Err(OutcomeUnknown(Stage::Claim.into()));
                 }
                 EdgeDirectDispatchAdmission::Claimed
             }
@@ -459,15 +544,15 @@ impl DatabaseEdgeDispatchService {
             "completed" | "failed" => {
                 let result = row
                     .try_get::<Option<String>, _>("result_json")
-                    .map_err(|_| OutcomeUnknown(Stage::TerminalResult))?
-                    .ok_or(OutcomeUnknown(Stage::TerminalResult))?;
+                    .map_err(|error| edge_admission_database_error(Stage::TerminalResult, error))?
+                    .ok_or(OutcomeUnknown(Stage::TerminalResult.into()))?;
                 EdgeDirectDispatchAdmission::Terminal(result)
             }
-            _ => return Err(OutcomeUnknown(Stage::Verify)),
+            _ => return Err(OutcomeUnknown(Stage::Verify.into())),
         };
         tx.commit()
             .await
-            .map_err(|_| OutcomeUnknown(Stage::Commit))?;
+            .map_err(|error| edge_admission_database_error(Stage::Commit, error))?;
         if inserted && let Some(metrics) = &self.metrics {
             metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
         }
@@ -1923,6 +2008,66 @@ mod tests {
     use uuid::Uuid;
 
     static EDGE_DISPATCH_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+    #[test]
+    fn admission_error_categorizes_failures_without_exposing_sources() {
+        let secret = "fixture-secret-in-database-error";
+        let failures = [
+            (
+                sqlx::Error::PoolTimedOut,
+                EdgeDispatchFailureCause::PoolTimeout,
+            ),
+            (
+                sqlx::Error::PoolClosed,
+                EdgeDispatchFailureCause::PoolClosed,
+            ),
+            (
+                sqlx::Error::Io(std::io::Error::other(secret)),
+                EdgeDispatchFailureCause::Connection,
+            ),
+            (
+                sqlx::Error::Protocol(secret.to_string()),
+                EdgeDispatchFailureCause::InvalidData,
+            ),
+        ];
+        for (error, cause) in failures {
+            let mapped = edge_admission_database_error(EdgeDispatchFailureStage::Begin, error);
+            assert_eq!(
+                mapped,
+                EdgeDispatchAdmissionError::OutcomeUnknown(EdgeDispatchFailure {
+                    stage: EdgeDispatchFailureStage::Begin,
+                    cause,
+                })
+            );
+            assert!(!mapped.to_string().contains(secret));
+            assert!(!format!("{mapped:?}").contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_reports_connection_acquisition_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(&format!("mysql://user:fixture-secret@{address}/unused"))
+            .unwrap();
+        let service = DatabaseEdgeDispatchService::new(pool.clone());
+        let identity = EdgeDispatchIdentity::new("user", "session", "run", "turn", "request");
+        let error = service
+            .admit_dispatch(&identity, "edge", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            EdgeDispatchAdmissionError::OutcomeUnknown(EdgeDispatchFailure {
+                stage: EdgeDispatchFailureStage::Begin,
+                cause: EdgeDispatchFailureCause::PoolTimeout,
+            })
+        );
+        assert!(!error.to_string().contains("fixture-secret"));
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn unconfirmed_direct_settlement_uses_service_metrics() {
