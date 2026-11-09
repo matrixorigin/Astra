@@ -312,6 +312,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "provider_interaction_resolved"
             | "user_intent"
             | "permission_mode_applied"
+            | "run_model_outcome"
             | "user_intent_applied"
             | "user_intent_returned"
             | "run_finished"
@@ -727,9 +728,54 @@ pub(crate) async fn submit_run_user_intent_handler(
     }))
 }
 
+pub(crate) async fn run_user_intent_status_handler(
+    State(state): State<AppState>,
+    Path((run_id, intent_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<RunPermissionModeQuery>,
+) -> Result<Json<astra_turn_types::UserIntentStatus>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .run_user_intent_status(user.user_id, query.expected_session_id, run_id, intent_id)
+        .await
+        .map(Json)
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct RunPermissionModeQuery {
     pub expected_session_id: String,
+}
+
+pub(crate) async fn request_run_model_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<astra_turn_types::RunModelRequest>,
+) -> Result<Json<astra_turn_types::RunModelSelection>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .request_run_model(user.user_id, run_id, request)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn run_model_snapshot_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunPermissionModeQuery>,
+) -> Result<Json<astra_turn_types::RunModelSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .run_model_snapshot(user.user_id, query.expected_session_id, run_id)
+        .await
+        .map(Json)
 }
 
 pub(crate) async fn request_permission_mode_handler(

@@ -669,6 +669,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "provider_interaction_required"
                 | "provider_interaction_resolved"
                 | "permission_mode_applied"
+                | "run_model_outcome"
                 | "user_intent_applied"
                 | "user_intent_returned"
                 | "stream_gap"
@@ -1244,11 +1245,12 @@ fn canonical_edge_interaction_events(event: &Value) -> Vec<Value> {
 }
 
 fn incrementally_persisted_edge_interaction_event(event: &Value) -> bool {
-    // Permission application is committed by the round-control owner before
-    // emitting its flat client projection. Never append that projection as a
-    // second (and differently shaped) durable permission receipt at settlement.
-    event.get("type").and_then(Value::as_str) == Some("permission_mode_applied")
-        || !canonical_edge_interaction_events(event).is_empty()
+    // Setting outcomes are committed before their client projection. Never
+    // append that projection as a second durable receipt at settlement.
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("permission_mode_applied" | "run_model_outcome")
+    ) || !canonical_edge_interaction_events(event).is_empty()
 }
 
 #[cfg(test)]
@@ -14048,12 +14050,12 @@ impl AgenticRunLifecycleService {
                         .user_intents
                         .bind_opening_wake(input_wake.subscribe(), tail);
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_opening_wake(input_wake.subscribe(), tail);
                 } else {
                     state.user_intents.bind_wake(Some(input_wake.subscribe()));
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_wake(input_wake.subscribe());
                 }
                 let mut control_watcher = start_active_run_control_watcher(
@@ -16613,57 +16615,115 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("stream live delta", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        // A terminal status is not the Explain Analyze publication boundary.
-        // The owner commits `run_finished` first and persists the report just
-        // after it. Load the immutable run metadata once so a cross-process
-        // observer can distinguish an ordinary terminal from an Explain run
-        // that still owes its publication outcome.
-        let durable_run = self
+        // Ordinary live attachments need the opening and current owner, not
+        // the entire event history. Explain needs its exceptional publication
+        // proof even when it predates the caller's replay cursor.
+        let admission = self
             .run_engine
-            .load_run(&user_id, &run_id)
+            .load_run_admission(&user_id, &run_id)
             .await
             .map_err(|error| Self::durable_persist_error("stream live run metadata", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        let explain_requested = astra_services::runs::run_requested_explain_analyze(&durable_run);
+        let admitted_run = admission.run();
+        let started = admitted_run.original_admission_data().map_err(|error| {
+            Self::durable_persist_error("stream live run admission", error.to_string())
+        })?;
+        let explain_requested = match started.get("explain_analyze_requested") {
+            None => false,
+            Some(Value::Bool(requested)) => *requested,
+            Some(_) => {
+                return Err(Self::durable_persist_error(
+                    "stream live run admission",
+                    "invalid Explain request flag".to_string(),
+                ));
+            }
+        };
         let mut replay_events = initial.events;
-        // `load_run_event_delta` reports the latest high watermark even when
-        // its event list is empty.  Keep the cursor at the greatest event we
-        // actually replayed so the metadata read below can fill the exact
-        // gap opened between the two reads (publication is often that gap).
         let mut event_cursor = replay_events
             .iter()
             .filter_map(|event| event.get("index").and_then(Value::as_i64))
             .max()
             .unwrap_or(after_event_idx);
-        for (position, event) in durable_run.events.iter().enumerate() {
-            let index = durable_event_index(event, position);
-            if index <= event_cursor {
-                continue;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object.insert("index".to_string(), Value::from(index));
-            }
-            event_cursor = event_cursor.max(index);
-            replay_events.push(event);
-        }
-        let mut publication_seen = replay_events
-            .iter()
-            .any(durable_event_is_valid_explain_publication)
-            || durable_run
-                .events
-                .iter()
-                .enumerate()
-                .any(|(position, event)| {
-                    durable_event_index(event, position) <= after_event_idx
-                        && durable_event_is_valid_explain_publication(event)
-                });
-        let turn_id = explain_turn_id_from_durable_run(&durable_run);
-        let owner_generation = durable_run.run_generation;
-        let latest_complete = Self::durable_live_attach_complete(
-            &durable_run.status,
-            self.run_execution_is_live(&durable_run).await,
-        );
+        let (mut publication_seen, turn_id, owner_generation, latest_complete) =
+            if explain_requested {
+                let durable_run = self
+                    .run_engine
+                    .load_run(&user_id, &run_id)
+                    .await
+                    .map_err(|error| Self::durable_persist_error("stream live Explain", error))?
+                    .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                for (position, event) in durable_run.events.iter().enumerate() {
+                    let index = durable_event_index(event, position);
+                    if index <= event_cursor {
+                        continue;
+                    }
+                    let mut event = event.clone();
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert("index".to_string(), Value::from(index));
+                    }
+                    event_cursor = event_cursor.max(index);
+                    replay_events.push(event);
+                }
+                let seen = replay_events
+                    .iter()
+                    .any(durable_event_is_valid_explain_publication)
+                    || durable_run
+                        .events
+                        .iter()
+                        .enumerate()
+                        .any(|(position, event)| {
+                            durable_event_index(event, position) <= after_event_idx
+                                && durable_event_is_valid_explain_publication(event)
+                        });
+                (
+                    seen,
+                    explain_turn_id_from_durable_run(&durable_run),
+                    durable_run.run_generation,
+                    Self::durable_live_attach_complete(
+                        &durable_run.status,
+                        self.run_execution_is_live(&durable_run).await,
+                    ),
+                )
+            } else {
+                // Drain a concurrent append before using the later opening's
+                // terminal status. Never advance beyond an event actually read.
+                let mut status = admitted_run.status.clone();
+                let mut execution_live = self.run_execution_is_live(admitted_run).await;
+                if admitted_run.last_event_idx > event_cursor {
+                    let gap = self
+                        .run_engine
+                        .load_run_event_delta(&user_id, &run_id, event_cursor)
+                        .await
+                        .map_err(|error| Self::durable_persist_error("stream live gap", error))?
+                        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                    for event in gap.events {
+                        if let Some(index) = event.get("index").and_then(Value::as_i64) {
+                            event_cursor = event_cursor.max(index);
+                        }
+                        replay_events.push(event);
+                    }
+                    if event_cursor < admitted_run.last_event_idx {
+                        return Err(Self::durable_persist_error(
+                            "stream live gap",
+                            "event tail did not reach the observed watermark".to_string(),
+                        ));
+                    }
+                    status = gap.status;
+                    execution_live = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .filter(|run| run.user_id == user_id && run.session_id == gap.session_id)
+                        .map_or(gap.execution_live, |run| run.execution_live);
+                }
+                (
+                    false,
+                    String::new(),
+                    admitted_run.run_generation,
+                    Self::durable_live_attach_complete(&status, execution_live),
+                )
+            };
         if latest_complete && (!explain_requested || publication_seen) {
             return Ok(ChatStreamRecord {
                 session_id: initial.session_id,
@@ -17145,13 +17205,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| {
                 let status = match e.as_str() {
-                    "permission run not found" => StatusCode::NOT_FOUND,
-                    "permission request identity conflict"
-                    | "permission run is inactive"
-                    | "permission run is cancelled" => StatusCode::CONFLICT,
-                    _ if e.starts_with("permission request requires") => {
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    }
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict"
+                    | "run setting cannot be changed after the run is inactive"
+                    | "run setting target is cancelled" => StatusCode::CONFLICT,
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
                     _ => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 error_response(status, &e)
@@ -17165,6 +17223,61 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         Ok(selection)
     }
+    async fn request_run_model(
+        &self,
+        user_id: String,
+        run_id: String,
+        request: astra_services::runs::RunModelRequest,
+    ) -> Result<astra_services::runs::RunModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        let selection = self
+            .run_engine
+            .request_run_model(&user_id, &run_id, &request)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e.as_str(),
+                    "run setting cannot be changed after the run is inactive"
+                        | "run setting target is cancelled"
+                ) {
+                    return error_response_coded(
+                        StatusCode::CONFLICT,
+                        &e,
+                        "run_model_target_inactive",
+                    );
+                }
+                let status = match e.as_str() {
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict" => StatusCode::CONFLICT,
+                    "Offering ID selector is invalid" | "reasoning budget must be positive" => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                error_response(status, &e)
+            })?;
+        if let Some(run) = self.runs.read().await.get(&run_id) {
+            run.input_wake.send_if_modified(|current| {
+                let changed = selection.revision > *current;
+                *current = (*current).max(selection.revision);
+                changed
+            });
+        }
+        Ok(selection)
+    }
+    async fn run_model_snapshot(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+    ) -> Result<astra_turn_types::RunModelSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        self.run_engine
+            .run_settings_snapshot(&user_id, &session_id, &run_id)
+            .await
+            .map_err(|e| Self::durable_persist_error("model setting lookup", e))?
+            .map(|snapshot| snapshot.model.client_snapshot())
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
     async fn permission_mode_snapshot(
         &self,
         user_id: String,
@@ -17177,6 +17290,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| Self::durable_persist_error("permission mode lookup", e))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    async fn run_user_intent_status(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+        intent_id: String,
+    ) -> Result<UserIntentStatus, (StatusCode, Json<ErrorResponse>)> {
+        if intent_id.is_empty() || intent_id.trim() != intent_id {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid intent identity",
+            ));
+        }
+        self.run_engine
+            .store()
+            .run_user_intent_status(&user_id, &session_id, &run_id, &intent_id)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Intent not found"))
     }
 
     async fn submit_run_user_intent(
@@ -17205,18 +17339,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
         }
 
-        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let source_key = format!("user_intent:{intent_id}");
+        let durable = self
+            .run_engine
+            .store()
+            .load_run_guidance_preflight(&user_id, &run_id, &source_key)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         // An admitted source already passed native input validation. Retry
         // reconciliation belongs to the atomic admission owner, including
         // immutable-content conflicts and terminal runs; it must not depend
         // on the current collaborator directory being available.
-        let source_key = format!("user_intent:{intent_id}");
-        let source_already_admitted = durable.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) == Some(source_key.as_str())
-        });
         let native_target = if input.delivery
             == astra_turn_types::UserIntentDelivery::GuideCurrentRun
-            && !source_already_admitted
+            && !durable.source_already_admitted
         {
             self.native_collaborator_target(&durable)
                 .await
@@ -18110,7 +18247,7 @@ impl AgenticRunLifecycleService {
     /// only on this explicit control path; ordinary turns do not pay for it.
     async fn native_collaborator_target(
         &self,
-        run: &DurableRunRecord,
+        run: &astra_services::runs::RunGuidancePreflight,
     ) -> Result<Option<astra_messaging::AgentAddress>, astra_services::runs::RunAdmissionError>
     {
         let Some(agent_id) = run.agent_id.as_deref().map(str::trim) else {
@@ -18119,7 +18256,7 @@ impl AgenticRunLifecycleService {
         if agent_id.is_empty() {
             return Ok(None);
         }
-        if native_stage_admitted_on_run(run) {
+        if run.native_anchor {
             return Ok(Some(astra_messaging::AgentAddress::new(
                 run.run_id.clone(),
                 agent_id,
@@ -18146,19 +18283,6 @@ impl AgenticRunLifecycleService {
             }
         }
     }
-}
-
-/// Find the native child target from stage admission facts already present on
-/// the requested run. The run record is the capability fact; no model name,
-/// executable version, or display label is consulted.
-fn native_stage_admitted_on_run(run: &DurableRunRecord) -> bool {
-    run.events.iter().rev().any(|event| {
-        event.get("event_type").and_then(Value::as_str) == Some("collaborator_stage_admitted")
-            && serde_json::from_value::<astra_services::runs::CollaboratorStageAdmission>(
-                event.get("admission").cloned().unwrap_or(Value::Null),
-            )
-            .is_ok_and(|admission| admission.anchor_run_id == run.run_id)
-    })
 }
 
 impl AgenticRunLifecycleService {
@@ -18975,7 +19099,8 @@ impl ServerSpawnAgentExecutor {
                         }
                     },
                 )
-                .await?;
+                .await?
+                .0;
         }
         Ok(context)
     }
@@ -24767,7 +24892,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
-        loop_state.permission_mode_observation.bind_wake(input_wake.subscribe());
+        loop_state.run_settings_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
             config.user_id.clone(),

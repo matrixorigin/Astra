@@ -532,7 +532,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // persistence without entering the successful render/checkpoint path.
         if result.is_err() || cancellation_exit {
             ensure_terminal_text(state, true);
+            let prior_messages = state.messages.len();
             materialize_terminal_text_message(state);
+            host.attest_model_messages(state, prior_messages);
+            state.record_appended_prompt_history_from(prior_messages);
             bound_current_terminal_message(state);
             if cancellation_exit {
                 settle_terminal_turn_state(state).await;
@@ -652,6 +655,8 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     if !state.final_output_ready_notified {
         let previous_message_count = state.messages.len();
         materialize_terminal_text_message(state);
+        host.attest_model_messages(state, previous_message_count);
+        state.record_appended_prompt_history_from(previous_message_count);
         if !state.final_text.is_empty()
             && (state.interruption.is_some() || state.messages.len() != previous_message_count)
         {
@@ -726,7 +731,7 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
         {
             message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
         }
-        state.push_prompt_history_message(message);
+        state.messages.push(message);
     }
 }
 
@@ -813,6 +818,7 @@ pub(crate) fn bound_ingested_terminal_message(state: &mut AgenticLoopState, star
             for field in [
                 astra_core::model_wire::responses::CONTINUATION_KEY,
                 astra_turn_types::MODEL_ITEM_ID_FIELD,
+                astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD,
                 astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD,
             ] {
                 if let Some(value) = message.get(field) {
@@ -1470,8 +1476,12 @@ mod tests {
         state.final_text = "Operation completed.".to_string();
         state.begin_run_transcript_capture(std::iter::empty());
 
+        let start = state.messages.len();
         materialize_terminal_text_message(&mut state);
+        state.record_appended_prompt_history_from(start);
+        let start = state.messages.len();
         materialize_terminal_text_message(&mut state);
+        state.record_appended_prompt_history_from(start);
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[1]["role"], "assistant");

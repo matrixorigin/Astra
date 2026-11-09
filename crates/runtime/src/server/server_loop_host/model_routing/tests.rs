@@ -152,6 +152,169 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
 struct Catalog {
     models: RwLock<HashMap<String, AdmittedModelExecution>>,
     separate_billing: AtomicBool,
+    admission_gate: RwLock<Option<AdmissionGate>>,
+}
+
+#[derive(Clone)]
+struct AdmissionGate {
+    model: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+struct LostModelAck {
+    engine: RunEngine,
+    lose_once: AtomicBool,
+    after_commit: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+#[derive(Clone, Copy)]
+enum ModelControlFault {
+    FailSnapshot,
+    HangSnapshot,
+    HangCommit,
+}
+
+struct FaultedModelControl {
+    engine: RunEngine,
+    fail_next_read: AtomicBool,
+    fault: ModelControlFault,
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl crate::turn::run_control::RunStatusProvider for FaultedModelControl {
+    async fn run_settings_snapshot(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
+        if self.fail_next_read.swap(false, Ordering::SeqCst) {
+            if matches!(self.fault, ModelControlFault::HangSnapshot) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
+            return Err("snapshot read unavailable".into());
+        }
+        self.engine.run_settings_snapshot(user, session, run).await
+    }
+
+    async fn finish_run_model(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+        outcome: &astra_turn_types::RunModelOutcome,
+        resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_turn_types::RunModelOutcome>, String> {
+        if matches!(self.fault, ModelControlFault::HangCommit) {
+            self.entered.notify_one();
+            return std::future::pending().await;
+        }
+        let result = self
+            .engine
+            .finish_run_model(user, session, run, outcome, resolved)
+            .await?;
+        self.fail_next_read.store(true, Ordering::SeqCst);
+        Ok(result)
+    }
+
+    async fn control_status(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl crate::turn::run_control::UserIntentProvider for FaultedModelControl {
+    async fn poll_user_intents(
+        &self,
+        _: &str,
+        _: &str,
+        _: usize,
+    ) -> crate::turn::run_control::UserIntentPoll {
+        Default::default()
+    }
+
+    async fn mark_user_intents_applied(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[usize],
+        _: crate::turn::run_control::UserIntentAdmissionAuthority,
+        _: Option<crate::turn::run_control::UserIntentInvocationApplication<'_>>,
+    ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
+    }
+}
+
+#[async_trait]
+impl crate::turn::run_control::RunStatusProvider for LostModelAck {
+    async fn run_settings_snapshot(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
+        self.engine.run_settings_snapshot(user, session, run).await
+    }
+    async fn finish_run_model(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+        outcome: &astra_turn_types::RunModelOutcome,
+        resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_turn_types::RunModelOutcome>, String> {
+        let result = self
+            .engine
+            .finish_run_model(user, session, run, outcome, resolved)
+            .await?;
+        if self.lose_once.swap(false, Ordering::SeqCst) {
+            if let Some((entered, release)) = &self.after_commit {
+                entered.notify_one();
+                release.notified().await;
+            }
+            Err("ack lost after commit".into())
+        } else {
+            Ok(result)
+        }
+    }
+    async fn control_status(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl crate::turn::run_control::UserIntentProvider for LostModelAck {
+    async fn poll_user_intents(
+        &self,
+        _: &str,
+        _: &str,
+        _: usize,
+    ) -> crate::turn::run_control::UserIntentPoll {
+        Default::default()
+    }
+    async fn mark_user_intents_applied(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[usize],
+        _: crate::turn::run_control::UserIntentAdmissionAuthority,
+        _: Option<crate::turn::run_control::UserIntentInvocationApplication<'_>>,
+    ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
+    }
 }
 
 fn unsupported<T>() -> Result<T, (StatusCode, Json<astra_core::ErrorResponse>)> {
@@ -171,6 +334,11 @@ impl ModelService for Catalog {
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<astra_core::ErrorResponse>)> {
         if user != "router-user" {
             return unsupported();
+        }
+        let gate = self.admission_gate.read().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.model == id) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         self.models
             .read()
@@ -457,6 +625,920 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
 }
 
 #[tokio::test]
+async fn explicit_model_change_applies_at_the_next_round_after_auto() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    let (catalog, engine, mut host, mut state) = fixture().await;
+    state.run_control = Some(Arc::new(engine.clone()));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "economy"
+    );
+    let run_id = state.current_run_id.clone().unwrap();
+    let request = RunModelRequest {
+        expected_session_id: "router-session".into(),
+        request_id: "switch-to-strong".into(),
+        model: astra_turn_types::ModelSelection {
+            offering_id: "strong".into(),
+        },
+        reasoning: ReasoningRequirement::ModelDefault,
+    };
+    engine
+        .request_run_model("router-user", &run_id, &request)
+        .await
+        .unwrap();
+    // The currently admitted request remains untouched until another round.
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "economy"
+    );
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "strong"
+    );
+    let snapshot = engine
+        .run_settings_snapshot("router-user", "router-session", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        snapshot.model.outcome.unwrap().result,
+        RunModelOutcomeKind::Applied { .. }
+    ));
+    assert_eq!(
+        snapshot.model.applied.unwrap().resolved.offering_id,
+        "strong"
+    );
+    assert!(host.model_routing.is_none());
+    let current = engine
+        .load_run("router-user", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.model_offering_id.as_deref(), Some("strong"));
+    // Auto revalidation must not repin economy after the user choice.
+    assert!(host.revalidate_auto_execution().await.unwrap().is_none());
+    // Both delegated agents and forked skills use this shared resolver; the
+    // earlier Auto decision must not override the later explicit choice.
+    let inherited = crate::server::model_execution_admission::inherit_routed_execution(
+        &engine,
+        "router-user",
+        "router-session",
+        &run_id,
+        None,
+        |id| async {
+            catalog
+                .admit_model_offering("router-user".into(), id)
+                .await
+                .map_err(|_| "not authorized".into())
+        },
+    )
+    .await
+    .unwrap()
+    .0
+    .unwrap();
+    assert_eq!(inherited.offering_id, "strong");
+    catalog.models.write().unwrap().remove("strong");
+    assert!(
+        crate::server::model_execution_admission::inherit_routed_execution(
+            &engine,
+            "router-user",
+            "router-session",
+            &run_id,
+            Some(&inherited),
+            |id| async {
+                catalog
+                    .admit_model_offering("router-user".into(), id)
+                    .await
+                    .map_err(|_| "not authorized".into())
+            },
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn applied_model_is_installed_before_a_followup_snapshot_failure() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+
+    let (_, engine, mut host, mut state) = fixture().await;
+    let workdir = tempfile::tempdir().unwrap();
+    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workdir.path().to_path_buf(),
+        "router-user".into(),
+        "router-session".into(),
+        None,
+        None,
+    );
+    executor.set_agent_tool_context(
+        crate::server::runtime_tool_executor::tests::test_agent_tool_context(workdir.path()),
+    );
+    let executor = Arc::new(executor);
+    state.runtime_tool_executor = Some(executor.clone());
+    state.run_control = Some(Arc::new(FaultedModelControl {
+        engine: engine.clone(),
+        fail_next_read: AtomicBool::new(false),
+        fault: ModelControlFault::FailSnapshot,
+        entered: Arc::new(tokio::sync::Notify::new()),
+    }));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    let run_id = state.current_run_id.clone().unwrap();
+    engine
+        .request_run_model(
+            "router-user",
+            &run_id,
+            &RunModelRequest {
+                expected_session_id: "router-session".into(),
+                request_id: "switch-before-snapshot-failure".into(),
+                model: astra_turn_types::ModelSelection {
+                    offering_id: "strong".into(),
+                },
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error =
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .err()
+            .expect("an unconfirmed followup read must stop the round");
+    assert!(error.to_string().contains("could not be confirmed"));
+    let settings = engine
+        .run_settings_snapshot("router-user", "router-session", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        settings.model.outcome.unwrap().result,
+        RunModelOutcomeKind::Applied { .. }
+    ));
+    assert_eq!(
+        settings.model.applied.unwrap().resolved.offering_id,
+        "strong"
+    );
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "strong"
+    );
+    assert_eq!(
+        crate::server::runtime_tool_executor::tests::test_current_agent_model(&executor).as_deref(),
+        Some("economy"),
+        "an unconfirmed selection must not reach child tool context"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn model_commit_and_confirmation_respect_the_original_stop_boundary() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    for fault in [
+        ModelControlFault::HangCommit,
+        ModelControlFault::HangSnapshot,
+    ] {
+        for stop in ["cancel", "flag", "deadline", "lease"] {
+            let (_, engine, mut host, mut state) = fixture().await;
+            state.run_control = Some(Arc::new(engine.clone()));
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+                .await
+                .unwrap();
+            let run_id = state.current_run_id.clone().unwrap();
+            engine
+                .request_run_model(
+                    "router-user",
+                    &run_id,
+                    &RunModelRequest {
+                        expected_session_id: "router-session".into(),
+                        request_id: "stop-selection".into(),
+                        model: astra_turn_types::ModelSelection {
+                            offering_id: "strong".into(),
+                        },
+                        reasoning: ReasoningRequirement::ModelDefault,
+                    },
+                )
+                .await
+                .unwrap();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            state.run_control = Some(Arc::new(FaultedModelControl {
+                engine: engine.clone(),
+                fail_next_read: AtomicBool::new(false),
+                fault,
+                entered: entered.clone(),
+            }));
+            let token = Arc::new(tokio_util::sync::CancellationToken::new());
+            let flag = Arc::new(AtomicBool::new(false));
+            let lost = Arc::new(AtomicBool::new(false));
+            if stop != "flag" {
+                state.cancellation.token = Some(token.clone());
+            } else {
+                state.cancellation.flag = Some(flag.clone());
+            }
+            state.cancellation.execution_lease_lost = Some(lost.clone());
+            if stop == "deadline" {
+                host.execution_time_budget = Some(
+                    ExecutionDeadlineAuthority::from_snapshot_at(
+                        astra_services::runs::ExecutionDeadlineSnapshot {
+                            deadline_unix_ms: 100,
+                            work_deadline_unix_ms: 100,
+                        },
+                        0,
+                    )
+                    .unwrap(),
+                );
+            }
+            let (prepared, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(
+                    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(
+                        &mut host, &mut state, 1
+                    ),
+                    async {
+                        entered.notified().await;
+                        match stop {
+                            "cancel" => token.cancel(),
+                            "flag" => flag.store(true, Ordering::Release),
+                            "lease" => {
+                                lost.store(true, Ordering::Release);
+                                token.cancel();
+                            }
+                            _ => {}
+                        }
+                    },
+                )
+            })
+            .await
+            .expect("a blocked control operation must respect the stop boundary");
+            let error = prepared.err().expect("the model round must not proceed");
+            assert_eq!(
+                error.kind,
+                match stop {
+                    "deadline" => astra_core::ErrorKind::BudgetExhausted,
+                    "lease" => astra_core::ErrorKind::ServerError,
+                    _ => astra_core::ErrorKind::Cancelled,
+                }
+            );
+            let snapshot = engine
+                .run_settings_snapshot("router-user", "router-session", &run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(fault, ModelControlFault::HangSnapshot) {
+                assert!(matches!(
+                    snapshot.model.outcome.unwrap().result,
+                    RunModelOutcomeKind::Applied { .. }
+                ));
+                assert_eq!(
+                    host.admitted_model_execution.as_ref().unwrap().offering_id,
+                    "strong"
+                );
+            } else {
+                assert!(snapshot.model.outcome.is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn newer_model_choice_wins_before_the_next_provider_request() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    for lose_ack in [false, true] {
+        let (catalog, engine, mut host, mut state) = fixture().await;
+        let response = json!({
+            "choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":24}
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "newer_model_choice_wins_before_the_next_provider_request",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::OpenAi(response)],
+        )])
+        .await;
+        let url = format!("{}/v1/chat/completions", provider.base_url);
+        for model in catalog.models.write().unwrap().values_mut() {
+            model.completions_url_override = Some(url.clone());
+        }
+        state.run_control = Some(Arc::new(engine.clone()));
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        if lose_ack {
+            state.run_control = Some(Arc::new(LostModelAck {
+                engine: engine.clone(),
+                lose_once: AtomicBool::new(true),
+                after_commit: None,
+            }));
+        }
+        let run_id = state.current_run_id.clone().unwrap();
+        let request = |request_id: &str, offering_id: &str| RunModelRequest {
+            expected_session_id: "router-session".into(),
+            request_id: request_id.into(),
+            model: astra_turn_types::ModelSelection {
+                offering_id: offering_id.into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        engine
+            .request_run_model("router-user", &run_id, &request("first", "strong"))
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(
+                    &mut host, &mut state, 1
+                ),
+                async {
+                    entered.notified().await;
+                    engine
+                        .request_run_model("router-user", &run_id, &request("second", "economy"))
+                        .await
+                        .unwrap();
+                    release.notify_one();
+                },
+            )
+        })
+        .await
+        .expect("the paused admission must resume");
+        prepared.unwrap();
+        *catalog.admission_gate.write().unwrap() = None;
+        let snapshot = engine
+            .run_settings_snapshot("router-user", "router-session", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .model
+                .applied
+                .as_ref()
+                .unwrap()
+                .resolved
+                .offering_id,
+            "economy"
+        );
+        assert!(matches!(
+            snapshot.model.outcome.unwrap().result,
+            RunModelOutcomeKind::Applied { .. }
+        ));
+        let run = engine
+            .load_run("router-user", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            run.events
+                .iter()
+                .any(|event| event["data"]["change"]["kind"] == "model_outcome"
+                    && event["data"]["change"]["value"]["selection"]["request_id"] == "first"
+                    && event["data"]["change"]["value"]["result"]["status"] == "superseded")
+        );
+        state.run_control = None;
+        host.inference_owner_pod_id = Some("test-inference-owner".into());
+        host.provider_observations =
+            Some(crate::server::provider_test_support::ProviderObservationsFixture::default());
+        host.execute_turn(&mut state).await.unwrap();
+        let recorded = provider.requests.lock().await.clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].body["model"], "wire-economy");
+        provider.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn rejected_newer_choice_cannot_dispatch_a_superseded_model() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+
+    let (catalog, engine, mut host, mut state) = fixture().await;
+    state.run_control = Some(Arc::new(engine.clone()));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    let run_id = state.current_run_id.clone().unwrap();
+    let request = |id: &str, offering: &str| RunModelRequest {
+        expected_session_id: "router-session".into(),
+        request_id: id.into(),
+        model: astra_turn_types::ModelSelection {
+            offering_id: offering.into(),
+        },
+        reasoning: ReasoningRequirement::ModelDefault,
+    };
+    engine
+        .request_run_model("router-user", &run_id, &request("first", "strong"))
+        .await
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+        model: "strong".into(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1),
+            async {
+                entered.notified().await;
+                engine
+                    .request_run_model("router-user", &run_id, &request("second", "missing"))
+                    .await
+                    .unwrap();
+                release.notify_one();
+            },
+        )
+    })
+    .await
+    .expect("the paused admission must resume");
+    assert!(
+        prepared.is_err(),
+        "an unconfirmed model must not reach inference"
+    );
+    let snapshot = engine
+        .run_settings_snapshot("router-user", "router-session", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.model.applied.is_none());
+    assert!(matches!(
+        snapshot.model.outcome.unwrap().result,
+        RunModelOutcomeKind::Rejected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn lost_applied_ack_and_rejected_newer_choice_restore_confirmed_model() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    let (_, engine, mut host, mut state) = fixture().await;
+    let workdir = tempfile::tempdir().unwrap();
+    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workdir.path().to_path_buf(),
+        "router-user".into(),
+        "router-session".into(),
+        None,
+        None,
+    );
+    executor.set_agent_tool_context(
+        crate::server::runtime_tool_executor::tests::test_agent_tool_context(workdir.path()),
+    );
+    let executor = Arc::new(executor);
+    state.runtime_tool_executor = Some(executor.clone());
+    state.run_control = Some(Arc::new(engine.clone()));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    let run_id = state.current_run_id.clone().unwrap();
+    let request = |id: &str, offering: &str| RunModelRequest {
+        expected_session_id: "router-session".into(),
+        request_id: id.into(),
+        model: astra_turn_types::ModelSelection {
+            offering_id: offering.into(),
+        },
+        reasoning: ReasoningRequirement::ModelDefault,
+    };
+    engine
+        .request_run_model("router-user", &run_id, &request("first", "strong"))
+        .await
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    state.run_control = Some(Arc::new(LostModelAck {
+        engine: engine.clone(),
+        lose_once: AtomicBool::new(true),
+        after_commit: Some((entered.clone(), release.clone())),
+    }));
+    let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1),
+            async {
+                entered.notified().await;
+                engine
+                    .request_run_model("router-user", &run_id, &request("second", "missing"))
+                    .await
+                    .unwrap();
+                release.notify_one();
+            },
+        )
+    })
+    .await
+    .expect("the lost acknowledgement must be reconciled");
+    prepared.unwrap();
+    let snapshot = engine
+        .run_settings_snapshot("router-user", "router-session", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        snapshot.model.outcome.unwrap().result,
+        RunModelOutcomeKind::Rejected { .. }
+    ));
+    assert_eq!(
+        snapshot.model.applied.unwrap().resolved.offering_id,
+        "strong"
+    );
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "strong"
+    );
+    assert_eq!(
+        crate::server::runtime_tool_executor::tests::test_current_agent_model(&executor).as_deref(),
+        Some("strong")
+    );
+}
+
+#[tokio::test]
+async fn active_model_change_applies_after_the_current_tool_round() {
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    use astra_turn_types::{ReasoningRequirement, RunModelRequest};
+
+    let (catalog, engine, _, mut state) = fixture().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_provider = entered.clone();
+    let chunks = [
+        json!({"choices":[{"delta":{"reasoning_content":"private to the first model"}}]}),
+        json!({"choices":[{"delta":{"content":concat!(
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"tool_search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">select:glob</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke></｜DSML｜ calls>"
+        )},"finish_reason":"stop"}]}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n").into_bytes())
+    .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+    .collect();
+    let provider = ProviderGateway::start(vec![
+        ProviderScript::new(
+            "first model finishes its in-flight tool call",
+            move |request| {
+                let matches = request.path == "/v1/chat/completions"
+                    && request.body["model"] == "wire-strong";
+                if matches {
+                    entered_provider.notify_one();
+                }
+                matches
+            },
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        ),
+        ProviderScript::new(
+            "new model continues with the tool result",
+            |request| request.path == "/v1/chat/completions" && request.body["model"] == "wire-economy",
+            vec![ProviderResponse::OpenAi(json!({
+                "choices":[{"message":{"content":"continued with the selected model"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":12,"completion_tokens":24}
+            }))],
+        ),
+    ]).await;
+    let url = format!("{}/v1/chat/completions", provider.base_url);
+    for model in catalog.models.write().unwrap().values_mut() {
+        model.completions_url_override = Some(url.clone());
+    }
+    let baseline = catalog.models.read().unwrap()["strong"].clone();
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let mut host = ServerAgenticLoopHostBuilder::new(
+        mock_matrixone(),
+        mock_encryptor(),
+        "router-user".into(),
+        "router-session".into(),
+    )
+    .with_admitted_model_execution(Some(baseline))
+    .with_model_service(Some(catalog))
+    .with_provider_observations(observations.clone())
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+    .build();
+    let decision = astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","assessment":{"difficulty":"easy","difficulty_confidence":"high"}}"#).unwrap();
+    host.apply_work_admission_decision(decision);
+    host.completed_work_admission_phase =
+        Some((Instant::now(), Instant::now(), 0, TurnPhaseOutcome::Decided));
+    state.run_control = Some(Arc::new(engine.clone()));
+    state.skills.request_constraints.allowed_tools = Some(
+        ["glob".to_string(), "tool_search".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
+        crate::orchestration::PermissionMode::Auto,
+    ));
+    let ledger =
+        crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+            engine.clone(),
+        )
+        .unwrap();
+    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workspace.path().to_path_buf(),
+        "router-user".into(),
+        "router-session".into(),
+        None,
+        None,
+    );
+    executor.set_invocation_ledger(ledger);
+    executor.set_execution_bindings(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    );
+    state.runtime_tool_executor = Some(Arc::new(executor));
+    let run_id = state.current_run_id.clone().unwrap();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            crate::turn::agentic_loop::host::run_agentic_loop_with_host(&mut host, &mut state),
+            async {
+                entered.notified().await;
+                engine
+                    .request_run_model(
+                        "router-user",
+                        &run_id,
+                        &RunModelRequest {
+                            expected_session_id: "router-session".into(),
+                            request_id: "switch-during-tool-round".into(),
+                            model: astra_turn_types::ModelSelection {
+                                offering_id: "economy".into(),
+                            },
+                            reasoning: ReasoningRequirement::ModelDefault,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                release.notify_one();
+            }
+        )
+    })
+    .await
+    .expect("the active model change and the tool round must complete");
+    result.expect("the same run must continue after changing model");
+    assert_eq!(state.final_text, "continued with the selected model");
+    assert_eq!(
+        state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|record| record.name == "tool_search" && record.was_executed())
+            .count(),
+        1
+    );
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["model"], "wire-strong");
+    assert_eq!(requests[1].body["model"], "wire-economy");
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .expect("the next model receives the tool call");
+    let call = assistant["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|call| call["function"]["name"] == "tool_search")
+        .expect("the original tool call remains available");
+    let arguments: Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments["query"], "select:glob");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == call["id"])
+        .expect("the tool result remains paired with its call");
+    assert!(result["content"].to_string().contains("glob"));
+    assert!(!assistant["content"].to_string().contains("DSML"));
+    assert!(
+        !requests[1]
+            .body
+            .to_string()
+            .contains("private to the first model")
+    );
+    drop(requests);
+    observations.assert_quiescent();
+    provider.assert_complete();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_or_deadline_interrupts_model_admission_without_an_outcome() {
+    use astra_turn_types::{ReasoningRequirement, RunModelRequest};
+    for expire in [false, true] {
+        let (catalog, engine, mut host, mut state) = fixture().await;
+        state.run_control = Some(Arc::new(engine.clone()));
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        let run_id = state.current_run_id.clone().unwrap();
+        engine
+            .request_run_model(
+                "router-user",
+                &run_id,
+                &RunModelRequest {
+                    expected_session_id: "router-session".into(),
+                    request_id: "cancelled-choice".into(),
+                    model: astra_turn_types::ModelSelection {
+                        offering_id: "strong".into(),
+                    },
+                    reasoning: ReasoningRequirement::ModelDefault,
+                },
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(cancel.clone());
+        if expire {
+            host.execution_time_budget = Some(
+                ExecutionDeadlineAuthority::from_snapshot_at(
+                    astra_services::runs::ExecutionDeadlineSnapshot {
+                        deadline_unix_ms: 100,
+                        work_deadline_unix_ms: 100,
+                    },
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(
+                    &mut host, &mut state, 1
+                ),
+                async {
+                    entered.notified().await;
+                    if !expire {
+                        cancel.cancel();
+                    }
+                },
+            )
+        })
+        .await
+        .expect("cancellation must not wait for model admission");
+        let expected = if expire {
+            astra_core::ErrorKind::BudgetExhausted
+        } else {
+            astra_core::ErrorKind::Cancelled
+        };
+        assert!(matches!(prepared, Err(error) if error.kind == expected));
+        let snapshot = engine
+            .run_settings_snapshot("router-user", "router-session", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            snapshot.model.outcome.is_none(),
+            "cancelled admission must not publish an outcome"
+        );
+        assert_eq!(
+            snapshot.model.requested.unwrap().request_id,
+            "cancelled-choice"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_or_deadline_interrupts_restoring_an_applied_model() {
+    use astra_turn_types::{ReasoningRequirement, RunModelSelection};
+    for expire in [false, true] {
+        let (catalog, _, mut host, mut state) = fixture().await;
+        host.admitted_model_execution = Some(catalog.models.read().unwrap()["economy"].clone());
+        let selection = RunModelSelection {
+            request_id: "applied".into(),
+            revision: 1,
+            model: astra_turn_types::ModelSelection {
+                offering_id: "strong".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let applied = astra_services::runs::RunModelApplied {
+            selection,
+            resolved: astra_services::runs::ResolvedModelSelection {
+                offering_id: "strong".into(),
+                model_name: "strong".into(),
+                source_identity: None,
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+            owner_generation: 0,
+            round_index: 0,
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(cancel.clone());
+        if expire {
+            host.execution_time_budget = Some(
+                ExecutionDeadlineAuthority::from_snapshot_at(
+                    astra_services::runs::ExecutionDeadlineSnapshot {
+                        deadline_unix_ms: 100,
+                        work_deadline_unix_ms: 100,
+                    },
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(host.ensure_applied_model(&mut state, &applied), async {
+                entered.notified().await;
+                if !expire {
+                    cancel.cancel();
+                }
+            })
+        })
+        .await
+        .expect("restoring an applied model must be interruptible");
+        let expected = if expire {
+            astra_core::ErrorKind::BudgetExhausted
+        } else {
+            astra_core::ErrorKind::Cancelled
+        };
+        assert!(matches!(result, Err(error) if error.kind == expected));
+        assert_eq!(
+            host.admitted_model_execution.as_ref().unwrap().offering_id,
+            "economy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rotated_catalog_route_preserves_public_tool_history_on_the_wire() {
+    let (catalog, _engine, mut host, mut state) = fixture().await;
+    host.model_routing = None;
+    host.inference_owner_pod_id = Some("test-inference-owner".into());
+    host.provider_observations =
+        Some(crate::server::provider_test_support::ProviderObservationsFixture::default());
+    let response = json!({"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":12,"completion_tokens":24}});
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "rotated_catalog_route_preserves_public_tool_history_on_the_wire",
+        |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::OpenAi(response)],
+    )])
+    .await;
+    let mut initial = catalog.models.read().unwrap()["strong"].clone();
+    initial.api_key = "old-account".into();
+    initial.base_url = format!("{}/old", provider.base_url);
+    initial.completions_url_override =
+        Some(format!("{}/old/v1/chat/completions", provider.base_url));
+    catalog
+        .models
+        .write()
+        .unwrap()
+        .insert("strong".into(), initial.clone());
+    host.admitted_model_execution = Some(initial);
+    host.resolve_llm_config_for_state(&state).await.unwrap();
+    let mut assistant = json!({"role":"assistant", "content":"working", "reasoning_content":"old-private-reasoning",
+        "tool_calls":[{"id":"rotation-call", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]});
+    host.attest_current_model_message(&state, &mut assistant);
+    state.messages = vec![
+        json!({"role":"user","content":"inspect"}),
+        assistant,
+        json!({"role":"tool", "tool_call_id":"rotation-call", "content":"public-tool-result"}),
+    ];
+    {
+        let mut models = catalog.models.write().unwrap();
+        let updated = models.get_mut("strong").unwrap();
+        updated.api_key = "new-account".into();
+        updated.base_url = provider.base_url.clone();
+        updated.completions_url_override =
+            Some(format!("{}/v1/chat/completions", provider.base_url));
+    }
+    host.admitted_model_execution.as_mut().unwrap().admitted_at =
+        Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
+    let rotated = host.resolve_llm_config_for_state(&state).await.unwrap();
+    assert_eq!(rotated.api_key, "new-account");
+    host.execute_turn(&mut state).await.unwrap();
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 1);
+    let wire = requests[0].body.to_string();
+    assert!(wire.contains("public-tool-result"), "{wire}");
+    assert!(!wire.contains("old-private-reasoning"), "{wire}");
+    provider.assert_complete();
+}
+
+#[tokio::test]
 async fn unavailable_incompatible_and_cross_billing_economy_retain_strong() {
     for case in [
         "unavailable",
@@ -700,6 +1782,7 @@ async fn auto_children_inherit_the_committed_model_instead_of_cached_baseline() 
     )
     .await
     .unwrap()
+    .0
     .unwrap();
     assert_eq!(inherited.offering_id, "economy");
     engine

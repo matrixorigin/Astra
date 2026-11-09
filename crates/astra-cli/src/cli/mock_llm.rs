@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -26,6 +26,8 @@ pub enum MockScenario {
     ToolThenComplete,
     /// Launch a gated background shell and ask the user for a decision.
     BackgroundThenQuestion,
+    /// Hold a foreground shell until the test releases its workspace gate.
+    ForegroundThenQuestion,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
     /// Root activates and launches one asynchronous child, then acknowledges its launch receipt.
@@ -41,6 +43,7 @@ impl MockScenario {
         match self {
             Self::ToolThenComplete => "one write_file tool call, then completion",
             Self::BackgroundThenQuestion => "background shell, then a user decision",
+            Self::ForegroundThenQuestion => "foreground shell, then a user decision",
             Self::Slow => "3s delay before response (tests progress display)",
             Self::AgentThenComplete => "one asynchronous child agent, then launch acknowledgement",
             Self::FanoutThenComplete => "Server-owned three-slot fanout with streamed completion",
@@ -226,13 +229,13 @@ fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
     s
 }
 
-fn body_background_then_question(round: u32) -> String {
+fn body_background_then_question(round: u32, foreground: bool) -> String {
     let mut body = session_info("mock-run-tool");
     if round == 1 {
         let args = serde_json::json!({
             "command": "while [ ! -f release-background ]; do sleep 0.05; done; printf background-task-finished",
             "description": "gated background task",
-            "yield_time_ms": 0,
+            "yield_time_ms": if foreground { 20_000 } else { 0 },
         });
         body.push_str(&tool_call_start("call-1", "bash", args.clone()));
         body.push_str(&tool_request("call-1", "bash", args));
@@ -350,10 +353,13 @@ struct ServerState {
     issued_tool_requests: Arc<Mutex<Vec<IssuedToolRequestIdentity>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
     completed_fanout_children: Arc<AtomicU8>,
-    cancelled_runs: Arc<Mutex<Vec<String>>>,
+    cancellation_requests: Arc<Mutex<Vec<String>>>,
+    completed_slow_runs: Arc<Mutex<Vec<String>>>,
     callback_ready: Arc<tokio::sync::Notify>,
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
+    held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    fail_model_catalog: Arc<AtomicBool>,
 }
 
 /// Keep tool dispatch and continuation under one Server-owned response. Dropping
@@ -437,7 +443,12 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         .unwrap_or("mock-agent"),
                     round + 1,
                 ),
-                MockScenario::BackgroundThenQuestion => body_background_then_question(round + 1),
+                MockScenario::BackgroundThenQuestion | MockScenario::ForegroundThenQuestion => {
+                    body_background_then_question(
+                        round + 1,
+                        state.scenario == MockScenario::ForegroundThenQuestion,
+                    )
+                }
                 _ => unreachable!("only Edge-tool scenarios wait for callbacks"),
             };
             let run_id = body
@@ -516,7 +527,11 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         event["tool_calls_count"] = count.into();
                         event["observation_tool_calls_count"] = 0.into();
                         event["tools_used"] = serde_json::json!([
-                            if state.scenario == MockScenario::BackgroundThenQuestion {
+                            if matches!(
+                                state.scenario,
+                                MockScenario::BackgroundThenQuestion
+                                    | MockScenario::ForegroundThenQuestion
+                            ) {
                                 "bash"
                             } else {
                                 "write_file"
@@ -606,6 +621,9 @@ fn server_orchestration_response(state: ServerState) -> Response<axum::body::Bod
         let call = "mock-control-call";
         let mut body = String::new();
         if phase == 0 {
+            if let Some(release) = &state.held_binding_release {
+                release.notified().await;
+            }
             body.push_str(&session_info(root));
             let agents = snapshot.runs.iter().enumerate().map(|(index, run)| serde_json::json!({
                 "slot_index": index, "id": format!("review-{}", index+1),
@@ -783,7 +801,9 @@ async fn handle_chat_turn(
 
     if matches!(
         state.scenario,
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+        MockScenario::ToolThenComplete
+            | MockScenario::BackgroundThenQuestion
+            | MockScenario::ForegroundThenQuestion
     ) {
         return orchestration_response(state, request_body);
     }
@@ -794,11 +814,19 @@ async fn handle_chat_turn(
         | MockScenario::FanoutPartialThenComplete => {
             unreachable!("Server agent scenarios own their stream")
         }
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => {
+        MockScenario::ToolThenComplete
+        | MockScenario::BackgroundThenQuestion
+        | MockScenario::ForegroundThenQuestion => {
             unreachable!("tool scenarios use one orchestration stream")
         }
         MockScenario::Slow => {
-            body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
+            let body = body_slow(&agent_id, turn, state.held_response_release.as_deref()).await;
+            state
+                .completed_slow_runs
+                .lock()
+                .expect("mock completed runs")
+                .push(format!("mock-run-{turn}"));
+            body
         }
     };
     // Callback authority is the exact request identity this mock emitted,
@@ -842,15 +870,18 @@ fn mock_model_catalog_entry(name: &str) -> Value {
     })
 }
 
-async fn handle_models() -> axum::Json<Value> {
+async fn handle_models(State(state): State<ServerState>) -> Result<axum::Json<Value>, StatusCode> {
+    if state.fail_model_catalog.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let items = mock_model_catalog();
-    axum::Json(serde_json::json!({
+    Ok(axum::Json(serde_json::json!({
         "items": items,
         "next_cursor": null,
         "limit": 50,
         "total": 3,
         "catalog_revision": "sha256:mock-catalog"
-    }))
+    })))
 }
 
 fn mock_model_catalog() -> Vec<Value> {
@@ -1021,7 +1052,7 @@ fn orchestration_snapshot(
         .is_empty();
     let completed = state.completed_fanout_children.load(Ordering::Acquire);
     let cancelled = state
-        .cancelled_runs
+        .cancellation_requests
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut runs = Vec::new();
@@ -1098,14 +1129,34 @@ async fn handle_cancel_run(
     State(state): State<ServerState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<axum::Json<Value>, StatusCode> {
+    if state.scenario == MockScenario::Slow
+        && state
+            .completed_slow_runs
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .contains(&run_id)
+    {
+        // Slow holds the HTTP response until the completed turn is released;
+        // a later cancellation observes that already-settled exact run.
+        state
+            .cancellation_requests
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .push(run_id.clone());
+        return Ok(axum::Json(serde_json::json!({
+            "run_id": run_id, "status": "completed", "execution_settled": true
+        })));
+    }
     // A pending local tool approval can interrupt the fixture's root stream.
     if matches!(
         state.scenario,
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+        MockScenario::ToolThenComplete
+            | MockScenario::BackgroundThenQuestion
+            | MockScenario::ForegroundThenQuestion
     ) && run_id == "mock-run-tool"
     {
         state
-            .cancelled_runs
+            .cancellation_requests
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .push(run_id.clone());
@@ -1127,7 +1178,7 @@ async fn handle_cancel_run(
             return Err(StatusCode::CONFLICT);
         }
         state
-            .cancelled_runs
+            .cancellation_requests
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .push(run_id.clone());
@@ -1179,7 +1230,9 @@ async fn handle_transcript(
         return Err(StatusCode::NOT_FOUND);
     }
     let root_run = match state.scenario {
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => "mock-run-tool",
+        MockScenario::ToolThenComplete
+        | MockScenario::BackgroundThenQuestion
+        | MockScenario::ForegroundThenQuestion => "mock-run-tool",
         MockScenario::AgentThenComplete => "mock-run-agent-root",
         MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete => {
             "mock-run-fanout-root"
@@ -1271,25 +1324,36 @@ pub struct MockLlmServer {
     received_requests: Arc<Mutex<Vec<Value>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
     completed_fanout_children: Arc<AtomicU8>,
-    cancelled_runs: Arc<Mutex<Vec<String>>>,
+    cancellation_requests: Arc<Mutex<Vec<String>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
+    held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    fail_model_catalog: Arc<AtomicBool>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
-        Self::start_inner(scenario, false, Router::new()).await
+        Self::start_inner(scenario, false, false, Router::new()).await
     }
 
     /// Add boundary-specific protocol fixtures alongside the scripted chat.
     pub async fn start_with_routes(scenario: MockScenario, routes: Router) -> Result<Self, String> {
-        Self::start_inner(scenario, false, routes).await
+        Self::start_inner(scenario, false, false, routes).await
     }
 
     /// Hold a Server orchestration stream until the test releases its terminal
     /// facts. Partial fanout results are published explicitly by the test.
     pub async fn start_with_held_orchestration(scenario: MockScenario) -> Result<Self, String> {
+        Self::start_with_held_orchestration_and_routes(scenario, false, Router::new()).await
+    }
+
+    /// Add protocol routes while retaining deterministic orchestration timing.
+    pub async fn start_with_held_orchestration_and_routes(
+        scenario: MockScenario,
+        hold_binding: bool,
+        routes: Router,
+    ) -> Result<Self, String> {
         if !matches!(
             scenario,
             MockScenario::AgentThenComplete
@@ -1298,19 +1362,20 @@ impl MockLlmServer {
         ) {
             return Err("held orchestration requires an agent or fanout scenario".to_string());
         }
-        Self::start_inner(scenario, true, Router::new()).await
+        Self::start_inner(scenario, true, hold_binding, routes).await
     }
 
     /// Start the slow-response fixture at an explicit provider boundary.
     /// The test releases the response only after it has observed the UI state
     /// under test, so cancellation coverage cannot race a fixed sleep.
     pub async fn start_with_held_slow_response(read_routes: Router) -> Result<Self, String> {
-        Self::start_inner(MockScenario::Slow, true, read_routes).await
+        Self::start_inner(MockScenario::Slow, true, false, read_routes).await
     }
 
     async fn start_inner(
         scenario: MockScenario,
         hold_response: bool,
+        hold_binding: bool,
         read_routes: Router,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1323,8 +1388,10 @@ impl MockLlmServer {
         let issued_tool_requests = Arc::new(Mutex::new(Vec::new()));
         let tool_results = Arc::new(Mutex::new(Vec::new()));
         let completed_fanout_children = Arc::new(AtomicU8::new(0));
-        let cancelled_runs = Arc::new(Mutex::new(Vec::new()));
+        let cancellation_requests = Arc::new(Mutex::new(Vec::new()));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
+        let held_binding_release = hold_binding.then(|| Arc::new(tokio::sync::Notify::new()));
+        let fail_model_catalog = Arc::new(AtomicBool::new(false));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
@@ -1332,10 +1399,13 @@ impl MockLlmServer {
             issued_tool_requests,
             tool_results: tool_results.clone(),
             completed_fanout_children: completed_fanout_children.clone(),
-            cancelled_runs: cancelled_runs.clone(),
+            cancellation_requests: cancellation_requests.clone(),
+            completed_slow_runs: Arc::new(Mutex::new(Vec::new())),
             callback_ready: Arc::new(tokio::sync::Notify::new()),
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
+            held_binding_release: held_binding_release.clone(),
+            fail_model_catalog: fail_model_catalog.clone(),
         };
 
         let app = Router::new()
@@ -1377,8 +1447,10 @@ impl MockLlmServer {
             received_requests,
             tool_results,
             completed_fanout_children,
-            cancelled_runs,
+            cancellation_requests,
             held_response_release,
+            held_binding_release,
+            fail_model_catalog,
             _shutdown: tx,
         })
     }
@@ -1407,8 +1479,8 @@ impl MockLlmServer {
             .unwrap_or_default()
     }
 
-    pub fn cancelled_runs(&self) -> Vec<String> {
-        self.cancelled_runs
+    pub fn cancellation_requests(&self) -> Vec<String> {
+        self.cancellation_requests
             .lock()
             .expect("fixture cancellation records")
             .clone()
@@ -1418,6 +1490,17 @@ impl MockLlmServer {
         self.held_response_release
             .as_ref()
             .expect("mock server was not started with a held response")
+            .notify_one();
+    }
+
+    pub fn fail_model_catalog(&self) {
+        self.fail_model_catalog.store(true, Ordering::Release);
+    }
+
+    pub fn release_held_binding(&self) {
+        self.held_binding_release
+            .as_ref()
+            .expect("mock server was not started with a held binding")
             .notify_one();
     }
 }
@@ -1541,7 +1624,10 @@ mod tests {
         assert_eq!(after.runs[2].status, SessionRunLifecycleStatus::Cancelled);
         assert!(after.runs[2].available_actions.is_empty());
         assert!(after.runs[2].run_event_high_watermark > before.runs[2].run_event_high_watermark);
-        assert_eq!(server.cancelled_runs(), std::slice::from_ref(selected));
+        assert_eq!(
+            server.cancellation_requests(),
+            std::slice::from_ref(selected)
+        );
         let retained = client
             .get_session_transcript(
                 Some("fixture"),
@@ -1597,9 +1683,10 @@ mod tests {
             MockScenario::FanoutThenComplete,
             MockScenario::FanoutPartialThenComplete,
         ] {
-            let server = super::MockLlmServer::start_inner(scenario, true, axum::Router::new())
-                .await
-                .unwrap();
+            let server =
+                super::MockLlmServer::start_inner(scenario, true, false, axum::Router::new())
+                    .await
+                    .unwrap();
             let mut response = astra_core::net::client_builder_for_target(&server.base_url)
                 .build()
                 .unwrap()

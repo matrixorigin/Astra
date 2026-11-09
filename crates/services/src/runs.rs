@@ -1,4 +1,4 @@
-mod permission_control;
+mod settings_control;
 mod terminal;
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
@@ -9,19 +9,30 @@ use astra_turn_types::{
     ModelSelection, SessionAttachmentV1, SessionKeyV1, UserIntentDelivery, UserIntentStatus,
 };
 pub use astra_turn_types::{
-    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
-    RunPermissionModeSnapshot,
+    RunModelOutcome, RunModelRequest, RunModelSelection, RunPermissionModeApplied,
+    RunPermissionModeRequest, RunPermissionModeSelection, RunPermissionModeSnapshot,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
+pub use settings_control::{RunModelApplied, RunModelSettingsSnapshot, RunSettingsSnapshot};
+use settings_control::{RunSettingsChange, RunSettingsEvent};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
+
+/// Current model authority for a child or a resumed execution. This is a
+/// read of the existing run facts, not another stored model state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InheritedRunModel {
+    Explicit(RunModelApplied),
+    Auto(Box<crate::model_routing::ModelRoutingDecision>),
+    Original,
+}
 pub(crate) use terminal::TerminalReceiptRunIdentity;
 pub use terminal::{
     CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalClaim,
@@ -85,6 +96,28 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Permission mode control is unavailable",
+        ))
+    }
+    async fn request_run_model(
+        &self,
+        _user_id: String,
+        _run_id: String,
+        _request: RunModelRequest,
+    ) -> Result<RunModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Model control is unavailable",
+        ))
+    }
+    async fn run_model_snapshot(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _run_id: String,
+    ) -> Result<astra_turn_types::RunModelSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Model control is unavailable",
         ))
     }
     async fn permission_mode_snapshot(
@@ -320,6 +353,20 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Active-run user intents are not supported",
+        ))
+    }
+
+    /// Reconcile one previously submitted intent without streaming a run.
+    async fn run_user_intent_status(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _run_id: String,
+        _intent_id: String,
+    ) -> Result<UserIntentStatus, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Intent status is unavailable",
         ))
     }
 
@@ -2199,6 +2246,50 @@ pub struct StoredRunAdmission {
 impl StoredRunAdmission {
     pub fn run(&self) -> &DurableRunRecord {
         &self.run
+    }
+}
+
+/// Facts needed before admitting one guidance message. The admission
+/// transaction remains authoritative for the Run and message outcome.
+#[derive(Clone, Debug)]
+pub struct RunGuidancePreflight {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub agent_id: Option<String>,
+    pub source_already_admitted: bool,
+    pub native_anchor: bool,
+}
+
+fn project_run_guidance_preflight<'a>(
+    run: &DurableRunRecord,
+    source_key: &str,
+    events: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> RunGuidancePreflight {
+    let mut source_already_admitted = false;
+    let mut native_anchor = false;
+    for event in events {
+        source_already_admitted |= event
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_key);
+        native_anchor |= event.get("event_type").and_then(serde_json::Value::as_str)
+            == Some(COLLABORATOR_STAGE_EVENT)
+            && serde_json::from_value::<CollaboratorStageAdmission>(
+                event
+                    .get("admission")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .is_ok_and(|admission| admission.anchor_run_id == run.run_id);
+    }
+    RunGuidancePreflight {
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        run_id: run.run_id.clone(),
+        agent_id: run.agent_id.clone(),
+        source_already_admitted,
+        native_anchor,
     }
 }
 
@@ -6024,6 +6115,60 @@ fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
 
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
+    async fn run_user_intent_status(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        intent_id: &str,
+    ) -> Result<Option<UserIntentStatus>, String> {
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(None);
+        };
+        if run.session_id != session_id {
+            return Ok(None);
+        }
+        let keys = user_intent_status_keys(intent_id);
+        let events: Vec<_> = run
+            .events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut event)| {
+                keys.iter()
+                    .any(|key| {
+                        Some(key.as_str())
+                            == event
+                                .get("idempotency_key")
+                                .and_then(serde_json::Value::as_str)
+                    })
+                    .then(|| {
+                        if event.get("index").is_none() {
+                            event["index"] = serde_json::json!(index);
+                        }
+                        event
+                    })
+            })
+            .collect();
+        user_intent_status_from_events(intent_id, &events)
+    }
+    async fn request_run_model(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        Err("model control is not supported by this store".into())
+    }
+    async fn finish_run_model(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _outcome: &RunModelOutcome,
+        _resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        Err("model control is not supported by this store".into())
+    }
     async fn request_permission_mode(
         &self,
         _user_id: &str,
@@ -6034,11 +6179,56 @@ pub trait RunStateStore: Send + Sync {
     }
     async fn permission_mode_snapshot(
         &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        Ok(self
+            .run_settings_snapshot(user_id, session_id, run_id)
+            .await?
+            .map(|settings| settings.permission))
+    }
+    async fn run_settings_snapshot(
+        &self,
         _user_id: &str,
         _session_id: &str,
         _run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
         Ok(None)
+    }
+    /// Resolve the same model facts used by the parent execution. Database
+    /// implementations read both indexed facts in one round trip.
+    async fn inherited_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<InheritedRunModel, String> {
+        if let Some(choice) = self
+            .run_settings_snapshot(user_id, session_id, run_id)
+            .await?
+            .and_then(|settings| settings.model.applied)
+        {
+            return Ok(InheritedRunModel::Explicit(choice));
+        }
+        let event = self
+            .load_run_event_by_idempotency_key(
+                user_id,
+                run_id,
+                crate::model_routing::EVENT_TYPE,
+                crate::model_routing::DECISION_KEY,
+            )
+            .await?;
+        match event {
+            Some(event) => {
+                let decision: crate::model_routing::ModelRoutingDecision =
+                    serde_json::from_value(event["data"].clone())
+                        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
+                decision.validate_identity(run_id, session_id)?;
+                Ok(InheritedRunModel::Auto(Box::new(decision)))
+            }
+            None => Ok(InheritedRunModel::Original),
+        }
     }
     #[allow(clippy::too_many_arguments)]
     async fn apply_permission_mode(
@@ -6187,6 +6377,20 @@ pub trait RunStateStore: Send + Sync {
             .load_run(user_id, run_id)
             .await?
             .map(|run| StoredRunAdmission { run }))
+    }
+
+    /// Read only the facts used to route one explicit guidance request.
+    /// Implementations must not substitute this observation for atomic admission.
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .map(|run| project_run_guidance_preflight(&run, source_key, &run.events)))
     }
 
     /// Order a no-row terminal receipt against child creation under the same
@@ -7633,6 +7837,74 @@ pub fn normalized_run_user_intent_content(input: &serde_json::Value) -> Option<S
     }
 }
 
+fn user_intent_status_keys(intent_id: &str) -> [String; 3] {
+    [
+        format!("user_intent:{intent_id}"),
+        format!("user_intent_applied:{intent_id}"),
+        format!("user_intent_returned:{intent_id}"),
+    ]
+}
+
+fn user_intent_status_from_events(
+    intent_id: &str,
+    events: &[serde_json::Value],
+) -> Result<Option<UserIntentStatus>, String> {
+    let mut source = None;
+    let mut disposition = None;
+    for event in events {
+        let kind = extract_event_type(event);
+        if kind == "user_intent" {
+            if source.replace(event).is_some() {
+                return Err("duplicate intent source".into());
+            }
+        } else if matches!(
+            kind.as_str(),
+            "user_intent_applied" | "user_intent_returned"
+        ) {
+            if disposition.replace(event).is_some() {
+                return Err("conflicting intent dispositions".into());
+            }
+        } else {
+            return Err("invalid intent status event".into());
+        }
+    }
+    let Some(source) = source else {
+        return if disposition.is_some() {
+            Err("intent disposition has no source".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let source_index = source
+        .get("index")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|index| *index >= 0)
+        .ok_or("intent source has no event index")?;
+    let (source_id, _, _, _) = validated_user_intent_source(source_index, source)?;
+    if source_id != intent_id {
+        return Err("intent source identity mismatch".into());
+    }
+    let Some(disposition) = disposition else {
+        return Ok(Some(UserIntentStatus::AcceptedRemote));
+    };
+    let status = match extract_event_type(disposition).as_str() {
+        "user_intent_applied" => UserIntentStatus::Applied,
+        "user_intent_returned" => UserIntentStatus::Returned,
+        _ => return Err("invalid intent disposition".into()),
+    };
+    let expected = user_intent_disposition_event_from_source(source_index, source, status)?;
+    if ["intent_id", "delivery", "status", "event_index", "input"]
+        .iter()
+        .any(|field| {
+            disposition.get("data").and_then(|data| data.get(*field))
+                != expected.get("data").and_then(|data| data.get(*field))
+        })
+    {
+        return Err("intent disposition does not match its source".into());
+    }
+    Ok(Some(status))
+}
+
 fn validated_user_intent_source(
     source_event_index: i64,
     source: &serde_json::Value,
@@ -8152,6 +8424,25 @@ fn is_checkpoint_version(version: &str) -> bool {
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
+    async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &RunModelOutcome,
+        resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        self.finish_model_request_inner(user_id, session_id, run_id, outcome, resolved)
+            .await
+    }
+    async fn request_run_model(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        self.request_model_inner(user_id, run_id, request).await
+    }
     async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -8161,13 +8452,13 @@ impl RunStateStore for InMemoryRunStateStore {
         self.request_permission_mode_inner(user_id, run_id, request)
             .await
     }
-    async fn permission_mode_snapshot(
+    async fn run_settings_snapshot(
         &self,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
+        self.run_settings_snapshot_inner(user_id, session_id, run_id)
             .await
     }
     async fn apply_permission_mode(
@@ -8415,6 +8706,19 @@ impl RunStateStore for InMemoryRunStateStore {
             .cloned())
     }
 
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .get(run_id)
+            .filter(|run| run.user_id == user_id)
+            .map(|run| project_run_guidance_preflight(run, source_key, &run.events)))
+    }
+
     async fn find_latest_root_run(
         &self,
         user_id: &str,
@@ -8486,9 +8790,8 @@ impl RunStateStore for InMemoryRunStateStore {
         let expected_key = format!("user_intent:{}", request.intent_id);
         if let Some((position, existing)) =
             run.events.iter().enumerate().rev().find(|(_, event)| {
-                extract_event_type(event) == "user_intent"
-                    && extract_optional_string(event, "idempotency_key").as_deref()
-                        == Some(expected_key.as_str())
+                extract_optional_string(event, "idempotency_key").as_deref()
+                    == Some(expected_key.as_str())
             })
         {
             if !run_guidance_event_matches(existing, request.event) {
@@ -13351,6 +13654,44 @@ async fn exact_run_event_receipts_match(
     Ok(true)
 }
 
+fn original_run_model_matches(expected: &DurableRunRecord, actual: &DurableRunRecord) -> bool {
+    let OpeningBody::Loaded(Some(opening)) = &actual.opening else {
+        return expected.model_offering_id == actual.model_offering_id
+            && expected.resolved_model_name == actual.resolved_model_name;
+    };
+    let Some(expected_hash) = expected.opening_hash.as_ref() else {
+        return false;
+    };
+    if opening.encode().ok().as_ref().map(|encoded| &encoded.hash) != Some(expected_hash) {
+        return false;
+    }
+    let Ok(admission) = opening.admission_data() else {
+        return false;
+    };
+    match (
+        admission.get("model_selection"),
+        admission.get("resolved_model_selection"),
+    ) {
+        (None, None) => {
+            expected.model_offering_id == actual.model_offering_id
+                && expected.resolved_model_name == actual.resolved_model_name
+        }
+        (Some(selection), Some(resolved)) => {
+            let Ok(selection) = serde_json::from_value::<ModelSelection>(selection.clone()) else {
+                return false;
+            };
+            let Ok(resolved) = serde_json::from_value::<ResolvedModelSelection>(resolved.clone())
+            else {
+                return false;
+            };
+            selection.offering_id == resolved.offering_id
+                && expected.model_offering_id.as_deref() == Some(selection.offering_id.as_str())
+                && expected.resolved_model_name.as_deref() == Some(resolved.model_name.as_str())
+        }
+        _ => false,
+    }
+}
+
 fn durable_run_start_receipt_matches(
     expected: &DurableRunRecord,
     actual: &DurableRunRecord,
@@ -13380,8 +13721,7 @@ fn durable_run_start_receipt_matches(
         && expected.agent_binding_id == actual.agent_binding_id
         && expected.agent_binding_name == actual.agent_binding_name
         && expected.agent_binding_schema_version == actual.agent_binding_schema_version
-        && expected.model_offering_id == actual.model_offering_id
-        && expected.resolved_model_name == actual.resolved_model_name
+        && original_run_model_matches(expected, actual)
         && expected.runtime_profile == actual.runtime_profile
         && expected.opening_hash == actual.opening_hash
         && expected.context_admission_hash == actual.context_admission_hash
@@ -16252,6 +16592,75 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn run_user_intent_status(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        intent_id: &str,
+    ) -> Result<Option<UserIntentStatus>, String> {
+        validate_expected_run_session_id(session_id)?;
+        if intent_id.trim() != intent_id || intent_id.is_empty() {
+            return Err("invalid intent identity".into());
+        }
+        let [source, applied, returned] = user_intent_status_keys(intent_id);
+        let rows = sqlx::query(
+            "SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=? \
+             UNION ALL SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=? \
+             UNION ALL SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(source)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(applied)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(returned)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|e| e.to_string())?;
+        // MatrixOne chooses a run-wide scan when session_id is in the lookup
+        // predicate. Each unique-key lookup is bounded; verify session before
+        // decoding or returning any payload.
+        for row in &rows {
+            if row
+                .try_get::<String, _>("session_id")
+                .map_err(|e| e.to_string())?
+                != session_id
+            {
+                return Ok(None);
+            }
+        }
+        let events = rows
+            .iter()
+            .map(|row| decode_run_event_payload(row, run_id).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        user_intent_status_from_events(intent_id, &events)
+    }
+    async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &RunModelOutcome,
+        resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        self.finish_model_request_inner(user_id, session_id, run_id, outcome, resolved)
+            .await
+    }
+    async fn request_run_model(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        self.request_model_inner(user_id, run_id, request).await
+    }
     async fn derive_tool_interaction_origin(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
@@ -16478,6 +16887,60 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
     }
 
+    async fn inherited_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<InheritedRunModel, String> {
+        // Child creation already reads Auto's decision. Include the latest
+        // settings in that same read rather than adding another SQL round trip.
+        let row = sqlx::query(
+            "SELECT settings.payload_json AS settings_payload, routing.payload_json AS routing_payload \
+             FROM agent_runs AS run \
+             LEFT JOIN (SELECT payload_json FROM agent_run_events \
+               WHERE user_id=? AND run_id=? AND event_type=? ORDER BY event_idx DESC LIMIT 1) AS settings ON TRUE \
+             LEFT JOIN (SELECT payload_json FROM agent_run_events \
+               WHERE user_id=? AND run_id=? AND event_type=? AND idempotency_key=? ORDER BY event_idx DESC LIMIT 1) AS routing ON TRUE \
+             WHERE run.user_id=? AND run.session_id=? AND run.run_id=? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(settings_control::SETTINGS)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(crate::model_routing::EVENT_TYPE)
+        .bind(crate::model_routing::DECISION_KEY)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|error| db_error("inherited_run_model", run_id, error).to_string())?
+        .ok_or_else(|| "Parent run does not belong to this session".to_string())?;
+        let settings: Option<String> =
+            row.try_get("settings_payload").map_err(|e| e.to_string())?;
+        if let Some(choice) = settings
+            .as_deref()
+            .map(settings_control::read_settings_snapshot)
+            .transpose()?
+            .and_then(|snapshot| snapshot.model.applied)
+        {
+            return Ok(InheritedRunModel::Explicit(choice));
+        }
+        let routing: Option<String> = row.try_get("routing_payload").map_err(|e| e.to_string())?;
+        if let Some(payload) = routing {
+            let event: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|_| "Invalid durable Auto routing event".to_string())?;
+            let decision: crate::model_routing::ModelRoutingDecision =
+                serde_json::from_value(event["data"].clone())
+                    .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
+            decision.validate_identity(run_id, session_id)?;
+            return Ok(InheritedRunModel::Auto(Box::new(decision)));
+        }
+        Ok(InheritedRunModel::Original)
+    }
+
     async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -16487,13 +16950,13 @@ impl RunStateStore for DatabaseRunStateStore {
         self.request_permission_mode_inner(user_id, run_id, request)
             .await
     }
-    async fn permission_mode_snapshot(
+    async fn run_settings_snapshot(
         &self,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
+        self.run_settings_snapshot_inner(user_id, session_id, run_id)
             .await
     }
     async fn apply_permission_mode(
@@ -17201,6 +17664,56 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())
     }
 
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The source key and native anchor stage have different owners and
+        // indexes. Keep them as separate equality probes in one round trip;
+        // an OR/IN predicate can make MatrixOne scan the whole Run history.
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx, session_id FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? AND event_idx <= ?
+             UNION ALL
+             SELECT payload_json, event_idx, session_id FROM agent_run_events FORCE INDEX (idx_agent_run_events_owner_session_subject)
+             WHERE user_id = ? AND session_id = ? AND event_type = ? AND subject_run_id = ?
+               AND run_id = ? AND event_idx <= ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(source_key)
+        .bind(run.last_event_idx)
+        .bind(user_id)
+        .bind(&run.session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run.last_event_idx)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_guidance_preflight", run_id, source).to_string())?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id: String = row.try_get("session_id").map_err(|e| e.to_string())?;
+            if session_id != run.session_id {
+                return Err("Guidance event belongs to a different session".into());
+            }
+            events.push(decode_run_event_payload(&row, run_id).map_err(|e| e.to_string())?);
+        }
+        Ok(Some(project_run_guidance_preflight(
+            &run, source_key, &events,
+        )))
+    }
+
     async fn load_run_observation(
         &self,
         user_id: &str,
@@ -17795,9 +18308,8 @@ impl RunStateStore for DatabaseRunStateStore {
         // subsequently fences or settles.
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let duplicate = sqlx::query(
-            "SELECT payload_json, event_idx, session_id, invocation_supersession_scope_key FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-               AND idempotency_key = ? LIMIT 1",
+            "SELECT payload_json, event_idx, session_id, event_type, invocation_supersession_scope_key FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
         )
         .bind(request.user_id)
         .bind(request.run_id)
@@ -17808,9 +18320,13 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("admit_run_guidance_load_duplicate", request.run_id, source).to_string()
         })?;
         if let Some(row) = duplicate {
-            let projection_matches = row.try_get::<String, _>("session_id").map_err(|source| {
-                db_error("decode_guidance_duplicate_session", request.run_id, source).to_string()
-            })? == request.expected_session_id
+            let projection_matches = row.try_get::<String, _>("event_type").map_err(|source| {
+                db_error("decode_guidance_duplicate_type", request.run_id, source).to_string()
+            })? == "user_intent"
+                && row.try_get::<String, _>("session_id").map_err(|source| {
+                    db_error("decode_guidance_duplicate_session", request.run_id, source)
+                        .to_string()
+                })? == request.expected_session_id
                 && row
                     .try_get::<Option<String>, _>("invocation_supersession_scope_key")
                     .map_err(|source| {
@@ -25290,6 +25806,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "runtime.control.handoff.rejected",
     "user_intent_accepted",
     "permission_mode_applied",
+    "run_model_outcome",
     "user_intent_applied",
     "user_intent_returned",
     "context_meta",
@@ -26044,21 +26561,25 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
-        "permission_mode_applied" => {
-            let Ok(applied) = serde_json::from_value::<RunPermissionModeApplied>(
-                serde_json::Value::Object(data.clone()),
-            ) else {
+        "run_settings_snapshot" => {
+            let Ok(settings) =
+                serde_json::from_value::<RunSettingsEvent>(serde_json::Value::Object(data.clone()))
+            else {
                 return serde_json::Value::Null;
             };
-            let mut event = serde_json::json!({"type":"permission_mode_applied", "request_id":applied.selection.request_id,
-                "mode":applied.selection.mode,"revision":applied.selection.revision,
-                "round_index":applied.round_index,"owner_generation":applied.owner_generation});
-            for key in ["run_id", "session_id"] {
-                if let Some(value) = data.get(key) {
-                    event[key] = value.clone();
+            match settings.change {
+                RunSettingsChange::PermissionApplied(applied) => {
+                    serde_json::json!({"type":"permission_mode_applied", "request_id":applied.selection.request_id,
+                    "mode":applied.selection.mode,"revision":applied.selection.revision,
+                    "round_index":applied.round_index,"owner_generation":applied.owner_generation,
+                    "run_id":settings.run_id,"session_id":settings.session_id})
                 }
+                RunSettingsChange::ModelOutcome(outcome) => serde_json::json!({
+                    "type":"run_model_outcome", "run_id":settings.run_id,
+                    "session_id":settings.session_id, "outcome":outcome
+                }),
+                _ => serde_json::Value::Null,
             }
-            event
         }
         "user_intent_applied" => {
             let mut out = serde_json::json!({ "type": "user_intent_applied" });
@@ -27200,11 +27721,21 @@ mod tests {
             owner_generation: 2,
             round_index: 3,
         };
-        let mut data = serde_json::to_value(applied).unwrap();
-        data["run_id"] = "run-1".into();
-        data["session_id"] = "session-1".into();
+        let data = serde_json::to_value(RunSettingsEvent {
+            change: RunSettingsChange::PermissionApplied(applied.clone()),
+            snapshot: RunSettingsSnapshot {
+                permission: RunPermissionModeSnapshot {
+                    requested: None,
+                    applied: Some(applied),
+                },
+                ..Default::default()
+            },
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+        })
+        .unwrap();
         let replay = transform_run_event_for_client(
-            serde_json::json!({"event_type":"permission_mode_applied","data":data}),
+            serde_json::json!({"event_type":"run_settings_snapshot","data":data}),
         );
         assert_eq!(replay["run_id"], "run-1");
         assert_eq!(replay["session_id"], "session-1");
@@ -27213,10 +27744,66 @@ mod tests {
         assert_eq!(transform_run_event_for_client(replay.clone()), replay);
         assert!(
             transform_run_event_for_client(
-                serde_json::json!({"event_type":"permission_mode_applied","data":{}})
+                serde_json::json!({"event_type":"run_settings_snapshot","data":{}})
             )
             .is_null()
         );
+    }
+
+    #[test]
+    fn model_outcome_projection_excludes_internal_model_route() {
+        use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind};
+        let selection = RunModelSelection {
+            request_id: "choose-model".into(),
+            revision: 7,
+            model: ModelSelection {
+                offering_id: "offering".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let outcome = RunModelOutcome {
+            selection: selection.clone(),
+            owner_generation: 2,
+            round_index: 3,
+            result: RunModelOutcomeKind::Applied {
+                model: selection.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let settings = RunSettingsEvent {
+            change: RunSettingsChange::ModelOutcome(outcome.clone()),
+            snapshot: RunSettingsSnapshot {
+                model: RunModelSettingsSnapshot {
+                    requested: Some(selection.clone()),
+                    outcome: Some(outcome.clone()),
+                    applied: Some(RunModelApplied {
+                        selection,
+                        reasoning: ReasoningRequirement::ModelDefault,
+                        resolved: ResolvedModelSelection {
+                            offering_id: "offering".into(),
+                            model_name: "internal-name".into(),
+                            source_identity: Some(ResolvedModelSourceIdentity {
+                                provider: "internal-provider".into(),
+                                access_label: "private-account".into(),
+                            }),
+                        },
+                        owner_generation: 2,
+                        round_index: 3,
+                    }),
+                },
+                ..Default::default()
+            },
+            run_id: "run".into(),
+            session_id: "session".into(),
+        };
+        let event = transform_run_event_for_client(
+            serde_json::json!({"event_type":"run_settings_snapshot", "data":settings}),
+        );
+        assert_eq!(event["type"], "run_model_outcome");
+        assert_eq!(event["outcome"], serde_json::to_value(outcome).unwrap());
+        assert!(!event.to_string().contains("internal-provider"));
+        assert!(!event.to_string().contains("private-account"));
+        assert_eq!(transform_run_event_for_client(event.clone()), event);
     }
 
     #[tokio::test]
@@ -27304,6 +27891,15 @@ mod tests {
             .request_permission_mode("u1", "permission-run", &conflicting)
             .await
             .unwrap();
+        // A delayed retry of the first request must not restore its old
+        // snapshot over a later choice.
+        assert_eq!(
+            store
+                .request_permission_mode("u1", "permission-run", &request)
+                .await
+                .unwrap(),
+            first
+        );
         let snapshot = store
             .permission_mode_snapshot("u1", "s1", "permission-run")
             .await
@@ -27427,6 +28023,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_and_permission_requests_share_a_fenced_snapshot() {
+        use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind};
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("settings-run"))
+            .await
+            .unwrap();
+        let model = RunModelRequest {
+            expected_session_id: "s1".into(),
+            request_id: "model-a".into(),
+            model: ModelSelection {
+                offering_id: "offering-a".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let permission = RunPermissionModeRequest {
+            expected_session_id: "s1".into(),
+            request_id: "mode".into(),
+            mode: astra_turn_types::PermissionMode::Plan,
+        };
+        let first = store
+            .request_run_model("u1", "settings-run", &model)
+            .await
+            .unwrap();
+        let mode = store
+            .request_permission_mode("u1", "settings-run", &permission)
+            .await
+            .unwrap();
+        let mut later = model.clone();
+        later.request_id = "model-b".into();
+        later.model.offering_id = "offering-b".into();
+        let second = store
+            .request_run_model("u1", "settings-run", &later)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .request_run_model("u1", "settings-run", &model)
+                .await
+                .unwrap(),
+            first
+        );
+        let snapshot = store
+            .run_settings_snapshot("u1", "s1", "settings-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.requested, Some(second.clone()));
+        assert_eq!(snapshot.permission.requested, Some(mode));
+        assert!(snapshot.model.applied.is_none());
+        let resolved = ResolvedModelSelection {
+            offering_id: "offering-b".into(),
+            model_name: "model-b".into(),
+            source_identity: None,
+        };
+        let stale = RunModelOutcome {
+            selection: first,
+            owner_generation: 0,
+            round_index: 1,
+            result: RunModelOutcomeKind::Applied {
+                model: model.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let stale_result = store
+            .finish_run_model("u1", "s1", "settings-run", &stale, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stale_result.result,
+            RunModelOutcomeKind::Superseded
+        ));
+        let applied = RunModelOutcome {
+            selection: second.clone(),
+            owner_generation: 0,
+            round_index: 2,
+            result: RunModelOutcomeKind::Applied {
+                model: later.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let mut wrong_owner = applied.clone();
+        wrong_owner.owner_generation = 1;
+        assert!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &wrong_owner, Some(&resolved),)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &applied, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(applied.clone())
+        );
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &applied, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(applied)
+        );
+        let mut rejected_request = later.clone();
+        rejected_request.request_id = "model-c".into();
+        rejected_request.model.offering_id = "offering-c".into();
+        let rejected_selection = store
+            .request_run_model("u1", "settings-run", &rejected_request)
+            .await
+            .unwrap();
+        let rejected = RunModelOutcome {
+            selection: rejected_selection,
+            owner_generation: 0,
+            round_index: 3,
+            result: RunModelOutcomeKind::Rejected {
+                kind: astra_core::ErrorKind::Auth,
+                error_code: Some("model_access_denied".into()),
+            },
+        };
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &rejected, None,)
+                .await
+                .unwrap(),
+            Some(rejected.clone())
+        );
+        let snapshot = store
+            .run_settings_snapshot("u1", "s1", "settings-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.applied.unwrap().selection, second);
+        assert_eq!(snapshot.model.outcome, Some(rejected));
+        let mut conflicting = model.clone();
+        conflicting.reasoning = ReasoningRequirement::Off;
+        assert!(
+            store
+                .request_run_model("u1", "settings-run", &conflicting)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .request_run_model("other", "settings-run", &model)
+                .await
+                .is_err()
+        );
+        let mut invalid = model;
+        invalid.request_id = "invalid".into();
+        invalid.reasoning = ReasoningRequirement::Budget { tokens: 0 };
+        assert!(
+            store
+                .request_run_model("u1", "settings-run", &invalid)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_permission_mode_control_round_snapshot() {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -27439,6 +28196,19 @@ mod tests {
         run.user_id = user.clone();
         run.session_id = session.clone();
         store.insert_run(run).await.unwrap();
+        assert_eq!(
+            store
+                .inherited_run_model(&user, &session, &id)
+                .await
+                .unwrap(),
+            InheritedRunModel::Original
+        );
+        assert!(
+            store
+                .inherited_run_model(&user, "wrong-session", &id)
+                .await
+                .is_err()
+        );
         let request = RunPermissionModeRequest {
             expected_session_id: session.clone(),
             request_id: "change".into(),
@@ -27479,6 +28249,102 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.applied.unwrap().selection, selected);
+        let next = RunPermissionModeRequest {
+            request_id: "later".into(),
+            mode: astra_turn_types::PermissionMode::Deny,
+            ..request.clone()
+        };
+        let next_selected = store
+            .request_permission_mode(&user, &id, &next)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .request_permission_mode(&user, &id, &request)
+                .await
+                .unwrap(),
+            selected
+        );
+        let snapshot = store
+            .permission_mode_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.requested, Some(next_selected));
+        assert_eq!(snapshot.applied.unwrap().selection, selected);
+        // Concurrent settings must merge under the same durable run fence.
+        let model = RunModelRequest {
+            expected_session_id: session.clone(),
+            request_id: "concurrent-model".into(),
+            model: ModelSelection {
+                offering_id: "test-offering".into(),
+            },
+            reasoning: astra_turn_types::ReasoningRequirement::ModelDefault,
+        };
+        let concurrent_permission = RunPermissionModeRequest {
+            expected_session_id: session.clone(),
+            request_id: "concurrent-mode".into(),
+            mode: astra_turn_types::PermissionMode::Auto,
+        };
+        let (model_result, permission_result) = tokio::join!(
+            store.request_run_model(&user, &id, &model),
+            store.request_permission_mode(&user, &id, &concurrent_permission),
+        );
+        let model_result = model_result.unwrap();
+        let permission_result = permission_result.unwrap();
+        let snapshot = store
+            .run_settings_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.requested, Some(model_result.clone()));
+        assert_eq!(snapshot.permission.requested, Some(permission_result));
+        assert_eq!(snapshot.permission.applied.unwrap().selection, selected);
+        let outcome = RunModelOutcome {
+            selection: model_result,
+            owner_generation: generation,
+            round_index: 1,
+            result: astra_turn_types::RunModelOutcomeKind::Applied {
+                model: model.model.clone(),
+                reasoning: model.reasoning.clone(),
+            },
+        };
+        let resolved = ResolvedModelSelection {
+            offering_id: model.model.offering_id.clone(),
+            model_name: "test-model".into(),
+            source_identity: None,
+        };
+        assert_eq!(
+            store
+                .finish_run_model(&user, &session, &id, &outcome, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(outcome.clone())
+        );
+        assert_eq!(
+            store
+                .finish_run_model(&user, &session, &id, &outcome, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(outcome)
+        );
+        let run = store.load_run(&user, &id).await.unwrap().unwrap();
+        assert_eq!(run.model_offering_id.as_deref(), Some("test-offering"));
+        assert_eq!(run.resolved_model_name.as_deref(), Some("test-model"));
+        let snapshot = store
+            .run_settings_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let applied = snapshot.model.applied.unwrap();
+        assert_eq!(applied.resolved, resolved);
+        assert_eq!(
+            store
+                .inherited_run_model(&user, &session, &id)
+                .await
+                .unwrap(),
+            InheritedRunModel::Explicit(applied)
+        );
         assert!(
             store
                 .permission_mode_snapshot(&user, &session, "absent-run")
@@ -28120,6 +28986,39 @@ mod tests {
         assert!(!durable_run_start_receipt_matches(
             &expected,
             &missing_event
+        ));
+    }
+
+    #[test]
+    fn run_start_receipt_uses_the_immutable_original_model_after_a_switch() {
+        let mut expected = durable_run_record("model-start-receipt");
+        expected.model_offering_id = Some("original-offering".into());
+        expected.resolved_model_name = Some("original-model".into());
+        let opening = DurableRunOpening::new(vec![serde_json::json!({
+            "event_type":"run_started", "data": {
+                "model_selection":{"offering_id":"original-offering"},
+                "resolved_model_selection":{"offering_id":"original-offering","model_name":"original-model"}
+            }
+        })]).unwrap();
+        expected.opening_hash = Some(opening.encode().unwrap().hash);
+        let mut actual = expected.clone();
+        actual.opening = Some(opening).into();
+        actual.model_offering_id = Some("new-offering".into());
+        actual.resolved_model_name = Some("new-model".into());
+        assert!(durable_run_start_receipt_matches(&expected, &actual));
+        let mut wrong_opening = actual.clone();
+        if let OpeningBody::Loaded(Some(opening)) = &mut wrong_opening.opening {
+            opening.events[0]["data"]["resolved_model_selection"]["model_name"] = "other".into();
+        }
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &wrong_opening
+        ));
+        let mut wrong_generation = actual;
+        wrong_generation.run_generation += 1;
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &wrong_generation
         ));
     }
 
@@ -35008,6 +35907,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.replayed);
+        let initial_preflight = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial_preflight.native_anchor);
+        assert!(!initial_preflight.source_already_admitted);
         let native = CollaboratorNativeSession {
             anchor_run_id: anchor_id.clone(),
             provider: CollaboratorProvider::Codex,
@@ -35109,6 +36015,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(association.latest_stage.run_id, next_id);
+        let old_anchor = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            old_anchor.native_anchor,
+            "the anchor remains identifiable after a later stage"
+        );
+        let later_stage = store
+            .load_run_guidance_preflight(&user_id, &next_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !later_stage.native_anchor,
+            "later stages use the canonical association lookup"
+        );
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", &anchor_id, "user_intent:new")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store
                 .load_run(&user_id, &anchor_id)
@@ -47417,6 +48348,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intent_receipt_requires_exact_source_and_single_disposition() {
+        let source = json!({"event_type":"user_intent", "index":7,
+        "idempotency_key":"user_intent:guide", "data":{
+            "intent_id":"guide", "delivery":"guide_current_run", "input":{"content":"inspect"}
+        }});
+        assert_eq!(user_intent_status_from_events("guide", &[]).unwrap(), None);
+        assert_eq!(
+            user_intent_status_from_events("guide", std::slice::from_ref(&source)).unwrap(),
+            Some(UserIntentStatus::AcceptedRemote)
+        );
+        let applied =
+            user_intent_disposition_event_from_source(7, &source, UserIntentStatus::Applied)
+                .unwrap();
+        let returned =
+            user_intent_disposition_event_from_source(7, &source, UserIntentStatus::Returned)
+                .unwrap();
+        assert_eq!(
+            user_intent_status_from_events("guide", &[source.clone(), applied.clone()]).unwrap(),
+            Some(UserIntentStatus::Applied)
+        );
+        assert!(
+            user_intent_status_from_events("guide", &[source.clone(), applied.clone(), returned])
+                .is_err()
+        );
+        let mut corrupt = applied;
+        corrupt["data"]["event_index"] = json!(8);
+        assert!(user_intent_status_from_events("guide", &[source, corrupt]).is_err());
+    }
+
+    #[tokio::test]
+    async fn guidance_preflight_does_not_clone_or_load_in_memory_history() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guide-preflight");
+        run.events = (0..5_000)
+            .map(|index| json!({"event_type":"trace", "data":{"index":index}}))
+            .collect();
+        run.events
+            .push(json!({"event_type":"user_intent", "idempotency_key":"user_intent:message"}));
+        run.events
+            .push(json!({"event_type":"tool_result", "idempotency_key":"user_intent:collision"}));
+        let user = run.user_id.clone();
+        let session = run.session_id.clone();
+        store.runs.write().await.insert(run.run_id.clone(), run);
+        let facts = store
+            .load_run_guidance_preflight(&user, "guide-preflight", "user_intent:message")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(facts.source_already_admitted);
+        assert!(!facts.native_anchor);
+        let collision = json!({"event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}});
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    user_id: &user,
+                    run_id: "guide-preflight",
+                    expected_session_id: &session,
+                    intent_id: "collision",
+                    event: &collision,
+                    process_local_execution_live: true,
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", "guide-preflight", "user_intent:message")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.load_run_call_count(), 0);
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_paused_guidance_and_live_delta_share_the_owner_lease_boundary() {
@@ -47455,6 +48463,13 @@ mod tests {
             initial.last_event_idx, 0,
             "insert preserves its run-created receipt"
         );
+        let before = store
+            .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.source_already_admitted);
+        assert!(!before.native_anchor);
         let admission = store.admit_run_guidance(request).await.unwrap();
         assert!(
             matches!(
@@ -47467,6 +48482,36 @@ mod tests {
             store.admit_run_guidance(request).await.unwrap(),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         ));
+        assert!(
+            store
+                .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_already_admitted
+        );
+        let observer = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("observer-pod");
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            Some(UserIntentStatus::AcceptedRemote)
+        );
+        assert_eq!(
+            observer
+                .run_user_intent_status("other-user", &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, "other-session", &id, "paused-guide")
+                .await
+                .unwrap(),
+            None
+        );
         let delta = store
             .load_run_event_delta(&user, &id, initial.last_event_idx)
             .await
@@ -47476,6 +48521,46 @@ mod tests {
         assert!(delta.execution_live);
         assert_eq!(delta.events.len(), 1);
         assert_eq!(extract_event_type(&delta.events[0]), "user_intent");
+        let returned =
+            user_intent_disposition_event_from_source(1, &event, UserIntentStatus::Returned)
+                .unwrap();
+        store
+            .append_event(&user, &session, &id, returned)
+            .await
+            .unwrap();
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            Some(UserIntentStatus::Returned)
+        );
+        store
+            .append_event(
+                &user,
+                &session,
+                &id,
+                json!({
+                    "event_type":"tool_result", "idempotency_key":"user_intent:collision", "data":{}
+                }),
+            )
+            .await
+            .unwrap();
+        let collision = json!({
+            "event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}
+        });
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    intent_id: "collision",
+                    event: &collision,
+                    ..request
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
         sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
             .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
         assert!(

@@ -527,8 +527,23 @@ pub fn validate_active_continuations<'a>(
     connection: &str,
     provider_id: impl Fn(&'a Value) -> Option<&'a str>,
 ) -> Result<(), String> {
+    validate_active_continuations_with_foreign(messages, model, connection, provider_id, |_| false)
+}
+
+/// Validate this model's own continuation while allowing a runtime-verified
+/// public group from a different admitted model to remain in the history.
+pub fn validate_active_continuations_with_foreign<'a>(
+    messages: &'a [Value],
+    model: &str,
+    connection: &str,
+    provider_id: impl Fn(&'a Value) -> Option<&'a str>,
+    foreign: impl Fn(&Value) -> bool,
+) -> Result<(), String> {
     for (index, message) in messages.iter().enumerate() {
         if message["role"] != "assistant" {
+            continue;
+        }
+        if foreign(message) {
             continue;
         }
         let has_calls = match message.get("tool_calls") {

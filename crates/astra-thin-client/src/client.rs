@@ -2058,6 +2058,61 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// Request a model for the next available round; acceptance is not application.
+    pub async fn request_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &astra_turn_types::RunModelRequest,
+    ) -> Result<astra_turn_types::RunModelSelection, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile one guidance receipt without replaying the Run stream.
+    pub async fn get_run_user_intent(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+        intent_id: &str,
+    ) -> Result<astra_turn_types::UserIntentStatus, ThinClientError> {
+        let url = self.url(&paths::chat_run_user_intent(run_id, intent_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile an uncertain model change without automatically resubmitting it.
+    pub async fn get_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+    ) -> Result<astra_turn_types::RunModelSnapshot, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     /// Request a policy for the next model round; acceptance is not application.
     pub async fn request_run_permission_mode(
         &self,

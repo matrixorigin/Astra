@@ -161,9 +161,39 @@ pub(crate) enum BottomPaneViewAction {
         run_id: String,
         target: AgentControlTarget,
     },
+    OpenReturnedAgentGuide,
+    NextRecoverableGuidance {
+        after_intent_id: String,
+    },
+    RecoverReturnedRootGuidance,
+    OpenUnconfirmedRootGuidance,
+    CopyUnconfirmedRootGuidance {
+        intent_id: String,
+        text: String,
+    },
+    DismissUnconfirmedRootGuidance {
+        intent_id: String,
+    },
+    CopyReturnedAgentGuide {
+        target: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+        text: String,
+    },
+    RetryReturnedAgentGuide {
+        target: crate::tui::event_loop::AgentGuideTarget,
+        recipient: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+        content: String,
+        acknowledged_unknown: Vec<String>,
+    },
+    DismissReturnedAgentGuide {
+        target: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+    },
     SubmitAgentGuide {
         target: crate::tui::event_loop::AgentGuideTarget,
         content: String,
+        acknowledged_unknown: Vec<String>,
     },
     SubmitSessionContinuation {
         target: crate::tui::event_loop::SessionContinuationTarget,
@@ -240,6 +270,18 @@ pub(crate) trait BottomPaneView: Send {
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
 
+    fn is_recoverable_guidance(&self, _intent: &super::PendingUserIntent) -> bool {
+        false
+    }
+
+    fn refresh_agent_guide_recipient(
+        &mut self,
+        _target: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _recipient: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::Escalate
     }
@@ -278,6 +320,16 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
+
+    /// Reconcile a displayed child-message draft without losing edits.
+    fn resolve_agent_guide(
+        &mut self,
+        _target: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _status: astra_turn_types::UserIntentStatus,
+    ) -> bool {
+        false
+    }
 
     fn refresh_agent_monitor(
         &mut self,
@@ -348,6 +400,17 @@ pub(crate) trait BottomPaneView: Send {
         _event: &astra_turn_core::agent_live_event::AgentLiveEvent,
     ) -> bool {
         false
+    }
+
+    fn refresh_agent_live_events(
+        &mut self,
+        events: &[astra_turn_core::agent_live_event::AgentLiveEvent],
+    ) -> bool {
+        let mut changed = false;
+        for event in events {
+            changed |= self.refresh_agent_live_event(event);
+        }
+        changed
     }
 
     /// Mark an open agent conversation as incomplete after its bounded live

@@ -40,6 +40,7 @@ mod login_control;
 mod markdown;
 mod markdown_render;
 mod mention_menu;
+mod model_control;
 mod model_setup;
 pub(crate) mod path_style;
 mod permission_control;

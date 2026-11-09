@@ -333,7 +333,7 @@ impl StatusLine {
         // Keep that intent visible until its application is acknowledged.
         if let Some(next_mode) = ctx.pending_permission_mode {
             out.left.push(Segment::styled(
-                format!("next: {}", permission_mode_label(next_mode)),
+                format!("requested: {}", permission_mode_label(next_mode)),
                 muted,
             ));
         }
@@ -556,7 +556,8 @@ fn fit_clusters(
     }
 
     let is_current = |segment: &Segment| segment.text == permission_mode_label(current_mode);
-    let pending_label = pending_mode.map(|mode| format!("next: {}", permission_mode_label(mode)));
+    let pending_label =
+        pending_mode.map(|mode| format!("requested: {}", permission_mode_label(mode)));
     let is_pending = |segment: &Segment| {
         pending_label
             .as_deref()

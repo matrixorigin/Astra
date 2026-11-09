@@ -1307,6 +1307,10 @@ struct CliSseStreamHost<'a> {
     last_context_window_policy: Option<(u64, u64)>,
     /// Last durable server run identity forwarded to active-run controls.
     last_bound_run_id: Option<String>,
+    /// Identity is essential to route live input. Publish it reliably at the
+    /// next async render boundary instead of sampling it with token events.
+    pending_session_binding: Option<String>,
+    pending_run_binding: Option<String>,
     /// Last provider-confirmed input occupancy forwarded to observers.
     last_context_window_measured: Option<Option<u64>>,
     /// Last provider-normalized request lanes forwarded to observers.
@@ -1830,6 +1834,8 @@ impl<'a> CliSseStreamHost<'a> {
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
+            pending_session_binding: None,
+            pending_run_binding: None,
             last_context_window_measured: None,
             last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
@@ -3783,6 +3789,40 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == Some("run_model_outcome") {
+            let run_id = event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            let session_id = event
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if run_id.is_none()
+                || session_id.is_none()
+                || self.last_bound_run_id.as_deref() != run_id
+                || self.executor.active_session_id().as_deref() != session_id
+            {
+                tracing::warn!("ignored model acknowledgement for another execution");
+                return Ok(());
+            }
+            let Some(outcome) = event.get("outcome").cloned().and_then(|value| {
+                serde_json::from_value::<astra_turn_types::RunModelOutcome>(value).ok()
+            }) else {
+                tracing::warn!("ignored malformed model acknowledgement");
+                return Ok(());
+            };
+            if outcome.selection.revision < 0 || outcome.selection.request_id.is_empty() {
+                tracing::warn!("ignored model acknowledgement with invalid identity");
+                return Ok(());
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::RunModelOutcome {
+                run_id: run_id.expect("validated run identity").to_owned(),
+                session_id: session_id.expect("validated session identity").to_owned(),
+                outcome,
+            })
+            .await;
+        }
         if event.get("type").and_then(Value::as_str) == Some("tool_request") {
             let read_only_execution = match event.get("read_only_execution") {
                 None => false,
@@ -4084,7 +4124,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         // The shared SSE consumer de-duplicates this stream's identity. A
         // resumed executor already having the id does not bind a new observer.
-        self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
+        self.pending_session_binding = Some(session_id.into());
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
         }
@@ -4102,9 +4142,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             match self.last_bound_run_id.as_deref() {
                 None => {
                     self.last_bound_run_id = Some(run_id.to_string());
-                    self.try_emit_stream_event(chat_stream::StreamEvent::RunBound(
-                        run_id.to_string(),
-                    ));
+                    self.pending_run_binding = Some(run_id.to_string());
                 }
                 Some(bound) if bound != run_id => {
                     tracing::warn!(
@@ -4188,6 +4226,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+        if let Some(session_id) = self.pending_session_binding.take() {
+            self.emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id))
+                .await;
+        }
+        if let Some(run_id) = self.pending_run_binding.take() {
+            self.emit_stream_event(chat_stream::StreamEvent::RunBound(run_id))
+                .await;
+        }
         // Forward to stream event channel (even when quiet/suppress are on)
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             use crate::cli::chat_stream::StreamEvent;
@@ -8206,6 +8252,95 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn edge_identity_binding_survives_backpressure_and_respects_cancellation() {
+        for cancel_while_blocked in [false, true] {
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let root = tempdir().unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+                .await
+                .unwrap();
+            let mut cache = EdgeToolCache::new(8);
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "unused",
+                    executor_id: "unused",
+                    executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(
+                        root.path(),
+                    )),
+                    render_policy: RenderPolicy::Silent,
+                    perm_manager: None,
+                    cancel_token: Some(&cancel),
+                    stream_event_tx: Some(tx),
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    compensate_non_file_on_failure: false,
+                    tool_cache: &mut cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                },
+                80,
+                false,
+            );
+            host.on_session_id("session");
+            let accum = ChatTurnSseAccum {
+                run_id: Some("run".into()),
+                ..Default::default()
+            };
+            host.on_accum_update(&accum);
+            {
+                let delivery = host.on_render_effects(vec![]);
+                tokio::pin!(delivery);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                        .await
+                        .is_err()
+                );
+                if cancel_while_blocked {
+                    cancel.cancel();
+                    tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::StatusLine(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::StatusLine(_))
+                    ));
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        matches!(rx.recv().await, Some(chat_stream::StreamEvent::SessionBound(id)) if id == "session")
+                    );
+                    tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(rx.recv().await, Some(chat_stream::StreamEvent::RunBound(id)) if id == "run")
+                    );
+                }
+            }
+            host.on_accum_update(&accum);
+            host.on_accum_update(&ChatTurnSseAccum {
+                run_id: Some("conflict".into()),
+                ..Default::default()
+            });
+            host.on_render_effects(vec![]).await;
+            assert!(rx.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn hook_config_diagnostics_reach_silent_tui_under_backpressure() {
@@ -15272,6 +15407,65 @@ mod tests {
         wrong_session["session_id"] = serde_json::json!("another-session");
         assert!(host.on_accepted_sse_event(&wrong_session).await.is_err());
         assert_eq!(mirror.applied_request_id().as_deref(), Some("mode-2"));
+    }
+
+    #[tokio::test]
+    async fn model_outcome_reaches_the_current_run_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id("session"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.last_bound_run_id = Some("run".into());
+        let event = serde_json::json!({"type":"run_model_outcome",
+            "session_id":"session", "run_id":"run",
+            "outcome": {"selection":{"request_id":"change", "revision":3,
+                "model":{"offering_id":"model"}, "reasoning":{"mode":"model_default"}},
+                "owner_generation":1, "round_index":2,
+                "result":{"status":"applied", "model":{"offering_id":"model"},
+                    "reasoning":{"mode":"model_default"}}}});
+        let mut wrong = event.clone();
+        wrong["run_id"] = serde_json::json!("other-run");
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        wrong = event.clone();
+        wrong["session_id"] = serde_json::json!("other-session");
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        wrong = event.clone();
+        wrong["outcome"]["selection"]["revision"] = serde_json::json!(-1);
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        assert!(rx.try_recv().is_err());
+
+        host.on_accepted_sse_event(&event).await.unwrap();
+        assert!(
+            matches!(rx.try_recv(), Ok(chat_stream::StreamEvent::RunModelOutcome {
+            run_id, session_id, outcome
+        }) if run_id == "run" && session_id == "session"
+            && outcome.selection.request_id == "change")
+        );
     }
 
     #[serial_test::serial]

@@ -217,7 +217,7 @@ async fn prompt_approval_over_piped_stdio_can_approve_deny_and_interrupt() {
             if action == "deny" {
                 assert_eq!(mock.tool_results().len(), 1, "denial must reach Server");
             } else {
-                assert_eq!(mock.cancelled_runs(), ["mock-run-tool"]);
+                assert_eq!(mock.cancellation_requests(), ["mock-run-tool"]);
             }
         }
         // Settled or interrupted requests cannot authorize a later tool call.

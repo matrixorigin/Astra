@@ -3205,6 +3205,7 @@ impl RuntimeToolExecutor {
     pub(super) fn set_agent_model_execution(
         &self,
         execution: &astra_services::AdmittedModelExecution,
+        thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     ) {
         if let Some(context) =
             astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context).as_mut()
@@ -3217,6 +3218,7 @@ impl RuntimeToolExecutor {
             if let Some(parent) = context.parent_model_reasoning.as_mut() {
                 parent.selection = selection;
                 parent.resolved_model_name = Some(execution.model_name.clone());
+                parent.thinking = thinking.clone();
             }
         }
     }
@@ -10938,6 +10940,10 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn test_current_agent_model(executor: &RuntimeToolExecutor) -> Option<String> {
+        executor.agent_tool_context_snapshot()?.current_model
+    }
+
     #[test]
     fn terminal_read_proof_requires_retained_result_and_current_parent_binding() {
         use crate::orchestration::{AgentStatus, spawner::DirectChildCompletion};
@@ -11003,7 +11009,10 @@ pub(crate) mod tests {
             crate::server::model_execution_admission::inheritance_test_support::genesis_execution();
         economy.offering_id = "economy".into();
         economy.model_name = "economy-model".into();
-        executor.set_agent_model_execution(&economy);
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+            effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+        };
+        executor.set_agent_model_execution(&economy, &thinking);
 
         let current = executor.agent_tool_context_snapshot().unwrap();
         assert_eq!(current.current_model.as_deref(), Some("economy-model"));
@@ -11014,10 +11023,7 @@ pub(crate) mod tests {
         let parent = current.parent_model_reasoning.unwrap();
         assert_eq!(parent.selection.offering_id, "economy");
         assert_eq!(parent.resolved_model_name.as_deref(), Some("economy-model"));
-        assert_eq!(
-            parent.thinking,
-            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
-        );
+        assert_eq!(parent.thinking, thinking);
     }
 
     fn semantic_cache_contract(

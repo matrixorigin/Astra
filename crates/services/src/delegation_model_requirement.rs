@@ -2,8 +2,7 @@
 //! Model proposals are execution inputs, never a second source of user authority.
 
 use astra_turn_types::{
-    AutoModelStrategy, DelegationReasoningRequirement, ModelSelection, ModelSelector,
-    RequestedModelPolicy,
+    AutoModelStrategy, ModelSelection, ModelSelector, ReasoningRequirement, RequestedModelPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,7 +33,7 @@ pub struct DelegationSlotBrief {
     /// Structured reasoning control already validated from this exact tool
     /// slot. Keeping it beside the canonical slot prevents Auto from being
     /// resolved against a weaker pre-override reasoning default.
-    pub reasoning: Option<DelegationReasoningRequirement>,
+    pub reasoning: Option<ReasoningRequirement>,
     /// Runtime-authored position within one invocation. The proposal remains
     /// untrusted matching data, not a source of user requirements.
     pub invocation: Option<DelegationSlotInvocation>,
