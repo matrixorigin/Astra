@@ -1939,9 +1939,12 @@ impl astra_runtime::TurnObserverWorker for HeldCanonicalObserver {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 1000 synthetic canonical Sessions"]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 128 synthetic canonical Sessions"]
 async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     require_system_e2e_env();
+    let started = std::time::Instant::now();
+    // Leave 20s of the strict online budget for both idle windows and cleanup.
+    let recovery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .expect("this integration binary owns its SQL subscriber");
@@ -1960,6 +1963,10 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .await
         .unwrap();
     let b = bootstrap_isolated_execution_handoff(database.clone()).await;
+    eprintln!(
+        "observation_burst phase=bootstrap elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     // Leave full empty physical intervals before the real backlog. Discovery
     // must advance across deletion/allocation gaps, not stop at an empty page.
     sqlx::query("INSERT INTO session_context_heads (isolation_domain,owner_user_id,session_id,branch_id) SELECT 'server','catalog-gap-owner',CAST(result AS CHAR),'main' FROM generate_series(1,4096) g")
@@ -1968,15 +1975,21 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .execute(&b.ctx.pool)
         .await
         .unwrap();
-    let mut sessions: Vec<_> = (0..1000)
-        .map(|_| uuid::Uuid::new_v4().to_string())
-        .collect();
+    // Two full 64-key discovery pages plus paced arrivals exercise backlog
+    // recovery within the unchanged 60s CI budget, including setup and idle
+    // checks. Large-catalog selectivity has its own 100,000-head regression.
+    let mut sessions: Vec<_> = (0..128).map(|_| uuid::Uuid::new_v4().to_string()).collect();
     // These formerly collided at 32 x 64 catalog slots. All must progress
     // independently while the first Session remains held on another owner.
     sessions[0] = "sparse-00000001".into();
     sessions[1] = "sparse-00002048".into();
     sessions[2] = "sparse-00002049".into();
     seed_observation_sessions(&b.ctx, &sessions).await;
+    eprintln!(
+        "observation_burst phase=seed sessions={} elapsed_ms={}",
+        sessions.len(),
+        started.elapsed().as_millis()
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work")
         .fetch_one(&b.ctx.pool)
         .await
@@ -2025,25 +2038,30 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         cancels.push(cancel);
         owners.push(owner);
     }
-    tokio::time::timeout(std::time::Duration::from_secs(15), probe.entered.notified())
+    tokio::time::timeout_at(recovery_deadline, probe.entered.notified())
         .await
         .unwrap();
-    wait_for_probe(&probe, std::time::Duration::from_secs(45), |seen| {
+    wait_for_probe(&probe, recovery_deadline, "first_page", |seen| {
         seen.len() >= 64
     })
     .await;
+    eprintln!(
+        "observation_burst phase=first_page elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     assert!(
         !probe.seen.lock().unwrap().contains_key(&sessions[0]),
         "slow Session must still be held"
     );
     let arrivals: Vec<_> = (0..16).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    let expected_sessions = sessions.len() + arrivals.len();
     for batch in arrivals.chunks(2) {
         seed_observation_sessions(&b.ctx, batch).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     // Fairness is independent progress while this exact call is held, not a
-    // promise to drain a thousand real-DB Sessions before its 60s deadline.
-    wait_for_probe(&probe, std::time::Duration::from_secs(45), |seen| {
+    // promise to drain the backlog before its 60s deadline.
+    wait_for_probe(&probe, recovery_deadline, "fairness", |seen| {
         seen.contains_key(&sessions[1]) && seen.contains_key(&sessions[2])
     })
     .await;
@@ -2067,38 +2085,47 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     }
     let held_owner = probe.slow_owner.load(std::sync::atomic::Ordering::SeqCst);
     cancels[held_owner].cancel();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        handles[held_owner].take().unwrap(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout_at(recovery_deadline, handles[held_owner].take().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         probe.active[held_owner].load(std::sync::atomic::Ordering::SeqCst),
         0
     );
     owners[held_owner].expire_lease().await;
-    wait_for_probe(&probe, std::time::Duration::from_secs(180), |seen| {
-        arrivals.iter().all(|key| seen.contains_key(key)) && seen.len() == 1016
+    eprintln!(
+        "observation_burst phase=handoff elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    wait_for_probe(&probe, recovery_deadline, "handoff", |seen| {
+        sessions
+            .iter()
+            .chain(&arrivals)
+            .all(|key| seen.contains_key(key))
+            && seen.len() == expected_sessions
     })
     .await;
     // Backend completion precedes durable acknowledgement. Do not cancel the
     // owner in that gap and mistake a deliberately replayable write for loss.
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout_at(recovery_deadline, async {
         loop {
             let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn')) = '1'")
                 .fetch_one(&b.ctx.pool).await.unwrap();
-            if receipts == 1016 {
+            if receipts == expected_sessions as i64 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }).await.expect("every observed Session must receive a durable checkpoint");
+    eprintln!(
+        "observation_burst phase=receipts elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     for (cancel, handle) in cancels.iter().zip(handles.iter_mut()) {
         cancel.cancel();
         if let Some(handle) = handle.take() {
-            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            tokio::time::timeout_at(recovery_deadline, handle)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2106,7 +2133,7 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     }
     let active_sql = capture.0.lock().unwrap().take().unwrap();
     assert!(
-        active_sql.len() <= 20_000,
+        active_sql.len() <= 20 * expected_sessions,
         "full two-owner recovery + paced completion SQL: {}",
         active_sql.len()
     );
@@ -2121,12 +2148,12 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .all(|q| !q.sql.contains("sweeper_leases") && !q.sql.contains("AUTO_INCREMENT"))
     );
     eprintln!(
-        "observation_sql fleet=2 phase=active sessions=1016 raw_total={}",
+        "observation_sql fleet=2 phase=active sessions={expected_sessions} raw_total={}",
         active_sql.len()
     );
     let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn')) = '1'")
         .fetch_one(&b.ctx.pool).await.unwrap();
-    assert_eq!(receipts, 1016);
+    assert_eq!(receipts, expected_sessions as i64);
     // Restart real managed owners with no cached keys. Idle retained history
     // and deletion gaps must require only one indexed read per owner/tick,
     // with no lease writes, checkpoint writes or transcript reads.
@@ -2187,12 +2214,20 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             "observation_sql fleet=2 phase=idle retained={retained} seconds=5.2 fixture_heartbeats={fixture_heartbeats} raw_total={}",
             statements.len()
         );
+        eprintln!(
+            "observation_burst phase=idle retained={retained} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
     b.ctx.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .unwrap();
+    eprintln!(
+        "observation_burst phase=cleanup elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
 }
 
 /// Full public request + real unscoped recovery + production HTTP observer.
@@ -2597,10 +2632,11 @@ impl astra_runtime::TurnObserverWorker for SchedulerObserver {
 }
 async fn wait_for_probe(
     probe: &SchedulerProbe,
-    budget: std::time::Duration,
+    deadline: tokio::time::Instant,
+    phase: &str,
     ready: impl Fn(&std::collections::BTreeMap<String, usize>) -> bool,
 ) {
-    tokio::time::timeout(budget, async {
+    tokio::time::timeout_at(deadline, async {
         loop {
             if ready(&probe.seen.lock().unwrap()) {
                 break;
@@ -2612,7 +2648,7 @@ async fn wait_for_probe(
     .unwrap_or_else(|_| {
         let observed = probe.seen.lock().unwrap().len();
         panic!(
-            "managed scheduler stalled: observed={}, active=[{}, {}]",
+            "managed scheduler stalled: phase={phase}, observed={}, active=[{}, {}]",
             observed,
             probe.active[0].load(std::sync::atomic::Ordering::SeqCst),
             probe.active[1].load(std::sync::atomic::Ordering::SeqCst),

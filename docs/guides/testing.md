@@ -652,7 +652,7 @@ Unconfigured deployments do not poll or dispatch observations, but retain the
 canonical due fact for later recovery.
 
 `canonical_observation_burst_recovers_without_chat_job_writes` separately measures
-the actual managed loop with two owners, 1,000 canonical Sessions, a held slow
+the actual managed loop with two owners, 128 canonical Sessions, a held slow
 observer, 16 paced arrivals and 4,096 deleted historical identities. Raw active
 capture includes **all** observation-recovery statements with the synthetic
 observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
@@ -664,10 +664,14 @@ fixture's exact 30-second test-account heartbeat is reported separately (at most
 one per interval) and remains in the bounded raw total. No SQL is discarded. This makes
 idle fleet cost visible independently of the marginal per-Session attempt.
 The test first verifies named independent Sessions progress while a call remains
-held, then cancels that owner and separately waits for the full backlog and paced
-arrivals. Fairness does not require draining a thousand Sessions before the held
-request's production deadline. It also verifies the eight-attempt bound,
-non-overlapping claims, handoff and every durable receipt before shutdown.
+held, then cancels that owner and separately waits for all 144 backlog/arrival
+receipts. Two full discovery pages plus arrivals exercise pagination without
+turning canonical fixture construction into a throughput test. The complete
+fixture, recovery, both idle intervals and cleanup must fit the unchanged
+60-second online budget. Phase timing logs distinguish setup, recovery and
+cleanup stalls. The test also verifies the eight-attempt bound, non-overlapping
+claims and handoff. It does not establish 1,000-Session throughput; large-catalog
+query selectivity is checked separately below.
 
 The ignored services test
 `session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
