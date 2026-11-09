@@ -350,6 +350,17 @@ pub fn ingest_agentic_turn_stream(
                     *st.consecutive_context_window_errors = 0;
                 }
                 kind
+            } else if astra_core::has_structured_llm_error_facts(err) {
+                // A parsed provider error with an unrecognized cause must
+                // not be re-read through message prose: both prose rules
+                // below match the same context needles against the
+                // envelope's own message, so a non-whitelist 400 parameter
+                // rejection (e.g. `max_tokens is too large`) would be
+                // funneled into context compaction. Keep the kind Unknown
+                // and clear the context streak; recovery has no reliable
+                // status or category to bound it further here.
+                *st.consecutive_context_window_errors = 0;
+                astra_core::ErrorKind::Unknown
             } else if astra_core::is_llm_context_window_error(err) {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
@@ -1196,6 +1207,42 @@ mod tests {
             if e.kind == astra_core::ErrorKind::InvalidRequest
         ));
         assert_eq!(pack.consecutive_context_window_errors, 0);
+    }
+
+    /// An SSE error carrying a parsed provider envelope whose cause tokens
+    /// are all outside the classification whitelist (here a 400 output-token
+    /// parameter rejection) must stay out of ContextWindow: prose needle
+    /// matching against the envelope's own message would otherwise escalate
+    /// the context streak and authorize compaction that cannot fix an
+    /// output-parameter problem. Locked through the SSE accumulator →
+    /// snapshot → ingest boundary so an unclassified SSE error event keeps
+    /// `error_kind: None` all the way in.
+    #[test]
+    fn fatal_structured_unknown_facts_are_not_context_window() {
+        let accum = ChatTurnSseAccum {
+            error_message: Some(
+                r#"LLM error 400: {"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#
+                    .to_string(),
+            ),
+            error_kind: None,
+            ..Default::default()
+        };
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+        assert_eq!(
+            snap.error_kind, None,
+            "test must exercise the unclassified SSE error branch"
+        );
+
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 3;
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
+            if e.kind == astra_core::ErrorKind::Unknown
+        ));
+        assert_eq!(
+            pack.consecutive_context_window_errors, 0,
+            "unknown structured facts must clear, not escalate, the context streak"
+        );
     }
 
     #[test]
