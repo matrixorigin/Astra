@@ -2941,18 +2941,18 @@ fn open_help(
     use crate::tui::bottom_pane::{help_view::HelpView, info_view::InfoView};
     match help_command_route(args) {
         HelpCommandRoute::Commands => {
-            chat_widget.commit_system(SystemCell::response("Opened command help"));
+            chat_widget.commit_concurrent_system(SystemCell::response("Opened command help"));
             bottom_pane.push_view(Box::new(HelpView::new()));
         }
         HelpCommandRoute::Keys => {
-            chat_widget.commit_system(SystemCell::response("Opened keyboard shortcuts"));
+            chat_widget.commit_concurrent_system(SystemCell::response("Opened keyboard shortcuts"));
             bottom_pane.push_view(Box::new(InfoView::from_key_value(
                 "Keyboard shortcuts",
                 keyboard_shortcut_pairs(),
             )));
         }
         HelpCommandRoute::Unsupported => {
-            chat_widget.commit_system(SystemCell::error("Usage: /help [keys]"))
+            chat_widget.commit_concurrent_system(SystemCell::error("Usage: /help [keys]"))
         }
     }
 }
@@ -3122,8 +3122,15 @@ pub(crate) fn push_model_picker(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     models: Vec<String>,
+    personal: bool,
 ) -> bool {
-    push_model_picker_for_choice(state.model.as_ref(), bottom_pane, chat_widget, models)
+    push_model_picker_for_choice(
+        state.model.as_ref(),
+        bottom_pane,
+        chat_widget,
+        models,
+        personal,
+    )
 }
 
 pub(crate) fn push_model_picker_for_choice(
@@ -3131,6 +3138,7 @@ pub(crate) fn push_model_picker_for_choice(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     models: Vec<String>,
+    personal: bool,
 ) -> bool {
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
@@ -3178,8 +3186,6 @@ pub(crate) fn push_model_picker_for_choice(
             )
         })
         .unzip();
-    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-    let personal = owner.server_account_id.is_some() && owner.native_binding.is_none();
     if personal {
         if items.is_empty() {
             crate::tui::model_setup::sources(bottom_pane);
@@ -3195,13 +3201,13 @@ pub(crate) fn push_model_picker_for_choice(
         ));
     }
     if items.is_empty() {
-        chat_widget.commit_system(SystemCell::info("No models available"));
+        chat_widget.commit_concurrent_system(SystemCell::info("No models available"));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_results(results);
-        chat_widget.commit_system(SystemCell::response("Opened model picker"));
+        chat_widget.commit_concurrent_system(SystemCell::response("Opened model picker"));
         bottom_pane.push_view(Box::new(view));
         true
     }
@@ -3247,7 +3253,7 @@ pub(crate) fn prepare_model_picker_result(
             .map(|selection| (entry, selection))
     });
     let Some((entry, mut selection)) = resolved else {
-        chat_widget.commit_system(SystemCell::error(
+        chat_widget.commit_concurrent_system(SystemCell::error(
             "Selected model is no longer available in this account's catalog. Reopen /model.",
         ));
         return Some(Err(()));
@@ -3278,7 +3284,7 @@ pub(crate) fn prepare_model_picker_result(
     .collect();
     if let Some(config) = config {
         if !opts.iter().any(|option| &option.config == config) {
-            chat_widget.commit_system(SystemCell::error(
+            chat_widget.commit_concurrent_system(SystemCell::error(
                 "Selected thinking mode is no longer supported. Reopen /model.",
             ));
             return Some(Err(()));
@@ -3351,7 +3357,11 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
-            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let personal = owner.server_account_id.is_some()
+                && owner.native_binding.is_none()
+                && !crate::cli::session::session_runtime::uses_environment_access_token(&token);
+            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names, personal) {
                 return SlashResult::Deferred;
             }
         }

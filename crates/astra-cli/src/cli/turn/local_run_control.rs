@@ -86,6 +86,8 @@ pub(crate) struct LocalRunControl {
     // simple without introducing async lock wakeups.
     state: Mutex<LocalRunControlState>,
     remote_disposition_notify: Arc<tokio::sync::Notify>,
+    admitted_auth:
+        tokio::sync::watch::Sender<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
 }
 
 impl Default for LocalRunControl {
@@ -93,6 +95,7 @@ impl Default for LocalRunControl {
         Self {
             state: Mutex::new(LocalRunControlState::default()),
             remote_disposition_notify: Arc::new(tokio::sync::Notify::new()),
+            admitted_auth: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -100,6 +103,20 @@ impl Default for LocalRunControl {
 impl LocalRunControl {
     pub(crate) fn shared() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub(crate) fn publish_admitted_auth(
+        &self,
+        auth: crate::cli::session::session_runtime::AdmittedAuth,
+    ) {
+        self.admitted_auth.send_replace(Some(auth));
+    }
+
+    pub(crate) fn admitted_auth(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::cli::session::session_runtime::AdmittedAuth>>
+    {
+        self.admitted_auth.subscribe()
     }
 
     fn request_cancel(&self, origin: astra_turn_core::orchestration_types::CancellationOrigin) {

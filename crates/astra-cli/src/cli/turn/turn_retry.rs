@@ -65,27 +65,30 @@ async fn try_retry_after_auth_refresh(
         if !owner.is_current() {
             return None;
         }
-        crate::cli::session::session_runtime::owner_access_token(
-            &server_turn.api,
-            owner,
-            Some(dispatch.token),
-        )
-        .await?
+        crate::cli::session::session_runtime::AdmittedAuth::Owner(owner.clone())
+            .access_token(&server_turn.api, Some(dispatch.token))
+            .await?
     } else if let Some(admission) = &dispatch.ctx.admission {
         // A bound submission cannot borrow the ambient profile or infer
         // refresh authority from a rendered error sentence.
         if !super::turn_auth_retry::should_retry_after_auth_refresh(failure) {
             return None;
         }
-        crate::cli::session::session_runtime::owner_access_token(
+        let owner = dispatch
+            .auth_owner
+            .filter(|owner| *owner == admission.owner)?;
+        crate::cli::session::session_runtime::AdmittedAuth::Owner(owner.clone())
+            .access_token(dispatch.ctx.api, Some(dispatch.token))
+            .await?
+    } else {
+        prepare_auth_refresh_retry(
             dispatch.ctx.api,
-            admission.owner,
-            Some(dispatch.token),
+            dispatch.auth_owner,
+            dispatch.token,
+            failure,
+            dispatch.ui,
         )
         .await?
-    } else {
-        prepare_auth_refresh_retry(dispatch.ctx.api, dispatch.ctx.profile, failure, dispatch.ui)
-            .await?
     };
     if !dispatch.ctx.permits_admission(state) {
         return None;
@@ -95,7 +98,7 @@ async fn try_retry_after_auth_refresh(
         state,
         input: TurnExecutionInput {
             api: dispatch.ctx.api,
-            profile: dispatch.ctx.profile,
+
             token: &new_token,
             message: dispatch.effective_line,
             user_intent: dispatch.user_intent,
@@ -105,6 +108,7 @@ async fn try_retry_after_auth_refresh(
             admitted_server_turn: dispatch.admitted_server_turn,
             semantic_query_override: dispatch.semantic_query_override,
             explain_analyze_terminal_degraded: dispatch.ctx.explain_analyze_terminal_degraded,
+            auth_owner: dispatch.auth_owner,
         },
     })
     .await;
@@ -290,6 +294,7 @@ mod tests {
                 turn_start: Instant::now(),
                 ui: &mut ui,
                 turn_usage_sink: None,
+                auth_owner: None,
             };
             let attempt = TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
                 error: "typed catalog authentication rejection".into(),
@@ -380,6 +385,7 @@ mod tests {
                 turn_start: Instant::now(),
                 ui: &mut ui,
                 turn_usage_sink: Some(&usage),
+                auth_owner: None,
             };
             let failure = if local {
                 crate::TurnFailure {
@@ -504,6 +510,7 @@ mod tests {
                 turn_start: Instant::now(),
                 ui: &mut ui,
                 turn_usage_sink: Some(&usage),
+                auth_owner: None,
             };
             let attempt = TurnAttempt::Completed(Box::new(Err(crate::TurnFailure {
                 error: error.into(),

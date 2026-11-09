@@ -374,28 +374,41 @@ pub(crate) async fn fetch_owner_model_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    // The exact owner supplies every bearer. An inherited transport provider
-    // must not replace it with another binding at request dispatch.
     let api = api.clone().without_bearer_provider();
     tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
-        let token = owner_access_token(&api, owner, None)
-            .await
-            .ok_or(ModelCatalogError::NotAuthenticated)?;
-        match fetch_model_catalog(&api, Some(&token)).await {
-            Err(ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status,
-                ..
-            })) if status == reqwest::StatusCode::UNAUTHORIZED => {
-                let refreshed = owner_access_token(&api, owner, Some(&token))
-                    .await
-                    .ok_or(ModelCatalogError::NotAuthenticated)?;
-                fetch_model_catalog(&api, Some(&refreshed)).await
-            }
-            result => result,
-        }
+        fetch_admitted_model_catalog(&api, &AdmittedAuth::Owner(owner.clone())).await
     })
     .await
     .map_err(|_| ModelCatalogError::TimedOut)?
+}
+
+pub(crate) async fn fetch_admitted_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    auth: &AdmittedAuth,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    let api = api.clone().without_bearer_provider();
+    let token = auth
+        .access_token(&api, None)
+        .await
+        .ok_or(ModelCatalogError::NotAuthenticated)?;
+    match fetch_model_catalog(&api, Some(&token)).await {
+        Err(
+            error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }),
+        ) => {
+            let Some(refreshed) = auth.access_token(&api, Some(&token)).await else {
+                return Err(if matches!(auth, AdmittedAuth::Owner(_)) {
+                    ModelCatalogError::NotAuthenticated
+                } else {
+                    error
+                });
+            };
+            fetch_model_catalog(&api, Some(&refreshed)).await
+        }
+        result => result,
+    }
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -1311,6 +1324,10 @@ fn active_env_access_token(now_epoch: i64) -> Option<String> {
     Some(token)
 }
 
+pub(crate) fn has_environment_access_token() -> bool {
+    active_env_access_token(chrono::Utc::now().timestamp()).is_some()
+}
+
 /// Whether the token selected for a turn came from the environment bearer.
 /// Keep this decision next to `fresh_access_token` so delivery code does not
 /// reimplement expiry or precedence rules and accidentally replace it with a
@@ -1378,6 +1395,70 @@ pub(crate) async fn capture_admitted_auth_owner(
         return None;
     }
     Some(owner)
+}
+
+/// Verified refresh authority or the immutable bearer that entered the turn.
+#[derive(Clone)]
+pub(crate) enum AdmittedAuth {
+    Owner(crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot),
+    Static(std::sync::Arc<str>),
+}
+
+impl AdmittedAuth {
+    pub(crate) fn new(
+        bearer: &str,
+        owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    ) -> Self {
+        match owner {
+            Some(owner) => Self::Owner(owner),
+            None => Self::Static(bearer.into()),
+        }
+    }
+
+    pub(crate) async fn access_token(
+        &self,
+        api: &astra_thin_client::ThinClient,
+        rejected: Option<&str>,
+    ) -> Option<String> {
+        match self {
+            Self::Owner(owner) if owner.is_current() => {
+                let token = owner_access_token(api, owner, rejected).await;
+                owner.is_current().then_some(token).flatten()
+            }
+            Self::Owner(_) => None,
+            Self::Static(bearer) if rejected != Some(bearer.as_ref()) => Some(bearer.to_string()),
+            Self::Static(_) => None,
+        }
+    }
+}
+
+/// Capture the source selected for a user action before any asynchronous wait.
+/// The bearer itself or verified owner remains fixed even if ambient state changes.
+pub(crate) fn capture_presented_auth(
+    profile: Option<&str>,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Option<AdmittedAuth> {
+    if !owner.is_current() {
+        return None;
+    }
+    if owner.native_binding.is_none()
+        && let Some(token) = active_env_access_token(chrono::Utc::now().timestamp())
+    {
+        return Some(AdmittedAuth::new(&token, None));
+    }
+    if profile.is_some_and(|name| owner.profile_name.as_deref() != Some(name)) {
+        return None;
+    }
+    if owner.native_binding.is_some() {
+        return Some(AdmittedAuth::Owner(owner.clone()));
+    }
+    owner.legacy_binding.as_ref()?;
+    Some(AdmittedAuth::Owner(owner.clone()))
+}
+
+pub(crate) fn can_manage_personal_models(auth: &AdmittedAuth) -> bool {
+    matches!(auth, AdmittedAuth::Owner(owner)
+        if owner.server_account_id.is_some() && owner.native_binding.is_none())
 }
 
 pub(crate) async fn fresh_access_token(
@@ -5017,5 +5098,42 @@ mod admitted_owner_tests {
             server.received_requests().await.unwrap().is_empty(),
             "capture cannot rotate a token or probe another identity"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn presented_environment_bearer_stays_static_and_never_borrows_profile() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("profile-token".into()),
+                refresh_token: Some("profile-refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let owner = cli_utils::cli_owner_auth_snapshot();
+        let auth = super::capture_presented_auth(Some("default"), &owner).unwrap();
+        assert_eq!(
+            auth.access_token(&api, None).await.as_deref(),
+            Some("gateway-token")
+        );
+        assert!(
+            auth.access_token(&api, Some("gateway-token"))
+                .await
+                .is_none()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

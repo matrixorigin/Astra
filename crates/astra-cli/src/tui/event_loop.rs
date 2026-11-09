@@ -117,7 +117,7 @@ enum ModelCatalogEffect {
         owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
         attachment_epoch: u64,
         initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
-        result: Result<Vec<astra_services::ModelListItemResponse>, String>,
+        result: Result<(Vec<astra_services::ModelListItemResponse>, bool), String>,
     },
 }
 
@@ -142,18 +142,86 @@ fn active_model_picker_choice(
     }
 }
 
+type ActiveTurnAuth = (
+    tokio::sync::watch::Receiver<Option<String>>,
+    tokio::sync::watch::Receiver<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
+);
+
+enum ModelCatalogAuth {
+    Presented(Option<String>),
+    Active {
+        run: tokio::sync::watch::Receiver<Option<String>>,
+        auth: tokio::sync::watch::Receiver<
+            Option<crate::cli::session::session_runtime::AdmittedAuth>,
+        >,
+    },
+}
+
+async fn wait_for_bound_turn_auth(
+    mut run: tokio::sync::watch::Receiver<Option<String>>,
+    mut auth: tokio::sync::watch::Receiver<
+        Option<crate::cli::session::session_runtime::AdmittedAuth>,
+    >,
+) -> Option<crate::cli::session::session_runtime::AdmittedAuth> {
+    loop {
+        if run.borrow().is_some()
+            && let Some(auth) = auth.borrow().clone()
+        {
+            return Some(auth);
+        }
+        tokio::select! {
+            changed = run.changed() => if changed.is_err() { return None; },
+            changed = auth.changed() => if changed.is_err() { return None; },
+        }
+    }
+}
+
 fn spawn_model_catalog_request(
     api: astra_thin_client::ThinClient,
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    auth: ModelCatalogAuth,
     attachment_epoch: u64,
     initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
     tx: tokio::sync::mpsc::Sender<ModelCatalogEffect>,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
+    use crate::cli::session::session_runtime as runtime;
+    // Select the credential source at the user gesture, before the task can
+    // be delayed and ambient environment/profile precedence changes.
+    let presented = match &auth {
+        ModelCatalogAuth::Presented(profile) => {
+            runtime::capture_presented_auth(profile.as_deref(), &owner)
+        }
+        ModelCatalogAuth::Active { .. } => None,
+    };
     tasks.spawn(async move {
-        let result = crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
+        let result =
+            match tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
+                let auth = match auth {
+                    ModelCatalogAuth::Presented(_) => presented.ok_or_else(|| {
+                        "Authentication is unavailable for the model catalog.".to_string()
+                    })?,
+                    ModelCatalogAuth::Active { run, auth } => {
+                        wait_for_bound_turn_auth(run, auth).await.ok_or_else(|| {
+                            "The task ended before the model picker could open. Try /model again."
+                                .to_string()
+                        })?
+                    }
+                };
+                if !owner.is_current() {
+                    return Err("Account changed. Reopen /model.".to_string());
+                }
+                let personal = runtime::can_manage_personal_models(&auth);
+                runtime::fetch_admitted_model_catalog(&api, &auth)
+                    .await
+                    .map(|catalog| (catalog, personal))
+                    .map_err(|error| error.to_string())
+            })
             .await
-            .map_err(|error| error.to_string());
+            {
+                Ok(result) => result,
+                Err(_) => Err("Model catalog request timed out".to_string()),
+            };
         let _ = tx
             .send(ModelCatalogEffect::Ready {
                 owner,
@@ -1214,23 +1282,29 @@ fn apply_model_catalog_effect_for_choice(
         return false;
     }
     if attachment_epoch != current_epoch && !bound_from_initial {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
             "Session changed before the model picker opened. Open /model again.",
         ));
         return false;
     }
     match result {
-        Ok(catalog) => {
+        Ok((catalog, personal)) => {
             let names = catalog
                 .iter()
                 .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
             bottom_pane.cache_model_catalog(catalog);
-            slash_dispatch::push_model_picker_for_choice(model, bottom_pane, chat_widget, names)
+            slash_dispatch::push_model_picker_for_choice(
+                model,
+                bottom_pane,
+                chat_widget,
+                names,
+                personal,
+            )
         }
         Err(error) => {
-            chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(error));
             false
         }
     }
@@ -1800,7 +1874,7 @@ fn apply_memory_read_effect(
             use crate::tui::bottom_pane::info_view::InfoView;
 
             let lines = crate::cli::slash::slash_memory::memory_health_lines(&body);
-            chat_widget.commit_system(history_cell::system::SystemCell::response(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                 "Opened memory health",
             ));
             bottom_pane.push_view(Box::new(
@@ -1808,7 +1882,7 @@ fn apply_memory_read_effect(
             ));
         }
         MemoryReadEffect::Health(Err(error)) => {
-            chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(format!(
                 "Memory health failed: {error}"
             )));
         }
@@ -1823,7 +1897,7 @@ fn apply_memory_read_effect(
                     .record
                     .as_ref()
                     .and_then(|memory| memory.summary.as_deref());
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     crate::cli::slash::slash_memory::format_session_memory_response(
                         summary,
                         body,
@@ -1837,9 +1911,9 @@ fn apply_memory_read_effect(
                 ));
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Session memory failed: {error}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
+                    format!("Session memory failed: {error}"),
+                ));
             }
         },
         MemoryReadEffect::Search {
@@ -1848,17 +1922,19 @@ fn apply_memory_read_effect(
             result,
         } => match result {
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                chat_widget
+                    .commit_concurrent_system(history_cell::system::SystemCell::error(error));
             }
             Ok(memories) if memories.is_empty() => {
-                chat_widget
-                    .commit_system(history_cell::system::SystemCell::info("No memories found."));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    "No memories found.",
+                ));
             }
             Ok(memories) if stats_view => {
                 use crate::tui::bottom_pane::info_view::InfoView;
 
                 let lines = crate::cli::slash::slash_memory::memory_stats_lines(&memories);
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened memory stats",
                 ));
                 bottom_pane.push_view(Box::new(
@@ -1909,7 +1985,8 @@ fn apply_memory_read_effect(
                     if hidden_session_entries > 0 {
                         message.push_str(" Use /memory session to view session state.");
                     }
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(message));
+                    chat_widget
+                        .commit_concurrent_system(history_cell::system::SystemCell::info(message));
                     return;
                 }
                 let header = format!(
@@ -1930,7 +2007,7 @@ fn apply_memory_read_effect(
                         String::new()
                     }
                 );
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened memory browser",
                 ));
                 bottom_pane.push_view(Box::new(
@@ -1958,20 +2035,21 @@ fn apply_slash_background_read_effect(
             success_message,
             result,
         } => match result {
-            Ok(()) => chat_widget
-                .commit_system(history_cell::system::SystemCell::response(success_message)),
-            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(
-                format!("Copy failed: {error}"),
-            )),
+            Ok(()) => chat_widget.commit_concurrent_system(
+                history_cell::system::SystemCell::response(success_message),
+            ),
+            Err(error) => chat_widget.commit_concurrent_system(
+                history_cell::system::SystemCell::error(format!("Copy failed: {error}")),
+            ),
         },
         SlashBackgroundReadEffect::Worktrees(entries) if entries.is_empty() => {
-            chat_widget.commit_system(history_cell::system::SystemCell::info(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                 "No worktrees found (or `git worktree list` failed).",
             ));
         }
         SlashBackgroundReadEffect::Worktrees(entries) => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            chat_widget.commit_system(history_cell::system::SystemCell::response(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                 "Opened worktrees",
             ));
             bottom_pane.push_view(Box::new(WorktreesView::new(
@@ -1983,14 +2061,14 @@ fn apply_slash_background_read_effect(
             timeline,
         } => {
             if let Some(error) = timeline.load_error() {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(error));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(error));
             } else if timeline.is_empty() {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "No turns recorded yet for session {session_id}."
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!("No turns recorded yet for session {session_id}."),
+                ));
             } else {
                 use crate::tui::bottom_pane::timeline_view::TimelineView;
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened timeline",
                 ));
                 bottom_pane.push_view(Box::new(TimelineView::new(timeline)));
@@ -2002,20 +2080,20 @@ fn apply_slash_background_read_effect(
                     "Work execution · {}",
                     &surface.session_id[..surface.session_id.len().min(8)]
                 );
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened Work execution",
                 ));
                 bottom_pane.push_view(Box::new(work_execution_view(surface, &title)));
             }
             Err(WorkExecutionLoadError::SessionNotBound) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "This Session is not attached to Work yet. Use `/work start <goal>` to create Work, then run `/work execution` again.",
                 ));
             }
             Err(WorkExecutionLoadError::Request(error)) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Work execution unavailable: {error}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
+                    format!("Work execution unavailable: {error}"),
+                ));
             }
         },
         SlashBackgroundReadEffect::WorkRecoveryPointCapture(result) => match *result {
@@ -2026,68 +2104,68 @@ fn apply_slash_background_read_effect(
                     "/works/{}?branch={}#work-progress",
                     point.work_id, point.branch_id
                 );
-                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(format!(
                     "Progress saved · {record_id} · {turns} committed {} · conversation and Work state recorded",
                     if turns == 1 { "turn" } else { "turns" }
                 )));
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
                     "Open {work_path} to inspect record {record_id}. It does not include code files or running effects yet, so it cannot restore the workspace."
                 )));
             }
             Err(WorkRecoveryPointCaptureError::SessionNotBound) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "This conversation is not a Work yet. Use `/work start <goal>` first, then `/work save`.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::SessionUnavailable) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
                     "Work progress could not be saved because its Session is unavailable. Refresh the Work and retry after the Session reconnects.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::RunActive) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Work progress was not saved because a Run is still active. Wait for it to finish, then use `/work save` again.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::TurnActive) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Work progress was not saved because a turn is still being committed. Wait for the turn to settle, then retry.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::EffectsUnresolved) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
                     "Work progress was not saved because an external operation has an unknown result. Review the Run/effect outcome before retrying; do not replay it blindly.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::RepairRequired) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
                     "Work progress was not saved because the Server found inconsistent Run state. Refresh the Work; if it persists, inspect Server diagnostics before continuing.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::BasisChanged) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Work changed while this save was starting. Refresh the Work, then save the current progress again.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::ExecutionChanging) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Work execution environment is changing. Wait for that operation to settle, then save progress again.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::VerificationUnavailable) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
                     "The Server could not verify the Session boundary, so progress was not marked saved. Retry when verification is available.",
                 ));
             }
             Err(WorkRecoveryPointCaptureError::Request(error)) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Work progress could not be saved: {error}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
+                    format!("Work progress could not be saved: {error}"),
+                ));
             }
         },
         SlashBackgroundReadEffect::WorkCatalog { result, cursor } => match result {
             Ok(page) if page.entries.is_empty() => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "No tracked Work yet. Start one here with `/work start <goal>` — for example, `/work start Fix the flaky API test`.",
                 ));
             }
@@ -2124,7 +2202,7 @@ fn apply_slash_background_read_effect(
                         cursor: next_cursor,
                     });
                 }
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     if cursor.is_some() {
                         "Opened older Work · choose a task to view or continue"
                     } else {
@@ -2143,9 +2221,9 @@ fn apply_slash_background_read_effect(
                 ));
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Work hub unavailable: {error}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
+                    format!("Work hub unavailable: {error}"),
+                ));
             }
         },
         SlashBackgroundReadEffect::WorkContinueProgress(progress) => {
@@ -2198,39 +2276,40 @@ fn apply_slash_background_read_effect(
                 } else {
                     history_cell::system::SystemCell::warning(status)
                 };
-                chat_widget.commit_system(status_cell);
+                chat_widget.commit_concurrent_system(status_cell);
                 if let Some(error) = surface.cleanup_error {
-                    chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
-                        "Work cleanup needs attention · {error}"
-                    )));
+                    chat_widget.commit_concurrent_system(
+                        history_cell::system::SystemCell::warning(format!(
+                            "Work cleanup needs attention · {error}"
+                        )),
+                    );
                 }
                 if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
                         "The accepted request is {request_id}; retry only with `/work retry {request_id}` after checking the Work status.",
                         request_id = surface.request_id
                     )));
                 }
                 if let Some(run_id) = surface.run_id {
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                        "Work run · {}",
-                        crate::tui::truncate_ellipsis(&run_id, 16)
-                    )));
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                        format!("Work run · {}", crate::tui::truncate_ellipsis(&run_id, 16)),
+                    ));
                 }
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Work continuation could not be started: {error}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
+                    format!("Work continuation could not be started: {error}"),
+                ));
             }
         },
         SlashBackgroundReadEffect::ResumePicker(discovery) => {
             if discovery.total() == 0 {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "No previous sessions found.",
                 ));
             } else {
                 use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened session picker",
                 ));
                 bottom_pane.push_view(Box::new(SessionPickerView::new(discovery)));
@@ -2240,7 +2319,7 @@ fn apply_slash_background_read_effect(
             snapshot,
             workspace,
         } => {
-            chat_widget.commit_system(history_cell::system::SystemCell::response(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                 "Opened session overview",
             ));
             bottom_pane.push_view(Box::new(slash_dispatch::session_hub_view(
@@ -2249,28 +2328,29 @@ fn apply_slash_background_read_effect(
         }
         SlashBackgroundReadEffect::SessionAnalysis { session_id, result } => match result {
             Ok(events) if events.is_empty() => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Session {session_id} has no journal events."
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!("Session {session_id} has no journal events."),
+                ));
             }
             Ok(events) => {
                 let session_short = &session_id[..session_id.len().min(8)];
-                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-                    "Opened session analysis · {session_short}"
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
+                    format!("Opened session analysis · {session_short}"),
+                ));
                 bottom_pane.push_view(Box::new(slash_dispatch::session_analysis_view(
                     &session_id,
                     &events,
                 )));
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                chat_widget
+                    .commit_concurrent_system(history_cell::system::SystemCell::error(error));
             }
         },
         SlashBackgroundReadEffect::Reflection(result) => match result {
             Ok(crate::cli::slash::slash_state::ReflectSurface::Diff { body }) => {
                 use crate::tui::bottom_pane::info_view::InfoView;
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                     "Opened session reflection delta",
                 ));
                 bottom_pane.push_view(Box::new(
@@ -2293,39 +2373,42 @@ fn apply_slash_background_read_effect(
                             "durable server observation"
                         }
                     };
-                        chat_widget.commit_system(history_cell::system::SystemCell::response(
-                            "Opened session reflection",
-                        ));
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::response("Opened session reflection"),
+                        );
                         bottom_pane.push_view(Box::new(
                             InfoView::from_reflection("Reflection", provenance, report)
                                 .with_primary_workspace(),
                         ));
                     }
                     Err(error) => {
-                        chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::error(error),
+                        );
                     }
                 }
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                chat_widget
+                    .commit_concurrent_system(history_cell::system::SystemCell::error(error));
             }
         },
         SlashBackgroundReadEffect::Memory(effect) => {
             apply_memory_read_effect(effect, bottom_pane, chat_widget);
         }
         SlashBackgroundReadEffect::Mcp(body) => {
-            chat_widget.commit_system(history_cell::system::SystemCell::response(body));
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(body));
         }
         SlashBackgroundReadEffect::Context(breakdown) => {
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
 
-            chat_widget.commit_system(history_cell::system::SystemCell::response(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
                 "Opened context panel",
             ));
             bottom_pane.push_view(Box::new(ContextPanelView::new(*breakdown)));
         }
         SlashBackgroundReadEffect::Failed { action, error } => {
-            chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(format!(
                 "{action} failed: {error}"
             )));
         }
@@ -2595,7 +2678,11 @@ async fn sync_default_model_after_auth(
                     if empty {
                         super::model_setup::sources(bottom_pane);
                     } else {
-                        slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names);
+                        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                        let personal = owner.server_account_id.is_some()
+                            && owner.native_binding.is_none()
+                            && !crate::cli::session::session_runtime::uses_environment_access_token(token);
+                        slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names, personal);
                     }
                     return None;
                 }
@@ -2924,7 +3011,7 @@ async fn handle_active_run_background_tasks_command(
         return false;
     }
     commit_submission_projection(chat_widget, queued_text);
-    chat_widget.commit_system(history_cell::system::SystemCell::response(
+    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
         "Opened background tasks",
     ));
     let _ = force_open_background_task_view(
@@ -3208,7 +3295,7 @@ fn queue_explicit_active_followup(
     if !bottom_pane.queue_next_turn_submission(text.clone()) {
         return false;
     }
-    chat_widget.commit_system(history_cell::system::SystemCell::info(
+    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
         "Queued for the next turn in this client; starts after a safe handoff.".to_string(),
     ));
     true
@@ -3412,8 +3499,8 @@ async fn project_primary_guidance_disposition(
 
 fn spawn_primary_guidance_reconciliation(
     api: astra_thin_client::ThinClient,
-    profile: Option<String>,
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    auth: crate::cli::session::session_runtime::AdmittedAuth,
     tui_tx: stream_bridge::TuiAppEventTx,
     run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
     turn_id: String,
@@ -3455,7 +3542,7 @@ fn spawn_primary_guidance_reconciliation(
                 }
             }
             let Some(token) = await_guidance_future_while_owner_alive(
-                owner_bound_access_token(&api, &owner, profile.as_deref()),
+                auth.access_token(&api, None),
                 &run_control,
             )
             .await
@@ -3561,9 +3648,9 @@ fn spawn_primary_guidance_reconciliation(
 
 struct ActiveRunGuidanceRequest<'a> {
     api: &'a astra_thin_client::ThinClient,
-    profile: Option<&'a str>,
     owner: &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
-    remote_run_id: &'a std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    auth: &'a crate::cli::session::session_runtime::AdmittedAuth,
+    remote_run_id: &'a tokio::sync::watch::Receiver<Option<String>>,
     run_control: &'a std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
     intent_id: &'a str,
     text: &'a str,
@@ -3571,29 +3658,13 @@ struct ActiveRunGuidanceRequest<'a> {
     work_unit_observations: &'a [astra_core::work_unit::WorkUnitObservation],
 }
 
-pub(super) async fn owner_bound_access_token(
-    api: &astra_thin_client::ThinClient,
-    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
-    profile: Option<&str>,
-) -> Option<String> {
-    if !owner.is_current() {
-        return None;
-    }
-    let token = if owner.native_binding.is_some() || owner.legacy_binding.is_some() {
-        crate::cli::session::session_runtime::owner_access_token(api, owner, None).await
-    } else {
-        crate::cli::session::session_runtime::fresh_access_token(api, profile).await
-    };
-    owner.is_current().then_some(token).flatten()
-}
-
 async fn submit_active_run_guidance(
     request: ActiveRunGuidanceRequest<'_>,
 ) -> Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError> {
     let ActiveRunGuidanceRequest {
         api,
-        profile,
         owner,
+        auth,
         remote_run_id,
         run_control,
         intent_id,
@@ -3601,27 +3672,37 @@ async fn submit_active_run_guidance(
         background_work_snapshot,
         work_unit_observations,
     } = request;
-    let run_id = astra_core::sync_poison::recover_mutex_lock(remote_run_id)
-        .clone()
-        .ok_or_else(|| {
-            GuidanceSubmissionError::Rejected(
-                "The server run is still starting. Try again in a moment.".to_string(),
-            )
-        })?;
+    let run_id = remote_run_id.borrow().clone().ok_or_else(|| {
+        GuidanceSubmissionError::Rejected(
+            "The server run is still starting. Try again in a moment.".to_string(),
+        )
+    })?;
     let input = crate::cli::turn::local_run_control::LocalRunControl::guidance_input(
         text,
         background_work_snapshot,
         work_unit_observations,
     )
     .map_err(GuidanceSubmissionError::Rejected)?;
+    let deadline = tokio::time::Instant::now() + ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT;
+    let token = tokio::time::timeout_at(
+        deadline,
+        await_guidance_future_while_owner_alive(auth.access_token(api, None), run_control),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .ok_or_else(|| {
+        GuidanceSubmissionError::Rejected(
+            "Authentication did not become available before the message could be sent.".to_string(),
+        )
+    })?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(GuidanceSubmissionError::Rejected(
+            "Authentication did not become available before the message could be sent.".to_string(),
+        ));
+    }
     let submission = async {
-        let token = owner_bound_access_token(api, owner, profile)
-            .await
-            .ok_or_else(|| {
-                GuidanceSubmissionError::Rejected(
-                    "Authentication is unavailable for active-run guidance.".to_string(),
-                )
-            })?;
         let request = astra_thin_client::RunUserIntentRequest {
             intent_id: intent_id.to_string(),
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -3702,7 +3783,7 @@ async fn submit_active_run_guidance(
     await_active_guidance_submission(
         submission,
         run_control,
-        ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
     )
     .await?
 }
@@ -3721,6 +3802,11 @@ async fn await_active_guidance_submission<F, T>(
 where
     F: std::future::Future<Output = T>,
 {
+    if run_control.upgrade().is_none() {
+        return Err(GuidanceSubmissionError::Rejected(
+            "The active turn ended before the message was sent.".into(),
+        ));
+    }
     tokio::pin!(submission);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -3745,6 +3831,7 @@ where
 struct ActiveRunGuidanceSubmission {
     intent_id: String,
     text: String,
+    auth: crate::cli::session::session_runtime::AdmittedAuth,
     result: Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError>,
 }
 
@@ -4484,7 +4571,7 @@ fn handle_agent_monitor_shortcut(
         return false;
     }
     if !reopen_agents_view(chat_widget, bottom_pane, frame_requester) {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
             "No agent runs yet. Active and recent delegated work will appear here.".to_string(),
         ));
     }
@@ -4638,7 +4725,7 @@ fn apply_tui_control_event(
 ) -> UserIntentProjection {
     match event {
         TuiAppEvent::PermissionAutoApproved { tool, reason } => {
-            chat_widget.commit_system(history_cell::system::SystemCell::info(
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                 astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
                     .trim()
                     .to_string(),
@@ -4680,7 +4767,7 @@ fn apply_tui_control_event(
             ..
         } => {
             if bottom_pane.return_user_intent(intent_id, *status, content) {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Your guidance was not adopted; it remains available for editing.".to_string(),
                 ));
                 UserIntentProjection::Returned
@@ -4760,7 +4847,7 @@ fn apply_agent_communication_event(
             }
             bottom_pane::PendingUserIntentTarget::ActiveRun => return,
         };
-        chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
             "Guidance received by {agent_name}"
         )));
     }
@@ -5065,10 +5152,46 @@ impl PartialEq for SessionContinuationTarget {
 
 impl Eq for SessionContinuationTarget {}
 
+#[derive(Clone)]
+enum AgentActionAuth {
+    Active(ActiveTurnAuth),
+    Presented(Option<crate::cli::session::session_runtime::AdmittedAuth>),
+}
+
+impl AgentActionAuth {
+    fn capture(
+        owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        turn_auth: Option<ActiveTurnAuth>,
+    ) -> Self {
+        match turn_auth {
+            Some(auth) => Self::Active(auth),
+            None => Self::Presented(
+                crate::cli::session::session_runtime::capture_presented_auth(
+                    owner.profile_name.as_deref(),
+                    owner,
+                ),
+            ),
+        }
+    }
+
+    async fn resolve(
+        self,
+        owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    ) -> Option<crate::cli::session::session_runtime::AdmittedAuth> {
+        if !owner.is_current() {
+            return None;
+        }
+        let auth = match self {
+            Self::Active((run, auth)) => wait_for_bound_turn_auth(run, auth).await,
+            Self::Presented(auth) => auth,
+        };
+        owner.is_current().then_some(auth).flatten()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentGuideTarget(Arc<AgentGuideContext>);
 
-#[derive(Debug)]
 struct AgentGuideContext {
     attachment_epoch: u64,
     session_id: Option<String>,
@@ -5077,7 +5200,19 @@ struct AgentGuideContext {
     agent_name: String,
     run_id: String,
     target: crate::tui::agent_run_projection::AgentControlTarget,
+    auth: AgentActionAuth,
     observation: tokio_util::sync::CancellationToken,
+}
+
+impl std::fmt::Debug for AgentGuideContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentGuideContext")
+            .field("session_id", &self.session_id)
+            .field("agent_name", &self.agent_name)
+            .field("run_id", &self.run_id)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for AgentGuideContext {
@@ -5102,12 +5237,11 @@ impl AgentGuideTarget {
         api: astra_thin_client::ThinClient,
         session_id: Option<String>,
         attachment_epoch: u64,
+        turn_auth: Option<ActiveTurnAuth>,
     ) -> Self {
         let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-        let api = match &owner.native_binding {
-            Some(binding) => api.with_bearer_provider(binding.clone()),
-            None => api.without_bearer_provider(),
-        };
+        let auth = AgentActionAuth::capture(&owner, turn_auth);
+        let api = api.without_bearer_provider();
         Self(Arc::new(AgentGuideContext {
             attachment_epoch,
             session_id,
@@ -5116,6 +5250,7 @@ impl AgentGuideTarget {
             agent_name,
             run_id,
             target,
+            auth,
             observation: tokio_util::sync::CancellationToken::new(),
         }))
     }
@@ -5241,6 +5376,7 @@ fn dispatch_agent_control(
         agent_workbench_tx: outcome_tx,
         session_id,
         session_attachment_epoch,
+        turn_auth,
         ..
     } = backends;
     let agent_id_owned = agent_id.to_string();
@@ -5249,18 +5385,16 @@ fn dispatch_agent_control(
         .as_deref()
         .is_some_and(|profile| owner.profile_name.as_deref() != Some(profile))
     {
-        chat_widget.commit_system(history_cell::system::SystemCell::error(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
             "Sign-in changed. Reopen the conversation controls with the intended account.",
         ));
         frame_requester.schedule_frame();
         return;
     }
-    let api = match &owner.native_binding {
-        Some(binding) => api.with_bearer_provider(binding.clone()),
-        None => api,
-    };
+    let api = api.without_bearer_provider();
+    let action_auth = AgentActionAuth::capture(&owner, turn_auth);
     let Some(request_id) = chat_widget.begin_agent_control(&agent_id_owned, &target, action) else {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
             "{} is no longer available for {agent_id}.",
             agent_control_action_label(action)
         )));
@@ -5286,6 +5420,7 @@ fn dispatch_agent_control(
                 spawner,
                 &api,
                 &context.owner,
+                action_auth,
             ),
         )
         .await
@@ -5312,6 +5447,7 @@ async fn execute_agent_control(
     spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    action_auth: AgentActionAuth,
 ) -> Result<AgentControlExecution, String> {
     match target {
         crate::tui::agent_run_projection::AgentControlTarget::LocalAgent { agent_id } => {
@@ -5332,8 +5468,15 @@ async fn execute_agent_control(
             }
         }
         crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id } => {
-            let token = crate::cli::session::session_runtime::owner_access_token(api, owner, None)
+            let api = api.clone().without_bearer_provider();
+            let auth = action_auth
+                .resolve(owner)
                 .await
+                .ok_or_else(|| "authentication is unavailable".to_string())?;
+            let token = auth
+                .access_token(&api, None)
+                .await
+                .filter(|_| owner.is_current())
                 .ok_or_else(|| "authentication is unavailable".to_string())?;
             let result = match action {
                 astra_thin_client::SessionRunAction::Pause => {
@@ -5413,7 +5556,7 @@ fn drain_agent_workbench_outcomes(
                     continue;
                 }
                 if outcome.is_error {
-                    chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
                         outcome.output.clone(),
                     ));
                     bottom_pane.push_view(Box::new(
@@ -5425,20 +5568,21 @@ fn drain_agent_workbench_outcomes(
                         ),
                     ));
                 } else {
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                        "Input sent to {task_id}"
-                    )));
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                        format!("Input sent to {task_id}"),
+                    ));
                 }
             }
             AgentWorkbenchOutcome::Clipboard {
                 success_message,
                 result,
             } => match result {
-                Ok(()) => chat_widget
-                    .commit_system(history_cell::system::SystemCell::response(success_message)),
-                Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(
-                    format!("Copy failed: {error}"),
-                )),
+                Ok(()) => chat_widget.commit_concurrent_system(
+                    history_cell::system::SystemCell::response(success_message),
+                ),
+                Err(error) => chat_widget.commit_concurrent_system(
+                    history_cell::system::SystemCell::error(format!("Copy failed: {error}")),
+                ),
             },
             AgentWorkbenchOutcome::LocalJournalRuns { session_id, runs } => {
                 if active_session_id == Some(session_id.as_str()) {
@@ -5468,7 +5612,7 @@ fn drain_agent_workbench_outcomes(
                                     history_cell::system::SystemCell::warning(outcome.user_notice())
                                 }
                             };
-                            chat_widget.commit_system(cell);
+                            chat_widget.commit_concurrent_system(cell);
                         }
                         tracing::debug!(agent_id = context.agent_id, action = ?context.action, "agent control accepted");
                     }
@@ -5512,7 +5656,7 @@ fn drain_agent_workbench_outcomes(
                             context.action,
                             context.request_id,
                         ) {
-                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(format!(
                         "Could not {} {}: {reason}. Its last confirmed state remains visible.",
                         agent_control_action_label(context.action).to_lowercase(), context.agent_id
                     )));
@@ -5539,9 +5683,9 @@ fn drain_agent_workbench_outcomes(
                     intent.target
                 {
                     let agent_name = target.agent_name();
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                        "Message added for {agent_name}"
-                    )));
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                        format!("Message added for {agent_name}"),
+                    ));
                 }
             }
             AgentWorkbenchOutcome::GuideReturned { intent_id, target } => {
@@ -5563,7 +5707,7 @@ fn drain_agent_workbench_outcomes(
                     continue;
                 }
                 let agent_name = target.agent_name();
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(format!(
                     "Could not send the message to {agent_name}: {reason}. Press Alt+U to view it."
                 )));
             }
@@ -5575,7 +5719,7 @@ fn drain_agent_workbench_outcomes(
             } => {
                 let agent_name = target.agent_name();
                 if bottom_pane.mark_user_intent_unconfirmed(&intent_id) {
-                    chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(format!(
                         "Couldn't confirm the outcome of your message to {agent_name}: {reason}. It won't be sent again automatically."
                     )));
                 }
@@ -5625,7 +5769,7 @@ fn stage_permission_mode_for_next_round(
     _current_mode: crate::cli::permission_manager::PermissionMode,
 ) {
     bottom_pane.stage_permission_mode_for_next_round(mode);
-    chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
+    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(format!(
         "{} · requested; waiting for the current task to apply it",
         slash_dispatch::permission_mode_feedback(mode)
     )));
@@ -5668,6 +5812,7 @@ struct ViewActionBackends {
     profile: Option<String>,
     session_id: Option<String>,
     session_attachment_epoch: u64,
+    turn_auth: Option<ActiveTurnAuth>,
     file_writer: Option<super::file_writer::TuiFileWriter>,
     agent_workbench_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
     native_delivery_refresh:
@@ -6700,52 +6845,65 @@ fn dispatch_root_transcript_load(
 async fn submit_agent_guide(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    guide_auth: AgentActionAuth,
     run_id: &str,
     request: &astra_thin_client::RunUserIntentRequest,
 ) -> Result<String, GuidanceSubmissionError> {
-    // Use the same bounded acknowledgement protocol as root guidance, but
-    // do not couple a member's lifetime to the foreground turn or retry it.
-    tokio::time::timeout(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT, async {
+    // The same deadline covers admission and delivery. Until POST starts,
+    // failures are known not to have sent the message and the draft is safe.
+    let deadline = tokio::time::Instant::now() + ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT;
+    let token = tokio::time::timeout_at(deadline, async {
         if !owner.is_current() {
             return Err(GuidanceSubmissionError::Rejected(
                 "Sign-in changed. Reopen guidance with the intended account.".into(),
             ));
         }
-        let token = crate::cli::session::session_runtime::owner_access_token(api, owner, None)
-            .await
-            .ok_or_else(|| {
-                GuidanceSubmissionError::Rejected("authentication is unavailable".into())
-            })?;
+        let auth = guide_auth.resolve(owner).await
+            .ok_or_else(|| GuidanceSubmissionError::Rejected("authentication is unavailable".into()))?;
+        let token = auth.access_token(api, None).await.ok_or_else(|| {
+            GuidanceSubmissionError::Rejected("authentication is unavailable".into())
+        })?;
         if !owner.is_current() {
             return Err(GuidanceSubmissionError::Rejected(
                 "Sign-in changed. Reopen guidance with the intended account.".into(),
             ));
         }
-        let response = api
-            .submit_run_user_intent(Some(&token), run_id, request)
-            .await
-            .map_err(GuidanceSubmissionError::from_thin_client)?;
-        if response.run_id != run_id
-            || response.intent_id != request.intent_id
-            || response.status != astra_turn_types::UserIntentStatus::AcceptedRemote
-            || response.event_index < 0
-        {
-            return Err(GuidanceSubmissionError::Unconfirmed(
-                "the server returned an inconsistent acknowledgement".into(),
-            ));
-        }
-        tracing::debug!(
-            duplicate = response.duplicate,
-            "agent guidance accepted remotely"
-        );
         Ok(token)
     })
+    .await
+    .map_err(|_| GuidanceSubmissionError::Rejected(
+        "Authentication did not become available before the deadline; the message was not sent.".into(),
+    ))??;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(GuidanceSubmissionError::Rejected(
+            "Authentication did not become available before the deadline; the message was not sent.".into(),
+        ));
+    }
+    let response = tokio::time::timeout_at(
+        deadline,
+        api.submit_run_user_intent(Some(&token), run_id, request),
+    )
     .await
     .map_err(|_| {
         GuidanceSubmissionError::Unconfirmed(
             "Guidance submission exceeded its bounded acknowledgement deadline.".into(),
         )
     })?
+    .map_err(GuidanceSubmissionError::from_thin_client)?;
+    if response.run_id != run_id
+        || response.intent_id != request.intent_id
+        || response.status != astra_turn_types::UserIntentStatus::AcceptedRemote
+        || response.event_index < 0
+    {
+        return Err(GuidanceSubmissionError::Unconfirmed(
+            "the server returned an inconsistent acknowledgement".into(),
+        ));
+    }
+    tracing::debug!(
+        duplicate = response.duplicate,
+        "agent guidance accepted remotely"
+    );
+    Ok(token)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6852,6 +7010,7 @@ fn dispatch_agent_guide(
             if let Some((target, intent_id)) = &recovery {
                 bottom_pane::task_input_view::TaskInputView::returned_with_error(
                     target.clone(),
+                    receipt,
                     intent_id.clone(),
                     &content,
                     message,
@@ -6871,6 +7030,7 @@ fn dispatch_agent_guide(
     let target = receipt.0.target.clone();
     let owner = receipt.0.owner.clone();
     let api = receipt.0.api.clone();
+    let guide_auth = receipt.0.auth.clone();
     if !receipt.is_attached(
         backends.session_id.as_deref(),
         backends.session_attachment_epoch,
@@ -6880,7 +7040,7 @@ fn dispatch_agent_guide(
         .iter()
         .any(|row| row.guide_target() == Some((&receipt.0.target, receipt.0.run_id.as_str())))
     {
-        chat_widget.commit_system(history_cell::system::SystemCell::error(
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
             "Message not sent. Your draft is preserved.",
         ));
         bottom_pane.push_view(Box::new(reopen(
@@ -7005,7 +7165,7 @@ fn dispatch_agent_guide(
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             input: serde_json::json!({ "content": content }),
         };
-        let token = match submit_agent_guide(&api, &owner, &run_id, &request).await {
+        let token = match submit_agent_guide(&api, &owner, guide_auth, &run_id, &request).await {
             Ok(token) => token,
             Err(error) => {
                 let reason = match error {
@@ -7204,7 +7364,7 @@ async fn dispatch_bottom_pane_view_action(
             attachment_epoch,
         } => {
             if attachment_epoch.is_some_and(|epoch| epoch != backends.session_attachment_epoch) {
-                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
                     "Session changed; local output was not opened.",
                 ));
                 return;
@@ -7264,7 +7424,7 @@ async fn dispatch_bottom_pane_view_action(
             input,
         } => {
             if attachment_epoch != backends.session_attachment_epoch {
-                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
                     "Session changed; no input was sent.",
                 ));
                 return;
@@ -7440,13 +7600,14 @@ async fn dispatch_bottom_pane_view_action(
                     backends.api.clone(),
                     backends.session_id.clone(),
                     backends.session_attachment_epoch,
+                    backends.turn_auth.clone(),
                 ),
             )));
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::RecoverReturnedRootGuidance => {
             if bottom_pane.recover_returned_root_guidance() {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Unsent message restored to the composer. Review it before sending.",
                 ));
             }
@@ -7496,16 +7657,26 @@ async fn dispatch_bottom_pane_view_action(
             if let Some(intent) = intent
                 && let bottom_pane::PendingUserIntentTarget::AgentRun { target } = intent.target
             {
+                let recipient = AgentGuideTarget::capture(
+                    target.agent_name().to_owned(),
+                    target.run_id().to_owned(),
+                    target.0.target.clone(),
+                    backends.api.clone(),
+                    backends.session_id.clone(),
+                    backends.session_attachment_epoch,
+                    backends.turn_auth.clone(),
+                );
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::returned(
                         target,
+                        recipient,
                         intent.intent_id,
                         &intent.text,
                         intent.status != astra_turn_types::UserIntentStatus::Returned,
                     ),
                 ));
             } else {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "No unsent agent message belongs to this session.",
                 ));
             }
@@ -7544,6 +7715,7 @@ async fn dispatch_bottom_pane_view_action(
         }
         BottomPaneViewAction::RetryReturnedAgentGuide {
             target,
+            recipient,
             intent_id,
             content,
             acknowledged_unknown,
@@ -7560,16 +7732,8 @@ async fn dispatch_bottom_pane_view_action(
                     return;
                 }
                 original.text = content.clone();
-                let current = AgentGuideTarget::capture(
-                    target.agent_name().to_owned(),
-                    target.run_id().to_owned(),
-                    target.0.target.clone(),
-                    backends.api.clone(),
-                    backends.session_id.clone(),
-                    backends.session_attachment_epoch,
-                );
                 if !dispatch_agent_guide(
-                    current,
+                    recipient,
                     content,
                     acknowledged_unknown,
                     Some((target, intent_id)),
@@ -7620,7 +7784,7 @@ async fn dispatch_bottom_pane_view_action(
             ) {
                 bottom_pane.dismiss_active_agent_monitor();
                 if bottom_pane.queue_session_continuation(target, content) {
-                    chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                         "Continuation queued for the next main-conversation turn.",
                     ));
                 }
@@ -7667,12 +7831,11 @@ async fn dispatch_bottom_pane_view_action(
         BottomPaneViewAction::ExportTranscript { path, lines } => {
             if let Some(writer) = backends.file_writer {
                 writer.rewrite_lines("Transcript export", path.clone(), lines);
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Transcript export queued → {}",
-                    path.display()
-                )));
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!("Transcript export queued → {}", path.display()),
+                ));
             } else {
-                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
                     "Transcript export is unavailable because the asynchronous file writer is not running."
                         .to_string(),
                 ));
@@ -7755,7 +7918,7 @@ fn commit_submission_projection(chat_widget: &mut chat_widget::ChatWidget, text:
             chat_widget::AppEvent::User(UserEvent::Submit(text.to_string())),
         ),
         SubmissionProjection::LocalAction(action) => {
-            chat_widget.commit_system(history_cell::system::SystemCell::action(action));
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::action(action));
         }
     }
 }
@@ -8424,27 +8587,22 @@ pub(crate) async fn run_tui_session(
     let mut model_catalog_loading = false;
     if state.model.is_none() {
         let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-        if owner.server_account_id.is_none() {
+        if owner.server_account_id.is_none()
+            && !crate::cli::session::session_runtime::has_environment_access_token()
+        {
             super::model_setup::sources(&mut bottom_pane);
         } else if owner.native_binding.is_none() {
             model_catalog_loading = true;
             let epoch = state.session_attachment_epoch;
-            let api = api.clone();
-            let tx = model_catalog_tx.clone();
-            model_catalog_tasks.spawn(async move {
-                let result =
-                    crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
-                        .await
-                        .map_err(|error| error.to_string());
-                let _ = tx
-                    .send(ModelCatalogEffect::Ready {
-                        owner,
-                        attachment_epoch: epoch,
-                        initial_bound_session: None,
-                        result,
-                    })
-                    .await;
-            });
+            spawn_model_catalog_request(
+                api.clone(),
+                owner,
+                ModelCatalogAuth::Presented(profile.map(str::to_owned)),
+                epoch,
+                None,
+                model_catalog_tx.clone(),
+                &mut model_catalog_tasks,
+            );
         }
     }
 
@@ -9450,6 +9608,7 @@ pub(crate) async fn run_tui_session(
                                         agent_workbench_tx: agent_workbench_tx.clone(),
                                         native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
+                                        turn_auth: None,
                                     },
                                     &frame_requester,
                                 );
@@ -9786,7 +9945,7 @@ pub(crate) async fn run_tui_session(
                                         let owner =
                                             crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
                                         let attachment_epoch = state.session_attachment_epoch;
-                                        spawn_model_catalog_request(api.clone(), owner, attachment_epoch, None,
+                                        spawn_model_catalog_request(api.clone(), owner, ModelCatalogAuth::Presented(profile.map(str::to_owned)), attachment_epoch, None,
                                             model_catalog_tx.clone(), &mut model_catalog_tasks);
                                     }
                                     pending_deferred_slash_flush = false;
@@ -9906,6 +10065,7 @@ pub(crate) async fn run_tui_session(
                                                     agent_workbench_tx: agent_workbench_tx.clone(),
                                                     native_delivery_refresh: state.native_delivery_refresh_handle(),
                                                     session_attachment_epoch: state.session_attachment_epoch,
+                                                    turn_auth: None,
                                                 },
                                                 &frame_requester,
                                             );
@@ -10183,9 +10343,10 @@ pub(crate) async fn run_tui_session(
                                     // stream. Keep it turn-scoped and share only that typed
                                     // identity with composer submissions; local execution state
                                     // is not evidence that the server accepted guidance.
-                                    let active_remote_run_id = std::sync::Arc::new(
-                                        std::sync::Mutex::new(None::<String>),
-                                    );
+                                    let (active_remote_run_id, active_remote_run_rx) =
+                                        tokio::sync::watch::channel(None::<String>);
+                                    let preinstalled_run_control =
+                                        crate::cli::turn::local_run_control::LocalRunControl::shared();
                                     let (
                                         guidance_submission_tx,
                                         mut guidance_submission_rx,
@@ -10220,7 +10381,8 @@ pub(crate) async fn run_tui_session(
                                     let mut staged_model: Option<NextModelSelection> = None;
 
                                     let mut permission_control = super::permission_control::ActivePermissionControl::new(
-                                        api.clone(), profile.map(str::to_owned), turn_model_owner.clone(), active_remote_run_id.clone(),
+                                        api.clone(), turn_model_owner.clone(), active_remote_run_rx.clone(),
+                                        preinstalled_run_control.admitted_auth(),
                                         state.perm_manager.permission_control_signal(),
                                     );
                                     if let Some(session_id) = state.session_id.as_deref() {
@@ -10237,8 +10399,6 @@ pub(crate) async fn run_tui_session(
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
-                                        let preinstalled_run_control =
-                                            crate::cli::turn::local_run_control::LocalRunControl::shared();
                                         *astra_core::sync_poison::recover_mutex_lock(
                                             &active_turn_local_run_control,
                                         ) = Some(preinstalled_run_control.clone());
@@ -10379,8 +10539,8 @@ pub(crate) async fn run_tui_session(
                                                 && turn_result_ready.is_none()
                                                 && let Some(intent) =
                                                     bottom_pane.next_unsent_guidance(&turn_submission_id)
-                                                && astra_core::sync_poison::recover_mutex_lock(&active_remote_run_id)
-                                                    .as_deref().is_some_and(|id| !id.trim().is_empty())
+                                                && active_remote_run_rx.borrow().as_deref().is_some_and(|id| !id.trim().is_empty())
+                                                && let Some(auth) = preinstalled_run_control.admitted_auth().borrow().clone()
                                             {
                                                 let intent_id = intent.intent_id.clone();
                                                 let text = intent.text.clone();
@@ -10389,12 +10549,8 @@ pub(crate) async fn run_tui_session(
                                                 let active_work_observations = active_work_registry_for_turn.active_work_observations();
                                                 preinstalled_run_control.expect_remote_user_intent_submission(&intent_id);
                                                 let submission_owner = turn_model_owner.clone();
-                                                let submission_api = match &submission_owner.native_binding {
-                                                    Some(binding) => api.clone().with_bearer_provider(binding.clone()),
-                                                    None => api.clone().without_bearer_provider(),
-                                                };
-                                                let submission_profile = profile.map(str::to_string);
-                                                let submission_run_id = active_remote_run_id.clone();
+                                                let submission_api = api.clone().without_bearer_provider();
+                                                let submission_run_id = active_remote_run_rx.clone();
                                                 let submission_run_control = Arc::downgrade(&preinstalled_run_control);
                                                 let submission_tx = guidance_submission_tx.clone();
                                                 in_flight_guidance_queue_index = Some(queue_index);
@@ -10403,8 +10559,8 @@ pub(crate) async fn run_tui_session(
                                                     let result = submit_active_run_guidance(
                                                         ActiveRunGuidanceRequest {
                                                             api: &submission_api,
-                                                            profile: submission_profile.as_deref(),
                                                             owner: &submission_owner,
+                                                            auth: &auth,
                                                             remote_run_id: &submission_run_id,
                                                             run_control: &submission_run_control,
                                                             intent_id: &intent_id,
@@ -10416,6 +10572,7 @@ pub(crate) async fn run_tui_session(
                                                     let _ = submission_tx.send(ActiveRunGuidanceSubmission {
                                                         intent_id,
                                                         text,
+                                                        auth,
                                                         result,
                                                     }).await;
                                                 }));
@@ -10473,7 +10630,7 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     guidance_handoff_blocked = true;
                                                     guidance_admission_closed = true;
-                                                    chat_widget.commit_system(
+                                                    chat_widget.commit_concurrent_system(
                                                         history_cell::system::SystemCell::info(
                                                             "Couldn't confirm the message before the task ended. It won't be sent again automatically."
                                                                 .to_string(),
@@ -10499,13 +10656,17 @@ pub(crate) async fn run_tui_session(
                                                         picker_owner = Some(owner);
                                                     }
                                                     bottom_pane.sync_popups();
+                                                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, width);
                                                     frame_requester.schedule_frame();
                                                 }
                                                 Some(Err(error)) = model_catalog_tasks.join_next(), if !model_catalog_tasks.is_empty() => {
                                                     model_catalog_loading = false;
-                                                    chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                                                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(format!(
                                                         "Model catalog request stopped: {error}"
                                                     )));
+                                                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, width);
                                                     frame_requester.schedule_frame();
                                                 }
                                                 Some(completion) = slash_background_read_rx.recv() => {
@@ -10560,12 +10721,9 @@ pub(crate) async fn run_tui_session(
                                                                 &submission.intent_id,
                                                             );
                                                             let _ = spawn_primary_guidance_reconciliation(
-                                                                match &turn_model_owner.native_binding {
-                                                                    Some(binding) => api.clone().with_bearer_provider(binding.clone()),
-                                                                    None => api.clone().without_bearer_provider(),
-                                                                },
-                                                                profile.map(str::to_string),
+                                                                api.clone().without_bearer_provider(),
                                                                 turn_model_owner.clone(),
+                                                                submission.auth,
                                                                 tui_tx.clone(),
                                                                 preinstalled_run_control.clone(),
                                                                 turn_submission_id.clone(),
@@ -10593,14 +10751,14 @@ pub(crate) async fn run_tui_session(
                                                                 bottom_pane.start_composer_draft(
                                                                     &slash_dispatch::conversation_for_composer(&draft),
                                                                 );
-                                                                chat_widget.commit_system(
+                                                                chat_widget.commit_concurrent_system(
                                                                     history_cell::system::SystemCell::error(error),
                                                                 );
                                                             } else {
                                                                 guidance_admission_closed = true;
                                                                 guidance_handoff_blocked = true;
                                                                 bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
-                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
                                                                     "Sign-in changed. Unsent messages remain with their original session."
                                                                 ));
                                                             }
@@ -10621,14 +10779,14 @@ pub(crate) async fn run_tui_session(
                                                             );
                                                             guidance_admission_closed = true;
                                                             if queued {
-                                                                chat_widget.commit_system(
+                                                                chat_widget.commit_concurrent_system(
                                                                     history_cell::system::SystemCell::info(
                                                                         notice.to_string(),
                                                                     ),
                                                                 );
                                                             } else {
                                                                 guidance_handoff_blocked = true;
-                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
                                                                     "Session changed. Unsent messages remain with their original session."
                                                                 ));
                                                             }
@@ -10640,7 +10798,7 @@ pub(crate) async fn run_tui_session(
                                                             bottom_pane.mark_user_intent_unconfirmed(&submission.intent_id);
                                                             guidance_admission_closed = true;
                                                             guidance_handoff_blocked = true;
-                                                            chat_widget.commit_system(
+                                                            chat_widget.commit_concurrent_system(
                                                                 history_cell::system::SystemCell::info(format!(
                                                                     "Couldn't confirm whether your message was received. It won't be sent again automatically. ({error})"
                                                                 )),
@@ -10684,6 +10842,7 @@ pub(crate) async fn run_tui_session(
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                                             native_delivery_refresh: native_delivery_refresh.clone(),
                                                                             session_attachment_epoch: live_session_attachment_epoch,
+                                                                            turn_auth: Some((active_remote_run_rx.clone(), preinstalled_run_control.admitted_auth())),
                                                                         },
                                                                         &frame_requester,
                                                                     );
@@ -10710,13 +10869,13 @@ pub(crate) async fn run_tui_session(
                                                             if is_ctrl_b_background_key(&k) {
                                                                 let wait_released = foreground_wait_control_for_ctrl_b.release();
                                                                 if wait_released {
-                                                                    chat_widget.commit_system(
+                                                                    chat_widget.commit_concurrent_system(
                                                                         history_cell::system::SystemCell::background_task(
                                                                             "Continuing without waiting; the task remains available in the task panel.",
                                                                         ),
                                                                     );
                                                                 } else {
-                                                                    chat_widget.commit_system(
+                                                                    chat_widget.commit_concurrent_system(
                                                                         history_cell::system::SystemCell::info(
                                                                             "Ctrl+B: Nothing to background. Opening task panel.",
                                                                         ),
@@ -10816,13 +10975,13 @@ pub(crate) async fn run_tui_session(
                                                                             }
                                                                             Some(slash_dispatch::ImmediateControl::StopCurrentRun) => {
                                                                                 if output_settled_at.is_some() {
-                                                                                    chat_widget.commit_system(
+                                                                                    chat_widget.commit_concurrent_system(
                                                                                         history_cell::system::SystemCell::info(
                                                                                             "The current run has already finished its response and is settling.",
                                                                                         ),
                                                                                     );
                                                                                 } else {
-                                                                                    chat_widget.commit_system(
+                                                                                    chat_widget.commit_concurrent_system(
                                                                                         history_cell::system::SystemCell::info(
                                                                                             "Stopping the current run…",
                                                                                         ),
@@ -10850,7 +11009,7 @@ pub(crate) async fn run_tui_session(
                                                                         match classify_local_shell_submission(&queued_text) {
                                                                             LocalShellSubmission::NotShell => {}
                                                                             LocalShellSubmission::Empty => {
-                                                                                chat_widget.commit_system(
+                                                                                chat_widget.commit_concurrent_system(
                                                                                     history_cell::system::SystemCell::error(
                                                                                         "Shell command is empty. Enter `!<command>`.",
                                                                                     ),
@@ -10869,7 +11028,7 @@ pub(crate) async fn run_tui_session(
                                                                                     user_shell_worktree_journal.clone(),
                                                                                     &command,
                                                                                 ).await {
-                                                                                    Ok(task_id) => chat_widget.commit_system(
+                                                                                    Ok(task_id) => chat_widget.commit_concurrent_system(
                                                                                         history_cell::system::SystemCell::info(
                                                                                             local_background_shell_started_message(
                                                                                                 &task_id,
@@ -10877,7 +11036,7 @@ pub(crate) async fn run_tui_session(
                                                                                             ),
                                                                                         ),
                                                                                     ),
-                                                                                    Err(error) => chat_widget.commit_system(
+                                                                                    Err(error) => chat_widget.commit_concurrent_system(
                                                                                         history_cell::system::SystemCell::error(format!(
                                                                                             "Could not start shell command: {error}"
                                                                                         )),
@@ -10892,7 +11051,7 @@ pub(crate) async fn run_tui_session(
                                                                                 continue;
                                                                             }
                                                                             LocalShellSubmission::Interactive(command) => {
-                                                                                chat_widget.commit_system(
+                                                                                chat_widget.commit_concurrent_system(
                                                                                     history_cell::system::SystemCell::error(format!(
                                                                                         "Interactive shell `{command}` needs the terminal. Wait for the current turn to finish or interrupt it first."
                                                                                     )),
@@ -10916,7 +11075,7 @@ pub(crate) async fn run_tui_session(
                                                                                 &mut chat_widget,
                                                                                 &queued_text,
                                                                             );
-                                                                            chat_widget.commit_system(
+                                                                            chat_widget.commit_concurrent_system(
                                                                                 history_cell::system::SystemCell::response(
                                                                                     "Loading requested view…",
                                                                                 ),
@@ -10959,6 +11118,7 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         if slash_dispatch::open_active_help(&queued_text, &mut bottom_pane, &mut chat_widget) {
                                                                             bottom_pane.sync_popups();
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
@@ -10984,14 +11144,16 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         if slash_dispatch::is_model_picker_request(&queued_text) {
                                                                             if model_catalog_loading {
-                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info("Model catalog is already loading."));
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info("Model catalog is already loading."));
                                                                             } else {
                                                                                 model_catalog_loading = true;
-                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info("Loading models… Current task continues."));
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info("Loading models… Current task continues."));
                                                                                 let owner = turn_model_owner.clone();
                                                                                 let bound = turn_model_session.is_none()
                                                                                     .then(|| permission_control.session_binding());
-                                                                                spawn_model_catalog_request(api.clone(), owner, turn_model_epoch, bound,
+                                                                                spawn_model_catalog_request(api.clone(), owner, ModelCatalogAuth::Active {
+                                                                                    run: active_remote_run_rx.clone(), auth: preinstalled_run_control.admitted_auth(),
+                                                                                }, turn_model_epoch, bound,
                                                                                     model_catalog_tx.clone(), &mut model_catalog_tasks);
                                                                             }
                                                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -11001,12 +11163,12 @@ pub(crate) async fn run_tui_session(
                                                                         if let Some(requested) = slash_dispatch::active_model_override(&queued_text) {
                                                                             if turn_model_owner.is_current() {
                                                                                 let label = requested.as_deref().unwrap_or("no model");
-                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
                                                                                     "Selected {label} · applies after this task, including queued messages."
                                                                                 )));
                                                                                 staged_model = Some(NextModelSelection::Requested(requested));
                                                                             } else {
-                                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
                                                                             }
                                                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                             frame_requester.schedule_frame();
@@ -11021,7 +11183,7 @@ pub(crate) async fn run_tui_session(
                                                                             // The current run has closed, or an older
                                                                             // next-turn message already has priority.
                                                                             if slash_dispatch::parse_submission(&queued_text).is_command() {
-                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                                     "Command queued until the current task finishes."
                                                                                 ));
                                                                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -11043,7 +11205,7 @@ pub(crate) async fn run_tui_session(
                                                                                 continue;
                                                                             }
                                                                             bottom_pane.restore_into_composer(&queued_text);
-                                                                            chat_widget.commit_system(
+                                                                            chat_widget.commit_concurrent_system(
                                                                                 history_cell::system::SystemCell::error(reason.message()),
                                                                             );
                                                                             continue;
@@ -11084,6 +11246,7 @@ pub(crate) async fn run_tui_session(
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
                                                                                 native_delivery_refresh: native_delivery_refresh.clone(),
                                                                                 session_attachment_epoch: live_session_attachment_epoch,
+                                                                                turn_auth: Some((active_remote_run_rx.clone(), preinstalled_run_control.admitted_auth())),
                                                                             },
                                                                             &restored_local_agent_task_projections,
                                                                             &mut chat_widget,
@@ -11101,7 +11264,7 @@ pub(crate) async fn run_tui_session(
                                                                         if picker_owner.as_ref().is_some_and(|owner| owner.is_current()) {
                                                                             match slash_dispatch::prepare_model_picker_result(&result, &mut bottom_pane, &mut chat_widget) {
                                                                                 Some(Ok(Some(selection))) => {
-                                                                                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                                                                                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
                                                                                         "Selected {} · applies after this task, including queued messages.", selection.name
                                                                                     )));
                                                                                     staged_model = Some(NextModelSelection::Picked { result: Box::new(result), selection });
@@ -11111,7 +11274,7 @@ pub(crate) async fn run_tui_session(
                                                                                 _ => {}
                                                                             }
                                                                         } else {
-                                                                            chat_widget.commit_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
+                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
                                                                             picker_owner = None;
                                                                         }
                                                                         bottom_pane.sync_popups();
@@ -11122,7 +11285,7 @@ pub(crate) async fn run_tui_session(
                                                                         result: Some(bottom_pane::view::ViewResult::ModelSetup(_)), ..
                                                                     } => {
                                                                         bottom_pane.queue_next_turn_submission("/model add".into());
-                                                                        chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                                                        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                             "Model setup will open after the current task."
                                                                         ));
                                                                         picker_owner = None;
@@ -11349,12 +11512,10 @@ pub(crate) async fn run_tui_session(
                                                     if let TuiAppEvent::RunBound(run_id) = &ae
                                                         && !run_id.trim().is_empty()
                                                     {
-                                                        let mut bound = astra_core::sync_poison::recover_mutex_lock(
-                                                            &active_remote_run_id,
-                                                        );
+                                                        let bound = active_remote_run_rx.borrow().clone();
                                                         match bound.as_deref() {
                                                             None => {
-                                                                *bound = Some(run_id.clone());
+                                                                let _ = active_remote_run_id.send_replace(Some(run_id.clone()));
                                                                 guidance_dispatch_needed = true;
                                                             }
                                                             Some(existing) if existing != run_id => {
@@ -11635,6 +11796,7 @@ pub(crate) async fn run_tui_session(
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                             native_delivery_refresh: native_delivery_refresh.clone(),
                                                             session_attachment_epoch: live_session_attachment_epoch,
+                                                            turn_auth: Some((active_remote_run_rx.clone(), preinstalled_run_control.admitted_auth())),
                                                         },
                                                         &restored_local_agent_task_projections,
                                                         &mut chat_widget,
@@ -11743,7 +11905,7 @@ pub(crate) async fn run_tui_session(
                                                     for message in
                                                         background_task_event_system_messages(&bg_events)
                                                     {
-                                                        chat_widget.commit_system(
+                                                        chat_widget.commit_concurrent_system(
                                                             history_cell::system::SystemCell::info(&message),
                                                         );
                                                     }
@@ -11780,7 +11942,7 @@ pub(crate) async fn run_tui_session(
                                                         match outcome {
                                                             Ok(_) => bottom_pane.clear_staged_permission_mode(),
                                                             Err(error) => {
-                                                                chat_widget.commit_system(history_cell::system::SystemCell::response(error));
+                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(error));
                                                             }
                                                         }
                                                     }
@@ -11829,6 +11991,7 @@ pub(crate) async fn run_tui_session(
                                         r
                                     };
 
+                                    drop(active_remote_run_id);
                                     let first_bound_session = astra_core::sync_poison::recover_mutex_lock(&turn_bound_session).clone();
                                     let same_turn_scope = turn_model_owner.is_current() && model_selection_attachment_matches(
                                         turn_model_session.as_deref(), turn_model_epoch,
@@ -12157,6 +12320,7 @@ pub(crate) async fn run_tui_session(
                                         agent_workbench_tx: agent_workbench_tx.clone(),
                                         native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
+                                        turn_auth: None,
                                     },
                                     &restored_local_agent_task_projections,
                                     &mut chat_widget,
@@ -12948,6 +13112,7 @@ pub(crate) async fn run_tui_session(
                         agent_workbench_tx: agent_workbench_tx.clone(),
                         native_delivery_refresh: state.native_delivery_refresh_handle(),
                         session_attachment_epoch: state.session_attachment_epoch,
+                        turn_auth: None,
                     },
                     &restored_local_agent_task_projections,
                     &mut chat_widget,
@@ -13150,6 +13315,7 @@ pub(crate) async fn run_tui_session(
                                     agent_workbench_tx: agent_workbench_tx.clone(),
                                     native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
+                                    turn_auth: None,
                                 },
                             );
                         }
@@ -13170,6 +13336,7 @@ pub(crate) async fn run_tui_session(
                                     agent_workbench_tx: agent_workbench_tx.clone(),
                                     native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
+                                    turn_auth: None,
                                 },
                                 &restored_local_agent_task_projections,
                                 &mut chat_widget,
@@ -15232,6 +15399,16 @@ mod tests {
 
     #[tokio::test]
     async fn active_guidance_submission_cancels_when_turn_owner_drops() {
+        let already_ended = std::sync::Weak::new();
+        assert!(matches!(
+            await_active_guidance_submission(
+                std::future::pending::<()>(),
+                &already_ended,
+                Duration::from_secs(1),
+            )
+            .await,
+            Err(GuidanceSubmissionError::Rejected(_))
+        ));
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let weak = std::sync::Arc::downgrade(&run_control);
         let submission = tokio::spawn(async move {
@@ -16094,6 +16271,7 @@ mod tests {
             api.clone(),
             Some("session".into()),
             1,
+            None,
         );
         let mut pane = BottomPane::new();
         pane.set_session_attachment(Some("session"), 1);
@@ -16128,6 +16306,7 @@ mod tests {
             api,
             Some("session".into()),
             2,
+            None,
         );
         assert!(matches!(pane.agent_delivery_barrier(&new_child, &[]),
             Some(bottom_pane::AgentDeliveryBarrier::Unconfirmed(ids)) if ids == ["child"]));
@@ -16226,6 +16405,7 @@ mod tests {
                 api.clone(),
                 Some("session-control".into()),
                 1,
+                None,
             );
             Mock::given(method("POST"))
                 .and(path("/chat/runs/child-run/intents"))
@@ -16249,6 +16429,7 @@ mod tests {
                     profile: Some(profile),
                     session_id: Some("session-control".into()),
                     session_attachment_epoch: 1,
+                    turn_auth: None,
                     file_writer: None,
                     agent_workbench_tx: tx,
                     native_delivery_refresh: Default::default(),
@@ -16287,6 +16468,7 @@ mod tests {
             let guide_result = submit_agent_guide(
                 &guide.0.api,
                 &guide.0.owner,
+                guide.0.auth.clone(),
                 &guide.0.run_id,
                 &guide_request,
             )
@@ -20990,11 +21172,12 @@ mod tests {
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".to_string())));
+            let (_run_tx, run_id) = tokio::sync::watch::channel(Some("run-1".to_string()));
+            let auth = crate::cli::session::session_runtime::AdmittedAuth::new("test-token", None);
             let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
             let result = submit_active_run_guidance(ActiveRunGuidanceRequest {
                 api: &api,
-                profile: None,
+                auth: &auth,
                 owner: &crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
                 remote_run_id: &run_id,
                 run_control: &Arc::downgrade(&control),
@@ -21035,11 +21218,12 @@ mod tests {
             .unwrap();
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".into())));
+        let (_run_tx, run_id) = tokio::sync::watch::channel(Some("run-1".into()));
+        let auth = crate::cli::session::session_runtime::AdmittedAuth::new("test-token", None);
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let result = submit_active_run_guidance(ActiveRunGuidanceRequest {
             api: &api,
-            profile: None,
+            auth: &auth,
             owner: &owner,
             remote_run_id: &run_id,
             run_control: &Arc::downgrade(&control),
@@ -21116,7 +21300,8 @@ mod tests {
         )
         .await;
         let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
-        let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".into())));
+        let (_run_tx, run_id) = tokio::sync::watch::channel(Some("run-1".into()));
+        let auth = crate::cli::session::session_runtime::AdmittedAuth::new("test-token", None);
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let binding = Arc::new(std::sync::Mutex::new(Some("session".into())));
         let mut pane = BottomPane::new();
@@ -21134,7 +21319,7 @@ mod tests {
         let control_weak = Arc::downgrade(&control);
         let submission = submit_active_run_guidance(ActiveRunGuidanceRequest {
             api: &api,
-            profile: None,
+            auth: &auth,
             owner: &owner,
             remote_run_id: &run_id,
             run_control: &control_weak,
@@ -21215,9 +21400,12 @@ mod tests {
         );
         let mut control = crate::tui::permission_control::ActivePermissionControl::new(
             api,
-            None,
             owner.clone(),
-            Arc::new(std::sync::Mutex::new(Some("run-1".into()))),
+            tokio::sync::watch::channel(Some("run-1".into())).1,
+            tokio::sync::watch::channel(Some(
+                crate::cli::session::session_runtime::AdmittedAuth::new("test-token", None),
+            ))
+            .1,
             state.perm_manager.permission_control_signal(),
         );
         control.bind_session("session");
@@ -21694,6 +21882,7 @@ mod tests {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             session_id,
             epoch,
+            None,
         )
     }
 
@@ -21953,6 +22142,7 @@ mod tests {
         use astra_thin_client::StreamEvent;
 
         let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default",
             Some("returned-guide-owner"),
@@ -22057,6 +22247,7 @@ mod tests {
             profile: None,
             session_id: Some("session".into()),
             session_attachment_epoch: 4,
+            turn_auth: None,
             file_writer: None,
             agent_workbench_tx: agent_workbench_tx.clone(),
             native_delivery_refresh: Default::default(),
@@ -22088,6 +22279,9 @@ mod tests {
             1,
             "closing the view must keep the message"
         );
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
         dispatch_bottom_pane_view_action(
             BottomPaneViewAction::OpenReturnedAgentGuide,
             &mut background,
@@ -22102,6 +22296,9 @@ mod tests {
             24,
         )
         .await;
+        unsafe {
+            std::env::remove_var("ASTRA_ACCESS_TOKEN");
+        }
         pane.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
@@ -22115,6 +22312,20 @@ mod tests {
         else {
             panic!("retry action expected")
         };
+        let BottomPaneViewAction::RetryReturnedAgentGuide { recipient, .. } = &retry else {
+            unreachable!()
+        };
+        let auth = recipient
+            .0
+            .auth
+            .clone()
+            .resolve(&recipient.0.owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.access_token(&api, None).await.as_deref(),
+            Some("gateway-token")
+        );
         dispatch_bottom_pane_view_action(
             retry,
             &mut background,
@@ -22344,7 +22555,7 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
             let error = tokio::time::timeout(
                 ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT + Duration::from_secs(2),
-                submit_agent_guide(&api, &owner, "member-run", &request),
+                submit_agent_guide(&api, &owner, AgentActionAuth::Presented(crate::cli::session::session_runtime::capture_presented_auth(owner.profile_name.as_deref(), &owner)), "member-run", &request),
             ).await.unwrap().unwrap_err();
             assert!(match error {
                 GuidanceSubmissionError::Rejected(_) | GuidanceSubmissionError::GuidanceClosed(_) => rejected,
@@ -22368,7 +22579,19 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            submit_agent_guide(&api, &owner, "member-run", &request).await,
+            submit_agent_guide(
+                &api,
+                &owner,
+                AgentActionAuth::Presented(
+                    crate::cli::session::session_runtime::capture_presented_auth(
+                        owner.profile_name.as_deref(),
+                        &owner
+                    )
+                ),
+                "member-run",
+                &request
+            )
+            .await,
             Err(GuidanceSubmissionError::Rejected(_))
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -22423,6 +22646,7 @@ mod tests {
                     astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
                     Some("session".into()),
                     9,
+                    None,
                 ),
                 "private guidance".into(),
                 Vec::new(),
@@ -22433,6 +22657,7 @@ mod tests {
                     profile: None,
                     session_id: Some("session".into()),
                     session_attachment_epoch: 9,
+                    turn_auth: None,
                     file_writer: None,
                     agent_workbench_tx: tx,
                     native_delivery_refresh: Default::default(),
@@ -22484,6 +22709,7 @@ mod tests {
                 api.clone(),
                 Some("session".into()),
                 9,
+                None,
             )
         };
         let mut widget = chat_widget::ChatWidget::new("session");
@@ -22511,6 +22737,7 @@ mod tests {
             profile: None,
             session_id: Some("session".into()),
             session_attachment_epoch: 9,
+            turn_auth: None,
             file_writer: None,
             agent_workbench_tx: tx.clone(),
             native_delivery_refresh: Default::default(),
@@ -22595,6 +22822,7 @@ mod tests {
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
                 None,
                 attachment_epoch,
+                None,
             ),
             "inspect the storage race".into(),
         ));
@@ -22895,6 +23123,7 @@ mod tests {
                 profile: None,
                 session_id: Some("session-control".into()),
                 session_attachment_epoch: 0,
+                turn_auth: None,
                 file_writer: None,
                 agent_workbench_tx,
                 native_delivery_refresh: Default::default(),
@@ -23210,6 +23439,7 @@ mod tests {
                 agent_workbench_tx,
                 native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
+                turn_auth: None,
             },
             &FrameRequester::test_dummy(),
         );
@@ -23277,6 +23507,7 @@ mod tests {
                 agent_workbench_tx,
                 native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
+                turn_auth: None,
             },
             &FrameRequester::test_dummy(),
         );
@@ -24392,7 +24623,7 @@ mod tests {
                 owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
                 attachment_epoch: state.session_attachment_epoch,
                 initial_bound_session: None,
-                result: Ok(catalog)
+                result: Ok((catalog, true))
             },
             &state,
             &mut bottom_pane,
@@ -24545,6 +24776,7 @@ mod tests {
             &mut pane,
             &mut widget,
             vec!["same-name".into(), "same-name".into()],
+            true,
         );
         pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let BottomPaneAction::ViewCompleted {
@@ -25947,5 +26179,455 @@ mod tests {
                 .all(|msg| !msg.contains("background shells completed")),
             "{messages:?}"
         );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn concurrent_controls_preserve_running_tool_until_its_real_completion() {
+        use crate::tui::history_cell::tool::{ToolCell, ToolStatus};
+        let mut widget = chat_widget::ChatWidget::new("");
+        let mut pane = BottomPane::new();
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ToolStarted {
+                name: "bash".into(),
+                description: "long command".into(),
+                tool_use_id: "running-tool".into(),
+                parent_tool_use_id: None,
+            },
+        ));
+        assert!(slash_dispatch::open_active_help(
+            "/help",
+            &mut pane,
+            &mut widget
+        ));
+        stage_permission_mode_for_next_round(
+            &mut pane,
+            &mut widget,
+            crate::cli::permission_manager::PermissionMode::Plan,
+            crate::cli::permission_manager::PermissionMode::Prompt,
+        );
+        commit_submission_projection(&mut widget, "/tasks");
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        apply_model_catalog_effect_for_choice(
+            ModelCatalogEffect::Ready {
+                owner,
+                attachment_epoch: 0,
+                initial_bound_session: None,
+                result: Err("catalog unavailable".into()),
+            },
+            None,
+            None,
+            0,
+            &mut pane,
+            &mut widget,
+        );
+        assert!(
+            widget
+                .active_cell()
+                .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+                .is_some_and(|cell| cell.status == ToolStatus::Running)
+        );
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ToolCompleted {
+                name: "bash".into(),
+                description: "long command".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: None,
+                tool_use_id: "running-tool".into(),
+                parent_tool_use_id: None,
+            },
+        ));
+        let tool = widget
+            .history()
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert_eq!(tool.status, ToolStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn model_picker_waits_for_bound_attempt_and_stops_when_turn_ends() {
+        use crate::cli::session::session_runtime::AdmittedAuth;
+        let (run_tx, run_rx) = tokio::sync::watch::channel(None);
+        let (auth_tx, auth_rx) =
+            tokio::sync::watch::channel(Some(AdmittedAuth::new("first-attempt", None)));
+        let wait = wait_for_bound_turn_auth(run_rx, auth_rx);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err()
+        );
+        auth_tx.send_replace(Some(AdmittedAuth::new("admitted-attempt", None)));
+        run_tx.send_replace(Some("run".into()));
+        let auth = wait.await.unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        assert_eq!(
+            auth.access_token(&api, None).await.as_deref(),
+            Some("admitted-attempt")
+        );
+        let (run_tx, run_rx) = tokio::sync::watch::channel(None);
+        let (_auth_tx, auth_rx) = tokio::sync::watch::channel(None);
+        drop(run_tx);
+        assert!(wait_for_bound_turn_auth(run_rx, auth_rx).await.is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(start_paused = true)]
+    async fn member_guidance_before_binding_is_known_unsent() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let request = astra_thin_client::RunUserIntentRequest {
+            intent_id: "intent".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            input: serde_json::json!({"content":"draft"}),
+        };
+        let (run_tx, run_rx) = tokio::sync::watch::channel(None);
+        let (_auth_tx, auth_rx) = tokio::sync::watch::channel(None);
+        let waiting = submit_agent_guide(
+            &api,
+            &owner,
+            AgentActionAuth::Active((run_rx, auth_rx)),
+            "child",
+            &request,
+        );
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("must wait for the actual turn binding"),
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        tokio::time::advance(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT).await;
+        assert!(matches!(
+            waiting.await,
+            Err(GuidanceSubmissionError::Rejected(_))
+        ));
+        drop(run_tx);
+
+        let (run_tx, run_rx) = tokio::sync::watch::channel(None);
+        let (_auth_tx, auth_rx) = tokio::sync::watch::channel(None);
+        drop(run_tx);
+        assert!(matches!(
+            submit_agent_guide(
+                &api,
+                &owner,
+                AgentActionAuth::Active((run_rx, auth_rx)),
+                "child",
+                &request
+            )
+            .await,
+            Err(GuidanceSubmissionError::Rejected(_))
+        ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn delayed_catalog_keeps_the_selected_credential_source_for_the_picker() {
+        use wiremock::matchers::{header, method, path};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            crate::cli::cli_config::cli_utils::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("profile-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let server = MockServer::start().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observed = entered.clone();
+        Mock::given(method("GET")).and(path("/models"))
+            .and(header("authorization", "Bearer gateway-token"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_millis(100)).set_body_json(serde_json::json!({
+                    "items": [], "next_cursor": null, "limit": 50, "total": 0, "catalog_revision": "sha256:empty"
+                }))
+            }).expect(1).mount(&server).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        spawn_model_catalog_request(
+            api,
+            owner,
+            ModelCatalogAuth::Presented(None),
+            0,
+            None,
+            tx,
+            &mut tasks,
+        );
+        // Change the ambient source before the spawned request can run.
+        unsafe {
+            std::env::remove_var("ASTRA_ACCESS_TOKEN");
+        }
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let effect = rx.recv().await.unwrap();
+        assert!(
+            matches!(&effect, ModelCatalogEffect::Ready { result: Ok((models, false)), .. } if models.is_empty())
+        );
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("");
+        assert!(!apply_model_catalog_effect_for_choice(
+            effect,
+            None,
+            None,
+            0,
+            &mut pane,
+            &mut widget
+        ));
+        assert!(
+            !pane.has_active_view(),
+            "an environment catalog cannot open profile setup"
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn active_guidance_distinguishes_auth_timeout_from_post_timeout() {
+        use wiremock::matchers::{method, path};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            crate::cli::cli_config::cli_utils::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("e30.eyJleHAiOjF9.sig".into()),
+                refresh_token: Some("refresh-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT * 2),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/root/intents"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT * 2),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (_run_tx, run) = tokio::sync::watch::channel(Some("root".into()));
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let weak = Arc::downgrade(&control);
+        let auth = crate::cli::session::session_runtime::AdmittedAuth::Owner(owner.clone());
+        let request = |auth| ActiveRunGuidanceRequest {
+            api: &api,
+            owner: &owner,
+            auth,
+            remote_run_id: &run,
+            run_control: &weak,
+            intent_id: "intent",
+            text: "change direction",
+            background_work_snapshot: None,
+            work_unit_observations: &[],
+        };
+        assert!(matches!(
+            submit_active_run_guidance(request(&auth)).await,
+            Err(GuidanceSubmissionError::Rejected(_))
+        ));
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().ends_with("/intents"))
+        );
+        let static_auth =
+            crate::cli::session::session_runtime::AdmittedAuth::new("gateway-token", None);
+        assert!(matches!(
+            submit_active_run_guidance(request(&static_auth)).await,
+            Err(GuidanceSubmissionError::Unconfirmed(_))
+        ));
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn durable_child_controls_use_presented_environment_bearer() {
+        use wiremock::matchers::{header, method, path};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            crate::cli::cli_config::cli_utils::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("profile-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/runs/child/intents"))
+            .and(header("authorization", "Bearer gateway-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id":"child", "intent_id":"intent", "status":"accepted_remote", "event_index":1, "duplicate":false
+            }))).expect(2).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/child"))
+            .and(header("authorization", "Bearer gateway-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        #[derive(Debug)]
+        struct WrongProvider;
+        impl astra_thin_client::client::BearerProvider for WrongProvider {
+            fn token(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<String, astra_thin_client::ThinClientError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok("wrong-provider-token".into()) })
+            }
+        }
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(Arc::new(WrongProvider));
+        let (run_tx, run_rx) = tokio::sync::watch::channel(Some("parent".into()));
+        let (auth_tx, auth_rx) = tokio::sync::watch::channel(Some(
+            crate::cli::session::session_runtime::AdmittedAuth::new("gateway-token", None),
+        ));
+        let target = AgentGuideTarget::capture(
+            "worker".into(),
+            "child".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "child".into(),
+            },
+            api.clone(),
+            Some("session".into()),
+            0,
+            Some((run_rx, auth_rx)),
+        );
+        let idle_target = AgentGuideTarget::capture(
+            "worker".into(),
+            "child".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "child".into(),
+            },
+            api.clone(),
+            Some("session".into()),
+            0,
+            None,
+        );
+        let idle_control_auth = AgentActionAuth::capture(&owner, None);
+        // The user opened the composer during the turn, but submitted only
+        // after it finished and ambient selection had changed to the profile.
+        drop(run_tx);
+        drop(auth_tx);
+        unsafe {
+            std::env::remove_var("ASTRA_ACCESS_TOKEN");
+        }
+        let request = astra_thin_client::RunUserIntentRequest {
+            intent_id: "intent".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            input: serde_json::json!({"content":"hello"}),
+        };
+        assert_eq!(
+            submit_agent_guide(
+                &target.0.api,
+                &owner,
+                target.0.auth.clone(),
+                "child",
+                &request
+            )
+            .await
+            .unwrap(),
+            "gateway-token"
+        );
+        assert_eq!(
+            submit_agent_guide(
+                &idle_target.0.api,
+                &owner,
+                idle_target.0.auth.clone(),
+                "child",
+                &request
+            )
+            .await
+            .unwrap(),
+            "gateway-token"
+        );
+        assert!(matches!(
+            execute_agent_control(
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child".into()
+                },
+                astra_thin_client::SessionRunAction::Cancel,
+                None,
+                &api,
+                &owner,
+                target.0.auth.clone()
+            )
+            .await,
+            Ok(AgentControlExecution::Applied(_))
+        ));
+        assert!(matches!(
+            execute_agent_control(
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child".into()
+                },
+                astra_thin_client::SessionRunAction::Cancel,
+                None,
+                &api,
+                &owner,
+                idle_control_auth,
+            )
+            .await,
+            Ok(AgentControlExecution::Applied(_))
+        ));
+        server.verify().await;
     }
 }

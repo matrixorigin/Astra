@@ -413,6 +413,7 @@ mod tests {
             turn_start: Instant::now(),
             ui: &mut ui,
             turn_usage_sink: None,
+            auth_owner: None,
         };
         crate::cli::turn::turn_settlement::settle_failed_turn(
             &mut state,

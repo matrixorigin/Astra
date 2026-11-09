@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -26,6 +26,8 @@ pub enum MockScenario {
     ToolThenComplete,
     /// Launch a gated background shell and ask the user for a decision.
     BackgroundThenQuestion,
+    /// Hold a foreground shell until the test releases its workspace gate.
+    ForegroundThenQuestion,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
     /// Root activates and launches one asynchronous child, then acknowledges its launch receipt.
@@ -41,6 +43,7 @@ impl MockScenario {
         match self {
             Self::ToolThenComplete => "one write_file tool call, then completion",
             Self::BackgroundThenQuestion => "background shell, then a user decision",
+            Self::ForegroundThenQuestion => "foreground shell, then a user decision",
             Self::Slow => "3s delay before response (tests progress display)",
             Self::AgentThenComplete => "one asynchronous child agent, then launch acknowledgement",
             Self::FanoutThenComplete => "Server-owned three-slot fanout with streamed completion",
@@ -226,13 +229,13 @@ fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
     s
 }
 
-fn body_background_then_question(round: u32) -> String {
+fn body_background_then_question(round: u32, foreground: bool) -> String {
     let mut body = session_info("mock-run-tool");
     if round == 1 {
         let args = serde_json::json!({
             "command": "while [ ! -f release-background ]; do sleep 0.05; done; printf background-task-finished",
             "description": "gated background task",
-            "yield_time_ms": 0,
+            "yield_time_ms": if foreground { 20_000 } else { 0 },
         });
         body.push_str(&tool_call_start("call-1", "bash", args.clone()));
         body.push_str(&tool_request("call-1", "bash", args));
@@ -355,6 +358,7 @@ struct ServerState {
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    fail_model_catalog: Arc<AtomicBool>,
 }
 
 /// Keep tool dispatch and continuation under one Server-owned response. Dropping
@@ -438,7 +442,12 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         .unwrap_or("mock-agent"),
                     round + 1,
                 ),
-                MockScenario::BackgroundThenQuestion => body_background_then_question(round + 1),
+                MockScenario::BackgroundThenQuestion | MockScenario::ForegroundThenQuestion => {
+                    body_background_then_question(
+                        round + 1,
+                        state.scenario == MockScenario::ForegroundThenQuestion,
+                    )
+                }
                 _ => unreachable!("only Edge-tool scenarios wait for callbacks"),
             };
             let run_id = body
@@ -517,7 +526,11 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         event["tool_calls_count"] = count.into();
                         event["observation_tool_calls_count"] = 0.into();
                         event["tools_used"] = serde_json::json!([
-                            if state.scenario == MockScenario::BackgroundThenQuestion {
+                            if matches!(
+                                state.scenario,
+                                MockScenario::BackgroundThenQuestion
+                                    | MockScenario::ForegroundThenQuestion
+                            ) {
                                 "bash"
                             } else {
                                 "write_file"
@@ -787,7 +800,9 @@ async fn handle_chat_turn(
 
     if matches!(
         state.scenario,
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+        MockScenario::ToolThenComplete
+            | MockScenario::BackgroundThenQuestion
+            | MockScenario::ForegroundThenQuestion
     ) {
         return orchestration_response(state, request_body);
     }
@@ -798,7 +813,9 @@ async fn handle_chat_turn(
         | MockScenario::FanoutPartialThenComplete => {
             unreachable!("Server agent scenarios own their stream")
         }
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => {
+        MockScenario::ToolThenComplete
+        | MockScenario::BackgroundThenQuestion
+        | MockScenario::ForegroundThenQuestion => {
             unreachable!("tool scenarios use one orchestration stream")
         }
         MockScenario::Slow => {
@@ -846,15 +863,18 @@ fn mock_model_catalog_entry(name: &str) -> Value {
     })
 }
 
-async fn handle_models() -> axum::Json<Value> {
+async fn handle_models(State(state): State<ServerState>) -> Result<axum::Json<Value>, StatusCode> {
+    if state.fail_model_catalog.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let items = mock_model_catalog();
-    axum::Json(serde_json::json!({
+    Ok(axum::Json(serde_json::json!({
         "items": items,
         "next_cursor": null,
         "limit": 50,
         "total": 3,
         "catalog_revision": "sha256:mock-catalog"
-    }))
+    })))
 }
 
 fn mock_model_catalog() -> Vec<Value> {
@@ -1105,7 +1125,9 @@ async fn handle_cancel_run(
     // A pending local tool approval can interrupt the fixture's root stream.
     if matches!(
         state.scenario,
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+        MockScenario::ToolThenComplete
+            | MockScenario::BackgroundThenQuestion
+            | MockScenario::ForegroundThenQuestion
     ) && run_id == "mock-run-tool"
     {
         state
@@ -1183,7 +1205,9 @@ async fn handle_transcript(
         return Err(StatusCode::NOT_FOUND);
     }
     let root_run = match state.scenario {
-        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => "mock-run-tool",
+        MockScenario::ToolThenComplete
+        | MockScenario::BackgroundThenQuestion
+        | MockScenario::ForegroundThenQuestion => "mock-run-tool",
         MockScenario::AgentThenComplete => "mock-run-agent-root",
         MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete => {
             "mock-run-fanout-root"
@@ -1278,6 +1302,7 @@ pub struct MockLlmServer {
     cancelled_runs: Arc<Mutex<Vec<String>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    fail_model_catalog: Arc<AtomicBool>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -1341,6 +1366,7 @@ impl MockLlmServer {
         let cancelled_runs = Arc::new(Mutex::new(Vec::new()));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let held_binding_release = hold_binding.then(|| Arc::new(tokio::sync::Notify::new()));
+        let fail_model_catalog = Arc::new(AtomicBool::new(false));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
@@ -1353,6 +1379,7 @@ impl MockLlmServer {
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
             held_binding_release: held_binding_release.clone(),
+            fail_model_catalog: fail_model_catalog.clone(),
         };
 
         let app = Router::new()
@@ -1397,6 +1424,7 @@ impl MockLlmServer {
             cancelled_runs,
             held_response_release,
             held_binding_release,
+            fail_model_catalog,
             _shutdown: tx,
         })
     }
@@ -1437,6 +1465,10 @@ impl MockLlmServer {
             .as_ref()
             .expect("mock server was not started with a held response")
             .notify_one();
+    }
+
+    pub fn fail_model_catalog(&self) {
+        self.fail_model_catalog.store(true, Ordering::Release);
     }
 
     pub fn release_held_binding(&self) {

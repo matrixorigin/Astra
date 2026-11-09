@@ -625,6 +625,7 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             None,
             7,
+            None,
         );
         assert!(pane.accept_agent_guide(
             "intent-agent-1".into(),
@@ -705,6 +706,7 @@ fn child_guidance_waits_for_same_target_delivery_and_keeps_other_targets_indepen
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             Some(session.into()),
             3,
+            None,
         )
     };
     let first = capture("run", "session");
@@ -718,6 +720,7 @@ fn child_guidance_waits_for_same_target_delivery_and_keeps_other_targets_indepen
         astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         Some("session".into()),
         4,
+        None,
     );
     let other_run = capture("other", "session");
     let other_session = capture("run", "other-session");
@@ -770,6 +773,7 @@ fn detached_child_messages_are_bounded_per_session_without_blocking_main_input()
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             Some(session.into()),
             1,
+            None,
         )
     };
     let first = target("first");
@@ -802,6 +806,7 @@ fn accepted_child_messages_become_actionable_after_observer_detaches() {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             Some("session".into()),
             epoch,
+            None,
         )
     };
     let original = target(1);

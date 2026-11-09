@@ -108,6 +108,10 @@ started model request or tool is not retroactively changed.
 During an active turn, `/allow` and `/allow read_only` use that same permission
 control, while the `/plan` workflow command waits for the turn to finish.
 Other commands that need the mutable Session are queued with explicit feedback.
+Live controls use the credentials admitted for the physical run. A static
+gateway bearer is never replaced or refreshed using an unrelated saved profile.
+Local notices and catalog errors remain visible during execution without
+finishing an in-flight tool; live transcript deltas reuse unchanged history.
 A typed client wake rechecks owner/Session attachment and input gates before
 consuming one FIFO entry. Input remains in the FIFO until consumption; terminal
 paste protection and popup handling apply to user gestures independently.

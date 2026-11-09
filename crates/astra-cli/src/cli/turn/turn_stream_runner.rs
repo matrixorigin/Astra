@@ -24,8 +24,9 @@ struct PreparedTurnStreamState {
 #[derive(Clone, Copy)]
 pub(crate) struct TurnExecutionInput<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
-    pub(crate) profile: Option<&'a str>,
     pub(crate) token: &'a str,
+    /// Verified before preflight so a concurrent refresh cannot change identity.
+    pub(crate) auth_owner: Option<&'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) message: &'a str,
     pub(crate) user_intent: &'a str,
     pub(crate) input_runtime_required_texts: &'a [String],
@@ -60,19 +61,11 @@ pub(crate) enum TurnAttempt {
 
 pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    // Capture the admitted owner after admission/validation but before the
-    // stream is built; only this snapshot may drive in-flight refresh.
-    let auth_owner = match input.admitted_server_turn {
-        Some(turn) => turn.auth_owner.clone(),
-        None => {
-            crate::cli::session::session_runtime::capture_admitted_auth_owner(
-                input.api,
-                input.profile,
-                input.token,
-            )
-            .await
-        }
-    };
+    let auth_owner = input.auth_owner.cloned().or_else(|| {
+        input
+            .admitted_server_turn
+            .and_then(|turn| turn.auth_owner.clone())
+    });
     if let Some(server_turn) = input.admitted_server_turn
         && (!server_turn.attachment_owner.is_current()
             || server_turn
@@ -99,6 +92,9 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
         }));
     }
     let prepared = prepare_turn_stream_state(state).await;
+    prepared.run_control.publish_admitted_auth(
+        crate::cli::session::session_runtime::AdmittedAuth::new(input.token, auth_owner.clone()),
+    );
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
         Some(prepared.run_control.clone());
     let mut params = build_turn_stream_params(state, input, &prepared);
@@ -598,7 +594,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
         state,
         TurnExecutionInput {
             api,
-            profile: None,
+
             token,
             message: "continue again",
             user_intent: "continue again",
@@ -610,6 +606,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
                 .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: None,
             explain_analyze_terminal_degraded: None,
+            auth_owner: None,
         },
         &prepared,
     );
@@ -1198,7 +1195,7 @@ mod tests {
             &mut state,
             TurnExecutionInput {
                 api: &api,
-                profile: None,
+
                 token: "token",
                 message: "what work is running?",
                 user_intent: "what work is running?",
@@ -1208,6 +1205,7 @@ mod tests {
                 admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
+                auth_owner: None,
             },
             &prepared,
         );
@@ -1308,7 +1306,7 @@ mod tests {
             &mut state,
             TurnExecutionInput {
                 api: &api,
-                profile: Some("profile"),
+
                 token: "token",
                 message: "continue",
                 user_intent: "continue",
@@ -1318,6 +1316,7 @@ mod tests {
                 admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
+                auth_owner: None,
             },
             &prepared,
         );

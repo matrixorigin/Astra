@@ -1246,7 +1246,60 @@ impl AgentTranscriptView {
             .replace_with(self.transcript_snapshot(), self.viewport_width);
     }
 
+    /// Consecutive deltas for an existing live tail do not alter canonical
+    /// history. Keep that history and its rendered rows intact.
+    fn refresh_live_tail(&mut self, events: &[AgentLiveEvent]) -> bool {
+        let Some(first) = events.first() else {
+            return false;
+        };
+        if self.run_id.is_empty() || events.iter().any(|event| event.run_id != self.run_id) {
+            return false;
+        }
+        let Some(entry) = self.live.items.last_mut() else {
+            return false;
+        };
+        let id = TranscriptItemId::from_widget_id((1_u64 << 63).saturating_add(entry.id));
+        let item = match (&mut entry.item, &first.kind) {
+            (LiveTranscriptItem::Assistant(cell), AgentLiveEventKind::OutputDelta { model_item_id, .. })
+                if cell.is_live()
+                    && cell.model_item_id() == model_item_id.as_deref()
+                    && !model_item_id.as_ref().is_some_and(|id| self.canonical.outputs.contains(id))
+                    && events.iter().all(|event| matches!(&event.kind,
+                        AgentLiveEventKind::OutputDelta { model_item_id: id, .. } if id == model_item_id)) => {
+                for event in events {
+                    if let AgentLiveEventKind::OutputDelta { text, .. } = &event.kind {
+                        cell.push_delta(text);
+                    }
+                }
+                TranscriptItem::rendered_kind(id, TranscriptItemKind::Assistant,
+                    cell.live_viewport_lines(self.viewport_width, 48), 1)
+            }
+            (LiveTranscriptItem::Reasoning(cell), AgentLiveEventKind::ThinkingDelta { model_item_id, .. })
+                if cell.is_live()
+                    && cell.model_item_id() == model_item_id.as_deref()
+                    && !model_item_id.as_ref().is_some_and(|id| self.canonical.reasoning.contains(id))
+                    && events.iter().all(|event| matches!(&event.kind,
+                        AgentLiveEventKind::ThinkingDelta { model_item_id: id, .. } if id == model_item_id)) => {
+                for event in events {
+                    if let AgentLiveEventKind::ThinkingDelta { text, .. } = &event.kind {
+                        cell.push_delta(text);
+                    }
+                }
+                TranscriptItem::reasoning(id, cell.clone(), 1)
+            }
+            _ => return false,
+        };
+        self.terminal_refresh_requested = false;
+        if !self.transcript.replace_live_tail(item, self.viewport_width) {
+            self.rebuild_transcript();
+        }
+        true
+    }
+
     fn apply_live_event(&mut self, event: &AgentLiveEvent) -> bool {
+        if self.refresh_live_tail(std::slice::from_ref(event)) {
+            return true;
+        }
         let changed = self.apply_live_event_without_rebuild(event);
         if changed {
             self.rebuild_transcript();
@@ -2406,6 +2459,9 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn refresh_agent_live_events(&mut self, events: &[AgentLiveEvent]) -> bool {
+        if self.refresh_live_tail(events) {
+            return true;
+        }
         let mut changed = false;
         for event in events {
             changed |= self.apply_live_event_without_rebuild(event);
@@ -5989,5 +6045,149 @@ mod tests {
                 ..
             }) if !text.is_empty()
         ));
+    }
+
+    #[test]
+    fn incremental_tail_matches_full_rebuild_across_event_boundaries() {
+        fn without_running_elapsed(text: &str) -> String {
+            text.lines()
+                .map(|line| {
+                    if let Some((prefix, rest)) = line.split_once("Running Read (")
+                        && let Some((_, suffix)) = rest.split_once(')')
+                    {
+                        format!("{prefix}Running Read (<elapsed>){suffix}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let page = transcript_page_with_assistant_lines(20);
+        incremental.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+        full.apply_page(page, true, AgentTranscriptSource::DurableServer);
+        let event = |kind| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind,
+        };
+        let events = [
+            event(AgentLiveEventKind::ThinkingDelta {
+                model_item_id: Some("thought".into()),
+                text: "thinking ".into(),
+            }),
+            event(AgentLiveEventKind::ThinkingDelta {
+                model_item_id: Some("thought".into()),
+                text: "more".into(),
+            }),
+            event(AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer-a".into()),
+                text: "answer ".into(),
+            }),
+            event(AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer-b".into()),
+                text: "new item".into(),
+            }),
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "file".into(),
+                tool_use_id: "tool".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "file".into(),
+                status: "success".into(),
+                duration_ms: 1,
+                output_summary: Some("done".into()),
+                output: None,
+                tool_use_id: "tool".into(),
+            }),
+            event(AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                duration_ms: 1,
+                reason: None,
+            }),
+        ];
+        for (index, event) in events.iter().enumerate() {
+            incremental.refresh_agent_live_event(event);
+            full.apply_live_event_without_rebuild(event);
+            full.rebuild_transcript();
+            if index == 0 {
+                for key in [KeyCode::End, KeyCode::Right] {
+                    let key = KeyEvent::new(key, KeyModifiers::NONE);
+                    incremental.handle_key(key);
+                    full.handle_key(key);
+                }
+            }
+            assert_eq!(
+                without_running_elapsed(&rendered(&incremental)),
+                without_running_elapsed(&rendered(&full)),
+                "event {index}"
+            );
+            assert_eq!(
+                incremental
+                    .transcript
+                    .export_plain_lines()
+                    .iter()
+                    .map(|line| without_running_elapsed(line))
+                    .collect::<Vec<_>>(),
+                full.transcript
+                    .export_plain_lines()
+                    .iter()
+                    .map(|line| without_running_elapsed(line))
+                    .collect::<Vec<_>>(),
+                "event {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_live_tail_matches_full_projection_with_history_and_navigation() {
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let page = transcript_page_with_assistant_lines(200);
+        incremental.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+        full.apply_page(page, true, AgentTranscriptSource::DurableServer);
+        let make = |text: &str| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("live".into()),
+                text: text.into(),
+            },
+        };
+        let first = make("first");
+        incremental.refresh_agent_live_event(&first);
+        full.apply_live_event_without_rebuild(&first);
+        full.rebuild_transcript();
+        for key in [KeyCode::Home, KeyCode::Char('v'), KeyCode::Char('f')] {
+            let key = KeyEvent::new(key, KeyModifiers::NONE);
+            incremental.handle_key(key);
+            full.handle_key(key);
+        }
+        let batch = vec![make(" second"), make(" third")];
+        incremental.refresh_agent_live_events(&batch);
+        for event in &batch {
+            full.apply_live_event_without_rebuild(event);
+        }
+        full.rebuild_transcript();
+        assert_eq!(rendered(&incremental), rendered(&full));
+        assert_eq!(
+            incremental.transcript.export_plain_lines(),
+            full.transcript.export_plain_lines()
+        );
+        incremental.fit_conversation_workspace(24, 55);
+        full.fit_conversation_workspace(24, 55);
+        let next = make(" after resize");
+        incremental.refresh_agent_live_event(&next);
+        full.apply_live_event_without_rebuild(&next);
+        full.rebuild_transcript();
+        assert_eq!(rendered(&incremental), rendered(&full));
+        assert_eq!(
+            incremental.transcript.export_plain_lines(),
+            full.transcript.export_plain_lines()
+        );
     }
 }

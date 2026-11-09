@@ -640,6 +640,61 @@ impl TranscriptView {
         self.replace_snapshot(snapshot, width);
     }
 
+    /// Update an existing live tail without rendering the unchanged history.
+    /// A different layout or identity falls back to the normal full projection.
+    pub(crate) fn replace_live_tail(&mut self, item: TranscriptItem, width: u16) -> bool {
+        let Some(old) = self.snapshot.items.last() else {
+            return false;
+        };
+        if self.width != width || old.id != item.id || old.kind != item.kind {
+            return false;
+        }
+        if !old.matches_filter(self.filter) {
+            *self.snapshot.items.last_mut().expect("checked tail") = item;
+            return true;
+        }
+        let Some(last_row) = self
+            .row_items
+            .iter()
+            .rposition(|id| id.as_ref() == Some(&item.id))
+        else {
+            return false;
+        };
+        if self.row_items[last_row + 1..].iter().any(Option::is_some) {
+            return false;
+        }
+        let mut start = last_row;
+        while start > 0 && self.row_items[start - 1].as_ref() == Some(&item.id) {
+            start -= 1;
+        }
+        let mut lines = item.render(width, self.expanded.contains(&item.id));
+        while lines.last().is_some_and(|line| line.spans.is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return false;
+        }
+        let follow_tail = self.is_following_tail();
+        let cursor = self.cursor;
+        let anchor = self.selection_anchor;
+        self.lines.truncate(start);
+        self.row_items.truncate(start);
+        self.row_items
+            .extend(std::iter::repeat_n(Some(item.id.clone()), lines.len()));
+        self.lines.extend(lines.into_iter().map(Arc::new));
+        *self.snapshot.items.last_mut().expect("checked tail") = item;
+        if follow_tail {
+            self.cursor = self.lines.len() - 1;
+            self.scroll = self.max_scroll();
+        } else {
+            self.cursor = cursor.min(self.lines.len() - 1);
+            self.selection_anchor = anchor.map(|row| row.min(self.lines.len() - 1));
+            self.scroll = self.scroll.min(self.max_scroll());
+            self.ensure_cursor_visible();
+        }
+        true
+    }
+
     /// Set a view-local status for an asynchronous transcript operation.
     ///
     /// This is deliberately outside [`TranscriptSnapshot`]: loading and
@@ -2383,5 +2438,32 @@ mod tests {
         pane.render(area, &mut buffer);
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(text.contains("Search cancelled"), "{text}");
+    }
+
+    #[test]
+    fn replacing_live_tail_reuses_history_rows() {
+        let history = TranscriptItem::rendered(
+            TranscriptItemId::from_widget_id(1),
+            vec![Line::from("history")],
+            1,
+        );
+        let tail = |text: &str| {
+            TranscriptItem::rendered_kind(
+                TranscriptItemId::from_widget_id(2),
+                TranscriptItemKind::Assistant,
+                vec![Line::from(text.to_string())],
+                1,
+            )
+        };
+        let mut view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(vec![history, tail("first")]),
+            24,
+            80,
+        );
+        let cached = view.lines[0].clone();
+        assert!(view.replace_live_tail(tail("second"), 80));
+        assert!(std::sync::Arc::ptr_eq(&cached, &view.lines[0]));
+        assert!(rendered(&view).contains("second"));
+        assert!(!view.replace_live_tail(tail("wrong width"), 40));
     }
 }

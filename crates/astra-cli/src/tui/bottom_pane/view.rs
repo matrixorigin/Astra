@@ -178,6 +178,7 @@ pub(crate) enum BottomPaneViewAction {
     },
     RetryReturnedAgentGuide {
         target: crate::tui::event_loop::AgentGuideTarget,
+        recipient: crate::tui::event_loop::AgentGuideTarget,
         intent_id: String,
         content: String,
         acknowledged_unknown: Vec<String>,

@@ -23,6 +23,7 @@ enum InputPurpose {
     Guide(crate::tui::event_loop::AgentGuideTarget),
     Returned {
         target: crate::tui::event_loop::AgentGuideTarget,
+        recipient: crate::tui::event_loop::AgentGuideTarget,
         intent_id: String,
         uncertain: bool,
     },
@@ -111,6 +112,7 @@ impl TaskInputView {
 
     pub(crate) fn returned(
         target: crate::tui::event_loop::AgentGuideTarget,
+        recipient: crate::tui::event_loop::AgentGuideTarget,
         intent_id: String,
         text: &str,
         uncertain: bool,
@@ -118,6 +120,7 @@ impl TaskInputView {
         let mut view = Self::new(target.clone());
         view.purpose = InputPurpose::Returned {
             target,
+            recipient,
             intent_id,
             uncertain,
         };
@@ -127,12 +130,13 @@ impl TaskInputView {
 
     pub(crate) fn returned_with_error(
         target: crate::tui::event_loop::AgentGuideTarget,
+        recipient: crate::tui::event_loop::AgentGuideTarget,
         intent_id: String,
         text: &str,
         error: &str,
         acknowledged_unknown: Vec<String>,
     ) -> Self {
-        let mut view = Self::returned(target, intent_id, text, false);
+        let mut view = Self::returned(target, recipient, intent_id, text, false);
         view.error = Some(error.into());
         view.acknowledged_unknown = acknowledged_unknown;
         view
@@ -222,9 +226,13 @@ impl TaskInputView {
                     acknowledged_unknown: self.acknowledged_unknown.clone(),
                 },
                 InputPurpose::Returned {
-                    target, intent_id, ..
+                    target,
+                    recipient,
+                    intent_id,
+                    ..
                 } => BottomPaneViewAction::RetryReturnedAgentGuide {
                     target: target.clone(),
+                    recipient: recipient.clone(),
                     intent_id: intent_id.clone(),
                     content,
                     acknowledged_unknown: self.acknowledged_unknown.clone(),
@@ -605,6 +613,7 @@ mod tests {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             Some("session".into()),
             0,
+            None,
         );
         let mut view = TaskInputView::new(target.clone());
         assert!(view.handle_paste("inspect the failing test"));
@@ -641,8 +650,13 @@ mod tests {
             }) if submitted_target == target && content == "second message" && prior == ["prior-intent"]
         ));
 
-        let mut uncertain =
-            TaskInputView::returned(target, "unknown".into(), "first message", true);
+        let mut uncertain = TaskInputView::returned(
+            target.clone(),
+            target,
+            "unknown".into(),
+            "first message",
+            true,
+        );
         uncertain.handle_key(key(KeyCode::Enter));
         assert!(uncertain.take_action_request().is_none());
         assert!(
@@ -680,6 +694,7 @@ mod tests {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             Some("session".into()),
             0,
+            None,
         ));
         view.handle_key(key(KeyCode::Enter));
         assert!(view.take_action_request().is_none());
