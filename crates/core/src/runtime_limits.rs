@@ -24,6 +24,16 @@ pub(crate) const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 80_000;
 /// Shared default inline presentation budget at the model tool-result boundary.
 /// Tools may retain complete results outside the inline view.
 pub const DEFAULT_TOOL_RESULT_INLINE_CHARS: usize = 8_000;
+/// Maximum serialized size of one canonical conversation segment.
+pub const MAX_CANONICAL_CONTEXT_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum encoded content in one canonical commit.
+pub const MAX_CANONICAL_CONTEXT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+/// Space left for a truthful terminal outcome after the last tool group.
+pub const CANONICAL_TERMINAL_RESERVE_BYTES: u64 = 64 * 1024;
+/// Result envelopes reserved before executing a tool batch.
+pub const MIN_CANONICAL_TOOL_RESULT_BYTES: u64 = 8 * 1024;
+pub const MAX_CANONICAL_TOOL_RESULT_BYTES: u64 = 1024 * 1024;
+pub const CANONICAL_TOOL_RESULT_PROVENANCE_BYTES: u64 = 2048;
 pub(crate) const DEFAULT_MAX_TOOL_RETRIES: usize = 2;
 pub(crate) const DEFAULT_RETRY_BASE_MS: u64 = 500;
 pub(crate) const DEFAULT_MAX_RETRIEVED: usize = 6;

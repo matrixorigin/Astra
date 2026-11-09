@@ -2789,9 +2789,7 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
                 None,
             )
             .await,
-        Err(astra_services::SessionContextCoordinatorError::ExecutionOccupied(
-            astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool
-        ))
+        Err(astra_services::SessionContextCoordinatorError::Fenced)
     ));
     assert!(
         recovered["control_basis"]["writer_epoch"].as_u64().unwrap() > source_lease.writer_epoch

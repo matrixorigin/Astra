@@ -115,7 +115,7 @@ within that root through its call-scoped `workdir`; this changes only the
 subprocess starting directory and never persists as session state. Resolution
 and symlink confinement happen at the CLI/User Runner executor before spawn,
 and, on Unix process paths with pinned-cwd support, a root-relative no-symlink
-directory-handle walk pins the identity used by policy, source capture, cache,
+directory-handle walk pins the identity used by policy, cache,
 execution, and evidence. Executors that cannot consume that pinned subdirectory
 identity (including the current managed mount boundary and non-Unix process
 path) fail closed instead of falling back to path-based execution.
@@ -126,8 +126,10 @@ Sandbox environment setup cannot reset it to the workspace root. Path checks
 resolve relative operands from that directory while retaining the existing
 workspace policy and explicitly allowed paths. Directory selection itself
 remains confined to the workspace root.
-Read-before-edit registration and inferred source capture follow the pinned
-execution directory. Declared `source_artifacts` keep workspace-root semantics.
+Read-before-edit registration follows the pinned execution directory. Local
+shell commands can run concurrently and do not claim automatic source
+preimages or rollback authority for their effects. Other execution providers
+may advertise source capture when they can own that contract.
 Outcomes carry the shared `bash_workdir` evidence for the requested and resolved
 workspace-relative directory, including started nonzero outcomes. An omitted
 `workdir` on a later call starts at the workspace root again.

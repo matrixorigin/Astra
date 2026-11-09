@@ -151,6 +151,9 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
     if crate == "runtime":
         _enable(result, "test_runtime")
         if is_test_only:
+            if path == "crates/runtime/tests/client_compatibility.rs":
+                # This ignored integration runs in the shared CLI job only.
+                _enable(result, "test_cli")
             online_lane = "online_integration" if "/tests/" in path else "online_core"
             _enable(result, online_lane)
         else:

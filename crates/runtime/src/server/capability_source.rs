@@ -1372,6 +1372,7 @@ pub(crate) mod tests {
         pub transport: Arc<super::super::runtime_mcp::AgentBindingMcpRuntime>,
         pub candidate: CapabilityCandidate,
         pub calls: Arc<std::sync::Mutex<Vec<Value>>>,
+        pub rpc_results: Arc<std::sync::Mutex<BTreeMap<String, Value>>>,
         pub bundle: super::super::runtime_mcp::RuntimeMcpBundle,
         endpoint_url: String,
         server: tokio::task::JoinHandle<()>,
@@ -1482,8 +1483,9 @@ pub(crate) mod tests {
             .collect();
         candidate = inventory[0].0.clone();
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc_results = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
         let app = axum::Router::new().route("/mcp", axum::routing::post(
-            |axum::extract::State((calls, inventory, gate)): axum::extract::State<(Arc<std::sync::Mutex<Vec<Value>>>, Vec<(CapabilityCandidate, String)>, Option<Arc<RpcGate>>)>,
+            |axum::extract::State((calls, inventory, gate, rpc_results)): axum::extract::State<(Arc<std::sync::Mutex<Vec<Value>>>, Vec<(CapabilityCandidate, String)>, Option<Arc<RpcGate>>, Arc<std::sync::Mutex<BTreeMap<String, Value>>>)>,
              headers: axum::http::HeaderMap, axum::Json(request): axum::Json<Value>| async move {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
                 calls.lock().unwrap().push(request.clone());
@@ -1526,9 +1528,10 @@ pub(crate) mod tests {
                     },
                     unexpected => panic!("unexpected source RPC {unexpected}"),
                 };
+                let result = rpc_results.lock().unwrap().get(request["method"].as_str().unwrap()).cloned().unwrap_or(result);
                 axum::Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
             }
-        )).with_state((calls.clone(), inventory, rpc_gate));
+        )).with_state((calls.clone(), inventory, rpc_gate, rpc_results.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -1553,6 +1556,7 @@ pub(crate) mod tests {
             transport,
             candidate,
             calls,
+            rpc_results,
             bundle,
             endpoint_url: endpoint,
             server,

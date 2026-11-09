@@ -1185,6 +1185,12 @@ fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
 }
 
 impl EdgeToolCacheValidation {
+    fn path(&self) -> &Path {
+        match self {
+            Self::FileMtime { path, .. } | Self::DirectoryMtime { path, .. } => path,
+        }
+    }
+
     fn is_valid(&self) -> bool {
         match self {
             Self::FileMtime {
@@ -1221,8 +1227,8 @@ pub(crate) struct EdgeSseContext<'a> {
     pub ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// When true, the whole turn becomes a deterministic rollback-on-failure boundary.
-    pub turn_rollback_on_failure: bool,
+    /// Plan subtasks retain their existing non-file compensation boundary.
+    pub compensate_non_file_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
@@ -1344,19 +1350,7 @@ struct CliSseStreamHost<'a> {
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Scoped identity for tool results observed in this SSE stream.
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
-    /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
-    active_turn_rollback: Option<ActiveTurnRollback>,
-    /// True once the current turn has emitted an execution-boundary-opened event.
-    turn_rollback_boundary_emitted: bool,
-    /// Tracks whether a turn-level rollback has already fired this turn.
-    /// This is used to:
-    /// 1. Prevent transactional batch from running (turn rollback and batch transaction
-    ///    are separate rollback strategies that should not be mixed).
-    /// 2. Record rollback metadata for the cloud event stream.
-    ///
-    /// NOTE: This does NOT block subsequent tool execution — the agent sees the error
-    /// and decides whether to continue or abort.
-    turn_rollback_fired: Option<TurnRollbackFired>,
+    non_file_rollback: Option<(u32, u64, u64)>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
     /// Set when posting edge-side tool or approval results receives 401.
@@ -1576,46 +1570,6 @@ fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra
     }
 }
 
-#[derive(Clone, Debug)]
-struct BatchTransactionMetadata {
-    id: String,
-}
-
-#[derive(Clone, Debug)]
-struct ActiveBatchTransaction {
-    id: String,
-    turn_index: u32,
-    file_checkpoint: u64,
-    database_checkpoint: u64,
-
-    worktree_checkpoint: u64,
-    session_state_checkpoint: u64,
-}
-
-#[derive(Clone, Debug)]
-struct AbortedBatchTransaction {
-    id: String,
-    rollback: Option<Value>,
-}
-
-#[derive(Clone, Debug)]
-struct ActiveTurnRollback {
-    turn_index: u32,
-    file_checkpoint: u64,
-    database_checkpoint: u64,
-
-    worktree_checkpoint: u64,
-    session_state_checkpoint: u64,
-}
-
-#[derive(Clone, Debug)]
-struct TurnRollbackFired {
-    rollback: Option<Value>,
-}
-
-const EXECUTION_BOUNDARY_KIND_TOOL_BATCH: &str = "tool_batch";
-const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
-
 /// RAII guard: installs a `ToolProgressSink` on the edge
 /// `ToolExecutor`, spawns a ticker task that polls the sink every
 /// ~200ms and emits `StreamEvent::ToolOutput`, and on drop aborts
@@ -1753,6 +1707,82 @@ impl PostToolResultError {
 }
 
 impl<'a> CliSseStreamHost<'a> {
+    async fn compensate_non_file_effects(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        fields: Option<&Map<String, Value>>,
+    ) -> Option<Value> {
+        let registry = astra_turn_core::tool::categories::registry();
+        let may_mutate = registry.is_mutating_for(tool, Some(args))
+            || (registry.is_read_only_for(tool, Some(args))
+                && !registry.is_read_only_for_recovery(tool, Some(args)));
+        if !may_mutate
+            || fields.is_some_and(|fields| {
+                fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+                    || fields.get("disposition").and_then(Value::as_str) == Some("rejected")
+                    || (registry
+                        .flags(tool)
+                        .contains(astra_turn_core::tool::categories::ToolFlags::FILE_OP)
+                        && fields
+                            .get("workspace_mutation_applied")
+                            .and_then(Value::as_bool)
+                            == Some(false)
+                        && fields
+                            .get("workspace_mutation_partial")
+                            .and_then(Value::as_bool)
+                            != Some(true))
+            })
+        {
+            return None;
+        }
+        let (turn, database_checkpoint, session_checkpoint) = self.non_file_rollback?;
+        let database_changed = astra_turn_core::database_snapshots::journal_checkpoint(
+            &self.executor.database_snapshot_journal,
+        ) > database_checkpoint;
+        let session_changed = self.executor.session_state_checkpoint() > session_checkpoint;
+        if !database_changed && !session_changed {
+            return None;
+        }
+        self.non_file_rollback = None;
+        let mut outcomes = serde_json::Map::new();
+        if database_changed {
+            let executor = self.executor.clone();
+            let args = serde_json::json!({"scope":"turn", "turn_index":turn, "database_after_sequence":database_checkpoint});
+            let result =
+                tokio::task::spawn_blocking(move || executor.rollback_database_snapshots(&args))
+                    .await;
+            let result = match result {
+                Ok(output) => serde_json::from_str(&output)
+                    .unwrap_or_else(|_| serde_json::json!({"success":false})),
+                Err(_) => serde_json::json!({"success":false}),
+            };
+            outcomes.insert(
+                "database".into(),
+                serde_json::json!({
+                    "success": result.get("success").and_then(Value::as_bool) == Some(true),
+                }),
+            );
+        }
+        if session_changed {
+            let output = self.executor.rollback_session_state(&serde_json::json!({
+                "scope":"turn", "turn_index":turn, "session_state_after_sequence":session_checkpoint,
+            })).await;
+            let result = serde_json::from_str(&output)
+                .unwrap_or_else(|_| serde_json::json!({"success":false}));
+            outcomes.insert(
+                "session".into(),
+                serde_json::json!({
+                    "success": result.get("success").and_then(Value::as_bool) == Some(true),
+                }),
+            );
+        }
+        let success = outcomes
+            .values()
+            .all(|result| result.get("success").and_then(Value::as_bool) == Some(true));
+        Some(serde_json::json!({"success":success, "outcomes":outcomes}))
+    }
+
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         Self::from_edge_ctx_with_auth(ctx, term_width, render_md, None)
     }
@@ -1764,16 +1794,16 @@ impl<'a> CliSseStreamHost<'a> {
         owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     ) -> Self {
         let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
-        let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
-            turn_index: ctx
-                .executor
-                .journal_turn_index
-                .load(std::sync::atomic::Ordering::Acquire),
-            file_checkpoint: ctx.executor.file_journal_checkpoint(),
-            database_checkpoint: ctx.executor.database_snapshot_journal_checkpoint(),
-
-            worktree_checkpoint: ctx.executor.git_worktree_journal_checkpoint(),
-            session_state_checkpoint: ctx.executor.session_state_journal_checkpoint(),
+        let non_file_rollback = ctx.compensate_non_file_on_failure.then(|| {
+            (
+                ctx.executor
+                    .journal_turn_index
+                    .load(std::sync::atomic::Ordering::Acquire),
+                astra_turn_core::database_snapshots::journal_checkpoint(
+                    &ctx.executor.database_snapshot_journal,
+                ),
+                ctx.executor.session_state_checkpoint(),
+            )
         });
         Self {
             last_permission_selection: None,
@@ -1815,9 +1845,7 @@ impl<'a> CliSseStreamHost<'a> {
             cloud_pre_approved: std::collections::HashSet::new(),
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
-            active_turn_rollback,
-            turn_rollback_boundary_emitted: false,
-            turn_rollback_fired: None,
+            non_file_rollback,
             tool_cache: ctx.tool_cache,
             auth_failure: false,
             callback_failure: None,
@@ -2014,6 +2042,17 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    async fn deliver_tool_result(
+        &mut self,
+        tool: &str,
+        body: &astra_thin_client::ToolResultRequest,
+    ) -> Result<(), PostToolResultError> {
+        self.post_tool_result_with_auth_retry(body).await?;
+        self.executor
+            .acknowledge_delivered_task_result(tool, body.tool_result_fields.as_ref());
+        Ok(())
+    }
+
     async fn post_approval_with_auth_retry(
         &mut self,
         body: &astra_thin_client::ApprovalRespondRequest,
@@ -2063,11 +2102,30 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
-    fn validated_cache_entry(&self, dedup_sig: &str) -> Option<(String, String)> {
+    fn cached_tool_path(&self, tool: &str, args: &Value) -> Option<PathBuf> {
+        match (tool, args.get("path").and_then(Value::as_str)) {
+            ("read_file" | "list_dir", Some(path)) => self.executor.resolve_checked(path).ok(),
+            ("list_dir", None) => Some(self.executor.effective_project_root()),
+            _ => None,
+        }
+    }
+
+    fn validated_cache_entry(
+        &self,
+        dedup_sig: &str,
+        tool: &str,
+        args: &Value,
+    ) -> Option<(String, String)> {
         let entry = self.tool_cache.output_cache.get(dedup_sig)?;
-        entry
-            .validation
-            .is_valid()
+        let current = self.cached_tool_path(tool, args)?;
+        let cached = entry.validation.path();
+        let same_path = current == cached
+            || current
+                .canonicalize()
+                .ok()
+                .zip(cached.canonicalize().ok())
+                .is_some_and(|(current, cached)| current == cached);
+        (same_path && entry.validation.is_valid())
             .then_some((entry.output.clone(), entry.status.clone()))
     }
 
@@ -2078,10 +2136,7 @@ impl<'a> CliSseStreamHost<'a> {
     ) -> Option<EdgeToolCacheValidation> {
         match tool {
             "read_file" => {
-                let path = self
-                    .executor
-                    .resolve_checked(args.get("path").and_then(Value::as_str)?)
-                    .ok()?;
+                let path = self.cached_tool_path(tool, args)?;
                 let timestamp_ms = path_mtime_ms(&path);
                 let content_sha256 = file_content_sha256(&path)?;
                 (timestamp_ms > 0).then_some(EdgeToolCacheValidation::FileMtime {
@@ -2091,10 +2146,7 @@ impl<'a> CliSseStreamHost<'a> {
                 })
             }
             "list_dir" => {
-                let path = match args.get("path").and_then(Value::as_str) {
-                    Some(path) => self.executor.resolve_checked(path).ok()?,
-                    None => self.executor.project_root.clone(),
-                };
+                let path = self.cached_tool_path(tool, args)?;
                 let timestamp_ms = path_mtime_ms(&path);
                 (timestamp_ms > 0)
                     .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
@@ -2353,7 +2405,7 @@ impl<'a> CliSseStreamHost<'a> {
             Some(tool_result_fields),
         ) {
             // ── Reconnection dedup: only record when server acked the result ──
-            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            if self.deliver_tool_result(tool, &body).await.is_ok() {
                 crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
             }
         } else {
@@ -2546,310 +2598,6 @@ impl<'a> CliSseStreamHost<'a> {
 }
 
 impl<'a> CliSseStreamHost<'a> {
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_from_checkpoints(
-        &self,
-        turn_index: u32,
-        file_checkpoint: u64,
-        database_checkpoint: u64,
-
-        worktree_checkpoint: u64,
-        session_state_checkpoint: u64,
-    ) -> Option<Value> {
-        let file_entries_added = self
-            .executor
-            .file_journal_checkpoint()
-            .saturating_sub(file_checkpoint);
-        let database_entries_added = self
-            .executor
-            .database_snapshot_journal_checkpoint()
-            .saturating_sub(database_checkpoint);
-
-        let worktree_entries_added = self
-            .executor
-            .git_worktree_journal_checkpoint()
-            .saturating_sub(worktree_checkpoint);
-        let session_state_entries_added = self
-            .executor
-            .session_state_journal_checkpoint()
-            .saturating_sub(session_state_checkpoint);
-        if file_entries_added == 0
-            && database_entries_added == 0
-            && worktree_entries_added == 0
-            && session_state_entries_added == 0
-        {
-            return None;
-        }
-
-        let rollback_output = self
-            .executor
-            .rollback_recorded_turn_mutations(&serde_json::json!({
-                "scope": "turn",
-                "turn_index": turn_index,
-                "file_after_sequence": file_checkpoint,
-                "database_after_sequence": database_checkpoint,
-
-
-                "worktree_after_sequence": worktree_checkpoint,
-                "session_state_after_sequence": session_state_checkpoint,
-            }))
-            .await;
-        Some(
-            serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
-                serde_json::json!({
-                    "ok": false,
-                    "error": format!(
-                        "Failed to parse recorded turn rollback output: {error}"
-                    ),
-                    "raw_output": rollback_output,
-                })
-            }),
-        )
-    }
-
-    fn has_batch_transaction_metadata(args: &Value) -> bool {
-        args.as_object()
-            .is_some_and(|obj| obj.contains_key("transaction_id"))
-    }
-
-    fn parse_batch_transaction_metadata(
-        args: &Value,
-    ) -> Result<Option<BatchTransactionMetadata>, String> {
-        let Some(obj) = args.as_object() else {
-            return Ok(None);
-        };
-
-        // `rollback_on_failure` is also a legitimate producer-owned field for
-        // tools such as agent.run_chain. The batch protocol owns it only when
-        // an explicit transaction_id selects that protocol.
-        if !obj.contains_key("transaction_id") {
-            return Ok(None);
-        }
-
-        let transaction_id = match obj.get("transaction_id") {
-            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
-            Some(Value::String(_)) => {
-                return Err("transaction_id must be a non-empty string.".to_string());
-            }
-            Some(_) => {
-                return Err("transaction_id must be a string.".to_string());
-            }
-            None => None,
-        };
-
-        let rollback_on_failure = match obj.get("rollback_on_failure") {
-            Some(Value::Bool(value)) => Some(*value),
-            Some(_) => {
-                return Err("rollback_on_failure must be a boolean.".to_string());
-            }
-            None => None,
-        };
-
-        match (transaction_id, rollback_on_failure) {
-            (None, _) => unreachable!("transaction_id presence was checked above"),
-            (Some(id), Some(true)) => Ok(Some(BatchTransactionMetadata { id })),
-            (Some(id), None | Some(false)) => Err(format!(
-                "transaction `{id}` requires rollback_on_failure=true."
-            )),
-        }
-    }
-
-    /// Return only producer-owned tool arguments after the batch protocol has
-    /// consumed its transaction envelope. Transaction controls are not part of
-    /// any tool's advertised schema and must not leak into permission checks or
-    /// execution as if every tool independently owned them.
-    fn batch_tool_args(args: &Value, transaction: Option<&BatchTransactionMetadata>) -> Value {
-        if transaction.is_none() {
-            return args.clone();
-        }
-        let Some(object) = args.as_object() else {
-            return args.clone();
-        };
-        let mut tool_args = object.clone();
-        tool_args.remove("transaction_id");
-        tool_args.remove("rollback_on_failure");
-        Value::Object(tool_args)
-    }
-
-    fn batch_transaction_boundary_supported(tool: &str, args: &Value) -> bool {
-        if tool == "bash" {
-            return args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
-        }
-
-        is_tool_concurrency_safe(tool, Some(args))
-            || matches!(
-                tool,
-                "write_file"
-                    | "delete_file"
-                    | "str_replace"
-                    | "multi_edit"
-                    | "rename_symbol"
-                    | "mo_query"
-            )
-    }
-
-    fn bash_boundary_violation(tool: &str, args: &Value, message: &str) -> Option<String> {
-        if tool != "bash" {
-            return None;
-        }
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())?;
-        if astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command) {
-            return None;
-        }
-        Some(message.to_string())
-    }
-
-    fn merge_transaction_fields(
-        mut existing: Option<Map<String, Value>>,
-        transaction_id: &str,
-        state: &str,
-        rollback: Option<Value>,
-    ) -> Option<Map<String, Value>> {
-        let mut fields = existing.take().unwrap_or_default();
-        fields.insert(
-            "transaction_id".to_string(),
-            Value::String(transaction_id.to_string()),
-        );
-        fields.insert(
-            "transaction_boundary".to_string(),
-            Value::String("tool_batch".to_string()),
-        );
-        fields.insert(
-            "transaction_state".to_string(),
-            Value::String(state.to_string()),
-        );
-        if let Some(rollback) = rollback {
-            fields.insert("transaction_rollback".to_string(), rollback);
-        }
-        Some(fields)
-    }
-
-    fn append_transaction_note(
-        output: &str,
-        transaction_id: &str,
-        note: &str,
-        rollback: Option<&Value>,
-    ) -> String {
-        let mut rendered = output.trim_end().to_string();
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
-        }
-        rendered.push_str(&format!("Transaction `{transaction_id}` {note}."));
-        if let Some(summary) = rollback
-            .and_then(|value| value.get("summary"))
-            .and_then(Value::as_str)
-        {
-            rendered.push(' ');
-            rendered.push_str(summary);
-        } else if rollback.is_some() {
-            rendered
-                .push_str(" Bounded rollback was attempted for earlier transaction side effects.");
-        }
-        rendered
-    }
-
-    async fn rollback_active_batch_transaction(
-        &self,
-        active: &ActiveBatchTransaction,
-    ) -> Option<Value> {
-        self.rollback_from_checkpoints(
-            active.turn_index,
-            active.file_checkpoint,
-            active.database_checkpoint,
-            active.worktree_checkpoint,
-            active.session_state_checkpoint,
-        )
-        .await
-    }
-
-    async fn rollback_active_turn(&self, active: &ActiveTurnRollback) -> Option<Value> {
-        self.rollback_from_checkpoints(
-            active.turn_index,
-            active.file_checkpoint,
-            active.database_checkpoint,
-            active.worktree_checkpoint,
-            active.session_state_checkpoint,
-        )
-        .await
-    }
-
-    fn merge_turn_rollback_fields(
-        mut existing: Option<Map<String, Value>>,
-        state: &str,
-        rollback: Option<Value>,
-    ) -> Option<Map<String, Value>> {
-        let mut fields = existing.take().unwrap_or_default();
-        fields.insert(
-            "rollback_boundary".to_string(),
-            Value::String("turn".to_string()),
-        );
-        fields.insert("rollback_on_failure".to_string(), Value::Bool(true));
-        fields.insert(
-            "rollback_state".to_string(),
-            Value::String(state.to_string()),
-        );
-        if let Some(rollback) = rollback {
-            fields.insert("rollback".to_string(), rollback);
-        }
-        Some(fields)
-    }
-
-    fn append_turn_rollback_note(output: &str, note: &str, rollback: Option<&Value>) -> String {
-        let mut rendered = output.trim_end().to_string();
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
-        }
-        rendered.push_str(&format!("Turn rollback policy {note}."));
-        if let Some(summary) = rollback
-            .and_then(|value| value.get("summary"))
-            .and_then(Value::as_str)
-        {
-            rendered.push(' ');
-            rendered.push_str(summary);
-        } else if rollback.is_some() {
-            rendered.push_str(" Bounded rollback was attempted for earlier turn side effects.");
-        } else {
-            rendered.push_str(" No earlier bounded side effects were recorded before the failure.");
-        }
-        rendered
-    }
-
-    fn execution_boundary_checkpoints(
-        file_checkpoint: u64,
-        database_checkpoint: u64,
-
-        worktree_checkpoint: u64,
-        session_state_checkpoint: u64,
-    ) -> Value {
-        serde_json::json!({
-            "file_checkpoint": file_checkpoint,
-            "database_checkpoint": database_checkpoint,
-
-
-            "worktree_checkpoint": worktree_checkpoint,
-            "session_state_checkpoint": session_state_checkpoint,
-        })
-    }
-
-    fn append_session_journal_event(&self, event: JournalEvent) {
-        let Some(session_id) = self.executor.active_session_id() else {
-            return;
-        };
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &event,
-            "stream_render:append_session_journal_event",
-        );
-    }
-
     fn sync_permission_manager_session_id(&mut self) {
         let Some(session_id) = self.executor.active_session_id() else {
             return;
@@ -2871,181 +2619,6 @@ impl<'a> CliSseStreamHost<'a> {
             return;
         };
         sync_incremental_tool_result_state(incremental_state, result);
-    }
-
-    fn emit_execution_boundary_opened(
-        &self,
-        turn_index: u32,
-        boundary_kind: &str,
-        transaction_id: Option<&str>,
-        checkpoints: Value,
-    ) {
-        let Some(session_id) = self.executor.active_session_id() else {
-            return;
-        };
-        self.append_session_journal_event(JournalEvent::execution_boundary_opened(
-            Some(&session_id),
-            turn_index,
-            boundary_kind,
-            transaction_id,
-            checkpoints,
-        ));
-    }
-
-    fn emit_execution_boundary_committed(
-        &self,
-        turn_index: u32,
-        boundary_kind: &str,
-        transaction_id: Option<&str>,
-        detail: Option<Value>,
-    ) {
-        let Some(session_id) = self.executor.active_session_id() else {
-            return;
-        };
-        self.append_session_journal_event(JournalEvent::execution_boundary_committed(
-            Some(&session_id),
-            turn_index,
-            boundary_kind,
-            transaction_id,
-            detail,
-        ));
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn emit_execution_boundary_aborted(
-        &self,
-        turn_index: u32,
-        boundary_kind: &str,
-        transaction_id: Option<&str>,
-        reason: &str,
-        trigger_request_id: Option<&str>,
-        trigger_tool_name: Option<&str>,
-        rollback: Option<Value>,
-    ) {
-        let Some(session_id) = self.executor.active_session_id() else {
-            return;
-        };
-        self.append_session_journal_event(JournalEvent::execution_boundary_aborted(
-            Some(&session_id),
-            turn_index,
-            boundary_kind,
-            transaction_id,
-            reason,
-            trigger_tool_name,
-            trigger_request_id,
-            rollback,
-        ));
-    }
-
-    fn emit_batch_transaction_opened(&self, active: &ActiveBatchTransaction) {
-        self.emit_execution_boundary_opened(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
-            Some(&active.id),
-            Self::execution_boundary_checkpoints(
-                active.file_checkpoint,
-                active.database_checkpoint,
-                active.worktree_checkpoint,
-                active.session_state_checkpoint,
-            ),
-        );
-    }
-
-    fn emit_batch_transaction_committed(&self, active: &ActiveBatchTransaction) {
-        self.emit_execution_boundary_committed(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
-            Some(&active.id),
-            None,
-        );
-    }
-
-    fn emit_batch_transaction_aborted(
-        &self,
-        active: &ActiveBatchTransaction,
-        reason: &str,
-        trigger_request_id: Option<&str>,
-        trigger_tool_name: Option<&str>,
-        rollback: Option<Value>,
-    ) {
-        self.emit_execution_boundary_aborted(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
-            Some(&active.id),
-            reason,
-            trigger_request_id,
-            trigger_tool_name,
-            rollback,
-        );
-    }
-
-    fn emit_turn_rollback_opened(&self, active: &ActiveTurnRollback) {
-        self.emit_execution_boundary_opened(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
-            None,
-            Self::execution_boundary_checkpoints(
-                active.file_checkpoint,
-                active.database_checkpoint,
-                active.worktree_checkpoint,
-                active.session_state_checkpoint,
-            ),
-        );
-    }
-
-    fn emit_turn_rollback_committed(&self, active: &ActiveTurnRollback) {
-        self.emit_execution_boundary_committed(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
-            None,
-            Some(serde_json::json!({
-                "executed_requests": self.edge_tool_round.len(),
-            })),
-        );
-    }
-
-    fn emit_turn_rollback_aborted(
-        &self,
-        active: &ActiveTurnRollback,
-        reason: &str,
-        trigger_request_id: Option<&str>,
-        trigger_tool_name: Option<&str>,
-        rollback: Option<Value>,
-    ) {
-        self.emit_execution_boundary_aborted(
-            active.turn_index,
-            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
-            None,
-            reason,
-            trigger_request_id,
-            trigger_tool_name,
-            rollback,
-        );
-    }
-
-    /// Bash mutations are allowed inside turn-level rollback boundaries.
-    /// They simply don't participate in checkpoint-based rollback — their
-    /// side effects persist even if a later tool triggers rollback.
-    /// Returning `None` means "no violation — let the tool execute".
-    fn turn_rollback_boundary_violation(_tool: &str, _args: &Value) -> Option<String> {
-        None
-    }
-
-    /// Returns `true` when an error from `tool` should trigger the turn-level
-    /// rollback policy.  Read-only tools and bash read-only commands have no
-    /// side effects so their errors are recoverable — the model can retry or
-    /// use a different approach.
-    fn tool_error_triggers_turn_rollback(tool: &str, args: &Value) -> bool {
-        astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(tool, Some(args))
-            .is_some()
-    }
-
-    fn batch_transaction_boundary_violation(tool: &str, args: &Value) -> Option<String> {
-        Self::bash_boundary_violation(
-            tool,
-            args,
-            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use admitted rollback-aware structured mutation tools, run project-native build/test commands through visible tools after this transaction, or keep bash read-only inside this transaction.",
-        )
     }
 
     async fn record_synthetic_batch_result(
@@ -3151,295 +2724,6 @@ impl<'a> CliSseStreamHost<'a> {
         }
 
         result
-    }
-
-    async fn execute_transactional_batch(
-        &mut self,
-        requests: &[ToolBatchRequest],
-    ) -> Vec<EdgeToolExecResult> {
-        let total = requests.len();
-        let mut results = Vec::with_capacity(total);
-        let mut active_tx: Option<ActiveBatchTransaction> = None;
-        let mut aborted_tx: Option<AbortedBatchTransaction> = None;
-
-        for (idx, req) in requests.iter().enumerate() {
-            self.render.tool_batch_progress = Some((idx + 1, total));
-
-            let metadata = match Self::parse_batch_transaction_metadata(&req.args) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    let rollback = match active_tx.as_ref() {
-                        Some(active) => self.rollback_active_batch_transaction(active).await,
-                        None => None,
-                    };
-                    let result = self
-                        .record_synthetic_batch_result(
-                            req,
-                            if let Some(active) = &active_tx {
-                                Self::append_transaction_note(
-                                    &format!("Error: {error}"),
-                                    &active.id,
-                                    "failed before execution",
-                                    rollback.as_ref(),
-                                )
-                            } else {
-                                format!("Error: {error}")
-                            },
-                            "failed",
-                            active_tx.as_ref().and_then(|active| {
-                                Self::merge_transaction_fields(
-                                    None,
-                                    &active.id,
-                                    if rollback.is_some() {
-                                        "rolled_back"
-                                    } else {
-                                        "failed"
-                                    },
-                                    rollback.clone(),
-                                )
-                            }),
-                        )
-                        .await;
-                    if let Some(active) = active_tx.take() {
-                        self.emit_batch_transaction_aborted(
-                            &active,
-                            &error,
-                            Some(&req.request_id),
-                            Some(&req.tool),
-                            rollback.clone(),
-                        );
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: active.id,
-                            rollback,
-                        });
-                    }
-                    results.push(result);
-                    continue;
-                }
-            };
-
-            if let Some(aborted) = aborted_tx.as_ref() {
-                match metadata.as_ref() {
-                    Some(meta) if meta.id == aborted.id => {
-                        let result = self
-                            .record_synthetic_batch_result(
-                                req,
-                                Self::append_transaction_note(
-                                    &format!(
-                                        "Error: skipped because transaction `{}` already failed earlier in this batch",
-                                        aborted.id
-                                    ),
-                                    &aborted.id,
-                                    "was already aborted",
-                                    aborted.rollback.as_ref(),
-                                ),
-                                "failed",
-                                Self::merge_transaction_fields(
-                                    None,
-                                    &aborted.id,
-                                    "aborted",
-                                    aborted.rollback.clone(),
-                                ),
-                            )
-                            .await;
-                        results.push(result);
-                        continue;
-                    }
-                    _ => aborted_tx = None,
-                }
-            }
-
-            let continuing_active_transaction = active_tx
-                .as_ref()
-                .zip(metadata.as_ref())
-                .is_some_and(|(active, meta)| active.id == meta.id);
-            if !continuing_active_transaction {
-                if let Some(active) = active_tx.take() {
-                    self.emit_batch_transaction_committed(&active);
-                }
-            }
-
-            if let Some(meta) = metadata.as_ref()
-                && active_tx.is_none()
-            {
-                let active = ActiveBatchTransaction {
-                    id: meta.id.clone(),
-                    turn_index: self
-                        .executor
-                        .journal_turn_index
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    file_checkpoint: self.executor.file_journal_checkpoint(),
-                    database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
-
-                    worktree_checkpoint: self.executor.git_worktree_journal_checkpoint(),
-                    session_state_checkpoint: self.executor.session_state_journal_checkpoint(),
-                };
-                self.emit_batch_transaction_opened(&active);
-                active_tx = Some(active);
-            }
-
-            if let Some(meta) = metadata.as_ref() {
-                if let Some(error) =
-                    Self::batch_transaction_boundary_violation(&req.tool, &req.args)
-                {
-                    let rollback = match active_tx.as_ref() {
-                        Some(active) => self.rollback_active_batch_transaction(active).await,
-                        None => None,
-                    };
-                    let result = self
-                        .record_synthetic_batch_result(
-                            req,
-                            Self::append_transaction_note(
-                                &error,
-                                &meta.id,
-                                "failed before execution",
-                                rollback.as_ref(),
-                            ),
-                            "failed",
-                            Self::merge_transaction_fields(
-                                None,
-                                &meta.id,
-                                if rollback.is_some() {
-                                    "rolled_back"
-                                } else {
-                                    "failed"
-                                },
-                                rollback.clone(),
-                            ),
-                        )
-                        .await;
-                    if let Some(active) = active_tx.take() {
-                        self.emit_batch_transaction_aborted(
-                            &active,
-                            &error,
-                            Some(&req.request_id),
-                            Some(&req.tool),
-                            rollback.clone(),
-                        );
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: active.id,
-                            rollback,
-                        });
-                    } else {
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: meta.id.clone(),
-                            rollback,
-                        });
-                    }
-                    results.push(result);
-                    continue;
-                }
-
-                if !Self::batch_transaction_boundary_supported(&req.tool, &req.args) {
-                    let rollback = match active_tx.as_ref() {
-                        Some(active) => self.rollback_active_batch_transaction(active).await,
-                        None => None,
-                    };
-                    let result = self
-                        .record_synthetic_batch_result(
-                            req,
-                            Self::append_transaction_note(
-                                &format!(
-                                    "Error: tool `{}` does not support rollback-on-failure batch transactions",
-                                    req.tool
-                                ),
-                                &meta.id,
-                                "failed before execution",
-                                rollback.as_ref(),
-                            ),
-                            "failed",
-                            Self::merge_transaction_fields(
-                                None,
-                                &meta.id,
-                                if rollback.is_some() {
-                                    "rolled_back"
-                                } else {
-                                    "failed"
-                                },
-                                rollback.clone(),
-                            ),
-                        )
-                        .await;
-                    if let Some(active) = active_tx.take() {
-                        self.emit_batch_transaction_aborted(
-                            &active,
-                            &format!(
-                                "tool `{}` does not support rollback-on-failure batch transactions",
-                                req.tool
-                            ),
-                            Some(&req.request_id),
-                            Some(&req.tool),
-                            rollback.clone(),
-                        );
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: active.id,
-                            rollback,
-                        });
-                    } else {
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: meta.id.clone(),
-                            rollback,
-                        });
-                    }
-                    results.push(result);
-                    continue;
-                }
-            }
-
-            let tool_args = Self::batch_tool_args(&req.args, metadata.as_ref());
-            let mut result = execute_server_budgeted(self, req, &tool_args).await;
-
-            if let Some(active) = active_tx.as_ref() {
-                if metadata.as_ref().is_some_and(|meta| meta.id == active.id)
-                    && tool_result_status_is_failure(&result.status)
-                {
-                    let rollback = self.rollback_active_batch_transaction(active).await;
-                    let failure_reason = result.output.clone();
-                    result.output = Self::append_transaction_note(
-                        &result.output,
-                        &active.id,
-                        "failed",
-                        rollback.as_ref(),
-                    );
-                    result.tool_result_fields = Self::merge_transaction_fields(
-                        result.tool_result_fields.take(),
-                        &active.id,
-                        if rollback.is_some() {
-                            "rolled_back"
-                        } else {
-                            "failed"
-                        },
-                        rollback.clone(),
-                    );
-                    if let Some(last) = self.edge_tool_round.last_mut() {
-                        if last.request_id == result.request_id {
-                            *last = result.clone();
-                        }
-                    }
-                    if let Some(active) = active_tx.take() {
-                        self.emit_batch_transaction_aborted(
-                            &active,
-                            &failure_reason,
-                            Some(&req.request_id),
-                            Some(&req.tool),
-                            rollback.clone(),
-                        );
-                        aborted_tx = Some(AbortedBatchTransaction {
-                            id: active.id,
-                            rollback,
-                        });
-                    }
-                }
-            }
-
-            results.push(result);
-        }
-
-        if let Some(active) = active_tx.take() {
-            self.emit_batch_transaction_committed(&active);
-        }
-
-        results
     }
 }
 
@@ -5017,11 +4301,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
     fn on_stream_complete(&mut self) {
         self.render.stop_thinking();
-        if self.turn_rollback_boundary_emitted
-            && let Some(active) = self.active_turn_rollback.take()
-        {
-            self.emit_turn_rollback_committed(&active);
-        }
     }
 
     fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
@@ -5087,17 +4366,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None
         };
 
-        // NOTE: We no longer block subsequent tools when a prior tool triggered rollback.
-        // The agent sees the error and can decide whether to continue or abort.
-        // This allows more flexible recovery strategies.
-
-        if !self.turn_rollback_boundary_emitted
-            && let Some(active) = self.active_turn_rollback.clone()
-        {
-            self.emit_turn_rollback_opened(&active);
-            self.turn_rollback_boundary_emitted = true;
-        }
-
         // ── Edge-path dedup: call-count limit + output cache ───────────
         let dedup_sig = tool_dedup_signature(tool, args);
         let call_count = {
@@ -5113,7 +4381,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         if call_count > max_calls {
             // Hard cap exceeded — return a stub telling the LLM to stop.
-            let body = if let Some((cached_out, _)) = self.validated_cache_entry(&dedup_sig) {
+            let body = if let Some((cached_out, _)) =
+                self.validated_cache_entry(&dedup_sig, tool, args)
+            {
                 format!(
                     "Cached repeat skipped (call #{} for identical args, limit: {}). \
                      The result is already in this conversation from an earlier call. \
@@ -5150,7 +4420,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // Cache hit for read-only (cacheable) tools
         if edge_tool_is_cacheable_read(tool, args)
-            && let Some((cached_output, cached_status)) = self.validated_cache_entry(&dedup_sig)
+            && let Some((cached_output, cached_status)) =
+                self.validated_cache_entry(&dedup_sig, tool, args)
         {
             if let Some(idx) = tool_idx {
                 self.render
@@ -5511,13 +4782,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
             }
         };
-        if allowed
-            && self.active_turn_rollback.is_some()
-            && let Some(error) = Self::turn_rollback_boundary_violation(tool, args)
-        {
-            denied_output = Some(error);
-            allowed = false;
-        }
         if allowed
             && let Err(error) = self
                 .preflight_explicit_path_sandbox_expansion(tool, args)
@@ -5906,35 +5170,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         .to_string();
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Execution status and rollback severity are separate facts. Only a
-        // typed failure/effect record can classify rollback risk; output text
-        // is model-facing content and may quote arbitrary source or logs.
         if tool_result_status_is_failure(&status)
-            && Self::tool_error_triggers_turn_rollback(tool, args)
-            && tool_failure_requires_turn_rollback(tool_result_fields.as_ref())
-            && let Some(active) = self.active_turn_rollback.clone()
+            && let Some(recovery) = self
+                .compensate_non_file_effects(tool, args, tool_result_fields.as_ref())
+                .await
         {
-            let rollback = self.rollback_active_turn(&active).await;
-            let failure_reason = output.clone();
-            output = Self::append_turn_rollback_note(&output, "failed", rollback.as_ref());
-            tool_result_fields = Self::merge_turn_rollback_fields(
-                tool_result_fields.take(),
-                if rollback.is_some() {
-                    "rolled_back"
-                } else {
-                    "failed"
-                },
-                rollback.clone(),
-            );
-            self.emit_turn_rollback_aborted(
-                &active,
-                &failure_reason,
-                Some(request_id),
-                Some(tool),
-                rollback.clone(),
-            );
-            self.turn_rollback_fired = Some(TurnRollbackFired { rollback });
-            self.active_turn_rollback = None;
+            let message = if recovery["success"] == true {
+                "Earlier database and session changes were restored after the failed operation."
+            } else {
+                "Earlier database or session changes could not be fully restored; review their state before continuing."
+            };
+            output.push_str("\n\n");
+            output.push_str(message);
+            tool_result_fields
+                .get_or_insert_with(Map::new)
+                .insert("non_file_recovery".into(), recovery);
         }
 
         // Mutation tools: clear cached read-only outputs before processing
@@ -6041,7 +5291,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             Some(tool_result_fields),
         ) {
             // ── Reconnection dedup: only record when server acked the result ──
-            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            if self.deliver_tool_result(tool, &body).await.is_ok() {
                 crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
             }
         } else {
@@ -6259,8 +5509,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     /// Sequential (side-effect) tools run first via [`execute_tool`](Self::execute_tool).
     /// Then all concurrent-safe tools execute in parallel via `join_all`, overlapping
     /// network I/O for async tools (GitHub, Memoria, MCP). If any request in the
-    /// batch carries explicit transaction metadata, the whole batch falls back to
-    /// deterministic original-order execution so rollback boundaries remain crisp.
+    /// batch requests automatic rollback, it is rejected before any tool runs.
     async fn execute_tools_batch(
         &mut self,
         requests: Vec<ToolBatchRequest>,
@@ -6279,40 +5528,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render.tool_batch_progress = Some((1, n));
         }
 
-        let has_batch_transaction = requests
+        // Reject the whole batch before dispatch: we cannot promise atomic
+        // rollback for arbitrary tool effects, including external commands.
+        if requests
             .iter()
-            .any(|req| Self::has_batch_transaction_metadata(&req.args));
-
-        // Fast path: ≤1 tool — use existing sequential code.
-        if n <= 1 {
-            if has_batch_transaction
-                && self.active_turn_rollback.is_none()
-                && self.turn_rollback_fired.is_none()
-            {
-                let out = self.execute_transactional_batch(&requests).await;
-                self.render.tool_batch_progress = None;
-                return out;
+            .any(|req| req.args.get("transaction_id").is_some())
+        {
+            let mut out = Vec::with_capacity(n);
+            for req in &requests {
+                out.push(self.record_synthetic_batch_result(
+                    req,
+                    "Error: automatic rollback is unsupported; no tools in this batch were run.".to_string(),
+                    "failed",
+                    None,
+                ).await);
             }
+            self.render.tool_batch_progress = None;
+            return out;
+        }
+
+        if n <= 1 {
             let mut out = Vec::with_capacity(n);
             for req in requests {
                 out.push(execute_server_budgeted(self, &req, &req.args).await);
             }
-            self.render.tool_batch_progress = None;
-            return out;
-        }
-
-        if self.active_turn_rollback.is_some() || self.turn_rollback_fired.is_some() {
-            let mut out = Vec::with_capacity(n);
-            for (i, req) in requests.iter().enumerate() {
-                self.render.tool_batch_progress = Some((i + 1, n));
-                out.push(execute_server_budgeted(self, req, &req.args).await);
-            }
-            self.render.tool_batch_progress = None;
-            return out;
-        }
-
-        if has_batch_transaction {
-            let out = self.execute_transactional_batch(&requests).await;
             self.render.tool_batch_progress = None;
             return out;
         }
@@ -6898,7 +6137,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             ) {
                 // ── Reconnection dedup: only record when server acked the result ──
                 if callback_delivery_open {
-                    match self.post_tool_result_with_auth_retry(&body).await {
+                    match self.deliver_tool_result(&req.tool, &body).await {
                         Ok(()) => {
                             crate::cli::edge_lifecycle::record_completed_request(
                                 req.request_id.clone(),
@@ -8241,66 +7480,6 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
     }
 }
 
-/// Decide turn rollback from execution and owner-authored mutation facts.
-///
-/// Failure causes are recovery guidance, not proof of side effects. Rejected
-/// or unstarted calls and owner-confirmed no-mutation results are safe to
-/// correct. A committed/partial mutation rolls back; missing effect facts stay
-/// conservative. Never infer the effect from output prose or failure cause.
-fn tool_failure_requires_turn_rollback(tool_result_fields: Option<&Map<String, Value>>) -> bool {
-    let Some(fields) = tool_result_fields else {
-        return true;
-    };
-
-    if fields
-        .get("workspace_mutation_partial")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return true;
-    }
-    if let Some(applied) = fields
-        .get("workspace_mutation_applied")
-        .and_then(Value::as_bool)
-    {
-        return applied;
-    }
-    if fields.get("executed").and_then(Value::as_bool) == Some(false)
-        || fields.get("execution_started").and_then(Value::as_bool) == Some(false)
-        || fields.get("disposition").and_then(Value::as_str) == Some("rejected")
-    {
-        return false;
-    }
-
-    if let Some(semantics) = fields
-        .get("exit_semantics")
-        .and_then(Value::as_str)
-        .and_then(|tag| {
-            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
-                tag.to_string(),
-            ))
-            .ok()
-        })
-    {
-        return semantics.is_tool_error();
-    }
-
-    if let Some(result_class) = fields
-        .get("result_class")
-        .and_then(Value::as_str)
-        .and_then(|tag| {
-            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
-                Value::String(tag.to_string()),
-            )
-            .ok()
-        })
-    {
-        return result_class.is_tool_error();
-    }
-
-    true
-}
-
 fn normalize_sandbox_denied_outcome(
     outcome: &mut crate::edge_tools::ToolExecutionOutcome,
 ) -> Option<String> {
@@ -8387,14 +7566,6 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             "Native collaborators require canonical child dispatch with an immutable execution grant, not a root tool callback".into(),
         );
     }
-    if tool_name == "bash"
-        && let Some(outcome) = executor
-            .bash_detachable_with_metadata(&args, invocation, cancel_token.as_ref())
-            .await
-    {
-        return outcome;
-    }
-
     // The async Bash path owns the workspace pre/post observer and its
     // per-root lease. Keep it on this path even when the caller is the
     // responsive stream renderer; the shell itself is moved to a blocking
@@ -9020,9 +8191,8 @@ mod tests {
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
-        tool_completion_is_authoritative, tool_dedup_signature,
-        tool_failure_requires_turn_rollback, tool_output_event_text, turn_has_tool_work,
-        work_task_board_update_from_server_event,
+        tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
+        turn_has_tool_work, work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -9031,7 +8201,6 @@ mod tests {
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
-    use serde_json::Map;
     use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -9078,7 +8247,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -9199,7 +8369,8 @@ mod tests {
                         approval_request_tx: None,
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        turn_rollback_on_failure: false,
+                        compensate_non_file_on_failure: false,
+
                         tool_cache: &mut cache,
                         incremental_state: Some(incremental.clone()),
                         request_session_execution_lease: None,
@@ -9279,7 +8450,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -9365,7 +8537,8 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    turn_rollback_on_failure: false,
+                    compensate_non_file_on_failure: false,
+
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
@@ -9592,7 +8765,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -9686,7 +8860,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -9913,7 +9088,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            turn_rollback_on_failure: false,
+            compensate_non_file_on_failure: false,
+
             tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
@@ -10606,7 +9782,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            turn_rollback_on_failure: false,
+            compensate_non_file_on_failure: false,
+
             tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
@@ -11299,144 +10476,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
-        let dir = tempdir().expect("tempdir");
-        let nested = dir.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        let (slot, listener) = astra_tools::detach::new_slot_with_handle();
+    async fn responsive_bash_releases_wait_without_transferring_the_process() {
+        let dir = tempdir().unwrap();
+        let task_root = tempdir().unwrap();
+        let control = astra_tools::detach::ForegroundWaitControl::default();
         let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
+            crate::edge_tools::ToolExecutor::new(dir.path())
+                .with_background_tasks(
+                    crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                        task_root.path().join("tasks"),
+                    ),
+                )
+                .with_foreground_wait_control(control.clone()),
         );
-
+        let tasks = executor.background_tasks.clone();
         let execution = tokio::spawn(execute_with_invocation_metadata_responsive(
             executor,
-            "bash".to_string(),
-            serde_json::json!({
-                // Detach is reserved for a pure long-running builtin.  A
-                // compound shell command stays foreground so the edge
-                // executor can emit its post-workspace receipt.
-                "command": "sleep 5",
-                "workdir": "nested",
-                "timeout": 30.0,
-            }),
+            "bash".into(),
+            serde_json::json!({"command":"sleep 10", "timeout":20}),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         ));
-
-        for _ in 0..100 {
-            if listener.is_active() {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !control.is_active() {
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            listener.is_active(),
-            "foreground edge bash must activate the TUI detach listener"
-        );
-
-        listener.signal_tx.send(true).expect("signal detach");
-        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), listener.payload_rx)
-            .await
-            .expect("edge bash should hand off promptly after Ctrl+B")
-            .expect("payload");
-        assert_eq!(payload.command, "sleep 5");
-        #[cfg(target_os = "linux")]
-        {
-            let pid = payload.child.id().expect("live detached child");
-            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).expect("child cwd");
-            assert_eq!(cwd.canonicalize().unwrap(), nested.canonicalize().unwrap());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let pid = payload.child.id().expect("live detached child").to_string();
-            let probe = std::process::Command::new("/usr/sbin/lsof")
-                .args(["-a", "-p", &pid, "-d", "cwd", "-Fn"])
-                .output()
-                .expect("system lsof child-cwd probe");
-            assert!(probe.status.success(), "child cwd must remain observable");
-            let text = String::from_utf8(probe.stdout).unwrap();
-            let cwd = text
-                .lines()
-                .find_map(|line| line.strip_prefix('n'))
-                .expect("child cwd path");
-            assert_eq!(
-                std::path::Path::new(cwd).canonicalize().unwrap(),
-                nested.canonicalize().unwrap()
-            );
-        }
-
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-edge".to_string()))
-            .expect("ack adoption");
-
+        })
+        .await
+        .expect("foreground wait registered");
+        assert!(control.release());
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
             .await
-            .expect("detached edge bash should finish the tool call")
-            .expect("join");
+            .unwrap()
+            .unwrap();
         assert!(!outcome.is_error, "{outcome:?}");
-        assert_eq!(
-            outcome.tool_result_fields.as_ref().unwrap()["bash_workdir"]["resolved_workspace_relative"],
-            "nested"
-        );
-        assert!(
-            outcome.output.contains("bash_detached"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("bg-shell-edge"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("continue with independent work"),
-            "{}",
-            outcome.output
-        );
-        assert!(outcome.output.contains("Do NOT poll"), "{}", outcome.output);
-        assert!(
-            outcome
-                .output
-                .contains("call `task_output` ONCE with block=false"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("tail/cat/head/less are denied"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            !outcome.output.contains("task_output("),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            !outcome.output.contains("task_list()"),
-            "{}",
-            outcome.output
-        );
-        assert!(!outcome.output.contains("task_stop("), "{}", outcome.output);
-        assert_eq!(
-            outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("background_task_id"))
-                .and_then(Value::as_str),
-            Some("bg-shell-edge")
-        );
-        let work = outcome
-            .tool_result_fields
-            .as_ref()
-            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-            .expect("edge detach receipt must publish the shared work-unit contract");
-        assert_eq!(work.id, "bg-shell-edge");
-        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
-        assert_eq!(
-            work.mode,
-            astra_core::work_unit::WorkUnitObservationMode::Transition
-        );
+        let id = outcome.tool_result_fields.as_ref().unwrap()["task_id"]
+            .as_str()
+            .unwrap();
+        let handle = tasks.get(id).expect("same executor owns background work");
+        assert!(!handle.status().is_terminal());
+        assert!(outcome.output.contains(id));
+        let mut tasks = tasks;
+        tasks
+            .kill_all_and_wait(std::time::Duration::from_secs(3))
+            .await;
+        assert!(tasks.get(id).unwrap().status().is_terminal());
     }
 
     #[test]
@@ -11640,7 +10724,8 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    turn_rollback_on_failure: false,
+                    compensate_non_file_on_failure: false,
+
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
@@ -11821,7 +10906,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12249,7 +11335,8 @@ mod tests {
                         approval_request_tx: Some(approval_tx),
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        turn_rollback_on_failure: false,
+                        compensate_non_file_on_failure: false,
+
                         tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
@@ -12322,7 +11409,8 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12413,7 +11501,8 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12486,7 +11575,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12507,7 +11597,7 @@ mod tests {
             request
                 .response_tx
                 .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
-                    mode: crate::cli::permission_manager::PermissionMode::AcceptEdits,
+                    mode: Some(crate::cli::permission_manager::PermissionMode::AcceptEdits),
                 })
                 .expect("send plan decision");
         };
@@ -12556,7 +11646,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12621,7 +11712,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -12741,7 +11833,8 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    turn_rollback_on_failure: false,
+                    compensate_non_file_on_failure: false,
+
                     tool_cache: cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
@@ -12814,6 +11907,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn directory_cache_follows_selected_worktree_and_external_changes() {
+        use crate::edge_tools::tests::worktree_tests::{
+            init_temp_git_repo, remove_preserved_test_worktree,
+        };
+        let repo = init_temp_git_repo();
+        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
+        let mut cache = EdgeToolCache::new(8);
+        let host = fixture.host(repo.path(), &mut cache, None);
+        let args = serde_json::json!({});
+        let before = host.executor.execute_with_metadata("list_dir", &args).await;
+        assert!(!before.is_error, "{before:?}");
+        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
+        host.tool_cache.output_cache.insert(
+            "listing".into(),
+            EdgeToolCacheEntry {
+                output: before.output,
+                status: "completed".into(),
+                validation,
+            },
+        );
+
+        let selected = host
+            .executor
+            .enter_worktree("cache-worktree")
+            .unwrap()
+            .worktree_path;
+        assert!(
+            host.validated_cache_entry("listing", "list_dir", &args)
+                .is_none()
+        );
+        let listing = host.executor.execute_with_metadata("list_dir", &args).await;
+        assert!(!listing.is_error, "{listing:?}");
+        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
+        host.tool_cache.output_cache.insert(
+            "listing".into(),
+            EdgeToolCacheEntry {
+                output: listing.output,
+                status: "completed".into(),
+                validation,
+            },
+        );
+        let old_mtime = std::fs::metadata(&selected).unwrap().modified().unwrap();
+        std::fs::write(selected.join("created-elsewhere"), "new").unwrap();
+        std::fs::File::open(&selected)
+            .unwrap()
+            .set_modified(old_mtime + std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            host.validated_cache_entry("listing", "list_dir", &args)
+                .is_none()
+        );
+        let refreshed = host.executor.execute_with_metadata("list_dir", &args).await;
+        assert!(
+            refreshed.output.contains("created-elsewhere"),
+            "{refreshed:?}"
+        );
+
+        host.executor.exit_worktree("keep", false).unwrap();
+        remove_preserved_test_worktree(repo.path(), &selected);
+    }
+
     fn parallel_batch_request(owner: &str, id: &str, tool: &str, args: Value) -> ToolBatchRequest {
         ToolBatchRequest {
             work_attribution: None,
@@ -12829,6 +11984,174 @@ mod tests {
             tool: tool.to_owned(),
             args,
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_task_is_acknowledged_only_after_callback_succeeds() {
+        for (accepted, finish_after_observation) in [(false, false), (true, false), (true, true)] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            if !accepted {
+                Mock::given(method("POST"))
+                    .and(path("/tools/result"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .with_priority(1)
+                    .mount(&fixture.callbacks)
+                    .await;
+            }
+            let workspace = tempdir().unwrap();
+            let stdout = workspace.path().join("stdout");
+            let stderr = workspace.path().join("stderr");
+            std::fs::write(&stdout, "partial\n").unwrap();
+            std::fs::write(&stderr, "").unwrap();
+            let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                workspace.path().join("captures"),
+            );
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let mut task = registry
+                .start_shell(
+                    "unknown shell --token \"test-secret-987654321\"",
+                    (stdout, stderr, None),
+                    true,
+                    false,
+                    None,
+                    |_, _| async move {
+                        finished.await.unwrap();
+                        let mut outcome = astra_tools::execution_outcome::ToolExecutionOutcome::error_with_evidence(
+                            "outcome unknown".into(),
+                            astra_core::ToolFailureEvidence::from_error_kind(
+                                astra_core::ErrorKind::ToolOutcomeUnknown,
+                            ),
+                        );
+                        outcome.tool_result_fields.as_mut().unwrap().insert(
+                            "cleanup_authoritative".into(), serde_json::json!(true),
+                        );
+                        outcome
+                    },
+                )
+                .unwrap();
+            let mut finish = Some(finish);
+            if !finish_after_observation {
+                finish.take().unwrap().send(()).unwrap();
+                task.wait().await.unwrap();
+            }
+            let executor = std::sync::Arc::new(
+                crate::edge_tools::ToolExecutor::new(workspace.path())
+                    .with_background_tasks(registry.clone()),
+            );
+            let outcome = executor
+                .execute_with_invocation_metadata_cancelable(
+                    "task_output",
+                    &serde_json::json!({"task_id":task.id}),
+                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                    None,
+                )
+                .await;
+            assert!(!outcome.output.contains("test-secret-987654321"));
+            if let Some(finish) = finish {
+                finish.send(()).unwrap();
+                task.wait().await.unwrap();
+            }
+            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "session".into(),
+                    run_id: "run".into(),
+                    turn_chain_id: "chain".into(),
+                    request_id: "request".into(),
+                    edge_agent_id: "edge-test".into(),
+                    status: "completed".into(),
+                    output: outcome.output,
+                    duration_ms: 1,
+                    tool_result_fields: outcome.tool_result_fields,
+                },
+            );
+            let mut cache = EdgeToolCache::new(8);
+            let mut host = fixture.host(workspace.path(), &mut cache, None);
+            host.executor = executor;
+            assert_eq!(
+                host.deliver_tool_result("task_output", &body).await.is_ok(),
+                accepted
+            );
+            let report = registry
+                .kill_all_and_wait(std::time::Duration::from_secs(1))
+                .await;
+            assert_eq!(
+                report.unknown.is_empty(),
+                accepted && !finish_after_observation,
+                "{report:?}"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn plan_failure_preserves_files_and_restores_session_state() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let workspace = tempdir().unwrap();
+        let session_id = format!("plan-non-file-{}", uuid::Uuid::new_v4());
+        let metadata = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &session_id,
+            "model",
+            &workspace.path().to_string_lossy(),
+            None,
+        );
+        astra_services::session_workspace::write_workspace(&metadata).unwrap();
+        let observability = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple(&session_id),
+        ));
+        let before = observability.read().unwrap().config.memory.retrieval_top_k;
+        let changed = (1..=20).find(|value| *value != before).unwrap();
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(workspace.path())
+                .with_active_session_id(&session_id)
+                .with_observability_session(observability.clone()),
+        );
+        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        host.executor = executor.clone();
+        host.non_file_rollback = Some((
+            0,
+            astra_turn_core::database_snapshots::journal_checkpoint(
+                &executor.database_snapshot_journal,
+            ),
+            executor.session_state_checkpoint(),
+        ));
+        let adjusted = executor
+            .execute(
+                "adjust_config",
+                &serde_json::json!({
+                    "path":"memory.retrieval_top_k", "value":changed, "force":true,
+                }),
+            )
+            .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&adjusted).unwrap()["status"],
+            "completed"
+        );
+        let mut request = parallel_batch_request(
+            "plan",
+            "failed-bash",
+            "bash",
+            serde_json::json!({
+                "command":"printf kept > preserved.txt; exit 1",
+            }),
+        );
+        request.session_id = session_id;
+        host.on_server_tool_surface_admission(&request).unwrap();
+        let result = host.execute_tools_batch(vec![request]).await.remove(0);
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("preserved.txt")).unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            observability.read().unwrap().config.memory.retrieval_top_k,
+            before
+        );
+        assert_eq!(
+            result.tool_result_fields.unwrap()["non_file_recovery"]["success"],
+            true
+        );
     }
 
     #[serial_test::serial]
@@ -13039,7 +12362,10 @@ mod tests {
             .expect("command cap ends execution before delivery deadline");
             assert_eq!(results.len(), 1);
             let result = &results[0];
-            assert!(result.output.contains("timed out"), "{}", result.output);
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["error_kind"],
+                "tool_timeout"
+            );
             assert_eq!(result.args, args);
             assert_eq!(request.args, args);
             requests.push(request);
@@ -13390,7 +12716,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental.clone()),
                 request_session_execution_lease: None,
@@ -13603,7 +12930,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -13694,7 +13022,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -13778,7 +13107,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: Some(request_lease.clone()),
@@ -13859,7 +13189,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -13914,7 +13245,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental_state.clone()),
                 request_session_execution_lease: None,
@@ -14039,7 +13371,8 @@ mod tests {
                         approval_request_tx: Some(approval_tx),
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        turn_rollback_on_failure: false,
+                        compensate_non_file_on_failure: false,
+
                         tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
@@ -14166,7 +13499,8 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    turn_rollback_on_failure: false,
+                    compensate_non_file_on_failure: false,
+
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
@@ -14258,7 +13592,8 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    turn_rollback_on_failure: false,
+                    compensate_non_file_on_failure: false,
+
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
@@ -14469,7 +13804,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            turn_rollback_on_failure: false,
+            compensate_non_file_on_failure: false,
+
             tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
@@ -14630,7 +13966,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            turn_rollback_on_failure: false,
+            compensate_non_file_on_failure: false,
+
             tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
@@ -15261,60 +14598,6 @@ mod tests {
         assert_eq!(edge_tool_outcome_status(&outcome), "completed");
     }
 
-    #[test]
-    fn rollback_decision_uses_execution_and_effect_facts_not_failure_cause() {
-        let diagnostics_only = Map::from_iter([(
-            "recovery_evidence".to_string(),
-            serde_json::to_value(astra_core::ToolFailureEvidence::new(
-                astra_core::ErrorKind::ToolInvalidArgs,
-                astra_core::ToolFailureCause::InvalidArguments,
-                false,
-                Vec::new(),
-            ))
-            .unwrap(),
-        )]);
-        assert!(tool_failure_requires_turn_rollback(Some(&diagnostics_only)));
-
-        let rejected_before_execution = Map::from_iter([(
-            "disposition".to_string(),
-            Value::String("rejected".to_string()),
-        )]);
-        assert!(!tool_failure_requires_turn_rollback(Some(
-            &rejected_before_execution
-        )));
-
-        let no_mutation =
-            Map::from_iter([("workspace_mutation_applied".to_string(), Value::Bool(false))]);
-        assert!(!tool_failure_requires_turn_rollback(Some(&no_mutation)));
-
-        let effect_committed =
-            Map::from_iter([("workspace_mutation_applied".to_string(), Value::Bool(true))]);
-        assert!(tool_failure_requires_turn_rollback(Some(&effect_committed)));
-
-        let partial_effect =
-            Map::from_iter([("workspace_mutation_partial".to_string(), Value::Bool(true))]);
-        assert!(tool_failure_requires_turn_rollback(Some(&partial_effect)));
-
-        let contradictory_rejection = Map::from_iter([
-            (
-                "disposition".to_string(),
-                Value::String("rejected".to_string()),
-            ),
-            ("workspace_mutation_applied".to_string(), Value::Bool(true)),
-        ]);
-        assert!(tool_failure_requires_turn_rollback(Some(
-            &contradictory_rejection
-        )));
-
-        let contradictory_no_effect = Map::from_iter([
-            ("execution_started".to_string(), Value::Bool(false)),
-            ("workspace_mutation_partial".to_string(), Value::Bool(true)),
-        ]);
-        assert!(tool_failure_requires_turn_rollback(Some(
-            &contradictory_no_effect
-        )));
-        assert!(tool_failure_requires_turn_rollback(None));
-    }
     // ── Skill/MCP output summary tests ──
 
     #[test]
@@ -15953,7 +15236,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -16033,7 +15317,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -16212,28 +15497,9 @@ mod tests {
         assert_ne!(sig1, sig3);
     }
 
-    #[test]
-    fn tool_owned_rollback_flag_does_not_select_batch_transaction_protocol() {
-        let args = serde_json::json!({
-            "action": "run_chain",
-            "name": "review",
-            "description": "Review the current change",
-            "steps": [{"tool": "read_file", "args": {"path": "README.md"}}],
-            "rollback_on_failure": true,
-        });
-
-        assert!(!CliSseStreamHost::has_batch_transaction_metadata(&args));
-        assert!(
-            CliSseStreamHost::parse_batch_transaction_metadata(&args)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(CliSseStreamHost::batch_tool_args(&args, None), args);
-    }
-
     #[serial_test::serial]
     #[tokio::test]
-    async fn transactional_batch_rolls_back_earlier_file_write_on_later_failure() {
+    async fn unsupported_transactional_batch_is_rejected_before_any_effect() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -16263,7 +15529,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -16315,583 +15582,18 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_ne!(results[0].status, "failed");
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert_eq!(rollback_fields["transaction_id"].as_str(), Some("tx-1"));
-        assert!(
-            results[1].output.contains("Transaction `tx-1` failed."),
-            "{}",
-            results[1].output
-        );
-        assert!(
-            !temp.path().join("txn.txt").exists(),
-            "rollback should remove the written file"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
+        for result in &results {
+            assert_eq!(result.status, "failed");
+            assert!(result.output.contains("automatic rollback is unsupported"));
+            let fields = result.tool_result_fields.as_ref().unwrap();
+            assert_eq!(fields.get("execution_started"), Some(&Value::Bool(false)));
+        }
+        assert!(!temp.path().join("txn.txt").exists());
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn transactional_batch_restores_deleted_file_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let victim = temp.path().join("txn.txt");
-        std::fs::write(&victim, "hello\n").expect("seed file");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(4, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "txn.txt",
-                        "delete": true,
-                        "transaction_id": "tx-del",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-del",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&victim).expect("restored file"),
-            "hello\n"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_skips_later_requests_after_rollback() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(5, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "txn.txt",
-                        "content": "hello\n",
-                        "transaction_id": "tx-2",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-2",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-3".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "other.txt",
-                        "transaction_id": "tx-2",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[2].status, "failed");
-        assert!(
-            results[2].output.contains("already aborted"),
-            "{}",
-            results[2].output
-        );
-        let fields = results[2]
-            .tool_result_fields
-            .as_ref()
-            .expect("transaction fields");
-        assert_eq!(fields["transaction_state"].as_str(), Some("aborted"));
-        assert_eq!(fields["transaction_id"].as_str(), Some("tx-2"));
-        assert!(
-            !results[2].output.contains("existing"),
-            "aborted transaction request should not execute normally"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn transactional_batch_records_boundary_open_and_commit_events() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
-        let session_id = "tx-boundary-commit";
-        let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
-        );
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(15, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![ToolBatchRequest {
-                work_attribution: None,
-                admitted_skill_names: None,
-                session_id: "test-session".to_string(),
-                run_id: "test-run".to_string(),
-                turn_chain_id: "test-chain".to_string(),
-                request_id: "tx-boundary-1".to_string(),
-                read_only_execution: false,
-                execution_timeout_ms: 300_000,
-                command_timeout_cap_ms: None,
-                execution_deadline_unix_ms: 4_102_444_800_000,
-                tool: "write_file".to_string(),
-                args: serde_json::json!({
-                    "path": "txn.txt",
-                    "content": "hello\n",
-                    "transaction_id": "tx-journal",
-                    "rollback_on_failure": true,
-                }),
-            }])
-            .await;
-
-        assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "failed");
-
-        let events = boundary_events(session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryCommitted
-        );
-
-        let opened = boundary_metadata(&events[0]);
-        assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
-        assert_eq!(opened["transaction_id"].as_str(), Some("tx-journal"));
-        assert_eq!(opened["rollback_on_failure"].as_bool(), Some(true));
-
-        let committed = boundary_metadata(&events[1]);
-        assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
-        assert_eq!(committed["transaction_id"].as_str(), Some("tx-journal"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn transactional_batch_records_boundary_abort_event() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
-        let session_id = "tx-boundary-abort";
-        let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
-        );
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(16, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tx-boundary-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "txn.txt",
-                        "content": "hello\n",
-                        "transaction_id": "tx-journal",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tx-boundary-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-journal",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "failed");
-
-        let events = boundary_events(session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryAborted
-        );
-
-        let aborted = boundary_metadata(&events[1]);
-        assert_eq!(aborted["kind"].as_str(), Some("tool_batch"));
-        assert_eq!(aborted["transaction_id"].as_str(), Some("tx-journal"));
-        assert_eq!(
-            aborted["trigger_request_id"].as_str(),
-            Some("tx-boundary-2")
-        );
-        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("read_file"));
-        assert!(
-            aborted["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("No such file or directory")),
-            "{aborted}"
-        );
-        assert_eq!(
-            aborted["rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn turn_rollback_restores_written_file_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(9, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "turn.txt",
-                        "content": "hello\n",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "exit 1",
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "failed");
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(rollback_fields["rollback_boundary"].as_str(), Some("turn"));
-        assert_eq!(
-            rollback_fields["rollback_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert_eq!(rollback_fields["rollback_on_failure"].as_bool(), Some(true));
-        assert!(
-            results[1].output.contains("Turn rollback policy failed."),
-            "{}",
-            results[1].output
-        );
-        assert!(
-            !temp.path().join("turn.txt").exists(),
-            "rollback should remove the written file"
-        );
-        assert_eq!(
-            rollback_fields["rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn turn_rollback_preserves_prior_edits_after_typed_str_replace_no_effects() {
+    async fn failed_edits_and_commands_preserve_prior_work() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -16952,7 +15654,8 @@ mod tests {
                 ask_user_request_tx: None,
                 approval_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: true,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -17021,7 +15724,6 @@ mod tests {
             Some("invalid_arguments")
         );
         assert!(!no_op_fields.contains_key("rollback_state"));
-        assert!(host.turn_rollback_fired.is_none());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
             "after-one\n",
@@ -17051,7 +15753,6 @@ mod tests {
             batch_no_op.output
         );
         assert_eq!(batch_no_op_fields["workspace_mutation_applied"], false);
-        assert!(host.turn_rollback_fired.is_none());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
             "after-one\n",
@@ -17076,7 +15777,6 @@ mod tests {
             batch_missing_anchor.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
             false
         );
-        assert!(host.turn_rollback_fired.is_none());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("batch-missing.txt")).unwrap(),
             "current bytes\n",
@@ -17101,7 +15801,6 @@ mod tests {
             batch_ambiguous_anchor.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
             false
         );
-        assert!(host.turn_rollback_fired.is_none());
 
         // The per-edit-path form uses the shared multi-path preparer instead
         // of the local same-file batch fast path. Its validation failures
@@ -17147,7 +15846,6 @@ mod tests {
                 "{request_id}: {fields:?}"
             );
             assert_eq!(fields["workspace_mutation_applied"], false, "{request_id}");
-            assert!(host.turn_rollback_fired.is_none(), "{request_id}");
             assert_eq!(
                 std::fs::read_to_string(temp.path().join(path)).unwrap(),
                 contents,
@@ -17174,7 +15872,6 @@ mod tests {
             Some("invalid_arguments")
         );
         assert!(!ambiguous_fields.contains_key("rollback_state"));
-        assert!(host.turn_rollback_fired.is_none());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
             "after-one\n",
@@ -17211,7 +15908,6 @@ mod tests {
             Some("invalid_arguments")
         );
         assert!(!missing_fields.contains_key("rollback_state"));
-        assert!(host.turn_rollback_fired.is_none());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
             "after-two\n",
@@ -17223,9 +15919,8 @@ mod tests {
                 .all(|event| { event.event_type != JournalEventType::ExecutionBoundaryAborted })
         );
 
-        // Negative control: an ambiguous command failure after a shell-side
-        // effect must retain the conservative rollback behavior for bounded
-        // structured edits. The shell effect itself is outside that journal.
+        // A failed command can have partial effects; both those effects and
+        // earlier successful edits remain available for the next attempt.
         let ambiguous_failure = execute_one!(request(
             "effectful-bash-failure",
             "bash",
@@ -17234,162 +15929,13 @@ mod tests {
             }),
         ));
         assert_eq!(ambiguous_failure.status, "failed");
-        let rollback_fields = ambiguous_failure
-            .tool_result_fields
-            .as_ref()
-            .expect("ambiguous failure rollback metadata");
-        assert_eq!(rollback_fields["rollback_boundary"].as_str(), Some("turn"));
-        assert_eq!(
-            rollback_fields["rollback_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert!(host.turn_rollback_fired.is_some());
         assert_eq!(
             std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
-            "before\n",
-            "an ambiguous failure must still undo earlier bounded edits"
+            "after-two\n",
         );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("shell-effect.txt")).unwrap(),
             "side effect\n",
-            "unbounded shell effects remain outside file-journal rollback"
-        );
-        let events = boundary_events(session_id);
-        let aborted = events
-            .iter()
-            .find(|event| event.event_type == JournalEventType::ExecutionBoundaryAborted)
-            .expect("only the ambiguous failure should abort the turn boundary");
-        assert_eq!(
-            boundary_metadata(aborted)["trigger_tool_name"].as_str(),
-            Some("bash")
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn turn_rollback_skips_later_requests_after_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(10, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        // write_file succeeds, then bash "exit 1" (non-read-only mutation
-        // error) triggers rollback + aborts later tools.
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "turn.txt",
-                        "content": "hello\n",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "exit 1",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-3".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "other.txt",
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 3);
-
-        // After the PR fix: rollback fires on the bash error (results[1]),
-        // but subsequent tools (results[2]) execute normally instead of being blocked.
-        // The agent sees the error and decides whether to continue.
-
-        // Bash error triggers rollback
-        assert_eq!(results[1].status, "failed");
-        let bash_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("bash rollback fields");
-        assert_eq!(
-            bash_fields["rollback_boundary"].as_str(),
-            Some("turn"),
-            "bash error should trigger turn rollback"
-        );
-
-        // Subsequent tool executes normally (not blocked)
-        assert_eq!(
-            results[2].status, "completed",
-            "read_file should execute normally after rollback"
-        );
-        assert!(
-            results[2].output.contains("existing"),
-            "read_file should return actual file content: {}",
-            results[2].output
         );
     }
 
@@ -17424,7 +15970,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -17533,7 +16080,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -17630,7 +16178,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -17735,7 +16284,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -17820,267 +16370,6 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn turn_rollback_allows_bash_and_persists_through_mutation_rollback() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(11, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        // bash mkdir should execute (no boundary violation), then bash "exit 1"
-        // (non-read-only mutation error) triggers rollback.  write_file from
-        // the first request is rolled back, but mkdir side-effect persists (no
-        // checkpoint for bash).
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-bash-0".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "turn.txt",
-                        "content": "hello\n",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-bash-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "mkdir -p subdir",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-bash-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "exit 1",
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 3);
-        // bash mkdir should have succeeded
-        assert_ne!(
-            results[1].status, "failed",
-            "bash mkdir should be allowed: {}",
-            results[1].output
-        );
-        // bash "exit 1" should have errored and triggered rollback
-        assert_eq!(results[2].status, "failed");
-        // write_file should be rolled back
-        assert!(
-            !temp.path().join("turn.txt").exists(),
-            "write_file should be rolled back"
-        );
-        // bash side-effect persists (no rollback for bash)
-        assert!(
-            temp.path().join("subdir").exists(),
-            "bash mkdir side-effect should persist through rollback"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn turn_rollback_allows_read_only_bash() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
-        let mut manager = crate::mcp_client::McpClientManager::new();
-        manager
-            .connect(crate::mcp_client::McpServerConfig {
-                name: "mock".to_string(),
-                transport: crate::mcp_client::Transport::Stdio {
-                    command: vec![
-                        crate::mcp_client::ensure_mock_mcp_server_binary()
-                            .to_string_lossy()
-                            .to_string(),
-                    ],
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                },
-                description: String::new(),
-                enabled: true,
-                retry: crate::mcp_client::RetryConfig::default(),
-            })
-            .await
-            .expect("connect mock MCP");
-        let schemas = manager.all_tool_schemas();
-        executor.install_mcp_bundle(
-            std::sync::Arc::new(tokio::sync::RwLock::new(manager)),
-            schemas,
-        );
-        let executor = std::sync::Arc::new(executor);
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(12, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        for (name, allowed) in [("mcp__mock__echo", true), ("mcp__missing__echo", false)] {
-            let fields = host.tool_result_fields_with_cli_runtime(name, None);
-            let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
-                serde_json::from_value(fields["runtime_environment_advertisement"].clone())
-                    .unwrap();
-            let admission = astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
-                &astra_runtime_env::ToolRegistry::builtins(),
-                name,
-                &serde_json::json!({"message": "hello"}),
-                &advertisement.binding.capabilities,
-                &advertisement.binding.tool_surface,
-            );
-            assert_eq!(admission.is_ok(), allowed, "{name}: {admission:?}");
-        }
-        executor
-            .accept_server_tool_surface_admission("mcp__mock__echo")
-            .unwrap();
-        let echo = executor
-            .execute(
-                "mcp__mock__echo",
-                &serde_json::json!({"message": "connected MCP response"}),
-            )
-            .await;
-        assert!(
-            echo.contains("connected MCP response"),
-            "MCP must execute after discovery: {echo}"
-        );
-        let result = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "turn-bash-ro",
-                "bash",
-                (serde_json::json!({"command": "pwd"})).clone(),
-            ))
-            .await;
-
-        assert_ne!(result.status, "failed");
-        let runtime_environment = result
-            .tool_result_fields
-            .as_ref()
-            .and_then(|fields| fields.get("runtime_environment_advertisement"))
-            .expect("edge tool result should carry runtime environment advertisement");
-        assert_eq!(
-            runtime_environment["binding"]["workspace"]["cwd"],
-            temp.path().to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            runtime_environment["binding"]["executor"]["kind"],
-            "local_cli"
-        );
-        let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
-            serde_json::from_value(runtime_environment.clone())
-                .expect("runtime advertisement should deserialize");
-        assert!(!advertisement.binding.tool_surface.contains("task_board"));
-        assert!(
-            astra_runtime_env::CapabilityResolver
-                .check_tool_call_for_surface(
-                    &astra_runtime_env::ToolRegistry::builtins(),
-                    "task_board",
-                    &serde_json::json!({"action": "list"}),
-                    &advertisement.binding.capabilities,
-                    &advertisement.binding.tool_surface,
-                )
-                .is_err(),
-            "the removed checklist tool must not re-enter through runtime advertisement"
-        );
-        assert!(
-            result
-                .output
-                .contains(temp.path().to_string_lossy().as_ref()),
-            "{}",
-            result.output
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
     async fn execute_tool_blocks_name_based_process_kill_for_bash() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -18108,7 +16397,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                turn_rollback_on_failure: false,
+                compensate_non_file_on_failure: false,
+
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
@@ -18174,514 +16464,6 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].request_id, host[0].request_id);
         assert_eq!(merged[0].output, host[0].output);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn turn_rollback_read_only_error_does_not_trigger_rollback() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("keep.txt"), "keep me\n").expect("seed");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(13, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        // write_file succeeds, read_file(missing) errors but should NOT
-        // trigger rollback because read_file is read-only.  The 3rd tool
-        // should still execute normally.
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "ro-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "new.txt",
-                        "content": "created\n",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "ro-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "ro-3".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "keep.txt",
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 3);
-        // write_file should succeed
-        assert_ne!(results[0].status, "failed", "{}", results[0].output);
-        // read_file(missing) should error
-        assert_eq!(results[1].status, "failed");
-        // read_file(keep) should still execute (no rollback triggered)
-        assert_ne!(
-            results[2].status, "failed",
-            "read-only error should not abort turn: {}",
-            results[2].output
-        );
-        assert!(
-            results[2].output.contains("keep me"),
-            "{}",
-            results[2].output
-        );
-        // File from write_file should still exist (no rollback)
-        assert!(
-            temp.path().join("new.txt").exists(),
-            "write_file should not be rolled back by read-only error"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn turn_rollback_records_boundary_open_and_commit_events() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("ok.txt"), "hello\n").expect("seed file");
-        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
-        let session_id = "turn-boundary-commit";
-        let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
-        );
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(17, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![ToolBatchRequest {
-                work_attribution: None,
-                admitted_skill_names: None,
-                session_id: "test-session".to_string(),
-                run_id: "test-run".to_string(),
-                turn_chain_id: "test-chain".to_string(),
-                request_id: "turn-boundary-1".to_string(),
-                read_only_execution: false,
-                execution_timeout_ms: 300_000,
-                command_timeout_cap_ms: None,
-                execution_deadline_unix_ms: 4_102_444_800_000,
-                tool: "read_file".to_string(),
-                args: serde_json::json!({
-                    "path": "ok.txt",
-                }),
-            }])
-            .await;
-        assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "failed");
-
-        host.on_stream_complete();
-
-        let events = boundary_events(session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryCommitted
-        );
-
-        let opened = boundary_metadata(&events[0]);
-        assert_eq!(opened["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(opened["rollback_on_failure"].as_bool(), Some(true));
-
-        let committed = boundary_metadata(&events[1]);
-        assert_eq!(committed["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(committed["detail"]["executed_requests"].as_u64(), Some(1));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn turn_rollback_records_boundary_abort_event() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
-        let session_id = "turn-boundary-abort";
-        let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
-        );
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(18, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: true,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-boundary-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "turn.txt",
-                        "content": "hello\n",
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "turn-boundary-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "exit 1",
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "failed");
-
-        let events = boundary_events(session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryAborted
-        );
-
-        let aborted = boundary_metadata(&events[1]);
-        assert_eq!(aborted["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(
-            aborted["trigger_request_id"].as_str(),
-            Some("turn-boundary-2")
-        );
-        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("bash"));
-        assert!(
-            aborted["reason"]
-                .as_str()
-                .is_some_and(|reason| !reason.is_empty()),
-            "reason should contain the error message: {aborted}"
-        );
-        assert_eq!(
-            aborted["rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_rejects_mutating_bash_and_restores_prior_state() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(13, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tx-bash-1".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: None,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "write_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "txn.txt",
-                        "content": "hello\n",
-                        "transaction_id": "tx-bash",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    work_attribution: None,
-                    admitted_skill_names: None,
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tx-bash-2".to_string(),
-                    read_only_execution: false,
-                    execution_timeout_ms: 300_000,
-                    command_timeout_cap_ms: Some(300_000),
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({
-                        "command": "mkdir unsafe-dir",
-                        "transaction_id": "tx-bash",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "failed");
-        assert!(
-            results[1]
-                .output
-                .contains("non-read-only bash commands do not participate"),
-            "{}",
-            results[1].output
-        );
-        let fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("transaction fields");
-        assert_eq!(fields["transaction_id"].as_str(), Some("tx-bash"));
-        assert_eq!(fields["transaction_state"].as_str(), Some("rolled_back"));
-        assert!(
-            !temp.path().join("txn.txt").exists(),
-            "prior bounded state should be rolled back"
-        );
-        assert!(
-            !temp.path().join("unsafe-dir").exists(),
-            "mutating bash should be blocked before execution"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_allows_read_only_bash() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(14, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![ToolBatchRequest {
-                work_attribution: None,
-                admitted_skill_names: None,
-                session_id: "test-session".to_string(),
-                run_id: "test-run".to_string(),
-                turn_chain_id: "test-chain".to_string(),
-                request_id: "tx-bash-ro".to_string(),
-                read_only_execution: false,
-                execution_timeout_ms: 300_000,
-                command_timeout_cap_ms: Some(300_000),
-                execution_deadline_unix_ms: 4_102_444_800_000,
-                tool: "bash".to_string(),
-                args: serde_json::json!({
-                    "command": "pwd",
-                    "transaction_id": "tx-bash-ro",
-                    "rollback_on_failure": true,
-                }),
-            }])
-            .await;
-
-        assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "failed");
-        assert!(
-            results[0]
-                .output
-                .contains(temp.path().to_string_lossy().as_ref()),
-            "{}",
-            results[0].output
-        );
     }
 
     // ── sync_incremental_accum / sync_incremental_tool_result ──────────

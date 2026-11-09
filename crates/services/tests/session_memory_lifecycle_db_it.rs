@@ -48,6 +48,100 @@ async fn persisted_work(pool: &SharedPool, user: &str, session: &str) -> serde_j
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn deleting_session_respects_actual_plan_holder_and_owner() {
+    let (pool, settings, user, session) = setup().await;
+    let other_session = format!("other-{}", uuid::Uuid::new_v4().simple());
+    let foreign_user = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, active_plan_id) VALUES (?, ?, 'active', 'held-elsewhere')")
+        .bind(&user).bind(&other_session).execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE agent_sessions SET active_plan_id = 'owned-active' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    for (owner, id, hint) in [
+        (&user, "held-elsewhere", Some(session.as_str())),
+        (&user, "owned-active", None),
+        (&user, "unbound-hint", Some(session.as_str())),
+        (&foreign_user, "unbound-hint", Some(session.as_str())),
+    ] {
+        sqlx::query("INSERT INTO plans (user_id, plan_id, session_id, goal, phase, plan_json) VALUES (?, ?, ?, 'goal', 'planning', '{}')")
+            .bind(owner).bind(id).bind(hint).execute(pool.get()).await.unwrap();
+    }
+    DatabaseSessionService::new(settings)
+        .with_pool(pool.clone())
+        .delete_session(session.clone(), user.clone())
+        .await
+        .unwrap();
+
+    let remaining: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT plan_id, session_id FROM plans WHERE user_id = ? ORDER BY plan_id")
+            .bind(&user)
+            .fetch_all(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        vec![("held-elsewhere".into(), Some(other_session.clone()))]
+    );
+    let binding: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&other_session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(binding.as_deref(), Some("held-elsewhere"));
+    let foreign: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plans WHERE user_id = ? AND plan_id = 'unbound-hint'",
+    )
+    .bind(&foreign_user)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(foreign, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn deleting_session_rolls_back_when_plan_has_multiple_holders() {
+    let (pool, settings, user, session) = setup().await;
+    let other_session = format!("other-{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, active_plan_id) VALUES (?, ?, 'active', 'shared')")
+        .bind(&user).bind(&other_session).execute(pool.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_sessions SET active_plan_id = 'shared' WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&session)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO plans (user_id, plan_id, session_id, goal, phase, plan_json) VALUES (?, 'shared', ?, 'goal', 'planning', '{}')")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    assert!(
+        DatabaseSessionService::new(settings)
+            .with_pool(pool.clone())
+            .delete_session(session.clone(), user.clone())
+            .await
+            .is_err()
+    );
+    let plans: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE user_id = ? AND plan_id = 'shared'")
+            .bind(&user)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    let sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND active_plan_id = 'shared'",
+    )
+    .bind(&user)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!((plans, sessions), (1, 2));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn continuation_activation_avoids_active_writes_and_respects_lifecycle() {
     let (pool, settings, user, session) = setup().await;
     let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());

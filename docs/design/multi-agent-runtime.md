@@ -86,7 +86,7 @@ these process-local deadline decisions.
 ## Agent profile
 
 Ordinary `agent.agent_type` and fanout slot/default `agent_type` select a builtin
-persona; omission uses the bounded read-only default. The shared child admission
+persona; omission inherits the parent-authorized capabilities. The shared child admission
 owns model authorization, inherited permissions, lineage, recursion and capacity
 before any child starts. Fork children retain their protected prohibition on
 further delegation across recovery, independently of prefix availability.

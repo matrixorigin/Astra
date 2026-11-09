@@ -319,6 +319,9 @@ impl EdgeBoundExecutionPlan {
             execution_deadline_unix_ms: self.execution_deadline_unix_ms,
             execution_timeout_ms: self.execution_timeout_ms(),
             command_timeout_cap_ms: self.command_timeout_cap_ms,
+
+            traceparent: None,
+            tracestate: None,
         }
     }
 

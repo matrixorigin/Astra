@@ -20,6 +20,10 @@ pub trait RowExt {
         Err(sqlx::Error::ColumnNotFound(column.to_string()))
     }
 
+    fn json_column(&self, column: &str) -> Result<serde_json::Value, sqlx::Error> {
+        Err(sqlx::Error::ColumnNotFound(column.to_string()))
+    }
+
     fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
         Err(sqlx::Error::ColumnNotFound(column.to_string()))
     }
@@ -169,6 +173,11 @@ impl<'a, R: RowExt + ?Sized> RowDecoder<'a, R> {
 impl RowExt for sqlx::mysql::MySqlRow {
     fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
         self.try_get::<String, _>(column)
+    }
+
+    fn json_column(&self, column: &str) -> Result<serde_json::Value, sqlx::Error> {
+        self.try_get::<sqlx::types::Json<serde_json::Value>, _>(column)
+            .map(|value| value.0)
     }
 
     fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {

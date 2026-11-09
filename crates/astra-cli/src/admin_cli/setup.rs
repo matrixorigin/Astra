@@ -235,7 +235,10 @@ async fn active_model_names(api: &ThinClient, token: &str) -> Result<Vec<String>
     Ok(names)
 }
 
-fn validate_model_probe_response(name: &str, body: &str) -> Result<(), String> {
+pub(super) fn validate_model_probe_response(
+    name: &str,
+    body: &str,
+) -> Result<serde_json::Value, String> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|error| format!("model check returned invalid JSON: {error}"))?;
     let active = value
@@ -243,7 +246,7 @@ fn validate_model_probe_response(name: &str, body: &str) -> Result<(), String> {
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "model check response did not include boolean is_active".to_string())?;
     if active {
-        return Ok(());
+        return Ok(value);
     }
     let connectivity = value
         .get("connectivity")

@@ -696,6 +696,7 @@ pub fn admitted_execution(
     let offering = astra_services::ResolvedModelOffering {
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,

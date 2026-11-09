@@ -2428,6 +2428,7 @@ mod tests {
             run_id: "run-1".into(),
             status: STATUS_CANCELLED.into(),
             execution_settled: true,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -2442,6 +2443,7 @@ mod tests {
             run_id: "run-1".into(),
             status: STATUS_COMPLETED.into(),
             execution_settled: true,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -2464,6 +2466,7 @@ mod tests {
             run_id: "run-1".into(),
             status: "cancellation_requested".into(),
             execution_settled: false,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {

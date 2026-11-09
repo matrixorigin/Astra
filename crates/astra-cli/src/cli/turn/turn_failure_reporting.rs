@@ -10,11 +10,26 @@ use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
 
 pub(crate) fn turn_failure_diagnostic(failure: &crate::TurnFailure) -> String {
-    match failure.partial.error_code.as_deref() {
+    let mut message = match failure.partial.error_code.as_deref() {
         Some(code) if failure.partial.server_admission_not_dispatched => {
             format!("[{code}] {}", failure.error)
         }
         _ => failure.error.clone(),
+    };
+    append_cancelled_context_notice(&mut message, failure.partial.cancel_context_not_saved);
+    message
+}
+
+pub(crate) fn append_cancelled_context_notice(
+    message: &mut String,
+    observation: Option<Option<bool>>,
+) {
+    if let Some(observation) = observation
+        && let Some(notice) = super::turn_cancellation::cancelled_context_notice(observation)
+        && !message.contains(notice)
+    {
+        message.push_str("; ");
+        message.push_str(notice);
     }
 }
 
@@ -155,6 +170,11 @@ pub(crate) fn report_turn_failure(
             crate::cli::theme::icon_err(),
             failure.error
         ));
+    }
+    if let Some(observation) = failure.partial.cancel_context_not_saved
+        && let Some(notice) = super::turn_cancellation::cancelled_context_notice(observation)
+    {
+        ui.show_warning(notice);
     }
 
     // A failed turn can still be a real, resumable session. Publish the

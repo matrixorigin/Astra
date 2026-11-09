@@ -136,7 +136,7 @@ pub fn build_recovery_message_with_evidence(
         || evidence.is_some_and(|e| e.cause == astra_core::ToolFailureCause::OutcomeUnknown)
     {
         return format!(
-            "⚠ {tool_name} may have applied the operation, but its acknowledgement was lost. First reconcile the provider's state or invocation receipt. Do NOT retry this operation, change its arguments, or switch tools to repeat its effect while the outcome is unknown. If reconciliation is unavailable, report the uncertainty and ask for an explicit decision."
+            "⚠ {tool_name} did not return a confirmed result. Do not use the missing result as evidence. A fresh read or a different observation can supply the needed information. Before repeating any state-changing effect, reconcile the provider state or invocation receipt; report any uncertainty you cannot resolve."
         );
     }
     if let Some(evidence) = evidence {
@@ -152,12 +152,12 @@ pub fn build_recovery_message_with_evidence(
         match evidence.cause {
             astra_core::ToolFailureCause::InvalidArguments => {
                 return format!(
-                    "⚠ {tool_name} rejected the structured arguments. Correct the named fields and make one new call; do not repeat the identical request."
+                    "⚠ {tool_name} could not use the supplied arguments or target. Inspect the source error, correct the target or named fields, and make one new call; do not repeat the identical request."
                 );
             }
             astra_core::ToolFailureCause::PermissionBoundary => {
                 return format!(
-                    "⚠ {tool_name} was denied by the active permission policy. Do NOT retry the identical call; remove the restricted effect or use a capability that is explicitly available."
+                    "⚠ {tool_name} could not access the target under the current permissions. Inspect the source error and use an authorized target or capability; do not repeat the identical call."
                 );
             }
             astra_core::ToolFailureCause::CapabilityUnavailable => {
@@ -813,8 +813,8 @@ mod tests {
                 &[],
                 evidence,
             );
-            assert!(message.contains("First reconcile the provider's state"));
-            assert!(message.contains("Do NOT retry this operation"));
+            assert!(message.contains("Before repeating any state-changing effect"));
+            assert!(message.contains("reconcile the provider state or invocation receipt"));
             assert!(!message.contains("retry only with corrected arguments"));
             assert!(!message.contains("capability-equivalent tool"));
         }

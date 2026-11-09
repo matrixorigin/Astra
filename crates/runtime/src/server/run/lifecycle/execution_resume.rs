@@ -3,6 +3,8 @@
 use super::*;
 use astra_services::SessionContextCoordinator;
 
+const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
+
 fn invalid_resume(detail: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     invalid_resume_with_message(
         detail,
@@ -277,6 +279,7 @@ impl AgenticRunLifecycleService {
             authority: proof.receipt().authority.clone(),
             opening_hash: proof.run().opening_hash.clone(),
             prior_messages: Vec::new(),
+            authorized_session_ids: None,
             had_canonical_head: proof.receipt().authority.base_head.is_some(),
             _weighted_permit: weighted,
         };
@@ -309,12 +312,13 @@ impl AgenticRunLifecycleService {
                 token.clone(),
             );
             if let Some(head) = canonical.authority.base_head.as_ref() {
-                canonical.prior_messages = canonical
+                let materialized = canonical
                     .coordinator
                     .materialize(head)
                     .await
-                    .map_err(|error| invalid_resume(error.to_string()))?
-                    .messages;
+                    .map_err(|error| invalid_resume(error.to_string()))?;
+                canonical.prior_messages = materialized.messages;
+                canonical.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
             self.prepare_resumed_execution(
                 &proof,
@@ -580,6 +584,9 @@ impl AgenticRunLifecycleService {
             &facts.hooks,
         );
         let mut state = Self::assemble_loop_state(environment, facts);
+        if let Some(origins) = canonical.authorized_session_ids.as_ref() {
+            host.set_private_reasoning_origins(origins.clone());
+        }
         state.skills.client_pipeline_skills = handoff.client_pipeline_skills.clone();
         bind_execution_owner_generation(&mut state, run.run_generation);
         if let Some(cursor) = canonical
@@ -593,10 +600,22 @@ impl AgenticRunLifecycleService {
                 &cursor.canonical_root_hash,
                 cursor.compaction_generation,
             );
+        } else if canonical.prior_messages.is_empty() {
+            state.initialize_canonical_rewrite_proof(
+                &canonical.prior_messages,
+                &astra_turn_types::canonical_conversation_root(&canonical.prior_messages),
+                0,
+            );
         }
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
+        if proof.prior_unresolved_tool_calls() {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                PREVIOUS_TOOL_ADVISORY.to_owned(),
+            );
+        }
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
@@ -754,6 +773,7 @@ impl AgenticRunLifecycleService {
             state.session_turn,
             token.clone(),
             interactive,
+            interaction_mode,
             None,
         )
         .await;

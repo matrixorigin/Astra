@@ -4,7 +4,11 @@ use serde_json::{Value, json};
 use super::ToolExecutor;
 
 impl ToolExecutor {
-    pub(super) fn adjust_config(&self, args: &Value) -> String {
+    pub(super) fn adjust_config(
+        &self,
+        args: &Value,
+        fields: &mut Option<serde_json::Map<String, Value>>,
+    ) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => p.trim(),
             _ => return json!({"error": "Missing required parameter: path"}).to_string(),
@@ -80,6 +84,10 @@ impl ToolExecutor {
                                 unknown,
                             ),
                         ) => {
+                            let fields = fields.get_or_insert_with(Default::default);
+                            fields.insert("execution_fact".into(), json!("unknown"));
+                            fields.insert("side_effects_maybe".into(), json!(true));
+                            fields.insert("retryable".into(), json!(false));
                             let projection_warning = match unknown.observed_config {
                                 Some(config) => match obs.write() {
                                     Ok(mut session) => {

@@ -336,6 +336,8 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
     advertisement["protocol_capabilities"]
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
+    advertisement["protocol_capabilities"]
+        [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY] = Value::Bool(true);
     advertisement
 }
 
@@ -883,6 +885,10 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
                     self.0.as_ref(),
                     &invocation.args,
                     authorization,
+                    &runtime_process_authorization::CommandTraceContext {
+                        traceparent: invocation.traceparent.clone(),
+                        tracestate: invocation.tracestate.clone(),
+                    },
                     &cancel,
                 )
                 .await
@@ -1094,6 +1100,9 @@ mod tests {
                 execution_timeout_ms: Some(86_400_000),
                 command_timeout_cap_ms: None,
                 execution_ceiling: None,
+
+                traceparent: None,
+                tracestate: None,
             };
             let mut original = None;
             for _ in 0..2 {
@@ -1212,6 +1221,8 @@ mod tests {
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     execution_ceiling: None,
+                    traceparent: None,
+                    tracestate: None,
                 };
                 ws.send(Message::Text(
                     serde_json::to_string(&request).unwrap().into(),
@@ -1252,6 +1263,9 @@ mod tests {
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     execution_ceiling: None,
+
+                    traceparent: None,
+                    tracestate: None,
                 })
                 .unwrap()
                 .into(),
@@ -1542,6 +1556,11 @@ mod tests {
         assert_eq!(
             value["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY],
             true
         );
         assert!(

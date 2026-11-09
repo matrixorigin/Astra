@@ -94,7 +94,7 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
     /// Per-channel freshness of runtime-injected prompt signals
-    /// (recent_failing_tests, outcome_bias, volatile_pending).
+    /// (outcome_bias, volatile_pending).
     /// Populated by the agentic loop from `AgenticLoopState.injection_history`
     /// at the start of each round. Feeds `facet=noise`. Empty when
     /// the runtime has not yet observed any round.
@@ -112,6 +112,13 @@ pub struct IntrospectSnapshot {
     /// Bridge circuit breaker state — surfaced in stall/full renders.
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerSnapshot>,
+
+    /// Runtime reasoning policy passed to provider request construction.
+    /// `ModelDefault` inherits admitted model/provider settings, including
+    /// request body overrides. Provider-internal effort and clamping are not
+    /// observable here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::thinking_config::ThinkingConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1064,6 +1071,23 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
     out
 }
 
+/// Render the configured runtime policy, without inferring provider-internal
+/// effort. `None` means no configuration was recorded.
+fn render_thinking(config: Option<&crate::thinking_config::ThinkingConfig>) -> Option<String> {
+    use crate::thinking_config::ThinkingConfig;
+
+    let value = match config? {
+        ThinkingConfig::ModelDefault => {
+            "model default (inherits model/provider settings)".to_string()
+        }
+        ThinkingConfig::Off => "off".to_string(),
+        ThinkingConfig::On {} => "on (binary switch)".to_string(),
+        ThinkingConfig::Enabled { budget_tokens } => format!("enabled budget={budget_tokens}"),
+        ThinkingConfig::Adaptive { effort } => format!("adaptive effort={effort}"),
+    };
+    Some(format!("Thinking: {value}"))
+}
+
 fn render_summary(s: &IntrospectSnapshot) -> String {
     let mut out = String::new();
     let Some(frame) = s.runtime_feedback.as_ref() else {
@@ -1148,6 +1172,10 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     out.push_str("Current model: ");
     out.push_str(&frame.identity.model_id);
     out.push('\n');
+    if let Some(thinking) = render_thinking(s.thinking.as_ref()) {
+        out.push_str(&thinking);
+        out.push('\n');
+    }
     out.push_str("Execution topology: ");
     out.push_str(frame.identity.topology.as_str());
     out.push('\n');
@@ -2398,6 +2426,51 @@ mod tests {
             current_round: 0,
             tool_errors: Vec::new(),
             circuit_breaker: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn thinking_policy_reaches_text_json_and_bounded_model_projection() {
+        use crate::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        for (thinking, expected_text) in [
+            (
+                Some(ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                }),
+                Some("Thinking: adaptive effort=high"),
+            ),
+            (
+                Some(ThinkingConfig::ModelDefault),
+                Some("Thinking: model default (inherits model/provider settings)"),
+            ),
+            (None, None),
+        ] {
+            let snapshot = IntrospectSnapshot {
+                thinking: thinking.clone(),
+                ..sample_snapshot()
+            };
+            let request = IntrospectRequest::default();
+            let text = render_introspect_request(&snapshot, &request);
+            if let Some(expected_text) = expected_text {
+                assert!(text.contains(expected_text), "{text}");
+            } else {
+                assert!(!text.contains("Thinking:"), "{text}");
+            }
+            let json_request = IntrospectRequest {
+                format: IntrospectFormat::Json,
+                ..request
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&render_introspect_request(&snapshot, &json_request)).unwrap();
+            let expected = thinking.as_ref().map(|config| serde_json::json!(config));
+            assert_eq!(json.get("thinking"), expected.as_ref());
+            let report = build_introspect_report(&snapshot, &json_request);
+            let projected = report
+                .model_projection(crate::tool::result::sanitize::INTROSPECT_MODEL_RESULT_CHARS);
+            let projected: serde_json::Value = serde_json::from_str(&projected).unwrap();
+            assert_eq!(projected.get("thinking"), expected.as_ref());
         }
     }
 
@@ -2443,11 +2516,11 @@ mod tests {
                 expected_result: "One verified fact".to_string(),
             },
             entries: vec![RuntimePolicyFeedbackEntry {
-                signal: RuntimePolicySignal::ReadCoverageOverlap,
+                signal: RuntimePolicySignal::SearchFanout,
                 stage: RuntimePolicyStage::Converge,
                 observed_at_round: 8,
                 evidence_count: 9,
-                recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+                recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
             }],
         };
 
@@ -2460,7 +2533,7 @@ mod tests {
             assert!(output.contains("server_only"), "{depth:?}: {output}");
             assert!(output.contains("work_item=item-2@3"), "{depth:?}: {output}");
             assert!(
-                output.contains("ReadCoverageOverlap/Converge"),
+                output.contains("SearchFanout/Converge"),
                 "{depth:?}: {output}"
             );
         }
@@ -3235,7 +3308,7 @@ mod tests {
             current_round: 58,
             injection_freshness: vec![
                 ChannelFreshness {
-                    channel: InjectionChannel::RecentFailingTests,
+                    channel: InjectionChannel::SkillListing,
                     status: ChannelStatus::Stale { rounds_alive: 58 },
                     preview: "could not find Cargo.toml in /home/.../astra".into(),
                     first_seen_round: Some(0),
@@ -3266,7 +3339,7 @@ mod tests {
         let out = render_injection_freshness(&snap);
         assert!(out.contains("## Injection Freshness (round 58)"), "{out}");
         assert!(
-            out.contains("recent_failing_tests") && out.contains("⚠ STALE"),
+            out.contains("skill_listing") && out.contains("⚠ STALE"),
             "stale channel must be flagged: {out}"
         );
         assert!(

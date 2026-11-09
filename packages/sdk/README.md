@@ -291,6 +291,17 @@ being flattened into prompt text. `workspaceBinding` uses the canonical request
 shape (`kind` plus optional `display_name`, `root`, `source`, and `authority`);
 the workspace object observed in runtime events is a separate response shape.
 
+`cancelRun(runId)` returns the acknowledged Run's `runId`, `status`,
+`executionSettled` and optional `contextNotSaved`. A successful command with an
+invalid or missing receipt returns `null`; it must not be treated as a rejected
+cancellation. An unsettled acknowledgement does not confirm Context saving.
+The matching `run_finished.context_not_saved` field is `true` for lost Context,
+`false` for saved/unchanged Context, and absent when unconfirmed. The chat hook
+exposes this as `ChatMessage.contextNotSaved` (`null` means unconfirmed), and
+`contextSaveWarning` provides the shared display text without changing the
+assistant's content. Cold conversation items carry the same receipt projection;
+a `cancellation` item represents a stopped Run without a visible assistant.
+
 ## §5.5 Edge protocol (from TypeScript)
 
 When a **local edge** runs tools, use the same routes as `astra-thin-client`:

@@ -200,6 +200,24 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onStreamGap).toHaveBeenCalledWith(expect.objectContaining({ nextEventIndex: 8 }));
   });
 
+  it.each([true, false, undefined])('projects cancellation Context evidence without losing partial text (%s)', async observation => {
+    const onWarning = vi.fn();
+    const onRunFinished = vi.fn();
+    const onCancelled = vi.fn();
+    const events = [
+      { type: 'session_info', run_id: 'root' },
+      { type: 'text_delta', content: 'partial answer' },
+      { type: 'run_finished', run_id: 'child', status: 'cancelled', context_not_saved: true },
+      { type: 'run_finished', run_id: 'root', status: 'cancelled', context_not_saved: observation },
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)) });
+    await streamChatMessage('chat', defaultPayload, { onWarning, onRunFinished, onCancelled });
+    expect(onCancelled).toHaveBeenCalledExactlyOnceWith('partial answer');
+    expect(onRunFinished).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: 'root', contextNotSaved: observation ?? null }));
+    expect(onWarning).toHaveBeenCalledTimes(observation === false ? 0 : 1);
+    if (observation !== false) expect(onWarning.mock.calls[0][0]).toContain(observation ? 'not saved' : 'could not be confirmed');
+  });
+
   it('does not replay hook warnings as new notifications', async () => {
     const onWarning = vi.fn();
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([

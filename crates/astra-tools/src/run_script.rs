@@ -21,8 +21,8 @@
 //! - `PATH` is a minimal trusted string in [`ExecutionMode::Strict`] and
 //!   passed through in [`ExecutionMode::Project`] (project tooling often
 //!   depends on the developer's PATH).
-//! - `setsid`'d child so SIGKILL on timeout / call-limit terminates the
-//!   entire process group (no orphan grandchildren).
+//! - A separate process group allows best-effort cleanup on timeout or
+//!   cancellation. Descendants can escape it by creating another session.
 //! - RPC response size is capped server-side — an unbounded tool result
 //!   can't OOM the script child.
 //! - UTF-8-safe stdout truncation (head + tail).
@@ -30,9 +30,8 @@
 //!   when the host supports it. [`RunScriptConfig::strict_defaults`]
 //!   enables 512 MiB memory + 1 CPU core by default; runaway scripts get
 //!   a SIGKILL from the kernel OOM killer before they exhaust the host.
-//!   If no invocation-owned process scope can be established, dispatch is
-//!   refused before the child starts; this prevents an unowned descendant
-//!   from changing the bound workspace after the tool result is published.
+//!   An available process scope and any requested limits are required before
+//!   the child starts.
 //!
 //! **Not enforced here**: filesystem scope beyond HOME, network access,
 //! syscall filtering, PID/mount/network namespaces. The Python script
@@ -46,7 +45,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -116,9 +115,47 @@ pub const STDERR_CAP_BYTES: usize = 10_000;
 
 /// A descendant that keeps an inherited stdout/stderr pipe open must not be
 /// able to hold the workspace writer forever. Once this bound expires the
-/// invocation is treated as unsettled and the workspace observer remains
-/// quarantined.
+/// output is reported as incomplete.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const RPC_SETTLEMENT_GRACE: Duration = Duration::from_secs(1);
+
+// Dropping a callback also requests cancellation of its work.
+struct PendingScriptRpc {
+    cancel: CancellationToken,
+    settled: bool,
+}
+
+impl Drop for PendingScriptRpc {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cancel.cancel();
+        }
+    }
+}
+
+// The process owner must settle before its caller releases the workspace
+// lease, including when the entire future is dropped between RPCs.
+struct ScriptScope {
+    cgroup: astra_sandbox::CgroupGuard,
+    leader_pid: Option<u32>,
+    settled: bool,
+}
+
+impl ScriptScope {
+    fn settle(&mut self) -> bool {
+        let settled = self.cgroup.terminate_all_for(self.leader_pid);
+        self.settled = true;
+        settled
+    }
+}
+
+impl Drop for ScriptScope {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle();
+        }
+    }
+}
 
 // Note: we don't need a secret-substring env filter because we `env_clear()`
 // the child and only set a fixed, hand-curated allowlist (see
@@ -153,9 +190,7 @@ pub struct RunScriptConfig {
     /// is true (secure-by-default). Disable only when you *need* the real
     /// HOME available and accept the script can read `~/.ssh/*`, etc.
     pub isolate_home: bool,
-    /// cgroup v2 memory ceiling for the script process (bytes). Zero
-    /// means no resource limit, but an invocation-owned process scope is
-    /// still required before dispatch.
+    /// cgroup v2 memory ceiling for the script process (bytes). Zero means no resource limit.
     ///
     /// A runaway `run_script` could allocate until the host OOMs
     /// (especially Project mode, which inherits the user's env). Setting
@@ -186,10 +221,15 @@ impl Default for RunScriptConfig {
 }
 
 impl RunScriptConfig {
-    /// Build an `RpcPolicy` that mirrors this config's policy-relevant fields.
-    fn rpc_policy(&self) -> RpcPolicy {
+    /// Build the RPC policy within the canonical script tool surface.
+    pub(crate) fn rpc_policy(&self) -> RpcPolicy {
         RpcPolicy {
-            allowed_tools: self.allowed_tools.clone(),
+            allowed_tools: self
+                .allowed_tools
+                .iter()
+                .filter(|tool| RPC_ALLOWED_TOOLS.contains(&tool.as_str()))
+                .cloned()
+                .collect(),
             max_tool_calls: self.max_tool_calls,
             max_response_bytes: self.max_response_bytes,
         }
@@ -233,11 +273,23 @@ const ERROR_STREAM_PREVIEW_BYTES: usize = 1_000;
 
 #[derive(Debug, Error)]
 pub enum RunScriptError {
-    #[error("Script timed out after {0:?}")]
-    Timeout(Duration),
+    #[error(
+        "Script timed out after {duration:?}:\nstderr: {}\nstdout: {}",
+        preview_stream(stderr),
+        preview_stream(stdout)
+    )]
+    Timeout {
+        duration: Duration,
+        stdout: String,
+        stderr: String,
+    },
 
-    #[error("Script cancelled")]
-    Cancelled,
+    #[error(
+        "Script cancelled:\nstderr: {}\nstdout: {}",
+        preview_stream(stderr),
+        preview_stream(stdout)
+    )]
+    Cancelled { stdout: String, stderr: String },
 
     #[error("Script exceeded maximum tool call limit ({0})")]
     TooManyToolCalls(usize),
@@ -270,20 +322,28 @@ pub enum RunScriptError {
     #[error("task-join error: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
 
-    /// The host could not provide an invocation-owned process scope. Running
-    /// a Python script in that state would let a daemonized child outlive the
-    /// workspace writer epoch, so dispatch is rejected before spawn.
-    #[error("run_script requires an invocation-owned process scope; no process was started")]
+    /// The required process scope or resource limits were unavailable.
+    #[error("run_script requires an available process scope; no process was started")]
     OwnershipUnavailable,
 
-    /// The invocation was started but its process scope could not be proven
-    /// empty at termination. The workspace is quarantined and the result is
-    /// never presented as a successful script completion.
-    #[error("run_script process ownership did not settle; workspace state is unverified")]
-    OwnershipUnsettled,
+    /// Execution started but the process result or cleanup could not be confirmed.
+    #[error(
+        "run_script outcome could not be confirmed: {reason}\nstderr: {}\nstdout: {}",
+        preview_stream(stderr),
+        preview_stream(stdout)
+    )]
+    OutcomeUnknown {
+        reason: String,
+        stdout: String,
+        stderr: String,
+    },
 
-    #[error("run_script output pipes did not settle within {0:?}")]
-    OutputDrainTimeout(Duration),
+    #[error(
+        "run_script output pipes did not settle:\nstderr: {}\nstdout: {}",
+        preview_stream(stderr),
+        preview_stream(stdout)
+    )]
+    OutputDrainTimeout { stdout: String, stderr: String },
 }
 
 /// Build a bounded preview of a stream for error `Display`. Uses the
@@ -471,13 +531,15 @@ def shell_quote(s):
 
 
 def retry(fn, max_attempts=3, delay=2):
-    """Retry a function up to max_attempts times with exponential backoff."""
+    """Retry with exponential backoff, unless a tool says retry is unsafe."""
     import time as _time
     last_err = None
     for attempt in range(max_attempts):
         try:
             return fn()
         except Exception as e:
+            if getattr(e, "retryable", True) is False:
+                raise
             last_err = e
             if attempt < max_attempts - 1:
                 _time.sleep(delay * (2 ** attempt))
@@ -500,6 +562,12 @@ import os
 _SOCKET_PATH = os.environ["ASTRA_RPC_SOCKET"]
 _AUTH_TOKEN = os.environ["ASTRA_RPC_AUTH_TOKEN"]
 
+class ToolCallError(RuntimeError):
+    def __init__(self, message, retryable=True, outcome_unknown=False):
+        super().__init__(message)
+        self.retryable = retryable
+        self.outcome_unknown = outcome_unknown
+
 
 def _call(tool_name, args):
     """Send an RPC request to the agent and return plain text output.
@@ -516,9 +584,11 @@ def _call(tool_name, args):
         "auth_token": _AUTH_TOKEN,
     })
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dispatched = False
     try:
         sock.connect(_SOCKET_PATH)
         sock.settimeout(300)
+        dispatched = True  # A failed send can still have delivered the request.
         sock.sendall((request + "\n").encode())
         sock.shutdown(socket.SHUT_WR)
         buf = b""
@@ -527,12 +597,17 @@ def _call(tool_name, args):
             if not chunk:
                 break
             buf += chunk
+        result = json.loads(buf.decode().strip())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        if dispatched:
+            raise ToolCallError("Tool response was lost; its effects may have occurred: " + str(e),
+                                retryable=False, outcome_unknown=True) from e
+        raise
     finally:
         sock.close()
-    raw = buf.decode().strip()
-    result = json.loads(raw)
     if result.get("error"):
-        raise RuntimeError(result["error"])
+        raise ToolCallError(result["error"], result.get("retryable", True),
+                            result.get("outcome_unknown", False))
     output = result.get("output")
     return "" if output is None else str(output)
 
@@ -851,7 +926,7 @@ async fn run_script(
     tool_executor: &dyn ToolExecutor,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<String, RunScriptError> {
-    let workspace_root = tool_executor.workspace_root().to_path_buf();
+    let policy = config.rpc_policy();
     let tmp_dir = tempfile::tempdir().map_err(|e| io_context("run_script tmpdir", e))?;
     let tmp_path = tmp_dir.path().to_path_buf();
 
@@ -872,7 +947,7 @@ async fn run_script(
 
     let auth_token = AuthToken::generate();
 
-    std::fs::write(&stub_path, generate_python_stub(&config.allowed_tools))
+    std::fs::write(&stub_path, generate_python_stub(&policy.allowed_tools))
         .map_err(|e| io_context("run_script write astra_tools.py", e))?;
     std::fs::write(&script_path, script)
         .map_err(|e| io_context("run_script write script.py", e))?;
@@ -915,16 +990,12 @@ async fn run_script(
     // scope. A single cgroup is intentional: a process can only belong to one
     // cgroup in this hierarchy, and combining separate resource/ownership
     // guards would silently leave one of them unenforced. Hosts without cgroup
-    // write access fall back to the private process group established below.
+    // write access retain the existing pre-dispatch refusal.
     let cgroup_guard = if config.memory_limit_bytes > 0 || config.cpu_quota > 0.0 {
         astra_sandbox::apply_cgroup(config.memory_limit_bytes, config.cpu_quota)
     } else {
         astra_sandbox::apply_process_scope()
     };
-    // A process-group fallback is useful cleanup, but it cannot own a child
-    // that creates a new session.  Refuse to dispatch before spawn when no
-    // delegated scope is available; otherwise a late write could be
-    // attributed to a later Bash window. Ordinary Bash remains available.
     if !cgroup_guard.ownership_guaranteed() {
         return Err(RunScriptError::OwnershipUnavailable);
     }
@@ -933,111 +1004,152 @@ async fn run_script(
     let mut child = cmd
         .spawn()
         .map_err(|e| io_context("run_script spawn python", e))?;
-    // Keep the leader PID after `Child::wait` reaps it. The process group is
-    // still the only available ownership boundary on hosts where cgroup
-    // creation is unavailable, and descendants must be terminated before the
-    // workspace writer epoch is released.
+    // Retain the leader PID for best-effort process-group cleanup as well.
     let leader_pid = child.id();
+    let mut scope = ScriptScope {
+        cgroup: cgroup_guard,
+        leader_pid,
+        settled: false,
+    };
 
     // Post-spawn: join child to cgroup by writing its real PID.
     if let Some(pid) = child.id()
-        && let Err(e) = cgroup_guard.join_child(pid)
+        && let Err(e) = scope.cgroup.join_child(pid)
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        scope.settle();
         return Err(io_context("cgroup join_child", e).into());
     }
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         kill_process_group(&child);
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
-        return Err(RunScriptError::Cancelled);
+        scope.settle();
+        return Err(RunScriptError::Cancelled {
+            stdout: String::new(),
+            stderr: String::new(),
+        });
     }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;
-    let mut stdout_handle =
-        tokio::spawn(async move { collect_stdout_head_tail(stdout, max_stdout).await });
+    let stop_output = CancellationToken::new();
+    let interrupted_output = Arc::new(AtomicBool::new(false));
+    let stdout_stop = stop_output.clone();
+    let stdout_interrupted = interrupted_output.clone();
+    let mut stdout_handle = tokio::spawn(async move {
+        collect_stdout_head_tail(stdout, max_stdout, stdout_stop, stdout_interrupted).await
+    });
 
     let stderr = child.stderr.take().expect("stderr piped");
-    let mut stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
+    let stderr_stop = stop_output.clone();
+    let stderr_interrupted = interrupted_output.clone();
+    let mut stderr_handle = tokio::spawn(async move {
+        collect_stderr_with_notice(stderr, stderr_stop, stderr_interrupted).await
+    });
 
-    let policy = config.rpc_policy();
-    let timeout_result = tokio::time::timeout(config.timeout, async {
-        loop {
-            tokio::select! {
-                _ = async {
-                    if let Some(token) = cancel_token {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "run_script cancelled",
-                    ));
-                }
-                accept = listener.accept() => {
-                    match accept {
-                        Ok((stream, _)) => {
-                            let outcome = handle_rpc_connection(
-                                stream,
-                                tool_executor,
-                                &call_count,
-                                &policy,
-                                &auth_token,
-                                cancel_token,
-                            )
-                            .await;
-                            if matches!(outcome, RpcOutcome::ExceededCallLimit) {
-                                kill_process_group(&child);
-                                let _ = child.kill().await;
-                                let result = child.wait().await;
-                                let scope_settled = settle_run_script_scope(
-                                    &cgroup_guard,
-                                    leader_pid,
-                                    &workspace_root,
-                                );
-                                return if scope_settled {
-                                    result
-                                } else {
-                                    Err(std::io::Error::other(
-                                        "run_script process ownership did not settle",
-                                    ))
-                                };
+    let deadline = tokio::time::sleep(config.timeout);
+    tokio::pin!(deadline);
+    let mut nested_outcome_unknown = false;
+    let timeout_result = loop {
+        tokio::select! {
+            _ = &mut deadline => break Err(()),
+            _ = async {
+                if let Some(token) = cancel_token { token.cancelled().await; }
+                else { std::future::pending::<()>().await; }
+            } => break Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted, "run_script cancelled",
+            ))),
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => {
+                        let rpc_cancel = cancel_token.map(CancellationToken::child_token)
+                            .unwrap_or_default();
+                        let mut pending = PendingScriptRpc {
+                            cancel: rpc_cancel.clone(),
+                            settled: false,
+                        };
+                        let callback = handle_rpc_connection(
+                            stream, tool_executor, &call_count, &policy, &auth_token,
+                            Some(&rpc_cancel),
+                        );
+                        tokio::pin!(callback);
+                        // A deadline cancels the nested operation first. Wait briefly
+                        // for its existing owner to settle before returning.
+                        let callback_result = tokio::select! {
+                            outcome = &mut callback => Ok(outcome),
+                            _ = &mut deadline => Err(true),
+                            _ = async {
+                                if let Some(token) = cancel_token { token.cancelled().await; }
+                                else { std::future::pending::<()>().await; }
+                            } => Err(false),
+                        };
+                        let outcome = match callback_result {
+                            Ok(outcome) => { pending.settled = true; outcome }
+                            Err(timed_out) => {
+                                rpc_cancel.cancel();
+                                pending.settled = tokio::time::timeout(
+                                    RPC_SETTLEMENT_GRACE, &mut callback,
+                                ).await.is_ok();
+                                if timed_out { break Err(()); }
+                                break Ok(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted, "run_script cancelled",
+                                )));
                             }
-                            if matches!(outcome, RpcOutcome::Cancelled) {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "run_script RPC cancelled",
-                                ));
-                            }
-                            // IoError and Ok both just loop.
+                        };
+                        if matches!(outcome, RpcOutcome::ExceededCallLimit) {
+                            kill_process_group(&child);
+                            let _ = child.kill().await;
+                            break Ok(child.wait().await);
                         }
-                        Err(_) => return child.wait().await,
+                        if matches!(outcome, RpcOutcome::Cancelled) {
+                            break Ok(Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted, "run_script RPC cancelled",
+                            )));
+                        }
+                        nested_outcome_unknown |= matches!(outcome, RpcOutcome::OutcomeUnknown);
                     }
-                }
-                wait_result = child.wait() => {
-                    return wait_result;
+                    Err(error) => break Ok(Err(error)),
                 }
             }
+            wait_result = child.wait() => break Ok(wait_result),
         }
-    })
-    .await;
+    };
 
     match timeout_result {
         Ok(Ok(status)) => {
-            let scope_settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let scope_settled = scope.settle();
             // Await both IO tasks concurrently, but never let an inherited
             // pipe from an escaped descendant hold the writer epoch forever.
-            let (stdout_content, stderr_content) =
-                collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await?;
+            let (stdout_content, stderr_content, incomplete) = collect_run_script_streams(
+                &mut stdout_handle,
+                &mut stderr_handle,
+                &stop_output,
+                &interrupted_output,
+            )
+            .await?;
+            if incomplete {
+                return Err(RunScriptError::OutputDrainTimeout {
+                    stdout: complete_head_lines(&stdout_content).to_string(),
+                    stderr: complete_head_lines(&stderr_content).to_string(),
+                });
+            }
 
             if !scope_settled {
-                return Err(RunScriptError::OwnershipUnsettled);
+                return Err(RunScriptError::OutcomeUnknown {
+                    reason: "the process group did not settle".into(),
+                    stdout: complete_head_lines(&stdout_content).to_string(),
+                    stderr: complete_head_lines(&stderr_content).to_string(),
+                });
+            }
+
+            if nested_outcome_unknown {
+                return Err(RunScriptError::OutcomeUnknown {
+                    reason: "a nested tool call's outcome is unknown; inspect its effects before retrying".into(),
+                    stdout: stdout_content,
+                    stderr: stderr_content,
+                });
             }
 
             if !status.success() {
@@ -1056,48 +1168,64 @@ async fn run_script(
         }
         Ok(Err(e)) => {
             if e.kind() == std::io::ErrorKind::Interrupted {
+                interrupted_output.store(true, Ordering::Release);
+                kill_process_group(&child);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
-                let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-                return Err(RunScriptError::Cancelled);
+                scope.settle();
+                let (stdout, stderr, _) = collect_run_script_streams(
+                    &mut stdout_handle,
+                    &mut stderr_handle,
+                    &stop_output,
+                    &interrupted_output,
+                )
+                .await
+                .unwrap_or_default();
+                return Err(RunScriptError::Cancelled {
+                    stdout: complete_head_lines(&stdout).to_string(),
+                    stderr: complete_head_lines(&stderr).to_string(),
+                });
             }
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
-            let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-            Err(RunScriptError::Io(e))
+            scope.settle();
+            interrupted_output.store(true, Ordering::Release);
+            let (stdout, stderr, _) = collect_run_script_streams(
+                &mut stdout_handle,
+                &mut stderr_handle,
+                &stop_output,
+                &interrupted_output,
+            )
+            .await
+            .unwrap_or_default();
+            Err(RunScriptError::OutcomeUnknown {
+                reason: format!("waiting for the script failed: {e}"),
+                stdout: complete_head_lines(&stdout).to_string(),
+                stderr: complete_head_lines(&stderr).to_string(),
+            })
         }
         Err(_) => {
+            interrupted_output.store(true, Ordering::Release);
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
-            let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-            Err(RunScriptError::Timeout(config.timeout))
+            scope.settle();
+            let (stdout, stderr, _) = collect_run_script_streams(
+                &mut stdout_handle,
+                &mut stderr_handle,
+                &stop_output,
+                &interrupted_output,
+            )
+            .await
+            .unwrap_or_default();
+            Err(RunScriptError::Timeout {
+                duration: config.timeout,
+                stdout: complete_head_lines(&stdout).to_string(),
+                stderr: complete_head_lines(&stderr).to_string(),
+            })
         }
     }
-}
-
-/// Finish an invocation-owned process scope before the workspace writer epoch
-/// can be released. A scope that cannot be proven empty quarantines future
-/// observations rather than allowing a late descendant write to look like a
-/// later Bash mutation.
-fn settle_run_script_scope(
-    cgroup_guard: &astra_sandbox::CgroupGuard,
-    leader_pid: Option<u32>,
-    workspace_root: &Path,
-) -> bool {
-    let settled = cgroup_guard.terminate_all_for(leader_pid);
-    if !settled {
-        let _ = crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        tracing::warn!(
-            workspace = %workspace_root.display(),
-            "run_script process ownership was not provably settled; workspace observation quarantined"
-        );
-    }
-    settled
 }
 
 /// Join stdout/stderr collectors under a hard bound. Borrowing the handles
@@ -1105,17 +1233,52 @@ fn settle_run_script_scope(
 async fn collect_run_script_streams(
     stdout_handle: &mut tokio::task::JoinHandle<String>,
     stderr_handle: &mut tokio::task::JoinHandle<String>,
-) -> Result<(String, String), RunScriptError> {
-    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
-        tokio::try_join!(&mut *stdout_handle, &mut *stderr_handle)
-    })
-    .await
-    {
-        Ok(result) => Ok(result?),
-        Err(_) => {
+    stop_output: &CancellationToken,
+    interrupted_output: &AtomicBool,
+) -> Result<(String, String, bool), RunScriptError> {
+    async fn join_stream(
+        handle: &mut tokio::task::JoinHandle<String>,
+        stop_output: &CancellationToken,
+        incomplete: &AtomicBool,
+        interrupted_output: &AtomicBool,
+    ) -> Result<String, RunScriptError> {
+        match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *handle).await {
+            Ok(result) => Ok(result?),
+            Err(_) => {
+                incomplete.store(true, Ordering::Release);
+                interrupted_output.store(true, Ordering::Release);
+                stop_output.cancel();
+                match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *handle).await {
+                    Ok(result) => Ok(result?),
+                    Err(_) => {
+                        handle.abort();
+                        Ok(String::new())
+                    }
+                }
+            }
+        }
+    }
+    let incomplete = AtomicBool::new(false);
+    let joined = tokio::try_join!(
+        join_stream(
+            &mut *stdout_handle,
+            stop_output,
+            &incomplete,
+            interrupted_output
+        ),
+        join_stream(
+            &mut *stderr_handle,
+            stop_output,
+            &incomplete,
+            interrupted_output
+        ),
+    );
+    match joined {
+        Ok((stdout, stderr)) => Ok((stdout, stderr, incomplete.load(Ordering::Acquire))),
+        Err(error) => {
             stdout_handle.abort();
             stderr_handle.abort();
-            Err(RunScriptError::OutputDrainTimeout(OUTPUT_DRAIN_TIMEOUT))
+            Err(error)
         }
     }
 }
@@ -1226,7 +1389,12 @@ fn safe_stream_capture_limit(max_bytes: usize) -> usize {
         .clamp(256 * 1024, MAX_SAFE_STREAM_CAPTURE_BYTES)
 }
 
-async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes: usize) -> String {
+async fn collect_stdout_head_tail(
+    stdout: tokio::process::ChildStdout,
+    max_bytes: usize,
+    stop: CancellationToken,
+    interrupted: Arc<AtomicBool>,
+) -> String {
     let mut reader = BufReader::new(stdout);
     let capture_limit = safe_stream_capture_limit(max_bytes);
     let head_limit = capture_limit / 2;
@@ -1244,7 +1412,11 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
     let mut pem_scan_overlap = Vec::new();
     let mut chunk = vec![0u8; 4096];
     loop {
-        match reader.read(&mut chunk).await {
+        let read = tokio::select! {
+            result = reader.read(&mut chunk) => result,
+            _ = stop.cancelled() => break,
+        };
+        match read {
             Ok(0) => break,
             Ok(n) => {
                 let chunk_start = total_bytes;
@@ -1364,7 +1536,12 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
     } else {
         let mut full = String::from_utf8_lossy(&head).into_owned();
         full.push_str(&String::from_utf8_lossy(&tail));
-        astra_text_utils::credential_redaction::redact_credentials_for_display(&full)
+        let safe_boundary = if interrupted.load(Ordering::Acquire) {
+            complete_head_lines(&full)
+        } else {
+            &full
+        };
+        astra_text_utils::credential_redaction::redact_credentials_for_display(safe_boundary)
     };
     // Redact before the user-visible head/tail budget is selected.  The
     // complete-line boundary above prevents a cross-cap token from becoming
@@ -1394,14 +1571,22 @@ fn complete_tail_lines(text: &str) -> &str {
 /// Drain stderr, keeping up to `STDERR_CAP_BYTES` and appending a truncation
 /// notice when more was produced. Always fully drains the pipe so the child
 /// never blocks on a full buffer.
-async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> String {
+async fn collect_stderr_with_notice(
+    stderr: tokio::process::ChildStderr,
+    stop: CancellationToken,
+    interrupted: Arc<AtomicBool>,
+) -> String {
     let capture_limit = safe_stream_capture_limit(STDERR_CAP_BYTES);
     let mut buf: Vec<u8> = Vec::with_capacity(capture_limit.min(8192));
     let mut reader = BufReader::new(stderr);
     let mut total = 0usize;
     let mut chunk = vec![0u8; 4096];
     loop {
-        match reader.read(&mut chunk).await {
+        let read = tokio::select! {
+            result = reader.read(&mut chunk) => result,
+            _ = stop.cancelled() => break,
+        };
+        match read {
             Ok(0) => break,
             Ok(n) => {
                 total += n;
@@ -1413,9 +1598,13 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
             Err(_) => break,
         }
     }
-    let (safe, _) = astra_text_utils::credential_redaction::redact_credentials_for_display(
-        &String::from_utf8_lossy(&buf),
-    );
+    let raw = String::from_utf8_lossy(&buf);
+    let raw = if total > capture_limit || interrupted.load(Ordering::Acquire) {
+        complete_head_lines(&raw)
+    } else {
+        &raw
+    };
+    let (safe, _) = astra_text_utils::credential_redaction::redact_credentials_for_display(raw);
     let mut out =
         astra_text_utils::credential_redaction::truncate_redacted_output(safe, STDERR_CAP_BYTES);
     if total > STDERR_CAP_BYTES {
@@ -1463,7 +1652,15 @@ pub async fn handle_run_script(
                 crate::ToolResult::text(output)
             }
         }
-        Err(RunScriptError::Cancelled) => crate::cancelled_tool_result("run_script", true),
+        Err(error @ RunScriptError::Cancelled { .. }) => {
+            let mut result = crate::cancelled_tool_result("run_script", true).with_execution_outcome_unknown();
+            result.output = format!("Error: {error}. The script or a nested tool may have changed state; inspect it before retrying.");
+            result
+        }
+        Err(error @ RunScriptError::Timeout { .. }) => {
+            crate::ToolResult::error(format!("Error: {error}. The script or a nested tool may have changed state; inspect it before retrying."))
+                .with_execution_outcome_unknown()
+        }
         Err(error @ RunScriptError::OwnershipUnavailable) => {
             let mut result = crate::ToolResult::error(format!("Error: {error}"));
             result.metadata = Some(serde_json::Map::from_iter([
@@ -1474,9 +1671,9 @@ pub async fn handle_run_script(
                 ("execution_started".to_string(), Value::Bool(false)),
                 ("retryable".to_string(), Value::Bool(false)),
             ]));
-            result
+            result.with_execution_not_started()
         }
-        Err(error @ RunScriptError::OwnershipUnsettled) => {
+        Err(error @ RunScriptError::OutcomeUnknown { .. }) => {
             let mut result = crate::ToolResult::error(format!("Error: {error}"));
             result.metadata = Some(serde_json::Map::from_iter([
                 (
@@ -1485,12 +1682,12 @@ pub async fn handle_run_script(
                 ),
                 ("execution_started".to_string(), Value::Bool(true)),
                 ("retryable".to_string(), Value::Bool(false)),
-                (
-                    "workspace_observation_quarantined".to_string(),
-                    Value::Bool(true),
-                ),
             ]));
-            result
+            result.with_execution_outcome_unknown()
+        }
+        Err(error @ RunScriptError::OutputDrainTimeout { .. }) => {
+            crate::ToolResult::error(format!("Error: {error}. The final output is unknown and child processes may still be running."))
+                .with_execution_outcome_unknown()
         }
         Err(e) => crate::ToolResult::error(format!("Error: {e}")),
     }
@@ -1504,6 +1701,17 @@ mod tests {
     use crate::{ToolExecutor, ToolResult};
     use async_trait::async_trait;
     use serial_test::serial;
+
+    fn live_script_prerequisites() -> bool {
+        let available = python3_available() && astra_sandbox::process_scope_available();
+        if std::env::var_os("ASTRA_TEST_REQUIRE_SCRIPT_SCOPE").is_some() {
+            assert!(
+                available,
+                "test requested Python and an available delegated process scope"
+            );
+        }
+        available
+    }
 
     // ── RAII env guard (R3.7) ────────────────────────────────────────────
 
@@ -1585,6 +1793,141 @@ mod tests {
         fn project_root(&self) -> &Path {
             &self.project_root
         }
+    }
+
+    struct RetryTestExecutor {
+        calls: AtomicUsize,
+        unknown: bool,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for RetryTestExecutor {
+        async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.unknown {
+                ToolResult::error("partial operation".into()).with_execution_outcome_unknown()
+            } else if call == 0 {
+                ToolResult::error("temporary failure".into())
+            } else {
+                ToolResult::text("recovered".into())
+            }
+        }
+
+        fn tool_schemas(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn project_root(&self) -> &Path {
+            Path::new("/tmp")
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn nested_unknown_is_not_retried_or_hidden_by_script() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        let exec = RetryTestExecutor {
+            calls: AtomicUsize::new(0),
+            unknown: true,
+        };
+        let result = handle_run_script(
+            &serde_json::json!({"script": "from astra_tools import bash, retry\ntry:\n    retry(lambda: bash('do work'), delay=0)\nexcept Exception as e:\n    print('caught:', e)\nprint('script continued')"}),
+            &exec,
+            RunScriptConfig { mode: ExecutionMode::Strict, ..Default::default() },
+            None,
+        ).await;
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_error, "{result:?}");
+        assert!(crate::execution_outcome::outcome_is_unknown(
+            result.metadata.as_ref()
+        ));
+        assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
+        assert!(result.output.contains("script continued"), "{result:?}");
+        assert!(result.output.contains("partial operation"), "{result:?}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn nested_retry_still_recovers_a_retryable_failure() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        let exec = RetryTestExecutor {
+            calls: AtomicUsize::new(0),
+            unknown: false,
+        };
+        let result = handle_run_script(
+            &serde_json::json!({"script": "from astra_tools import read_file, retry\nprint(retry(lambda: read_file('x'), delay=0))"}),
+            &exec,
+            RunScriptConfig { mode: ExecutionMode::Strict, ..Default::default() },
+            None,
+        ).await;
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("recovered"), "{result:?}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn nested_timeout_preserves_applied_effect_and_allows_later_work() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        struct SlowWriter {
+            root: PathBuf,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ToolExecutor for SlowWriter {
+            async fn execute(&self, _: &str, _: &Value) -> ToolResult {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(self.root.join("applied"), "once").unwrap();
+                std::future::pending().await
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                &self.root
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exec = SlowWriter {
+            root: dir.path().to_path_buf(),
+            calls: AtomicUsize::new(0),
+        };
+        let config = RunScriptConfig {
+            mode: ExecutionMode::Strict,
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let result = handle_run_script(
+            &serde_json::json!({"script": "from astra_tools import write_file\nprint('before nested call', flush=True)\nwrite_file('x', 'value')"}),
+            &exec, config.clone(), None,
+        ).await;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("applied")).unwrap(),
+            "once"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_fact"],
+            "unknown"
+        );
+        assert!(result.output.contains("before nested call"), "{result:?}");
+        let next = handle_run_script(
+            &serde_json::json!({"script": "print('later work')"}),
+            &exec,
+            config,
+            None,
+        )
+        .await;
+        assert!(
+            !next.is_error && next.output.contains("later work"),
+            "{next:?}"
+        );
     }
 
     // ── Config defaults (A3.3: assert secure-by-default choices) ─────────
@@ -1890,7 +2233,13 @@ mod tests {
             .spawn()
             .expect("shell should be available for the bounded collector test");
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let output = collect_stdout_head_tail(stdout, 64).await;
+        let output = collect_stdout_head_tail(
+            stdout,
+            64,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let _ = child.wait().await;
         assert!(!output.contains(secret));
         assert!(!output.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
@@ -1911,7 +2260,13 @@ mod tests {
             .spawn()
             .expect("shell should be available for the bounded collector test");
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let output = collect_stdout_head_tail(stdout, 64).await;
+        let output = collect_stdout_head_tail(
+            stdout,
+            64,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let _ = child.wait().await;
         assert!(!output.contains("PEM_BODY_SENTINEL"));
         assert!(
@@ -1931,7 +2286,13 @@ mod tests {
             .spawn()
             .expect("shell should be available for the bounded collector test");
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let output = collect_stdout_head_tail(stdout, 64).await;
+        let output = collect_stdout_head_tail(
+            stdout,
+            64,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let _ = child.wait().await;
         assert!(!output.contains("PEM_BODY_SENTINEL_MIDDLE"), "{output:?}");
         assert!(!output.contains("TAIL_AFTER_UNCLOSED_PEM"), "{output:?}");
@@ -1949,7 +2310,13 @@ mod tests {
             .spawn()
             .expect("shell should be available for the bounded collector test");
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let output = collect_stdout_head_tail(stdout, 64).await;
+        let output = collect_stdout_head_tail(
+            stdout,
+            64,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let _ = child.wait().await;
         assert!(
             !output.contains("PEM_INVALID_UTF8_BODY_SENTINEL"),
@@ -1970,7 +2337,13 @@ mod tests {
             .spawn()
             .expect("shell should be available for the bounded collector test");
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let output = collect_stdout_head_tail(stdout, 64).await;
+        let output = collect_stdout_head_tail(
+            stdout,
+            64,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let _ = child.wait().await;
         assert!(
             !output.contains("PEM_BODY_SENTINEL_AFTER_HEAD"),
@@ -2680,6 +3053,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_script_without_process_scope_is_rejected_before_spawn() {
+        if astra_sandbox::process_scope_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_run_script(
+            &serde_json::json!({"script": "open('must-not-start', 'w').write('x')"}),
+            &MockToolExecutor::new(),
+            RunScriptConfig {
+                session_cwd: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_started"],
+            false
+        );
+        assert!(!dir.path().join("must-not-start").exists());
+    }
+
+    #[tokio::test]
     async fn handle_run_script_cancelled_parent_does_not_execute() {
         let exec = MockToolExecutor::new();
         let cancel_token = CancellationToken::new();
@@ -2698,6 +3095,85 @@ mod tests {
     }
 
     // ── Integration tests (require Python) ───────────────────────────────
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn live_timeout_keeps_safe_output_when_a_child_holds_the_pipes() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        let exec = MockToolExecutor::new();
+        let config = RunScriptConfig {
+            mode: ExecutionMode::Strict,
+            ..Default::default()
+        };
+        let timed_out = handle_run_script(
+            &serde_json::json!({"script": "import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(4)'], start_new_session=True)\nprint('before timeout', flush=True)\nsys.stderr.write('stderr checkpoint\\n')\nsys.stderr.flush()\nsys.stdout.write('ghp_' + 'a'*20)\nsys.stdout.flush()\nsys.stderr.write('ghp_' + 'b'*20)\nsys.stderr.flush()\ntime.sleep(5)", "timeout": 1}),
+            &exec, config.clone(), None,
+        ).await;
+        assert!(timed_out.is_error);
+        assert!(
+            timed_out.output.contains("before timeout"),
+            "{}",
+            timed_out.output
+        );
+        assert!(
+            timed_out.output.contains("stderr checkpoint"),
+            "{}",
+            timed_out.output
+        );
+        assert!(
+            !timed_out.output.contains("ghp_"),
+            "incomplete credential-like lines must be omitted"
+        );
+        assert_eq!(timed_out.metadata.unwrap()["execution_fact"], "unknown");
+        let next = handle_run_script(
+            &serde_json::json!({"script":"print('next call')"}),
+            &exec,
+            config,
+            None,
+        )
+        .await;
+        assert!(!next.is_error, "{}", next.output);
+        assert!(next.output.contains("next call"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn live_completed_large_single_line_output_is_not_discarded() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        let exec = MockToolExecutor::new();
+        let config = RunScriptConfig {
+            mode: ExecutionMode::Strict,
+            ..Default::default()
+        };
+        let output = run_script(
+            "import sys; sys.stdout.write('a' * 60000)",
+            &config,
+            &exec,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("aaaa"));
+        assert!(output.contains("OUTPUT TRUNCATED"));
+        let error = run_script(
+            "import sys; sys.stderr.write('e' * 20000); sys.exit(1)",
+            &config,
+            &exec,
+            None,
+        )
+        .await
+        .unwrap_err();
+        match error {
+            RunScriptError::ScriptFailed { stderr, .. } => assert!(stderr.contains("eeee")),
+            other => panic!("expected failed script with stderr, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
@@ -2820,7 +3296,7 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_scripts_run_concurrently_without_cross_talk() {
-        if !python3_available() || !astra_sandbox::process_scope_available() {
+        if !live_script_prerequisites() {
             return;
         }
 
@@ -3180,4 +3656,28 @@ print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
             }
         }
     }
+}
+#[tokio::test]
+async fn dropped_rpc_cancels_work_without_stranding_the_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let worker = tokio::spawn(async move {
+        worker_cancellation.cancelled().await;
+    });
+    let pending = PendingScriptRpc {
+        cancel: cancellation,
+        settled: false,
+    };
+    drop(pending);
+    worker.await.unwrap();
+    assert!(
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_ok()
+    );
 }

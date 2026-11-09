@@ -135,6 +135,10 @@ export type ChatMessage = {
   id: string;
   role: MessageRole;
   content: string;
+  /** Durable Run identity for a cold transcript projection. */
+  runId?: string;
+  /** Terminal Context receipt; null means unconfirmed after cancellation. */
+  contextNotSaved?: boolean | null;
   activeSkills?: string[];
   activeTools?: string[];
   reasoning?: string;
@@ -254,6 +258,7 @@ export type QueueRunInputResponse = {
 };
 
 export type ActiveRunMutationResponse = {
+  contextNotSaved?: boolean | null;
   activeRun?: {
     runId: string;
     status: string;

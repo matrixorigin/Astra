@@ -154,6 +154,10 @@ pub(crate) struct RpcResponse {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_unknown: Option<bool>,
 }
 
 impl RpcResponse {
@@ -161,12 +165,16 @@ impl RpcResponse {
         Self {
             output: Some(output),
             error: None,
+            retryable: None,
+            outcome_unknown: None,
         }
     }
     pub fn error(msg: String) -> Self {
         Self {
             output: None,
             error: Some(msg),
+            retryable: None,
+            outcome_unknown: None,
         }
     }
 }
@@ -304,6 +312,8 @@ pub(crate) enum RpcOutcome {
     /// Request handled successfully (including policy-rejected requests that
     /// produced error responses).
     Ok,
+    /// A dispatched nested call's outcome was not established.
+    OutcomeUnknown,
     /// The script exceeded `max_tool_calls`. Caller should kill the child.
     ExceededCallLimit,
     /// The parent invocation was cancelled while this connection was being
@@ -515,13 +525,39 @@ pub(crate) async fn handle_rpc_connection(
     // result from flooding the sandbox and triggering an OOM inside it.
     let capped = redact_then_truncate_rpc_output(&result.output, policy.max_response_bytes);
 
-    let response = if result.is_error {
-        RpcResponse::error(capped)
+    let unknown = crate::execution_outcome::outcome_is_unknown(result.metadata.as_ref());
+    let response = if result.is_error || unknown {
+        let mut response = RpcResponse::error(capped);
+        response.retryable = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("retryable"))
+            .and_then(Value::as_bool);
+        if unknown {
+            response.retryable = Some(false);
+            response.outcome_unknown = Some(true);
+        }
+        response
     } else {
         RpcResponse::success(capped)
     };
 
-    reply_with_cancel(&mut writer, response, cancel_token).await
+    if unknown {
+        reply_with_outcome_and_cancel(
+            &mut writer,
+            response,
+            RpcOutcome::OutcomeUnknown,
+            cancel_token,
+        )
+        .await
+    } else {
+        // A lost response after dispatch leaves the script unable to know
+        // whether repeating the call would repeat its effects.
+        match reply_with_cancel(&mut writer, response, cancel_token).await {
+            RpcOutcome::IoError => RpcOutcome::OutcomeUnknown,
+            other => other,
+        }
+    }
 }
 
 /// Strip newlines from a string before embedding in an error message.
@@ -739,6 +775,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_script_tools_cannot_expand_the_canonical_allowlist() {
+        let mut config = crate::run_script::RunScriptConfig::default();
+        config.allowed_tools.insert("rollback_file_edits".into());
+        let token = AuthToken::from_str_for_test("tok");
+        let exec = MockExecutor::new();
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"rollback_file_edits","args":{},"auth_token":"tok"}"#;
+        let (response, _) =
+            rpc_roundtrip(request, &config.rpc_policy(), &token, &exec, &counter).await;
+        assert!(response.contains("not allowed"), "{response}");
+        assert_eq!(exec.call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn authenticated_nested_writers_reuse_parent_without_minting_receipts() {
         struct CapturingExecutor {
             inner: crate::executor::DefaultToolExecutor,
@@ -823,6 +873,40 @@ mod tests {
             "only the parent may sign after its complete generation settles: {metadata:?}"
         );
         drop(parent_writer);
+    }
+
+    #[tokio::test]
+    async fn nested_source_receipt_is_rejected_before_command_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("input.txt"), "original").unwrap();
+        let _parent = crate::workspace_observation::begin_workspace_writer_with_options(
+            workspace.path(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let executor =
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()));
+        let policy = RpcPolicy {
+            allowed_tools: ["bash".to_string()].into_iter().collect(),
+            max_tool_calls: 1,
+            max_response_bytes: 16 * 1024,
+        };
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"bash","args":{"command":"printf changed > input.txt","source_artifacts":["input.txt"]},"auth_token":"tok"}"#;
+        let (response, outcome) =
+            rpc_roundtrip(request, &policy, &token, &executor, &counter).await;
+        assert!(matches!(outcome, RpcOutcome::Ok));
+        assert!(
+            response.contains("separate foreground command"),
+            "{response}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("input.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[tokio::test]

@@ -136,7 +136,20 @@ ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 
 With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.2 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
 
-Existing `.env` files are not overwritten by `stack-env`. If upgrading from the older Memoria pin, back up the database, update `MEMORIA_IMAGE` to the compatible digest in `.env.example`, set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, and run `make stack-up` to recreate affected containers. `make stack-setup` offers this change with confirmation and preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401).
+Memoria 0.5.2 does not provide the idempotent write endpoint required for durable session-memory extraction and finalization. Configure `MEMORIA_IMAGE` to a verified build containing [Memoria #310](https://github.com/matrixorigin/Memoria/pull/310) to enable those background operations. The older image fails closed; it is not safe to replace the idempotent write with an ordinary write.
+
+Until an official image containing that fix is published, a local Docker build
+can be used (verified on Apple Silicon):
+
+```bash
+docker build -t astra-memoria:cb38fec --file memoria/Dockerfile \
+  'https://github.com/matrixorigin/Memoria.git#cb38fec1cf15a3be30f8afccff31c0506bbe41d5'
+```
+
+Set `MEMORIA_IMAGE=astra-memoria:cb38fec` in `deployment/all-in-one/.env`, then
+run `make stack-up` to start the updated service.
+
+Existing `.env` files are not overwritten by `stack-env`. If upgrading from an image that predates owner-scoped authentication, back up the database, set `MEMORIA_IMAGE` to a verified compatible image and `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, then run `make stack-up` to recreate affected containers. `make stack-setup` preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401). The default image also requires the idempotent-write upgrade described above for session-memory maintenance.
 
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the

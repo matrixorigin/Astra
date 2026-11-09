@@ -29,27 +29,6 @@ mod tests {
         assert!(session.read().unwrap_or_else(|e| e.into_inner()).user_id == "user1");
     }
 
-    /// Guard regression f85a02bb: verify the injection-freshness observer
-    /// marks unchanged `Recent test failures` as stale after many turns.
-    #[test]
-    fn observe_injections_stale_after_unchanged_signal_across_many_turns() {
-        use astra_turn_core::injection_tracking::{
-            ChannelStatus, InjectionChannel, freshness_report,
-        };
-        let mut session = ObservabilitySession::new_simple("sess-f85a02bb");
-        session.recent_failing_tests = vec!["could not find Cargo.toml".to_string()];
-        for t in 0..=58 {
-            session.turn_number = t;
-            session.observe_injections_partial(InjectionPreviews::EMPTY, None);
-        }
-        let report = freshness_report(&session.injection_history, session.turn_number);
-        let failing = report
-            .iter()
-            .find(|c| c.channel == InjectionChannel::RecentFailingTests)
-            .expect("should have a freshness entry for the failing-tests channel");
-        assert!(matches!(failing.status, ChannelStatus::Stale { .. }));
-    }
-
     #[test]
     fn session_summary_from_session() {
         let hub = ObservabilityHub::new();

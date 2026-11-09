@@ -137,6 +137,9 @@ pub(crate) struct BackgroundTaskRow {
     pub title: String,
     pub output_ref: Option<String>,
     pub output_tail: Option<String>,
+    /// Local-only paths for a human inspecting withheld interactive output.
+    /// Never include these paths in the model-facing task list.
+    pub local_capture_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     pub output_offset: Option<u64>,
     pub total_bytes: Option<u64>,
     pub total_lines: Option<u64>,
@@ -147,6 +150,7 @@ pub(crate) struct BackgroundTaskRow {
     /// Foreground fan-in remains observable in this view without pretending
     /// that observation changed lifecycle ownership.
     pub run_in_background: bool,
+    pub input_available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +213,7 @@ impl BackgroundTaskRow {
             title: init.title,
             output_ref: init.output_ref,
             output_tail: init.output_tail,
+            local_capture_paths: None,
             output_offset: None,
             total_bytes: init.total_bytes,
             total_lines: None,
@@ -216,6 +221,7 @@ impl BackgroundTaskRow {
             terminal_reason: None,
             fanout: None,
             run_in_background: true,
+            input_available: false,
         }
     }
 
@@ -232,6 +238,19 @@ impl BackgroundTaskRow {
             BackgroundTaskRowInit::new(id, BackgroundTaskKind::Shell, status, elapsed_ms, title)
                 .with_output(output_ref, output_tail, total_bytes),
         )
+    }
+
+    pub(crate) fn with_input_available(mut self, available: bool) -> Self {
+        self.input_available = available;
+        self
+    }
+
+    pub(crate) fn with_local_capture_paths(
+        mut self,
+        paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> Self {
+        self.local_capture_paths = paths;
+        self
     }
 
     pub(crate) fn with_live_control(mut self, live_control: LiveControlState) -> Self {

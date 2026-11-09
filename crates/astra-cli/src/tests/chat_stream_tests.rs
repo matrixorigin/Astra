@@ -42,9 +42,9 @@ fn basic_chat_context<'a>(
         mcp_manager: None,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
 
@@ -869,9 +869,9 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         unified_skill_registry: &unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: None,
         stream_json_emitter: None,
         #[cfg(feature = "harness")]
@@ -1244,9 +1244,9 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1427,9 +1427,9 @@ async fn stream_chat_sse_simple_text_response() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1552,9 +1552,9 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1702,9 +1702,9 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
@@ -1807,9 +1807,9 @@ async fn stream_chat_sse_api_error_propagated() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1925,9 +1925,9 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
@@ -1969,7 +1969,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
-async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
+async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let temp = tempfile::tempdir().unwrap();
     let _guard = ProcessJournalDirGuard::new(temp.path());
     #[derive(Clone)]
@@ -2097,9 +2097,9 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -2130,44 +2130,8 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
+    assert_eq!(tool_results[0]["status"].as_str(), Some("failed"));
     drop(tool_results);
-
-    let boundary_events: Vec<_> = session_journal::read_journal("sess-tx-e2e")
-        .unwrap()
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.event_type,
-                JournalEventType::ExecutionBoundaryOpened
-                    | JournalEventType::ExecutionBoundaryCommitted
-            )
-        })
-        .collect();
-    assert_eq!(boundary_events.len(), 2);
-    assert_eq!(
-        boundary_events[0].event_type,
-        JournalEventType::ExecutionBoundaryOpened
-    );
-    assert_eq!(
-        boundary_events[1].event_type,
-        JournalEventType::ExecutionBoundaryCommitted
-    );
-
-    let opened = boundary_events[0]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("opened boundary metadata");
-    assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(opened["transaction_id"].as_str(), Some("tx-e2e"));
-
-    let committed = boundary_events[1]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("committed boundary metadata");
-    assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(committed["transaction_id"].as_str(), Some("tx-e2e"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2265,9 +2229,9 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -2431,9 +2395,9 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: 3,
         pipeline_state: None,
         compaction_state: None,
@@ -2582,9 +2546,9 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             mcp_manager: Some(mcp_arc.clone()),
             agent_spawner: None,
             root_agent_id: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
 

@@ -84,6 +84,24 @@ pub(super) enum FsLeafError {
 }
 
 impl FsLeafError {
+    /// Keep the OS failure at its owner; downstream recovery must not infer
+    /// a missing resource or permission failure from the rendered message.
+    fn io(error: &std::io::Error, output: String) -> Self {
+        use astra_core::{ErrorKind, ToolFailureEvidence, ToolRecoveryAction};
+
+        let kind = match error.kind() {
+            std::io::ErrorKind::NotFound => ErrorKind::ToolNotFound,
+            std::io::ErrorKind::PermissionDenied => ErrorKind::PolicyDenied,
+            std::io::ErrorKind::IsADirectory => ErrorKind::ToolInvalidArgs,
+            _ => ErrorKind::Unknown,
+        };
+        let mut evidence = ToolFailureEvidence::from_error_kind(kind);
+        if error.kind() == std::io::ErrorKind::IsADirectory {
+            evidence.recovery_actions = vec![ToolRecoveryAction::SelectAvailableCapability];
+        }
+        Self::Shared(astra_tools::ToolResult::error(output).with_failure_evidence(evidence))
+    }
+
     fn sandbox_denied(message: String) -> Self {
         Self::SandboxDenied(message)
     }
@@ -190,13 +208,16 @@ impl ToolExecutor {
             .as_deref()
             .unwrap_or_else(|| Path::new(path));
 
+        let workspace_root = self.effective_project_root();
         {
             let sp_guard = self
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard {
-                return validate_path(policy, validation_path).map_err(|e| {
+                let mut policy = policy.clone();
+                policy.project_root = workspace_root;
+                return validate_path(&policy, validation_path).map_err(|e| {
                     if e.is_boundary_violation() {
                         FsLeafError::sandbox_denied(format!(
                             "Path '{}' is outside the project directory '{}'; \
@@ -213,7 +234,7 @@ impl ToolExecutor {
         Ok(if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.project_root.join(p)
+            workspace_root.join(p)
         })
     }
 
@@ -239,9 +260,10 @@ impl ToolExecutor {
                     .map_err(|error| format!("Error: Cannot bind file target: {error}"))?
             }
             Err(error) => {
-                return Err(
-                    format!("Error: Cannot bind file target {}: {error}", path.display()).into(),
-                );
+                return Err(FsLeafError::io(
+                    &error,
+                    format!("Error: Cannot bind file target {}: {error}", path.display()),
+                ));
             }
         };
         if !self.is_within_sandbox_boundary(&target) {
@@ -270,22 +292,34 @@ impl ToolExecutor {
 
     fn record_committed_file_edit(
         &self,
-        path: &Path,
+        prepared: &PreparedWriteFile,
         call_id: &str,
-        before: Option<&[u8]>,
-        after: &[u8],
         edit_type: EditType,
     ) {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        self.file_journal
+        let workspace_root = self.effective_project_root();
+        let mut journal = self
+            .file_journal
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_committed(path, call_id, turn, before, after, edit_type);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(unix)]
+        journal.record_published_write(prepared, call_id, turn, edit_type, &workspace_root);
+        #[cfg(not(unix))]
+        journal.record_committed_in_workspace(
+            &workspace_root,
+            prepared.path(),
+            call_id,
+            turn,
+            (prepared.original_content_bytes(), prepared.content_bytes()),
+            edit_type,
+        );
+        drop(journal);
         self.record_write_with_content(
-            path,
-            std::str::from_utf8(after).expect("prepared text publication is UTF-8"),
+            prepared.path(),
+            std::str::from_utf8(prepared.content_bytes())
+                .expect("prepared text publication is UTF-8"),
         );
     }
 
@@ -298,10 +332,8 @@ impl ToolExecutor {
         let result = prepared.apply();
         if !result.is_error && !prepared.is_already_desired() {
             self.record_committed_file_edit(
-                prepared.path(),
+                prepared,
                 call_id,
-                prepared.original_content_bytes(),
-                prepared.content_bytes(),
                 if prepared.original_content_bytes().is_none() {
                     EditType::Create
                 } else {
@@ -383,7 +415,7 @@ impl ToolExecutor {
                         self.record_read(&path, false);
                         return Ok(format!("data:{mime};base64,{b64}"));
                     }
-                    Err(e) => return Err(format!("Error reading image: {e}").into()),
+                    Err(e) => return Err(FsLeafError::io(&e, format!("Error reading image: {e}"))),
                 }
             }
 
@@ -419,7 +451,7 @@ impl ToolExecutor {
                 // evidence of definitions or line counts in the unread suffix.
                 let cap = limit.saturating_mul(2).min(size);
                 let content = read_capped_to_string_lossy(&path, cap)
-                    .map_err(|e| format!("Error reading file: {e}"))?;
+                    .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
                 let lines_in_cap = content.lines().count();
                 let safe_outline_text =
                     astra_tools::fs_ops::render_outline(&path, &content, lines_in_cap)
@@ -462,20 +494,20 @@ impl ToolExecutor {
                             if let Some(cached) = self.get_cached_content(&path) {
                                 cached
                             } else {
-                                read_to_string_lossy(&path).map_err(|e| format!("Error: {e}"))?
+                                read_to_string_lossy(&path)
+                                    .map_err(|e| FsLeafError::io(&e, format!("Error: {e}")))?
                             };
                         let total_lines = content_for_outline.lines().count();
                         let (safe_content_for_outline, _) =
                             astra_text_utils::credential_redaction::redact_credentials_in_text(
                                 &content_for_outline,
                             );
-                        self.record_read_cached(&path, true, content_for_outline.clone());
-
                         if let Some(outline) = astra_tools::fs_ops::render_outline(
                             &path,
                             &content_for_outline,
                             total_lines,
                         ) {
+                            self.record_read_cached(&path, true, content_for_outline.clone());
                             return Ok(format!(
                                 "[Auto-downgraded to outline — aggregate output budget is high \
                                  ({agg} bytes used). Use start_line/end_line to read specific sections.]\n{outline}"
@@ -492,7 +524,21 @@ impl ToolExecutor {
                             .read_file_body_output_limit()
                             .saturating_sub(marker.chars().count());
                         let lines: Vec<&str> = safe_content_for_outline.split('\n').collect();
-                        let mut delivered = add_line_numbers_budgeted(&lines, 1, budget).output;
+                        let delivery = add_line_numbers_budgeted(&lines, 1, budget);
+                        let end = delivery.complete_lines.min(total_lines);
+                        let delivered_range = (end > 0
+                            && safe_content_for_outline.lines().count() == total_lines)
+                            .then_some(super::file_state::DeliveredLineRange {
+                                start: 1,
+                                end: end as u64,
+                            });
+                        self.record_read_with_delivery_range_cached(
+                            &path,
+                            true,
+                            content_for_outline,
+                            delivered_range,
+                        );
+                        let mut delivered = delivery.output;
                         push_suffix_if_fits(
                             &mut delivered,
                             &marker,
@@ -520,32 +566,33 @@ impl ToolExecutor {
                         } else {
                             String::new()
                         };
-                        let cwd = self.project_root.display();
-                        return Err(format!(
-                            "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
-                        ).into());
+                        let root = self.effective_project_root();
+                        let cwd = root.display();
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!(
+                                "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
+                            ),
+                        ));
                     }
                     if e.kind() == std::io::ErrorKind::IsADirectory {
-                        return Err(format!("{msg}. Use list_dir instead for directories.").into());
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!("{msg}. Use list_dir instead for directories."),
+                        ));
                     }
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        return Err(format!(
-                            "{msg}. Check file permissions or use bash with `sudo cat` if appropriate."
-                        ).into());
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!(
+                                "{msg}. Check access to the requested file or select an authorized resource."
+                            ),
+                        ));
                     }
-                    return Err(msg.into());
+                    return Err(FsLeafError::io(&e, msg));
                 }
             }
         };
-        // This executor owns the workspace read, so it is the only boundary
-        // allowed to issue an edit-capable redaction reference.  Redact the
-        // full content before any output budget/window is applied; otherwise
-        // a credential split at the model limit becomes an unrecognisable
-        // partial secret.  Keep `raw_content` for AST parsing, line-range
-        // accounting, and the staleness cache.
-        let (safe_content, _) =
-            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
-
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let total_lines = raw_content.lines().count();
@@ -590,6 +637,7 @@ impl ToolExecutor {
         // otherwise it would be compressed after we had incorrectly recorded
         // the file as fully delivered.
         const AUTO_EXPAND_MAX_BYTES: usize = 16_384;
+        let mut expanded_view = None;
         if is_ranged {
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= AUTO_EXPAND_MAX_BYTES
@@ -605,7 +653,7 @@ impl ToolExecutor {
                 let expanded = format!(
                     "[Auto-expanded to full file ({total_lines} lines) — \
                      small enough to read entirely. Use this content for all \
-                     references to {path_str}; do not re-read.]\n\
+                     references to {path_str}.]\n\
                      {numbered}"
                 );
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
@@ -623,10 +671,15 @@ impl ToolExecutor {
                     );
                     return Ok(expanded);
                 }
+                expanded_view = Some(expanded_content);
             }
         }
 
         if !is_ranged {
+            // Redact the complete source before applying the output budget so
+            // a truncated secret cannot escape detection.
+            let (safe_content, _) =
+                astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
             let lines: Vec<&str> = safe_content.split('\n').collect();
             let total_lines = raw_content.lines().count();
             let numbered = add_line_numbers(&safe_content, 1);
@@ -700,11 +753,19 @@ impl ToolExecutor {
             ));
         }
         let actual_start_line = s + 1; // 1-indexed
-        let safe_range = astra_text_utils::credential_redaction::redact_line_window(
-            &raw_content,
-            actual_start_line,
-            e,
-        );
+        let safe_range = match expanded_view {
+            Some(view) => view
+                .split('\n')
+                .skip(s)
+                .take(e - s)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => astra_text_utils::credential_redaction::redact_line_window(
+                &raw_content,
+                actual_start_line,
+                e,
+            ),
+        };
         let source_line_count = e.saturating_sub(s);
         let line_numbers_preserve_source = safe_range.lines().count() == source_line_count;
         let numbered = add_line_numbers(&safe_range, actual_start_line);
@@ -769,8 +830,8 @@ impl ToolExecutor {
 
     fn read_warning_for(overlaps_prior_delivery: bool) -> String {
         if overlaps_prior_delivery {
-            "\n\nNote: Some returned content overlaps lines already returned for the same captured file content. \
-             Earlier output may no longer be in context; authorized rereads can still be necessary."
+            "\n\nNote: This executor previously produced overlapping numbered lines for the same captured file content. \
+             Earlier output may have been compacted or not delivered; reread when needed."
                 .to_string()
         } else {
             String::new()
@@ -950,7 +1011,8 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         let target = self.bind_file_mutation_target(&path)?;
-        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let original_bytes = fs::read(&target)
+            .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
         let content = std::str::from_utf8(&original_bytes)
             .map_err(|_| {
                 "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
@@ -1107,6 +1169,11 @@ impl ToolExecutor {
             return format!("Error: file not found: {}", rel_str);
         }
 
+        #[cfg(unix)]
+        let parent_binding = match astra_tools::fs_ops::capture_file_parent(&path) {
+            Ok(parent) => parent,
+            Err(error) => return format!("Error: Cannot bind file directory: {error}"),
+        };
         let before_content = match fs::read(&path) {
             Ok(content) => content,
             Err(error) => return format!("Error reading file before delete: {error}"),
@@ -1116,21 +1183,42 @@ impl ToolExecutor {
             .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("delete_file:{}", path.display());
 
-        match fs::remove_file(&path) {
+        #[cfg(unix)]
+        let deleted = astra_tools::fs_ops::restore_file_in_bound_parent(
+            &parent_binding,
+            &path,
+            Some(&before_content),
+            None,
+        );
+        #[cfg(not(unix))]
+        let deleted = fs::remove_file(&path);
+        match deleted {
             Ok(_) => {
                 *applied = true;
                 self.remove_file_state(&path);
-                match self.file_journal.lock() {
-                    Ok(mut journal) => {
-                        journal.record_delete(&path, &journal_call_id, turn_idx, before_content)
-                    }
-                    Err(poisoned) => poisoned.into_inner().record_delete(
-                        &path,
-                        &journal_call_id,
-                        turn_idx,
-                        before_content,
-                    ),
-                }
+                let workspace_root = self.effective_project_root();
+                let mut journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(unix)]
+                journal.record_delete_in_parent(
+                    &path,
+                    &journal_call_id,
+                    turn_idx,
+                    &before_content,
+                    Some(parent_binding),
+                    &workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    &workspace_root,
+                    &path,
+                    &journal_call_id,
+                    turn_idx,
+                    (Some(&before_content), &[]),
+                    EditType::Delete,
+                );
                 format!("Deleted: {}", rel_str)
             }
             Err(e) => format!("Error deleting file: {e}"),
@@ -1151,6 +1239,22 @@ impl ToolExecutor {
         })
     }
 
+    fn rollback_failures(result: &Value) -> Value {
+        let mut failed = result
+            .get("failed")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            failed.push(json!({"error": error}));
+        } else if result.get("failed").and_then(Value::as_array).is_none()
+            && result.get("success").and_then(Value::as_bool) != Some(true)
+        {
+            failed.push(json!({"error":"rollback did not return a valid result"}));
+        }
+        Value::Array(failed)
+    }
+
     fn refresh_rolled_back_file_state(&self, path: &Path) {
         if path.exists() {
             match read_to_string_lossy(path) {
@@ -1162,11 +1266,56 @@ impl ToolExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn file_journal_checkpoint(&self) -> u64 {
         match self.file_journal.lock() {
             Ok(journal) => journal.checkpoint(),
             Err(poisoned) => poisoned.into_inner().checkpoint(),
         }
+    }
+
+    async fn file_rollback_preflight(&self, args: &Value) -> Result<(), String> {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").map(|_| "file"))
+            .unwrap_or("current_turn");
+        if scope == "list" {
+            return Ok(());
+        }
+        let root = self.effective_project_root();
+        if matches!(scope, "turn" | "current_turn") {
+            let turn = if scope == "turn" {
+                args.get("turn_index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+            } else {
+                Some(
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            };
+            if let Some(turn) = turn {
+                let checkpoint = args
+                    .get("file_after_sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if journal.entries().any(|entry| {
+                    entry.turn_index == turn
+                        && entry.sequence >= checkpoint
+                        && !entry.belongs_to_workspace(&root)
+                }) {
+                    return Err(
+                        "Some edits belong to another workspace; no files were rolled back.".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rollback all file edits recorded since `checkpoint` within the
@@ -1197,327 +1346,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) async fn rollback_recorded_turn_mutations(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("current_turn");
-        let explicit_turn_index = if scope == "turn" {
-            match args.get("turn_index").and_then(Value::as_u64) {
-                Some(turn_index) => Some(turn_index),
-                None => {
-                    return json!({
-                        "success": false,
-                        "error": "missing 'turn_index' for scope=turn",
-                    })
-                    .to_string();
-                }
-            }
-        } else {
-            None
-        };
-
-        match scope {
-            "list" => {
-                let file_result = Self::parse_rollback_tool_output(
-                    "rollback_file_edits",
-                    self.rollback_file_edits(args),
-                );
-                let database_result = Self::parse_rollback_tool_output(
-                    "rollback_database_snapshots",
-                    self.rollback_database_snapshots(args),
-                );
-
-                let worktree_result = Self::parse_rollback_tool_output(
-                    "rollback_git_worktrees",
-                    self.rollback_git_worktrees(args),
-                );
-                let session_state_result = Self::parse_rollback_tool_output(
-                    "rollback_session_state",
-                    self.rollback_session_state(args).await,
-                );
-                let file_entries = file_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let database_entries = database_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-
-                let worktree_entries = worktree_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let session_state_entries = session_state_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let total_file_entries = file_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        file_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                let total_database_entries = database_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        database_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-
-                let total_worktree_entries = worktree_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        worktree_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                let total_session_state_entries = session_state_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        session_state_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                json!({
-                    "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && database_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-
-
-                        && worktree_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && session_state_result.get("success").and_then(Value::as_bool).unwrap_or(false),
-                    "scope": "list",
-                    "total_file_entries": total_file_entries,
-                    "total_database_entries": total_database_entries,
-
-
-                    "total_git_worktree_entries": total_worktree_entries,
-                    "total_session_state_entries": total_session_state_entries,
-                    "file_entries": file_entries,
-                    "database_entries": database_entries,
-
-
-                    "git_worktree_entries": worktree_entries,
-                    "session_state_entries": session_state_entries,
-                    "files": file_result,
-                    "database_snapshots": database_result,
-
-
-                    "git_worktrees": worktree_result,
-                    "session_state": session_state_result,
-                    "summary": format!(
-                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_worktree_entries} git worktree rollback entr{}, and {total_session_state_entries} session-state rollback entr{}",
-                        if total_file_entries == 1 { "y" } else { "ies" },
-                        if total_database_entries == 1 { "y" } else { "ies" },
-
-
-                        if total_worktree_entries == 1 { "y" } else { "ies" },
-                        if total_session_state_entries == 1 { "y" } else { "ies" }
-                    ),
-                })
-                .to_string()
-            }
-            "turn" | "current_turn" => {
-                let database_result = Self::parse_rollback_tool_output(
-                    "rollback_database_snapshots",
-                    self.rollback_database_snapshots(args),
-                );
-                let file_result = Self::parse_rollback_tool_output(
-                    "rollback_file_edits",
-                    self.rollback_file_edits(args),
-                );
-
-                let worktree_result = Self::parse_rollback_tool_output(
-                    "rollback_git_worktrees",
-                    self.rollback_git_worktrees(args),
-                );
-                let session_state_result = Self::parse_rollback_tool_output(
-                    "rollback_session_state",
-                    self.rollback_session_state(args).await,
-                );
-                let turn_index = database_result
-                    .get("turn_index")
-                    .and_then(Value::as_u64)
-                    .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| worktree_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| {
-                        session_state_result
-                            .get("turn_index")
-                            .and_then(Value::as_u64)
-                    })
-                    .or(explicit_turn_index)
-                    .unwrap_or_else(|| {
-                        self.journal_turn_index
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            as u64
-                    });
-                let reverted_files = file_result
-                    .get("reverted")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let restored_snapshots = database_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_file_rollbacks = file_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_database_rollbacks = database_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-
-                let restored_git_worktrees = worktree_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_git_worktree_rollbacks = worktree_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let restored_session_state = session_state_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_session_state_rollbacks = session_state_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let reverted_file_count = reverted_files
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_snapshot_count = restored_snapshots
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_file_count = failed_file_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_database_count = failed_database_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-
-                let restored_git_worktree_count = restored_git_worktrees
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_git_worktree_count = failed_git_worktree_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_session_state_count = restored_session_state
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_session_state_count = failed_session_state_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_total = reverted_file_count
-                    + restored_snapshot_count
-                    + restored_git_worktree_count
-                    + restored_session_state_count;
-                let failed_total = failed_file_count
-                    + failed_database_count
-                    + failed_git_worktree_count
-                    + failed_session_state_count;
-                let success = restored_total > 0 && failed_total == 0;
-                let summary = if restored_total == 0 {
-                    format!("No recorded rollback actions found for turn {turn_index}")
-                } else if failed_total == 0 {
-                    format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index}",
-                        if reverted_file_count == 1 { "" } else { "s" },
-                        if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_worktree_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_session_state_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                    )
-                } else {
-                    format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index} with {failed_total} failure{}",
-                        if reverted_file_count == 1 { "" } else { "s" },
-                        if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_worktree_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_session_state_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if failed_total == 1 { "" } else { "s" }
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "reverted_files": reverted_files,
-                    "restored_database_snapshots": restored_snapshots,
-
-
-                    "restored_git_worktrees": restored_git_worktrees,
-                    "restored_session_state": restored_session_state,
-                    "failed_file_rollbacks": failed_file_rollbacks,
-                    "failed_database_rollbacks": failed_database_rollbacks,
-
-
-                    "failed_git_worktree_rollbacks": failed_git_worktree_rollbacks,
-                    "failed_session_state_rollbacks": failed_session_state_rollbacks,
-                    "files": file_result,
-                    "database_snapshots": database_result,
-
-
-                    "git_worktrees": worktree_result,
-                    "session_state": session_state_result,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, list)"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
-    pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_file_edits(&self, args: &Value) -> String {
         if args.get("after_sequence").is_some() {
             return json!({
                 "success": false,
@@ -1537,52 +1366,11 @@ impl ToolExecutor {
             })
             .unwrap_or("current_turn");
 
+        if let Err(error) = self.file_rollback_preflight(args).await {
+            return json!({"success":false, "scope":scope, "error":error}).to_string();
+        }
+
         match scope {
-            "source_receipt" => {
-                let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
-                    Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
-                    _ => {
-                        return json!({
-                            "success": false,
-                            "scope": "source_receipt",
-                            "error": "missing 'receipt_id' for scope=source_receipt",
-                        })
-                        .to_string();
-                    }
-                };
-                let Some(session_id) = self
-                    .active_session_id()
-                    .filter(|id| !id.trim().is_empty())
-                else {
-                    return json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "error": "source receipt restore requires an active CLI session",
-                    })
-                    .to_string();
-                };
-                let owner_scope = format!("cli:{session_id}");
-                match astra_tools::source_preimage::restore_receipt(
-                    &self.project_root,
-                    &owner_scope,
-                    receipt_id,
-                ) {
-                    Ok(()) => json!({
-                        "success": true,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "summary": "Restored the retained source preimage.",
-                    })
-                    .to_string(),
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "error": error,
-                    })
-                    .to_string(),
-                }
-            }
             "list" => {
                 let summary = match self.file_journal.lock() {
                     Ok(journal) => journal.summary(),
@@ -1626,29 +1414,29 @@ impl ToolExecutor {
                 if !candidates.iter().any(|candidate| candidate == &aliased) {
                     candidates.push(aliased);
                 }
-                let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => {
-                        let mut outcome = Ok(None);
-                        for candidate in &candidates {
-                            outcome = journal.undo_file(candidate);
-                            if !matches!(outcome, Ok(None)) {
-                                break;
-                            }
+                let root = self.effective_project_root();
+                let journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut undo_result = Ok(None);
+                for candidate in &candidates {
+                    if let Some(entry) = journal
+                        .entries()
+                        .filter(|entry| entry.path == *candidate)
+                        .last()
+                    {
+                        if !entry.belongs_to_workspace(&root) {
+                            undo_result = Err(std::io::Error::other(
+                                "This edit belongs to another workspace; no file was rolled back",
+                            ));
+                        } else {
+                            undo_result = journal.undo_file(candidate);
                         }
-                        outcome
+                        break;
                     }
-                    Err(poisoned) => {
-                        let journal = poisoned.into_inner();
-                        let mut outcome = Ok(None);
-                        for candidate in &candidates {
-                            outcome = journal.undo_file(candidate);
-                            if !matches!(outcome, Ok(None)) {
-                                break;
-                            }
-                        }
-                        outcome
-                    }
-                };
+                }
+                drop(journal);
                 match undo_result {
                     Ok(Some(edit_type)) => {
                         self.refresh_rolled_back_file_state(&path);
@@ -1725,21 +1513,21 @@ impl ToolExecutor {
                     })
                     .collect();
                 let success = !reverted.is_empty() && failed.is_empty();
-                let summary = if reverted.is_empty() {
-                    format!("No recorded file edits found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Rolled back {} file edit{} from turn {turn_index}",
-                        reverted.len(),
-                        if reverted.len() == 1 { "" } else { "s" }
-                    )
-                } else {
+                let summary = if !failed.is_empty() {
                     format!(
                         "Rolled back {} file edit{} from turn {turn_index} with {} failure{}",
                         reverted.len(),
                         if reverted.len() == 1 { "" } else { "s" },
                         failed.len(),
                         if failed.len() == 1 { "" } else { "s" }
+                    )
+                } else if reverted.is_empty() {
+                    format!("No recorded file edits found for turn {turn_index}")
+                } else {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" }
                     )
                 };
                 json!({
@@ -1755,7 +1543,7 @@ impl ToolExecutor {
             other => json!({
                 "success": false,
                 "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list, source_receipt)"
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
                 ),
             })
             .to_string(),
@@ -1852,10 +1640,8 @@ impl ToolExecutor {
             };
         prepared.apply_with_committed(|edit| {
             self.record_committed_file_edit(
-                edit.path(),
+                edit.publication(),
                 &format!("batch_edit:{}", edit.path().display()),
-                Some(edit.original_content_bytes()),
-                edit.new_content_bytes(),
                 EditType::Patch,
             );
         })
@@ -1893,7 +1679,8 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         let target = self.bind_file_mutation_target(&path)?;
-        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let original_bytes = fs::read(&target)
+            .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
         let content = std::str::from_utf8(&original_bytes)
             .map_err(|_| {
                 "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
@@ -1969,7 +1756,7 @@ impl ToolExecutor {
                 Ok(safe) => safe,
                 Err(e) => return astra_tools::ToolResult::error(e).with_execution_not_started(),
             },
-            None => self.project_root.clone(),
+            None => self.effective_project_root(),
         };
         let depth = args
             .get("depth")
@@ -2057,7 +1844,7 @@ impl ToolExecutor {
             path.parent().map(|p| p.to_path_buf())
         } else {
             Some(
-                self.project_root
+                self.effective_project_root()
                     .join(path.parent().unwrap_or(Path::new(""))),
             )
         };
@@ -2073,7 +1860,7 @@ impl ToolExecutor {
             Self::collect_similar_in_dir(
                 &search_dir,
                 &target_name,
-                &self.project_root,
+                &self.effective_project_root(),
                 &mut candidates,
             );
         }
@@ -2082,9 +1869,9 @@ impl ToolExecutor {
         // search for exact filename matches using a bounded walk.
         if candidates.is_empty() {
             Self::collect_exact_name_in_tree(
-                &self.project_root,
+                &self.effective_project_root(),
                 &target_name,
-                &self.project_root,
+                &self.effective_project_root(),
                 &mut candidates,
             );
         }
@@ -2184,7 +1971,7 @@ impl ToolExecutor {
     fn inline_lsp_diagnostics(&self, path: &std::path::Path) -> Option<String> {
         let diag_value = self
             .passive_lsp
-            .diagnostics_for_file(&self.project_root, path)
+            .diagnostics_for_file(&self.effective_project_root(), path)
             .ok()??;
         let items = diag_value.get("diagnostics")?.as_array()?;
         if items.is_empty() {
@@ -2428,7 +2215,9 @@ fn push_suffix_if_fits(output: &mut String, suffix: &str, max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
-    use super::{add_line_numbers, is_unc_path, similarity_score};
+    use super::{
+        FsLeafError, SANDBOX_DENIED_PREFIX, add_line_numbers, is_unc_path, similarity_score,
+    };
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
     use serde_json::{Value, json};
@@ -2842,7 +2631,6 @@ mod tests {
             serde_json::json!({"path": "missing.txt", "start_line": -1}),
             serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
             serde_json::json!({"path": "missing.txt", "end_line": "2"}),
-            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
             serde_json::json!({"path": "missing.txt", "outline": 1}),
         ] {
             let result = executor.read_file_with_metadata(&args);
@@ -2906,16 +2694,6 @@ mod tests {
         }));
         assert!(result.contains("`outline`"), "{result}");
         assert!(result.contains("boolean"), "{result}");
-
-        let result = executor.read_file(&serde_json::json!({
-            "path": "test.txt",
-            "start_line": 3,
-            "end_line": 1
-        }));
-        assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected, got: {result}"
-        );
     }
 
     #[test]
@@ -2938,11 +2716,9 @@ mod tests {
             "end_line": 300
         }));
 
-        // Structural validation runs before small-file auto-expansion: a
-        // reversed range is malformed even when the file has one line.
         assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected before auto-expand, got: {result}"
+            result.contains("start_line 300 exceeds file length 1"),
+            "the ordered range remains past EOF, got: {result}"
         );
         assert!(
             !result.contains("Auto-expanded"),
@@ -3247,6 +3023,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ranged_read_reuses_safe_small_file_view_when_auto_expand_exceeds_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = (0..100)
+            .map(|i| format!("line {i}: {}\r\n", "x".repeat(48)))
+            .collect::<String>();
+        raw.push_str("-----BEGIN PRIVATE KEY-----\r\nprivatebody\r\n-----END PRIVATE KEY-----\r\nlast\r\n\r\n");
+        assert!(raw.len() < 16_384);
+        std::fs::write(dir.path().join("budgeted-small.txt"), raw).unwrap();
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&json!({
+            "path": "budgeted-small.txt", "start_line": 102, "end_line": 104
+        }));
+        assert!(!result.contains("Auto-expanded"), "{result}");
+        assert!(!result.contains("privatebody"), "{result}");
+        assert!(result.contains("[REDACTED:PRIVATE_KEY]"), "{result}");
+        assert!(result.contains("last"), "{result}");
+    }
+
     // ── Read observations preserve legitimate repeated and ranged reads ─────
 
     #[test]
@@ -3269,7 +3064,7 @@ mod tests {
                 "end_line": start + 5
             }));
             assert!(
-                !out.contains("overlaps lines already returned"),
+                !out.contains("previously produced overlapping numbered lines"),
                 "disjoint pages must not be called redundant"
             );
         }
@@ -3279,7 +3074,7 @@ mod tests {
             "end_line": 45
         }));
         assert!(
-            !third.contains("overlaps lines already returned"),
+            !third.contains("previously produced overlapping numbered lines"),
             "third disjoint page must not warn, got: {}",
             &third[third.len().saturating_sub(200)..]
         );
@@ -3295,13 +3090,13 @@ mod tests {
             let output = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
             assert!(output.contains("first observation"));
             if index > 0 {
-                assert!(output.contains("Earlier output may no longer be in context"));
+                assert!(output.contains("Earlier output may have been compacted or not delivered"));
             }
         }
         std::fs::write(&path, "changed observation\n").unwrap();
         let changed = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
         assert!(changed.contains("changed observation"));
-        assert!(!changed.contains("overlaps lines already returned"));
+        assert!(!changed.contains("previously produced overlapping numbered lines"));
     }
 
     #[test]
@@ -3326,14 +3121,14 @@ mod tests {
                     output.contains("line 99:"),
                     "new range content must remain available"
                 );
-                assert!(output.contains("authorized rereads can still be necessary"));
+                assert!(output.contains("reread when needed"));
                 assert!(
-                    output.contains("overlaps lines already returned"),
+                    output.contains("previously produced overlapping numbered lines"),
                     "an actual overlap should be called out, got: {output}"
                 );
             } else {
                 assert!(
-                    !output.contains("overlaps lines already returned"),
+                    !output.contains("previously produced overlapping numbered lines"),
                     "disjoint pages should not warn, got: {output}"
                 );
             }
@@ -3366,7 +3161,7 @@ mod tests {
             "end_line": 40
         }));
         assert!(
-            repeated_large_range.contains("overlaps lines already returned"),
+            repeated_large_range.contains("previously produced overlapping numbered lines"),
             "a complete-line prefix delivered by a truncated full read counts as covered"
         );
 
@@ -3413,7 +3208,7 @@ mod tests {
             "path": "big.txt", "start_line": 60, "end_line": 65
         }));
         assert!(
-            !fourth_ranged.contains("overlaps lines already returned"),
+            !fourth_ranged.contains("previously produced overlapping numbered lines"),
             "4th disjoint page must not trigger a redundant-read warning"
         );
         assert!(
@@ -3457,7 +3252,7 @@ mod tests {
             "path": "a.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            !third_a.contains("overlaps lines already returned"),
+            !third_a.contains("previously produced overlapping numbered lines"),
             "3rd disjoint ranged read of file a should not warn, got: {third_a}"
         );
         // A third disjoint page of file b remains useful pagination too.
@@ -3465,7 +3260,8 @@ mod tests {
             "path": "b.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            !third_b.contains("overlaps lines already returned") && !third_b.contains("Use grep"),
+            !third_b.contains("previously produced overlapping numbered lines")
+                && !third_b.contains("Use grep"),
             "3rd disjoint ranged read of file b should not trigger a grep nudge"
         );
     }
@@ -3506,6 +3302,34 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_read_results_keep_errors_local_to_each_call() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "sample.txt", 1000);
+        let executor = test_executor_in(dir.path());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let executor = &executor;
+                scope.spawn(move || {
+                    for index in 0..16 {
+                        let missing = index % 2 == 0;
+                        let result = executor.read_file_with_metadata(&json!({
+                            "path": if missing { "missing.txt" } else { "sample.txt" },
+                            "start_line":50, "end_line":145,
+                        }));
+                        assert_eq!(result.is_error, missing);
+                        if missing {
+                            assert_eq!(result.metadata.unwrap()["error_kind"], "tool_not_found");
+                        } else {
+                            assert!(result.output.contains("line 50:"));
+                            assert!(result.metadata.is_none());
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn read_file_treats_error_prefixed_file_content_as_success() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3521,15 +3345,116 @@ mod tests {
         assert!(result.output.contains("Error: literal file content"));
     }
 
-    #[test]
-    fn read_file_reports_actual_io_failure_structurally() {
+    #[tokio::test]
+    async fn read_file_reports_actual_io_failure_structurally() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
+        std::fs::create_dir(dir.path().join("directory")).unwrap();
+        for (path, kind, action) in [
+            (
+                "missing.txt",
+                astra_core::ErrorKind::ToolNotFound,
+                astra_core::ToolRecoveryAction::VerifyResource,
+            ),
+            (
+                "missing.png",
+                astra_core::ErrorKind::ToolNotFound,
+                astra_core::ToolRecoveryAction::VerifyResource,
+            ),
+            (
+                "directory",
+                astra_core::ErrorKind::ToolInvalidArgs,
+                astra_core::ToolRecoveryAction::SelectAvailableCapability,
+            ),
+        ] {
+            let result = executor
+                .execute_with_metadata("read_file", &serde_json::json!({"path": path}))
+                .await;
+            assert!(result.is_error, "{path}");
+            let fields = result
+                .tool_result_fields
+                .as_ref()
+                .expect("source error evidence");
+            assert_eq!(fields["error_kind"], kind.as_str());
+            let evidence: astra_core::ToolFailureEvidence =
+                serde_json::from_value(fields["recovery_evidence"].clone()).unwrap();
+            assert_eq!(evidence.kind, kind);
+            assert_eq!(evidence.recovery_actions, vec![action]);
+            assert_ne!(
+                fields.get("execution_started"),
+                Some(&Value::Bool(false)),
+                "I/O was attempted"
+            );
+        }
+        std::fs::write(
+            dir.path().join("missing.txt"),
+            "Error: ordinary file content\n",
+        )
+        .unwrap();
+        let recovered = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "missing.txt"}))
+            .await;
+        assert!(!recovered.is_error);
+        assert!(recovered.output.contains("Error: ordinary file content"));
+        assert!(
+            recovered
+                .tool_result_fields
+                .as_ref()
+                .is_none_or(|fields| !fields.contains_key("error_kind")),
+            "a prior failure is not sticky authority"
+        );
+    }
 
-        let result = executor.read_file_with_metadata(&serde_json::json!({"path": "missing.txt"}));
-
+    #[cfg(unix)]
+    #[test]
+    fn read_file_os_permissions_preserve_failure_without_sandbox_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        std::fs::write(&path, "private\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let os_failure = std::fs::read(&path).err().map(|error| error.kind());
+        let result =
+            test_executor_in(dir.path()).read_file_with_metadata(&json!({"path": "private.txt"}));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if os_failure.is_none() {
+            // Privileged processes may be allowed to read mode-000 files.
+            assert!(!result.is_error, "do not invent a permission denial");
+            return;
+        }
+        assert_eq!(os_failure, Some(std::io::ErrorKind::PermissionDenied));
         assert!(result.is_error);
-        assert!(result.output.starts_with("Error:"));
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["error_kind"], "policy_denied");
+        assert_eq!(fields["recovery_evidence"]["cause"], "permission_boundary");
+        assert!(!result.output.contains("sudo"));
+        assert!(!result.output.contains(SANDBOX_DENIED_PREFIX));
+        assert_ne!(fields.get("disposition"), Some(&json!("rejected")));
+    }
+
+    #[test]
+    fn filesystem_io_kind_survives_independent_of_rendered_error_text() {
+        for (source, expected) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                astra_core::ErrorKind::PolicyDenied,
+            ),
+            (
+                std::io::ErrorKind::NotFound,
+                astra_core::ErrorKind::ToolNotFound,
+            ),
+            (
+                std::io::ErrorKind::IsADirectory,
+                astra_core::ErrorKind::ToolInvalidArgs,
+            ),
+            (std::io::ErrorKind::Other, astra_core::ErrorKind::Unknown),
+        ] {
+            let error = std::io::Error::from(source);
+            let result =
+                FsLeafError::io(&error, "localized source diagnostic".into()).into_tool_result();
+            assert!(result.is_error);
+            assert_eq!(result.metadata.unwrap()["error_kind"], expected.as_str());
+        }
     }
 
     #[test]
@@ -4554,8 +4479,8 @@ mod tests {
         assert!(!file.exists());
     }
 
-    #[test]
-    fn delete_file_rollback_restores_file() {
+    #[tokio::test]
+    async fn delete_file_rollback_restores_file() {
         let tmpdir = tempfile::tempdir().unwrap();
         let file = tmpdir.path().join("victim.txt");
         std::fs::write(&file, "restore me").unwrap();
@@ -4567,10 +4492,12 @@ mod tests {
         assert!(result.starts_with("Deleted:"), "result: {result}");
         assert!(!file.exists());
 
-        let rollback = exe.rollback_file_edits(&json!({
-            "scope": "file",
-            "path": "victim.txt"
-        }));
+        let rollback = exe
+            .rollback_file_edits(&json!({
+                "scope": "file",
+                "path": "victim.txt"
+            }))
+            .await;
         let parsed: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(parsed["success"], true, "rollback: {rollback}");
         assert_eq!(parsed["edit_type"], "delete", "rollback: {rollback}");

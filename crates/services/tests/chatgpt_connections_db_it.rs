@@ -203,6 +203,7 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
                 owner.clone(),
                 UserModelCreateRequestData {
                     inference_protocol: None,
+                    responses_reasoning_history: None,
                     name: format!("subscription-{index}"),
                     provider: "chatgpt".into(),
                     model: slug.into(),
@@ -716,6 +717,7 @@ async fn disconnect_fences_inflight_model_creation_check_activation_and_default(
         let connection = provider.connect(models.as_ref(), &owner).await;
         let model_request = UserModelCreateRequestData {
             inference_protocol: None,
+            responses_reasoning_history: None,
             connection_id: Some(connection.clone()),
             name: "initial".into(),
             provider: "chatgpt".into(),

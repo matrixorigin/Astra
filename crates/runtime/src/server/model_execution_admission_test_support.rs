@@ -29,6 +29,7 @@ pub(crate) fn genesis_execution() -> AdmittedModelExecution {
     let mut execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
         offering_id: OFFERING_ID.into(),
         model: ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,

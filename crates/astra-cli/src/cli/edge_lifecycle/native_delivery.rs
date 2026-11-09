@@ -1765,16 +1765,15 @@ pub(crate) async fn ensure_session_native_delivery(
     };
 
     let mut executor = ToolExecutor::new(root.clone())
+        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
         .with_active_session_id(session_id.to_owned())
         .with_cloud(api.api_origin(), token.to_owned())
         .with_shared_file_journal(state.file_journal.clone())
         .with_shared_file_state(state.file_state.clone())
         .with_shared_database_snapshot_journal(state.database_snapshot_journal.clone())
-        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
         .with_shared_session_state_journal(state.session_state_journal.clone())
-        .with_bg_task_commands(state.bg_task_commands.clone())
-        .with_bg_task_list_cache(state.bg_task_list_cache.clone())
-        .with_bash_detach_slot(state.bash_detach_slot.clone());
+        .with_background_tasks(state.background_tasks.clone())
+        .with_foreground_wait_control(state.foreground_wait_control.clone());
     if let Some(observability) = state.observability_session.clone() {
         executor = executor.with_observability_session(observability);
     }
@@ -2492,6 +2491,8 @@ for line in sys.stdin:
                     network_allowed: false,
                 },
             )),
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -3121,6 +3122,9 @@ for line in sys.stdin:
                 execution_deadline_unix_ms: Some(unix + 5000),
                 execution_timeout_ms: Some(5000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             ws.send(Message::Text(
                 serde_json::to_string(&request).unwrap().into(),
@@ -3449,6 +3453,9 @@ for line in sys.stdin:
                 ),
                 execution_timeout_ms: Some(15_000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             if scenario == "released" {
                 let mut refused = request.clone();

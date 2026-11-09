@@ -519,6 +519,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         ),
         background_control("task_output", ToolLoadPolicy::Deferred),
         background_control("task_stop", ToolLoadPolicy::Deferred),
+        background_control("task_input", ToolLoadPolicy::Deferred),
         background_control("task_list", ToolLoadPolicy::Deferred),
         // Memory is useful contextual evidence, but explicit memory operations
         // are not required to answer or execute an ordinary first turn.
@@ -1553,7 +1554,10 @@ fn background_control(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
         run_observation: false,
         name: name.to_string(),
         load_policy,
-        effect: ToolEffect::none(),
+        effect: ToolEffect {
+            mutates_external_state: name == "task_input",
+            ..ToolEffect::none()
+        },
         required: ToolRequirements::background_session(),
     }
 }

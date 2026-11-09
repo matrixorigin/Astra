@@ -39,9 +39,6 @@ impl StandardKernel {
             Box::new(crate::verifiers::TurnGuardVerifierAdapter::default()),
             Box::new(crate::verifiers::DelegationVerifier::default()),
             Box::new(crate::verifiers::ConfidenceVerifier::default()),
-            Box::new(crate::verifiers::ProgressVerifier {
-                max_redundant_read_count: limits.max_redundant_read_count,
-            }),
             Box::new(crate::verifiers::CompletionVerifier),
         ];
         if let Some(max_cost) = limits.max_session_cost_usd {
@@ -95,7 +92,7 @@ impl FromStr for HarnessProfile {
 }
 
 /// Production limits for harness verifiers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HarnessLimits {
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
@@ -107,26 +104,6 @@ pub struct HarnessLimits {
     pub cache_creation_cost_per_mtok: Option<f64>,
     pub max_tool_calls_per_session: Option<u32>,
     pub sensitive_tools: Vec<String>,
-    pub max_redundant_read_count: u32,
-}
-
-impl Default for HarnessLimits {
-    fn default() -> Self {
-        let progress = crate::verifiers::ProgressVerifier::default();
-        Self {
-            max_turns: None,
-            max_tokens: None,
-            max_duration_millis: None,
-            max_session_cost_usd: None,
-            prompt_cost_per_mtok: None,
-            completion_cost_per_mtok: None,
-            cache_read_cost_per_mtok: None,
-            cache_creation_cost_per_mtok: None,
-            max_tool_calls_per_session: None,
-            sensitive_tools: Vec::new(),
-            max_redundant_read_count: progress.max_redundant_read_count,
-        }
-    }
 }
 
 impl HarnessLimits {
@@ -325,7 +302,6 @@ mod tests {
         let mut record = make_record(HookPoint::PostTurn, 1, 0);
         record.snapshot.final_state = Some("empty".into());
         record.snapshot.read_only_round_streak = 2;
-        record.snapshot.redundant_read_count = 2;
 
         match kernel.on_record(&record) {
             HookVerdict::Pause { reason, .. } => {
@@ -336,21 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn all_profiles_keep_overlap_observations_nonblocking() {
-        for profile in [HarnessProfile::Default, HarnessProfile::Swebench] {
-            let sink = InMemorySnapshotSink::arc();
-            let kernel = StandardKernel::with_profile(sink.clone(), profile);
-            let mut record = make_record(HookPoint::PostTurn, 1, 0);
-            record.snapshot.final_state = Some("empty".into());
-            record.snapshot.read_only_round_streak = 100;
-            record.snapshot.redundant_read_count = 100;
-
-            assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
-        }
-    }
-
-    #[test]
-    fn actual_budget_still_blocks_with_high_read_overlap() {
+    fn actual_budget_still_blocks_with_long_read_streak() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::configured(
             sink,
@@ -361,7 +323,6 @@ mod tests {
         );
         let mut record = make_record(HookPoint::PostTurn, 2, 100);
         record.snapshot.read_only_round_streak = 100;
-        record.snapshot.redundant_read_count = 100;
         match kernel.on_record(&record) {
             HookVerdict::Block { reason } => assert!(reason.contains("[budget]")),
             other => panic!("expected budget block, got {other:?}"),
@@ -379,24 +340,6 @@ mod tests {
             Ok(HarnessProfile::Swebench)
         );
         assert!("unknown".parse::<HarnessProfile>().is_err());
-    }
-
-    #[test]
-    fn warning_severity_does_not_pause() {
-        let sink = InMemorySnapshotSink::arc();
-        let kernel = StandardKernel::new(
-            sink.clone(),
-            vec![Box::new(ProgressVerifier {
-                max_redundant_read_count: 3,
-            })],
-        );
-
-        let mut record = make_record(HookPoint::PostTurn, 1, 0);
-        record.snapshot.final_state = Some("empty".into());
-        record.snapshot.read_only_round_streak = 1;
-        record.snapshot.redundant_read_count = 3;
-
-        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
     }
 
     #[test]

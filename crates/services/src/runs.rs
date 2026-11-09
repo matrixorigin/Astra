@@ -1464,6 +1464,8 @@ pub struct CancelRunRecord {
     /// Server-owned execution lease has retired; task verification may safely
     /// begin only when this is true.
     pub execution_settled: bool,
+    /// Observation from the same Run's terminal; absent when unavailable.
+    pub context_not_saved: Option<bool>,
 }
 
 /// Cancellation acceptance is distinct from retiring all session execution
@@ -2794,7 +2796,7 @@ pub(crate) async fn activate_execution_resume_tx(
     run: &mut DurableRunRecord,
     checkpoint: &DurableRunCheckpointRecord,
     owner_pod_id: &str,
-) -> Result<(), ExecutionHandoffReferenceError> {
+) -> Result<bool, ExecutionHandoffReferenceError> {
     use ExecutionHandoffReferenceError::{Rejected, Unavailable};
     if run.status != STATUS_PAUSED || run.waiting_for.is_some() {
         return Err(Rejected("execution checkpoint is not parked"));
@@ -2842,19 +2844,22 @@ pub(crate) async fn activate_execution_resume_tx(
     if affected.rows_affected() != 1 {
         return Err(Rejected("execution owner remains live or changed"));
     }
-    if run_requires_independent_admission(run)
-        && !crate::storage::session_execution_activity(
+    let prior_unresolved_tool_calls = if run_requires_independent_admission(run) {
+        let activity = crate::storage::session_execution_activity(
             tx,
             &run.user_id,
             &run.session_id,
             Some(&run.run_id),
         )
         .await
-        .map_err(|error| Unavailable(error.to_string()))?
-        .is_idle()
-    {
-        return Err(Rejected("session has unsettled execution"));
-    }
+        .map_err(|error| Unavailable(error.to_string()))?;
+        if activity.active_run {
+            return Err(Rejected("session has active execution"));
+        }
+        activity.unresolved_invocations
+    } else {
+        false
+    };
     let row = build_run_event_insert_row(
         &run.user_id,
         &run.run_id,
@@ -2887,7 +2892,7 @@ pub(crate) async fn activate_execution_resume_tx(
     let admission = std::mem::take(&mut run.events);
     *run = resumed;
     run.events = admission;
-    Ok(())
+    Ok(prior_unresolved_tool_calls)
 }
 
 pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
@@ -12508,7 +12513,7 @@ impl DatabaseRunStateStore {
             Some(&run.run_id),
         )
         .await
-        .map(|activity| activity.is_idle())
+        .map(|activity| !activity.active_run)
         .map_err(|source| db_error("check_execution_activity", &run.session_id, source))
     }
 
@@ -14732,7 +14737,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
-        let session_capture_override = if independent {
+        let session_admission = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
                 &record.session_id,
@@ -14756,8 +14761,7 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_capture_override =
-            session_capture_override.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override = session_admission.ok_or(RunAdmissionError::SessionBusy)?;
         let provider_owner = record
             .opening
             .loaded()?
@@ -25335,12 +25339,13 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "work_task_board_update",
 ];
 
-fn project_hook_configuration_warning(event: serde_json::Value) -> serde_json::Value {
+fn project_client_warning(event: serde_json::Value) -> serde_json::Value {
     // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
-    // This message is authored by the typed, redacted hook diagnostic producer.
-    if event.get("code").and_then(serde_json::Value::as_str) != Some("hook_configuration") {
+    // Accepted messages are authored by the typed, redacted hook producer.
+    let Some(code @ "hook_configuration") = event.get("code").and_then(serde_json::Value::as_str)
+    else {
         return serde_json::Value::Null;
-    }
+    };
     let Some(message) = event
         .get("message")
         .and_then(serde_json::Value::as_str)
@@ -25354,7 +25359,7 @@ fn project_hook_configuration_warning(event: serde_json::Value) -> serde_json::V
         return serde_json::Value::Null;
     };
     let mut projected = serde_json::json!({
-        "type": "warning", "code": "hook_configuration", "message": message,
+        "type": "warning", "code": code, "message": message,
     });
     if let Some(index) = event.get("index").and_then(serde_json::Value::as_u64) {
         projected["index"] = index.into();
@@ -25547,7 +25552,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_execution_binding = matches!(client_type, "workspace_bound" | "executor_bound");
         if is_external {
             return if client_type == "warning" {
-                project_hook_configuration_warning(event)
+                project_client_warning(event)
             } else if client_type == "artifact_publication" {
                 project_artifact_publication(event)
             } else if is_tool_call_end {
@@ -25598,7 +25603,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             if let Some(index) = event.get("index") {
                 wire["index"] = index.clone();
             }
-            project_hook_configuration_warning(wire)
+            project_client_warning(wire)
         }
         "workspace_bound" | "executor_bound" => {
             let mut wire = serde_json::Value::Object(data);
@@ -25830,6 +25835,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "turn_evaluation",
                     "status",
                     "cancellation_origin",
+                    "context_not_saved",
                     "outcome",
                     "finish_reason",
                     "error",
@@ -26871,7 +26877,7 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hook_config_diagnostics_project_only_marked_redacted_warnings() {
+    fn client_warnings_project_only_marked_redacted_warnings() {
         let message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";
         let data = serde_json::json!({
             "code": "hook_configuration", "message": message,
@@ -31039,8 +31045,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_independent_admission_fences_competing_runs_live_leases_and_unknown_effects()
-    {
+    async fn database_independent_admission_fences_live_owners_but_allows_prior_unknown_effects() {
         use crate::tool_invocation_ledger::{
             DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
         };
@@ -31196,16 +31201,34 @@ mod tests {
             .await
             .unwrap();
         let final_run = record("after-effect");
-        assert!(
-            store.insert_run(final_run.clone()).await.is_err(),
-            "terminal Run and executor exit cannot discharge unknown effects"
-        );
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
             &user,
             &session,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
+        // Ordinary controller work may proceed after the Run owner exits,
+        // while destructive workspace reuse still requires settled effects.
+        use crate::session_context_coordinator::{
+            AcquireWriterOutcome, DatabaseSessionContextCoordinator, SessionContextCoordinator,
+        };
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user,
+            "controller",
+            astra_turn_types::ActorKindV1::Cli,
+            astra_turn_types::SessionSurfaceV1::Cli,
+            None,
+            Default::default(),
+        );
+        let AcquireWriterOutcome::Acquired(lease) = coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(60), "after-unknown")
+            .await
+            .expect("a prior unknown result is not a live controller owner")
+        else {
+            panic!("no controller owns this Session")
+        };
+        coordinator.release_writer(&lease).await.unwrap();
         let mut tx = pool.get().begin().await.unwrap();
         let facts =
             crate::storage::admit_context_execution_write_with_facts(&mut tx, &session, &user)
@@ -31220,8 +31243,33 @@ mod tests {
             Some(crate::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool)
         );
         tx.rollback().await.unwrap();
-        // A confirmed effect outcome, rather than a Run status or deleted
-        // pointer, is the existing custody owner's release boundary.
+        store
+            .insert_run(final_run.clone())
+            .await
+            .expect("a prior unknown invocation does not block an independent Run");
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            ToolInvocationState::OutcomeUnknown
+        );
+        assert!(
+            ledger
+                .claim_dispatch(
+                    &identity,
+                    "another-worker",
+                    90_000,
+                    ToolInvocationDispatchAdmission {
+                        expected_control_epoch: -1,
+                        expected_owner_generation: next.run_generation,
+                        expected_owner_pod_id: store.owner_pod_id.clone(),
+                        expected_execution_binding_generation: None,
+                    },
+                )
+                .await
+                .is_err(),
+            "the original invocation must not be redelivered"
+        );
+        // Only a confirmed result settles the original invocation, independently
+        // of admitting a new Run. Destructive changes retain their stricter gate.
         ledger
             .compare_and_complete(
                 &identity,
@@ -31238,10 +31286,6 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .insert_run(final_run.clone())
-            .await
-            .expect("confirmed custody allows the next independent Run");
         cleanup_database_run_fixture(&pool, &other_user, &other_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&other_user)
@@ -31255,9 +31299,10 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
-        for run in [&winner, &next, &final_run] {
+        for run in [&winner, &next] {
             cleanup_database_run_fixture(&pool, &user, &run.run_id).await;
         }
+        cleanup_execution_resume_fixture(&pool, &user, &final_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&user)
             .bind(&session)
@@ -41817,6 +41862,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,

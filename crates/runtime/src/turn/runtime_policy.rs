@@ -69,7 +69,6 @@ pub fn evaluation_thresholds_from_policy(
     policy: &astra_config::runtime_config::ToolPolicyConfig,
 ) -> astra_turn_core::evaluation::EvaluationThresholds {
     astra_turn_core::evaluation::EvaluationThresholds {
-        redundant_overlapping_reads: policy.effective_redundant_reads_eval_threshold() as usize,
         search_fanout: policy.effective_search_fanout_eval_threshold() as usize,
         redundant_validation_retries: policy.effective_redundant_validation_retries_eval_threshold()
             as usize,
@@ -309,10 +308,11 @@ fn evaluate_policy_boundary(
         })
         .collect::<Vec<_>>();
     state.records_cursor = records.len();
-    let lifecycle_transition = new_records.iter().any(|record| {
+    let lifecycle_transition = boundary_facts.iter().any(|(record, fact)| {
         is_work_lifecycle_tool(&record.name)
-            && record.effective_disposition() == ToolCallDisposition::Executed
-            && record.ok
+            && fact.was_executed()
+            && fact.ok
+            && !fact.has_failed_outcome()
     });
     let mut authoritative_observation = false;
     for (record, fact) in &boundary_facts {
@@ -374,12 +374,12 @@ fn evaluate_policy_boundary(
     // behavioral guidance so a failed attempt cannot steer the next request.
     let successful_subject_window = subject_window
         .iter()
-        .filter(|record| record.was_executed() && record.ok)
+        .filter(|record| record.was_executed() && record.ok && !record.has_failed_outcome())
         .cloned()
         .collect::<Vec<_>>();
     let mut operation_counts = BTreeMap::new();
     for fact in &successful_subject_window {
-        if let Some(identity) = fact.complete_operation_identity() {
+        if let Some(identity) = fact.operation_identity() {
             *operation_counts.entry(identity).or_insert(0usize) += 1;
         }
     }
@@ -389,10 +389,6 @@ fn evaluate_policy_boundary(
     // equality run: A → failure/unknown → A is not two adjacent observations.
     let trailing_repeated_observation_evidence =
         astra_turn_core::evaluation::trailing_repeated_observation_evidence(&subject_window);
-    let redundant_reads =
-        astra_turn_core::evaluation::count_active_redundant_overlapping_read_facts(
-            &successful_subject_window,
-        );
     let exploration_streak =
         astra_turn_core::evaluation::exploration_family_fact_streak(&successful_subject_window)
             .map(|(_, streak)| streak)
@@ -412,7 +408,7 @@ fn evaluate_policy_boundary(
     // recovery. Invocation shape (batching, a mutation, or changed arguments)
     // is not outcome evidence and cannot clear a prior convergence decision.
     for (_, fact) in &boundary_facts {
-        if fact.was_executed() && fact.ok {
+        if fact.was_executed() && fact.ok && !fact.has_failed_outcome() {
             if let Some(key) = policy_operation_key(fact) {
                 state.low_yield_problem_operations.remove(&key);
             }
@@ -426,7 +422,10 @@ fn evaluate_policy_boundary(
     let successful_new_records = boundary_facts
         .iter()
         .filter(|(record, fact)| {
-            !is_work_lifecycle_tool(&record.name) && fact.was_executed() && fact.ok
+            !is_work_lifecycle_tool(&record.name)
+                && fact.was_executed()
+                && fact.ok
+                && !fact.has_failed_outcome()
         })
         .map(|(_, fact)| fact.clone())
         .collect::<Vec<_>>();
@@ -448,9 +447,9 @@ fn evaluate_policy_boundary(
         && authoritative_boundary_records
             .iter()
             .all(|record| record_is_observation_only(record));
-    let boundary_has_decisive_transition = authoritative_boundary_records
+    let boundary_has_decisive_transition = boundary_facts
         .iter()
-        .any(|record| record_is_decisive_transition(record));
+        .any(|(record, fact)| record_is_decisive_transition(record, fact));
     let inspection_watch_will_converge = state
         .search_converged_followup_inspections
         .is_some_and(|followups| boundary_is_inspection_only && followups >= 1);
@@ -466,7 +465,7 @@ fn evaluate_policy_boundary(
     };
     let reobserved_failure_operations = boundary_facts
         .iter()
-        .filter(|(_, fact)| fact.was_executed() && !fact.ok)
+        .filter(|(_, fact)| fact.was_executed() && fact.has_failed_outcome())
         .filter_map(|(_, fact)| policy_operation_key(fact))
         .filter(|key| {
             active_failure_operations.contains(key)
@@ -526,20 +525,6 @@ fn evaluate_policy_boundary(
             observed_at_round: completed_rounds,
             evidence_count: saturating_u32(exploration_streak),
             recommendation: RuntimePolicyRecommendation::TestExactHypothesis,
-        });
-    }
-    if redundant_reads >= thresholds.redundant_overlapping_reads
-        && entries.len() < general_entry_limit
-    {
-        entries.push(RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::ReadCoverageOverlap,
-            stage: stage(
-                RuntimePolicySignal::ReadCoverageOverlap,
-                saturating_u32(redundant_reads),
-            ),
-            observed_at_round: completed_rounds,
-            evidence_count: saturating_u32(redundant_reads),
-            recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
         });
     }
     if unresolved_outcomes > 0 && entries.len() < general_entry_limit {
@@ -890,16 +875,6 @@ fn record_args_value(record: &ToolCallRecord) -> Option<serde_json::Value> {
 /// therefore covers directory, Git, shell, network, and code-intelligence
 /// readers without a second scenario vocabulary.
 fn record_is_observation_only(record: &ToolCallRecord) -> bool {
-    // Execution-owned outcome evidence outranks the admission-time command
-    // classifier. Some otherwise observational command families have
-    // argument forms that write; a bound, validated changed receipt proves
-    // this invocation crossed a task-state boundary without teaching the
-    // policy engine a second shell vocabulary.
-    if crate::turn::agentic_loop::execution_phase::record_has_trusted_workspace_mutation_receipt(
-        record,
-    ) {
-        return false;
-    }
     if matches!(record.name.as_str(), "introspect" | "reflect") {
         return true;
     }
@@ -916,19 +891,19 @@ fn record_is_observation_only(record: &ToolCallRecord) -> bool {
 /// explicit non-observation actions. Unknown or malformed shell arguments stay
 /// conservative; a rejected/read-only call cannot become action merely because
 /// it is absent from an exploration allowlist.
-fn record_is_decisive_transition(record: &ToolCallRecord) -> bool {
+fn record_is_decisive_transition(
+    record: &ToolCallRecord,
+    fact: &astra_turn_core::evaluation::ToolEvaluationFact,
+) -> bool {
     // A policy transition is a successful, typed change in task course.  A
     // failed scratch command must not erase convergence pressure merely
     // because its tool category can write.  Keep this narrower than general
     // admission: the policy is evidence for user-visible progress, not a
     // capability classifier.
-    if !record.was_executed() || !record.ok {
+    if !fact.was_executed() || !fact.ok || fact.has_failed_outcome() {
         return false;
     }
-    if crate::turn::agentic_loop::execution_phase::record_has_trusted_workspace_mutation_receipt(
-        record,
-    ) || crate::turn::agentic_loop::lifecycle::record_has_typed_workspace_tool_receipt(record)
-    {
+    if crate::turn::agentic_loop::lifecycle::record_has_typed_workspace_tool_receipt(record) {
         return true;
     }
     if matches!(record.name.as_str(), "introspect" | "reflect") {
@@ -1016,9 +991,6 @@ fn recommendation_text(
         }
         (RuntimePolicyRecommendation::TestExactHypothesis, RuntimePolicyStage::Converge) => {
             "The same exploration family persists across observed boundaries. Use the evidence already present to decide the hypothesis, or run one materially different decisive check."
-        }
-        (RuntimePolicyRecommendation::ReviewReadCoverage, _) => {
-            "Recorded reads cover overlapping ranges. This does not establish unchanged content or current context coverage. Check whether another read serves an unmet requirement; reuse prior results only when available and sufficient."
         }
         (RuntimePolicyRecommendation::DiagnoseToolOutcomes, RuntimePolicyStage::Observe) => {
             "Some tool calls failed. Treat each failure as scoped evidence: stop retrying the same operation, use a known-good alternative, and continue the task's next authorized mutation when its prerequisites are sufficient. Do not claim the affected Work item is delivered until its outcome is directly evidenced; report blocked/failed only when the failure prevents the requested result."
@@ -1441,88 +1413,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_policy_advances_only_on_new_authoritative_terminal_evidence() {
-        let mut state = RuntimePolicyEvaluationState::default();
-        let subject = work_subject("item-1");
-        let mut records = vec![executed("read_file", r#"{"path":"a.rs"}"#, 1)];
-        let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
-            .unwrap()
-            .expect("initial evaluation");
-        assert!(matches!(
-            first,
-            RuntimePolicyFeedbackSet::Evaluated { revision: 1, .. }
-        ));
-        assert!(
-            evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
-                .unwrap()
-                .is_none(),
-            "request preparation/retry without a terminal tool fact must reuse exact bytes"
-        );
-
-        records.push(executed("read_file", r#"{"path":"a.rs"}"#, 3));
-        records.push(executed("read_file", r#"{"path":"a.rs"}"#, 3));
-        records.push(executed("read_file", r#"{"path":"a.rs"}"#, 3));
-        let converging = evaluate_tool_boundary(&mut state, subject, &records, 3)
-            .unwrap()
-            .expect("calibrated redundant-read evidence changes policy");
-        let RuntimePolicyFeedbackSet::Evaluated {
-            revision, entries, ..
-        } = converging
-        else {
-            panic!("evaluated feedback expected");
-        };
-        assert_eq!(revision, 2);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].signal, RuntimePolicySignal::ReadCoverageOverlap);
-        assert_eq!(entries[0].stage, RuntimePolicyStage::Observe);
-
-        records.push(executed("read_file", r#"{"path":"a.rs"}"#, 4));
-        let converged = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 4)
-            .unwrap()
-            .expect("continued redundant reads advance an observed signal to converge");
-        assert!(matches!(
-            converged,
-            RuntimePolicyFeedbackSet::Evaluated { revision: 3, .. }
-        ));
-
-        records.push(executed("str_replace", r#"{"path":"a.rs"}"#, 5));
-        assert_eq!(
-            astra_turn_core::evaluation::count_active_redundant_overlapping_reads(&records),
-            0,
-            "the shared calibrated detector must treat mutation as invalidation"
-        );
-        let resolved = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 5)
-            .unwrap()
-            .expect("a workspace mutation invalidates stale read-overlap evidence");
-        let RuntimePolicyFeedbackSet::Evaluated {
-            revision, entries, ..
-        } = resolved
-        else {
-            panic!("evaluated feedback expected");
-        };
-        assert_eq!(revision, 4);
-        assert!(
-            entries
-                .iter()
-                .all(|entry| { entry.signal != RuntimePolicySignal::ReadCoverageOverlap })
-        );
-        let repeated = entries
-            .iter()
-            .find(|entry| entry.signal == RuntimePolicySignal::RepeatedOperation)
-            .expect("historical operation count remains observable after mutation");
-        assert_eq!(repeated.stage, RuntimePolicyStage::Observe);
-        assert_eq!(repeated.evidence_count, 5);
-
-        records.push(executed("read_file", r#"{"path":"d.rs"}"#, 6));
-        assert!(
-            evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 6)
-                .unwrap()
-                .is_none(),
-            "stable resolved evidence must reuse the exact policy revision"
-        );
-    }
-
-    #[test]
     fn typed_failures_are_feedback_evidence_and_later_success_resolves_them() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = work_subject("item-1");
@@ -1615,7 +1505,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(signals.contains(&RuntimePolicySignal::UnresolvedToolOutcomes));
         for forbidden in [
-            RuntimePolicySignal::ReadCoverageOverlap,
             RuntimePolicySignal::ExplorationFamilyChurn,
             RuntimePolicySignal::ValidationRetryChurn,
             RuntimePolicySignal::SearchFanout,
@@ -1626,39 +1515,6 @@ mod tests {
                 "failed execution was treated as positive behavioral evidence: {forbidden:?}"
             );
         }
-    }
-
-    #[test]
-    fn failed_mutation_does_not_invalidate_successful_read_evidence() {
-        let mut state = RuntimePolicyEvaluationState::default();
-        let mut records = vec![executed("read_file", r#"{"path":"src/lib.rs"}"#, 1)];
-        records
-            .extend((2..=4).map(|round| executed("read_file", r#"{"path":"src/lib.rs"}"#, round)));
-        let first = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 4)
-            .unwrap()
-            .expect("successful reads produce overlap evidence");
-        assert!(
-            entries(&first)
-                .iter()
-                .any(|entry| entry.signal == RuntimePolicySignal::ReadCoverageOverlap)
-        );
-
-        records.push(failed(
-            "str_replace",
-            r#"{"path":"src/lib.rs"}"#,
-            5,
-            "execution_error",
-        ));
-        let after_failed_mutation =
-            evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 5)
-                .unwrap()
-                .expect("the failed mutation is new failure evidence");
-        assert!(
-            entries(&after_failed_mutation)
-                .iter()
-                .any(|entry| entry.signal == RuntimePolicySignal::ReadCoverageOverlap),
-            "a failed mutation must not invalidate successful read evidence"
-        );
     }
 
     #[test]
@@ -1787,7 +1643,7 @@ mod tests {
         let subject = work_subject("item-1");
         let records = vec![ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(1),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,
@@ -1820,7 +1676,7 @@ mod tests {
 
         continued.push(ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(3),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,
@@ -2597,7 +2453,10 @@ mod tests {
         ] {
             assert!(record_is_observation_only(&record), "record: {record:?}");
             assert!(
-                !record_is_decisive_transition(&record),
+                !record_is_decisive_transition(
+                    &record,
+                    &astra_turn_core::evaluation::ToolEvaluationFact::from_record(&record)
+                ),
                 "record: {record:?}"
             );
         }
@@ -2605,7 +2464,13 @@ mod tests {
             executed("bash", r#"{"command":"cargo test"}"#, 1),
             typed_writer("src/fix.rs", 1),
         ] {
-            assert!(record_is_decisive_transition(&record), "record: {record:?}");
+            assert!(
+                record_is_decisive_transition(
+                    &record,
+                    &astra_turn_core::evaluation::ToolEvaluationFact::from_record(&record)
+                ),
+                "record: {record:?}"
+            );
         }
         for record in [
             executed("write_file", r#"{"path":"src/fix.rs","content":"x"}"#, 1),
@@ -2618,7 +2483,10 @@ mod tests {
             ),
         ] {
             assert!(
-                !record_is_decisive_transition(&record),
+                !record_is_decisive_transition(
+                    &record,
+                    &astra_turn_core::evaluation::ToolEvaluationFact::from_record(&record)
+                ),
                 "non-task-facing shell activity must not reset convergence: {record:?}"
             );
         }
@@ -2630,58 +2498,36 @@ mod tests {
             ..Default::default()
         };
         assert!(record_is_observation_only(&rejected_reader));
-        assert!(!record_is_decisive_transition(&rejected_reader));
+        assert!(!record_is_decisive_transition(
+            &rejected_reader,
+            &astra_turn_core::evaluation::ToolEvaluationFact::from_record(&rejected_reader)
+        ));
 
         let mixed = [
             executed("read_file", r#"{"path":"src/a.rs"}"#, 1),
             executed("write_file", r#"{"path":"src/a.rs","content":"x"}"#, 1),
         ];
         assert!(
-            !mixed.iter().any(record_is_decisive_transition),
+            !mixed.iter().any(|record| {
+                record_is_decisive_transition(
+                    record,
+                    &astra_turn_core::evaluation::ToolEvaluationFact::from_record(record),
+                )
+            }),
             "an unreceipted write is not task-facing policy progress"
         );
         assert!(!mixed.iter().all(record_is_observation_only));
     }
 
     #[test]
-    fn trusted_changed_receipt_clears_active_search_watch() {
-        let mut state = RuntimePolicyEvaluationState {
-            search_converged_followup_inspections: Some(1),
-            ..Default::default()
-        };
-        let record = ToolCallRecord {
-            name: "bash".to_string(),
-            args_full: Some(r#"{"command":"head -n 20 src/lib.rs"}"#.to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ok: true,
-            round: Some(1),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.to_string(),
-            ),
-            workspace_mutation_receipt: Some(
+    fn untrusted_changed_receipt_cannot_clear_active_search_watch() {
+        for (scope, receipt) in [
+            (
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE,
                 astra_tools::workspace_observation::changed_receipt()
                     .remove(astra_tools::workspace_observation::RECEIPT_FIELD)
                     .expect("changed receipt"),
             ),
-            ..Default::default()
-        };
-
-        assert!(!record_is_observation_only(&record));
-        assert!(record_is_decisive_transition(&record));
-        let feedback =
-            evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1).unwrap();
-        assert!(state.search_converged_followup_inspections.is_none());
-        assert!(
-            feedback
-                .as_ref()
-                .is_none_or(|set| !feedback_has_persistent_round_activity(set))
-        );
-    }
-
-    #[test]
-    fn untrusted_changed_receipt_cannot_clear_active_search_watch() {
-        for (scope, receipt) in [
             (
                 "external",
                 astra_tools::workspace_observation::changed_receipt()
@@ -2710,7 +2556,10 @@ mod tests {
             };
 
             assert!(record_is_observation_only(&record));
-            assert!(!record_is_decisive_transition(&record));
+            assert!(!record_is_decisive_transition(
+                &record,
+                &astra_turn_core::evaluation::ToolEvaluationFact::from_record(&record)
+            ));
             let feedback =
                 evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1)
                     .unwrap()
@@ -2745,173 +2594,111 @@ mod tests {
     }
 
     #[test]
-    fn unemitted_search_convergence_cannot_arm_inspection_watch() {
+    fn search_watch_tracks_emitted_feedback_across_projection_eviction() {
         let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
-            redundant_overlapping_reads: 1,
             search_fanout: 1,
             redundant_validation_retries: usize::MAX,
             llm_round_churn: usize::MAX,
             exploration_family_churn: 1,
         };
-        let mut state = RuntimePolicyEvaluationState::default();
-        let subject = RuntimePolicySubject::Run;
-        let mut records = vec![
-            executed("bash", r#"{"command":"git diff -- src/a.rs"}"#, 1),
-            executed("bash", r#"{"command":"git diff -- src/b.rs"}"#, 1),
-            executed("bash", r#"{"command":"rg first src"}"#, 2),
-        ];
-        let _ = evaluate_tool_boundary_with_thresholds(
-            &mut state,
-            subject.clone(),
-            &records,
-            2,
-            thresholds,
-            None,
-        )
-        .unwrap();
-        records.extend([
-            executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
-            executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
-            failed(
-                "read_file",
-                r#"{"path":"src/missing.rs"}"#,
-                3,
-                "execution_error",
-            ),
-            ToolCallRecord {
-                name: "read_file".to_string(),
-                args_full: Some(r#"{"path":"src/blocked.rs"}"#.to_string()),
-                round: Some(3),
-                disposition: Some(ToolCallDisposition::Rejected),
-                ok: false,
-                result_class: Some("rejected".to_string()),
-                ..Default::default()
-            },
-            executed("bash", r#"{"command":"rg second src"}"#, 3),
-        ]);
-        let saturated = evaluate_tool_boundary_with_thresholds(
-            &mut state,
-            subject.clone(),
-            &records,
-            3,
-            thresholds,
-            None,
-        )
-        .unwrap()
-        .expect("saturated projection is evaluated");
-        assert!(
-            entries(&saturated)
-                .iter()
-                .all(|entry| entry.signal != RuntimePolicySignal::SearchFanout),
-            "the bounded projection intentionally omitted SearchFanout: {saturated:?}"
-        );
-
-        for round in 4..=5 {
-            records.push(executed(
-                "read_file",
-                &format!(r#"{{"path":"src/after-{round}.rs"}}"#),
-                round,
-            ));
-            let feedback = evaluate_tool_boundary_with_thresholds(
+        for already_emitted in [false, true] {
+            let mut state = RuntimePolicyEvaluationState::default();
+            let subject = RuntimePolicySubject::Run;
+            let mut records = vec![
+                executed("bash", r#"{"command":"rg first src"}"#, 1),
+                executed("bash", r#"{"command":"rg second src"}"#, 1),
+            ];
+            let _ = evaluate_tool_boundary_with_thresholds(
                 &mut state,
                 subject.clone(),
                 &records,
-                round,
+                1,
                 thresholds,
                 None,
             )
             .unwrap();
-            let current = feedback.as_ref().unwrap_or_else(|| state.latest());
-            assert!(
-                !feedback_has_persistent_round_activity(current),
-                "an unemitted search signal cannot arm the inspection watch"
-            );
-        }
-    }
-
-    #[test]
-    fn emitted_search_watch_survives_later_projection_eviction() {
-        let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
-            redundant_overlapping_reads: 1,
-            search_fanout: 1,
-            redundant_validation_retries: usize::MAX,
-            llm_round_churn: usize::MAX,
-            exploration_family_churn: 1,
-        };
-        let mut state = RuntimePolicyEvaluationState::default();
-        let subject = RuntimePolicySubject::Run;
-        let mut records = vec![executed("bash", r#"{"command":"rg first src"}"#, 1)];
-        let _ = evaluate_tool_boundary_with_thresholds(
-            &mut state,
-            subject.clone(),
-            &records,
-            1,
-            thresholds,
-            None,
-        )
-        .unwrap();
-        records.push(executed("bash", r#"{"command":"rg second src"}"#, 2));
-        let delivered = evaluate_tool_boundary_with_thresholds(
-            &mut state,
-            subject.clone(),
-            &records,
-            2,
-            thresholds,
-            None,
-        )
-        .unwrap()
-        .expect("search convergence is projected");
-        assert!(entries(&delivered).iter().any(|entry| {
-            entry.signal == RuntimePolicySignal::SearchFanout
-                && entry.stage == RuntimePolicyStage::Converge
-        }));
-
-        records.extend([
-            executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
-            executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
-            failed(
-                "read_file",
-                r#"{"path":"src/missing.rs"}"#,
-                3,
-                "execution_error",
-            ),
-            ToolCallRecord {
-                name: "read_file".to_string(),
-                args_full: Some(r#"{"path":"src/blocked.rs"}"#.to_string()),
-                round: Some(3),
+            records.push(executed(
+                "bash",
+                r#"{"command":"rg third src"}"#,
+                if already_emitted { 2 } else { 3 },
+            ));
+            if already_emitted {
+                let delivered = evaluate_tool_boundary_with_thresholds(
+                    &mut state,
+                    subject.clone(),
+                    &records,
+                    2,
+                    thresholds,
+                    None,
+                )
+                .unwrap()
+                .expect("search convergence is projected");
+                assert!(entries(&delivered).iter().any(|entry| {
+                    entry.signal == RuntimePolicySignal::SearchFanout
+                        && entry.stage == RuntimePolicyStage::Converge
+                }));
+            }
+            records.push(ToolCallRecord {
+                error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+                ..failed(
+                    "read_file",
+                    r#"{"path":"src/missing.rs"}"#,
+                    3,
+                    "execution_error",
+                )
+            });
+            records.push(ToolCallRecord {
                 disposition: Some(ToolCallDisposition::Rejected),
-                ok: false,
-                result_class: Some("rejected".to_string()),
-                ..Default::default()
-            },
-        ]);
-        let evicted = evaluate_tool_boundary_with_thresholds(
-            &mut state,
-            subject.clone(),
-            &records,
-            3,
-            thresholds,
-            None,
-        )
-        .unwrap()
-        .expect("the saturated projection changes");
-        assert!(
-            entries(&evicted)
-                .iter()
-                .all(|entry| entry.signal != RuntimePolicySignal::SearchFanout)
-        );
-
-        records.push(executed(
-            "read_file",
-            r#"{"path":"src/second-followup.rs"}"#,
-            4,
-        ));
-        let persistent = evaluate_tool_boundary_with_thresholds(
-            &mut state, subject, &records, 4, thresholds, None,
-        )
-        .unwrap()
-        .expect("persistent inspection evidence reserves a projection slot");
-        assert!(feedback_has_persistent_round_activity(&persistent));
+                result_class: Some("rejected".into()),
+                ..failed("read_file", r#"{"path":"src/blocked.rs"}"#, 3, "rejected")
+            });
+            records.extend((0..2).map(|_| ToolCallRecord {
+                result_full: Some("same delivered snapshot".into()),
+                ..executed("read_file", r#"{"path":"src/a.rs"}"#, 3)
+            }));
+            let saturated = evaluate_tool_boundary_with_thresholds(
+                &mut state,
+                subject.clone(),
+                &records,
+                3,
+                thresholds,
+                None,
+            )
+            .unwrap()
+            .expect("independent observation facts fill the bounded projection");
+            assert_eq!(
+                entries(&saturated).len(),
+                RuntimePolicyFeedbackSet::MAX_ENTRIES
+            );
+            assert!(
+                entries(&saturated)
+                    .iter()
+                    .all(|entry| entry.signal != RuntimePolicySignal::SearchFanout),
+                "{saturated:?}"
+            );
+            for round in 4..=5 {
+                records.push(executed(
+                    "read_file",
+                    &format!(r#"{{"path":"src/after-{round}.rs"}}"#),
+                    round,
+                ));
+                let feedback = evaluate_tool_boundary_with_thresholds(
+                    &mut state,
+                    subject.clone(),
+                    &records,
+                    round,
+                    thresholds,
+                    None,
+                )
+                .unwrap();
+                let current = feedback.as_ref().unwrap_or_else(|| state.latest());
+                assert_eq!(
+                    feedback_has_persistent_round_activity(current),
+                    already_emitted,
+                    "only an emitted convergence can survive eviction and advance the watch: {current:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -3137,8 +2924,8 @@ mod tests {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = work_subject("item-1");
         let mut records = vec![failed(
-            "read_file",
-            r#"{"path":"missing"}"#,
+            "bash",
+            r#"{"command":"cargo test -p failing"}"#,
             1,
             "execution_error",
         )];
@@ -3163,8 +2950,8 @@ mod tests {
         );
 
         records.push(failed(
-            "read_file",
-            r#"{"path":"missing"}"#,
+            "bash",
+            r#"{"command":"cargo test -p failing"}"#,
             8,
             "execution_error",
         ));
@@ -3180,8 +2967,8 @@ mod tests {
         );
 
         records.push(failed(
-            "read_file",
-            r#"{"path":"missing"}"#,
+            "bash",
+            r#"{"command":"cargo test -p failing"}"#,
             9,
             "execution_error",
         ));
@@ -3194,6 +2981,25 @@ mod tests {
                 .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Converge)
+        );
+
+        let captured_causes = state.low_yield_problem_operations.clone();
+        assert!(!captured_causes.is_empty());
+        let mut delivered_failure = failed(
+            "bash",
+            r#"{"command":"cargo test -p failing"}"#,
+            10,
+            "test_failure",
+        );
+        delivered_failure.ok = true;
+        records.push(delivered_failure);
+        let feedback = evaluate_tool_boundary(&mut state, subject.clone(), &records, 11).unwrap();
+        assert!(feedback_has_persistent_round_activity(
+            feedback.as_ref().unwrap_or_else(|| state.latest())
+        ));
+        assert_eq!(
+            state.low_yield_problem_operations, captured_causes,
+            "a delivered failed-test result is not recovery of its operation"
         );
 
         // Push the original failure outside the bounded detector window.
@@ -3217,7 +3023,11 @@ mod tests {
             "window aging must not masquerade as outcome recovery"
         );
 
-        records.push(executed("read_file", r#"{"path":"missing"}"#, 66));
+        records.push(executed(
+            "bash",
+            r#"{"command":"cargo test -p failing"}"#,
+            66,
+        ));
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 66)
             .unwrap()
             .expect("same-tool success resolves the typed cause");
@@ -3338,11 +3148,11 @@ mod tests {
                         recommendation: RuntimePolicyRecommendation::ReviewTaskProgress,
                     },
                     RuntimePolicyFeedbackEntry {
-                        signal: RuntimePolicySignal::ReadCoverageOverlap,
+                        signal: RuntimePolicySignal::SearchFanout,
                         stage,
                         observed_at_round: 12,
                         evidence_count: 4,
-                        recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+                        recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
                     },
                 ],
             };
@@ -3358,14 +3168,14 @@ mod tests {
                 RuntimePolicyStage::Converge =>
                     instruction.contains("observed low-yield trajectory persists"),
             });
-            let overlap = &payload["entries"][1];
-            assert_eq!(overlap["signal"], "read_coverage_overlap");
-            assert_eq!(overlap["recommendation"], "review_read_coverage");
+            let search = &payload["entries"][1];
+            assert_eq!(search["signal"], "search_fanout");
+            assert_eq!(search["recommendation"], "narrow_evidence_search");
             assert!(
-                overlap["instruction"]
+                search["instruction"]
                     .as_str()
                     .unwrap()
-                    .contains("does not establish unchanged content or current context coverage")
+                    .contains("Search fan-out")
             );
             for entry in payload["entries"].as_array().unwrap() {
                 let instruction = entry["instruction"].as_str().unwrap();
@@ -3381,6 +3191,59 @@ mod tests {
         assert!(outcomes.contains("affected Work item"));
         assert!(outcomes.contains("requested result"));
         assert!(outcomes.contains("blocked/failed"));
+    }
+
+    #[test]
+    fn changed_path_observations_do_not_leave_execution_failure_pressure() {
+        let mut state = RuntimePolicyEvaluationState::default();
+        let subject = work_subject("inspect-file");
+        let mut missing = failed(
+            "read_file",
+            r#"{"path":"missing.rs"}"#,
+            1,
+            "execution_error",
+        );
+        missing.result_class = None;
+        missing.error_kind = Some(astra_core::ErrorKind::ToolNotFound);
+        let mut records = vec![missing];
+        let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            entries(&first)
+                .iter()
+                .all(|entry| entry.signal != RuntimePolicySignal::UnresolvedToolOutcomes)
+        );
+        assert!(
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+                .unwrap()
+                .is_none(),
+            "no new execution means no new feedback revision"
+        );
+        records.push(executed("read_file", r#"{"path":"correct.rs"}"#, 2));
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2).unwrap();
+        assert!(state.prior_active_failure_operations.is_empty());
+        records.push(failed(
+            "bash",
+            r#"{"command":"cargo test"}"#,
+            3,
+            "test_failure",
+        ));
+        let failing = evaluate_tool_boundary(&mut state, subject.clone(), &records, 3)
+            .unwrap()
+            .unwrap();
+        assert!(
+            entries(&failing)
+                .iter()
+                .any(|entry| entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes)
+        );
+        records.push(executed("read_file", r#"{"path":"another.rs"}"#, 4));
+        let _ = evaluate_tool_boundary(&mut state, subject, &records, 4).unwrap();
+        assert_eq!(
+            state.prior_active_failure_operations.len(),
+            1,
+            "unrelated reading does not establish test success"
+        );
     }
 
     #[test]
@@ -3475,11 +3338,11 @@ mod tests {
             subject: work_subject("item-7"),
             recovery: None,
             entries: vec![RuntimePolicyFeedbackEntry {
-                signal: RuntimePolicySignal::ReadCoverageOverlap,
+                signal: RuntimePolicySignal::SearchFanout,
                 stage: RuntimePolicyStage::Converge,
                 observed_at_round: 9,
                 evidence_count: 12,
-                recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+                recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
             }],
         };
 

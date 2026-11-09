@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 regex.workspace = true
+regex-automata = "0.4.18"
 sha2.workspace = true
 uuid.workspace = true
 serde_json = { workspace = true }

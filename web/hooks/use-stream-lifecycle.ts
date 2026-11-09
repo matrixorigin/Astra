@@ -612,8 +612,11 @@ export function useStreamLifecycle(
             activeRun: mergeStreamRunUpdate({ ...run, assistantMessageId }, current.activeRun),
           }));
         },
-        onRunFinished: () => {
-          if (canReceive()) setStoppingRun(false);
+        onRunFinished: run => {
+          if (canReceive()) {
+            assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
+            setStoppingRun(false);
+          }
         },
         onReasoning: reasoning => {
           if (canReceive()) assistantPatcher.patchBatched({ reasoning, reasoningStatus: "streaming", status: "streaming" });
@@ -940,8 +943,9 @@ export function useStreamLifecycle(
               ),
             }));
           },
-          onRunFinished: () => {
+          onRunFinished: run => {
             if (!canReceive()) return;
+            assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
             setStoppingRun(false);
             setStartingRun(false);
           },
@@ -1255,6 +1259,8 @@ export function useStreamLifecycle(
         setDetail(current => !owns(current) || current.activeRun !== cancellingRun ? current : {
           ...current,
           activeRun: result.activeRun ? mergeStreamRunUpdate(result.activeRun, current.activeRun) : undefined,
+          messages: current.messages.map(message => message.id === binding.assistantMessageId && result.contextNotSaved !== undefined
+            ? { ...message, contextNotSaved: result.contextNotSaved } : message),
         });
         hydrate();
       } catch (error) {

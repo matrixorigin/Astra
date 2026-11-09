@@ -194,6 +194,7 @@ impl AgenticRunLifecycleService {
                 run_id: run_id.to_owned(),
                 status: "cancellation_requested".to_owned(),
                 execution_settled: false,
+                context_not_saved: None,
             }),
         }
     }

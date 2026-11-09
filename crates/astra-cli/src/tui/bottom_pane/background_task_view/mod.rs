@@ -37,28 +37,27 @@ pub(crate) struct BackgroundTaskView {
 
 impl BackgroundTaskView {
     pub(crate) fn new(rows: Vec<BackgroundTaskRow>) -> Self {
-        let mut view = Self {
-            rows: sort_rows(rows),
-            selected: 0,
-            completed: false,
-            mode: Mode::List,
-            detail_scroll: Cell::new(0),
-            pending_action: None,
-        };
-        view.clamp_selection();
-        view
+        Self::new_with_selected(rows, None)
     }
 
     pub(crate) fn new_with_selected(
         rows: Vec<BackgroundTaskRow>,
         selected_id: Option<&str>,
     ) -> Self {
-        let mut view = Self::new(rows);
+        let mut view = Self {
+            rows: sort_rows(visible_rows(rows, selected_id)),
+            selected: 0,
+            completed: false,
+            mode: Mode::List,
+            detail_scroll: Cell::new(0),
+            pending_action: None,
+        };
         if let Some(selected_id) = selected_id
             && let Some(idx) = view.rows.iter().position(|row| row.id == selected_id)
         {
             view.selected = idx;
         }
+        view.clamp_selection();
         view
     }
 
@@ -72,6 +71,7 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) {
         let current_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        let rows = visible_rows(rows, selected_id.or(current_selected_id.as_deref()));
         let rows = sort_rows_preserving_work_unit_order(rows, &self.rows);
         let selected_idx = selected_id.and_then(|id| rows.iter().position(|row| row.id == id));
         let fallback_idx = current_selected_id
@@ -181,6 +181,60 @@ impl BackgroundTaskView {
             });
         }
     }
+
+    fn request_input(&mut self) {
+        if let Some(row) = self.selected_row()
+            && row.input_available
+            && row.live_control.can_stop()
+        {
+            self.pending_action = Some(ViewActionRequest {
+                action: BottomPaneViewAction::BeginShellInput {
+                    task_id: row.id.clone(),
+                },
+                disposition: ViewActionDisposition::KeepOpen,
+            });
+        }
+    }
+
+    fn request_local_output(&mut self) {
+        if let Some(row) = self.selected_row()
+            && row.kind == BackgroundTaskKind::Shell
+        {
+            self.pending_action = Some(ViewActionRequest {
+                action: BottomPaneViewAction::ViewShellOutput {
+                    task_id: row.id.clone(),
+                    attachment_epoch: None,
+                },
+                disposition: ViewActionDisposition::KeepOpen,
+            });
+        }
+    }
+}
+
+/// Keep the task switcher focused on live work and failures. Older successful
+/// shell output remains available through the task registry and session trace.
+fn visible_rows(rows: Vec<BackgroundTaskRow>, selected_id: Option<&str>) -> Vec<BackgroundTaskRow> {
+    let is_completed_shell = |row: &BackgroundTaskRow| {
+        row.kind == BackgroundTaskKind::Shell
+            && matches!(
+                row.status,
+                BackgroundTaskStatus::Completed | BackgroundTaskStatus::Cancelled
+            )
+    };
+    let mut completed: Vec<_> = rows.iter().filter(|row| is_completed_shell(row)).collect();
+    completed.sort_unstable_by(|a, b| b.ended_at_ms.cmp(&a.ended_at_ms).then(a.id.cmp(&b.id)));
+    let recent: std::collections::HashSet<_> = completed
+        .into_iter()
+        .take(3)
+        .map(|row| row.id.clone())
+        .collect();
+    rows.into_iter()
+        .filter(|row| {
+            !is_completed_shell(row)
+                || recent.contains(&row.id)
+                || selected_id == Some(row.id.as_str())
+        })
+        .collect()
 }
 
 fn work_unit_key(row: &BackgroundTaskRow) -> String {
@@ -268,6 +322,8 @@ impl BottomPaneView for BackgroundTaskView {
     fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::List => match key.code {
+                KeyCode::Char('i') => self.request_input(),
+                KeyCode::Char('v') => self.request_local_output(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => self.move_down(),
                 KeyCode::PageUp => self.move_page_up(),
@@ -290,6 +346,8 @@ impl BottomPaneView for BackgroundTaskView {
                 _ => {}
             },
             Mode::Detail => match key.code {
+                KeyCode::Char('i') => self.request_input(),
+                KeyCode::Char('v') => self.request_local_output(),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.detail_scroll
                         .set(self.detail_scroll.get().saturating_sub(1));
@@ -354,10 +412,25 @@ impl BottomPaneView for BackgroundTaskView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        match self.mode {
-            Mode::List => Some("↑↓ move · Enter details · S stop · Esc close".into()),
-            Mode::Detail => Some("↑↓ scroll · PgUp/PgDn page · S stop · Esc list · Q close".into()),
-        }
+        let input = if self.selected_row().is_some_and(|row| row.input_available) {
+            " · I input"
+        } else {
+            ""
+        };
+        let output = if self
+            .selected_row()
+            .is_some_and(|row| row.kind == BackgroundTaskKind::Shell)
+        {
+            " · V local output"
+        } else {
+            ""
+        };
+        Some(match self.mode {
+            Mode::List => format!("↑↓ move · Enter details{output}{input} · S stop · Esc close"),
+            Mode::Detail => {
+                format!("↑↓ scroll · PgUp/PgDn page{output}{input} · S stop · Esc list · Q close")
+            }
+        })
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -442,6 +515,36 @@ mod tests {
             }
         }
         buffer_to_string(&draw_widget(ViewWidget(view), width, height))
+    }
+
+    #[test]
+    fn task_switcher_keeps_active_failures_and_recent_shell_results() {
+        let mut rows = vec![
+            row("running", "running", "build"),
+            row("failed", "failed", "test"),
+        ];
+        rows.extend((0..8).map(|index| {
+            row(&format!("done-{index}"), "completed", "inspection")
+                .with_timing(Some(index), Some(index))
+        }));
+        let mut view = BackgroundTaskView::new(rows.clone());
+        let shown = render(&view, 100, 12);
+        assert!(
+            shown.contains("running") && shown.contains("failed"),
+            "{shown}"
+        );
+        assert_eq!(
+            view.rows
+                .iter()
+                .filter(|row| row.status == BackgroundTaskStatus::Completed)
+                .count(),
+            3
+        );
+        assert!(view.rows.iter().any(|row| row.id == "done-7"));
+        assert!(!view.rows.iter().any(|row| row.id == "done-0"));
+
+        view.replace_rows_with_selected(rows, Some("done-0"));
+        assert_eq!(view.selected_row().unwrap().id, "done-0");
     }
 
     #[test]
@@ -752,6 +855,17 @@ mod tests {
     }
 
     #[test]
+    fn detail_shows_local_capture_paths_for_interactive_shell() {
+        let row = BackgroundTaskRow::shell("task", "running", 0, "interactive", None, None, None)
+            .with_local_capture_paths(Some(("/private/stdout".into(), "/private/stderr".into())));
+        let mut view = BackgroundTaskView::new(vec![row]);
+        view.handle_key(key(KeyCode::Enter));
+        let text = render(&view, 100, 14);
+        assert!(text.contains("local stdout /private/stdout"), "{text}");
+        assert!(text.contains("local stderr /private/stderr"), "{text}");
+    }
+
+    #[test]
     fn detail_keeps_actionable_diagnostics_visible_and_scrolls_secondary_metadata() {
         let mut view = BackgroundTaskView::new(vec![
             BackgroundTaskRow::shell(
@@ -1032,6 +1146,19 @@ mod tests {
 
         assert!(view.take_action_request().is_none());
         assert!(!view.is_complete());
+    }
+
+    #[test]
+    fn local_output_is_available_when_shell_stdin_is_closed() {
+        let mut view = BackgroundTaskView::new(vec![row("shell", "running", "command")]);
+        assert!(!view.selected_row().unwrap().input_available);
+        view.handle_key(key(KeyCode::Char('v')));
+        assert!(
+            matches!(view.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::ViewShellOutput { task_id, attachment_epoch: None },
+            disposition: ViewActionDisposition::KeepOpen,
+        }) if task_id == "shell")
+        );
     }
 
     #[test]

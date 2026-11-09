@@ -454,6 +454,16 @@ impl HttpMemoriaPort {
     }
 
     fn status_error(&self, operation: &str, status: reqwest::StatusCode) -> String {
+        if operation == "idempotent store"
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            return format!(
+                "Memoria {operation} HTTP {status}: this backend does not provide the required idempotent write endpoint; upgrade Memoria before retrying session memory maintenance"
+            );
+        }
         if self.owner_scoped_master && status == reqwest::StatusCode::UNAUTHORIZED {
             return format!(
                 "Memoria {operation} HTTP {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme"
@@ -1782,6 +1792,30 @@ mod tests {
             socket.write_all(response_body).await.unwrap();
         });
         (address, captured, server)
+    }
+
+    #[tokio::test]
+    async fn missing_idempotent_endpoint_explains_the_backend_requirement() {
+        let (address, captured, server) =
+            capture_one_http_request("405 Method Not Allowed", b"{}").await;
+        let client = HttpMemoriaPort::new(format!("http://{address}"), "fixture".into())
+            .with_owner_user_id("owner");
+        let error = client
+            .store_idempotent("content", "working", "session", "T3", "key")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .starts_with("POST /v1/memories/idempotent ")
+        );
+        assert!(
+            error.contains("required idempotent write endpoint"),
+            "{error}"
+        );
+        assert!(error.contains("upgrade Memoria"), "{error}");
     }
 
     #[test]

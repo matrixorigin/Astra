@@ -492,14 +492,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
     }
     .to_string();
     let mut context = serde_json::Map::new();
-    for field in [
-        "edge_tools",
-        "edge_profile",
-        "edge_skills",
-        "thinking",
-        "rollback_on_failure",
-        "rollback_boundary",
-    ] {
+    for field in ["edge_tools", "edge_profile", "edge_skills", "thinking"] {
         if let Some(value) = source.remove(field) {
             context.insert(field.to_string(), value);
         }
@@ -1243,8 +1236,6 @@ fn inject_runtime_turn_overrides(
 
     if is_plan_subtask {
         root.insert("is_plan_subtask".into(), json!(true));
-        root.insert("rollback_on_failure".into(), json!(true));
-        root.insert("rollback_boundary".into(), json!("turn"));
     }
     if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
         root.insert("plan_subtask_id".into(), json!(id));
@@ -1729,7 +1720,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
-        turn_rollback_on_failure: is_plan_subtask,
+        compensate_non_file_on_failure: is_plan_subtask,
         tool_cache,
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
@@ -2636,8 +2627,8 @@ mod tests {
 
         assert!(payload.get("skill_search").is_none());
         assert_eq!(payload["is_plan_subtask"], json!(true));
-        assert_eq!(payload["rollback_on_failure"], json!(true));
-        assert_eq!(payload["rollback_boundary"], json!("turn"));
+        assert!(payload.get("rollback_on_failure").is_none());
+        assert!(payload.get("rollback_boundary").is_none());
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
     }
 
@@ -3448,10 +3439,11 @@ mod tests {
             schema("read_file"),
         ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
-        let executor = Arc::new(
-            ToolExecutor::new(temp_dir.path())
-                .with_bg_task_commands(Arc::new(std::sync::Mutex::new(Vec::new()))),
-        );
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        ));
         let messages = vec![json!({"role": "user", "content": "run make check"})];
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -3535,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_removes_background_controls_without_a_registry_binding() {
+    fn runtime_filter_requires_a_session_owner_for_shell_controls() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut schemas = vec![
             schema("bash"),
@@ -3555,8 +3547,32 @@ mod tests {
             astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
             std::collections::HashSet::from(["bash".to_string()])
         );
-        assert_eq!(report.visible_tools, vec!["bash".to_string()]);
         assert_eq!(report.visible_count, 1);
+
+        let mut schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+        ];
+        let mut report = surface_report_from_visible_schemas(&schemas, 4, 4);
+        let executor = crate::edge_tools::ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        );
+        assert!(runtime_filter_turn_schemas_and_report(
+            &executor,
+            &mut schemas,
+            &mut report
+        ));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
+            std::collections::HashSet::from(
+                ["bash", "task_output", "task_list", "task_stop"].map(str::to_string)
+            )
+        );
+        assert_eq!(report.visible_count, 4);
     }
 
     #[tokio::test]

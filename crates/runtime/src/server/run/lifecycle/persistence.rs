@@ -285,6 +285,7 @@ impl PostLoopPersistContext {
         error_metadata: Option<&astra_services::models::ModelGatewayErrorMetadata>,
         cancellation_origin: Option<astra_turn_core::orchestration_types::CancellationOrigin>,
         context_commit: Option<&PreparedSessionContextCommit>,
+        context_not_saved: bool,
     ) -> Result<Option<CanonicalTerminalSettlementCommit>, String> {
         let Some(pool) = self.shared_pool.as_ref() else {
             return Ok(None);
@@ -315,6 +316,7 @@ impl PostLoopPersistContext {
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
                 context_commit,
+                context_not_saved,
             },
             terminal_operation,
         )
@@ -380,6 +382,7 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
     pub(crate) completion_tokens: u64,
     pub(crate) tool_calls: u32,
     pub(crate) context_commit: Option<&'a PreparedSessionContextCommit>,
+    pub(crate) context_not_saved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +511,22 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
+    // Normalize the terminal once, before its receipt, claim and replay are
+    // built. A typed interruption owns its public message when there is no
+    // separately classified provider error.
+    let settlement = if let Some(interruption) = state.interruption.as_ref().filter(|_| {
+        settlement.status == STATUS_FAILED
+            && settlement.error_kind.is_none()
+            && settlement.error_metadata.is_none()
+    }) {
+        CanonicalTerminalSettlement {
+            error_message: Some(&interruption.user_message),
+            error_code: Some(interruption.kind.label()),
+            ..settlement
+        }
+    } else {
+        settlement
+    };
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -576,7 +595,7 @@ async fn prepare_canonical_terminal(
     let outcome = CanonicalRunTerminalReceipt::outcome_for_request(request)?;
     let context = if authority.is_none() {
         CanonicalTerminalContext::Unowned
-    } else if matches!(outcome, CanonicalTerminalOutcome::Cancelled { .. }) {
+    } else if settlement.context_not_saved {
         CanonicalTerminalContext::Revoked
     } else if let Some(prepared) = settlement.context_commit {
         CanonicalTerminalContext::Advanced {
@@ -632,12 +651,10 @@ async fn prepare_canonical_terminal(
         interruption: state
             .interruption
             .as_ref()
-            .filter(|interruption| {
+            .filter(|_| {
                 settlement.status == STATUS_FAILED
                     && settlement.error_kind.is_none()
                     && settlement.error_metadata.is_none()
-                    && interruption.kind
-                        == astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
             })
             .map(astra_turn_core::interruption::InterruptionRecord::public_projection),
         context,
@@ -658,13 +675,70 @@ async fn prepare_canonical_terminal(
     Ok(PreparedCanonicalTerminal { receipt, authority })
 }
 
+enum CanonicalAppendError {
+    ContextFenced,
+    Other(String),
+}
+
+impl From<String> for CanonicalAppendError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<&str> for CanonicalAppendError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.to_owned())
+    }
+}
+
 async fn persist_server_loop_canonical_append_inner(
     pool: &SharedPool,
     append: CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
-    mut settlement: Option<CanonicalTerminalSettlement<'_>>,
+    settlement: Option<CanonicalTerminalSettlement<'_>>,
     mut terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
+    let first = persist_server_loop_canonical_append_attempt(
+        pool,
+        &append,
+        state,
+        settlement,
+        &mut terminal_operation,
+        false,
+    )
+    .await;
+    let result = match first {
+        // A revoked Context must not keep an otherwise valid cancellation
+        // running. The first transaction was rolled back before this retry;
+        // the same Run owner and cancellation marker still fence the second.
+        Err(CanonicalAppendError::ContextFenced) => {
+            persist_server_loop_canonical_append_attempt(
+                pool,
+                &append,
+                state,
+                settlement,
+                &mut terminal_operation,
+                true,
+            )
+            .await
+        }
+        result => result,
+    };
+    result.map_err(|error| match error {
+        CanonicalAppendError::ContextFenced => "canonical Context was fenced".into(),
+        CanonicalAppendError::Other(error) => error,
+    })
+}
+
+async fn persist_server_loop_canonical_append_attempt(
+    pool: &SharedPool,
+    append: &CanonicalLoopAppend<'_>,
+    state: &AgenticLoopState,
+    mut settlement: Option<CanonicalTerminalSettlement<'_>>,
+    terminal_operation: &mut Option<RunOwnerLeaseTerminalOperation<'_>>,
+    revoke_context: bool,
+) -> Result<CanonicalTerminalSettlementCommit, CanonicalAppendError> {
     if let Some(settlement) = settlement
         && append.expected_owner_generation != Some(settlement.expected_owner_generation)
     {
@@ -681,10 +755,13 @@ async fn persist_server_loop_canonical_append_inner(
     );
     let mut plan = match settlement {
         Some(settlement) => {
-            Some(prepare_canonical_terminal(pool, &append, state, settlement, &items).await?)
+            Some(prepare_canonical_terminal(pool, append, state, settlement, &items).await?)
         }
         None => None,
     };
+    if revoke_context && let Some(prepared) = plan.as_mut() {
+        prepared.receipt.context = CanonicalTerminalContext::Revoked;
+    }
     let store = match settlement {
         Some(settlement) => DatabaseRunStateStore::new(pool.clone())
             .with_owner_pod_id(settlement.expected_owner_pod_id),
@@ -724,7 +801,7 @@ async fn persist_server_loop_canonical_append_inner(
                 .claim_canonical_terminal_with_controls_in_transaction(
                     &mut tx,
                     atomic_terminal_request(
-                        &append,
+                        append,
                         *current,
                         prepared.receipt.interruption.as_ref(),
                     ),
@@ -744,7 +821,6 @@ async fn persist_server_loop_canonical_append_inner(
                     *current = CanonicalTerminalSettlement {
                         status: STATUS_CANCELLED,
                         expected_statuses: &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
-                        context_commit: None,
                         cancellation_origin: Some(
                             astra_turn_core::orchestration_types::CancellationOrigin::User,
                         ),
@@ -755,11 +831,6 @@ async fn persist_server_loop_canonical_append_inner(
                     };
                     prepared.receipt.outcome = CanonicalTerminalOutcome::Cancelled {
                         origin: DurableCancellationOrigin::User,
-                    };
-                    prepared.receipt.context = if prepared.authority.is_some() {
-                        CanonicalTerminalContext::Revoked
-                    } else {
-                        CanonicalTerminalContext::Unowned
                     };
                     prepared.receipt.error_code = None;
                     prepared.receipt.error_kind = None;
@@ -778,39 +849,61 @@ async fn persist_server_loop_canonical_append_inner(
         if admission.is_none() {
             tx.rollback().await.map_err(|error| error.to_string())?;
             drop(connection);
-            if store
-                .resolve_canonical_terminal_receipt(
-                    atomic_terminal_request(
-                        &append,
-                        *current,
-                        prepared.receipt.interruption.as_ref(),
-                    ),
-                    &prepared.receipt,
-                )
-                .await?
-                .is_none()
+            let request =
+                atomic_terminal_request(append, *current, prepared.receipt.interruption.as_ref());
+            let resolved = match store
+                .resolve_canonical_terminal_receipt(request, &prepared.receipt)
+                .await
             {
+                Ok(resolved) => resolved,
+                Err(error)
+                    if current.status == STATUS_CANCELLED
+                        && !matches!(
+                            prepared.receipt.context,
+                            CanonicalTerminalContext::Revoked
+                        ) =>
+                {
+                    // A prior exact attempt may have committed after the
+                    // Context fence forced the cancellation-only fallback.
+                    let mut revoked = prepared.receipt.clone();
+                    revoked.context = CanonicalTerminalContext::Revoked;
+                    match store
+                        .resolve_canonical_terminal_receipt(request, &revoked)
+                        .await
+                    {
+                        Ok(Some(resolved)) => {
+                            prepared.receipt = revoked;
+                            Some(resolved)
+                        }
+                        _ => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if resolved.is_none() {
                 return Err(format!(
                     "canonical terminal lost durable execution authority at generation {}",
                     current.expected_owner_generation
-                ));
+                )
+                .into());
             }
             let cursor = match &prepared.receipt.context {
                 CanonicalTerminalContext::Advanced { cursor, .. } => Some(cursor),
                 _ => None,
             };
-            verify_canonical_append_evidence(pool, &append, state, cursor).await?;
+            verify_canonical_append_evidence(pool, append, state, cursor).await?;
             verify_terminal_context_evidence(pool, *current, &prepared.receipt).await?;
             if let Some(operation) = terminal_operation.take() {
                 operation.retire();
             }
             return canonical_terminal_projection(
-                &append,
+                append,
                 &items,
                 prepared,
                 current.error_message,
                 Vec::new(),
-            );
+            )
+            .map_err(Into::into);
         }
     } else if let Some(generation) = append.expected_owner_generation {
         let duration = append
@@ -824,42 +917,57 @@ async fn persist_server_loop_canonical_append_inner(
         if affected != 1 {
             return Err(format!(
                 "canonical append lost durable execution authority at generation {generation}"
-            ));
+            )
+            .into());
         }
     }
     let canonical_context_cursor = if let (Some(current), Some(prepared), Some(admission)) =
         (settlement, plan.as_ref(), admission.as_ref())
     {
         let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        match &prepared.receipt.context {
-            CanonicalTerminalContext::Advanced { .. } => Some(
-                coordinator
-                    .commit_turn_in_terminal_transaction(
-                        &mut tx,
-                        current
-                            .context_commit
-                            .ok_or("advanced terminal has no prepared Context")?,
-                        admission,
+        let context_result = match &prepared.receipt.context {
+            CanonicalTerminalContext::Advanced { .. } => coordinator
+                .commit_turn_in_terminal_transaction(
+                    &mut tx,
+                    current
+                        .context_commit
+                        .ok_or("advanced terminal has no prepared Context")?,
+                    admission,
+                )
+                .await
+                .map(Some),
+            CanonicalTerminalContext::Unchanged => coordinator
+                .validate_unchanged_run_context_in_terminal_transaction(
+                    &mut tx,
+                    prepared
+                        .authority
+                        .as_ref()
+                        .ok_or("empty terminal has no admitted base")?,
+                    &prepared.receipt.opening_hash,
+                    admission,
+                )
+                .await
+                .map(|()| None),
+            CanonicalTerminalContext::Revoked | CanonicalTerminalContext::Unowned => Ok(None),
+        };
+        match context_result {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                use astra_services::SessionContextCoordinatorError as E;
+                if current.status == STATUS_CANCELLED
+                    && matches!(
+                        error,
+                        E::Fenced
+                            | E::ExecutionBindingFenced { .. }
+                            | E::ExecutionBindingPresent { .. }
+                            | E::ExecutionBindingNotReady(_)
                     )
-                    .await
-                    .map_err(|error| error.to_string())?,
-            ),
-            CanonicalTerminalContext::Unchanged => {
-                coordinator
-                    .validate_unchanged_run_context_in_terminal_transaction(
-                        &mut tx,
-                        prepared
-                            .authority
-                            .as_ref()
-                            .ok_or("empty terminal has no admitted base")?,
-                        &prepared.receipt.opening_hash,
-                        admission,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                None
+                {
+                    tx.rollback().await.map_err(|error| error.to_string())?;
+                    return Err(CanonicalAppendError::ContextFenced);
+                }
+                return Err(error.to_string().into());
             }
-            CanonicalTerminalContext::Revoked | CanonicalTerminalContext::Unowned => None,
         }
     } else {
         None
@@ -883,12 +991,12 @@ async fn persist_server_loop_canonical_append_inner(
         Err(error) => {
             drop(connection);
             let (Some(current), Some(prepared)) = (settlement, plan.as_ref()) else {
-                return Err(format!("canonical commit acknowledgement failed: {error}"));
+                return Err(format!("canonical commit acknowledgement failed: {error}").into());
             };
             if store
                 .resolve_canonical_terminal_receipt(
                     atomic_terminal_request(
-                        &append,
+                        append,
                         current,
                         prepared.receipt.interruption.as_ref(),
                     ),
@@ -897,13 +1005,11 @@ async fn persist_server_loop_canonical_append_inner(
                 .await?
                 .is_none()
             {
-                return Err(format!(
-                    "canonical commit acknowledgement unresolved: {error}"
-                ));
+                return Err(format!("canonical commit acknowledgement unresolved: {error}").into());
             }
             verify_canonical_append_evidence(
                 pool,
-                &append,
+                append,
                 state,
                 canonical_context_cursor.as_ref(),
             )
@@ -918,12 +1024,13 @@ async fn persist_server_loop_canonical_append_inner(
     }
     if let (Some(current), Some(prepared)) = (settlement, plan.as_ref()) {
         canonical_terminal_projection(
-            &append,
+            append,
             &items,
             prepared,
             current.error_message,
             control_events,
         )
+        .map_err(Into::into)
     } else {
         Ok(CanonicalTerminalSettlementCommit {
             terminal_status: None,
@@ -1046,11 +1153,11 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     // one agent-turn scope; durable replay is owned by the invocation ledger
     // instead.
     loop_state.idempotency_cache = Default::default();
-    if restored.workspace_observation_quarantine.is_some() {
-        loop_state.stall.workspace_observation_quarantine =
-            restored.workspace_observation_quarantine;
-    }
-    loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    // A prior Run's observation quarantine is not execution authority for a
+    // new Run. Unresolved calls are surfaced separately from the journal.
+    // Retry admission belongs to this request, not checkpoint history. The
+    // user may have changed the model capacity or request since the failure.
+    loop_state.consecutive_context_window_errors = 0;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
@@ -1065,6 +1172,9 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
                 current_date,
             ),
         );
+    }
+    if let Some(session) = loop_state.pipeline_session.as_mut() {
+        session.recovery.reset_on_success();
     }
     Ok(())
 }
@@ -3195,6 +3305,26 @@ mod tests {
     }
 
     #[test]
+    fn server_loop_observer_never_exports_provider_reasoning() {
+        let mut state = observer_test_state();
+        state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = json!({
+            "items":[{"type":"reasoning", "content":[
+                {"type":"reasoning_text", "text":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}
+            ]}]
+        });
+        let request = build_server_loop_observer_request("user-1", "session-1", &state).unwrap();
+        let payload = serde_json::to_string(&request.messages).unwrap();
+        assert!(!payload.contains("_astra_responses"));
+        assert!(!payload.contains("reasoning_text"));
+        assert!(!payload.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(
+            state.messages[1]
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn server_loop_observer_excludes_structured_memory_operation_turns() {
         let mut state = observer_test_state();
         state.messages = vec![
@@ -4076,6 +4206,7 @@ mod tests {
                 completion_tokens: 7,
                 tool_calls: 3,
                 context_commit: None,
+                context_not_saved: false,
             },
             None,
         )
@@ -4221,6 +4352,7 @@ mod tests {
                 completion_tokens: 13,
                 tool_calls: 5,
                 context_commit: None,
+                context_not_saved: false,
             },
             None,
         )
@@ -4314,6 +4446,316 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn current_turn_reasoning_cleanup_survives_replace_and_next_admission() {
+        use super::super::{AgenticRunLifecycleService, RootTurnStartParticipant};
+        use astra_services::{SessionContextCoordinator, runs::RunLifecycleService};
+        use astra_turn_types::{
+            ActorContextV1, ActorKindV1, AuthorityEpochsV1, CanonicalDeltaModeV1,
+            CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+        };
+
+        let pool = setup_pool().await;
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        for completed in [true, false] {
+            let user = Uuid::new_v4().to_string();
+            let session = Uuid::new_v4().to_string();
+            let run_id = Uuid::new_v4().to_string();
+            let route = Uuid::new_v4().to_string();
+            let other_route = Uuid::new_v4().to_string();
+            crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+            let key = SessionKeyV1::owner_session("server", &user, &session, "main");
+            let actor = ActorContextV1::owner_user(
+                &user,
+                "fixture",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Server,
+                None,
+                AuthorityEpochsV1::default(),
+            );
+            let reservation = match coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    None,
+                    &actor,
+                    Duration::from_secs(60),
+                    "fixture-writer",
+                    "fixture-turn",
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                astra_services::AcquireWriterAndReserveTurnOutcome::Ready {
+                    reservation, ..
+                } => reservation,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            let encryptor = astra_services::FernetTokenEncryptor::new("fixture-key").unwrap();
+            let mut history = vec![
+                json!({"role":"user", "content":"old request ".repeat(1000)}),
+                json!({"role":"assistant", "content":"old answer ".repeat(1000)}),
+            ];
+            for scope in [&route, &other_route] {
+                let mut saved = json!({"connection_id":scope, "model":"model", "items":[
+                    {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]},
+                    {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}
+                ]});
+                crate::turn::llm::private_continuation::seal(
+                    &mut saved, &encryptor, &user, &session,
+                )
+                .unwrap();
+                history.push(json!({"role":"user", "content":"request"}));
+                history.push(json!({"role":"assistant", "content":"done", astra_core::model_wire::responses::CONTINUATION_KEY:saved}));
+            }
+            let delta = CanonicalTurnDeltaV1 {
+                schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                config_version_id: None,
+                mode: CanonicalDeltaModeV1::Append,
+                logical_segments: vec![history],
+            };
+            coordinator
+                .commit_turn_and_release_writer(&reservation, delta, "fixture-commit")
+                .await
+                .unwrap();
+
+            let owner = "reasoning-replace-owner";
+            let service = super::super::tests::db_backed_test_service(&pool, owner);
+            let request = super::super::tests::prepared_test_request("continue");
+            let mut participant = RootTurnStartParticipant {
+                service: &service,
+                user_id: &user,
+                session_id: &session,
+                run_id: &run_id,
+                request: &request,
+                admission: None,
+                prepared: None,
+                rejection: None,
+                full_llm_capture: None,
+            };
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &run_id,
+                    &user,
+                    &session,
+                    Some(&session),
+                    crate::server::run::engine::RunStartContext {
+                        original_input: Some(request.message.clone()),
+                        ..Default::default()
+                    },
+                    true,
+                    &mut participant,
+                )
+                .await
+                .unwrap();
+            let mut admitted = participant.admission.take().unwrap();
+            let materialized = coordinator
+                .materialize(admitted.authority.base_head.as_ref().unwrap())
+                .await
+                .unwrap();
+            admitted.prior_messages = materialized.messages;
+            admitted.authorized_session_ids = Some(materialized.authorized_session_ids);
+            let cursor = &admitted.authority.base_head.as_ref().unwrap().cursor;
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.initialize_provider_canonical_wal_base(&admitted.prior_messages);
+            state.initialize_canonical_rewrite_proof(
+                &admitted.prior_messages,
+                &cursor.canonical_root_hash,
+                cursor.compaction_generation,
+            );
+            state.messages = admitted.prior_messages.clone();
+            state
+                .messages
+                .push(json!({"role":"user", "content":request.message}));
+            state
+                .messages
+                .push(json!({"role":"assistant", "content":"answer"}));
+            state.final_text = "answer".into();
+            let permit = state.begin_canonical_rewrite();
+            state.messages = crate::turn::cloud::compaction::prepare_prefix_summary(
+                &state.messages,
+                2,
+                astra_turn_core::cloud::history_summary::history_summary_message("summary".into()),
+                0,
+                128_000,
+                None,
+            )
+            .unwrap()
+            .messages;
+            state.finish_canonical_rewrite(permit);
+            let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
+                Some(&admitted),
+                &state.messages,
+                state.canonical_rewrite_proof(),
+                false,
+                completed.then_some((route.as_str(), "model")),
+                &run_id,
+            )
+            .unwrap()
+            .unwrap();
+            let settlement = CanonicalTerminalSettlement {
+                expected_owner_pod_id: owner,
+                expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
+                expected_owner_generation: admitted.authority.generation,
+                status: if completed {
+                    astra_core::STATUS_COMPLETED
+                } else {
+                    STATUS_FAILED
+                },
+                waiting_for: None,
+                error_message: (!completed).then_some("provider disconnected"),
+                error_code: (!completed).then_some("provider_connection_lost"),
+                error_kind: (!completed).then_some(astra_core::ErrorKind::Network),
+                error_metadata: None,
+                cancellation_origin: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                context_commit: Some(&context),
+                context_not_saved: false,
+            };
+            persist_server_loop_canonical_terminal_settlement(
+                &pool,
+                CanonicalLoopAppend {
+                    user_id: &user,
+                    session_id: &session,
+                    run_id: &run_id,
+                    expected_owner_generation: Some(admitted.authority.generation),
+                    owner_lease_duration: Some(Duration::from_secs(45)),
+                    trace_context: None,
+                    user_message: &request.message,
+                    include_terminal_assistant: true,
+                },
+                &state,
+                settlement,
+                None,
+            )
+            .await
+            .unwrap();
+            let head = coordinator.load_head(&key).await.unwrap().unwrap();
+            let restored = coordinator.materialize(&head).await.unwrap().messages;
+            let has_reasoning = |scope: &str| {
+                restored.iter().any(|message| {
+                    message[astra_core::model_wire::responses::CONTINUATION_KEY]["connection_id"]
+                        == scope
+                        && astra_core::model_wire::responses::has_reasoning_continuation(message)
+                })
+            };
+            assert_eq!(has_reasoning(&route), !completed);
+            assert!(has_reasoning(&other_route));
+            for (scope, expected) in [(&route, !completed), (&other_route, true)] {
+                let mut projected = restored.clone();
+                projected.push(json!({"role":"user", "content":"continue"}));
+                crate::turn::llm::private_continuation::open(
+                    &mut projected,
+                    &encryptor,
+                    &user,
+                    &HashSet::from([session.clone()]),
+                    scope,
+                    "model",
+                )
+                .unwrap();
+                let request = astra_core::model_wire::responses::request(
+                    "model", &projected, None, scope, false, None,
+                )
+                .unwrap();
+                assert_eq!(
+                    request["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "reasoning"),
+                    expected
+                );
+            }
+
+            let next_run = Uuid::new_v4().to_string();
+            let next_request = super::super::tests::prepared_test_request("next turn");
+            let mut next = RootTurnStartParticipant {
+                service: &service,
+                user_id: &user,
+                session_id: &session,
+                run_id: &next_run,
+                request: &next_request,
+                admission: None,
+                prepared: None,
+                rejection: None,
+                full_llm_capture: None,
+            };
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &next_run,
+                    &user,
+                    &session,
+                    Some(&session),
+                    crate::server::run::engine::RunStartContext {
+                        original_input: Some(next_request.message.clone()),
+                        ..Default::default()
+                    },
+                    true,
+                    &mut next,
+                )
+                .await
+                .unwrap();
+            let mut next_admitted = next.admission.take().unwrap();
+            let materialized = coordinator
+                .materialize(next_admitted.authority.base_head.as_ref().unwrap())
+                .await
+                .unwrap();
+            next_admitted.prior_messages = materialized.messages;
+            next_admitted.authorized_session_ids = Some(materialized.authorized_session_ids);
+            assert_eq!(next_admitted.prior_messages, restored);
+            let mut next_state = crate::turn::agentic_loop::host::make_test_loop_state();
+            next_state.initialize_provider_canonical_wal_base(&next_admitted.prior_messages);
+            let mut predecessor = restored.clone();
+            predecessor.push(json!({"role":"user", "content":"next turn"}));
+            let transition =
+                astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+                    None,
+                    next_state.provider_canonical_wal_base.unwrap(),
+                    &predecessor,
+                    vec![],
+                )
+                .unwrap();
+            let mut replayed = restored.clone();
+            transition.apply_to(&mut replayed).unwrap();
+            assert_eq!(replayed, predecessor);
+            for table in [
+                "conversation_manifest_nodes",
+                "session_context_heads",
+                "session_context_operation_receipts",
+                "session_context_authority_events",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE owner_user_id = ? AND session_id = ?"
+                )))
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+            for table in ["agent_run_events", "agent_runs"] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+                )))
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+            cleanup_core_persist_fixture_for_owner(pool.get(), &session, &user).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
         assert_canonical_terminal(TerminalCase::RawCollision).await;
     }
@@ -4338,6 +4780,14 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn cancellation_survives_context_authority_change() {
+        assert_canonical_terminal(TerminalCase::UserCancellationFenced).await;
+        assert_canonical_terminal(TerminalCase::UserCancellationEmptyFenced).await;
+        assert_canonical_terminal(TerminalCase::UserCancellationResourceLimit).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_returns_late_guidance_without_claiming_model_application() {
         assert_canonical_terminal(TerminalCase::LateGuidance).await;
     }
@@ -4356,7 +4806,33 @@ mod tests {
         LateGuidance,
         RawCollision,
         UserCancellation,
+        UserCancellationFenced,
+        UserCancellationEmptyFenced,
+        UserCancellationResourceLimit,
         Paused,
+    }
+
+    impl TerminalCase {
+        fn user_cancelled(self) -> bool {
+            matches!(
+                self,
+                Self::UserCancellation
+                    | Self::UserCancellationFenced
+                    | Self::UserCancellationEmptyFenced
+                    | Self::UserCancellationResourceLimit
+            )
+        }
+
+        fn context_fenced(self) -> bool {
+            matches!(
+                self,
+                Self::UserCancellationFenced | Self::UserCancellationEmptyFenced
+            )
+        }
+
+        fn context_lost(self) -> bool {
+            self.context_fenced() || self == Self::UserCancellationResourceLimit
+        }
     }
 
     async fn assert_canonical_terminal(case: TerminalCase) {
@@ -4422,10 +4898,7 @@ mod tests {
             astra_turn_types::CanonicalTokenUsage::new(Some(101), Some(202), Some(303), Some(404))
                 .unwrap(),
         );
-        let incomplete = matches!(
-            case,
-            TerminalCase::Incomplete | TerminalCase::UserCancellation
-        );
+        let incomplete = case == TerminalCase::Incomplete || case.user_cancelled();
         if incomplete {
             use astra_turn_core::interruption::{
                 InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
@@ -4445,7 +4918,7 @@ mod tests {
         }
         if incomplete {
             let original_interruption = state.interruption.take();
-            let kind = if case == TerminalCase::UserCancellation {
+            let kind = if case.user_cancelled() {
                 astra_core::ErrorKind::Cancelled
             } else {
                 astra_core::ErrorKind::Network
@@ -4519,21 +4992,54 @@ mod tests {
             assert!(state.interruption.is_some());
             assert!(child_owner.has_pending_direct_children());
         }
-        let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
+        if case.user_cancelled() {
+            // The model already received one tool result when cancellation
+            // interrupted the other. Both facts must survive into the next run.
+            state.messages = vec![
+                json!({"role":"user", "content":request.message}),
+                json!({"role":"assistant", "content":null, "tool_calls":[
+                    {"id":"known", "type":"function", "function":{"name":"read_file", "arguments":"{}"}},
+                    {"id":"unknown", "type":"function", "function":{"name":"bash", "arguments":"{}"}}
+                ]}),
+                json!({"role":"tool", "tool_call_id":"known", "content":"recorded result"}),
+            ];
+        }
+        if case == TerminalCase::UserCancellationResourceLimit {
+            state
+                .messages
+                .push(json!({"role":"assistant", "content":"x".repeat(9 * 1024 * 1024)}));
+        }
+        let prepared_context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
             Some(&admitted),
             &state.messages,
             None,
             false,
+            None,
             &run_id,
-        )
-        .unwrap()
-        .unwrap();
+        );
+        let context = match prepared_context {
+            Err(astra_services::SessionContextCoordinatorError::ResourceLimit(_))
+                if case == TerminalCase::UserCancellationResourceLimit =>
+            {
+                None
+            }
+            other => Some(other.unwrap().unwrap()),
+        };
         let trace = server_trace_context(&user, &session, &run_id, state.session_turn);
         if case == TerminalCase::LateGuidance {
             store.append_event(&user, &session, &run_id, json!({"event_type":"user_intent", "idempotency_key":"user_intent:late",
                 "data":{"intent_id":"late", "delivery":"guide_current_run", "input":{"content":"late guidance"}}})).await.unwrap();
         }
-        if case == TerminalCase::UserCancellation {
+        if case.context_fenced() {
+            let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+            let mut epochs = admitted.authority.authority_epochs;
+            epochs.permission_epoch += 1;
+            coordinator
+                .advance_authority_epochs(&admitted.authority.key, epochs)
+                .await
+                .unwrap();
+        }
+        if case.user_cancelled() {
             assert!(
                 store
                     .request_run_cancellation(&user, &run_id)
@@ -4563,14 +5069,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let proposed_failure = matches!(
-            case,
-            TerminalCase::Failed | TerminalCase::Incomplete | TerminalCase::UserCancellation
-        );
-        let public_error = state
-            .interruption
-            .as_ref()
-            .map(|record| record.user_message.clone());
+        let proposed_failure = matches!(case, TerminalCase::Failed | TerminalCase::Incomplete)
+            || case.user_cancelled();
         let settlement = CanonicalTerminalSettlement {
             expected_owner_pod_id: owner,
             expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
@@ -4582,12 +5082,12 @@ mod tests {
             },
             waiting_for: None,
             error_message: if incomplete {
-                public_error.as_deref()
+                Some("original private runtime diagnostic")
             } else {
                 proposed_failure.then_some("provider disconnected")
             },
             error_code: if incomplete {
-                Some("execution_incomplete")
+                Some("original_runtime_error")
             } else {
                 proposed_failure.then_some("provider_connection_lost")
             },
@@ -4597,7 +5097,12 @@ mod tests {
             prompt_tokens: 606,
             completion_tokens: 404,
             tool_calls: 0,
-            context_commit: Some(&context),
+            context_commit: if case == TerminalCase::UserCancellationEmptyFenced {
+                None
+            } else {
+                context.as_ref()
+            },
+            context_not_saved: case == TerminalCase::UserCancellationResourceLimit,
         };
         let append = || CanonicalLoopAppend {
             user_id: &user,
@@ -4656,7 +5161,7 @@ mod tests {
             );
         } else {
             let commit = result.unwrap();
-            let expected_status = if case == TerminalCase::UserCancellation {
+            let expected_status = if case.user_cancelled() {
                 STATUS_CANCELLED
             } else if matches!(case, TerminalCase::Failed | TerminalCase::Incomplete) {
                 astra_core::STATUS_FAILED
@@ -4668,7 +5173,7 @@ mod tests {
             assert!(current.owner_pod_id.is_none());
             assert_eq!(slot, 0);
             let expected_cursor =
-                (case != TerminalCase::UserCancellation).then(|| context.cursor());
+                (!case.context_lost()).then(|| context.as_ref().unwrap().cursor());
             assert_eq!(
                 head.as_ref().map(|head| head.cursor.clone()),
                 expected_cursor
@@ -4754,10 +5259,43 @@ mod tests {
             )
             .unwrap();
             assert_eq!(stored.receipt.error_kind, expected_kind);
-            if case == TerminalCase::UserCancellation {
+            if case.user_cancelled() {
                 assert!(stored.receipt.error_code.is_none());
                 assert!(stored.receipt.error_metadata.is_none());
                 assert!(stored.receipt.interruption.is_none());
+                if case.context_lost() {
+                    assert_eq!(stored.receipt.context, CanonicalTerminalContext::Revoked);
+                    assert_eq!(completion[0]["data"]["context_not_saved"], true);
+                    let projected =
+                        crate::server::run::handlers::transform_stream_run_events_for_client(
+                            &run_id,
+                            vec![completion[0].clone()],
+                        );
+                    let mut accum =
+                        astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+                    astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                        &format!(
+                            "data: {}\n\n",
+                            json!({"type":"run_started", "run_id":run_id})
+                        ),
+                        &mut accum,
+                        &mut Vec::new(),
+                    );
+                    let terminal = projected
+                        .iter()
+                        .find(|event| event["type"] == "run_finished")
+                        .unwrap();
+                    let effects =
+                        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                            &format!("data: {}\n\n", terminal),
+                            &mut accum,
+                            &mut Vec::new(),
+                        );
+                    assert!(effects.iter().any(|effect| matches!(effect,
+                        astra_turn_core::chat_turn_sse_dispatch::SseRenderEffect::SystemWarning(message)
+                            if message.contains("history could not be saved")
+                    )));
+                }
             }
 
             let text = current
@@ -4895,6 +5433,100 @@ mod tests {
             let replayed = store.load_run(&user, &run_id).await.unwrap().unwrap();
             assert_eq!(replayed.last_event_idx, current.last_event_idx);
             assert_eq!(replayed.events, current.events);
+            if case.user_cancelled() {
+                let observed = service
+                    .get_run_execution_settlement(run_id.clone(), user.clone())
+                    .await
+                    .unwrap();
+                assert!(observed.execution_settled);
+                assert_eq!(observed.context_not_saved, Some(case.context_lost()));
+                let (_, conversation, _, _, _) =
+                    crate::server::session::conversation::read_conversation(
+                        &pool, &user, &session, 200, None, false,
+                    )
+                    .await
+                    .unwrap();
+                let conversation = serde_json::to_value(conversation).unwrap();
+                let context = conversation
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| {
+                        item["run_id"] == run_id && item.get("context_not_saved").is_some()
+                    })
+                    .expect("cold conversation retains the exact cancelled Run's Context fact");
+                assert_eq!(context["context_not_saved"], case.context_lost());
+                let next_run = Uuid::new_v4().to_string();
+                let next_request = super::super::tests::prepared_test_request("continue");
+                let mut next = RootTurnStartParticipant {
+                    service: &service,
+                    user_id: &user,
+                    session_id: &session,
+                    run_id: &next_run,
+                    request: &next_request,
+                    admission: None,
+                    prepared: None,
+                    rejection: None,
+                    full_llm_capture: None,
+                };
+                assert!(matches!(
+                    service
+                        .run_engine
+                        .admit_run_with_context(
+                            &next_run,
+                            &user,
+                            &session,
+                            Some(&session),
+                            crate::server::run::engine::RunStartContext {
+                                original_input: Some(next_request.message.clone()),
+                                ..Default::default()
+                            },
+                            true,
+                            &mut next,
+                        )
+                        .await
+                        .unwrap(),
+                    astra_services::runs::DurableRunStartClaim::Started { .. }
+                ));
+                let next = next.admission.take().unwrap();
+                if case.context_lost() {
+                    assert!(next.authority.base_head.is_none());
+                } else {
+                    let mut messages = coordinator
+                        .materialize(next.authority.base_head.as_ref().unwrap())
+                        .await
+                        .unwrap()
+                        .messages;
+                    assert!(messages.iter().any(|message| {
+                        message["tool_call_id"] == "known"
+                            && message["content"] == "recorded result"
+                    }));
+                    assert!(messages.iter().any(|message| {
+                        message["tool_call_id"] == "unknown"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("may not have started"))
+                    }));
+                    messages.push(json!({"role":"user", "content":"continue"}));
+                    let wire = astra_core::model_wire::responses::request(
+                        "model", &messages, None, "route", false, None,
+                    )
+                    .unwrap();
+                    let inputs = wire["input"].as_array().unwrap();
+                    assert!(inputs.iter().any(|item| {
+                        item["type"] == "function_call_output"
+                            && item["call_id"] == "known"
+                            && item["output"] == "recorded result"
+                    }));
+                    assert!(inputs.iter().any(|item| {
+                        item["type"] == "function_call_output"
+                            && item["call_id"] == "unknown"
+                            && item["output"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("before retrying"))
+                    }));
+                }
+            }
             if case == TerminalCase::LateGuidance {
                 let returned = |events: &[Value]| {
                     events
@@ -4945,6 +5577,7 @@ mod tests {
                     CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionSurfaceV1,
                 };
                 let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+                let context = context.as_ref().unwrap();
                 let authority = context.run_context_authority().unwrap();
                 let key = &authority.key;
                 let old_cursor = context.cursor();

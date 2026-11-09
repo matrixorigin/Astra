@@ -1020,8 +1020,9 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
 
     let b = bootstrap().await;
     let model = format!("mock-{}", b.ctx.suffix);
-    // This fits the provider's existing 16 MiB stream budget but exceeds the
-    // canonical segment's 8 MiB once message framing is included.
+    // The answer fits the provider stream but exceeds the canonical segment.
+    // The live and durable transcript must retain it while model context
+    // keeps the preceding tool facts and a bounded placeholder.
     let large_answer = "x".repeat(8 * 1024 * 1024);
     let expected_hash = Sha256::digest(large_answer.as_bytes());
     b.ctx.install_native_provider(&b.auth_header, vec![ProviderScript::new(
@@ -1075,7 +1076,7 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
     assert!(
         events
             .iter()
-            .any(|e| e["type"] == "run_error" && e["error_code"] == "resource_limit")
+            .any(|e| e["type"] == "run_error" && e["error_code"] == "execution_incomplete")
     );
     let run_id = finished["run_id"].as_str().unwrap();
     let row = sqlx::query(
@@ -1094,8 +1095,11 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
     .unwrap()
     .receipt;
     assert_eq!(receipt.outcome, CanonicalTerminalOutcome::Failed);
-    assert_eq!(receipt.context, CanonicalTerminalContext::Unchanged);
-    assert_eq!(receipt.error_code.as_deref(), Some("resource_limit"));
+    assert!(matches!(
+        receipt.context,
+        CanonicalTerminalContext::Advanced { .. }
+    ));
+    assert_eq!(receipt.error_code.as_deref(), Some("execution_incomplete"));
     let usage = receipt
         .usage
         .expect("provider accounting survives optional Context failure");
@@ -1115,7 +1119,10 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
     assert_eq!(Sha256::digest(stored_answer.as_bytes()), expected_hash);
     let context_nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
-    assert_eq!(context_nodes, 0);
+    assert!(
+        context_nodes > 0,
+        "the bounded tool history must be retained"
+    );
     assert_eq!(
         b.ctx.native_provider_requests().await.len(),
         3,
@@ -1130,7 +1137,11 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
         "{next}"
     );
     assert!(next.contains("Next turn succeeds."));
-    assert_eq!(b.ctx.native_provider_requests().await.len(), 4);
+    let requests = b.ctx.native_provider_requests().await;
+    assert_eq!(requests.len(), 4);
+    let next_prompt = requests[3].body.to_string();
+    assert!(next_prompt.contains("preceding assistant response exceeded the context limit"));
+    assert!(!next_prompt.contains(&"x".repeat(1024)));
     assert!(
         b.ctx
             .app_state

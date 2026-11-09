@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-04-v120";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-08-v122";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -114,6 +114,7 @@ const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_mo
             model_name VARCHAR(255) NOT NULL,
             provider VARCHAR(50) NOT NULL,
             inference_protocol VARCHAR(32) NULL,
+            responses_reasoning_history VARCHAR(16) NULL,
             api_key_encrypted TEXT NULL,
             connection_id VARCHAR(64) NULL,
             base_url VARCHAR(500) NOT NULL,
@@ -1220,7 +1221,7 @@ where
 /// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
 /// decorrelating an EXISTS, letting another Session hide this one's owner.
 /// Callers retain the lifecycle/Session fence and current-read locks.
-fn push_session_execution_activity(
+fn push_session_active_runs(
     query: &mut sqlx::QueryBuilder<MySql>,
     user_id: &str,
     session_id: &str,
@@ -1238,8 +1239,23 @@ fn push_session_execution_activity(
     if let Some(run_id) = except_run_id {
         query.push(" AND executor.run_id <> ").push_bind(run_id);
     }
-    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active, CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ")
-        .push_bind(user_id).push(" AND custody.session_id = ").push_bind(session_id)
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active");
+}
+
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    push_session_active_runs(query, user_id, session_id, except_run_id);
+    query
+        .push(
+            ", CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ",
+        )
+        .push_bind(user_id)
+        .push(" AND custody.session_id = ")
+        .push_bind(session_id)
         .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
     if let Some(run_id) = except_run_id {
         query.push(" AND custody.run_id <> ").push_bind(run_id);
@@ -1296,7 +1312,7 @@ where
           WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE -1 END \
          ELSE NULL END AS SIGNED) AS full_llm_capture_override, ",
     );
-    push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
+    push_session_active_runs(&mut query, user_id, session_id, Some(run_id));
     query
         .push(" FROM agent_sessions session WHERE session.user_id = ")
         .push_bind(user_id)
@@ -1312,7 +1328,7 @@ where
     if status != "active" {
         return Err(sqlx::Error::RowNotFound);
     }
-    if !SessionExecutionActivity::from_row(&row)?.is_idle() {
+    if row.try_get::<i64, _>("execution_active")? != 0 {
         return Ok(None);
     }
     let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
@@ -1326,6 +1342,23 @@ where
         }
     };
     Ok(Some(capture))
+}
+
+/// Read live Run owners under an existing Session fence. Old unknown tool
+/// outcomes remain in their invocation ledger, but are not live Run owners.
+pub(crate) async fn session_has_active_run<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_active_runs(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    Ok(row.try_get::<i64, _>("execution_active")? != 0)
 }
 
 /// Read actual Run/lease/effect custody under an already held Session fence.
@@ -3126,7 +3159,7 @@ async fn ensure_core_schema_while_leased(
                 (delete_requested_at, user_id, session_id),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
-            INDEX idx_agent_sessions_active_plan_id (active_plan_id),
+            INDEX idx_agent_sessions_active_plan_id (user_id, active_plan_id),
             INDEX idx_agent_sessions_config_version (config_version_id),
             INDEX idx_sessions_project (user_id, project_id, updated_at)
         )",
@@ -4364,7 +4397,7 @@ async fn ensure_core_schema_while_leased(
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_status_user (status, user_id, edge_agent_id, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -4781,16 +4814,24 @@ async fn verify_core_schema_shape(
             }
         }
         if table == "user_llm_models"
-            && column == "inference_protocol"
+            && matches!(
+                column.as_str(),
+                "inference_protocol" | "responses_reasoning_history"
+            )
             && (!row
                 .try_get::<String, _>("DATA_TYPE")?
                 .eq_ignore_ascii_case("varchar")
                 || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
-                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(32))
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")?
+                    != Some(if column == "inference_protocol" {
+                        32
+                    } else {
+                        16
+                    }))
         {
-            return Err(sqlx::Error::Protocol(
-                "invalid user_llm_models.inference_protocol shape".into(),
-            ));
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid user_llm_models.{column} shape"
+            )));
         }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
@@ -4939,6 +4980,7 @@ async fn verify_core_schema_shape(
             &[
                 "thinking_probe_json",
                 "api_key_encrypted",
+                "responses_reasoning_history",
                 "connection_id",
                 "inference_protocol",
             ][..],
@@ -5643,11 +5685,11 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "edge_pending_dispatch",
-        "idx_edge_dispatch_user_status",
+        "idx_edge_dispatch_status_user",
         &[
+            "status",
             "user_id",
             "edge_agent_id",
-            "status",
             "created_at",
             "session_id",
             "run_id",

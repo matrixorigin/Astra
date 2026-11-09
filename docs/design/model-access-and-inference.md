@@ -38,6 +38,29 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Provider rejection contract
+
+The shared ordinary-provider HTTP boundary distinguishes authentication (`auth`), an
+explicit provider balance/quota denial (`provider_quota_exhausted`), and a
+provider denial without a proven cause (`provider_forbidden`). HTTP 401 is
+authentication failure. HTTP 403 alone, including `upstream_forbidden`, is not
+evidence of expired credentials or exhausted credit. Only the bounded machine
+codes `invalid_api_key`, `invalid_token`, `authentication_error`,
+`insufficient_quota`, and `insufficient_balance` refine that classification;
+provider message text never does. A quota-coded 429 is terminal, unlike a
+transient rate limit. These access rejections do not trigger automatic retry,
+credential refresh, provider fallback, or a waiting run.
+
+Both streaming and nonstreaming calls preserve these classifications through
+the shared agent loop and failed Run outcome. The negotiated MOI gateway can
+carry the same provider facts using `provider_authentication_failed`,
+`provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
+(for example `insufficient_credit`) keep their separate versioned contract.
+Provider diagnostics, balances, and echoed credentials never enter public
+error messages. Clients must not infer an end-user billing remedy from a
+provider-account failure. Real input/authorization waits retain their existing
+lifecycle semantics.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
@@ -53,6 +76,15 @@ header names are case-insensitive, and invalid or duplicate configured headers
 are rejected at configuration and execution admission. Probe-only and unrelated
 capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
+Personal and administrator model creation validates connectivity before storing
+the model. Credential updates are also checked before committing. A failed
+check returns a coded error and leaves existing model configuration and
+activation unchanged; a successful administrator check can activate it.
+Authentication/access, rejected requests, rate limits, upstream failures,
+timeouts and network failures have distinct error codes across both wire
+protocols. Probes do not automatically repeat potentially billable requests
+after uncertain delivery. A Chat Completions 2xx response must be bounded JSON
+without an error; an HTML page or embedded error is not a successful check.
 Personal model configuration stores the protocol separately from the optional
 thinking observation. Credential rotation and concurrent checks are fenced by
 the existing model row. A Responses tool group retains its scoped provider
@@ -144,13 +176,20 @@ conversation prefixes without dropping optional or required context. Custom
 OpenAI-compatible gateways retain their existing provider defaults because their
 message and caching semantics are not established by the API format alone.
 Functions use the standard flat Responses tool format. Completed provider output items,
-including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Stateless
-Responses return encrypted reasoning without an `include` override. If a tool
-round contains reasoning without replayable encrypted content, Astra stops
-before executing its calls. Opaque provider-encrypted reasoning is base64
-encoded for storage so generic text
-redaction cannot corrupt ciphertext. Function arguments come from the canonical
+including reasoning and message phase, live in private canonical assistant-message
+metadata before tool execution/final checkpoint. Stateless OpenAI Responses
+returns encrypted reasoning without an `include` override; compatible endpoints
+can instead return replayable `reasoning_text` content. A tool round containing
+a reasoning item without replayable content stops before executing its calls.
+Provider reasoning, including provider-supplied opaque state, is sealed by the
+Server before canonical storage. The capsule is authenticated against the owner,
+session lineage, admitted route, model, item and tool calls; its encoded bytes
+survive credential sanitization. It can contain credential-shaped provider
+reasoning in encrypted form so replay preserves the provider's exact state;
+plaintext remains excluded from public history and diagnostic captures. The inference owner opens it only for an
+authorized continuation. Raw reasoning is omitted from user-visible streams,
+observers and diagnostic artifacts; resume and segment APIs retain only the
+sealed capsule. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No
@@ -164,6 +203,13 @@ Inference performs no catalog fetch. The shared `responses_reasoning` adapter
 emits `reasoning.effort`; Model default omits the field. Unsupported effort,
 binary suppression and token-budget requests fail before provider dispatch.
 
+For a personal API-key model using Responses, the model create/update API also
+accepts `responses_reasoning_history`: `current_turn` only for an endpoint whose
+contract has been verified to need reasoning within the active human turn, or
+`all_turns` to retain it across turns. Omission is conservative. This is a route
+capability, not a setting inferred from the provider's name; changing it adds no
+per-turn database query.
+
 Only completed responses authorize tool dispatch and replayable provider state.
 A typed `max_output_tokens` truncation retains partial text, response identity,
 usage and `length` even without output items. Empty-terminal text fallback
@@ -174,8 +220,10 @@ guessing ownership; done-only text is not recovered on that error path. It creat
 calls nor continuation metadata, including when individual function items look
 complete. The existing output-cap owner handles continuation or interruption;
 other incomplete reasons remain failures. Explicitly unfinished saved items
-cannot be replayed. Connectivity probes and summary acceptance reject truncated
-results even when their partial text is nonempty or structurally complete.
+cannot be replayed. Summary acceptance rejects truncated results even when
+partial text is present. A connectivity probe only checks that the configured
+route produced valid output; a typed output-limit response can establish that
+fact without authorizing a complete answer, tool call, or capability.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas
 alone cannot establish a replayable response or authorize tools.
@@ -290,9 +338,10 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set as
-the frozen format version 2, including `thinking_protocol` and `pricing`. A
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
 same frozen format; current thin-client and TypeScript SDK requests negotiate
 the current format `3` on every page.
@@ -300,14 +349,9 @@ Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
 
-Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
-The Server must not infer a version from identity or strip protocol metadata
-needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
-its embedded schema-v1 executor are outside the support baseline, as is
-standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
-The installed CLI can still report an unknown-field/invalid-JSON error before
-execution; a new Server error code cannot repair that old diagnostic. This
-policy does not claim to repair the original 0.2.10 conversation failure.
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
 
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
@@ -349,10 +393,8 @@ verify that the selected format can represent the required semantics.
 Authentication, execution requests, approvals, and Edge advertisements are not
 made permissive.
 
-Historical fixtures and binary identities do not move with the producer.
-Support changes must be reviewed separately and document affected features
-and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the fixed artifact inventory and required behavior.
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before
@@ -420,7 +462,10 @@ their own provider account.
 
 - `POST /me/models` accepts a provider credential once over an authenticated
   TLS connection. Owner identity is derived from the Astra access token; the
-  request cannot select another owner.
+  request cannot select another owner. Failures known to precede the creation
+  transaction include `metadata.model_saved: false`; clients may retain the
+  form for correction. An ambiguous response requires checking the model list
+  before retrying.
 - Astra Server encrypts the credential with the configured secret backend and
   stores only ciphertext in `user_llm_models`.
 - `GET /me/models`, `GET /me/models/{model_id}`, catalog, trace, error, and
@@ -437,22 +482,16 @@ their own provider account.
   existing administrator registry; a host-only entry admits port 443 only.
   The default is `public-https`; invalid configuration fails closed.
 - Custom endpoint policy is rechecked at create, credential rotation, probe,
-  activation, and inference admission. Each outbound attempt pins a freshly
-  validated public DNS address set and forbids redirects. DNS queries go directly
-  to system-configured nameservers instead of OS synthetic-address caches;
-  `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
-  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
-  attempt or UDP fallback. This is an explicit operator route, not automatic
-  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
-  instead of racing answers from different DNS servers. There is no hardcoded
-  public DNS or OS resolver fallback.
-  Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
-  HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
-  loopback adapter sends only validated public IP targets to that proxy,
-  retaining the origin hostname for end-to-end TLS, SNI and Host. SOCKS5h does
-  not delegate target DNS. Dropping the client cancels its tunnel tasks.
-  Ambient proxy variables cannot override this route; proxy failure never
-  falls back to direct access. Private/Fake-IP DNS answers remain rejected.
+  activation, and inference admission. Each outbound attempt resolves with the
+  Server's system DNS, validates every address as public, pins the result, and
+  forbids redirects. `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` select the same
+  Server egress configuration as other providers. For proxied requests, a
+  shared tunnel listener authenticates each request's short-lived route and
+  sends only its validated IP targets to the proxy while retaining the origin
+  hostname for TLS, SNI and Host. Dropping the client revokes its route and
+  cancels its connections. Proxy failure never falls back to direct access. If system
+  DNS returns private or Fake-IP addresses, the operator must configure it to
+  return public addresses; proxy DNS cannot bypass validation.
 - Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and
   returns `204` after URL, policy, and DNS checks, without provider HTTP traffic,
   credentials, or stored model state. CLI runs it immediately after custom URL

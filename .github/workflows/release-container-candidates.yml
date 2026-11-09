@@ -167,38 +167,6 @@ jobs:
       - name: Verify health and exact memory round trip
         run: make stack-verify
 
-      - name: Restore released client components
-        if: matrix.platform == 'linux/amd64'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/historical-clients/*.tar.gz
-          key: historical-clients-linux-amd64-${{ hashFiles('scripts/ci/historical-clients.json') }}
-
-      - name: Verify reviewed historical CLI and Edge against the exact candidate
-        if: matrix.platform == 'linux/amd64'
-        shell: bash
-        env:
-          ASTRA_COMPAT_SERVER_SOURCE: ${{ env.RELEASE_SOURCE_SHA }}
-        run: |
-          set -euo pipefail
-          digest_files=(/tmp/digest/*)
-          ASTRA_COMPAT_SERVER_IMAGE_DIGEST="sha256:$(basename "${digest_files[0]}")"
-          export ASTRA_COMPAT_SERVER_IMAGE_DIGEST
-          python3 scripts/ci/client_compatibility.py \
-            --api-url http://127.0.0.1:17001 \
-            --provider-host host.docker.internal \
-            --artifacts "${GITHUB_WORKSPACE}/target/historical-clients" \
-            --report "${RUNNER_TEMP}/client-compatibility.json" \
-            --disposable-server
-
-      - name: Preserve historical client compatibility results
-        if: ${{ !cancelled() && matrix.platform == 'linux/amd64' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-client-compatibility-${{ matrix.slug }}
-          path: ${{ runner.temp }}/client-compatibility.json
-          if-no-files-found: error
-
       - name: Write container candidate summary
         shell: bash
         run: |

@@ -48,6 +48,17 @@ pub struct McpToolCallResult {
 }
 
 impl McpToolCallResult {
+    /// Interaction metadata, even when malformed, is not a terminal outcome.
+    /// A provider-authored error takes precedence over interaction metadata.
+    pub fn requires_interaction(&self) -> bool {
+        !self.is_error
+            && self.protocol_metadata.as_ref().is_some_and(|metadata| {
+                metadata
+                    .get(PROVIDER_INTERACTION_REQUEST_METADATA_KEY)
+                    .is_some()
+            })
+    }
+
     pub fn workspace_effect_is_settled(&self) -> bool {
         workspace_effect_is_settled(self.protocol_metadata.as_ref())
     }

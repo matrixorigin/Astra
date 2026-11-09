@@ -125,6 +125,7 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
     });
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -165,6 +166,7 @@ fn context_pipeline_rejects_zero_model_limit_before_compaction() {
 
     let err = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -199,6 +201,7 @@ fn context_pipeline_uses_session_provider_policy_not_default_config() {
 
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -335,13 +338,13 @@ fn cache_marker_indices_match_serialized_system_blocks() {
 }
 
 #[test]
-fn pipeline_aborts_on_consecutive_ptl_errors() {
+fn pipeline_rebuilds_context_after_prior_overflow_errors() {
     let (statics, agent, latches, session, mut turn, ext, stats) = build_sources();
     // Simulate 3 consecutive PTL errors
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
-    assert!(turn.recovery.should_abort());
+    assert_eq!(turn.recovery.consecutive_ptl_errors, 3);
 
     let sources = ContextSources {
         statics: &statics,
@@ -357,6 +360,7 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         provider_policy: session.provider_policy.clone(),
     });
     let result = pipeline.run(PipelineRunInput {
+        planning_messages: None,
         sources: &sources,
         tokens: &turn.tokens,
         model_limit: session.model_limit,
@@ -367,12 +371,9 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         query_source: "harness",
     });
 
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err(),
-        PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 3
-        }
+    assert!(
+        result.is_ok(),
+        "recovery informs optimization, not permanent refusal: {result:?}"
     );
 }
 
@@ -394,6 +395,7 @@ fn serialized_output_format_system_blocks_are_well_structured() {
     });
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,

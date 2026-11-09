@@ -314,6 +314,13 @@ class CiScopeTests(unittest.TestCase):
         self.assertFalse(scopes["online_core"])
         self.assertFalse(scopes["online_integration"])
 
+    def test_candidate_client_integration_selects_its_cli_owner(self) -> None:
+        scopes = classify(["crates/runtime/tests/client_compatibility.rs"])
+        self.assertTrue(scopes["test_cli"])
+        self.assertTrue(scopes["test_runtime"])
+        self.assertTrue(scopes["online_integration"])
+        self.assertFalse(scopes["test_macos"])
+
     def test_shared_core_source_selects_downstream_lanes(self) -> None:
         scopes = classify(["crates/astra-text-utils/src/lib.rs"])
         for name in (

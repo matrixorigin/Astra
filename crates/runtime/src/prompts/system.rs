@@ -682,15 +682,15 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Omit `requested_model_policy` for profile/parent defaults. Use it for an Astra Offering override, or use the exact provider tool/model from the current provider directory. Use `model_catalog` only for unknown Astra Offerings; never inspect config/credentials, run provider CLIs, or substitute. Task text is not a control.\n",
+            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Omit `requested_model_policy` for profile/parent defaults. Use it for an Astra Offering override, or use the exact provider tool/model from the current provider directory. Use `model_catalog` only for unknown Astra Offerings; never inspect credentials or silently substitute a requested provider/model. Task text is not a control.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
+            "         - After spawn, do independent requested work, then observe or wait for child results. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {
         body.push_str(
-            "         - `tools[]` limits structured calls, not executables available through `bash`. For provider collaborators, use the directory's exact structured tool/model; never inspect config/credentials or invoke a provider CLI through `bash`. Other named services without structured capability permit one bounded non-secret CLI/API probe; otherwise disclose evidence.\n",
+            "         - `tools[]` limits structured calls, not executables available through `bash`. Explicitly requested local programs (including provider CLIs) may use admitted CLI/User Runner Bash even with an empty provider directory. Prefer suitable adapters; preserve requested provider/model, sandbox, credentials, network and approvals.\n",
         );
     }
     body.push_str(&tool_precedence_section(tool_names));
@@ -1312,7 +1312,7 @@ mod tests {
             agent_with_discovery
                 .contains("Use the visible `agent` schema directly for its permitted actions")
         );
-        assert!(agent_surface.contains("then await child results"));
+        assert!(agent_surface.contains("then observe or wait for child results"));
         assert!(agent_surface.contains("do independent requested work"));
         assert!(
             agent_with_discovery
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(
             agent_surface.contains("exact provider tool/model from the current provider directory")
         );
-        assert!(agent_surface.contains("never inspect config/credentials"));
+        assert!(agent_surface.contains("never inspect credentials"));
         assert!(!agent_surface.contains("settle_work_item"));
         let fanout_surface = tool_conditional_section(&["agent_fanout"]);
         assert!(!fanout_surface.contains("call visible `agent` spawn directly"));
@@ -1450,7 +1450,9 @@ mod tests {
         assert!(
             !turn_discipline_section().contains("before your first tool call, write ONE sentence")
         );
-        assert!(tool_conditional_section(&["bash"]).contains("bounded non-secret CLI/API probe"));
+        assert!(
+            tool_conditional_section(&["bash"]).contains("Explicitly requested local programs")
+        );
     }
 
     #[test]
@@ -1524,11 +1526,9 @@ mod tests {
         assert!(prompt.contains("Task text is not a control"));
         assert!(prompt.contains("Omit `requested_model_policy` for profile/parent defaults"));
         assert!(prompt.contains("exact provider tool/model from the current provider directory"));
-        assert!(
-            prompt.contains(
-                "never inspect config/credentials or invoke a provider CLI through `bash`"
-            )
-        );
+        assert!(prompt.contains(
+            "never inspect credentials or silently substitute a requested provider/model"
+        ));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
         assert!(prompt.contains("Launch before child-specific checks"));
@@ -1757,7 +1757,7 @@ mod tests {
         );
         let guidance = tool_conditional_section(&["bash", "glob", "grep", "read_file"]);
         assert!(guidance.contains("not executables available through `bash`"));
-        assert!(guidance.contains("bounded non-secret CLI/API probe"));
+        assert!(guidance.contains("Explicitly requested local programs"));
         assert!(!guidance.contains("run_build_test"));
         assert!(!tool_conditional_section(&["git"]).contains("Git Workflow"));
         let tokens: u32 = sections

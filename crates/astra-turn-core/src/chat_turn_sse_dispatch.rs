@@ -569,7 +569,7 @@ pub fn durable_run_terminal_from_event(
                 .and_then(Value::as_u64)
                 .is_none()
             || error_kind.is_some()
-            || record.kind != crate::interruption::InterruptionKind::ExecutionIncomplete
+            || astra_core::ErrorKind::parse_tag(record.kind.label()).is_some()
             || event.get("error_code").and_then(Value::as_str) != Some(record.kind.label())
             || record.user_message.trim().is_empty()
             || event.get("error").and_then(Value::as_str) != Some(record.user_message.as_str())
@@ -1752,8 +1752,11 @@ fn apply_one_event(
             if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
                 return;
             }
-            let provisional_interruption = event.get("error_code").and_then(Value::as_str)
-                == Some("execution_incomplete")
+            let provisional_interruption = event
+                .get("error_code")
+                .and_then(Value::as_str)
+                .and_then(crate::interruption::InterruptionKind::from_label)
+                .is_some_and(|kind| astra_core::ErrorKind::parse_tag(kind.label()).is_none())
                 && matches!(event.get("error_kind"), None | Some(Value::Null));
             if provisional_interruption
                 && (accum.error_kind.is_some() || accum.pending_attempt_error)
@@ -1931,6 +1934,13 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        if accum.run_terminal.is_none()
+                            && event.get("context_not_saved").and_then(Value::as_bool) == Some(true)
+                        {
+                            effects.push(SseRenderEffect::SystemWarning(
+                                "This turn's conversation history could not be saved. Check tool results and current state before continuing.".into(),
+                            ));
+                        }
                         if let Some(interruption) = terminal.interruption.as_ref() {
                             let coherent = accum.error_kind.is_none()
                                 && !accum.pending_attempt_error
@@ -2438,11 +2448,11 @@ mod tests {
                     "expected_result": "One verified result"
                 },
                 "entries": [{
-                    "signal": "read_coverage_overlap",
+                    "signal": "search_fanout",
                     "stage": "observe",
                     "observed_at_round": 2,
                     "evidence_count": 3,
-                    "recommendation": "review_read_coverage"
+                    "recommendation": "narrow_evidence_search"
                 }]
             }
         }))
@@ -3966,6 +3976,48 @@ mod tests {
         let terminal = a.run_terminal.expect("root terminal must be retained");
         assert_eq!(terminal.run_id, "root-run");
         assert_eq!(terminal.status, DurableRunTerminalStatus::Cancelled);
+    }
+
+    #[test]
+    fn token_budget_interruption_survives_live_and_terminal_only_streams() {
+        use crate::interruption::{
+            InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+        };
+
+        let record = InterruptionRecord::new(
+            InterruptionKind::TokenBudgetExceeded,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary::default(),
+        );
+        let failure = serde_json::json!({"type":"run_error", "run_id":"root",
+            "error_code":record.kind.label(), "error":record.user_message});
+        let terminal = serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":1,
+            "status":"failed", "error_code":record.kind.label(), "error":record.user_message,
+            "interruption":record.to_json()});
+        for include_failure in [true, false] {
+            let mut accum = ChatTurnSseAccum::default();
+            let mut pending = vec![];
+            dispatch_chat_turn_sse_event_block(
+                &sse("session_info", ",\"run_id\":\"root\""),
+                &mut accum,
+                &mut pending,
+            );
+            if include_failure {
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {failure}\n\n"),
+                    &mut accum,
+                    &mut pending,
+                );
+            }
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {terminal}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+            assert!(accum.has_authoritative_interrupted_terminal(), "{accum:?}");
+            assert_eq!(accum.error_code.as_deref(), Some("token_budget_exceeded"));
+            assert_eq!(accum.server_interruption, Some(record.to_json()));
+        }
     }
 
     #[test]

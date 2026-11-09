@@ -24,6 +24,8 @@ use tokio::net::TcpListener;
 pub enum MockScenario {
     /// Agent calls one edge tool (write_file), then completes.
     ToolThenComplete,
+    /// Launch a gated background shell and ask the user for a decision.
+    BackgroundThenQuestion,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
     /// Root activates and launches one asynchronous child, then acknowledges its launch receipt.
@@ -38,6 +40,7 @@ impl MockScenario {
     fn description(self) -> &'static str {
         match self {
             Self::ToolThenComplete => "one write_file tool call, then completion",
+            Self::BackgroundThenQuestion => "background shell, then a user decision",
             Self::Slow => "3s delay before response (tests progress display)",
             Self::AgentThenComplete => "one asynchronous child agent, then launch acknowledgement",
             Self::FanoutThenComplete => "Server-owned three-slot fanout with streamed completion",
@@ -221,6 +224,26 @@ fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
     s.push_str(&text_done(&msg));
     s.push_str(&server_terminal_event("mock-run-tool", &msg, 200));
     s
+}
+
+fn body_background_then_question(round: u32) -> String {
+    let mut body = session_info("mock-run-tool");
+    if round == 1 {
+        let args = serde_json::json!({
+            "command": "while [ ! -f release-background ]; do sleep 0.05; done; printf background-task-finished",
+            "description": "gated background task",
+            "yield_time_ms": 0,
+        });
+        body.push_str(&tool_call_start("call-1", "bash", args.clone()));
+        body.push_str(&tool_request("call-1", "bash", args));
+        body.push_str(&done_event(150));
+    } else {
+        let message = "Which option should I choose?";
+        body.push_str(&text_delta(message));
+        body.push_str(&text_done(message));
+        body.push_str(&server_terminal_event("mock-run-tool", message, 200));
+    }
+    body
 }
 
 async fn body_slow(
@@ -414,6 +437,7 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         .unwrap_or("mock-agent"),
                     round + 1,
                 ),
+                MockScenario::BackgroundThenQuestion => body_background_then_question(round + 1),
                 _ => unreachable!("only Edge-tool scenarios wait for callbacks"),
             };
             let run_id = body
@@ -491,7 +515,13 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                             .expect("receipt serializes");
                         event["tool_calls_count"] = count.into();
                         event["observation_tool_calls_count"] = 0.into();
-                        event["tools_used"] = serde_json::json!(["write_file"]);
+                        event["tools_used"] = serde_json::json!([
+                            if state.scenario == MockScenario::BackgroundThenQuestion {
+                                "bash"
+                            } else {
+                                "write_file"
+                            }
+                        ]);
                         event["llm_rounds"] = (round + 1).into();
                         event["token_usage_coverage"]["attempts"] = (round + 1).into();
                         event["token_usage_coverage"]["provider_reported"] = (round + 1).into();
@@ -751,7 +781,10 @@ async fn handle_chat_turn(
         return server_orchestration_response(state);
     }
 
-    if matches!(state.scenario, MockScenario::ToolThenComplete) {
+    if matches!(
+        state.scenario,
+        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+    ) {
         return orchestration_response(state, request_body);
     }
 
@@ -761,7 +794,7 @@ async fn handle_chat_turn(
         | MockScenario::FanoutPartialThenComplete => {
             unreachable!("Server agent scenarios own their stream")
         }
-        MockScenario::ToolThenComplete => {
+        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => {
             unreachable!("tool scenarios use one orchestration stream")
         }
         MockScenario::Slow => {
@@ -1066,7 +1099,11 @@ async fn handle_cancel_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<axum::Json<Value>, StatusCode> {
     // A pending local tool approval can interrupt the fixture's root stream.
-    if state.scenario == MockScenario::ToolThenComplete && run_id == "mock-run-tool" {
+    if matches!(
+        state.scenario,
+        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion
+    ) && run_id == "mock-run-tool"
+    {
         state
             .cancelled_runs
             .lock()
@@ -1142,7 +1179,7 @@ async fn handle_transcript(
         return Err(StatusCode::NOT_FOUND);
     }
     let root_run = match state.scenario {
-        MockScenario::ToolThenComplete => "mock-run-tool",
+        MockScenario::ToolThenComplete | MockScenario::BackgroundThenQuestion => "mock-run-tool",
         MockScenario::AgentThenComplete => "mock-run-agent-root",
         MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete => {
             "mock-run-fanout-root"

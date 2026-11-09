@@ -25,6 +25,7 @@ import type {
   PublishSkillBody,
   RunInputRequestBody,
   RunInputResponse,
+  RunCancellationResult,
   RunListCursor,
   RunListParams,
   RunListResponse,
@@ -2830,8 +2831,17 @@ export class AstraClient {
     return normalizeRunStatus(raw);
   }
 
-  async cancelRun(runId: string): Promise<void> {
-    await this.fetch(chatRunPath(runId), { method: "DELETE" });
+  /** null means the command was acknowledged but its receipt was invalid/unconfirmed. */
+  async cancelRun(runId: string): Promise<RunCancellationResult | null> {
+    const response = await this.request(chatRunPath(runId), { method: "DELETE" });
+    let raw: Record<string, unknown>;
+    try { raw = JSON.parse(await response.text()); } catch { return null; }
+    if (!raw || raw.run_id !== runId || typeof raw.status !== "string" || !raw.status.trim() ||
+      typeof raw.execution_settled !== "boolean" ||
+      raw.context_not_saved !== undefined && typeof raw.context_not_saved !== "boolean") return null;
+    return { runId, status: raw.status, executionSettled: raw.execution_settled,
+      ...(raw.execution_settled && typeof raw.context_not_saved === "boolean"
+        ? { contextNotSaved: raw.context_not_saved } : {}) };
   }
 
   async pauseRun(runId: string): Promise<void> {

@@ -21,7 +21,6 @@ pub mod session_tool_contract;
 pub mod web_fetch;
 pub mod web_search;
 
-pub mod build_test;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
@@ -209,6 +208,20 @@ impl ToolResult {
         self
     }
 
+    /// The caller lost the result after dispatch; effects may have occurred.
+    #[must_use]
+    pub fn with_execution_outcome_unknown(mut self) -> Self {
+        self.is_error = true;
+        self.exit_semantics = Some(exit_semantics::ExitSemantics::ExecutionError);
+        let fields = self.metadata.get_or_insert_with(Map::new);
+        fields.insert("execution_fact".into(), json!("unknown"));
+        fields.insert("side_effects_maybe".into(), json!(true));
+        fields.insert("retryable".into(), json!(false));
+        fields.insert("exit_semantics".into(), json!("execution_error"));
+        fields.insert("result_class".into(), json!("execution_error"));
+        self
+    }
+
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);
@@ -354,6 +367,7 @@ pub fn dispatch_deadline_result(
     ]);
     let message = if execution_started {
         fields.insert("executed".into(), Value::Null);
+        fields.insert("execution_fact".into(), json!("unknown"));
         "The run admission deadline expired before a continuation. An earlier call started; its outcome remains unresolved and no further call was dispatched."
     } else {
         fields.insert("executed".into(), json!(false));
@@ -455,7 +469,7 @@ pub fn workspace_lease_failure_tool_result(
         workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
             TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
             format!(
-                "Tool '{name}' was not executed because a previous workspace owner did not settle; inspect or re-bind the workspace before continuing, and do not replay the call"
+                "Tool '{name}' was not executed because earlier work may still be using this workspace. Stop that work and confirm workspace recovery before continuing."
             ),
             false,
         ),
@@ -634,6 +648,7 @@ pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult
             ),
         ),
         ("execution_started".to_string(), Value::Bool(true)),
+        ("execution_fact".to_string(), json!("unknown")),
         ("side_effects_maybe".to_string(), Value::Bool(true)),
         ("retryable".to_string(), Value::Bool(false)),
         ("workspace_effect_settled".to_string(), Value::Bool(false)),
@@ -663,7 +678,7 @@ pub trait ToolExecutor: Send + Sync {
         };
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                cancelled_tool_result(name, true)
+                cancelled_tool_result(name, true).with_execution_outcome_unknown()
             }
             result = self.execute(name, args) => result,
         }
@@ -679,8 +694,8 @@ pub trait ToolExecutor: Send + Sync {
     /// Most executors use the project root, but a server/edge binding may
     /// expose a project container while executing inside a narrower session
     /// workspace.  Observation and completion receipts must use the latter.
-    fn workspace_root(&self) -> &Path {
-        self.project_root()
+    fn workspace_root(&self) -> PathBuf {
+        self.project_root().to_path_buf()
     }
 
     /// Execute a tool and return extended metadata (e.g., rollback journal entries).
@@ -827,6 +842,12 @@ pub enum ApprovalDecision {
 /// execute immediately.
 #[async_trait]
 pub trait ToolApprovalGate: Send + Sync {
+    /// Whether authoring must wait for human review under the current user
+    /// policy. A model may request review, never waive a required review.
+    async fn plan_review_required(&self) -> bool {
+        true
+    }
+
     /// Request approval for a tool invocation. The implementation should send
     /// the request to the UI and block until the user responds or timeout.
     async fn request_approval(

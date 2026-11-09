@@ -117,7 +117,7 @@ fn execution_limits_survive_resident_and_deferred_projection() {
     let resident = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
     let resident_schemas = resident.always_load_schemas();
     for (name, paths) in [
-        ("bash", vec!["/properties/mode"]),
+        ("bash", vec!["/properties/timeout", "/properties/workdir"]),
         (
             "agent",
             vec!["/properties/max_output_tokens", "/properties/message_type"],
@@ -146,14 +146,19 @@ fn execution_limits_survive_resident_and_deferred_projection() {
             assert!(native.is_some(), "{name} must be resident");
         }
         for path in paths {
-            let expected = original["function"]["parameters"].pointer(path).unwrap()
-                ["x-astra-discovery-summary"].as_str().expect("producer-owned execution limit");
+            let property = original["function"]["parameters"].pointer(path).unwrap();
             for parameters in std::iter::once(&selected["matches"][0]["parameters"])
                 .chain(native.map(|s| &s["function"]["parameters"]))
             {
+                let projected = parameters.pointer(path).unwrap();
                 assert_eq!(
-                    parameters.pointer(path).unwrap()["description"].as_str(),
-                    Some(expected)
+                    without_descriptions(projected.clone()),
+                    without_descriptions(property.clone()),
+                    "{name} {path} must retain its execution constraints"
+                );
+                assert_eq!(
+                    projected["description"].as_str(),
+                    property["x-astra-discovery-summary"].as_str()
                 );
             }
         }
@@ -212,7 +217,8 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
 
 #[test]
 fn resident_bash_command_guidance_survives_projection() {
-    let canonical = catalog_schemas();
+    let mut canonical = catalog_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut canonical);
     let canonical_bash = canonical
         .iter()
         .find(|schema| tool_schema_name(schema) == Some("bash"))
@@ -238,6 +244,42 @@ fn resident_bash_command_guidance_survives_projection() {
     assert!(
         resident_bash["function"]["parameters"]["properties"]["command"]["description"].is_null()
     );
+}
+
+#[test]
+fn resident_bash_exposes_interactive_controls_only_when_provider_supplies_them() {
+    for enabled in [false, true] {
+        let mut catalog = catalog_schemas();
+        if !enabled {
+            astra_tools::schemas::hide_shell_task_controls(&mut catalog);
+        }
+        let surface = ToolSurface::build(catalog, &ToolSurfaceConfig::default(), &[]);
+        let bash = surface
+            .always_load_schemas()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .unwrap();
+        let fields = bash
+            .pointer("/function/parameters/properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(fields.contains_key("stdin"), enabled);
+        assert_eq!(fields.contains_key("yield_time_ms"), enabled);
+        let args = serde_json::json!({"command":"cat","stdin":true,"yield_time_ms":0});
+        assert_eq!(
+            astra_tools::schemas::validate_tool_arguments_against_schema("bash", &args, &bash)
+                .is_ok(),
+            enabled
+        );
+        assert_eq!(
+            bash["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("task_input"),
+            enabled
+        );
+    }
 }
 
 #[test]
@@ -531,8 +573,10 @@ fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape
 
 #[test]
 fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
+    let mut catalog = catalog_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut catalog);
     let surface = ToolSurface::build(
-        catalog_schemas(),
+        catalog,
         &ToolSurfaceConfig {
             pinned_tools: vec!["memory".into()],
         },
@@ -605,7 +649,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "force", "mode", "timeout", "workdir"]
+        ["command", "force", "timeout", "workdir"]
             .into_iter()
             .collect(),
         "ordinary resident Bash must retain its exact foreground call shape"
@@ -643,7 +687,10 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let profile = agent_params["properties"]["agent_type"]["description"]
         .as_str()
         .unwrap();
-    for constraint in ["Read-only:omit", "task/general-purpose", "shell/mutation"] {
+    for constraint in [
+        "Default:inherit parent authority",
+        "explore/code-review:read-only",
+    ] {
         assert!(profile.contains(constraint), "{profile}");
     }
     assert!(
@@ -837,6 +884,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
 #[test]
 fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
     let mut edge_catalog = astra_tools::schemas::all_tool_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut edge_catalog);
     astra_tools::schemas::enable_managed_background_bash_schema(&mut edge_catalog);
     let surface = ToolSurface::build(edge_catalog, &ToolSurfaceConfig::default(), &[]);
     let bash = surface
@@ -862,7 +910,6 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
             "background_ttl",
             "command",
             "force",
-            "mode",
             "ready_check",
             "run_in_background",
             "timeout",

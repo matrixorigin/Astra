@@ -82,8 +82,10 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         // ── File I/O ────────────────────────────────────────────────
         "read_file" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let start = args.get("start_line").and_then(Value::as_u64);
-            let end = args.get("end_line").and_then(Value::as_u64);
+            let (start, end) = astra_text_utils::line_range::ordered_bounds(
+                args.get("start_line").and_then(Value::as_u64),
+                args.get("end_line").and_then(Value::as_u64),
+            );
             let short_path = short(path, path_budget(10));
             match (start, end) {
                 (Some(s), Some(e)) => format!("Reading: {short_path}:{s}-{e}"),
@@ -618,6 +620,13 @@ mod tests {
             p(
                 "read_file",
                 json!({"path": "src/main.rs", "start_line": 10, "end_line": 50})
+            ),
+            "Reading: src/main.rs:10-50"
+        );
+        assert_eq!(
+            p(
+                "read_file",
+                json!({"path":"src/main.rs", "start_line":50, "end_line":10})
             ),
             "Reading: src/main.rs:10-50"
         );

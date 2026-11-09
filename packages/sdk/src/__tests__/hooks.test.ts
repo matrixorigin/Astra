@@ -943,6 +943,20 @@ describe("useAstraChat", () => {
     expect(result.current.isStreaming).toBe(false);
   });
 
+  test.each([true, false, undefined])("keeps the root cancellation Context fact (%s)", observation => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: !observation },
+      { type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation },
+    ]);
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+    act(() => result.current.sendMessage("hello"));
+    expect(result.current.messages.at(-1)?.contextNotSaved).toBe(observation ?? null);
+    expect(result.current.runId).toBe("root");
+    expect(result.current.runStatus).toBe("cancelled");
+  });
+
   test("stop() aborts stream and finalizes", () => {
     const { client, streamChatMock } = createMockClient();
     // Don't fire run_finished so we stay in streaming state

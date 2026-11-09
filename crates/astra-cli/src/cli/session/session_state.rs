@@ -535,7 +535,7 @@ pub(crate) struct SessionState {
     pub pending_bg_notifications: Vec<String>,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
-    pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    pub(crate) background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     /// Shared background task list cache.
     /// The TUI event loop writes the rendered task-list XML here every tick
     /// (not just on-demand) so [`ToolExecutor::task_list_bg`] can read the
@@ -547,7 +547,7 @@ pub(crate) struct SessionState {
     /// into the executor's ToolContext so each bash invocation can
     /// observe the signal. Headless paths still see it but never
     /// fire the signal so behaviour is unchanged.
-    pub bash_detach_slot: astra_tools::detach::DetachShellSlot,
+    pub foreground_wait_control: astra_tools::detach::ForegroundWaitControl,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -671,9 +671,14 @@ impl Default for SessionState {
             native_delivery_shutdown: None,
             tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
-            bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                std::env::temp_dir()
+                    .join("astra")
+                    .join("bg_tasks")
+                    .join(uuid::Uuid::new_v4().to_string()),
+            ),
             bg_task_list_cache: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
-            bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            foreground_wait_control: astra_tools::detach::ForegroundWaitControl::default(),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
         }
@@ -791,6 +796,11 @@ impl SessionState {
         // boundary without requiring unbounded shutdown waits.
         self.active_work_registry =
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        // A selected checkout belongs to this session. Rotate the shared
+        // owner so a retiring turn cannot redirect a different session.
+        self.git_worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::edge_tools::worktree::GitWorktreeRollbackJournal::default(),
+        ));
         self.pending_recovery = None;
         self.run_id = None;
         *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
@@ -1085,6 +1095,14 @@ mod default_tests {
         assert!(state.session_persistence_error.is_none());
         assert!(state.perm_manager.export_session_overrides().is_none());
         assert!(state.pending_bg_notifications.is_empty());
+    }
+
+    #[test]
+    fn resetting_session_replaces_the_worktree_owner() {
+        let mut state = SessionState::default();
+        let prior = state.git_worktree_journal.clone();
+        state.reset_for_new_session();
+        assert!(!std::sync::Arc::ptr_eq(&prior, &state.git_worktree_journal));
     }
 
     #[test]

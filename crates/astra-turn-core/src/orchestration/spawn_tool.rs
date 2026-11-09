@@ -150,7 +150,7 @@ pub struct SpawnAgentInput {
     pub prompt: String,
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
-    /// Omitted values use the bounded read-only `explore` persona.
+    /// Omitted values use `general-purpose`, within the parent's authority.
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
 
@@ -509,8 +509,8 @@ mod budget_resolve_tests {
     }
 }
 
-fn default_agent_type() -> String {
-    "explore".to_string()
+pub fn default_agent_type() -> String {
+    "general-purpose".to_string()
 }
 
 /// Output from spawn_agent tool.
@@ -588,11 +588,14 @@ mod tests {
         let json = r#"{"description": "Test", "prompt": "Do the thing"}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
-        assert_eq!(input.agent_type, "explore");
-        // Inheritance defaults to None — existing clients get no
-        // behavior change when they don't set inherit_prefix.
+        assert_eq!(input.agent_type, "general-purpose");
         assert!(input.inherit_prefix.is_none());
         assert!(input.max_output_tokens.is_none());
+        let restricted: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"Inspect","prompt":"Read files","agent_type":"explore"}"#,
+        )
+        .unwrap();
+        assert_eq!(restricted.agent_type, "explore");
     }
 
     #[test]

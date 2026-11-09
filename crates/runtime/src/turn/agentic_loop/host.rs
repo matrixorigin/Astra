@@ -991,9 +991,10 @@ pub trait AgenticLoopHost: Send {
     /// round. On success the implementation must return the typed event that
     /// describes the applied mutation and bump
     /// [`AgenticLoopState::compact_tier_applied`] to at least
-    /// [`CompactionTier::CompactHistory`] so the downstream budget guard
-    /// skips redundant mechanical compression. Lifecycle accounting and
-    /// delivery are owned by the caller, independently of quiet rendering.
+    /// [`CompactionTier::CompactHistory`]. Subsequent pressure is evaluated
+    /// against the current history, not the historical tier. Lifecycle
+    /// accounting and delivery are owned by the caller, independently of
+    /// quiet rendering.
     /// Default is a no-op so non-server hosts preserve legacy behavior.
     async fn maybe_pre_turn_compact(
         &mut self,
@@ -1418,6 +1419,7 @@ fn build_introspect_snapshot_with_tool_admission(
         current_round,
         tool_errors,
         circuit_breaker,
+        thinking: Some(state.thinking.clone()),
     };
 
     // Enrich live-metric fields from provider data when available.
@@ -2967,10 +2969,6 @@ pub enum VolatileKind {
     /// errors, redundant reads, cache waste, or exploration-family churn.
     /// It never carries execution authority.
     BehaviorAdvisory,
-    /// Executor-authored notice that a command changed or deleted a source
-    /// artifact whose original bytes were retained. Advisory-only: it never
-    /// authorizes rollback, retry, budget extension, or terminal settlement.
-    SourceRecoveryAdvisory,
     /// Mailbox / agent-to-agent drop-offs. Multiple batches accumulate until
     /// one provider attempt consumes them; later drains must not erase earlier
     /// acknowledged messages.
@@ -3080,7 +3078,6 @@ impl VolatileKind {
                 | Self::PolicyAdvisory
                 | Self::RuntimeInputBoundary
                 | Self::BehaviorAdvisory
-                | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
                 | Self::ActiveWorkSnapshot
                 | Self::CanonicalWorkState
@@ -3111,7 +3108,7 @@ impl VolatileKind {
             | Self::SessionHookContext
             | Self::PlanModeMarker
             | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
-            Self::PolicyAdvisory | Self::BehaviorAdvisory | Self::SourceRecoveryAdvisory => {
+            Self::PolicyAdvisory | Self::BehaviorAdvisory => {
                 VolatileDeliveryClass::DecisionFeedback
             }
             Self::ToolBatchCoaching
@@ -4276,6 +4273,21 @@ impl AgenticLoopState {
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();
+    }
+
+    pub(crate) fn pending_canonical_messages_for_commit(&self) -> &[Value] {
+        let committed_prefix = self
+            .provider_canonical_wal_base
+            .as_ref()
+            .filter(|_| {
+                !self
+                    .canonical_rewrite_proof()
+                    .is_some_and(|proof| proof.requires_full_commit_budget())
+            })
+            .and_then(|base| usize::try_from(base.canonical.message_count).ok())
+            .filter(|count| *count <= self.messages.len())
+            .unwrap_or(0);
+        &self.messages[committed_prefix..]
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -6414,7 +6426,9 @@ pub(crate) mod tests {
         pub(crate) handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
+        direct_context_errors: bool,
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
+        pre_execution_rejection: Option<String>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
         provider_response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -6481,7 +6495,9 @@ pub(crate) mod tests {
                 handoff_snapshots: Vec::new(),
                 turn_results,
                 terminal_provider_error: None,
+                direct_context_errors: false,
                 admitted_results_by_turn,
+                pre_execution_rejection: None,
                 current_turn: 0,
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
@@ -6762,6 +6778,14 @@ pub(crate) mod tests {
             if let Some(counter) = &self.provider_call_counter {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            if self.direct_context_errors
+                && result.error_kind == Some(astra_core::ErrorKind::ContextWindow)
+            {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContextWindow,
+                    result.accum.error_message.unwrap(),
+                ));
+            }
             Ok(result)
         }
 
@@ -6771,6 +6795,16 @@ pub(crate) mod tests {
             tool_calls: &[Value],
         ) -> AdmittedToolCallOutcome {
             self.admitted_tool_call_batches.push(tool_calls.to_vec());
+            if let Some(result) = self.pre_execution_rejection.take() {
+                assert_eq!(tool_calls.len(), 1);
+                return AdmittedToolCallOutcome {
+                    pre_execution_rejections: vec![RejectedToolCall::ordinary(
+                        tool_calls[0].clone(),
+                        result,
+                    )],
+                    ..Default::default()
+                };
+            }
             let scripted = self
                 .current_turn
                 .checked_sub(1)
@@ -8518,26 +8552,57 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stop_after_success_template_becomes_rendered_final_text() {
-        let mut host = MockHost::new(vec![edge_tool_result(
-            vec![make_edge_tool(
-                "mcp__moi__read_catalog_file_content",
-                "parsing",
+        let tool = "mcp__moi__read_catalog_file_content";
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            astra_runtime_env::WorkspaceBinding::none(),
+            astra_runtime_env::ExecutorBinding {
+                kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                executor_id: "moi".into(),
+                display_name: "MOI".into(),
+                transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                status: astra_runtime_env::ExecutorStatus::Online,
+            },
+            astra_runtime_env::RuntimeBinding::none(),
+            astra_runtime_env::PolicyIntent::cloud_control_plane(),
+            &registry,
+            &[astra_runtime_env::request_scoped_mcp_provider(
+                "moi",
+                [tool.to_string()],
             )],
-            20,
-            10,
-            Some(50),
-        )])
-        .with_stop_after_success_completion(
-            "mcp__moi__read_catalog_file_content",
-            Some("文件正在解析，工作流执行 ID：syswfe-1"),
         );
+        let mut result = make_edge_tool(tool, "parsing");
+        result.tool_result_fields.as_mut().unwrap().insert(
+            "runtime_environment_advertisement".into(),
+            serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                binding,
+            ))
+            .unwrap(),
+        );
+        let mut host = MockHost::new(vec![edge_tool_result(vec![result], 20, 10, Some(50))])
+            .with_stop_after_success_completion(
+                tool,
+                Some("文件正在解析，工作流执行 ID：syswfe-1"),
+            );
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "expected Ok but got: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "expected Ok but got: {outcome:?}; records={:?}; messages={:?}",
+            state.stall.tool_call_records,
+            state.messages,
+        );
         assert_eq!(host.current_turn, 1);
         assert_eq!(state.final_text, "文件正在解析，工作流执行 ID：syswfe-1");
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == tool && record.was_executed() && record.ok })
+        );
         assert!(state.final_text_streamed);
         let terminal_messages = state
             .messages
@@ -8555,25 +8620,246 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn denied_mcp_tool_does_not_trigger_a_success_template() {
+        let tool = "mcp__moi__read_catalog_file_content";
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool(tool, "parsing")], 20, 10, Some(50)),
+            text_result("The tool was unavailable.", 15, 5, Some(30)),
+        ])
+        .with_stop_after_success_completion(tool, Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected model recovery: {outcome:?}");
+        assert_eq!(state.final_text, "The tool was unavailable.");
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == tool && !record.was_executed() && !record.ok })
+        );
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == format!("req-{tool}")
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("mcp_executor_required"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_sibling_reaches_model_before_success_can_end_turn() {
+        let mut failed = make_edge_tool("read_file", "source unavailable");
+        failed.status = "failed".into();
+        let mut repaired = make_edge_tool("read_file", "source recovered");
+        repaired.request_id = "req-read-repair".into();
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![failed, make_edge_tool("catalog", "catalog ready")],
+                20,
+                10,
+                Some(50),
+            ),
+            edge_tool_result(vec![repaired], 20, 10, Some(30)),
+            text_result("recovered", 15, 5, Some(30)),
+        ])
+        .with_stop_after_success_completion("catalog", Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(
+            state.interruption.is_none(),
+            "recovery must finish normally"
+        );
+        assert_eq!(host.current_turn, 3);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "req-read_file"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("source unavailable"))
+                && message["_astra_tool_result_advisories"]
+                    .as_array()
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.as_str()
+                                .is_some_and(|text| text.contains("\"execution\":\"failed\""))
+                        })
+                    })
+        }));
+        assert_eq!(state.final_text, "recovered");
+    }
+
+    #[tokio::test]
+    async fn delivered_failed_build_reaches_model_before_success_can_end_turn() {
+        let mut failed = make_edge_tool_with_args(
+            "bash",
+            json!({"command": "go build ./..."}),
+            "cannot find module providing package example/fault",
+        );
+        failed.tool_result_fields.as_mut().unwrap().extend([
+            ("exit_code".into(), json!(1)),
+            ("exit_semantics".into(), json!("domain_negative")),
+            ("result_class".into(), json!("inconclusive")),
+        ]);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![failed, make_edge_tool("catalog", "catalog ready")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("The build could not find the module.", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash", "catalog"])
+        .with_stop_after_success_completion("catalog", Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(host.current_turn, 2);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("cannot find module"))
+        }));
+        assert_eq!(state.final_text, "The build could not find the module.");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_rejection_allows_a_different_permitted_action() {
+        let rejected = json!({
+            "id": "denied-command", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"denied\"}"}
+        });
+        let mut host = MockHost::new(vec![
+            server_tool_result(vec![rejected], Vec::new(), 20, 10, Some(50)),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "available")],
+                20,
+                10,
+                Some(30),
+            ),
+            text_result("done", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash", "read_file"]);
+        host.pre_execution_rejection = Some(
+            json!({"status":"rejected", "error_kind":"policy_denied", "retryable":false,
+                   "error":"This command is not permitted."})
+            .to_string(),
+        );
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(state.interruption.is_none());
+        assert_eq!(state.final_text, "done");
+        assert_eq!(host.current_turn, 3);
+        assert!(!host.text_only_turns[1]);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == "denied-command"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("This command is not permitted"))
+                && message["_astra_tool_result_advisories"]
+                    .to_string()
+                    .contains("\\\"retryable\\\":false")
+        }));
+        let denied = state
+            .stall
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("denied-command"))
+            .expect("rejection receipt");
+        assert!(!denied.was_executed());
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == "read_file" && record.was_executed() && record.ok })
+        );
+    }
+
+    fn completed_write_with_lost_result() -> EdgeToolExecResult {
+        let mut write = make_edge_tool_with_args(
+            "write_file",
+            json!({"path":"output.txt", "content":"expected"}),
+            "the result could not be saved",
+        );
+        write.status = "failed".into();
+        write.tool_result_fields.as_mut().unwrap().extend([
+            ("error_kind".into(), json!("contract_violation")),
+            ("provider_outcome_acknowledged".into(), json!(true)),
+            ("provider_result_was_error".into(), json!(false)),
+            ("durable_result_complete".into(), json!(false)),
+        ]);
+        write
+    }
+
+    #[tokio::test]
+    async fn model_can_verify_a_completed_write_whose_result_was_lost() {
+        let read = make_edge_tool_with_args("read_file", json!({"path":"output.txt"}), "expected");
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![completed_write_with_lost_result()], 20, 10, Some(50)),
+            edge_tool_result(vec![read], 20, 10, Some(30)),
+            text_result("verified", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(
+            state.interruption.is_none(),
+            "verified work must not remain blocked"
+        );
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.final_text, "verified");
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == "req-write_file"
+                && message["_astra_tool_result_advisories"]
+                    .to_string()
+                    .contains("result_delivery")
+        }));
+    }
+
+    #[tokio::test]
+    async fn lost_result_without_model_followup_does_not_complete_the_turn() {
+        let mut host = MockHost::new(vec![edge_tool_result(
+            vec![completed_write_with_lost_result()],
+            20,
+            10,
+            Some(50),
+        )]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_err() || state.interruption.is_some());
+        assert_eq!(host.current_turn, 1);
+    }
+
+    #[tokio::test]
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
-        let mut quality = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./quality-gate", "mode": "verify"}),
-            "quality ok",
-        );
+        let mut quality =
+            make_edge_tool_with_args("bash", json!({"command": "./quality-gate"}), "quality ok");
         quality.request_id = "req-quality".into();
-        let mut unit = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./unit-gate", "mode": "verify"}),
-            "unit ok",
-        );
+        let mut unit =
+            make_edge_tool_with_args("bash", json!({"command": "./unit-gate"}), "unit ok");
         unit.request_id = "req-unit".into();
         for receipt in [&mut quality, &mut unit] {
-            receipt.tool_result_fields.as_mut().unwrap().extend(
-                astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-            );
+            receipt.tool_result_fields.as_mut().unwrap().extend([
+                ("result_class".into(), json!("success")),
+                ("exit_semantics".into(), json!("success")),
+            ]);
         }
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![write], 0, 0, Some(50)),
@@ -9234,7 +9520,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_unchanged_work_observations_are_bounded_by_runtime() {
+    async fn context_overflow_preparation_and_streaming_rebuild_the_next_request() {
+        for direct in [false, true] {
+            let mut overflow = text_result("", 0, 0, None);
+            overflow.response.accum.error_message =
+                Some("input exceeds the provider context window".into());
+            overflow.response.error_kind = Some(astra_core::ErrorKind::ContextWindow);
+            let mut host = MockHost::new(vec![
+                overflow,
+                text_result("Recovered after compaction", 100, 10, None),
+            ]);
+            host.direct_context_errors = direct;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages.clear();
+            for index in 0..20 {
+                state
+                    .messages
+                    .push(json!({"role":"user","content":format!("old question {index}")}));
+                state
+                    .messages
+                    .push(json!({"role":"assistant","content":"old answer ".repeat(200)}));
+            }
+            state.messages.push(
+                json!({"role":"user","content":"Fix this; preserve the authentication boundary."}),
+            );
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{direct}: {outcome:?}"
+            );
+            assert_eq!(host.turn_count(), 2);
+            assert_eq!(
+                state.total_tool_calls, 0,
+                "failed preparation cannot execute tools"
+            );
+            assert!(!host.compaction_events.is_empty());
+            assert!(
+                crate::prompts::estimate_wire_input_tokens(&host.executed_messages[1], 0)
+                    < crate::prompts::estimate_wire_input_tokens(&host.executed_messages[0], 0)
+            );
+            assert!(
+                host.executed_messages[1]
+                    .iter()
+                    .any(|message| message["content"]
+                        == "Fix this; preserve the authentication boundary.")
+            );
+            assert_eq!(state.final_text, "Recovered after compaction");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_unchanged_work_observations_leave_next_step_to_model() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -9262,7 +9599,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["bash", "task_output"]);
         let mut state = make_state();
@@ -9275,19 +9617,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged observation must close the loop without another model call"
+            4,
+            "a repeated observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
@@ -9468,7 +9804,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["task_output"]);
         let mut state = make_state();
@@ -9481,19 +9822,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged live observation must close the loop"
+            4,
+            "a repeated live observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("has not materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
@@ -11100,7 +11435,6 @@ pub(crate) mod tests {
     fn original_execution_facts_keep_admitted_evaluation_thresholds() {
         use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
         let mut policy = astra_config::runtime_config::ToolPolicyConfig {
-            redundant_reads_eval_threshold: 7,
             search_fanout_eval_threshold: 19,
             redundant_validation_retries_eval_threshold: 5,
             ..Default::default()
@@ -14496,34 +14830,6 @@ mod parallel_execution_tests {
         assert_eq!(value[0]["payload"]["evidence"], "latest");
     }
 
-    #[test]
-    fn source_recovery_advisory_is_independent_singleton_decision_feedback() {
-        let mut state = make_state();
-        assert!(VolatileKind::SourceRecoveryAdvisory.is_singleton());
-        assert_eq!(
-            VolatileKind::SourceRecoveryAdvisory.delivery_class(),
-            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback,
-        );
-
-        state.push_volatile(VolatileKind::BehaviorAdvisory, "batch calls");
-        state.push_volatile_payload(
-            VolatileKind::SourceRecoveryAdvisory,
-            json!({"signal": "source_preimage_recovery_pending"}),
-        );
-        assert_eq!(
-            state.volatile_pending.len(),
-            2,
-            "source recovery must not overwrite unrelated behavioral feedback"
-        );
-        let value = super::runtime_volatile_injections_edge_profile_value(&state.volatile_pending)
-            .expect("source recovery advisory should serialize");
-        assert!(value.as_array().unwrap().iter().any(|entry| {
-            entry["kind"] == "source_recovery_advisory"
-                && entry["delivery_class"] == "decision_feedback"
-                && entry["payload"]["signal"] == "source_preimage_recovery_pending"
-        }));
-    }
-
     // ═══════════════════════════════════════════════════════════════════
     // Wire-format invariant tests — prompt cache protection
     // ═══════════════════════════════════════════════════════════════════
@@ -15052,7 +15358,6 @@ mod parallel_execution_tests {
                             r.snapshot.final_state.as_deref(),
                             Some("completed" | "interrupted")
                         ) && r.snapshot.read_only_round_streak >= 32
-                            && r.snapshot.redundant_read_count >= 6
                     })
                     .count()
                     >= 3,

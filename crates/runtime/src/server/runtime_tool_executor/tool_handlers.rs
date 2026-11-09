@@ -582,18 +582,17 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("enter_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_enter_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.session_id,
-                &context.user_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                args,
-            )
-            .await,
+        execute_enter_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.session_id,
+            &context.user_id,
+            &context.plan_mode_cache,
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            args,
+            cancel_token,
         )
+        .await
     }
 }
 
@@ -640,20 +639,27 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("exit_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_exit_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.user_id,
-                &context.session_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                context.approval_gate.as_deref(),
-                &plan_review_request_id(&context.session_id, invocation.tool_call_id),
-                args,
-            )
-            .await,
-        )
+        let request_id = plan_review_request_id(&context.session_id, invocation.tool_call_id);
+        let exit = execute_exit_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.user_id,
+            &context.session_id,
+            context.plan_mode_cache.as_ref(),
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            context.approval_gate.as_deref(),
+            &request_id,
+            args,
+        );
+        match cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                result = exit => result,
+                _ = token.cancelled() => astra_tools::cancelled_tool_result("exit_plan_mode", true)
+                    .with_execution_outcome_unknown(),
+            },
+            None => exit.await,
+        }
     }
 }
 
@@ -1257,13 +1263,15 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::cancelled_tool_result("rollback_file_edits", false);
-        }
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return astra_tools::cancelled_tool_result("rollback_file_edits", false);
         }
-        if args.get("scope").and_then(Value::as_str) == Some("source_receipt") {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").map(|_| "file"))
+            .unwrap_or("current_turn");
+        let receipt = if scope == "source_receipt" {
             let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
                 Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
                 _ => {
@@ -1287,28 +1295,34 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
                     .to_string(),
                 );
             };
-            return tool_result_from_output(
-                match astra_tools::source_preimage::restore_receipt(
-                    &context.workspace_root,
-                    &owner_scope,
-                    receipt_id,
-                ) {
-                    Ok(()) => serde_json::json!({
-                        "success": true,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "summary": "Restored the retained source preimage.",
-                    })
-                    .to_string(),
-                    Err(error) => serde_json::json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "error": error,
-                    })
-                    .to_string(),
-                },
-            );
+            match astra_tools::source_preimage::prepare_receipt_restore(
+                &context.workspace_root,
+                &owner_scope,
+                receipt_id,
+            ) {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    return tool_result_from_output(
+                        serde_json::json!({
+                            "success": false,
+                            "scope": "source_receipt",
+                            "receipt_id": receipt_id,
+                            "error": error,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(receipt) = receipt {
+            return tool_result_from_output(match receipt.restore() {
+                Ok(()) => serde_json::json!({"success":true, "scope":"source_receipt",
+                    "receipt_id":args["receipt_id"], "summary":"Restored the retained source preimage."}).to_string(),
+                Err(error) => serde_json::json!({"success":false, "scope":"source_receipt",
+                    "receipt_id":args["receipt_id"], "error":error}).to_string(),
+            });
         }
         tool_result_from_output(execute_rollback_file_edits(
             &context.workspace_root,

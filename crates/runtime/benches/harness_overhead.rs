@@ -45,7 +45,6 @@ fn make_snapshot() -> RuntimeSnapshot {
         has_final_text: false,
         last_tool_result_class: None,
         read_only_round_streak: 0,
-        redundant_read_count: 0,
         recursion_depth: 0,
         consecutive_errors: 0,
         captured_at_unix_millis: 1_700_000_000_000,

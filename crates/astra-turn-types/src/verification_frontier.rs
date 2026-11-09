@@ -41,10 +41,8 @@ impl BoundVerificationFrontier {
         {
             return Err("verification frontier chain or contract is invalid".into());
         }
-        if (self.contract.is_empty() && self.mutation.is_some())
-            || (self.mutation.is_none() && self.proofs.iter().any(Option::is_some))
-        {
-            return Err("verification proofs without a source mutation".into());
+        if self.contract.is_empty() && self.mutation.is_some() {
+            return Err("verification change evidence without a declared contract".into());
         }
         let mut ordinals = std::collections::BTreeMap::new();
         let mut identities = std::collections::BTreeMap::new();
@@ -82,14 +80,15 @@ impl BoundVerificationFrontier {
             if self
                 .mutation
                 .as_ref()
-                .is_none_or(|mutation| proof.ordinal <= mutation.ordinal)
+                .is_some_and(|mutation| proof.ordinal < mutation.ordinal)
                 || proof.invocation.state != ToolInvocationState::Succeeded
                 || proof.invocation.dispatch_certainty != DispatchCertainty::Dispatched
                 || proof.invocation.completion_source.is_some()
                 || proof.invocation.outcome_digest.is_none()
             {
                 return Err(
-                    "verification proof is not a successful post-mutation execution".into(),
+                    "declared check evidence is not a successful execution after the known change"
+                        .into(),
                 );
             }
         }
@@ -159,6 +158,16 @@ mod tests {
             proofs: vec![Some(evidence("check", 2)); 2],
             workspace_root: None,
         }
+    }
+
+    #[test]
+    fn declared_check_outcomes_do_not_require_a_preceding_change() {
+        let mut unchanged = snapshot();
+        unchanged.mutation = None;
+        unchanged.validate().unwrap();
+        let mut checked_change = snapshot();
+        checked_change.mutation = checked_change.proofs[0].clone();
+        checked_change.validate().unwrap();
     }
 
     #[test]
