@@ -4993,7 +4993,9 @@ mod model_catalog_loading_tests {
         CredentialsFile, Profile, cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
         load_credentials, save_credentials,
     };
-    use crate::cli::session::session_runtime::{ModelCatalogError, fetch_owner_model_catalog};
+    use crate::cli::session::session_runtime::{
+        AdmittedAuth, ModelCatalogError, fetch_admitted_model_catalog, fetch_owner_model_catalog,
+    };
     use crate::test_utils::ProcessEnvGuard;
     use crate::tests::isolate_credentials;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -5215,6 +5217,106 @@ mod model_catalog_loading_tests {
         assert!(
             matches!(result, Ok(Outcome::Saved { model_id, catalog: Err(_), .. }) if model_id == id)
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_finishes_bound_catalog_after_account_switch() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::HeaderMap,
+            routing::{get, put},
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone, Default)]
+        struct Gate {
+            write_started: Arc<tokio::sync::Notify>,
+            release_write: Arc<tokio::sync::Notify>,
+        }
+        fn require_old_owner(headers: &HeaderMap) {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer valid-access")
+            );
+        }
+        async fn sources(headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            Json(serde_json::json!({"management_available": true}))
+        }
+        async fn activate(State(gate): State<Gate>, headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            gate.write_started.notify_one();
+            gate.release_write.notified().await;
+            Json(serde_json::json!({}))
+        }
+        async fn models(headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            Json(
+                serde_json::json!({"items":[], "next_cursor":null, "limit":50, "total":0, "catalog_revision":"sha256:empty"}),
+            )
+        }
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let mut creds = load_credentials();
+        creds.profiles.insert(
+            "other".into(),
+            Profile {
+                account_id: Some("other-user".into()),
+                access_token: Some("other-access".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let owner = cli_owner_auth_snapshot();
+        let gate = Gate::default();
+        let app = Router::new()
+            .route("/me/model-connections", get(sources))
+            .route("/me/models/{id}", put(activate))
+            .route("/models", get(models))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let setup = model_setup::run(
+            Action::Activate(id.into()),
+            api,
+            owner.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(LoginControl::default()),
+            progress,
+        );
+        tokio::pin!(setup);
+        tokio::select! {
+            _ = &mut setup => panic!("model write must be held"),
+            _ = gate.write_started.notified() => {}
+        }
+        creds.current_profile = Some("other".into());
+        save_credentials(&creds).unwrap();
+        let _selected = install_cli_profile_identity_for_test("other", Some("other-user")).unwrap();
+        assert!(!owner.is_current());
+        gate.release_write.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut setup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Outcome::Saved { model_id, catalog: Ok(models) } if model_id == id && models.is_empty())
+        );
+        server.abort();
     }
 
     #[serial_test::serial]
@@ -5487,6 +5589,14 @@ mod model_catalog_loading_tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None)
             .unwrap()
             .with_bearer_provider(std::sync::Arc::new(UnrelatedBearer));
+
+        // A new UI action cannot use the old owner after the account switch.
+        // The already-bound operation below can still finish with that owner.
+        assert!(matches!(
+            fetch_admitted_model_catalog(&api, &AdmittedAuth::Owner(owner.clone())).await,
+            Err(ModelCatalogError::NotAuthenticated)
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
 
         let models = fetch_owner_model_catalog(&api, &owner)
             .await

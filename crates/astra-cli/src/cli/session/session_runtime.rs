@@ -376,7 +376,19 @@ pub(crate) async fn fetch_owner_model_catalog(
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
     let api = api.clone().without_bearer_provider();
     tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
-        fetch_admitted_model_catalog(&api, &AdmittedAuth::Owner(owner.clone())).await
+        // An already committed action may finish with its captured binding
+        // after the user selects a different profile. The binding itself
+        // still rejects logout, re-login, and credential replacement.
+        let token = owner_access_token(&api, owner, None)
+            .await
+            .ok_or(ModelCatalogError::NotAuthenticated)?;
+        fetch_model_catalog_with_retry(
+            &api,
+            &token,
+            owner_access_token(&api, owner, Some(&token)),
+            true,
+        )
+        .await
     })
     .await
     .map_err(|_| ModelCatalogError::TimedOut)?
@@ -391,21 +403,36 @@ pub(crate) async fn fetch_admitted_model_catalog(
         .access_token(&api, None)
         .await
         .ok_or(ModelCatalogError::NotAuthenticated)?;
-    match fetch_model_catalog(&api, Some(&token)).await {
+    fetch_model_catalog_with_retry(
+        &api,
+        &token,
+        auth.access_token(&api, Some(&token)),
+        matches!(auth, AdmittedAuth::Owner(_)),
+    )
+    .await
+}
+
+async fn fetch_model_catalog_with_retry(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    refresh: impl std::future::Future<Output = Option<String>>,
+    owner_bound: bool,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    match fetch_model_catalog(api, Some(token)).await {
         Err(
             error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::UNAUTHORIZED,
                 ..
             }),
         ) => {
-            let Some(refreshed) = auth.access_token(&api, Some(&token)).await else {
-                return Err(if matches!(auth, AdmittedAuth::Owner(_)) {
+            let Some(refreshed) = refresh.await else {
+                return Err(if owner_bound {
                     ModelCatalogError::NotAuthenticated
                 } else {
                     error
                 });
             };
-            fetch_model_catalog(&api, Some(&refreshed)).await
+            fetch_model_catalog(api, Some(&refreshed)).await
         }
         result => result,
     }
