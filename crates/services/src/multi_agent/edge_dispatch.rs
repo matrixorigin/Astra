@@ -110,73 +110,6 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     Ok(persisted == replayed)
 }
 
-fn canonical_edge_dispatch_payload_json(payload_json: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&serde_json::from_str::<serde_json::Value>(payload_json)?)
-}
-
-fn edge_dispatch_payloads_match(
-    persisted: &serde_json::Value,
-    replayed: &str,
-) -> Result<bool, String> {
-    let replayed = serde_json::from_str::<serde_json::Value>(replayed)
-        .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
-    Ok(edge_dispatch_values_match(persisted, &replayed))
-}
-
-fn edge_dispatch_values_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    use serde_json::Value;
-
-    match (left, right) {
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| edge_dispatch_values_match(left, right))
-        }
-        (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|other| edge_dispatch_values_match(value, other))
-                })
-        }
-        (Value::Number(left), Value::Number(right)) => {
-            left == right
-                || integral_float_matches_integer(left, right)
-                || integral_float_matches_integer(right, left)
-        }
-        _ => left == right,
-    }
-}
-
-fn integral_float_matches_integer(
-    float: &serde_json::Number,
-    integer: &serde_json::Number,
-) -> bool {
-    if !float.is_f64() {
-        return false;
-    }
-    let Some(value) = float.as_f64() else {
-        return false;
-    };
-    if value.fract() != 0.0 {
-        return false;
-    }
-
-    // MatrixOne's JSON storage can return 120.0 as 120. Compare through an
-    // integer only when the float is in range: converting integers to f64, or
-    // allowing a saturating cast, would equate distinct large payloads.
-    if (0.0..18_446_744_073_709_551_616.0).contains(&value) {
-        integer.as_u64() == Some(value as u64)
-    } else if (-9_223_372_036_854_775_808.0..0.0).contains(&value) {
-        integer.as_i64() == Some(value as i64)
-    } else {
-        false
-    }
-}
-
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(context, %error, "edge_dispatch rollback failed");
@@ -185,71 +118,28 @@ async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'
 
 #[async_trait]
 pub trait EdgeDispatchService: Send + Sync {
-    /// Insert a new pending dispatch idempotently inside the full turn boundary.
-    async fn insert_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload_json: &str,
-    ) -> Result<(), String>;
-
-    /// Admit a durable dispatch and report whether the exact identity already
-    /// has terminal evidence. Implementations with a durable store must also
-    /// reject an existing identity bound to different payload or edge owner.
-    /// The default is only suitable when `insert_dispatch` errors prove that
-    /// no durable write occurred; stores with ambiguous commit responses must
-    /// override this method and return `OutcomeUnknown`.
+    /// Atomically admit a durable request, preserving its serialized payload.
     async fn admit_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload_json: &str,
-    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
-        self.insert_dispatch(identity, edge_agent_id, payload_json)
-            .await
-            .map_err(EdgeDispatchAdmissionError::Rejected)?;
-        Ok(EdgeDispatchAdmission::Pending)
-    }
-
-    /// Atomically claim an admitted pending row for direct socket delivery.
-    /// False means another relay already owns dispatch and the caller must
-    /// observe the durable result instead of sending a duplicate.
-    async fn claim_direct_dispatch(
         &self,
         _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        Ok(true)
+        _payload: &serde_json::Value,
+    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
+        Err(EdgeDispatchAdmissionError::Rejected(
+            "durable Edge admission is unavailable".to_string(),
+        ))
     }
 
-    /// Atomically admit a durable row and reserve it for direct socket
-    /// delivery. Durable implementations must prevent relay polling from
-    /// observing a newly admitted request between these two state changes.
+    /// Atomically admit and claim a request for direct socket delivery.
     async fn admit_and_claim_direct_dispatch(
         &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload_json: &str,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+        _payload: &serde_json::Value,
     ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
-        match self
-            .admit_dispatch(identity, edge_agent_id, payload_json)
-            .await?
-        {
-            EdgeDispatchAdmission::Terminal(result) => {
-                Ok(EdgeDirectDispatchAdmission::Terminal(result))
-            }
-            EdgeDispatchAdmission::Pending => self
-                .claim_direct_dispatch(identity, edge_agent_id)
-                .await
-                .map(|claimed| {
-                    if claimed {
-                        EdgeDirectDispatchAdmission::Claimed
-                    } else {
-                        EdgeDirectDispatchAdmission::Observing
-                    }
-                })
-                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown),
-        }
+        Err(EdgeDispatchAdmissionError::Rejected(
+            "direct Edge admission is unavailable".to_string(),
+        ))
     }
 
     /// Resource limits for durable claim, delivery, and settlement work.
@@ -357,21 +247,55 @@ pub enum EdgeDirectDispatchAdmission {
 /// contrast, `OutcomeUnknown` means the durable insert or its verification may
 /// have committed before the caller lost the response, so retrying through a
 /// different transport could duplicate an external side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeDispatchFailureStage {
+    Begin,
+    Insert,
+    Verify,
+    Claim,
+    Commit,
+    Rollback,
+    TerminalResult,
+    Adapter,
+}
+
+impl std::fmt::Display for EdgeDispatchFailureStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Begin => "database transaction start",
+            Self::Insert => "database insert",
+            Self::Verify => "database verification",
+            Self::Claim => "dispatch claim",
+            Self::Commit => "database commit",
+            Self::Rollback => "database rollback",
+            Self::TerminalResult => "terminal result verification",
+            Self::Adapter => "dispatch adapter",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeDispatchAdmissionError {
     Rejected(String),
-    OutcomeUnknown(String),
+    OutcomeUnknown(EdgeDispatchFailureStage),
 }
 
 impl std::fmt::Display for EdgeDispatchAdmissionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rejected(message) | Self::OutcomeUnknown(message) => formatter.write_str(message),
+            Self::Rejected(message) => formatter.write_str(message),
+            Self::OutcomeUnknown(stage) => write!(formatter, "{stage}"),
         }
     }
 }
 
 impl std::error::Error for EdgeDispatchAdmissionError {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeAdmissionMode {
+    Relay,
+    Direct,
+}
 
 pub struct DatabaseEdgeDispatchService {
     pool: sqlx::Pool<sqlx::MySql>,
@@ -423,6 +347,134 @@ impl DatabaseEdgeDispatchService {
         let _ = self.wait_coordinator.metrics.set(metrics.clone());
         self.metrics = Some(metrics);
         self
+    }
+
+    async fn admit(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload: &serde_json::Value,
+        mode: EdgeAdmissionMode,
+    ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
+        use EdgeDispatchAdmissionError::{OutcomeUnknown, Rejected};
+        use EdgeDispatchFailureStage as Stage;
+
+        if !identity.is_complete() {
+            return Err(Rejected("edge dispatch identity is incomplete".to_string()));
+        }
+        if edge_agent_id.trim().is_empty() {
+            return Err(Rejected("edge dispatch owner is required".to_string()));
+        }
+        let payload_json = payload.to_string();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| OutcomeUnknown(Stage::Begin))?;
+        let insert = match mode {
+            EdgeAdmissionMode::Relay => {
+                "INSERT IGNORE INTO edge_pending_dispatch \
+                 (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')"
+            }
+            EdgeAdmissionMode::Direct => {
+                "INSERT IGNORE INTO edge_pending_dispatch \
+                 (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status, dispatched_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', NOW(6))"
+            }
+        };
+        let inserted = sqlx::query(insert)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(edge_agent_id)
+            .bind(&identity.request_id)
+            .bind(&payload_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| OutcomeUnknown(Stage::Insert))?
+            .rows_affected()
+            > 0;
+        let row = sqlx::query(
+            "SELECT edge_agent_id, payload_json, status, result_json \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? \
+               AND turn_chain_id = ? AND request_id = ? FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| OutcomeUnknown(Stage::Verify))?
+        .ok_or(OutcomeUnknown(Stage::Verify))?;
+        let stored_edge: String = row
+            .try_get("edge_agent_id")
+            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+        let stored_payload: String = row
+            .try_get("payload_json")
+            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+        if stored_edge != edge_agent_id || stored_payload != payload_json {
+            tx.rollback()
+                .await
+                .map_err(|_| OutcomeUnknown(Stage::Rollback))?;
+            return Err(Rejected(format!(
+                "edge_dispatch identity {} conflicts with its durable edge owner or payload",
+                identity.request_id
+            )));
+        }
+        let status: String = row
+            .try_get("status")
+            .map_err(|_| OutcomeUnknown(Stage::Verify))?;
+        let wake = mode == EdgeAdmissionMode::Relay && status == "pending";
+        let outcome = match status.as_str() {
+            "pending" if mode == EdgeAdmissionMode::Direct => {
+                let updated = sqlx::query(
+                    "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
+                     WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                       AND request_id = ? AND edge_agent_id = ? AND status = 'pending'",
+                )
+                .bind(&identity.user_id)
+                .bind(&identity.session_id)
+                .bind(&identity.run_id)
+                .bind(&identity.turn_chain_id)
+                .bind(&identity.request_id)
+                .bind(edge_agent_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| OutcomeUnknown(Stage::Claim))?;
+                if updated.rows_affected() != 1 {
+                    return Err(OutcomeUnknown(Stage::Claim));
+                }
+                EdgeDirectDispatchAdmission::Claimed
+            }
+            "pending" => EdgeDirectDispatchAdmission::Observing,
+            "dispatched" if mode == EdgeAdmissionMode::Direct && inserted => {
+                EdgeDirectDispatchAdmission::Claimed
+            }
+            "dispatched" => EdgeDirectDispatchAdmission::Observing,
+            "completed" | "failed" => {
+                let result = row
+                    .try_get::<Option<String>, _>("result_json")
+                    .map_err(|_| OutcomeUnknown(Stage::TerminalResult))?
+                    .ok_or(OutcomeUnknown(Stage::TerminalResult))?;
+                EdgeDirectDispatchAdmission::Terminal(result)
+            }
+            _ => return Err(OutcomeUnknown(Stage::Verify)),
+        };
+        tx.commit()
+            .await
+            .map_err(|_| OutcomeUnknown(Stage::Commit))?;
+        if inserted && let Some(metrics) = &self.metrics {
+            metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
+        }
+        if wake {
+            self.wake_hub.notify(&identity.user_id, edge_agent_id).await;
+        }
+        Ok(outcome)
     }
 }
 
@@ -1134,9 +1186,8 @@ fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispa
             .string_column("request_id")
             .map_err(|e| edge_dispatch_decode_error("poll row", "request_id", e))?,
         payload_json: row
-            .json_column("payload_json")
-            .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?
-            .to_string(),
+            .string_column("payload_json")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?,
         result_json: row
             .optional_string_column("result_json")
             .map_err(|e| edge_dispatch_decode_error("poll row", "result_json", e))?,
@@ -1285,143 +1336,22 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         }
     }
 
-    #[tracing::instrument(skip(self, identity, payload_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id))]
-    async fn insert_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload_json: &str,
-    ) -> Result<(), String> {
-        if !identity.is_complete() {
-            return Err("edge_dispatch insert: incomplete dispatch identity".to_string());
-        }
-        let payload_json = canonical_edge_dispatch_payload_json(payload_json)
-            .map_err(|error| format!("edge_dispatch insert payload is invalid JSON: {error}"))?;
-        // Idempotent insert inside a full turn boundary: duplicate calls for
-        // the same dispatched tool are harmless retries, while same request_id
-        // values in other runs/chains remain isolated.
-        match sqlx::query(
-            "INSERT IGNORE INTO edge_pending_dispatch \
-             (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(edge_agent_id)
-        .bind(&identity.request_id)
-        .bind(&payload_json)
-        .execute(&self.pool)
-        .await
-        {
-            Ok(r) => {
-                if r.rows_affected() > 0
-                    && let Some(ref m) = self.metrics
-                {
-                    m.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
-                }
-                self.wake_hub
-                    .notify(&identity.user_id, edge_agent_id)
-                    .await;
-                Ok(())
-            }
-            Err(e) => Err(format!("edge_dispatch insert: {e}")),
-        }
-    }
-
     async fn admit_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
+        payload: &serde_json::Value,
     ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
-        if !identity.is_complete() {
-            return Err(EdgeDispatchAdmissionError::Rejected(
-                "edge_dispatch admit: incomplete dispatch identity".to_string(),
-            ));
-        }
-        if edge_agent_id.trim().is_empty() {
-            return Err(EdgeDispatchAdmissionError::Rejected(
-                "edge_dispatch admit: edge_agent_id is required".to_string(),
-            ));
-        }
-        let payload_json = canonical_edge_dispatch_payload_json(payload_json).map_err(|error| {
-            EdgeDispatchAdmissionError::Rejected(format!(
-                "edge_dispatch admit: payload is invalid JSON: {error}"
-            ))
-        })?;
-        self.insert_dispatch(identity, edge_agent_id, &payload_json)
-            .await
-            .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?;
-        let row = sqlx::query(
-            "SELECT edge_agent_id, payload_json, \
-                    status, result_json \
-             FROM edge_pending_dispatch \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? \
-               AND turn_chain_id = ? AND request_id = ?",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch admit SELECT: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(
-                "edge_dispatch admitted row disappeared before verification".to_string(),
-            )
-        })?;
-        let persisted_edge: String = row.try_get("edge_agent_id").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch admit edge_agent_id decode: {error}"
-            ))
-        })?;
-        let persisted_payload = row.json_column("payload_json").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch admit payload_json decode: {error}"
-            ))
-        })?;
-        if persisted_edge != edge_agent_id
-            || !edge_dispatch_payloads_match(&persisted_payload, &payload_json)
-                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
+        match self
+            .admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Relay)
+            .await?
         {
-            return Err(EdgeDispatchAdmissionError::Rejected(format!(
-                "edge_dispatch identity {} conflicts with its durable edge owner or payload",
-                identity.request_id
-            )));
-        }
-        let status: String = row.try_get("status").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch admit status decode: {error}"
-            ))
-        })?;
-        match status.as_str() {
-            "pending" | "dispatched" => Ok(EdgeDispatchAdmission::Pending),
-            "completed" | "failed" => row
-                .try_get::<Option<String>, _>("result_json")
-                .map_err(|error| {
-                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                        "edge_dispatch admit result_json decode: {error}"
-                    ))
-                })?
-                .map(EdgeDispatchAdmission::Terminal)
-                .ok_or_else(|| {
-                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                        "edge_dispatch terminal identity {} has no result evidence",
-                        identity.request_id
-                    ))
-                }),
-            other => Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch identity {} has unsupported status {other}",
-                identity.request_id
-            ))),
+            EdgeDirectDispatchAdmission::Terminal(result) => {
+                Ok(EdgeDispatchAdmission::Terminal(result))
+            }
+            EdgeDirectDispatchAdmission::Claimed | EdgeDirectDispatchAdmission::Observing => {
+                Ok(EdgeDispatchAdmission::Pending)
+            }
         }
     }
 
@@ -1429,167 +1359,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
+        payload: &serde_json::Value,
     ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
-        if !identity.is_complete() {
-            return Err(EdgeDispatchAdmissionError::Rejected(
-                "edge_dispatch direct admit: incomplete dispatch identity".to_string(),
-            ));
-        }
-        if edge_agent_id.trim().is_empty() {
-            return Err(EdgeDispatchAdmissionError::Rejected(
-                "edge_dispatch direct admit: edge_agent_id is required".to_string(),
-            ));
-        }
-        let payload_json = canonical_edge_dispatch_payload_json(payload_json).map_err(|error| {
-            EdgeDispatchAdmissionError::Rejected(format!(
-                "edge_dispatch direct admit: payload is invalid JSON: {error}"
-            ))
-        })?;
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch direct admit begin: {error}"
-            ))
-        })?;
-        let inserted = match sqlx::query(
-            "INSERT IGNORE INTO edge_pending_dispatch \
-             (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-              payload_json, status, dispatched_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', NOW(6))",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(edge_agent_id)
-        .bind(&identity.request_id)
-        .bind(&payload_json)
-        .execute(&mut *tx)
-        .await
-        {
-            Ok(result) => result.rows_affected() > 0,
-            Err(error) => {
-                rollback_edge_dispatch_tx(tx, "direct admit insert").await;
-                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                    "edge_dispatch direct admit INSERT: {error}"
-                )));
-            }
-        };
-        let row = match sqlx::query(
-            "SELECT edge_agent_id, payload_json, \
-                    status, result_json \
-             FROM edge_pending_dispatch \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? \
-               AND turn_chain_id = ? AND request_id = ? FOR UPDATE",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .fetch_optional(&mut *tx)
-        .await
-        {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                rollback_edge_dispatch_tx(tx, "direct admit missing row").await;
-                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(
-                    "edge_dispatch direct admitted row disappeared".to_string(),
-                ));
-            }
-            Err(error) => {
-                rollback_edge_dispatch_tx(tx, "direct admit select").await;
-                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                    "edge_dispatch direct admit SELECT: {error}"
-                )));
-            }
-        };
-        let persisted_edge: String = row.try_get("edge_agent_id").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch direct admit edge decode: {error}"
-            ))
-        })?;
-        let persisted_payload = row.json_column("payload_json").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch direct admit payload decode: {error}"
-            ))
-        })?;
-        if persisted_edge != edge_agent_id
-            || !edge_dispatch_payloads_match(&persisted_payload, &payload_json)
-                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
-        {
-            rollback_edge_dispatch_tx(tx, "direct admit conflict").await;
-            return Err(EdgeDispatchAdmissionError::Rejected(format!(
-                "edge_dispatch identity {} conflicts with its durable edge owner or payload",
-                identity.request_id
-            )));
-        }
-        let status: String = row.try_get("status").map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch direct admit status decode: {error}"
-            ))
-        })?;
-        let outcome = match status.as_str() {
-            "pending" => {
-                let updated = sqlx::query(
-                    "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
-                     WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-                       AND request_id = ? AND edge_agent_id = ? AND status = 'pending'",
-                )
-                .bind(&identity.user_id)
-                .bind(&identity.session_id)
-                .bind(&identity.run_id)
-                .bind(&identity.turn_chain_id)
-                .bind(&identity.request_id)
-                .bind(edge_agent_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                        "edge_dispatch direct admit UPDATE: {error}"
-                    ))
-                })?;
-                if updated.rows_affected() != 1 {
-                    rollback_edge_dispatch_tx(tx, "direct admit update count").await;
-                    return Err(EdgeDispatchAdmissionError::OutcomeUnknown(
-                        "edge_dispatch direct admit did not claim exactly one pending row"
-                            .to_string(),
-                    ));
-                }
-                EdgeDirectDispatchAdmission::Claimed
-            }
-            "dispatched" if inserted => EdgeDirectDispatchAdmission::Claimed,
-            "dispatched" => EdgeDirectDispatchAdmission::Observing,
-            "completed" | "failed" => row
-                .try_get::<Option<String>, _>("result_json")
-                .map_err(|error| {
-                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                        "edge_dispatch direct admit result decode: {error}"
-                    ))
-                })?
-                .map(EdgeDirectDispatchAdmission::Terminal)
-                .ok_or_else(|| {
-                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                        "edge_dispatch terminal identity {} has no result evidence",
-                        identity.request_id
-                    ))
-                })?,
-            other => {
-                rollback_edge_dispatch_tx(tx, "direct admit unsupported status").await;
-                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                    "edge_dispatch direct admit observed unsupported status {other}"
-                )));
-            }
-        };
-        tx.commit().await.map_err(|error| {
-            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
-                "edge_dispatch direct admit commit: {error}"
-            ))
-        })?;
-        if inserted && let Some(ref metrics) = self.metrics {
-            metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(outcome)
+        self.admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Direct)
+            .await
     }
 
     async fn subscribe_pending_wakeup(
@@ -1600,52 +1373,6 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(Some(self.wake_hub.subscribe(user_id, edge_agent_id).await))
     }
 
-    async fn claim_direct_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        let claimed = sqlx::query(
-            "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-               AND request_id = ? AND edge_agent_id = ? AND status = 'pending'",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .bind(edge_agent_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| format!("edge_dispatch direct claim: {error}"))?;
-        if claimed.rows_affected() > 0 {
-            return Ok(true);
-        }
-        let status = sqlx::query(
-            "SELECT status FROM edge_pending_dispatch \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-               AND request_id = ? AND edge_agent_id = ?",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .bind(edge_agent_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| format!("edge_dispatch verify direct claim: {error}"))?
-        .ok_or_else(|| "edge_dispatch direct claim row disappeared".to_string())?
-        .try_get::<String, _>("status")
-        .map_err(|error| format!("edge_dispatch direct claim status decode: {error}"))?;
-        match status.as_str() {
-            "dispatched" | "completed" | "failed" => Ok(false),
-            other => Err(format!(
-                "edge_dispatch direct claim observed unsupported status {other}"
-            )),
-        }
-    }
     #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
     async fn poll_pending(
         &self,
@@ -2149,14 +1876,6 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
         Ok(None)
     }
 
-    async fn insert_dispatch(
-        &self,
-        _identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-        _payload_json: &str,
-    ) -> Result<(), String> {
-        Err("edge dispatch service not configured".to_string())
-    }
     async fn poll_pending(
         &self,
         _user_id: &str,
@@ -2196,6 +1915,10 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn parse_dispatch_payload(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("valid dispatch fixture")
+    }
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use uuid::Uuid;
 
@@ -2346,7 +2069,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let identity = EdgeDispatchIdentity::new(&id, &id, &id, &id, &id);
         writer
-            .insert_dispatch(&identity, "edge", "{}")
+            .admit_dispatch(&identity, "edge", &json!({}))
             .await
             .unwrap();
         assert_eq!(writer.poll_pending(&id, "edge").await.unwrap().len(), 1);
@@ -2674,6 +2397,7 @@ mod tests {
                 "turn_chain_id" => "turn-chain-1",
                 "edge_agent_id" => "edge-1",
                 "request_id" => "request-1",
+                "payload_json" => r#"{"tool":"agent_fanout"}"#,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .to_string())
@@ -2795,7 +2519,10 @@ mod tests {
             ),
         ];
         for (identity, edge) in &rows[..2] {
-            service.insert_dispatch(identity, edge, "{}").await.unwrap();
+            service
+                .admit_dispatch(identity, edge, &json!({}))
+                .await
+                .unwrap();
         }
         assert!(
             service
@@ -2806,7 +2533,10 @@ mod tests {
                 .is_empty()
         );
         for (identity, edge) in &rows[2..] {
-            service.insert_dispatch(identity, edge, "{}").await.unwrap();
+            service
+                .admit_dispatch(identity, edge, &json!({}))
+                .await
+                .unwrap();
         }
         let found = service.wake_hub.pending_targets(&targets).await.unwrap();
         assert_eq!(found.len(), 2);
@@ -3090,7 +2820,7 @@ mod tests {
         cleanup_edge_dispatch_fixture(&pool, &identity).await;
 
         DatabaseEdgeDispatchService::from_shared(&pool)
-            .insert_dispatch(&identity, "edge-backlog-agent", r#"{"tool":"probe"}"#)
+            .admit_dispatch(&identity, "edge-backlog-agent", &json!({"tool":"probe"}))
             .await
             .expect("insert backlog fixture");
 
@@ -3151,39 +2881,19 @@ mod tests {
     }
 
     #[test]
-    fn edge_dispatch_payload_matching_handles_database_numeric_normalization() {
-        let cases = [
-            (
-                r#"{"args":[120.0,-120.0,-0.0,0.125]}"#,
-                r#"{"args":[120,-120,0,0.125]}"#,
-                true,
-            ),
-            (r#"{"a":1.0,"b":[2.0]}"#, r#"{"b":[2],"a":1}"#, true),
-            ("9007199254740992.0", "9007199254740992", true),
-            ("9007199254740992.0", "9007199254740993", false),
-            ("-9223372036854775808.0", "-9223372036854775808", true),
-            ("-9223372036854775808.0", "-9223372036854775807", false),
-            ("18446744073709551616.0", "18446744073709551615", false),
-            ("120.5", "120", false),
-            (r#"{"timeout":"120"}"#, r#"{"timeout":120.0}"#, false),
-            ("[1,2]", "[2,1]", false),
-            (r#"{"a":1}"#, r#"{"b":1}"#, false),
-        ];
-        for (left, right, expected) in cases {
-            let left_value = serde_json::from_str(left).unwrap();
-            let right_value = serde_json::from_str(right).unwrap();
-            assert_eq!(
-                edge_dispatch_payloads_match(&left_value, right).unwrap(),
-                expected,
-                "{left} vs {right}"
-            );
-            assert_eq!(
-                edge_dispatch_payloads_match(&right_value, left).unwrap(),
-                expected,
-                "{right} vs {left}"
-            );
-        }
-        assert!(edge_dispatch_payloads_match(&serde_json::Value::Null, "not-json").is_err());
+    fn dispatch_payload_serialization_is_ordered_and_keeps_numeric_types() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"args":{"timestamp":8.949943645992772e17,"zero":-0.0},"tool":"bash"}"#,
+        )
+        .unwrap();
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{"tool":"bash","args":{"zero":-0.0,"timestamp":8.949943645992772e17}}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.to_string(), reordered.to_string());
+        let mut changed = reordered;
+        changed["args"]["zero"] = json!(0.0);
+        assert_ne!(payload.to_string(), changed.to_string());
     }
 
     #[test]
@@ -3223,7 +2933,11 @@ mod tests {
         .to_string();
 
         let admission = direct
-            .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)
+            .admit_and_claim_direct_dispatch(
+                &identity,
+                &edge_agent_id,
+                &parse_dispatch_payload(&payload),
+            )
             .await
             .expect("direct admission");
 
@@ -3255,19 +2969,23 @@ mod tests {
             "dispatched"
         );
         assert_eq!(
-            persisted.json_column("payload_json").unwrap(),
-            serde_json::from_str::<serde_json::Value>(&payload).unwrap()
+            persisted.try_get::<String, _>("payload_json").unwrap(),
+            payload
         );
         assert_eq!(
             direct
-                .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)
+                .admit_and_claim_direct_dispatch(
+                    &identity,
+                    &edge_agent_id,
+                    &parse_dispatch_payload(&payload)
+                )
                 .await
                 .unwrap(),
             EdgeDirectDispatchAdmission::Observing
         );
         assert!(matches!(
             direct
-                .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, "{}")
+                .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &json!({}))
                 .await,
             Err(EdgeDispatchAdmissionError::Rejected(_))
         ));
@@ -3325,13 +3043,13 @@ mod tests {
         .to_string();
         assert_eq!(
             pod_a
-                .admit_dispatch(&identity, &edge_agent_id, &payload)
+                .admit_dispatch(&identity, &edge_agent_id, &parse_dispatch_payload(&payload))
                 .await
                 .expect("admit pending dispatch"),
             EdgeDispatchAdmission::Pending
         );
         pod_a
-            .insert_dispatch(&identity, &edge_agent_id, &payload)
+            .admit_dispatch(&identity, &edge_agent_id, &parse_dispatch_payload(&payload))
             .await
             .expect("duplicate insert should be idempotent");
         tokio::time::timeout(Duration::from_secs(1), cross_pod_wakeup.changed())
@@ -3407,7 +3125,10 @@ mod tests {
             (&cancelled_after, &edge_agent_id),
             (&other_edge, &other_edge_agent_id),
         ] {
-            pod_a.insert_dispatch(row, edge, &payload).await.unwrap();
+            pod_a
+                .admit_dispatch(row, edge, &parse_dispatch_payload(&payload))
+                .await
+                .unwrap();
         }
         assert_eq!(
             pod_b

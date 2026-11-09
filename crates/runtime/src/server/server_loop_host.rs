@@ -16185,7 +16185,6 @@ impl ServerAgenticLoopHost {
                     Ok(outcome)
                 });
                 dispatch_event["work_attribution"] = json!(frozen_work_attribution);
-                let dispatch_payload = dispatch_event.to_string();
                 let mut committed_event = match admission {
                     Ok(
                         GuardedToolRequestCommitOutcome::Committed { event }
@@ -16352,7 +16351,7 @@ impl ServerAgenticLoopHost {
                         .admit_and_claim_direct_dispatch(
                             &identity,
                             &selected_edge_agent_id,
-                            &dispatch_payload,
+                            &dispatch_event,
                         )
                         .await;
                     let dispatch_error = match dispatch_admission {
@@ -16383,9 +16382,9 @@ impl ServerAgenticLoopHost {
                                     committed_event = None;
                                     None
                                 }
-                                Err(error) => {
-                                    Some(EdgeDispatchAdmissionError::OutcomeUnknown(error))
-                                }
+                                Err(_) => Some(EdgeDispatchAdmissionError::OutcomeUnknown(
+                                    astra_services::multi_agent::EdgeDispatchFailureStage::TerminalResult,
+                                )),
                             }
                         }
                         Err(error) => Some(error),
@@ -16396,16 +16395,17 @@ impl ServerAgenticLoopHost {
                             &callback_key,
                         );
                         match &error {
-                            EdgeDispatchAdmissionError::OutcomeUnknown(_) => {
+                            EdgeDispatchAdmissionError::OutcomeUnknown(stage) => {
                                 tracing::warn!(
                                     target: "astra::tool_admission",
                                     run_id,
                                     request_id,
+                                    stage = %stage,
                                     "edge dispatch admission outcome unknown"
                                 );
                                 let unknown = self.edge_action_outcome_unknown_result(
                                     tc,
-                                    "Tool admission could not be confirmed. The execution outcome is unknown; the request was not dispatched again because that could repeat a side effect.",
+                                    &format!("Tool admission could not be confirmed during {stage}. The execution outcome is unknown; the request was not dispatched again because that could repeat a side effect."),
                                 );
                                 results_by_id.insert(unknown.request_id.clone(), unknown);
                             }
@@ -30645,6 +30645,7 @@ mod tests {
         Claimed,
         Rejected,
         OutcomeUnknown,
+        OutcomeUnknownCommit,
     }
 
     struct RecordingHostEdgeDispatch {
@@ -30656,30 +30657,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EdgeDispatchService for RecordingHostEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("host fixture uses atomic direct admission".to_string())
-        }
-
         async fn admit_and_claim_direct_dispatch(
             &self,
             identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             edge_agent_id: &str,
-            payload_json: &str,
+            payload_json: &serde_json::Value,
         ) -> Result<
             astra_services::multi_agent::EdgeDirectDispatchAdmission,
             astra_services::multi_agent::EdgeDispatchAdmissionError,
         > {
             assert!(!edge_agent_id.is_empty());
             assert_eq!(
-                serde_json::from_str::<Value>(payload_json)
-                    .expect("host must admit its canonical request payload")
-                    .get("request_id")
-                    .and_then(Value::as_str),
+                payload_json.get("request_id").and_then(Value::as_str),
                 Some(identity.request_id.as_str())
             );
             self.events.lock().expect("host events").push("admit");
@@ -30695,7 +30684,12 @@ mod tests {
                 ),
                 HostAdmissionFixture::OutcomeUnknown => Err(
                     astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                        "simulated ambiguous admission fixture-secret".to_string(),
+                        astra_services::multi_agent::EdgeDispatchFailureStage::Adapter,
+                    ),
+                ),
+                HostAdmissionFixture::OutcomeUnknownCommit => Err(
+                    astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
+                        astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
                     ),
                 ),
             }
@@ -30803,15 +30797,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("not used".to_string())
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,
@@ -40871,6 +40856,7 @@ mod tests {
         for mode in [
             HostAdmissionFixture::Rejected,
             HostAdmissionFixture::OutcomeUnknown,
+            HostAdmissionFixture::OutcomeUnknownCommit,
         ] {
             let events = Arc::new(std::sync::Mutex::new(Vec::new()));
             let dispatch = Arc::new(RecordingHostEdgeDispatch {
@@ -40948,7 +40934,8 @@ mod tests {
                     );
                     assert_eq!(outcome.results[0].status, "blocked");
                 }
-                HostAdmissionFixture::OutcomeUnknown => {
+                HostAdmissionFixture::OutcomeUnknown
+                | HostAdmissionFixture::OutcomeUnknownCommit => {
                     assert_eq!(outcome.results[0].status, "unknown");
                     assert_eq!(
                         outcome.results[0].tool_result_fields.as_ref().unwrap()["executed"],
@@ -40956,6 +40943,13 @@ mod tests {
                     );
                     assert!(!outcome.results[0].output.contains("before recovery"));
                     assert!(!outcome.results[0].output.contains("fixture-secret"));
+                    let expected_stage =
+                        if matches!(mode, HostAdmissionFixture::OutcomeUnknownCommit) {
+                            "database commit"
+                        } else {
+                            "dispatch adapter"
+                        };
+                    assert!(outcome.results[0].output.contains(expected_stage));
                     let terminal = host
                         .emitted_events
                         .iter()
@@ -40965,6 +40959,7 @@ mod tests {
                         })
                         .expect("unknown outcome must be emitted to the client");
                     assert!(!terminal.to_string().contains("fixture-secret"));
+                    assert!(terminal.to_string().contains(expected_stage));
                 }
                 HostAdmissionFixture::Claimed => unreachable!(),
             }

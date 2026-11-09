@@ -325,7 +325,7 @@ impl EdgeBoundExecutionPlan {
         }
     }
 
-    pub(crate) fn dispatch_payload_json(&self) -> Result<String, serde_json::Error> {
+    pub(crate) fn dispatch_payload(&self) -> Result<serde_json::Value, serde_json::Error> {
         if self.execution_ceiling.as_ref().is_some_and(|ceiling| {
             ceiling
                 .materialization_id
@@ -339,7 +339,7 @@ impl EdgeBoundExecutionPlan {
         // Durable dispatch rows are replayable database state. RuntimeGrant
         // bearer credentials are request-scoped secrets and must only be
         // attached by the live websocket delivery boundary.
-        serde_json::to_string(&self.dispatch_message())
+        serde_json::to_value(self.dispatch_message())
     }
 
     pub(crate) fn delivered_result_with_fields(

@@ -1106,19 +1106,9 @@ async fn handle_edge_connection(
                             );
                             continue;
                         }
-                        let text = match serde_json::to_string(&msg) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                tracing::warn!(%error, "unable to encode Edge dispatch");
-                                append_unsent_receipts(
-                                    &mut receipts,
-                                    std::slice::from_ref(row),
-                                    "the dispatch payload could not be encoded",
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
+                        // Admission stores serializer-produced JSON. Preserve those bytes
+                        // after validation so relay does not round-trip tool numbers again.
+                        let text = row.payload_json.clone();
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),

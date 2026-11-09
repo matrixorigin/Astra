@@ -391,7 +391,7 @@ async fn try_edge_websocket(
         &request.turn_chain_id,
         plan.dispatch_request_id(),
     );
-    let payload_json = match plan.dispatch_payload_json() {
+    let payload = match plan.dispatch_payload() {
         Ok(payload) => payload,
         Err(error) => {
             return EdgeTransportAttempt::Delivered(astra_tools::ToolResult::error(format!(
@@ -400,7 +400,7 @@ async fn try_edge_websocket(
         }
     };
     match dispatch
-        .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
+        .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload)
         .await
     {
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed) => {
@@ -459,7 +459,7 @@ async fn try_edge_websocket(
             return EdgeTransportAttempt::AdmissionRejected(error);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
-            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error.to_string());
         }
     }
     tracing::info!(
@@ -750,8 +750,8 @@ async fn try_edge_dispatch(
                 .to_string(),
         ));
     }
-    let payload_json = match plan.dispatch_payload_json() {
-        Ok(json) => json,
+    let payload = match plan.dispatch_payload() {
+        Ok(payload) => payload,
         Err(error) => {
             return EdgeTransportAttempt::Delivered(astra_tools::ToolResult::error(format!(
                 "dispatch payload serialization failed: {error}"
@@ -759,7 +759,7 @@ async fn try_edge_dispatch(
         }
     };
     match dispatch
-        .admit_dispatch(&identity, &agent.edge_agent_id, &payload_json)
+        .admit_dispatch(&identity, &agent.edge_agent_id, &payload)
         .await
     {
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
@@ -770,7 +770,7 @@ async fn try_edge_dispatch(
             return EdgeTransportAttempt::AdmissionRejected(error);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
-            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error.to_string());
         }
     }
     let wait_dispatch = dispatch.clone();

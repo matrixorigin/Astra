@@ -282,15 +282,32 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for AdmittingEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
             self.admissions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
         }
 
         async fn poll_pending(
