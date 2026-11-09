@@ -16615,57 +16615,115 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("stream live delta", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        // A terminal status is not the Explain Analyze publication boundary.
-        // The owner commits `run_finished` first and persists the report just
-        // after it. Load the immutable run metadata once so a cross-process
-        // observer can distinguish an ordinary terminal from an Explain run
-        // that still owes its publication outcome.
-        let durable_run = self
+        // Ordinary live attachments need the opening and current owner, not
+        // the entire event history. Explain needs its exceptional publication
+        // proof even when it predates the caller's replay cursor.
+        let admission = self
             .run_engine
-            .load_run(&user_id, &run_id)
+            .load_run_admission(&user_id, &run_id)
             .await
             .map_err(|error| Self::durable_persist_error("stream live run metadata", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        let explain_requested = astra_services::runs::run_requested_explain_analyze(&durable_run);
+        let admitted_run = admission.run();
+        let started = admitted_run.original_admission_data().map_err(|error| {
+            Self::durable_persist_error("stream live run admission", error.to_string())
+        })?;
+        let explain_requested = match started.get("explain_analyze_requested") {
+            None => false,
+            Some(Value::Bool(requested)) => *requested,
+            Some(_) => {
+                return Err(Self::durable_persist_error(
+                    "stream live run admission",
+                    "invalid Explain request flag".to_string(),
+                ));
+            }
+        };
         let mut replay_events = initial.events;
-        // `load_run_event_delta` reports the latest high watermark even when
-        // its event list is empty.  Keep the cursor at the greatest event we
-        // actually replayed so the metadata read below can fill the exact
-        // gap opened between the two reads (publication is often that gap).
         let mut event_cursor = replay_events
             .iter()
             .filter_map(|event| event.get("index").and_then(Value::as_i64))
             .max()
             .unwrap_or(after_event_idx);
-        for (position, event) in durable_run.events.iter().enumerate() {
-            let index = durable_event_index(event, position);
-            if index <= event_cursor {
-                continue;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object.insert("index".to_string(), Value::from(index));
-            }
-            event_cursor = event_cursor.max(index);
-            replay_events.push(event);
-        }
-        let mut publication_seen = replay_events
-            .iter()
-            .any(durable_event_is_valid_explain_publication)
-            || durable_run
-                .events
-                .iter()
-                .enumerate()
-                .any(|(position, event)| {
-                    durable_event_index(event, position) <= after_event_idx
-                        && durable_event_is_valid_explain_publication(event)
-                });
-        let turn_id = explain_turn_id_from_durable_run(&durable_run);
-        let owner_generation = durable_run.run_generation;
-        let latest_complete = Self::durable_live_attach_complete(
-            &durable_run.status,
-            self.run_execution_is_live(&durable_run).await,
-        );
+        let (mut publication_seen, turn_id, owner_generation, latest_complete) =
+            if explain_requested {
+                let durable_run = self
+                    .run_engine
+                    .load_run(&user_id, &run_id)
+                    .await
+                    .map_err(|error| Self::durable_persist_error("stream live Explain", error))?
+                    .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                for (position, event) in durable_run.events.iter().enumerate() {
+                    let index = durable_event_index(event, position);
+                    if index <= event_cursor {
+                        continue;
+                    }
+                    let mut event = event.clone();
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert("index".to_string(), Value::from(index));
+                    }
+                    event_cursor = event_cursor.max(index);
+                    replay_events.push(event);
+                }
+                let seen = replay_events
+                    .iter()
+                    .any(durable_event_is_valid_explain_publication)
+                    || durable_run
+                        .events
+                        .iter()
+                        .enumerate()
+                        .any(|(position, event)| {
+                            durable_event_index(event, position) <= after_event_idx
+                                && durable_event_is_valid_explain_publication(event)
+                        });
+                (
+                    seen,
+                    explain_turn_id_from_durable_run(&durable_run),
+                    durable_run.run_generation,
+                    Self::durable_live_attach_complete(
+                        &durable_run.status,
+                        self.run_execution_is_live(&durable_run).await,
+                    ),
+                )
+            } else {
+                // Drain a concurrent append before using the later opening's
+                // terminal status. Never advance beyond an event actually read.
+                let mut status = admitted_run.status.clone();
+                let mut execution_live = self.run_execution_is_live(admitted_run).await;
+                if admitted_run.last_event_idx > event_cursor {
+                    let gap = self
+                        .run_engine
+                        .load_run_event_delta(&user_id, &run_id, event_cursor)
+                        .await
+                        .map_err(|error| Self::durable_persist_error("stream live gap", error))?
+                        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                    for event in gap.events {
+                        if let Some(index) = event.get("index").and_then(Value::as_i64) {
+                            event_cursor = event_cursor.max(index);
+                        }
+                        replay_events.push(event);
+                    }
+                    if event_cursor < admitted_run.last_event_idx {
+                        return Err(Self::durable_persist_error(
+                            "stream live gap",
+                            "event tail did not reach the observed watermark".to_string(),
+                        ));
+                    }
+                    status = gap.status;
+                    execution_live = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .filter(|run| run.user_id == user_id && run.session_id == gap.session_id)
+                        .map_or(gap.execution_live, |run| run.execution_live);
+                }
+                (
+                    false,
+                    String::new(),
+                    admitted_run.run_generation,
+                    Self::durable_live_attach_complete(&status, execution_live),
+                )
+            };
         if latest_complete && (!explain_requested || publication_seen) {
             return Ok(ChatStreamRecord {
                 session_id: initial.session_id,

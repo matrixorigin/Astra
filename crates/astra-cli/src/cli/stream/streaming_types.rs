@@ -21,6 +21,26 @@ pub(crate) struct AppliedStreamUserIntent {
     pub(crate) content: String,
 }
 
+/// Merge dispositions recovered after the live stream without changing the
+/// server's original guidance order or duplicating an observed identity.
+pub(crate) fn merge_applied_user_intents(
+    current: &mut Vec<AppliedStreamUserIntent>,
+    recovered: Vec<AppliedStreamUserIntent>,
+) {
+    if recovered.is_empty() {
+        return;
+    }
+    for intent in recovered {
+        if !current
+            .iter()
+            .any(|existing| existing.intent_id == intent.intent_id)
+        {
+            current.push(intent);
+        }
+    }
+    current.sort_by_key(|intent| intent.event_index);
+}
+
 /// Token lanes attributed to one execution class. `None` means that the
 /// provider did not report that lane; it is deliberately different from zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

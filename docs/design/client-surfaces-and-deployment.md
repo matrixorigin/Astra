@@ -91,6 +91,9 @@ An uncertain delivery is not retried as a new message, and unsent messages
 remain editable if the turn cannot hand them off. The ordinary lifecycle
 handoff, modal/draft gates, session-change restoration, and guidance custody
 rules remain authoritative. Local controls retain their dispatcher semantics.
+The primary turn stream carries guidance dispositions. After it closes,
+unresolved accepted messages receive one exact receipt lookup; a failed or
+still-pending lookup remains unconfirmed and is not resent.
 The agent navigator's message action targets the selected agent. A previous
 message still being sent keeps a later draft editable; if its delivery is
 unknown, the user may explicitly send the later message despite possible
@@ -111,12 +114,19 @@ rechecks the selected Offering and applies it at the next model-round
 boundary it observes. The interface reports the request as pending until the
 Run confirms application; an already started model request or tool continues
 unchanged. Rejected or unconfirmed changes are not presented as applied.
+An interrupted model-change commit remains unconfirmed; the Run's original
+cancellation and deadline still bound admission and confirmation.
 The selected model is also used by this client for later turns, including
 queued messages. `/model clear` removes the client's override for later turns.
 Permission changes likewise remain visibly requested until the active Run
 reports that its execution boundary applied them.
 During an active turn, `/allow` and `/allow read_only` use that same permission
-control, while the `/plan` workflow command waits for the turn to finish.
+control. `/plan` requests read-only planning at the next observed boundary and
+submits the planning instruction only after the exact permission application is
+acknowledged. If the task ends or the request is superseded first, the original
+command is returned for editing while the same session remains attached; it is
+never inserted into a different session. An already-running tool continues,
+but its current foreground wait is released when the command is entered.
 Other commands that need the mutable Session are queued with explicit feedback.
 Live controls use the credentials admitted for the physical run. A static
 gateway bearer is never replaced or refreshed using an unrelated saved profile.

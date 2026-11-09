@@ -1257,6 +1257,27 @@ impl AgentTranscriptView {
             .replace_with(self.transcript_snapshot(), self.viewport_width);
     }
 
+    fn refresh_live_tool_suffix(&mut self) -> bool {
+        if self.activity.is_some()
+            || self.activity_error.is_some()
+            || self.local_root_live.is_some()
+        {
+            return false;
+        }
+        // An overlapping durable request can replace a canonical row; that
+        // reconciliation needs the full identity-aware projection.
+        if self.live.items.iter().any(|entry| {
+            matches!(&entry.item, LiveTranscriptItem::Tool { tool_use_id, cell: Some(_), .. }
+                if self.canonical.tools.contains_key(&(Some(self.run_id.clone()), tool_use_id.clone())))
+        }) {
+            return false;
+        }
+        let mut suffix = Vec::new();
+        self.append_live_projection(&mut suffix);
+        self.transcript
+            .replace_live_suffix(self.canonical.items.len(), suffix, self.viewport_width)
+    }
+
     /// Consecutive deltas for an existing live tail do not alter canonical
     /// history. Keep that history and its rendered rows intact.
     fn refresh_live_tail(&mut self, events: &[AgentLiveEvent]) -> bool {
@@ -1313,7 +1334,12 @@ impl AgentTranscriptView {
             return true;
         }
         let changed = self.apply_live_event_without_rebuild(event);
-        if changed {
+        if changed
+            && (!matches!(
+                event.kind,
+                AgentLiveEventKind::ToolStarted { .. } | AgentLiveEventKind::ToolCompleted { .. }
+            ) || !self.refresh_live_tool_suffix())
+        {
             self.rebuild_transcript();
         }
         changed
@@ -2478,7 +2504,15 @@ impl BottomPaneView for AgentTranscriptView {
         for event in events {
             changed |= self.apply_live_event_without_rebuild(event);
         }
-        if changed {
+        if changed
+            && (!events.iter().all(|event| {
+                matches!(
+                    event.kind,
+                    AgentLiveEventKind::ToolStarted { .. }
+                        | AgentLiveEventKind::ToolCompleted { .. }
+                )
+            }) || !self.refresh_live_tool_suffix())
+        {
             self.rebuild_transcript();
         }
         changed
@@ -5180,6 +5214,112 @@ mod tests {
             "{settled}"
         );
         assert!(settled.contains("unreconciled live finding"), "{settled}");
+    }
+
+    #[test]
+    fn parallel_live_tools_match_a_full_transcript_rebuild() {
+        fn without_running_elapsed(text: String) -> String {
+            text.split_whitespace()
+                .map(|word| {
+                    if word
+                        .strip_prefix('(')
+                        .and_then(|value| value.strip_suffix("ms)"))
+                        .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+                    {
+                        "(elapsed)"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let event = |kind| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind,
+        };
+        let (mut old_tools, _) = delegation_history(1);
+        old_tools[0].item_seq = 200;
+        old_tools[1].item_seq = 201;
+        old_tools[0].tool_calls[0].name = "read_file".into();
+        old_tools[0].tool_calls[0].arguments = "old file".into();
+        old_tools[1].tool_result.as_mut().unwrap().name = Some("read_file".into());
+        old_tools[1].tool_result.as_mut().unwrap().status = Some("success".into());
+        old_tools[1].content = "old result".into();
+        let mut page = transcript_page_with_assistant_lines(200);
+        page.items.extend(old_tools);
+        for view in [&mut incremental, &mut full] {
+            for kind in [
+                AgentLiveEventKind::ToolStarted {
+                    name: "read_file".into(),
+                    description: "old file".into(),
+                    tool_use_id: "spawn-0".into(),
+                },
+                AgentLiveEventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    description: "old file".into(),
+                    tool_use_id: "spawn-0".into(),
+                    status: "success".into(),
+                    duration_ms: 1,
+                    output_summary: None,
+                    output: Some("old result".into()),
+                },
+            ] {
+                view.refresh_agent_live_event(&event(kind));
+            }
+            view.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+            assert!(view.live.items.iter().any(|entry| matches!(&entry.item,
+                LiveTranscriptItem::Tool { tool_use_id, cell: None, .. } if tool_use_id == "spawn-0")));
+        }
+        for event in [
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "first".into(),
+                tool_use_id: "a".into(),
+            }),
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "second".into(),
+                tool_use_id: "b".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "first".into(),
+                status: "success".into(),
+                duration_ms: 1,
+                output_summary: Some("one".into()),
+                output: None,
+                tool_use_id: "a".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "second".into(),
+                status: "success".into(),
+                duration_ms: 2,
+                output_summary: Some("two".into()),
+                output: None,
+                tool_use_id: "b".into(),
+            }),
+        ] {
+            assert!(incremental.refresh_agent_live_event(&event));
+            assert!(
+                incremental.refresh_live_tool_suffix(),
+                "covered old tools must not disable incremental updates"
+            );
+            assert!(full.refresh_agent_live_event(&event));
+            full.rebuild_transcript();
+            assert_eq!(
+                without_running_elapsed(rendered(&incremental)),
+                without_running_elapsed(rendered(&full))
+            );
+            assert_eq!(
+                without_running_elapsed(incremental.transcript.export_plain_lines().join("\n")),
+                without_running_elapsed(full.transcript.export_plain_lines().join("\n"))
+            );
+        }
     }
 
     #[test]

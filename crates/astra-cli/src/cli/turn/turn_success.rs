@@ -53,9 +53,8 @@ pub(crate) async fn apply_turn_success_async(
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
     post_commit_tx: Option<&tokio::sync::mpsc::Sender<TurnPostCommitJob>>,
 ) {
-    // A dedicated durable control-tail observer may receive Applied after the
-    // primary live SSE fanout closed. Merge that exact fact before snapshotting
-    // or committing the turn so local history matches the server transcript.
+    // A one-shot reconciliation may recover Applied after the primary stream
+    // closes. Merge that fact before committing the local turn.
     let active_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
             .as_ref()
@@ -69,15 +68,10 @@ pub(crate) async fn apply_turn_success_async(
                 "Turn completed, but durable guidance disposition reconciliation timed out; canonical server history remains authoritative.",
             );
         }
-        for intent in run_control.take_remotely_applied_user_intents() {
-            if !result
-                .applied_user_intents
-                .iter()
-                .any(|existing| existing.intent_id == intent.intent_id)
-            {
-                result.applied_user_intents.push(intent);
-            }
-        }
+        crate::cli::stream::streaming_types::merge_applied_user_intents(
+            &mut result.applied_user_intents,
+            run_control.take_remotely_applied_user_intents(),
+        );
     }
     // Primary settlement projects the continuation anchor from typed message
     // semantics. Keep the messages on `result` until that synchronous state
@@ -1186,6 +1180,15 @@ mod tests {
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(control);
         let mut result = crate::tests::stub_stream_result("done");
+        result.applied_user_intents.push(
+            crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                intent_id: "intent-newer".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 21,
+                content: "do the newer work".into(),
+            },
+        );
         result.final_messages = vec![
             serde_json::json!({"role":"user","content":"original"}),
             serde_json::json!({"role":"assistant","content":"done"}),
@@ -1211,9 +1214,17 @@ mod tests {
             .and_then(|metadata| metadata.get("user_intents"))
             .and_then(serde_json::Value::as_array)
             .expect("applied guidance metadata");
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0]["intent_id"], "intent-tail");
         assert_eq!(applied[0]["content"], "wait");
+        assert_eq!(applied[1]["intent_id"], "intent-newer");
+        assert_eq!(
+            state
+                .continuation_anchor
+                .as_ref()
+                .and_then(|anchor| anchor.recent_user_input.as_deref()),
+            Some("do the newer work")
+        );
     }
 
     #[test]

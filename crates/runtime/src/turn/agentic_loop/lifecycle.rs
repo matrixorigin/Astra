@@ -2151,9 +2151,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     // Cancellation and pause have priority over round control. Capture the
     // permission selection before any mode-dependent preparation begins.
-    super::settings_boundary::apply_round_settings(host, state)
-        .await
-        .map_err(|error| error.to_string())?;
+    super::settings_boundary::apply_round_settings(host, state).await?;
 
     if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
         super::execution_phase::finish_unavailable_verification(state, error);

@@ -41,9 +41,8 @@ pub(crate) async fn reconcile_and_report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    // A closed primary SSE fanout is not permission to lose a server-applied
-    // user intent. The dedicated control-tail observer owns that fact until
-    // either success or failure settlement consumes it.
+    // A closed primary stream can still have a server-applied user intent.
+    // Wait for any one-shot reconciliation before committing the failure.
     let active_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
             .as_ref()
@@ -57,16 +56,10 @@ pub(crate) async fn reconcile_and_report_turn_failure(
                 "Turn failed before durable guidance disposition reconciliation completed; canonical server history remains authoritative.",
             );
         }
-        for intent in run_control.take_remotely_applied_user_intents() {
-            if !failure
-                .partial
-                .applied_user_intents
-                .iter()
-                .any(|existing| existing.intent_id == intent.intent_id)
-            {
-                failure.partial.applied_user_intents.push(intent);
-            }
-        }
+        crate::cli::stream::streaming_types::merge_applied_user_intents(
+            &mut failure.partial.applied_user_intents,
+            run_control.take_remotely_applied_user_intents(),
+        );
     }
 
     report_turn_failure(state, profile, line, failure, turn_start, ui);
@@ -387,6 +380,15 @@ mod tests {
                 prompt_tokens: 17,
                 completion_tokens: 3,
                 qualified_usage: Some(usage),
+                applied_user_intents: vec![
+                    crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                        intent_id: "intent-newer".into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::Applied,
+                        event_index: 30,
+                        content: "newer instruction".into(),
+                    },
+                ],
                 ..Default::default()
             },
         };
@@ -438,6 +440,7 @@ mod tests {
             .expect("durable applied guidance");
         assert_eq!(intents[0]["intent_id"], "intent-failed-tail");
         assert_eq!(intents[0]["content"], "stop old work");
+        assert_eq!(intents[1]["intent_id"], "intent-newer");
         assert_eq!(
             state.history,
             vec![
@@ -447,6 +450,10 @@ mod tests {
                 ),
                 (
                     "stop old work".to_string(),
+                    "[Previous turn failed: callback failed]".to_string()
+                ),
+                (
+                    "newer instruction".to_string(),
                     "[Previous turn failed: callback failed]".to_string()
                 ),
             ],

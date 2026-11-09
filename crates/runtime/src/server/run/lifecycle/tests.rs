@@ -22924,6 +22924,59 @@ async fn durable_live_attach_follows_a_run_without_process_local_state() {
 }
 
 #[tokio::test]
+async fn ordinary_live_attach_delivers_events_added_before_the_admission_read() {
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[]).with_events_before_load_call(
+            1,
+            "user-1",
+            "race-session",
+            "ordinary-race",
+            vec![json!({"event_type": "tool_completed", "data": {"marker":"after-first-read"}})],
+        ),
+    );
+    let engine = RunEngine::new(store.clone());
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    );
+    engine
+        .start_run("ordinary-race", "user-1", "race-session")
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "race-session",
+                "ordinary-race",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type":"run_finished", "data":{}}),
+            )
+            .await
+            .unwrap()
+    );
+    store.reset_read_counters();
+
+    let stream = ok(svc
+        .stream_run_live("ordinary-race".into(), "user-1".into(), 0)
+        .await);
+    assert!(stream.event_rx.is_none());
+    assert_eq!(
+        stream
+            .events
+            .iter()
+            .filter(|event| event["data"]["marker"] == "after-first-read")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_settles() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let svc = AgenticRunLifecycleService::new(
@@ -22934,35 +22987,29 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
     engine
-        .start_run("remote-explain", "user-1", "remote-session")
-        .await
-        .expect("seed remote Explain run");
-    engine
-        .append_event(
+        .start_run_with_context(
+            "remote-explain",
             "user-1",
             "remote-session",
-            "remote-explain",
-            json!({
-                "event_type": "run_started",
-                "data": {"explain_analyze_requested": true}
-            }),
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
         )
         .await
-        .expect("mark Explain request");
+        .expect("seed remote Explain run");
 
     let mut stream = ok(svc
         .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0)
         .await);
     let mut event_rx = stream.event_rx.take().expect("active Explain attachment");
-    for _ in 0..2 {
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-                .await
-                .expect("run replay timeout")
-                .expect("run replay event")["event_type"],
-            "run_started"
-        );
-    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("run replay timeout")
+            .expect("run replay event")["event_type"],
+        "run_started"
+    );
 
     assert!(
         engine
@@ -23084,21 +23131,17 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
     engine
-        .start_run("remote-settled-explain", "user-1", "remote-session")
-        .await
-        .expect("seed remote Explain run");
-    engine
-        .append_event(
+        .start_run_with_context(
+            "remote-settled-explain",
             "user-1",
             "remote-session",
-            "remote-settled-explain",
-            json!({
-                "event_type": "run_started",
-                "data": {"explain_analyze_requested": true}
-            }),
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
         )
         .await
-        .expect("mark Explain request");
+        .expect("seed remote Explain run");
     assert!(
         engine
             .transition_status_with_event_if_current(
@@ -23221,21 +23264,17 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
     engine
-        .start_run("race-explain", "user-1", "race-session")
-        .await
-        .expect("seed Explain run");
-    engine
-        .append_event(
+        .start_run_with_context(
+            "race-explain",
             "user-1",
             "race-session",
-            "race-explain",
-            json!({
-                "event_type": "run_started",
-                "data": {"explain_analyze_requested": true}
-            }),
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
         )
         .await
-        .expect("mark Explain request");
+        .expect("seed Explain run");
     assert!(
         engine
             .transition_status_with_event_if_current(
@@ -23283,21 +23322,17 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
     engine
-        .start_run("unread-terminal", "user-1", "unread-session")
-        .await
-        .expect("seed terminal Explain run");
-    engine
-        .append_event(
+        .start_run_with_context(
+            "unread-terminal",
             "user-1",
             "unread-session",
-            "unread-terminal",
-            json!({
-                "event_type": "run_started",
-                "data": {"explain_analyze_requested": true}
-            }),
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
         )
         .await
-        .expect("mark Explain request");
+        .expect("seed terminal Explain run");
     assert!(
         engine
             .transition_status_with_event_if_current(

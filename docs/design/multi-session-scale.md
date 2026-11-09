@@ -59,6 +59,12 @@ source of truth for reconnect and cross-pod delivery. This bounded display
 delay must not weaken durable event ordering, terminal status, or Explain
 publication outcomes.
 
+An ordinary SSE attachment reads the validated Run opening and only the
+requested event tail; it does not hydrate the whole Run for metadata. A stale
+cursor can still request a large replay. Explain attachments currently load
+the complete Run to prove whether a publication predates the cursor; they are
+an exceptional path and are not included in a bounded-read capacity claim.
+
 Browser WebSocket clients authenticate in the first frame, then may send
 `attach_run` with an owned `run_id` and inclusive `last_index` cursor after a
 disconnect. The server verifies run ownership before binding the connection

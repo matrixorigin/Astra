@@ -18267,7 +18267,12 @@ impl ServerAgenticLoopHost {
                 break;
             }
             if let Some((previous, output, boundary)) = fallback.take() {
-                assembly = Some((previous, None));
+                // A fallback remains sealed while later candidates are tried.
+                // Open it only if it is ultimately selected.
+                let budget_source = self
+                    .provider_budget_view(&previous.messages, llm_cfg, state)
+                    .inspect_err(|_| state.restore_volatile_attempt_lease())?;
+                assembly = Some((previous, budget_source));
                 selected_output_tokens = output;
                 final_wire_compaction_boundary = boundary;
                 break;
@@ -18291,14 +18296,7 @@ impl ServerAgenticLoopHost {
             ));
         }
 
-        let (candidate, mut budget_source) = assembly.expect("bounded wire assembly must settle");
-        if budget_source.is_none() {
-            // A fallback stays sealed while later candidates are tried, so
-            // concurrent requests do not retain an extra plaintext copy.
-            budget_source = self
-                .provider_budget_view(&candidate.messages, llm_cfg, state)
-                .inspect_err(|_| state.restore_volatile_attempt_lease())?;
-        }
+        let (candidate, budget_source) = assembly.expect("bounded wire assembly must settle");
         let wire_messages = candidate.messages;
         if let Err(error) =
             state.extend_append_only_runtime_messages(candidate.new_append_only_runtime_messages)

@@ -137,14 +137,26 @@ impl ActivePermissionControl {
         self.session_bound.clone()
     }
 
-    pub(super) fn request(&mut self, mode: PermissionMode) {
+    pub(super) fn request(&mut self, mode: PermissionMode) -> String {
         let intent = ModeIntent {
             request_id: uuid::Uuid::now_v7().to_string(),
             mode,
         };
         self.reported_error = None;
         self.latest = Some(intent.clone());
+        let request_id = intent.request_id.clone();
         self.sender.send_replace(Some(intent));
+        request_id
+    }
+
+    pub(super) fn is_current_request(&self, request_id: &str) -> bool {
+        self.latest
+            .as_ref()
+            .is_some_and(|intent| intent.request_id == request_id)
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        self.latest.is_some()
     }
 
     /// A stale response must never erase a newer requested mode.

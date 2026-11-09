@@ -1,8 +1,83 @@
 //! User settings are captured once before round preparation.
 //! Guidance/action epochs remain independent of this control lane.
 
-use super::host::{AgenticLoopHost, AgenticLoopState, VolatileKind};
+use super::host::{AgenticLoopHost, AgenticLoopState, CancellationState, VolatileKind};
+use astra_turn_core::orchestration_types::CancellationOrigin;
 use astra_turn_types::RunPermissionModeApplied;
+use std::{sync::atomic::Ordering, time::Duration};
+
+pub(crate) fn settings_control_stop(
+    cancellation: &CancellationState,
+    remaining: Option<Duration>,
+) -> Option<astra_core::ClassifiedError> {
+    let lease_lost = cancellation
+        .execution_lease_lost
+        .as_ref()
+        .is_some_and(|lost| lost.load(Ordering::Acquire));
+    let (kind, message) = if lease_lost
+        && cancellation.resolved_origin != Some(CancellationOrigin::User)
+    {
+        (
+            astra_core::ErrorKind::ServerError,
+            "Execution ownership was lost during settings control; its outcome may be unconfirmed",
+        )
+    } else if cancellation
+        .token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+        || cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        (
+            astra_core::ErrorKind::Cancelled,
+            "Settings control was interrupted; its outcome may be unconfirmed",
+        )
+    } else if remaining.is_some_and(|budget| budget.is_zero()) {
+        (
+            astra_core::ErrorKind::BudgetExhausted,
+            "Execution deadline expired during settings control; its outcome may be unconfirmed",
+        )
+    } else {
+        return None;
+    };
+    Some(astra_core::ClassifiedError::new(kind, message))
+}
+
+/// Wait under the original execution authority. Callers must use
+/// cancellation-safe I/O and reconcile a potentially committed write.
+pub(crate) async fn await_settings_control<T>(
+    operation: impl std::future::Future<Output = T>,
+    cancellation: &CancellationState,
+    remaining: Option<Duration>,
+) -> Result<T, astra_core::ClassifiedError> {
+    if let Some(error) = settings_control_stop(cancellation, remaining) {
+        return Err(error);
+    }
+    tokio::select! {
+        biased;
+        result = operation => Ok(result),
+        _ = async {
+            if let Some(token) = &cancellation.token {
+                token.cancelled().await;
+            } else if cancellation.flag.is_some() || cancellation.execution_lease_lost.is_some() {
+                loop {
+                    if settings_control_stop(cancellation, None).is_some() { break; }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => Err(settings_control_stop(cancellation, None).unwrap_or_else(|| boundary_error("settings control was interrupted"))),
+        _ = async {
+            match remaining {
+                Some(remaining) => tokio::time::sleep(remaining).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => Err(settings_control_stop(cancellation, Some(Duration::ZERO)).expect("zero budget stops settings control")),
+    }
+}
 
 fn boundary_error(message: impl std::fmt::Display) -> astra_core::ClassifiedError {
     astra_core::ClassifiedError::new(
@@ -114,12 +189,22 @@ pub(crate) async fn apply_round_settings<H: AgenticLoopHost>(
     {
         state.run_settings_observation.wake = None;
     }
-    let Some(snapshot) = state
-        .run_settings_observation
-        .read(control.as_ref(), &user_id, &session_id, &run_id)
-        .await
-        .map_err(boundary_error)?
-    else {
+    let remaining = host
+        .execution_time_budget_remaining()
+        .map(|budget| budget.total_remaining);
+    let observed = await_settings_control(
+        state
+            .run_settings_observation
+            .read(control.as_ref(), &user_id, &session_id, &run_id),
+        &state.cancellation,
+        remaining,
+    )
+    .await;
+    if observed.is_err() {
+        // A cancelled read consumed its wake before entering I/O.
+        state.run_settings_observation.invalidate();
+    }
+    let Some(snapshot) = observed?.map_err(boundary_error)? else {
         return Ok(());
     };
     let snapshot = snapshot.permission;
@@ -142,24 +227,38 @@ pub(crate) async fn apply_round_settings<H: AgenticLoopHost>(
         if let Some(context) = state.permission_context.as_ref() {
             // Preserve inherited/session allow/deny rules, tool allowlists,
             // fingerprint decisions, telemetry, and skill restrictions.
-            context.write().await.inherited.mode = selection.mode;
+            let remaining = host
+                .execution_time_budget_remaining()
+                .map(|budget| budget.total_remaining);
+            await_settings_control(context.write(), &state.cancellation, remaining)
+                .await?
+                .inherited
+                .mode = selection.mode;
         } else {
             state.permission_context = Some(
                 crate::orchestration::PermissionSyncContext::shared_root(selection.mode),
             );
         }
-        if !control
-            .apply_permission_mode(
+        let remaining = host
+            .execution_time_budget_remaining()
+            .map(|budget| budget.total_remaining);
+        let acknowledged = await_settings_control(
+            control.apply_permission_mode(
                 &user_id,
                 &session_id,
                 &run_id,
                 generation,
                 &selection,
                 state.current_round_index,
-            )
-            .await
-            .map_err(boundary_error)?
-        {
+            ),
+            &state.cancellation,
+            remaining,
+        )
+        .await;
+        if !matches!(&acknowledged, Ok(Ok(true))) {
+            state.run_settings_observation.invalidate();
+        }
+        if !acknowledged?.map_err(boundary_error)? {
             return Err(boundary_error(
                 "durable application rejected execution authority",
             ));
@@ -209,6 +308,9 @@ mod tests {
         reads: std::sync::atomic::AtomicUsize,
         control_reads: std::sync::atomic::AtomicUsize,
         reject_read: std::sync::atomic::AtomicBool,
+        hang_read: std::sync::atomic::AtomicBool,
+        hang_ack: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
     }
     impl Control {
         fn request(&self, mode: PermissionMode, revision: i64) {
@@ -238,6 +340,10 @@ mod tests {
         ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.hang_read.load(std::sync::atomic::Ordering::Relaxed) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
             if self.reject_read.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err("permission read unavailable".into());
             }
@@ -255,6 +361,10 @@ mod tests {
             selection: &RunPermissionModeSelection,
             round: u32,
         ) -> Result<bool, String> {
+            if self.hang_ack.load(std::sync::atomic::Ordering::Relaxed) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
             if self.reject_ack.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(false);
             }
@@ -295,6 +405,7 @@ mod tests {
         next: Option<PermissionMode>,
         observed: Vec<PermissionMode>,
         tools: HashSet<String>,
+        deadline: Option<tokio::time::Instant>,
     }
     #[async_trait]
     impl AgenticLoopHost for Host {
@@ -344,6 +455,17 @@ mod tests {
         fn is_quiet(&self) -> bool {
             true
         }
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
+            self.deadline.map(|deadline| {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                astra_turn_types::ExecutionTimeRemaining {
+                    work_remaining: remaining,
+                    total_remaining: remaining,
+                }
+            })
+        }
         fn valid_tool_names(&self) -> &HashSet<String> {
             &self.tools
         }
@@ -364,6 +486,7 @@ mod tests {
                 next: None,
                 observed: Vec::new(),
                 tools: HashSet::from(["read_file".into()]),
+                deadline: None,
             },
             state,
         )
@@ -433,6 +556,69 @@ mod tests {
         assert!(state.applied_permission_mode.is_none());
         assert!(host.control.acknowledgements.lock().unwrap().is_empty());
         assert!(host.observed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn round_settings_waits_respect_cancellation_and_original_deadline() {
+        use std::sync::atomic::Ordering;
+        for hang_read in [true, false] {
+            for cancel in [true, false] {
+                let (mut host, mut state) = fixture(PermissionMode::Plan);
+                let control = host.control.clone();
+                control.hang_read.store(hang_read, Ordering::SeqCst);
+                control.hang_ack.store(!hang_read, Ordering::SeqCst);
+                let (wake, receive) = tokio::sync::watch::channel(0);
+                state.run_settings_observation.bind_opening_wake(receive, 0);
+                wake.send_replace(1);
+                let token = Arc::new(tokio_util::sync::CancellationToken::new());
+                state.cancellation.token = Some(token.clone());
+                if !cancel {
+                    host.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                }
+                let error = {
+                    let prepare =
+                        super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0);
+                    tokio::pin!(prepare);
+                    tokio::select! {
+                        _ = control.entered.notified() => {}
+                        _ = &mut prepare => panic!("settings operation did not wait"),
+                    }
+                    if cancel {
+                        token.cancel();
+                    }
+                    match tokio::time::timeout(Duration::from_secs(2), prepare)
+                        .await
+                        .unwrap()
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("interrupted settings must not admit the model round"),
+                    }
+                };
+                assert_eq!(
+                    error.kind,
+                    if cancel {
+                        astra_core::ErrorKind::Cancelled
+                    } else {
+                        astra_core::ErrorKind::BudgetExhausted
+                    }
+                );
+                assert!(state.applied_permission_mode.is_none());
+                assert!(host.observed.is_empty());
+
+                // A cancelled read or uncertain acknowledgement must not
+                // consume the wake and permanently reuse a stale snapshot.
+                control.hang_read.store(false, Ordering::SeqCst);
+                control.hang_ack.store(false, Ordering::SeqCst);
+                state.cancellation.token = None;
+                host.deadline = None;
+                apply_round_settings(&mut host, &mut state).await.unwrap();
+                assert_eq!(control.reads.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    state.applied_permission_mode.as_ref().unwrap().mode,
+                    PermissionMode::Plan
+                );
+            }
+        }
     }
 
     #[tokio::test]

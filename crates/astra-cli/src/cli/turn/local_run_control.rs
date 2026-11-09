@@ -18,7 +18,7 @@ pub(crate) struct UserIntentReceipt {
 
 /// A reducer-completion latch for one server-owned guidance disposition.
 ///
-/// The observer owns only this process-local latch and a weak turn reference,
+/// The lookup owns only this process-local latch and a weak turn reference,
 /// so waiting for the foreground reducer cannot keep a finished turn alive.
 pub(crate) struct RemoteDispositionProjectionAck {
     run_control: std::sync::Weak<LocalRunControl>,
@@ -53,8 +53,8 @@ struct LocalRunControlState {
     /// Runtime facts that reached a model boundary but are not safe to forget
     /// until the enclosing turn settles successfully.
     applied_runtime_notifications: Vec<String>,
-    /// Server-owned dispositions observed on the independent durable control
-    /// tail. This bridges a closed primary SSE fanout into final local turn
+    /// Server-owned dispositions recovered after the primary stream closes.
+    /// This bridges the stream into final local turn
     /// settlement without treating the guidance as a second model input.
     remotely_applied_user_intents:
         Vec<crate::cli::stream::streaming_types::AppliedStreamUserIntent>,
@@ -69,11 +69,9 @@ struct LocalRunControlState {
     /// rejected/unconfirmed one is explicitly released.
     pending_remote_submissions: std::collections::HashSet<String>,
     /// Durable cursor at which each accepted remote intent was committed.
-    /// Keeping the cursor with the intent is essential for recovery: if the
-    /// shared observer exits abnormally, a later intent must restart from the
-    /// oldest unresolved boundary rather than skip an earlier disposition.
+    /// Keeping the original event index with the identity lets a status-only
+    /// lookup reconstruct the same ordered disposition as the primary stream.
     pending_remote_dispositions: std::collections::HashMap<String, i64>,
-    remote_disposition_observer_running: bool,
     status: Option<RunControlStatus>,
     cancellation_origin: Option<astra_turn_core::orchestration_types::CancellationOrigin>,
 }
@@ -328,6 +326,13 @@ impl LocalRunControl {
             .collect()
     }
 
+    pub(crate) fn pending_remote_disposition_index(&self, intent_id: &str) -> Option<i64> {
+        recover_mutex_lock(&self.state)
+            .pending_remote_dispositions
+            .get(intent_id)
+            .copied()
+    }
+
     fn remote_disposition_is_pending(&self, intent_id: &str) -> bool {
         recover_mutex_lock(&self.state)
             .pending_remote_dispositions
@@ -343,32 +348,6 @@ impl LocalRunControl {
             notify: self.remote_disposition_notify.clone(),
             intent_id: intent_id.to_string(),
         }
-    }
-
-    /// Claim the single durable control-tail observer for this run. Multiple
-    /// accepted intents share it; they must not create one long-lived SSE
-    /// connection per user message.
-    pub(crate) fn claim_remote_disposition_observer(&self) -> Option<i64> {
-        let mut guard = recover_mutex_lock(&self.state);
-        if guard.remote_disposition_observer_running {
-            return None;
-        }
-        let oldest_cursor = guard.pending_remote_dispositions.values().copied().min()?;
-        guard.remote_disposition_observer_running = true;
-        Some(oldest_cursor)
-    }
-
-    pub(crate) fn release_remote_disposition_observer(&self) {
-        recover_mutex_lock(&self.state).remote_disposition_observer_running = false;
-    }
-
-    pub(crate) fn release_remote_disposition_observer_if_idle(&self) -> bool {
-        let mut guard = recover_mutex_lock(&self.state);
-        if !guard.pending_remote_dispositions.is_empty() {
-            return false;
-        }
-        guard.remote_disposition_observer_running = false;
-        true
     }
 
     pub(crate) async fn wait_for_remote_user_intent_dispositions(
@@ -696,38 +675,5 @@ mod tests {
                 .wait_for_remote_user_intent_dispositions(std::time::Duration::ZERO)
                 .await
         );
-    }
-
-    #[test]
-    fn remote_guidance_uses_one_observer_until_every_pending_intent_settles() {
-        let provider = LocalRunControl::default();
-        provider.expect_remote_user_intent_disposition("intent-a", 10);
-        assert_eq!(provider.claim_remote_disposition_observer(), Some(10));
-        provider.expect_remote_user_intent_disposition("intent-b", 20);
-        assert_eq!(provider.claim_remote_disposition_observer(), None);
-
-        provider.record_remotely_returned_user_intent("intent-a");
-        assert!(
-            !provider.release_remote_disposition_observer_if_idle(),
-            "the shared observer must remain owned while a later intent is pending"
-        );
-        provider.record_remotely_returned_user_intent("intent-b");
-        assert!(provider.release_remote_disposition_observer_if_idle());
-        assert_eq!(provider.claim_remote_disposition_observer(), None);
-    }
-
-    #[test]
-    fn replacement_observer_resumes_from_oldest_unsettled_intent() {
-        let provider = LocalRunControl::default();
-        provider.expect_remote_user_intent_disposition("intent-old", 10);
-        assert_eq!(provider.claim_remote_disposition_observer(), Some(10));
-
-        // Authentication loss, transport exhaustion, or task cancellation
-        // releases the observer but must not release its durable cursor.
-        provider.release_remote_disposition_observer();
-        provider.expect_remote_user_intent_disposition("intent-new", 30);
-
-        assert_eq!(provider.claim_remote_disposition_observer(), Some(10));
-        provider.release_remote_disposition_observer();
     }
 }

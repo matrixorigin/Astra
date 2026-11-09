@@ -10940,6 +10940,10 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn test_current_agent_model(executor: &RuntimeToolExecutor) -> Option<String> {
+        executor.agent_tool_context_snapshot()?.current_model
+    }
+
     #[test]
     fn terminal_read_proof_requires_retained_result_and_current_parent_binding() {
         use crate::orchestration::{AgentStatus, spawner::DirectChildCompletion};

@@ -1,5 +1,6 @@
 use super::*;
 use crate::server::run::engine::RunEngine;
+use crate::turn::agentic_loop::settings_boundary::{await_settings_control, settings_control_stop};
 use astra_services::{AdmittedModelExecution, ModelExecutionPlacement, ModelService};
 use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
 
@@ -43,6 +44,19 @@ fn preserves_contract(
 }
 
 impl ServerAgenticLoopHost {
+    fn check_model_control(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let remaining = self
+            .execution_time_budget_remaining()
+            .map(|budget| budget.total_remaining);
+        match settings_control_stop(&state.cancellation, remaining) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Install one admitted model in the existing execution owner. Credentials
     /// stay in memory; all derived policy follows the same selected model.
     fn install_model_execution(
@@ -54,9 +68,6 @@ impl ServerAgenticLoopHost {
         self.model_override = Some(execution.model_name.clone());
         state.policy_model_name = Some(execution.model_name.clone());
         state.hooks.admitted_model_execution = Some(execution.clone());
-        if let Some(executor) = state.runtime_tool_executor.as_ref() {
-            executor.set_agent_model_execution(&execution, &state.thinking);
-        }
         let tool_policy = state
             .admitted_tool_policy
             .resolve_for_model(Some(&execution.model_name));
@@ -70,6 +81,15 @@ impl ServerAgenticLoopHost {
         }
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
+    }
+
+    fn publish_model_execution_to_tools(&self, state: &AgenticLoopState) {
+        if let (Some(executor), Some(execution)) = (
+            state.runtime_tool_executor.as_ref(),
+            self.admitted_model_execution.as_ref(),
+        ) {
+            executor.set_agent_model_execution(execution, &state.thinking);
+        }
     }
 
     async fn admit_explicit_model(
@@ -135,24 +155,12 @@ impl ServerAgenticLoopHost {
         let remaining = self
             .execution_time_budget_remaining()
             .map(|budget| budget.total_remaining);
-        tokio::select! {
-            biased;
-            _ = async {
-                match state.cancellation.token.as_ref() {
-                    Some(token) => token.cancelled().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Cancelled, "Model selection was cancelled")),
-            _ = async {
-                match remaining {
-                    Some(remaining) => tokio::time::sleep(remaining).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::BudgetExhausted, "Execution deadline expired during model selection")),
-            result = self.admit_explicit_model(selection) => Ok(result),
-        }
+        await_settings_control(
+            self.admit_explicit_model(selection),
+            &state.cancellation,
+            remaining,
+        )
+        .await
     }
 
     fn install_explicit_model(
@@ -185,9 +193,11 @@ impl ServerAgenticLoopHost {
                     && state.thinking == thinking
             });
         if already_installed {
+            self.check_model_control(state)?;
             self.preserve_thinking =
                 thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
             self.model_routing = None;
+            self.publish_model_execution_to_tools(state);
             return Ok(());
         }
         let mut selection = applied.selection.clone();
@@ -208,7 +218,9 @@ impl ServerAgenticLoopHost {
                 "The selected model identity changed; select the updated model to continue",
             ));
         }
+        self.check_model_control(state)?;
         self.install_explicit_model(state, execution, &applied.reasoning);
+        self.publish_model_execution_to_tools(state);
         Ok(())
     }
 
@@ -221,6 +233,7 @@ impl ServerAgenticLoopHost {
         // A newer choice may arrive while the current one is being admitted.
         // Consume the latest observed choice at this boundary before starting
         // provider I/O. Bound retries under continuous user changes.
+        let mut speculative_install = false;
         for _ in 0..8 {
             let pending = settings
                 .requested
@@ -235,7 +248,14 @@ impl ServerAgenticLoopHost {
             let Some(selection) = pending else {
                 if let Some(applied) = settings.applied.as_ref() {
                     self.ensure_applied_model(state, applied).await?;
+                    speculative_install = false;
                 }
+                if speculative_install {
+                    return Err(invalid(
+                        "The model change could not be confirmed; select a model to continue",
+                    ));
+                }
+                self.check_model_control(state)?;
                 return Ok(());
             };
             let (Some(control), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
@@ -288,6 +308,14 @@ impl ServerAgenticLoopHost {
                     )?;
                     Ok(execution)
                 });
+            self.check_model_control(state)?;
+            // Install in the execution owner before publishing an Applied
+            // outcome. The child-facing tool context remains unchanged until
+            // the durable decision is confirmed below.
+            if let Ok(execution) = &admission {
+                self.install_explicit_model(state, execution.clone(), &selection.reasoning);
+                speculative_install = true;
+            }
             let (result, resolved) = match &admission {
                 Ok(execution) => (
                     RunModelOutcomeKind::Applied {
@@ -314,20 +342,47 @@ impl ServerAgenticLoopHost {
                 round_index: state.current_round_index,
                 result,
             };
-            let committed = control
-                .finish_run_model(&user_id, &session_id, &run_id, &outcome, resolved.as_ref())
-                .await;
+            let remaining = self
+                .execution_time_budget_remaining()
+                .map(|budget| budget.total_remaining);
+            let committed = await_settings_control(
+                control.finish_run_model(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &outcome,
+                    resolved.as_ref(),
+                ),
+                &state.cancellation,
+                remaining,
+            )
+            .await;
             state.run_settings_observation.invalidate();
-            let fresh = state
-            .run_settings_observation
-            .read(control.as_ref(), &user_id, &session_id, &run_id)
-            .await
-            .map_err(|_| {
-                invalid(
-                    "The model change could not be confirmed; continue this task to reconcile it",
-                )
-            })?
-            .ok_or_else(|| invalid("The model change no longer belongs to this task"))?;
+            let committed = committed?;
+            if matches!(committed, Ok(None)) {
+                return Err(invalid("The model change lost its execution owner"));
+            }
+            let remaining = self
+                .execution_time_budget_remaining()
+                .map(|budget| budget.total_remaining);
+            let fresh = await_settings_control(
+                state.run_settings_observation.read(
+                    control.as_ref(),
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                ),
+                &state.cancellation,
+                remaining,
+            )
+            .await;
+            if fresh.is_err() {
+                state.run_settings_observation.invalidate();
+            }
+            let fresh = fresh?
+                .map_err(|_| invalid("The model change could not be confirmed; continue this task to reconcile it"))?
+                .ok_or_else(|| invalid("The model change no longer belongs to this task"))?;
+            self.check_model_control(state)?;
             let newer_pending = fresh.model.requested.as_ref().is_some_and(|requested| {
                 fresh
                     .model
@@ -346,8 +401,8 @@ impl ServerAgenticLoopHost {
                 {
                     Some(outcome) => outcome,
                     None if newer_pending => {
-                        // The old commit may have succeeded, but a newer choice
-                        // is already authoritative. Do not invent its outcome.
+                        // Keep any speculative installation private while the
+                        // newer choice reaches the same durable fence.
                         settings = fresh.model;
                         continue;
                     }
@@ -358,6 +413,21 @@ impl ServerAgenticLoopHost {
                     }
                 },
             };
+            if matches!(decided.result, RunModelOutcomeKind::Applied { .. }) {
+                let confirmed = match (&admission, fresh.model.applied.as_ref()) {
+                    (Ok(execution), Some(applied)) => {
+                        applied.selection == selection
+                            && execution.offering_id == applied.resolved.offering_id
+                            && execution.model_name == applied.resolved.model_name
+                            && execution.source_identity == applied.resolved.source_identity
+                    }
+                    _ => false,
+                };
+                if !confirmed {
+                    return Err(invalid("The applied model could not be confirmed"));
+                }
+                speculative_install = false;
+            }
             if newer_pending {
                 self.emit_committed_lifecycle_projection(
                     json!({"type":"run_model_outcome", "run_id":run_id,
@@ -368,23 +438,20 @@ impl ServerAgenticLoopHost {
                 continue;
             }
             if let Some(applied) = fresh.model.applied.as_ref() {
-                if let Ok(execution) = admission
-                    && applied.selection == selection
-                    && execution.offering_id == applied.resolved.offering_id
-                    && execution.model_name == applied.resolved.model_name
-                    && execution.source_identity == applied.resolved.source_identity
-                    && matches!(decided.result, RunModelOutcomeKind::Applied { .. })
-                {
-                    self.install_explicit_model(state, execution, &applied.reasoning);
-                } else {
-                    self.ensure_applied_model(state, applied).await?;
-                }
+                self.ensure_applied_model(state, applied).await?;
+                speculative_install = false;
+            }
+            if speculative_install {
+                return Err(invalid(
+                    "The model change could not be confirmed; select a model to continue",
+                ));
             }
             self.emit_committed_lifecycle_projection(
                 json!({"type":"run_model_outcome", "run_id":run_id,
             "session_id":session_id, "outcome":decided}),
             )
             .await;
+            self.check_model_control(state)?;
             return Ok(());
         }
         Err(invalid(
@@ -681,6 +748,7 @@ impl ServerAgenticLoopHost {
         // Everything model-dependent is repinned before prompt construction or
         // compaction. No endpoint or credential is included in the saved fact.
         self.install_model_execution(state, execution, "auto");
+        self.publish_model_execution_to_tools(state);
         if let Some(manifest) = state.runtime_manifest.as_mut() {
             manifest["model_routing"] =
                 serde_json::to_value(&decision).map_err(|error| invalid(error.to_string()))?;

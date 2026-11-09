@@ -523,6 +523,9 @@ impl DatabaseRunStateStore {
         session_id: &str,
         run_id: &str,
     ) -> Result<Option<RunSettingsSnapshot>, String> {
+        let mut connection = CancellationSafePoolConnection::acquire(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         let row = sqlx::query(
             "SELECT settings.payload_json AS settings_payload \
              FROM agent_runs AS run \
@@ -536,9 +539,10 @@ impl DatabaseRunStateStore {
         .bind(user_id)
         .bind(session_id)
         .bind(run_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection.connection_mut())
         .await
         .map_err(|e| e.to_string())?;
+        connection.release();
         let Some(row) = row else {
             return Ok(None);
         };

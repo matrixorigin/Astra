@@ -786,6 +786,69 @@ impl TranscriptView {
         self.replace_snapshot(snapshot, width);
     }
 
+    /// Replace a live suffix without rendering the unchanged conversation.
+    /// Interactive or filtered views use the full identity-aware projection.
+    pub(crate) fn replace_live_suffix(
+        &mut self,
+        prefix_len: usize,
+        suffix: Vec<TranscriptItem>,
+        width: u16,
+    ) -> bool {
+        if self.width != width
+            || self.filter != TranscriptFilter::All
+            || self.selection_anchor.is_some()
+            || self.live_tail_dirty
+            || !self.expanded.is_empty()
+            || suffix.is_empty()
+        {
+            return false;
+        }
+        let Some(first) = self.snapshot.items.get(prefix_len) else {
+            return false;
+        };
+        let Some(mut start) = self
+            .row_items
+            .iter()
+            .rposition(|id| id.as_ref() == Some(&first.id))
+        else {
+            return false;
+        };
+        while start > 0 && self.row_items[start - 1].as_ref() == Some(&first.id) {
+            start -= 1;
+        }
+        let follow_tail = self.is_following_tail();
+        if !follow_tail && self.cursor >= start {
+            return false;
+        }
+        self.lines.truncate(start);
+        self.row_items.truncate(start);
+        self.snapshot.items.truncate(prefix_len);
+        for item in suffix {
+            let lines = item.render(width, false);
+            self.row_items
+                .extend(std::iter::repeat_n(Some(item.id.clone()), lines.len()));
+            self.lines.extend(lines.into_iter().map(Arc::new));
+            for _ in 0..item.separator_rows {
+                self.lines.push(Arc::new(Line::default()));
+                self.row_items.push(None);
+            }
+            self.snapshot.items.push(item);
+        }
+        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
+            self.lines.pop();
+            self.row_items.pop();
+        }
+        self.activity_cache = None;
+        if follow_tail {
+            self.cursor = self.lines.len().saturating_sub(1);
+            self.scroll = self.max_scroll();
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
+            self.ensure_cursor_visible();
+        }
+        true
+    }
+
     /// Update an existing live tail without rendering the unchanged history.
     /// A different layout or identity falls back to the normal full projection.
     pub(crate) fn replace_live_tail(&mut self, item: TranscriptItem, width: u16) -> bool {

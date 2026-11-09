@@ -3494,48 +3494,6 @@ fn recover_queued_followups_after_cancelled_read(
     true
 }
 
-fn primary_guidance_disposition_event(
-    event: astra_thin_client::StreamEvent,
-    expected_run_id: &str,
-    expected_intent_id: &str,
-) -> Option<TuiAppEvent> {
-    match event {
-        astra_thin_client::StreamEvent::RunUserIntentApplied {
-            run_id,
-            intent_id,
-            delivery,
-            event_index,
-            content,
-            ..
-        } if run_id == expected_run_id && intent_id == expected_intent_id => {
-            Some(TuiAppEvent::UserIntentApplied {
-                intent_id,
-                delivery,
-                status: astra_turn_types::UserIntentStatus::Applied,
-                event_index: usize::try_from(event_index).unwrap_or(usize::MAX),
-                content,
-            })
-        }
-        astra_thin_client::StreamEvent::RunUserIntentReturned {
-            run_id,
-            intent_id,
-            delivery,
-            event_index,
-            content,
-            ..
-        } if run_id == expected_run_id && intent_id == expected_intent_id => {
-            Some(TuiAppEvent::UserIntentReturned {
-                intent_id,
-                delivery,
-                status: astra_turn_types::UserIntentStatus::Returned,
-                event_index: usize::try_from(event_index).unwrap_or(usize::MAX),
-                content,
-            })
-        }
-        _ => None,
-    }
-}
-
 fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Option<TuiAppEvent> {
     match event {
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
@@ -3558,30 +3516,6 @@ fn accept_attached_agent_event(
     }
 }
 
-struct PrimaryGuidanceObserverClaim(
-    std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
-);
-
-impl Drop for PrimaryGuidanceObserverClaim {
-    fn drop(&mut self) {
-        if let Some(run_control) = self.0.upgrade() {
-            run_control.release_remote_disposition_observer();
-        }
-    }
-}
-
-async fn next_guidance_stream_item_while_owner_alive<S>(
-    stream: &mut S,
-    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
-) -> Option<S::Item>
-where
-    S: tokio_stream::Stream + Unpin,
-{
-    await_guidance_future_while_owner_alive(stream.next(), run_control)
-        .await
-        .flatten()
-}
-
 async fn await_guidance_future_while_owner_alive<F>(
     future: F,
     run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
@@ -3599,16 +3533,78 @@ where
     }
 }
 
-/// Publish the durable disposition to the foreground reducer before releasing
-/// the turn-settlement barrier. Otherwise a saturated TUI channel can let the
-/// turn finish, drop this observer, and leave the visible intent permanently
-/// stuck at `AcceptedRemote` even though the server already applied it.
+/// Reconcile an accepted message only when the primary turn stream has ended.
+/// The pending intent remains the settlement barrier until the reducer applies
+/// the exact result; failed or still-pending reads never authorize a resend.
+#[allow(clippy::too_many_arguments)]
+fn spawn_primary_guidance_reconciliation(
+    api: astra_thin_client::ThinClient,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    auth: crate::cli::session::session_runtime::AdmittedAuth,
+    tui_tx: stream_bridge::TuiAppEventTx,
+    run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
+    turn_id: String,
+    session_id: String,
+    receipt: crate::cli::turn::local_run_control::UserIntentReceipt,
+    content: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let run_id = receipt.run_id.clone()?;
+    let event_index = usize::try_from(receipt.event_index).ok()?;
+    let run_control = std::sync::Arc::downgrade(&run_control);
+    Some(tokio::spawn(async move {
+        let lookup = async {
+            if !owner.is_current() {
+                return None;
+            }
+            let token = auth.access_token(&api, None).await?;
+            if !owner.is_current() {
+                return None;
+            }
+            let status = api
+                .get_run_user_intent(Some(&token), &run_id, &session_id, &receipt.intent_id)
+                .await
+                .ok()?;
+            owner.is_current().then_some(status)
+        };
+        let Some(Ok(Some(status))) = await_guidance_future_while_owner_alive(
+            tokio::time::timeout(Duration::from_secs(3), lookup),
+            &run_control,
+        )
+        .await
+        else {
+            return;
+        };
+        // The durable store normalizes the payload's content before emitting
+        // Applied/Returned; the status-only lookup must project the same text.
+        let content = content.trim().to_owned();
+        let disposition = match status {
+            astra_turn_types::UserIntentStatus::Applied => TuiAppEvent::UserIntentApplied {
+                intent_id: receipt.intent_id,
+                delivery: receipt.delivery,
+                status,
+                event_index,
+                content,
+            },
+            astra_turn_types::UserIntentStatus::Returned => TuiAppEvent::UserIntentReturned {
+                intent_id: receipt.intent_id,
+                delivery: receipt.delivery,
+                status,
+                event_index,
+                content,
+            },
+            _ => return,
+        };
+        let _ = project_primary_guidance_disposition(&tui_tx, &run_control, &turn_id, disposition)
+            .await;
+    }))
+}
+
 async fn project_primary_guidance_disposition(
     tui_tx: &stream_bridge::TuiAppEventTx,
     run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
     turn_id: &str,
     disposition: TuiAppEvent,
-) -> Option<bool> {
+) -> Option<()> {
     let intent_id = match &disposition {
         TuiAppEvent::UserIntentApplied { intent_id, .. }
         | TuiAppEvent::UserIntentReturned { intent_id, .. } => intent_id,
@@ -3621,162 +3617,13 @@ async fn project_primary_guidance_disposition(
         turn_id: turn_id.to_owned(),
         event: Box::new(disposition),
     };
-    let _delivery =
-        await_guidance_future_while_owner_alive(tui_tx.send(scoped), run_control).await?;
-    if !projection_ack.wait().await {
+    await_guidance_future_while_owner_alive(tui_tx.send(scoped), run_control)
+        .await?
+        .ok()?;
+    if !await_guidance_future_while_owner_alive(projection_ack.wait(), run_control).await? {
         return None;
     }
-    let active_run_control = run_control.upgrade()?;
-    Some(active_run_control.release_remote_disposition_observer_if_idle())
-}
-
-fn spawn_primary_guidance_reconciliation(
-    api: astra_thin_client::ThinClient,
-    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
-    auth: crate::cli::session::session_runtime::AdmittedAuth,
-    tui_tx: stream_bridge::TuiAppEventTx,
-    run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
-    turn_id: String,
-    receipt: crate::cli::turn::local_run_control::UserIntentReceipt,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let run_id = receipt.run_id?;
-    run_control.expect_remote_user_intent_disposition(&receipt.intent_id, receipt.event_index);
-    let oldest_pending_cursor = run_control.claim_remote_disposition_observer()?;
-    let Ok(after_event_index) = u32::try_from(oldest_pending_cursor) else {
-        tracing::warn!(
-            intent_id = %receipt.intent_id,
-            event_index = oldest_pending_cursor,
-            "cannot reconcile guidance with an invalid durable event cursor"
-        );
-        run_control.release_remote_disposition_observer();
-        return None;
-    };
-    let run_control = std::sync::Arc::downgrade(&run_control);
-    Some(tokio::spawn(async move {
-        let _observer_claim = PrimaryGuidanceObserverClaim(run_control.clone());
-        // The acceptance response supplies the exact durable cursor, so this
-        // observer reads only the control tail rather than replaying a long
-        // run's complete model/tool history. Keep this single per-run owner
-        // alive across auth/network failures: releasing it without arranging
-        // a successor strands accepted guidance when no later intent arrives.
-        // Reconnecting from the same cursor is idempotent because BottomPane
-        // resolves by stable intent_id.
-        let mut retry_delay = Duration::from_millis(100);
-        loop {
-            if !owner.is_current() {
-                return;
-            }
-            {
-                let Some(run_control) = run_control.upgrade() else {
-                    return;
-                };
-                if run_control.release_remote_disposition_observer_if_idle() {
-                    return;
-                }
-            }
-            let Some(token) = await_guidance_future_while_owner_alive(
-                auth.access_token(&api, None),
-                &run_control,
-            )
-            .await
-            .flatten() else {
-                if run_control.upgrade().is_none() {
-                    return;
-                }
-                tracing::debug!(
-                    run_id,
-                    intent_id = %receipt.intent_id,
-                    "guidance disposition authentication is temporarily unavailable; retrying"
-                );
-                if await_guidance_future_while_owner_alive(
-                    tokio::time::sleep(retry_delay),
-                    &run_control,
-                )
-                .await
-                .is_none()
-                {
-                    return;
-                }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
-                continue;
-            };
-            let mut stream = api.stream_run(&run_id, after_event_index, Some(&token));
-            while let Some(item) =
-                next_guidance_stream_item_while_owner_alive(&mut stream, &run_control).await
-            {
-                match item {
-                    Ok(event) => {
-                        let Some(active_run_control) = run_control.upgrade() else {
-                            return;
-                        };
-                        let disposition = active_run_control
-                            .pending_remote_disposition_ids()
-                            .into_iter()
-                            .find_map(|intent_id| {
-                                primary_guidance_disposition_event(
-                                    event.clone(),
-                                    &run_id,
-                                    &intent_id,
-                                )
-                            });
-                        if let Some(disposition) = disposition {
-                            drop(active_run_control);
-                            let Some(observer_is_idle) = project_primary_guidance_disposition(
-                                &tui_tx,
-                                &run_control,
-                                &turn_id,
-                                disposition,
-                            )
-                            .await
-                            else {
-                                return;
-                            };
-                            if observer_is_idle {
-                                return;
-                            }
-                            retry_delay = Duration::from_millis(100);
-                            continue;
-                        }
-                        if matches!(
-                            event,
-                            astra_thin_client::StreamEvent::RunFinished { .. }
-                                | astra_thin_client::StreamEvent::RunCancelled { .. }
-                                | astra_thin_client::StreamEvent::RunError { .. }
-                        ) {
-                            tracing::warn!(
-                                run_id,
-                                intent_id = %receipt.intent_id,
-                                "run terminated without projecting the accepted guidance disposition"
-                            );
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(
-                            run_id,
-                            intent_id = %receipt.intent_id,
-                            error = %error,
-                            "guidance disposition stream interrupted; reconnecting"
-                        );
-                        break;
-                    }
-                }
-            }
-            if run_control.upgrade().is_none() {
-                return;
-            }
-            if await_guidance_future_while_owner_alive(
-                tokio::time::sleep(retry_delay),
-                &run_control,
-            )
-            .await
-            .is_none()
-            {
-                return;
-            }
-            retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
-        }
-    }))
+    Some(())
 }
 
 struct ActiveRunGuidanceRequest<'a> {
@@ -3964,6 +3811,7 @@ where
 struct ActiveRunGuidanceSubmission {
     intent_id: String,
     text: String,
+    plan_command: Option<String>,
     auth: crate::cli::session::session_runtime::AdmittedAuth,
     result: Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError>,
 }
@@ -6028,6 +5876,115 @@ fn reconcile_server_agent_observer(
 /// Keep user intent visible until the exact server application acknowledgement.
 /// Cycling back to the active mode still submits a new request: an earlier
 /// request may already have been accepted by the server.
+struct PendingActivePlan {
+    request_id: String,
+    intent_id: Option<String>,
+    original: String,
+    entering: bool,
+    permission_applied: bool,
+}
+
+impl PendingActivePlan {
+    fn matches_applied(
+        &self,
+        mode: crate::cli::permission_manager::PermissionMode,
+        request_id: Option<&str>,
+    ) -> bool {
+        let expected = if self.entering {
+            crate::cli::permission_manager::PermissionMode::Plan
+        } else {
+            crate::cli::permission_manager::PermissionMode::Auto
+        };
+        mode == expected && request_id == Some(self.request_id.as_str())
+    }
+
+    fn blocks_intent(&self, intent_id: &str) -> bool {
+        !self.permission_applied && self.intent_id.as_deref() == Some(intent_id)
+    }
+}
+
+fn active_plan_command(text: &str) -> Option<&str> {
+    let slash_dispatch::SubmissionInput::Command(command) = slash_dispatch::parse_submission(text)
+    else {
+        return None;
+    };
+    if command.trim() == "/plan" {
+        Some("")
+    } else {
+        slash_plan_goal(command)
+    }
+}
+
+/// Preserve the user's command locally, and translate it only at the model
+/// boundary after Plan mode has actually been applied.
+fn active_plan_guidance(text: &str) -> Option<String> {
+    let goal = active_plan_command(text)?;
+    Some(if goal.is_empty() {
+        "Pause implementation and prepare a plan for the current task. Present the plan for approval.".to_string()
+    } else {
+        format!("Prepare a plan for this goal before making changes: {goal}")
+    })
+}
+
+fn restore_pending_active_plan(
+    plan: PendingActivePlan,
+    bottom_pane: &mut BottomPane,
+    same_turn_scope: bool,
+) -> bool {
+    restore_active_plan_command(
+        plan.intent_id.as_deref(),
+        plan.original,
+        bottom_pane,
+        same_turn_scope,
+    )
+}
+
+fn restore_active_plan_command(
+    intent_id: Option<&str>,
+    original: String,
+    bottom_pane: &mut BottomPane,
+    same_turn_scope: bool,
+) -> bool {
+    if let Some(intent_id) = intent_id {
+        if !bottom_pane.root_intent_is_visible(intent_id) || !same_turn_scope {
+            bottom_pane.retain_unsent_detached_plan(intent_id);
+            return false;
+        }
+        bottom_pane.remove_local_user_intent(intent_id);
+    } else if !same_turn_scope {
+        return false;
+    }
+    bottom_pane.restore_into_composer(&original);
+    true
+}
+
+fn restore_rejected_active_guidance(
+    bottom_pane: &mut BottomPane,
+    turn_id: &str,
+    intent_id: &str,
+    text: &str,
+    plan_command: Option<String>,
+    pending_plan: &mut Option<PendingActivePlan>,
+) {
+    bottom_pane.remove_local_user_intent(intent_id);
+    let unsent = bottom_pane.take_unsent_turn_guidance(turn_id);
+    if pending_plan
+        .as_ref()
+        .and_then(|plan| plan.intent_id.as_ref())
+        .is_some_and(|id| unsent.iter().any(|intent| &intent.intent_id == id))
+    {
+        *pending_plan = None;
+    }
+    let first = plan_command
+        .unwrap_or_else(|| slash_dispatch::conversation_for_composer(text).into_owned());
+    bottom_pane.start_composer_draft(&first);
+    bottom_pane.restore_inputs_into_composer(
+        unsent
+            .into_iter()
+            .map(|intent| intent.composer_text().into_owned()),
+    );
+}
+
 fn stage_permission_mode_for_next_round(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
@@ -10730,6 +10687,9 @@ pub(crate) async fn run_tui_session(
                                     let turn_model_epoch = state.session_attachment_epoch;
                                     let turn_model_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
                                     let mut staged_model: Option<NextModelSelection> = None;
+                                    let plan_workflow_at_turn_start = state.plan_mode_active() && state.cloud_plan_mirror.is_some();
+                                    let mut pending_active_plan: Option<PendingActivePlan> = None;
+                                    let mut applied_active_plan: Option<bool> = None;
 
                                     let mut permission_control = super::permission_control::ActivePermissionControl::new(
                                         api.clone(), turn_model_owner.clone(), active_remote_run_rx.clone(),
@@ -10889,6 +10849,20 @@ pub(crate) async fn run_tui_session(
                                             // One turn owns one FIFO of user messages. Wait for
                                             // its RunBound and submit one at a time so neither a
                                             // slow acknowledgement nor startup can reorder them.
+                                            if pending_active_plan.as_ref().is_some_and(|plan| {
+                                                if plan.permission_applied {
+                                                    permission_control.has_pending() || perm_mode_mirror.current() != crate::cli::permission_manager::PermissionMode::Plan
+                                                } else {
+                                                    !permission_control.is_current_request(&plan.request_id)
+                                                }
+                                            }) {
+                                                let restored = restore_pending_active_plan(pending_active_plan.take().unwrap(), &mut bottom_pane, turn_model_owner.is_current());
+                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                                                    if restored { "The plan change was superseded. The original command is available for editing." }
+                                                    else { "The plan change was superseded. The command was not restored here; retry if needed." }
+                                                ));
+                                                guidance_dispatch_needed = true;
+                                            }
                                             if guidance_dispatch_needed {
                                                 guidance_dispatch_needed = false;
                                             if !guidance_submission_in_flight
@@ -10899,12 +10873,18 @@ pub(crate) async fn run_tui_session(
                                                 && turn_result_ready.is_none()
                                                 && let Some(intent) =
                                                     bottom_pane.next_unsent_guidance(&turn_submission_id)
+                                                && pending_active_plan.as_ref().is_none_or(|plan| !plan.blocks_intent(&intent.intent_id))
                                                 && active_remote_run_rx.borrow().as_deref().is_some_and(|id| !id.trim().is_empty())
                                                 && let Some(auth) = preinstalled_run_control.admitted_auth().borrow().clone()
                                             {
                                                 let intent_id = intent.intent_id.clone();
-                                                let text = intent.text.clone();
                                                 let queue_index = intent.next_turn_position;
+                                                let plan_command = if pending_active_plan.as_ref().is_some_and(|plan| plan.permission_applied && plan.intent_id.as_deref() == Some(intent_id.as_str())) {
+                                                    pending_active_plan.take().map(|plan| plan.original)
+                                                } else {
+                                                    None
+                                                };
+                                                let text = intent.wire_text().to_owned();
                                                 let active_work_snapshot = bg_task_list_cache_for_turn.read().await.clone();
                                                 let active_work_observations = active_work_registry_for_turn.active_work_observations();
                                                 preinstalled_run_control.expect_remote_user_intent_submission(&intent_id);
@@ -10932,6 +10912,7 @@ pub(crate) async fn run_tui_session(
                                                     let _ = submission_tx.send(ActiveRunGuidanceSubmission {
                                                         intent_id,
                                                         text,
+                                                        plan_command,
                                                         auth,
                                                         result,
                                                     }).await;
@@ -11079,15 +11060,19 @@ pub(crate) async fn run_tui_session(
                                                             bottom_pane.promote_user_intent_accepted(
                                                                 &submission.intent_id,
                                                             );
-                                                            let _ = spawn_primary_guidance_reconciliation(
-                                                                api.clone().without_bearer_provider(),
-                                                                turn_model_owner.clone(),
-                                                                submission.auth,
-                                                                tui_tx.clone(),
-                                                                preinstalled_run_control.clone(),
-                                                                turn_submission_id.clone(),
-                                                                receipt,
+                                                            preinstalled_run_control.expect_remote_user_intent_disposition(
+                                                                &receipt.intent_id, receipt.event_index,
                                                             );
+                                                            if turn_projection_drained {
+                                                                let session = astra_core::sync_poison::recover_mutex_lock(&turn_bound_session).clone();
+                                                                if let Some(session) = session {
+                                                                    let _ = spawn_primary_guidance_reconciliation(
+                                                                        api.clone().without_bearer_provider(), turn_model_owner.clone(),
+                                                                        submission.auth, tui_tx.clone(), preinstalled_run_control.clone(),
+                                                                        turn_submission_id.clone(), session, receipt, submission.text.clone(),
+                                                                    );
+                                                                }
+                                                            }
                                                             chat_widget.commit_concurrent_system(
                                                                 history_cell::system::SystemCell::runtime_control(
                                                                     "Message received · waiting to take effect."
@@ -11101,14 +11086,9 @@ pub(crate) async fn run_tui_session(
                                                             );
                                                             if turn_model_owner.is_current()
                                                                 && bottom_pane.root_intent_is_visible(&submission.intent_id) {
-                                                                bottom_pane.remove_local_user_intent(&submission.intent_id);
-                                                                let unsent = bottom_pane.take_unsent_turn_guidance(&turn_submission_id);
-                                                                let draft = std::iter::once(submission.text.clone())
-                                                                    .chain(unsent.into_iter().map(|intent| intent.text))
-                                                                    .collect::<Vec<_>>()
-                                                                    .join("\n\n");
-                                                                bottom_pane.start_composer_draft(
-                                                                    &slash_dispatch::conversation_for_composer(&draft),
+                                                                restore_rejected_active_guidance(
+                                                                    &mut bottom_pane, &turn_submission_id, &submission.intent_id,
+                                                                    &submission.text, submission.plan_command, &mut pending_active_plan,
                                                                 );
                                                                 chat_widget.commit_concurrent_system(
                                                                     history_cell::system::SystemCell::error(error),
@@ -11123,6 +11103,22 @@ pub(crate) async fn run_tui_session(
                                                             }
                                                         }
                                                         Err(GuidanceSubmissionError::GuidanceClosed(notice)) => {
+                                                            if let Some(command) = submission.plan_command {
+                                                                preinstalled_run_control.release_remote_user_intent_submission(&submission.intent_id);
+                                                                let restored = restore_active_plan_command(
+                                                                    Some(&submission.intent_id), command, &mut bottom_pane, turn_model_owner.is_current(),
+                                                                );
+                                                                guidance_admission_closed = true;
+                                                                guidance_handoff_blocked = true;
+                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                                                                    if restored { "The task ended before the plan request was sent. The original command is available for editing." }
+                                                                    else { "The task ended before the plan request was sent. The command was not restored here; retry if needed." }
+                                                                ));
+                                                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                frame_requester.schedule_frame();
+                                                                continue;
+                                                            }
                                                             let queue_index = submitted_queue_index.unwrap_or_else(
                                                                 || {
                                                                     bottom_pane
@@ -11477,6 +11473,52 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         if slash_dispatch::open_active_help(&queued_text, &mut bottom_pane, &mut chat_widget) {
                                                                             bottom_pane.sync_popups();
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if let Some(goal) = active_plan_command(&queued_text)
+                                                                            && output_settled_at.is_none()
+                                                                            && !guidance_admission_closed
+                                                                        {
+                                                                            if pending_active_plan.is_some() {
+                                                                                bottom_pane.restore_into_composer(&queued_text);
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                                                                                    "A plan change is already pending. The command is available for editing."
+                                                                                ));
+                                                                                frame_requester.schedule_frame();
+                                                                                continue;
+                                                                            }
+                                                                            let planning = applied_active_plan.unwrap_or(plan_workflow_at_turn_start)
+                                                                                && perm_mode_mirror.current() == crate::cli::permission_manager::PermissionMode::Plan;
+                                                                            let entering = !goal.is_empty() || !planning;
+                                                                            let intent_id = if entering {
+                                                                                let intent_id = format!("intent_{}", uuid::Uuid::now_v7().simple());
+                                                                                let wire_text = active_plan_guidance(&queued_text).expect("parsed plan command");
+                                                                                if let Err(reason) = bottom_pane.accept_turn_plan_intent(&turn_submission_id, intent_id.clone(), queued_text.clone(), wire_text) {
+                                                                                    bottom_pane.restore_into_composer(&queued_text);
+                                                                                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(reason.message()));
+                                                                                    frame_requester.schedule_frame();
+                                                                                    continue;
+                                                                                }
+                                                                                Some(intent_id)
+                                                                            } else {
+                                                                                None
+                                                                            };
+                                                                            let mode = if entering {
+                                                                                crate::cli::permission_manager::PermissionMode::Plan
+                                                                            } else {
+                                                                                crate::cli::permission_manager::PermissionMode::Auto
+                                                                            };
+                                                                            // Release only the wait that exists at the user's gesture.
+                                                                            // Permission still gates the planning message until applied.
+                                                                            foreground_wait_control_for_ctrl_b.release();
+                                                                            stage_permission_mode_for_next_round(&mut bottom_pane, &mut chat_widget, mode, perm_mode_mirror.current());
+                                                                            let request_id = permission_control.request(mode);
+                                                                            pending_active_plan = Some(PendingActivePlan {
+                                                                                request_id, intent_id, original: queued_text, entering, permission_applied: false,
+                                                                            });
+                                                                            guidance_dispatch_needed = true;
                                                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
@@ -11936,6 +11978,25 @@ pub(crate) async fn run_tui_session(
                                                         // finalized by the immediately following
                                                         // TurnComplete/TurnError reducer.
                                                         turn_projection_drained = true;
+                                                        let session = astra_core::sync_poison::recover_mutex_lock(&turn_bound_session).clone();
+                                                        let run_id = active_remote_run_rx.borrow().clone();
+                                                        let auth = preinstalled_run_control.admitted_auth().borrow().clone();
+                                                        if let (Some(session), Some(run_id), Some(auth)) = (session, run_id, auth) {
+                                                            for intent in bottom_pane.accepted_turn_guidance(&turn_submission_id) {
+                                                                if let Some(event_index) = preinstalled_run_control.pending_remote_disposition_index(&intent.intent_id) {
+                                                                    let content = intent.wire_text().to_owned();
+                                                                    let receipt = crate::cli::turn::local_run_control::UserIntentReceipt {
+                                                                        run_id: Some(run_id.clone()), intent_id: intent.intent_id,
+                                                                        delivery: intent.delivery, status: intent.status, event_index,
+                                                                    };
+                                                                    let _ = spawn_primary_guidance_reconciliation(
+                                                                        api.clone().without_bearer_provider(), turn_model_owner.clone(),
+                                                                        auth.clone(), tui_tx.clone(), preinstalled_run_control.clone(),
+                                                                        turn_submission_id.clone(), session.clone(), receipt, content,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
                                                         continue;
                                                     }
                                                     if matches!(
@@ -12327,8 +12388,35 @@ pub(crate) async fn run_tui_session(
                                                     if turn_model_owner.is_current()
                                                         && let Some(outcome) = permission_control.reconcile(&perm_mode_mirror) {
                                                         match outcome {
-                                                            Ok(_) => bottom_pane.clear_staged_permission_mode(),
+                                                            Ok(mode) => {
+                                                                bottom_pane.clear_staged_permission_mode();
+                                                                if let Some(mut plan) = pending_active_plan.take() {
+                                                                    if plan.matches_applied(mode, perm_mode_mirror.applied_request_id().as_deref()) {
+                                                                        applied_active_plan = Some(plan.entering);
+                                                                        if plan.entering {
+                                                                            plan.permission_applied = true;
+                                                                            pending_active_plan = Some(plan);
+                                                                            guidance_dispatch_needed = true;
+                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                                                                                "Plan mode active · planning request queued."
+                                                                            ));
+                                                                        }
+                                                                    } else {
+                                                                        let restored = restore_pending_active_plan(plan, &mut bottom_pane, turn_model_owner.is_current());
+                                                                        guidance_dispatch_needed = true;
+                                                                        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                                                                            if restored { "The plan change was superseded. The original command is available for editing." }
+                                                                            else { "The plan change was superseded. The command was not restored here; retry if needed." }
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
                                                             Err(error) => {
+                                                                if let Some(plan) = pending_active_plan.take() {
+                                                                    let _ = restore_pending_active_plan(plan, &mut bottom_pane, turn_model_owner.is_current());
+                                                                    bottom_pane.clear_staged_permission_mode();
+                                                                    guidance_dispatch_needed = true;
+                                                                }
                                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(error));
                                                             }
                                                         }
@@ -12389,8 +12477,26 @@ pub(crate) async fn run_tui_session(
                                         state.session_id.as_deref(), state.session_attachment_epoch,
                                         first_bound_session.as_deref().unwrap_or(""),
                                     );
-                                    if same_turn_scope && matches!(permission_control.reconcile(&perm_mode_mirror), Some(Ok(_))) {
+                                    if same_turn_scope && let Some(Ok(mode)) = permission_control.reconcile(&perm_mode_mirror) {
                                         bottom_pane.clear_staged_permission_mode();
+                                        if let Some(plan) = pending_active_plan.as_ref() {
+                                            if plan.matches_applied(mode, perm_mode_mirror.applied_request_id().as_deref()) {
+                                                applied_active_plan = Some(plan.entering);
+                                            }
+                                        }
+                                    }
+                                    if let Some(plan) = pending_active_plan.take() {
+                                        let exit_confirmed = !plan.entering && applied_active_plan == Some(false);
+                                        if !exit_confirmed {
+                                            if permission_control.is_current_request(&plan.request_id) {
+                                                bottom_pane.clear_staged_permission_mode();
+                                            }
+                                            let restored = restore_pending_active_plan(plan, &mut bottom_pane, same_turn_scope);
+                                            chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                if restored { "The task ended before its planning request was delivered. The command is available for editing." }
+                                                else { "The task ended before its planning request was delivered. The command was not restored here; retry if needed." }
+                                            ));
+                                        }
                                     }
                                     if same_turn_scope {
                                         if let Some(feedback) = model_control.take_submission() {
@@ -12437,6 +12543,18 @@ pub(crate) async fn run_tui_session(
                                     finish_staged_permission_selection(
                                         &mut state, &mut bottom_pane, &mut chat_widget, same_turn_scope,
                                     );
+                                    if same_turn_scope {
+                                        match applied_active_plan {
+                                            Some(true) if state.plan_mode_active() && state.cloud_plan_mirror.is_none() => {
+                                                state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new(String::new()));
+                                            }
+                                            Some(false) if !state.plan_mode_active() => {
+                                                state.cloud_plan_mirror = None;
+                                                state.plan_mode_sync_error = None;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
 
                                     *astra_core::sync_poison::recover_mutex_lock(
                                         &state.active_turn_local_run_control,
@@ -15568,43 +15686,6 @@ mod tests {
     }
 
     #[test]
-    fn primary_guidance_durable_disposition_maps_only_exact_identity() {
-        let applied = astra_thin_client::StreamEvent::RunUserIntentApplied {
-            run_id: "run-1".into(),
-            intent_id: "intent-1".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            event_index: 41,
-            content: "stop".into(),
-            index: 44,
-        };
-        assert!(matches!(
-            primary_guidance_disposition_event(applied.clone(), "run-1", "intent-1"),
-            Some(TuiAppEvent::UserIntentApplied {
-                event_index: 41,
-                content,
-                ..
-            }) if content == "stop"
-        ));
-        assert!(primary_guidance_disposition_event(applied, "run-2", "intent-1").is_none());
-
-        let returned = astra_thin_client::StreamEvent::RunUserIntentReturned {
-            run_id: "run-1".into(),
-            intent_id: "intent-1".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            event_index: 41,
-            content: "stop".into(),
-            index: 45,
-        };
-        assert!(matches!(
-            primary_guidance_disposition_event(returned, "run-1", "intent-1"),
-            Some(TuiAppEvent::UserIntentReturned {
-                event_index: 41,
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn guidance_disposition_before_post_ack_wins_and_preserves_returned_input() {
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let mut pane = BottomPane::new();
@@ -15731,57 +15812,6 @@ mod tests {
         assert!(pane.composer.is_empty());
         assert!(!rendered_transcript_overlay(&widget, 80).contains("old message"));
         assert!(control.pending_remote_disposition_ids().is_empty());
-    }
-
-    #[test]
-    fn guidance_observer_claim_does_not_keep_a_finished_turn_alive() {
-        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
-        run_control.expect_remote_user_intent_disposition("intent-1", 7);
-        assert_eq!(run_control.claim_remote_disposition_observer(), Some(7));
-
-        let weak = std::sync::Arc::downgrade(&run_control);
-        let claim = PrimaryGuidanceObserverClaim(weak.clone());
-        assert_eq!(
-            std::sync::Arc::strong_count(&run_control),
-            1,
-            "observer ownership must be weak so a failed historical turn cannot leak a retry task"
-        );
-        drop(run_control);
-        assert!(weak.upgrade().is_none());
-        drop(claim);
-    }
-
-    #[tokio::test]
-    async fn guidance_observer_drops_a_never_yielding_stream_after_turn_owner_release() {
-        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
-        run_control.publish_admitted_auth(crate::cli::session::session_runtime::AdmittedAuth::new(
-            "picker-token",
-            None,
-        ));
-        let (_, picker_attempt) = wait_for_catalog_auth(
-            run_control.admitted_auth(),
-            std::sync::Arc::downgrade(&run_control),
-        )
-        .await
-        .unwrap();
-        let weak = std::sync::Arc::downgrade(&run_control);
-        let mut stream = tokio_stream::pending::<()>();
-        let observer = tokio::spawn(async move {
-            next_guidance_stream_item_while_owner_alive(&mut stream, &weak).await
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!observer.is_finished());
-        drop(run_control);
-        let result = tokio::time::timeout(Duration::from_secs(1), observer)
-            .await
-            .expect("owner release must stop a half-open stream within one check interval")
-            .expect("observer task");
-        assert_eq!(result, None);
-        assert!(
-            picker_attempt.is_current(),
-            "the picker remains usable after turn settlement"
-        );
     }
 
     #[tokio::test]
@@ -15999,10 +16029,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_stream_guidance_recovery_uses_one_exact_lookup() {
+        use wiremock::matchers::{header, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (http_status, status, expected) in [
+            (
+                200,
+                "applied",
+                Some(astra_turn_types::UserIntentStatus::Applied),
+            ),
+            (
+                200,
+                "returned",
+                Some(astra_turn_types::UserIntentStatus::Returned),
+            ),
+            (200, "accepted_remote", None),
+            (503, "unavailable", None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/chat/runs/run-1/intents/intent-1"))
+                .and(query_param("expected_session_id", "session-1"))
+                .and(header("authorization", "Bearer captured-token"))
+                .respond_with(ResponseTemplate::new(http_status).set_body_json(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            run_control.expect_remote_user_intent_disposition("intent-1", 7);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            let task = spawn_primary_guidance_reconciliation(
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                crate::cli::session::session_runtime::AdmittedAuth::new("captured-token", None),
+                tx,
+                run_control.clone(),
+                "turn".into(),
+                "session-1".into(),
+                crate::cli::turn::local_run_control::UserIntentReceipt {
+                    run_id: Some("run-1".into()),
+                    intent_id: "intent-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 7,
+                },
+                "keep this message".into(),
+            )
+            .unwrap();
+            if let Some(expected) = expected {
+                let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let event = accept_owned_tui_event(event, Some("turn")).unwrap();
+                let mut pane = BottomPane::new();
+                pane.accept_turn_user_intent("turn", "intent-1".into(), "keep this message".into())
+                    .unwrap();
+                pane.promote_user_intent_accepted("intent-1");
+                let mut widget = chat_widget::ChatWidget::new(String::new());
+                let projection = apply_active_turn_tui_control_event(
+                    &event,
+                    &mut pane,
+                    &mut widget,
+                    &run_control,
+                    0,
+                    "turn",
+                );
+                assert!(matches!(
+                    (expected, projection),
+                    (
+                        astra_turn_types::UserIntentStatus::Applied,
+                        UserIntentProjection::Applied
+                    ) | (
+                        astra_turn_types::UserIntentStatus::Returned,
+                        UserIntentProjection::Returned
+                    )
+                ));
+                assert!(run_control.pending_remote_disposition_ids().is_empty());
+            } else {
+                assert!(
+                    run_control
+                        .pending_remote_disposition_ids()
+                        .contains(&"intent-1".to_string())
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn guidance_disposition_waits_for_exact_reducer_ack_not_channel_enqueue() {
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         run_control.expect_remote_user_intent_disposition("intent-1", 7);
-        assert_eq!(run_control.claim_remote_disposition_observer(), Some(7));
         let weak = std::sync::Arc::downgrade(&run_control);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(TuiAppEvent::StatusLine("occupy the channel".into()))
@@ -16071,7 +16193,7 @@ mod tests {
         );
         assert_eq!(
             projection.await.unwrap(),
-            Some(true),
+            Some(()),
             "the only pending disposition should release after its exact reducer ACK"
         );
         assert!(run_control.pending_remote_disposition_ids().is_empty());
@@ -17349,6 +17471,161 @@ mod tests {
             "please continue",
             true
         ));
+    }
+
+    #[test]
+    fn active_plan_waits_for_its_exact_permission_ack_and_restores_superseded_input() {
+        use crate::cli::permission_manager::PermissionMode;
+
+        assert_eq!(active_plan_command("/plan"), Some(""));
+        assert_eq!(
+            active_plan_command("/plan inspect the failures"),
+            Some("inspect the failures")
+        );
+        assert_eq!(active_plan_command("//plan inspect"), None);
+        assert_eq!(active_plan_command("/planner"), None);
+        let mut plan = PendingActivePlan {
+            request_id: "permission-1".into(),
+            intent_id: Some("intent-1".into()),
+            original: "/plan inspect the failures".into(),
+            entering: true,
+            permission_applied: false,
+        };
+        assert!(plan.blocks_intent("intent-1"));
+        assert!(!plan.blocks_intent("earlier-intent"));
+        assert!(!plan.matches_applied(PermissionMode::Plan, Some("other-request")));
+        assert!(!plan.matches_applied(PermissionMode::Auto, Some("permission-1")));
+        assert!(plan.matches_applied(PermissionMode::Plan, Some("permission-1")));
+        plan.permission_applied = true;
+        assert!(!plan.blocks_intent("intent-1"));
+
+        let mut pane = BottomPane::new();
+        pane.accept_turn_user_intent("turn", "intent-1".into(), "plan guidance".into())
+            .unwrap();
+        assert!(restore_pending_active_plan(plan, &mut pane, true));
+        assert!(pane.next_unsent_guidance("turn").is_none());
+        assert_eq!(pane.composer.text(), "/plan inspect the failures");
+    }
+
+    #[test]
+    fn rejected_guidance_preserves_plan_and_literal_slash_draft_boundaries() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for permission_applied in [false, true] {
+            let mut pane = explicit_followup_pane();
+            pane.accept_turn_user_intent("turn", "earlier".into(), "/plan literal text".into())
+                .unwrap();
+            let command = "/plan inspect the failures";
+            let wire = active_plan_guidance(command).unwrap();
+            pane.accept_turn_plan_intent("turn", "plan".into(), command.into(), wire.clone())
+                .unwrap();
+            let plan = pane.next_unsent_guidance("turn").unwrap();
+            assert_eq!(plan.wire_text(), "/plan literal text");
+            let mut pending_plan = Some(PendingActivePlan {
+                request_id: "permission".into(),
+                intent_id: Some("plan".into()),
+                original: command.into(),
+                entering: true,
+                permission_applied,
+            });
+            restore_rejected_active_guidance(
+                &mut pane,
+                "turn",
+                "earlier",
+                "/plan literal text",
+                None,
+                &mut pending_plan,
+            );
+            assert!(pending_plan.is_none());
+            assert_eq!(pane.composer.text(), "//plan literal text");
+            let action = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                matches!(action, BottomPaneAction::SubmitInput(ref text) if text == "//plan literal text")
+            );
+            assert_eq!(pane.composer.text(), command);
+
+            let mut returned = BottomPane::new();
+            returned
+                .accept_turn_plan_intent("turn", "plan".into(), command.into(), wire.clone())
+                .unwrap();
+            assert_eq!(
+                returned.next_unsent_guidance("turn").unwrap().wire_text(),
+                wire
+            );
+            assert!(returned.promote_user_intent_accepted("plan"));
+            assert!(returned.return_user_intent(
+                "plan",
+                astra_turn_types::UserIntentStatus::Returned,
+                &wire
+            ));
+            assert_eq!(returned.composer.text(), command);
+        }
+    }
+
+    #[test]
+    fn closed_plan_guidance_restores_the_command_without_queueing_it() {
+        let mut pane = BottomPane::new();
+        let command = "/plan";
+        pane.accept_turn_plan_intent(
+            "turn",
+            "plan".into(),
+            command.into(),
+            active_plan_guidance(command).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_active_plan_command(
+            Some("plan"),
+            command.into(),
+            &mut pane,
+            true
+        ));
+        assert_eq!(pane.composer.text(), command);
+        assert_eq!(pane.queued_next_turn_submission_count(), 0);
+        assert!(pane.next_unsent_guidance("turn").is_none());
+    }
+
+    #[test]
+    fn undelivered_plan_stays_with_its_original_session() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session-a");
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session-a"), state.session_attachment_epoch);
+        pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            state.session_attachment_epoch,
+            Arc::new(std::sync::Mutex::new(Some("session-a".into()))),
+        )));
+        pane.accept_turn_plan_intent(
+            "turn",
+            "intent-1".into(),
+            "/plan private goal".into(),
+            "plan private goal".into(),
+        )
+        .unwrap();
+        state.set_session_id("session-b");
+        pane.set_session_attachment(Some("session-b"), state.session_attachment_epoch);
+        assert!(!restore_pending_active_plan(
+            PendingActivePlan {
+                request_id: "request".into(),
+                intent_id: Some("intent-1".into()),
+                original: "/plan private goal".into(),
+                entering: true,
+                permission_applied: false,
+            },
+            &mut pane,
+            false
+        ));
+        assert!(pane.composer.is_empty());
+        assert!(!pane.recover_returned_root_guidance());
+        state.set_session_id("session-a");
+        pane.set_session_attachment(Some("session-a"), state.session_attachment_epoch);
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "/plan private goal");
     }
 
     #[test]

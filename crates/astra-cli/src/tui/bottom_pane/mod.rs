@@ -166,6 +166,9 @@ pub(crate) struct PendingUserIntent {
     pub(crate) delivery: astra_turn_types::UserIntentDelivery,
     pub(crate) status: astra_turn_types::UserIntentStatus,
     pub(crate) text: String,
+    /// Model-facing text when a local command needs a different wire form.
+    /// The original text remains available for explicit user recovery.
+    pub(crate) wire_text: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
     /// Physical turn that owns an active-run submission. Child messages keep
     /// their own captured target and do not use this field.
@@ -259,6 +262,18 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    pub(crate) fn wire_text(&self) -> &str {
+        self.wire_text.as_deref().unwrap_or(&self.text)
+    }
+
+    pub(crate) fn composer_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.wire_text.is_some() {
+            std::borrow::Cow::Borrowed(&self.text)
+        } else {
+            super::slash_dispatch::conversation_for_composer(&self.text)
+        }
+    }
+
     pub(crate) fn delivery_is_unconfirmed(&self) -> bool {
         self.custody == PendingUserIntentCustody::Unconfirmed
     }
@@ -611,7 +626,7 @@ impl BottomPane {
             intent_id.into(),
             delivery,
             status,
-            text.into(),
+            (text.into(), None),
             PendingUserIntentTarget::ActiveRun,
             None,
         )
@@ -627,7 +642,24 @@ impl BottomPane {
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-            text,
+            (text, None),
+            PendingUserIntentTarget::ActiveRun,
+            Some(turn_id.to_owned()),
+        )
+    }
+
+    pub(crate) fn accept_turn_plan_intent(
+        &mut self,
+        turn_id: &str,
+        intent_id: String,
+        command: String,
+        wire_text: String,
+    ) -> Result<(), UserIntentRejectReason> {
+        self.accept_user_intent_for_target(
+            intent_id,
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedLocal,
+            (command, Some(wire_text)),
             PendingUserIntentTarget::ActiveRun,
             Some(turn_id.to_owned()),
         )
@@ -643,7 +675,7 @@ impl BottomPane {
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-            text,
+            (text, None),
             PendingUserIntentTarget::AgentRun { target },
             None,
         )
@@ -689,12 +721,13 @@ impl BottomPane {
         intent_id: String,
         delivery: astra_turn_types::UserIntentDelivery,
         status: astra_turn_types::UserIntentStatus,
-        text: String,
+        text: (String, Option<String>),
         target: PendingUserIntentTarget,
         turn_id: Option<String>,
     ) -> Result<(), UserIntentRejectReason> {
         const MAX_PENDING_INTENTS: usize = 64;
         const MAX_PENDING_BYTES: usize = 1024 * 1024;
+        let (text, wire_text) = text;
         let counts_toward_limit = |intent: &&PendingUserIntent| match &target {
             PendingUserIntentTarget::ActiveRun => {
                 matches!(intent.target, PendingUserIntentTarget::ActiveRun)
@@ -733,9 +766,10 @@ impl BottomPane {
                 .pending_user_intents
                 .iter()
                 .filter(counts_toward_limit)
-                .map(|intent| intent.text.len())
+                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
                 .sum::<usize>()
                 .saturating_add(text.len())
+                .saturating_add(wire_text.as_ref().map_or(0, String::len))
                 > MAX_PENDING_BYTES
         {
             Some(UserIntentRejectReason::QueueFull)
@@ -753,6 +787,7 @@ impl BottomPane {
             delivery,
             status,
             text,
+            wire_text,
             target,
             turn_id,
             next_turn_position: self.queued_next_turn_submissions.len(),
@@ -782,6 +817,18 @@ impl BottomPane {
             }
         }
         None
+    }
+
+    pub(crate) fn accepted_turn_guidance(&self, turn_id: &str) -> Vec<PendingUserIntent> {
+        self.pending_user_intents
+            .iter()
+            .filter(|intent| {
+                intent.turn_id.as_deref() == Some(turn_id)
+                    && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                    && intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn promote_agent_guide_accepted(&mut self, intent_id: &str) -> bool {
@@ -1082,6 +1129,7 @@ impl BottomPane {
             delivery,
             status,
             text: runtime_content.to_string(),
+            wire_text: None,
             target,
             turn_id: None,
             next_turn_position: 0,
@@ -1154,6 +1202,17 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn retain_unsent_detached_plan(&mut self, intent_id: &str) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+        }) {
+            intent.status = astra_turn_types::UserIntentStatus::Returned;
+            intent.custody = PendingUserIntentCustody::Run;
+        }
+    }
+
     pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
         let Some(id) = self
             .visible_pending_intents()
@@ -1175,9 +1234,7 @@ impl BottomPane {
         let Some(intent) = self.pending_user_intents.remove(index) else {
             return false;
         };
-        self.start_composer_draft(&super::slash_dispatch::conversation_for_composer(
-            &intent.text,
-        ));
+        self.start_composer_draft(&intent.composer_text());
         true
     }
 
@@ -1252,11 +1309,17 @@ impl BottomPane {
             self.applied_user_intent_ids.insert(intent_id.to_string());
             return true;
         }
-        self.pending_user_intents.remove(index);
+        let intent = self
+            .pending_user_intents
+            .remove(index)
+            .expect("matched intent");
         self.applied_user_intent_ids.insert(intent_id.to_string());
-        self.restore_into_composer(&super::slash_dispatch::conversation_for_composer(
-            runtime_content,
-        ));
+        let restored = if intent.wire_text.is_some() {
+            std::borrow::Cow::Borrowed(intent.text.as_str())
+        } else {
+            super::slash_dispatch::conversation_for_composer(runtime_content)
+        };
+        self.restore_into_composer(&restored);
         true
     }
 
