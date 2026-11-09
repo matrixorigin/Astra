@@ -330,10 +330,10 @@ pub fn parse_usage(
 fn parse_usage_sample(
     dialect: UsageDialect,
     usage_obj: &Map<String, Value>,
-    same_frame_aliases: bool,
+    raw_sample: bool,
 ) -> Option<(TokenUsage, TokenUsagePresence)> {
     match dialect {
-        UsageDialect::OpenAi => parse_openai_usage(usage_obj, same_frame_aliases),
+        UsageDialect::OpenAi => parse_openai_usage(usage_obj, raw_sample),
         UsageDialect::BedrockConverse | UsageDialect::AnthropicMessages => {
             parse_disjoint_usage(dialect, usage_obj)
         }
@@ -404,7 +404,7 @@ fn reconcile_usage_aliases(values: &[Option<u64>], conflict: &mut bool) -> Optio
 
 fn parse_openai_usage(
     u: &Map<String, Value>,
-    same_frame_aliases: bool,
+    raw_sample: bool,
 ) -> Option<(TokenUsage, TokenUsagePresence)> {
     let mut input_invalid = false;
     let mut output_invalid = false;
@@ -463,7 +463,7 @@ fn parse_openai_usage(
         &[completion, native_output, opencode_output],
         &mut output_conflict,
     );
-    output_invalid |= same_frame_aliases && output_conflict;
+    output_invalid |= raw_sample && output_conflict;
     let native_partition = hit.is_some() || miss.is_some();
     let mut alias_conflict = false;
     let inclusive = native_partition
@@ -484,14 +484,11 @@ fn parse_openai_usage(
         &mut alias_conflict,
     )
     .or_else(|| (hit.is_some() && miss.is_some()).then_some(0));
-    // Even an incomplete lifetime split cannot exceed a reported write total.
-    alias_conflict |= creation.is_some_and(|total| {
-        [write_5m, write_1h]
-            .into_iter()
-            .flatten()
-            .try_fold(0_u64, u64::checked_add)
-            .is_none_or(|reported| reported > total)
-    });
+    // A single lifetime bounds writes but cannot establish the write total.
+    let partial_write = write_5m.xor(write_1h);
+    alias_conflict |= creation
+        .zip(partial_write)
+        .is_some_and(|(total, reported)| reported > total);
     let derived_fresh = || {
         prompt.and_then(|total| {
             cached
@@ -510,21 +507,23 @@ fn parse_openai_usage(
     };
     let fresh =
         reconcile_usage_aliases(&[fresh, native_input, opencode_input], &mut alias_conflict);
-    input_invalid |= same_frame_aliases && alias_conflict;
-    let known_sum = [fresh, cached, creation]
+    let known_sum = [fresh, cached, creation.or(partial_write)]
         .into_iter()
         .flatten()
         .try_fold(0_u64, u64::checked_add);
-    let partition_conflict =
-        (hit.is_some() && miss.is_some() && creation.is_some_and(|write| write != 0))
-            || prompt.is_some_and(|total| {
-                inclusive
-                    && (known_sum.is_none_or(|sum| sum > total)
-                        || (fresh.is_some()
-                            && cached.is_some()
-                            && creation.is_some()
-                            && known_sum != Some(total)))
-            });
+    let exceeds_prompt =
+        inclusive && prompt.is_some_and(|total| known_sum.is_none_or(|sum| sum > total));
+    // A raw OpenCode lower bound can contradict the prompt even when the
+    // write lane is unknown. A mismatch found only after assembly can recover.
+    input_invalid |= raw_sample
+        && (alias_conflict || (creation.is_none() && partial_write.is_some() && exceeds_prompt));
+    let partition_conflict = exceeds_prompt
+        || (hit.is_some() && miss.is_some() && creation.is_some_and(|write| write != 0))
+        || (inclusive
+            && fresh.is_some()
+            && cached.is_some()
+            && creation.is_some()
+            && prompt.is_some_and(|total| known_sum != Some(total)));
     let mut usage = TokenUsage {
         input_tokens: fresh.unwrap_or(0),
         cached_input_tokens: cached.unwrap_or(0),
@@ -917,6 +916,35 @@ mod tests {
             let (_, presence) =
                 super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
             assert!(presence.input_invalid && presence.output_invalid);
+        }
+    }
+
+    #[test]
+    fn opencode_partial_write_evidence_bounds_inclusive_input() {
+        for lifetime in ["cache_write_5m", "cache_write_1h"] {
+            let mut raw = serde_json::json!({
+                "prompt_tokens":15,"completion_tokens":7,
+                "opencode":{"tokens":{"input":4,"cache_read":6}}
+            });
+            raw["opencode"]["tokens"][lifetime] = serde_json::json!(6);
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(
+                serde_json::Value::Object(usage.to_qualified_json_map(presence)),
+                serde_json::json!({"output_tokens":7}),
+                "{raw}"
+            );
+            assert_eq!(presence.measured_input_tokens, None);
+
+            raw["prompt_tokens"] = serde_json::json!(16);
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(presence.measured_input_tokens, Some(16));
+            assert_eq!(
+                serde_json::Value::Object(usage.to_qualified_json_map(presence)),
+                serde_json::json!({"input_tokens":4,"cached_input_tokens":6,"output_tokens":7}),
+                "a matching lower bound does not prove the other lifetime was reported"
+            );
         }
     }
 

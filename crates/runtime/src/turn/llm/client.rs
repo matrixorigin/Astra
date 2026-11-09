@@ -12712,6 +12712,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_opencode_partial_write_conflict_respects_frame_boundary() {
+        let partial_tokens = json!({"input":4,"cache_read":6,"cache_write_5m":6});
+        for (updates, expected_usage, expected_status) in [
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7,"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"output_tokens":7}),
+                astra_services::InferenceUsageStatus::ProviderPartial,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7}),
+                    json!({"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"input_tokens":4,"cached_input_tokens":6,"cache_creation_tokens":6,"output_tokens":7,"total_tokens":23}),
+                astra_services::InferenceUsageStatus::ProviderExact,
+            ),
+        ] {
+            let mut frames: Vec<_> = updates
+                .into_iter()
+                .map(|usage| Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":usage})))))
+                .collect();
+            frames.push(Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("usage qualification must not discard the answer");
+            assert_eq!(result.full_text, "done");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage_status, expected_status);
+            assert_eq!(Value::Object(result.usage), expected_usage);
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
         for (usage, expected_input, expected_output) in [
             (

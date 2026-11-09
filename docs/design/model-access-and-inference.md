@@ -1125,9 +1125,12 @@ cached input, and output evidence. Output already includes reasoning. The checke
 sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
 both counts are reported; a missing lifetime is unknown, not zero. Mirrored
 generic and OpenCode fields must agree, and a complete input partition must
-match an inclusive prompt total. The generic fields retain their existing
-inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible responses
-reconcile the extension through the same OpenAI usage normalizer.
+match an inclusive prompt total. A reported write lifetime contributes to the
+input lower bound even when the full write count is unknown. If that bound
+exceeds the inclusive prompt total in one raw sample, later stream updates
+cannot qualify that attempt's input usage. The generic fields retain their
+existing inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible
+responses reconcile the extension through the same OpenAI usage normalizer.
 Aliases are decoded independently: null fields carry no evidence, and reported
 `input_tokens`/`output_tokens` remain subject to reconciliation even when
 `prompt_tokens`/`completion_tokens` are also present.
