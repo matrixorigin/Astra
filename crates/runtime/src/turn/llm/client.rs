@@ -13514,8 +13514,10 @@ mod tests {
             "~~~{}\n<|DSML|invoke name=\"bash\">{{\"command\":\"pwd\"}}</|DSML|invoke>\n~~~\n",
             "x`".repeat(32_000)
         );
+        let lazy_quotes = format!("{}first\n{}", "> ".repeat(3_200), "!x\n".repeat(3_200));
         for (content, expected) in [
             (fence_info.clone(), fence_info),
+            (lazy_quotes.clone(), lazy_quotes),
             (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
             (
                 format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
@@ -13763,6 +13765,41 @@ mod tests {
                 format!("- item\n-\n    {call}"),
                 "- item\n-\n    ".to_owned(),
                 vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n\n    {call}"),
+                format!("- item\n-\n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>\n>     {call}"),
+                format!("> - item\n> - \n>\n>     {call}"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2. \n\n    {call}"),
+                format!("1. item\n2. \n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n  started\n\n  {call}"),
+                "- item\n-\n  started\n\n  ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "before `unmatched\n    ".to_owned(),
+                "before `unmatched\n    ".to_owned(),
+                vec![],
+            ),
+            (
+                format!("Need `inspect\n{wrapped}\n    "),
+                "Need `inspect\n\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- > > before `open\n<br>\n{call}`"),
+                format!("- > > before `open\n<br>\n{call}`"),
+                vec![],
             ),
             (
                 format!("Start `{wrapped}\n-     `\n"),

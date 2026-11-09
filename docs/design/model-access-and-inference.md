@@ -1088,14 +1088,16 @@ indexes make unmatched closers constant-time and matching pops amortized linear.
 Physical line-prefix state follows every byte consumed, including newlines inside
 tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
 deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
-remain unchanged. List context survives continuation lines and empty sibling
-items. The block probe retains the preceding item's container shape when the
-next line leaves it, so CommonMark can distinguish an empty item from a setext
-underline. After a possible
+remain unchanged. A new empty item can take its first block on the next line;
+a blank separator before that block ends the empty item. The block probe
+retains the first unmatched container's shape so CommonMark can distinguish a
+sibling item from a setext underline without reparsing the deeper nesting for
+each lazy continuation. After a possible
 inline code opener, the stream publishes prose before potential markup and
 releases the prefix when there is no competing delimiter to reconsider.
 Matching runs make any remaining tail literal; at a block boundary or EOF the
-lexer replays an unmatched tail once with indexed delimiter runs, allowing
+lexer replays an unmatched tail once with indexed delimiter runs, including
+when indentation consumes the last bytes of the response. This allows
 real calls outside matched spans to be recovered. The existing CommonMark parser
 determines paragraph continuation, heading boundaries and new container facts.
 Structural prefixes are classified through their

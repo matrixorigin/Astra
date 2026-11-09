@@ -2,6 +2,8 @@
 //! Cursor checkpoints retain completed containers. Only bounded marker/padding
 //! lookahead can be revisited; long indentation is published once it is literal.
 
+use std::sync::Arc;
+
 #[derive(Clone, Debug)]
 pub(super) enum Container {
     Quote,
@@ -14,6 +16,14 @@ pub(super) struct ListPrefix {
     marker_len: usize,
     delimiter: u8,
     width: usize,
+    content: ItemContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItemContent {
+    MarkerLine,
+    AwaitingBlock,
+    Started,
 }
 
 impl ListPrefix {
@@ -27,6 +37,31 @@ impl ListPrefix {
             ' ',
             self.width - self.indent - self.marker_len,
         ));
+    }
+}
+
+/// An empty marker may start its first block on the next line. A blank
+/// separator before that block closes the item; a populated item can still
+/// have blank lines between its blocks. Ancestors are already populated by
+/// their child containers, so only the innermost item can be awaiting content.
+pub(super) fn finish_container_line(containers: &mut Arc<[Container]>, blank: bool) {
+    let Some(Container::List(list)) = containers.last() else {
+        return;
+    };
+    match (list.content, blank) {
+        (ItemContent::Started, _) => {}
+        (ItemContent::AwaitingBlock, true) => {
+            *containers = Arc::from(&containers[..containers.len() - 1]);
+        }
+        (content, blank) => {
+            if let Some(Container::List(list)) = Arc::make_mut(containers).last_mut() {
+                list.content = if content == ItemContent::MarkerLine && blank {
+                    ItemContent::AwaitingBlock
+                } else {
+                    ItemContent::Started
+                };
+            }
+        }
     }
 }
 
@@ -108,6 +143,15 @@ pub(super) struct Cursor {
 }
 
 impl Cursor {
+    fn enter(&mut self, container: Container) {
+        if let Some(Container::List(list)) = self.containers.last_mut() {
+            // The marker is content of its parent even if it opens an empty
+            // block or CommonMark later classifies it as a rule.
+            list.content = ItemContent::Started;
+        }
+        self.containers.push(container);
+    }
+
     fn prefix(&self, at: Position, indented: bool, containers: &[Container]) -> Prefix {
         Prefix {
             end: at.byte,
@@ -154,7 +198,7 @@ impl Cursor {
                 return None;
             }
             if at.quote(bytes, finish)? {
-                self.containers.push(Container::Quote);
+                self.enter(Container::Quote);
                 self.at = at;
                 continue;
             }
@@ -193,11 +237,12 @@ impl Cursor {
                     blank_line_start(&bytes[content.byte..], finish)?.then_some(1)
                 };
                 if let Some(padding) = padding {
-                    self.containers.push(Container::List(ListPrefix {
+                    self.enter(Container::List(ListPrefix {
                         indent,
                         marker_len: marker,
                         delimiter: bytes[at.byte + marker - 1],
                         width: indent + marker + padding,
+                        content: ItemContent::MarkerLine,
                     }));
                     self.at = content;
                     continue;
@@ -337,10 +382,11 @@ fn inspect_line(line: &str, previous: Option<&[Container]>, tag: Option<(&str, &
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
     let mut source = String::new();
     if let Some(containers) = previous {
-        // Matched containers have already been consumed on both lines.
-        // Recreate only the previous paragraph's departing containers so
-        // CommonMark can distinguish a sibling item from a setext underline.
-        for container in containers {
+        // Matched containers have already been consumed on both lines. The
+        // first unmatched container is the level at which this line can
+        // start a sibling. It cannot explicitly continue any deeper container
+        // without matching this one; lazy continuation only needs its paragraph.
+        if let Some(container) = containers.first() {
             match container {
                 Container::Quote => source.push_str("> "),
                 Container::List(list) => list.write_to(&mut source),
@@ -377,6 +423,7 @@ fn inspect_line(line: &str, previous: Option<&[Container]>, tag: Option<(&str, &
             // synthetic text to this line means the same paragraph continues.
             Event::SoftBreak | Event::HardBreak if span.start < start && span.end == start => {
                 interrupts = false;
+                paragraph = true;
             }
             // Tight list items omit Paragraph events, but their inline content
             // still owns the same paragraph continuation and delimiter lifetime.

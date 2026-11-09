@@ -534,10 +534,11 @@ impl Lexer {
                 }
                 self.line_prefix_done = true;
             }
-            let first = self.remaining().chars().next().unwrap_or('\n');
-            if self.remaining().is_empty() {
-                break;
-            }
+            // A prefix can consume the last byte. Return through the common
+            // EOF path so a pending inline probe is replayed before exit.
+            let Some(first) = self.remaining().chars().next() else {
+                continue;
+            };
             if let Some(end) = self.html.block_prefix(&self.pending[self.cursor..], finish) {
                 if end == 0 {
                     break;
@@ -886,6 +887,7 @@ impl Lexer {
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 let blank = !self.line_has_text;
+                markdown::finish_container_line(&mut self.block_containers, blank);
                 self.html.newline(blank);
                 if blank || !self.line_paragraph {
                     if matches!(self.literal, Some((_, _, false))) {
