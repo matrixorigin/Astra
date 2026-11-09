@@ -761,9 +761,9 @@ impl StructuredLlmError {
         self.error_field("code").is_none()
             && self.error_field("type") == Some("invalid_request_error")
             && self.error_field("param").is_none()
-            && self.error_field("message").is_some_and(|message| {
-                message.to_ascii_lowercase().contains("prompt is too long")
-            })
+            && self
+                .error_field("message")
+                .is_some_and(|message| message.to_ascii_lowercase().contains("prompt is too long"))
     }
 }
 

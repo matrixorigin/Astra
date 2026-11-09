@@ -923,11 +923,11 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
-    ClassifiedError, ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction,
-    classify_llm_error_message, classify_model_resolution_error_message, classify_tool_output,
-    has_structured_llm_error_facts, is_llm_context_window_error, llm_error_envelope_code_class,
-    structured_llm_error_code, structured_llm_error_kind, structured_llm_error_request_id,
-    validated_llm_provider_request_id, StructuredLlmError,
+    ClassifiedError, ErrorKind, StructuredLlmError, ToolFailureCause, ToolFailureEvidence,
+    ToolRecoveryAction, classify_llm_error_message, classify_model_resolution_error_message,
+    classify_tool_output, has_structured_llm_error_facts, is_llm_context_window_error,
+    llm_error_envelope_code_class, structured_llm_error_code, structured_llm_error_kind,
+    structured_llm_error_request_id, validated_llm_provider_request_id,
 };
 pub use observation::{
     EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

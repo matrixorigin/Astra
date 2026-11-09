@@ -6425,7 +6425,9 @@ async fn call_prepared_llm_with_total_budget(
         // Parse the response once and reuse its machine facts, semantic cause,
         // and validated correlation ID across all streaming classifiers.
         let structured_body = astra_core::StructuredLlmError::parse(&text);
-        let body_request_id = structured_body.as_ref().and_then(|error| error.request_id());
+        let body_request_id = structured_body
+            .as_ref()
+            .and_then(|error| error.request_id());
         let envelope_code = structured_body.as_ref().and_then(|error| error.code());
         let response_request_id = body_request_id.as_deref().or(request_id.as_deref());
 
@@ -6751,10 +6753,7 @@ async fn call_prepared_llm_with_total_budget(
         // Other 400 errors
         if status == 400 {
             let error = attach_provider_request_id(
-                astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::InvalidRequest,
-                    last_err,
-                ),
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, last_err),
                 status,
                 terminal_request_id,
             );
@@ -6765,11 +6764,8 @@ async fn call_prepared_llm_with_total_budget(
         // The final response owns its kind. In particular, an unstructured
         // 413 after a retryable 500 is a terminal request-size rejection, not
         // the previous attempt's ServerError.
-        let kind = provider_http_error_kind_with_projection(
-            status,
-            structured_body.as_ref(),
-            &text,
-        );
+        let kind =
+            provider_http_error_kind_with_projection(status, structured_body.as_ref(), &text);
         let error = attach_provider_request_id(
             astra_core::ClassifiedError::new(kind, last_err),
             status,
@@ -9021,9 +9017,7 @@ fn provider_http_error_kind_with_projection(
         // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
         // byte limit is a request-size problem, never context overflow.
         kind
-    } else if status == 400
-        && structured.is_some_and(|error| error.is_context_window_overflow())
-    {
+    } else if status == 400 && structured.is_some_and(|error| error.is_context_window_overflow()) {
         // Anthropic documents prompt overflow as the generic
         // invalid_request_error family plus a specific semantic cause.
         ErrorKind::ContextWindow
@@ -17555,7 +17549,10 @@ mod tests {
                     error.message
                 );
                 let details: Value = serde_json::from_str(
-                    error.details_json.as_deref().expect("structured HTTP details"),
+                    error
+                        .details_json
+                        .as_deref()
+                        .expect("structured HTTP details"),
                 )
                 .expect("valid details");
                 assert_eq!(details["request_id"], REQUEST_ID);
@@ -17662,7 +17659,10 @@ mod tests {
                     error.message
                 );
                 let details: Value = serde_json::from_str(
-                    error.details_json.as_deref().expect("structured HTTP details"),
+                    error
+                        .details_json
+                        .as_deref()
+                        .expect("structured HTTP details"),
                 )
                 .expect("valid details");
                 assert_eq!(details["request_id"], REQUEST_ID);
