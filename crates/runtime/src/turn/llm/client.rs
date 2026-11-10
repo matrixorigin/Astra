@@ -1649,7 +1649,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     observer
         .finish_attempt(attempt_index, terminal)
         .await
-        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
+        .map_err(|error| {
+            crate::server::run_trace::note_attempt_settlement_error(error.kind.as_str());
+            attach_provider_terminal_evidence(error, terminal)
+        })
 }
 
 fn note_observed_provider_usage_presence(
@@ -5499,6 +5502,15 @@ impl LlmAttemptSpan {
         self.phase = "response_body";
     }
 
+    fn begin_request(&mut self) {
+        crate::server::run_trace::clear_attempt_code();
+        self.phase = "request";
+    }
+
+    fn note_preparation_error(error: &astra_core::ClassifiedError) {
+        crate::server::run_trace::note_attempt_code(error.kind.as_str());
+    }
+
     fn transport_error(&mut self, error: &reqwest::Error) {
         self.reason = Some(llm_transport_error_reason(error));
     }
@@ -5513,9 +5525,12 @@ impl Drop for LlmAttemptSpan {
     fn drop(&mut self) {
         if self.failed {
             let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
-            self.span.record("error.phase", self.phase);
-            self.span
-                .record("error.reason", self.reason.unwrap_or(code));
+            let (phase, reason) = match crate::server::run_trace::attempt_settlement_error() {
+                Some(code) => ("settlement", code),
+                None => (self.phase, self.reason.unwrap_or(code)),
+            };
+            self.span.record("error.phase", phase);
+            self.span.record("error.reason", reason);
             astra_logging::trace_context::mark_error(&self.span, code);
         }
     }
@@ -5722,6 +5737,8 @@ async fn call_prepared_llm_with_total_budget(
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let mut llm_attempt = LlmAttemptSpan::start(attempt);
+        llm_attempt.phase = "preparation";
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
             match prepare_compatible_endpoint(
                 &url,
@@ -5729,6 +5746,7 @@ async fn call_prepared_llm_with_total_budget(
                 cancel,
             )
             .await
+            .inspect_err(LlmAttemptSpan::note_preparation_error)
             {
                 Ok(client) => Some(client),
                 Err(error)
@@ -5743,6 +5761,7 @@ async fn call_prepared_llm_with_total_budget(
         } else {
             None
         };
+        llm_attempt.begin_request();
         let client = compatible_client.as_deref().unwrap_or(client);
         let lease = if let Some(binding) = subscription {
             let remaining = total_budget.saturating_sub(started.elapsed());
@@ -5814,7 +5833,6 @@ async fn call_prepared_llm_with_total_budget(
             crate::server::outbound_trace::rewrite(&mut request);
             client.execute(request).await
         };
-        let mut llm_attempt = LlmAttemptSpan::start(attempt);
         let send_request = send_request.instrument(llm_attempt.span.clone());
         let send_result = tokio::select! {
             biased;
@@ -5963,7 +5981,6 @@ async fn call_prepared_llm_with_total_budget(
                         )
                         .await
                         {
-                            crate::server::run_trace::note_attempt_code(error.kind.as_str());
                             return Err(attach_llm_result_details(error, &result));
                         }
                         llm_attempt.succeed();
@@ -6259,7 +6276,6 @@ async fn call_prepared_llm_with_total_budget(
                     )
                     .await
                     {
-                        crate::server::run_trace::note_attempt_code(error.kind.as_str());
                         return Err(attach_llm_result_details(error, &result));
                     }
                     llm_attempt.succeed();
@@ -8356,11 +8372,16 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.phase = "preparation";
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
         let mut attempt = 0;
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
-            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None).await {
+            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None)
+                .await
+                .inspect_err(LlmAttemptSpan::note_preparation_error)
+            {
                 Ok(client) => break Some(client),
                 Err(error)
                     if error.kind == astra_core::ErrorKind::Network
@@ -8370,6 +8391,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                     let delay = std::time::Duration::from_millis(retry_backoff_ms(attempt));
                     let remaining = timeout.saturating_sub(started.elapsed());
                     if delay >= remaining {
+                        crate::server::run_trace::note_attempt_code(
+                            astra_core::ErrorKind::ProviderDeadline.as_str(),
+                        );
                         return Err(astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ProviderDeadline,
                             "LLM non-stream total budget exhausted while preparing the connection",
@@ -8383,6 +8407,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     } else {
         None
     };
+    llm_attempt.begin_request();
     let client = compatible_client.as_deref().unwrap_or(client);
     let observed_attempt =
         begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
@@ -8425,7 +8450,6 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         crate::server::outbound_trace::rewrite(&mut request);
         client.execute(request).await
     };
-    let mut llm_attempt = LlmAttemptSpan::start(0);
     let send_request = send_request.instrument(llm_attempt.span.clone());
     let resp = match send_request.await {
         Ok(response) => response,
@@ -8677,7 +8701,6 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     )
     .await
     {
-        crate::server::run_trace::note_attempt_code(error.kind.as_str());
         return Err(attach_llm_result_details(error, &result));
     }
     llm_attempt.succeed();
@@ -12347,47 +12370,49 @@ mod tests {
             .expect_err("provider that accepts but never responds should time out")
     }
 
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    type CapturedLlmSpans = HashMap<u64, HashMap<String, String>>;
+    #[derive(Clone, Default)]
+    struct LlmTraceCapture(Arc<Mutex<CapturedLlmSpans>>);
+    struct LlmTraceFields<'a>(&'a mut HashMap<String, String>);
+    impl tracing::field::Visit for LlmTraceFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for LlmTraceCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::Id,
+            _: Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "llm.call" {
+                attrs.record(&mut LlmTraceFields(
+                    self.0.lock().unwrap().entry(id.into_u64()).or_default(),
+                ));
+            }
+        }
+        fn on_record(
+            &self,
+            id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _: Context<'_, S>,
+        ) {
+            if let Some(fields) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut LlmTraceFields(fields));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn llm_trace_fields_follow_real_streaming_and_nonstream_responses() {
         use tracing::instrument::WithSubscriber;
-        use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-        type CapturedLlmSpans = HashMap<u64, HashMap<String, String>>;
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<CapturedLlmSpans>>);
-        struct Fields<'a>(&'a mut HashMap<String, String>);
-        impl tracing::field::Visit for Fields<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.insert(field.name().into(), format!("{value:?}"));
-            }
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.insert(field.name().into(), value.into());
-            }
-        }
-        impl<S: tracing::Subscriber> Layer<S> for Capture {
-            fn on_new_span(
-                &self,
-                attrs: &tracing::span::Attributes<'_>,
-                id: &tracing::Id,
-                _: Context<'_, S>,
-            ) {
-                if attrs.metadata().name() == "llm.call" {
-                    attrs.record(&mut Fields(
-                        self.0.lock().unwrap().entry(id.into_u64()).or_default(),
-                    ));
-                }
-            }
-            fn on_record(
-                &self,
-                id: &tracing::Id,
-                values: &tracing::span::Record<'_>,
-                _: Context<'_, S>,
-            ) {
-                if let Some(fields) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
-                    values.record(&mut Fields(fields));
-                }
-            }
-        }
         for (streaming, status, malformed, settlement_failure, expected_phase, expected_reason) in [
             (false, 200u16, false, false, None, None),
             (true, 200, false, false, None, None),
@@ -12417,6 +12442,9 @@ mod tests {
             ),
             (false, 200, false, true, Some("settlement"), Some("network")),
             (true, 200, false, true, Some("settlement"), Some("network")),
+            (false, 403, false, true, Some("settlement"), Some("network")),
+            (true, 403, false, true, Some("settlement"), Some("network")),
+            (false, 200, true, true, Some("settlement"), Some("network")),
         ] {
             let app = Router::new().route(
                 "/chat/completions",
@@ -12472,7 +12500,7 @@ mod tests {
                 temperature: None,
                 thinking: &ThinkingConfig::Off,
             };
-            let capture = Capture::default();
+            let capture = LlmTraceCapture::default();
             let subscriber = tracing_subscriber::registry().with(capture.clone());
             let carrier = astra_logging::trace_context::Carrier::default();
             let failing_observer = FailingFinishAttemptObserver(astra_core::ErrorKind::Network);
@@ -12502,6 +12530,9 @@ mod tests {
             .with_subscriber(subscriber)
             .await;
             assert_eq!(result.is_err(), expected_phase.is_some());
+            if settlement_failure {
+                assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Network);
+            }
             let spans = capture.0.lock().unwrap();
             assert_eq!(spans.len(), 1);
             let fields = spans.values().next().unwrap();
@@ -12526,6 +12557,100 @@ mod tests {
                 "private provider body",
             ] {
                 assert!(!rendered.contains(private));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_preparation_failures_cover_both_call_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        let _retry_guard = set_test_retry_backoff_ms(0);
+        for streaming in [false, true] {
+            for (base, kind) in [
+                (
+                    "https://astra-trace-test.invalid/v1",
+                    astra_core::ErrorKind::Network,
+                ),
+                (
+                    "http://provider.example/v1",
+                    astra_core::ErrorKind::InvalidRequest,
+                ),
+            ] {
+                let messages = [json!({"role":"user","content":"private prompt"})];
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
+                        fixed_temperature: None,
+                        supported_reasoning_efforts: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "private-key",
+                        base_url: base,
+                        provider: astra_services::byok_endpoint::COMPATIBLE_PROVIDER,
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let capture = LlmTraceCapture::default();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let carrier = astra_logging::trace_context::Carrier::default();
+                let client = reqwest::Client::new();
+                // Preparation fails before durable admission or HTTP dispatch.
+                let observer = RecordingAttemptObserver::default();
+                let result = astra_logging::trace_context::bind_run(&carrier, async {
+                    if streaming {
+                        call_llm_and_collect_with_stream_callback(
+                            call,
+                            LlmCancel::None,
+                            None,
+                            Some(&observer),
+                            RuntimeToolChoice::Auto,
+                            None,
+                        )
+                        .await
+                    } else {
+                        call_llm_nonstream_with_attempt_observer(
+                            &client,
+                            call,
+                            std::time::Duration::from_secs(10),
+                            Some(&observer),
+                        )
+                        .await
+                    }
+                })
+                .with_subscriber(subscriber)
+                .await;
+                assert_eq!(result.unwrap_err().kind, kind);
+                assert!(observer.began.lock().unwrap().is_empty());
+                let spans = capture.0.lock().unwrap();
+                let count = if streaming && kind == astra_core::ErrorKind::Network {
+                    LLM_MAX_RETRIES as usize + 1
+                } else {
+                    1
+                };
+                assert_eq!(spans.len(), count);
+                for fields in spans.values() {
+                    assert_eq!(fields.get("error.phase").unwrap(), "preparation");
+                    assert_eq!(fields.get("error.reason").unwrap(), kind.as_str());
+                    assert!(!fields.contains_key("http.response.status_code"));
+                    let rendered = format!("{fields:?}");
+                    for private in [base, "private-key", "private prompt"] {
+                        assert!(!rendered.contains(private));
+                    }
+                }
             }
         }
     }

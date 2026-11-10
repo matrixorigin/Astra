@@ -333,9 +333,15 @@ pub fn mark_error(span: &tracing::Span, code: &'static str) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AttemptError {
+    Provider(&'static str),
+    Settlement(&'static str),
+}
+
 tokio::task_local! {
     static ACTIVE_RUN: RefCell<RunSpan>;
-    static ATTEMPT_CODE: RefCell<Option<&'static str>>;
+    static ATTEMPT_CODE: RefCell<Option<AttemptError>>;
 }
 
 /// Bind `astra.run` and a fresh attempt-code slot for this task.
@@ -422,7 +428,13 @@ pub fn active_run_error_code() -> Option<&'static str> {
 }
 
 pub fn note_attempt_code(code: &'static str) {
-    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(code));
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Provider(code)));
+}
+
+/// Settlement can replace the provider error returned by the adapter. Keep
+/// that distinction in the existing task-local attempt outcome.
+pub fn note_attempt_settlement_error(code: &'static str) {
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Settlement(code)));
 }
 
 pub fn clear_attempt_code() {
@@ -430,7 +442,23 @@ pub fn clear_attempt_code() {
 }
 
 pub fn attempt_code() -> Option<&'static str> {
-    ATTEMPT_CODE.try_with(|slot| *slot.borrow()).ok().flatten()
+    ATTEMPT_CODE
+        .try_with(|slot| match *slot.borrow() {
+            Some(AttemptError::Provider(code) | AttemptError::Settlement(code)) => Some(code),
+            None => None,
+        })
+        .ok()
+        .flatten()
+}
+
+pub fn attempt_settlement_error() -> Option<&'static str> {
+    ATTEMPT_CODE
+        .try_with(|slot| match *slot.borrow() {
+            Some(AttemptError::Settlement(code)) => Some(code),
+            _ => None,
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(feature = "otel")]
@@ -569,6 +597,38 @@ impl opentelemetry::propagation::Injector for MapInjector<'_> {
 #[cfg(test)]
 mod carrier_tests {
     use super::Carrier;
+
+    #[test]
+    fn attempt_settlement_outcome_is_reset_and_isolated_from_child_tasks() {
+        use super::{
+            attempt_code, attempt_settlement_error, bind_run, clear_attempt_code, in_active_run,
+            note_attempt_code, note_attempt_settlement_error,
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(bind_run(&Carrier::default(), async {
+                note_attempt_code("auth");
+                note_attempt_settlement_error("network");
+                assert_eq!(attempt_code(), Some("network"));
+                assert_eq!(attempt_settlement_error(), Some("network"));
+                tokio::spawn(in_active_run(async {
+                    assert_eq!(attempt_code(), None);
+                    note_attempt_code("cancelled");
+                    assert_eq!(attempt_settlement_error(), None);
+                }))
+                .await
+                .unwrap();
+                assert_eq!(attempt_settlement_error(), Some("network"));
+                clear_attempt_code();
+                assert_eq!(attempt_code(), None);
+                assert_eq!(attempt_settlement_error(), None);
+                note_attempt_code("auth");
+                assert_eq!(attempt_settlement_error(), None);
+            }));
+        assert_eq!(attempt_code(), None);
+    }
 
     #[test]
     fn forbidden_version_is_not_a_carrier() {
