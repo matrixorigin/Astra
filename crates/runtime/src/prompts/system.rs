@@ -555,7 +555,7 @@ fn planning_section() -> &'static str {
      7. **Build/test only AFTER your writes**; not for exploration/review/Q&A.\n\
      8. **Converge on evidence**: once targeted reads establish scope, make the smallest authorized change; for read-only work, summarize or change approach when reads add no evidence.\n\
      9. **Acceptance**: preserve quantifiers/positions; don't infer order; test named items independently; no partial claims; derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only; exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\
-     10. **Reproducible external facts**: exact versioned-data results need an identified revision and toolchain. Honor lockfiles; never treat floating latest as reproducible. Record versions or the missing boundary.\n\
+     10. **Reproducible external facts**: exact versioned-data results need an identified revision and toolchain. Honor lockfiles; never treat floating latest as reproducible. Record versions/revisions or the missing boundary.\n\
      11. **Executable acceptance**: run the complete unmodified harness for the user-named workflow from a fresh process after the final mutation. Smoke checks do not prove the composed workflow. Fix and rerun failures or report incomplete; claim pre-existing/unrelated only with an equivalent before-change baseline or explicit exemption. Cover queued/cancelled/error paths; check artifact derivation and the official measurement. Cancellation must finish within a bound, stop later queued work, and clean up owned resources. Reviews retain boundary evidence and disclose unverified scope. Self-authored checks are provisional; keep the task open until every acceptance predicate agrees.\n\
      12. **Performance outcomes**: correctness is necessary but not sufficient for optimization. Benchmark materially different correct candidates when practical and retain the best verified one. Being faster than the starting point is not evidence that the requested optimization is complete.\n"
 }
@@ -1248,7 +1248,7 @@ mod tests {
     fn exploration_converges_on_evidence_without_fixed_call_caps() {
         let p = static_sections_for_test(None).planning_protocol.text;
         assert!(p.contains("Converge on evidence"));
-        assert!(p.contains("targeted reads establish the affected set"));
+        assert!(p.contains("targeted reads establish scope"));
         assert!(!p.contains("do one useful pass, then stop"));
         assert!(!p.contains("≤2 dir listings"));
     }
@@ -1478,11 +1478,9 @@ mod tests {
         ));
         assert!(contains("every explicitly required component"));
         assert!(contains("smoke test proves only its exact assertions"));
-        assert!(contains("exact results derived from versioned datasets"));
-        assert!(contains(
-            "never silently treat a floating latest dependency"
-        ));
-        assert!(contains("Record the effective versions/revisions"));
+        assert!(contains("exact versioned-data results"));
+        assert!(contains("never treat floating latest as reproducible"));
+        assert!(contains("Record versions/revisions"));
         assert!(contains("Smoke checks do not prove the composed workflow"));
         assert!(contains(
             "equivalent before-change baseline or explicit exemption"
