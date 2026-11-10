@@ -74,6 +74,38 @@ class SchemaInventoryTest(unittest.TestCase):
             "duplicate manifest source paths must not be hidden by set comparison",
         )
 
+    def test_runtime_admission_ddl_after_test_helper_is_inventoried(self) -> None:
+        source = next(
+            source
+            for source in schema_inventory.SCHEMA_SOURCES
+            if source.domain == "runtime_admission"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / source.path
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '#[cfg(test)]\nmod mysql_response_proxy;\n'
+                'const WINDOWS: &str = "CREATE TABLE IF NOT EXISTS '
+                'llm_provider_admission_windows (bucket_key VARCHAR(64) PRIMARY KEY)";\n'
+                'const PACING: &str = "CREATE TABLE IF NOT EXISTS '
+                'llm_provider_admission_pacing (bucket_key VARCHAR(64) PRIMARY KEY)";\n',
+                encoding="utf-8",
+            )
+            inventory = schema_inventory.build_inventory(root, sources=(source,))
+            self.assertEqual(
+                {row["table"] for row in inventory["tables"]},
+                {"llm_provider_admission_windows", "llm_provider_admission_pacing"},
+            )
+            self.assertEqual(
+                {row["startup_owner"] for row in inventory["tables"]},
+                {"ensure_llm_provider_admission_schema_if_configured"},
+            )
+            self.assertEqual(
+                schema_inventory.discover_production_ddl_source_paths(root),
+                [source.path],
+            )
+
     def test_work_schema_source_and_exact_table_set(self) -> None:
         work_source = next(
             source
