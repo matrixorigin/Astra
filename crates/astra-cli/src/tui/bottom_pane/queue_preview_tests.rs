@@ -1357,3 +1357,33 @@ fn recovery_waits_behind_intentional_whitespace_drafts() {
         assert!(!pane.composer.is_empty());
     }
 }
+
+
+#[test]
+fn unknown_slash_paths_are_conversation_not_commands() {
+    use crate::tui::slash_dispatch::{SubmissionInput, immediate_control, parse_submission};
+
+    for input in [
+        "/Users/example/Library/screenshot.jpg",
+        "/tmp/image.png",
+        "  /tmp/image.png",
+        "/not-a-command please inspect this",
+    ] {
+        assert!(
+            matches!(parse_submission(input), SubmissionInput::Conversation(text) if text == input),
+            "ordinary slash text must reach the agent unchanged: {input}"
+        );
+        assert_eq!(immediate_control(input), None);
+    }
+
+    for input in ["/help", "/stop now", "/model gpt-5"] {
+        assert!(
+            matches!(parse_submission(input), SubmissionInput::Command(text) if text == input),
+            "registered controls must still be routed as commands: {input}"
+        );
+    }
+    assert!(matches!(
+        parse_submission("//tmp/image.png"),
+        SubmissionInput::Literal("/tmp/image.png")
+    ));
+}
