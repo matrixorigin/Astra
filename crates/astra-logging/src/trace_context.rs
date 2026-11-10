@@ -344,7 +344,7 @@ tokio::task_local! {
     static ATTEMPT_CODE: RefCell<Option<AttemptError>>;
 }
 
-/// Bind `astra.run` and a fresh attempt-code slot for this task.
+/// Bind `astra.run` for this task. LLM outcomes have a separate per-call scope.
 ///
 /// The run future is large; keep the scopes directly around it. An async
 /// wrapper here adds a copy of that future to every poll's stack frame.
@@ -352,10 +352,13 @@ pub fn bind_run<F>(carrier: &Carrier, future: F) -> impl Future<Output = F::Outp
 where
     F: Future,
 {
-    ATTEMPT_CODE.scope(
-        RefCell::new(None),
-        ACTIVE_RUN.scope(RefCell::new(RunSpan::start(carrier)), future),
-    )
+    ACTIVE_RUN.scope(RefCell::new(RunSpan::start(carrier)), future)
+}
+
+/// Isolate one LLM call's outcomes on every poll, including when multiple
+/// call futures are joined on the same task. This scope also covers drop.
+pub fn in_llm_call<F: Future>(future: F) -> impl Future<Output = F::Output> + use<F> {
+    ATTEMPT_CODE.scope(RefCell::new(None), future)
 }
 
 /// Let `future` see the caller's current run without owning it. The run is
@@ -369,10 +372,7 @@ where
         .try_with(|slot| slot.borrow().link())
         .ok()
         .flatten();
-    ACTIVE_RUN.scope(
-        RefCell::new(RunSpan::observe(link)),
-        ATTEMPT_CODE.scope(RefCell::new(None), future),
-    )
+    ACTIVE_RUN.scope(RefCell::new(RunSpan::observe(link)), future)
 }
 
 /// Run `future` on a new task that can see the current run without owning it.
@@ -602,31 +602,34 @@ mod carrier_tests {
     fn attempt_settlement_outcome_is_reset_and_isolated_from_child_tasks() {
         use super::{
             attempt_code, attempt_settlement_error, bind_run, clear_attempt_code, in_active_run,
-            note_attempt_code, note_attempt_settlement_error,
+            in_llm_call, note_attempt_code, note_attempt_settlement_error,
         };
 
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(bind_run(&Carrier::default(), async {
-                note_attempt_code("auth");
-                note_attempt_settlement_error("network");
-                assert_eq!(attempt_code(), Some("network"));
-                assert_eq!(attempt_settlement_error(), Some("network"));
-                tokio::spawn(in_active_run(async {
+            .block_on(bind_run(
+                &Carrier::default(),
+                in_llm_call(async {
+                    note_attempt_code("auth");
+                    note_attempt_settlement_error("network");
+                    assert_eq!(attempt_code(), Some("network"));
+                    assert_eq!(attempt_settlement_error(), Some("network"));
+                    tokio::spawn(in_active_run(in_llm_call(async {
+                        assert_eq!(attempt_code(), None);
+                        note_attempt_code("cancelled");
+                        assert_eq!(attempt_settlement_error(), None);
+                    })))
+                    .await
+                    .unwrap();
+                    assert_eq!(attempt_settlement_error(), Some("network"));
+                    clear_attempt_code();
                     assert_eq!(attempt_code(), None);
-                    note_attempt_code("cancelled");
                     assert_eq!(attempt_settlement_error(), None);
-                }))
-                .await
-                .unwrap();
-                assert_eq!(attempt_settlement_error(), Some("network"));
-                clear_attempt_code();
-                assert_eq!(attempt_code(), None);
-                assert_eq!(attempt_settlement_error(), None);
-                note_attempt_code("auth");
-                assert_eq!(attempt_settlement_error(), None);
-            }));
+                    note_attempt_code("auth");
+                    assert_eq!(attempt_settlement_error(), None);
+                }),
+            ));
         assert_eq!(attempt_code(), None);
     }
 

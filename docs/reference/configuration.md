@@ -431,7 +431,7 @@ call can be matched to runtime logs. Tool arguments, shell commands and result
 bodies are not included. This metadata does not change execution timeouts.
 
 LLM spans retain the `llm.call` operation name and existing `error.code`.
-Failures also carry `error.phase` (`preparation`, `request`, `response_body`,
+Failures also carry `error.phase` (`preparation`, `admission`, `request`, `response_body`,
 `response_status`, `response_decode`, or `settlement`) and a fixed
 `error.reason`. Typed transport causes can identify `connection_refused`,
 `connection_reset`, `connection_aborted`, `broken_pipe`, `unexpected_eof`, or
@@ -443,6 +443,9 @@ without inventing an HTTP response or a durable provider attempt.
 `http.response.status_code` is recorded only after a response arrives. If
 settlement fails after a provider failure, the phase/reason describe settlement
 while preserving the observed HTTP status.
+Credential acquisition and durable admission failures record their actual
+classified error without an HTTP status. Outcomes are scoped to each call
+future, so joined concurrent calls on the same Run task remain independent.
 `retry.attempt` is the zero-based client retry-loop index; non-streaming calls
 use zero. These fields do not export raw error messages, provider URLs, prompts
 or response bodies, and do not change retry, timeout or request-result behavior.
