@@ -926,8 +926,8 @@ pub(crate) struct SessionAuthRetirement {
 }
 
 impl SessionAuthRetirement {
-    pub(crate) async fn run(self) -> Result<(), String> {
-        if let Some(spawner) = self.runtime {
+    pub(crate) async fn retire_runtime(&mut self) {
+        if let Some(spawner) = self.runtime.take() {
             spawner
                 .shutdown_and_wait_with_reason(
                     AUTH_RUNTIME_SHUTDOWN_WAIT,
@@ -935,11 +935,50 @@ impl SessionAuthRetirement {
                 )
                 .await;
         }
+    }
+
+    pub(crate) async fn run(mut self) -> Result<(), String> {
+        self.retire_runtime().await;
         if let Some(finalization) = self.finalization {
             finalization.run(Duration::from_secs(5)).await?;
         }
         Ok(())
     }
+
+    /// Browser publication is the first point at which a changed owner is known.
+    /// Merely opening or cancelling the browser must not end the live Session.
+    pub(crate) async fn finish_browser(
+        self,
+        previous_owner: &astra_services::OwnerScope,
+        uc: bool,
+        api: &astra_thin_client::ThinClient,
+    ) -> Result<BrowserIdentity, String> {
+        let (owner, user_id) = if uc {
+            crate::cli::native_auth::published_owner_identity().await?
+        } else {
+            (
+                astra_services::local_owner_scope(),
+                crate::cli::cli_config::cli_utils::cli_account_id()
+                    .ok_or("Login completed without an authenticated account")?,
+            )
+        };
+        let owner_changed = &owner != previous_owner;
+        if uc && owner_changed {
+            crate::cli::native_auth::bind_after_login(api)?;
+        }
+        if owner_changed && let Some(finalization) = self.finalization {
+            finalization.run(Duration::from_secs(5)).await?;
+        }
+        Ok(BrowserIdentity {
+            owner_changed,
+            user_id,
+        })
+    }
+}
+
+pub(crate) struct BrowserIdentity {
+    pub(crate) owner_changed: bool,
+    pub(crate) user_id: String,
 }
 
 #[derive(Debug)]
@@ -1025,7 +1064,10 @@ pub(crate) fn prepare_browser_session_retirement(
 
 #[cfg(test)]
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
-    prepare_browser_session_retirement(state).run().await
+    prepare_browser_session_retirement(state)
+        .retire_runtime()
+        .await;
+    Ok(())
 }
 
 pub(crate) struct PreparedBrowserLogin {
@@ -1081,14 +1123,23 @@ pub(crate) fn commit_browser_session_login(
     }
 }
 
-/// The browser has published credentials. Retire the previous attachment now,
-/// including when subsequent execution registration will fail.
-pub(crate) fn commit_browser_session_identity(state: &mut SessionState) -> Result<(), String> {
-    state.reset_for_new_session();
-    state.clear_session_id();
-    state.model = None;
-    state.ingestion_user_id = Some(crate::cli::cli_config::cli_utils::cli_user_id());
+/// Credentials have committed. Replace credential-owned services in every case,
+/// but retire the conversation only when its account or environment changed.
+pub(crate) fn commit_browser_session_identity(
+    state: &mut SessionState,
+    owner_changed: bool,
+    user_id: &str,
+) -> Result<(), String> {
+    if owner_changed {
+        state.reset_for_new_session();
+        state.clear_session_id();
+        state.model = None;
+    }
+    state.ingestion_user_id = Some(user_id.to_owned());
     invalidate_identity_services(state);
+    if !owner_changed {
+        return Ok(());
+    }
     let (config, version) =
         crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
@@ -1111,7 +1162,11 @@ async fn finish_browser_session_login(
     String,
 > {
     crate::cli::edge_lifecycle::stop_heartbeat(edge_heartbeat).await;
-    commit_browser_session_identity(state)?;
+    commit_browser_session_identity(
+        state,
+        true,
+        &crate::cli::cli_config::cli_utils::cli_user_id(),
+    )?;
     let prepared = prepare_browser_session_login(api, profile, uc).await?;
     let BrowserLoginCompletion {
         api,
@@ -1170,7 +1225,8 @@ pub(crate) async fn build_identity_services(
             api,
             profile,
             authenticated_user_id,
-        ),
+        )
+        .await,
     );
     IdentityServices { modules, memory }
 }
@@ -1536,7 +1592,7 @@ mod tests {
                 .unwrap();
             assert!(state.session_memory_port.is_none());
             assert_eq!(state.runtime_config.memory.retrieval_top_k, 42);
-            super::commit_browser_session_identity(&mut state).unwrap();
+            super::commit_browser_session_identity(&mut state, true, owner).unwrap();
             assert_eq!(
                 state.runtime_config.memory.retrieval_top_k,
                 astra_config::RuntimeConfig::load().memory.retrieval_top_k

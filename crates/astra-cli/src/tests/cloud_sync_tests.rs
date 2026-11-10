@@ -127,6 +127,103 @@ fn install_test_cloud_auth(access_token: Option<&str>) -> TestCloudAuth {
 }
 
 // ── Cloud sync regression tests ─────────────────────────────────────
+
+#[serial_test::serial]
+#[tokio::test]
+async fn successful_old_owner_upload_hands_the_occupied_drain_to_the_new_owner() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let _journal = ProcessJournalDirGuard::new(root.path());
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = isolate_credentials();
+    let _identity = install_cli_profile_identity_for_test("default", None).unwrap();
+    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/sync/outbox/events",
+        axum::routing::post({
+            let reached = reached.clone();
+            let release = release.clone();
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let reached = reached.clone();
+                let release = release.clone();
+                async move {
+                    if headers.get("authorization").unwrap() == "Bearer access-a" {
+                        reached.notify_one();
+                        release.notified().await;
+                    } else {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer access-b");
+                    }
+                    (
+                        axum::http::StatusCode::CREATED,
+                        axum::Json(json!({
+                            "schema_version":1,"record_id":body["event_id"],
+                            "payload_hash":body["metadata"]["sync_outbox"]["payload_hash"],
+                            "ingestion_status":"created"
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _url = EnvVarGuard::set(
+        "ASTRA_API_URL",
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut stores = Vec::new();
+    for account in ["a", "b"] {
+        crate::cli::auth_flow::save_profile_auth_tokens(
+            None,
+            account,
+            &crate::cli::auth_flow::AuthTokenPayload {
+                user_id: account.into(),
+                access_token: format!("access-{account}"),
+                refresh_token: format!("refresh-{account}"),
+            },
+        )
+        .unwrap();
+        let state = session_state_with_journal(format!("held-drain-{account}"));
+        stores.push(SyncOutboxStore::local());
+        append_cloud_pull_sync_journal_for_immediate_drain(
+            &state,
+            "default",
+            "post_login",
+            &CloudPullResult {
+                cloud_reachable: true,
+            },
+            &[],
+        );
+        cloud_sync::schedule_sync_outbox_drain();
+        if account == "a" {
+            tokio::time::timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .unwrap();
+        }
+    }
+    // B's only wake arrives while the process-wide claim still belongs to A.
+    cloud_sync::schedule_sync_outbox_drain();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if stores
+                .iter()
+                .all(|store| store.status().unwrap().acked == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both owners settle without a second user action");
+    peer.abort();
+    let _ = peer.await;
+}
+
 // These tests verify the async cloud sync functions don't panic when
 // called from within a tokio runtime. We unset ASTRA_API_URL so they
 // take the graceful-fallback path (CLI is now HTTP-only).

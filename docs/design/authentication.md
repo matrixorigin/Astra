@@ -225,8 +225,13 @@ deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
 instead of claiming cancellation after credentials may have committed.
 Runtime retirement and session finalization also run on this supervised owner
 from an owned snapshot of the canonical finalizer's inputs. The terminal does
-not await optional memory maintenance; credentials remain unpublished until the
-old owner's durable boundary settles. Graceful shutdown settles the resulting
+not await optional memory maintenance. Password account replacement keeps
+credentials unpublished until the old owner's durable boundary settles.
+Browser login stops the execution runtime first, but finalizes the captured
+Session only after publication proves that the account or environment changed.
+Same-owner browser reauthentication preserves the Session, transcript and model;
+cancellation never writes a SessionEnd or completes its workspace.
+Graceful shutdown settles the resulting
 prepared publication through the same credential owner.
 Both password and browser completion rebuild identity-owned Skill/MCP services
 and the session-memory port before runtime initialization. Credential publication
@@ -241,8 +246,10 @@ authentication or UC binding. Credential settlement does not repeat `/auth/me`;
 optional startup identity discovery has a ten-second overall deadline. Cancelling
 browser waiting reattaches the exact retired memory service only while its
 original credential binding remains current, without another network request.
-Post-login preference reads and model discovery use the existing catalog task
-owner independently. Account preferences are fenced by the originating identity,
+Post-login preference reads, model discovery and outbox wakeups use the existing
+catalog task owner independently of Edge registration success. Registration
+failure remains visible and does not automatically submit queued input.
+Account preferences are fenced by the originating identity,
 not the Session attachment epoch: first-session binding and same-account `/new`
 must not discard them. Model completion additionally retains its Session scope
 and cannot replace a newer explicit model selection. Preference
@@ -321,8 +328,11 @@ ignore the new attempt-only field rather than interpreting it as the legacy
 `admission_state: rejected` guarantee. An admitted run or resume failure is never
 relabeled as an unexecuted turn.
 
-At browser re-login the CLI drains and retires its old session-memory service
-before credential publication. Successful completion rebuilds that service with
+At browser re-login the CLI detaches its old session-memory service while waiting
+for authentication. Actual account replacement finalizes only the captured old
+owner's journal and workspace; optional memory maintenance uses that service's
+captured bearer or verified refresh authority, never replacement credentials.
+Successful completion rebuilds that service with
 the authenticated identity, including when the process started signed out. It
 also replaces the remote skill registry and its private cache, restarts external
 discovery, and attaches both the workbench and runtime to the new registry.

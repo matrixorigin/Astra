@@ -83,8 +83,9 @@ pub(crate) async fn finalize_session_with_budget(
 }
 
 /// The canonical finalizer's owned input. Login can supervise this work without
-/// borrowing the terminal state or publishing another account prematurely.
+/// borrowing the terminal state or reselecting its artifact owner.
 pub(crate) struct SessionFinalization {
+    owner: astra_services::OwnerScope,
     journal: Option<(astra_services::OwnerScope, String, std::path::PathBuf)>,
     session_id: Option<String>,
     turn: u32,
@@ -96,6 +97,12 @@ pub(crate) struct SessionFinalization {
 impl SessionFinalization {
     pub(crate) fn capture(state: &SessionState) -> Self {
         Self {
+            owner: state
+                .journal
+                .as_ref()
+                .map_or_else(astra_services::local_owner_scope, |journal| {
+                    journal.owner_scope().clone()
+                }),
             journal: state.journal.as_ref().map(|journal| {
                 (
                     journal.owner_scope().clone(),
@@ -125,7 +132,12 @@ impl SessionFinalization {
                 Ok(journal)
             })
             .transpose()?;
-        commit_session_durable_boundary(journal.as_ref(), self.session_id.as_deref(), self.turn)?;
+        commit_session_durable_boundary(
+            &self.owner,
+            journal.as_ref(),
+            self.session_id.as_deref(),
+            self.turn,
+        )?;
         finish_session_maintenance(
             self.session_id,
             self.memory,
@@ -205,6 +217,12 @@ async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) 
 /// state.
 pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Result<(), String> {
     let result = commit_session_durable_boundary(
+        &state
+            .journal
+            .as_ref()
+            .map_or_else(astra_services::local_owner_scope, |journal| {
+                journal.owner_scope().clone()
+            }),
         state.journal.as_ref(),
         state.session_id.as_deref(),
         state.turn,
@@ -216,6 +234,7 @@ pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Res
 }
 
 fn commit_session_durable_boundary(
+    owner: &astra_services::OwnerScope,
     journal: Option<&session_journal::JournalWriter>,
     session_id: Option<&str>,
     turn: u32,
@@ -232,7 +251,7 @@ fn commit_session_durable_boundary(
     if turn > 0
         && let Some(sid) = session_id
     {
-        astra_services::session_workspace::finalize_workspace_on_end(sid)
+        astra_services::session_workspace::finalize_workspace_on_end_for_owner(owner, sid)
             .map_err(|error| format!("failed to finalize session workspace: {error}"))?;
     }
     Ok(())

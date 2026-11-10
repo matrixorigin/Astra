@@ -1357,19 +1357,40 @@ pub fn format_project_context(summaries: &[ProjectSessionSummary]) -> String {
 /// Finalize workspace at session end: extract summary from journal and mark completed.
 /// Returns the summary string if one was found.
 pub fn finalize_workspace_on_end(session_id: &str) -> std::io::Result<Option<String>> {
-    if read_workspace_optional(session_id)?.is_none() {
-        return Ok(None);
+    finalize_workspace_on_end_for_owner(&crate::local_owner_scope(), session_id)
+}
+
+/// Complete only the captured owner's workspace after an identity replacement.
+pub fn finalize_workspace_on_end_for_owner(
+    owner: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Option<String>> {
+    let dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    match read_workspace_at_path(session_id, &dir.join("workspace.yaml")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
-    let summary = extract_last_compact_summary(session_id)?;
-    update_existing_workspace(session_id, |workspace| {
+    let summary = extract_last_compact_summary_for_owner(owner, session_id)?;
+    update_existing_workspace_for_owner(owner, session_id, |workspace| {
         workspace.mark_completed(summary.as_deref());
     })?;
     Ok(summary)
 }
 
 /// Extract the summary from the last Compact journal event that has compact_summary metadata.
+#[cfg(test)]
 fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<String>> {
-    let events = crate::session_journal::read_journal(session_id)?;
+    extract_last_compact_summary_for_owner(&crate::local_owner_scope(), session_id)
+}
+
+fn extract_last_compact_summary_for_owner(
+    owner: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Option<String>> {
+    let events = crate::session_journal::read_journal_for_owner(owner, session_id)?;
     Ok(events
         .iter()
         .rev()
@@ -1388,6 +1409,31 @@ fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn finalization_after_owner_change_only_completes_the_captured_workspace() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::session_journal::JournalDirGuard::new(root.path());
+        let old = crate::OwnerScope::user("finalizer-old-owner").unwrap();
+        let current = crate::local_owner_scope();
+        let sid = "same-session-id";
+        for owner in [&old, &current] {
+            update_workspace_for_owner(owner, sid, || WorkspaceMetadata::new(sid, "model"), |_| {})
+                .unwrap();
+        }
+        finalize_workspace_on_end_for_owner(&old, sid).unwrap();
+        let old_path = crate::local_session_artifact_store()
+            .session_dir_for_owner(&old, sid)
+            .unwrap()
+            .join("workspace.yaml");
+        assert_eq!(
+            read_workspace_at_path(sid, &old_path).unwrap().status,
+            "completed"
+        );
+        assert_eq!(read_workspace(sid).unwrap().status, "active");
+    }
+
     #[test]
     #[serial_test::serial]
     fn explicit_owner_workspace_update_reads_and_writes_only_the_captured_namespace() {
