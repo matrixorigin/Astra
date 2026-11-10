@@ -5677,8 +5677,15 @@ async fn call_prepared_llm_attempts(
             "subscription_route_mismatch",
         ));
     }
+    // Admission precedes the retry loop, but belongs to the first diagnostic
+    // span. Transfer that span into the loop without releasing the call's permit.
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
     let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
+    llm_attempt.phase = "preparation";
+    let mut first_span = Some(llm_attempt);
     let model_key = model_name;
     let cooldown = rate_limit_cooldown();
     let logical_total_budget = total_budget;
@@ -5705,7 +5712,8 @@ async fn call_prepared_llm_attempts(
     let subscription_client = subscription
         .map(|binding| binding.http_client())
         .transpose()
-        .map_err(responses::credential_error)?;
+        .map_err(responses::credential_error)
+        .inspect_err(LlmAttemptSpan::note_error)?;
     let client = subscription_client
         .as_ref()
         .unwrap_or_else(|| global_llm_client());
@@ -5730,7 +5738,8 @@ async fn call_prepared_llm_attempts(
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Cancelled,
                 "LLM call cancelled",
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         // Provider work deadline guard: abort if we've already spent too long across retries.
         if started.elapsed() >= total_budget {
@@ -5740,7 +5749,8 @@ async fn call_prepared_llm_attempts(
                     "LLM provider work deadline reached ({:.0}s): {last_err}",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         if attempt > 0 {
             // A provider/cooldown hint owns the next delay when present.
@@ -5791,14 +5801,17 @@ async fn call_prepared_llm_attempts(
                     "LLM provider work deadline reached ({:.0}s) before provider retry request",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
 
         // Every configured observer is wrapped by
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
-        let mut llm_attempt = LlmAttemptSpan::start(attempt);
+        let mut llm_attempt = first_span
+            .take()
+            .unwrap_or_else(|| LlmAttemptSpan::start(attempt));
         llm_attempt.phase = "preparation";
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
             match prepare_compatible_endpoint(
@@ -8451,9 +8464,11 @@ async fn call_llm_nonstream_attempts(
     } else {
         url
     };
-    let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
+    let _registered_endpoint_permit =
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
     llm_attempt.phase = "preparation";
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
         let mut attempt = 0;
@@ -12719,6 +12734,95 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_endpoint_saturation_is_admission_without_dispatch() {
+        use tracing::instrument::WithSubscriber;
+
+        for streaming in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let requests = hits.clone();
+            let base = spawn_local_http_server(Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let body = if streaming {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                        } else {
+                            r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                        };
+                        Response::builder().status(200)
+                            .header("content-type", if streaming { "text/event-stream" } else { "application/json" })
+                            .body(Body::from(body)).unwrap()
+                    }
+                }),
+            )).await;
+            let endpoint = format!("{base}/chat/completions");
+            let mut permits = Vec::new();
+            while let Ok(Some(permit)) =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+            {
+                permits.push(permit);
+            }
+            assert!(!permits.is_empty());
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let make_call = || {
+                let mut call = trace_fixture_call(&messages, &base, "openai");
+                call.route.completions_url_override = Some(&endpoint);
+                call
+            };
+            let capture = LlmTraceCapture::default();
+            let observer = RecordingAttemptObserver::default();
+            let error = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::ResourceLimit);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert!(observer.began.lock().unwrap().is_empty());
+            assert!(observer.finished.lock().unwrap().is_empty());
+            {
+                let spans = capture.0.lock().unwrap();
+                assert_eq!(spans.len(), 1);
+                let fields = spans.values().next().unwrap();
+                assert_eq!(fields["retry.attempt"], "0");
+                assert_eq!(fields["error.phase"], "admission");
+                assert_eq!(fields["error.reason"], "resource_limit");
+                assert!(!fields.contains_key("http.response.status_code"));
+                let rendered = format!("{fields:?}");
+                for private in [&endpoint, &base, "private"] {
+                    assert!(!rendered.contains(private));
+                }
+            }
+            // Releasing one slot allows the unchanged request path to run;
+            // the early diagnostic span must be reused instead of duplicated.
+            drop(permits.pop().unwrap());
+            let capture = LlmTraceCapture::default();
+            let result = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "ok");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            assert_eq!(observer.finished.lock().unwrap().len(), 1);
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["http.response.status_code"], "200");
+            assert!(!fields.contains_key("error.phase"));
+            let _released_permit =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+                    .expect("the successful call releases its endpoint permit");
         }
     }
 
