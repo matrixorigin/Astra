@@ -1358,7 +1358,6 @@ fn recovery_waits_behind_intentional_whitespace_drafts() {
     }
 }
 
-
 #[test]
 fn unknown_slash_paths_are_conversation_not_commands() {
     use crate::tui::slash_dispatch::{SubmissionInput, immediate_control, parse_submission};
@@ -1387,3 +1386,20 @@ fn unknown_slash_paths_are_conversation_not_commands() {
         SubmissionInput::Literal("/tmp/image.png")
     ));
 }
+
+#[test]
+fn slash_menu_discovery_stays_open_for_prospective_unknown_drafts() {
+    use crate::tui::slash_menu::{SlashItem, is_open_for};
+
+    let items = vec![SlashItem::simple("/model", "pick a model")];
+    // Discovery is prospective: unknown, fuzzy, case-variant, and digit
+    // drafts keep the menu open so completions stay reachable while
+    // typing. Only the escaped-literal form never opens it.
+    for draft in ["/", "/mdl", "/HELP", "/2", "/unknown-command"] {
+        assert!(is_open_for(draft, &items), "{draft:?}");
+    }
+    assert!(!is_open_for("//escaped literal", &items));
+    assert!(!is_open_for("plain text", &items));
+    assert!(!is_open_for(" /leading-space", &items));
+}
+
