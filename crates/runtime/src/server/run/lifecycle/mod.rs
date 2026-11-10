@@ -5317,7 +5317,6 @@ fn start_active_run_control_watcher(
             tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
             ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
         );
-        let mut checked_event_idx = -1;
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -5328,7 +5327,7 @@ fn start_active_run_control_watcher(
                     }
                     let control_status = tokio::time::timeout(
                         ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT,
-                        run_control.control_observation(&user_id, &run_id, checked_event_idx),
+                        run_control.control_observation(&user_id, &run_id),
                     )
                     .await;
                     match control_status {
@@ -5361,21 +5360,12 @@ fn start_active_run_control_watcher(
                                     changed
                                 });
                             }
-                            match observation.guidance_observation {
-                                Some(Ok(index)) => {
-                                    if let Some(through) = observation.last_event_idx {
-                                        checked_event_idx = checked_event_idx.max(through);
-                                    }
-                                    if let Some(index) = index {
-                                        guidance_wake.send_if_modified(|current| {
-                                            let changed = index > *current;
-                                            *current = (*current).max(index);
-                                            changed
-                                        });
-                                    }
-                                }
-                                Some(Err(error)) => tracing::warn!(run_id = %run_id, %error, "guidance observation failed; retaining the previous cursor"),
-                                None => {}
+                            if let Some(index) = observation.last_guidance_event_idx {
+                                guidance_wake.send_if_modified(|current| {
+                                    let changed = index > *current;
+                                    *current = (*current).max(index);
+                                    changed
+                                });
                             }
                         }
                         Ok(Err(error)) => {
@@ -24185,7 +24175,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .await?;
             let execution_authority = durable_admission.as_ref().map(|admission| {
                 crate::server::run::engine::RunExecutionAuthority {
-                    opening_control_tail: None,
+                    opening_control_tail: admission.initial_authority.and_then(|authority| authority.opening_control_tail),
                     owner_generation: admission.owner_generation,
                     owner_lease_expires_at: None,
                 }

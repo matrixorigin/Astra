@@ -2836,7 +2836,6 @@ struct StaticRunControlProvider {
     status: Option<RunControlStatus>,
     calls: AtomicUsize,
     guidance: StdMutex<std::collections::VecDeque<Result<Option<i64>, String>>>,
-    checked: StdMutex<Vec<i64>>,
 }
 
 struct HangingRunControlProvider {
@@ -2892,7 +2891,6 @@ impl StaticRunControlProvider {
             status,
             calls: AtomicUsize::new(0),
             guidance: StdMutex::new(Default::default()),
-            checked: StdMutex::new(Vec::new()),
         }
     }
 
@@ -2907,14 +2905,18 @@ impl crate::turn::run_control::RunStatusProvider for StaticRunControlProvider {
         &self,
         user_id: &str,
         run_id: &str,
-        guidance_after: i64,
     ) -> Result<crate::turn::run_control::RunControlObservation, String> {
-        self.checked.lock().unwrap().push(guidance_after);
-        let guidance = self.guidance.lock().unwrap().pop_front();
+        let guidance = self
+            .guidance
+            .lock()
+            .unwrap()
+            .pop_front()
+            .transpose()?
+            .flatten();
         Ok(crate::turn::run_control::RunControlObservation {
             status: self.control_status(user_id, run_id).await?,
-            last_event_idx: guidance.as_ref().map(|_| 7),
-            guidance_observation: guidance,
+            last_event_idx: guidance.map(|_| 7),
+            last_guidance_event_idx: guidance,
             ..Default::default()
         })
     }
@@ -27892,14 +27894,44 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
 }
 
 #[tokio::test(start_paused = true)]
-async fn active_run_control_watcher_retries_failed_guidance_without_losing_pause() {
+async fn fresh_control_watcher_observes_committed_guidance() {
+    let provider = Arc::new(StaticRunControlProvider::new(None));
+    provider.guidance.lock().unwrap().push_back(Ok(Some(6)));
+    let (guidance, observed) = tokio::sync::watch::channel(-1);
+    let _watcher = start_active_run_control_watcher(
+        Some(provider.clone()),
+        "user-1".into(),
+        "session-1".into(),
+        "run-1".into(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(CancellationToken::new()),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
+        guidance,
+    )
+    .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        *observed.borrow(),
+        6,
+        "guidance committed after the opening ACK is still seen"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_run_control_watcher_retries_control_failure_without_losing_pause() {
     let provider = Arc::new(StaticRunControlProvider::new(Some(
         RunControlStatus::Paused,
     )));
     provider.guidance.lock().unwrap().extend([
-        Err("event query unavailable".into()),
-        Ok(Some(6)),
         Ok(None),
+        Err("control query unavailable".into()),
+        Ok(Some(6)),
     ]);
     let pause = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(CancellationToken::new());
@@ -27925,10 +27957,11 @@ async fn active_run_control_watcher_retries_failed_guidance_without_losing_pause
     assert_eq!(*observed.borrow(), -1);
     tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
     tokio::task::yield_now().await;
-    assert_eq!(*observed.borrow(), 6);
+    assert!(pause.load(Ordering::Acquire));
+    assert_eq!(*observed.borrow(), -1);
     tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
     tokio::task::yield_now().await;
-    assert_eq!(*provider.checked.lock().unwrap(), [-1, -1, 7]);
+    assert_eq!(*observed.borrow(), 6);
     assert!(!cancel.is_cancelled());
 }
 
@@ -28853,6 +28886,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: 449,
+        last_guidance_event_idx: -1,
         current_checkpoint: None,
         error_code: None,
         error_message: None,

@@ -48,6 +48,7 @@ pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> D
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
+        last_guidance_event_idx: -1,
         current_checkpoint: None,
         error_code: None,
         error_message: None,

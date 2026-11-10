@@ -320,6 +320,12 @@ remote run remains protected by Server session-slot admission. An unconfirmed
 local execution or failed owner cleanup is not treated as a clean stream
 failure and retains its local exclusion until its own authority settles.
 
+CLI stream output, live guidance, and tool lifecycle events share their
+delivery order. If an observer remains unable to receive events, the client
+stops the physical stream with an explicit observer error; the error does not
+assert that remote work stopped or that already-started tools had no effects.
+Partial execution and the durable run remain available for reconciliation.
+
 Transcript progress is described by item sequence and committed cursor.
 Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence

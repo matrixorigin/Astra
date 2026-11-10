@@ -734,6 +734,12 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-10-v124` adds a guidance event watermark to the
+existing Run row. User-intent commits update it in the same transaction as the
+event; existing batched control reads carry it without another query. Deploy
+all writers against a fresh schema together; the previous schema and mixed
+old/new writers are not supported.
+
 Fresh schema contract `2026-11-09-v123` stores Edge dispatch requests as
 lossless text, preserving the serialized payload used for admission and relay
 delivery. Existing databases must make an explicit data and deployment decision;

@@ -3119,12 +3119,8 @@ impl ChatWidget {
         self.history_cell_ids.push(id);
     }
 
-    /// Commit a user message directly into history without opening a new turn
-    /// or draining the current live tool/assistant state.
-    ///
-    /// Used for user intents that become active mid-turn: the transcript
-    /// should show the newest user message as a first-class user row, but the
-    /// current streaming turn should remain live until the runtime yields.
+    /// Preserve the conversational ordering of a mid-turn user message
+    /// without treating any still-running tool as complete.
     pub fn commit_applied_user_intent(
         &mut self,
         _intent_id: impl Into<String>,
@@ -3132,6 +3128,12 @@ impl ChatWidget {
         _status: astra_turn_types::UserIntentStatus,
         text: impl Into<String>,
     ) {
+        if matches!(
+            self.active_cell.as_deref().map(cell_kind),
+            Some(CellKind::Assistant | CellKind::Reasoning)
+        ) {
+            self.commit_active();
+        }
         self.commit_cell(Box::new(UserCell::new(text.into())));
     }
 
@@ -5753,9 +5755,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_applied_user_intent_keeps_live_active_cell() {
+    fn applied_user_intent_follows_prior_answer_and_preserves_live_tool() {
         let mut w = fresh();
-        w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("before".into()),
+            text: "old answer".into(),
+        }));
 
         w.commit_applied_user_intent(
             "intent-1",
@@ -5764,17 +5769,40 @@ mod tests {
             "stop after this tool",
         );
 
-        assert_eq!(w.history.len(), 1, "user intent is committed as history");
-        let persisted = w.history[0].to_persist().expect("user cell persists");
+        assert_eq!(w.history.len(), 2);
+        assert!(matches!(
+            w.history[0].to_persist(),
+            Some(TurnEvent::Assistant { .. })
+        ));
+        let persisted = w.history[1].to_persist().expect("user cell persists");
         assert!(matches!(
             &persisted,
             TurnEvent::User { text, .. } if text == "stop after this tool"
         ));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("after".into()),
+            text: "new answer".into(),
+        }));
         assert_eq!(
             w.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Assistant),
-            "user intent must not finalize the live assistant/tool cell"
+            Some(CellKind::Assistant)
         );
+
+        let mut tool = fresh();
+        tool.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "bash".into(),
+            description: "running".into(),
+            tool_use_id: "live".into(),
+            parent_tool_use_id: None,
+        }));
+        tool.commit_applied_user_intent(
+            "intent-2",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "new direction",
+        );
+        assert!(tool.has_live_tool_projection());
+        assert_eq!(tool.active_tool_use_id.as_deref(), Some("live"));
     }
 
     #[test]
@@ -5793,13 +5821,14 @@ mod tests {
             "new guidance",
         );
 
-        assert_eq!(w.active_cell_id(), Some(live_id));
-        assert_ne!(w.history_cell_id(0), live_id);
+        assert!(w.active_cell_id().is_none());
+        assert_eq!(w.history_cell_id(0), live_id);
+        assert_ne!(w.history_cell_id(1), live_id);
 
         w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
         assert!(w.active_cell().is_none());
-        assert_eq!(w.history_cell_id(1), live_id);
+        assert_eq!(w.history_cell_id(0), live_id);
         assert_eq!(w.history.len(), w.history_cell_ids.len());
     }
 

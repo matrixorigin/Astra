@@ -4001,7 +4001,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.final_text_model_item_id = None;
         state.final_text.clear();
         state.final_text_streamed = false;
-        runtime_input_boundary(host, state, RuntimeInputBoundary::IntentReady).await?;
+        if !runtime_input_boundary(host, state, RuntimeInputBoundary::IntentReady)
+            .await?
+            .durable_guidance_applied
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "guidance superseded inference without an acknowledged instruction",
+            ));
+        }
         state.step_recorder.end_turn(false);
         return Ok(TurnExecutionControl::ContinueLoop);
     }
@@ -15380,6 +15388,42 @@ mod tests {
         assert!(!resumed.contains("unexecuted-tool-fragment"));
         assert_eq!(state.final_text, "revised result");
         assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn guidance_wake_without_an_instruction_does_not_retry_stale_inference() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-empty-guidance-wake".into());
+        state.current_run_owner_generation = Some(7);
+        state.owner_user_id = Some("user-empty-guidance-wake".into());
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll::default(),
+        ])));
+        let (wake, receive) = tokio::sync::watch::channel(-1);
+        state.user_intents.guidance_wake = Some(receive);
+        state.cancellation.token = Some(Arc::new(tokio_util::sync::CancellationToken::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![text_result("stale", 0, 0, None)]);
+        host.provider_response_gate = Some((started.clone(), Arc::new(tokio::sync::Notify::new())));
+        let run = tokio::spawn(async move {
+            let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (result, host)
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        wake.send_replace(1);
+        let (result, host) = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an empty wake must not authorize a retry"),
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(host.admitted_tool_call_batches.is_empty());
     }
 
     #[tokio::test]
