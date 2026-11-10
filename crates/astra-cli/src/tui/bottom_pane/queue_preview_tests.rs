@@ -1402,4 +1402,3 @@ fn slash_menu_discovery_stays_open_for_prospective_unknown_drafts() {
     assert!(!is_open_for("plain text", &items));
     assert!(!is_open_for(" /leading-space", &items));
 }
-
