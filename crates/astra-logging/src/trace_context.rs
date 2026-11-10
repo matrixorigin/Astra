@@ -293,6 +293,23 @@ pub fn attach_link(span: &tracing::Span, link: &RunLink) {
     }
 }
 
+/// Create the coarse tool span using execution metadata only. Callers supply
+/// the resolved tool name and route, never tool arguments or result bodies.
+pub fn tool_span(tool_name: &str, call_id: Option<&str>, route: &str) -> tracing::Span {
+    let span = tracing::info_span!(
+        target: "astra.tool",
+        "tool.exec",
+        otel.name = %format!("tool.exec {tool_name}"),
+        tool.name = tool_name,
+        tool.route = route,
+        tool.call.id = tracing::field::Empty,
+    );
+    if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
+        span.record("tool.call.id", call_id);
+    }
+    span
+}
+
 /// Stable exported status. The description is `code`, not the cause text.
 pub fn mark_error(span: &tracing::Span, code: &'static str) {
     #[cfg(feature = "otel")]
@@ -661,6 +678,74 @@ mod tests {
             .with_simple_exporter(capture.clone())
             .build();
         (capture, provider)
+    }
+
+    #[test]
+    fn tool_spans_export_identity_route_and_parent_without_arguments() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        mark_export_ready();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryLayer::new(provider.tracer("astra-test"))
+                .with_filter(EnvFilter::new("astra.tool=info")),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+        let mut run = RunSpan::start(&Carrier::default());
+        let link = run.link().expect("run link");
+
+        for (name, call_id, route) in [
+            ("bash", Some("call-1"), "edge_bound"),
+            ("mcp_lookup", None, "request_scoped_mcp"),
+            ("web_fetch", Some(""), "server_local"),
+        ] {
+            let span = tool_span(name, call_id, route);
+            attach_link(&span, &link);
+            {
+                let _entered = span.enter();
+                tracing::warn!(target: "astra_runtime::tool", command = "secret-command", "private output");
+            }
+            if name == "bash" {
+                mark_error(&span, "stream_transport");
+            }
+            drop(span);
+        }
+        run.end();
+
+        let finished = exporter.0.lock().expect("span capture");
+        for (name, call_id, route) in [
+            ("bash", Some("call-1"), "edge_bound"),
+            ("mcp_lookup", None, "request_scoped_mcp"),
+            ("web_fetch", None, "server_local"),
+        ] {
+            let span = finished
+                .iter()
+                .find(|span| span.name == format!("tool.exec {name}"))
+                .expect("tool span exported");
+            assert_eq!(span.parent_span_id.to_bytes(), link.span_id);
+            for (key, value) in [
+                ("tool.name", Some(name)),
+                ("tool.route", Some(route)),
+                ("tool.call.id", call_id),
+            ] {
+                let actual = span
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key.as_str() == key)
+                    .map(|attr| attr.value.as_str().into_owned());
+                assert_eq!(actual.as_deref(), value);
+            }
+            let rendered = format!("{span:?}");
+            assert!(!rendered.contains("secret-command"));
+            assert!(!rendered.contains("private output"));
+            if name == "bash" {
+                assert_eq!(
+                    span.status,
+                    opentelemetry::trace::Status::error("stream_transport")
+                );
+            }
+        }
     }
 
     #[test]

@@ -424,6 +424,12 @@ its scheme, for example `http://127.0.0.1:4317`.
 enable export. A failure to initialize or flush the exporter does not change
 the HTTP result, command result, or process exit code.
 
+Tool execution spans appear as `tool.exec <tool name>` in Jaeger. They carry
+`tool.name`, the resolved `tool.route` (such as `edge_bound` or
+`request_scoped_mcp`), and `tool.call.id` when available, so an individual
+call can be matched to runtime logs. Tool arguments, shell commands and result
+bodies are not included. This metadata does not change execution timeouts.
+
 ### CLI overrides (optional)
 
 - `ASTRA_CLI_SESSION_ID`, `ASTRA_CLI_SESSION_NAME`
