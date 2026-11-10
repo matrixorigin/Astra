@@ -1,7 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
-assertion_line: 1754
 expression: "render(&c, 60, 3)"
 ---
 ● Thought · 2 lines · 14 tokens
-Hello — happy to help.
+  Hello — happy to help.

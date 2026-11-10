@@ -10,8 +10,8 @@
 │                                                                 │
 │  › user message                                                 │  ← UserCell
 │                                                                 │
-│    assistant response, streamed word by word, markdown-rendered │  ← AssistantCell
-│    prose and code aligned; code blocks remain verbatim         │
+│  assistant response, streamed word by word, markdown-rendered   │  ← AssistantCell
+│  prose shares the gutter; code blocks stay verbatim at column 0 │
 │                                                                 │
 │  • Ran bash (52ms)                                              │  ← ToolCell
 │    │ $ echo hello                                               │
