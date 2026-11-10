@@ -721,14 +721,16 @@ impl StructuredLlmError {
     }
 
     /// Derive recovery once for HTTP and untyped SSE consumers. Explicit
-    /// protocol causes win; the generic invalid-request family requires
-    /// provider-neutral input-overflow semantics and no parameter/code cause.
+    /// protocol causes win. Otherwise a generic family, numeric HTTP code, or
+    /// input parameter does not contradict an explicit input-overflow message;
+    /// specific string codes and non-input parameters still bound recovery.
     #[must_use]
     pub fn kind(&self) -> Option<ErrorKind> {
         self.code().map(|(kind, _)| kind).or_else(|| {
             (self.error_field("code").is_none()
-                && self.error_field("type") == Some("invalid_request_error")
-                && self.error_field("param").is_none()
+                && self.error_field("param").is_none_or(|parameter| {
+                    matches!(parameter, "input" | "input_tokens" | "messages" | "prompt")
+                })
                 && self.error_field("message").is_some_and(|message| {
                     is_explicit_input_context_window_message_lower(&message.to_ascii_lowercase())
                 }))
@@ -759,36 +761,11 @@ impl StructuredLlmError {
                 .is_some_and(|token| !token.trim().is_empty())
         })
     }
-
-    /// Whether [`Self::kind`] derived context recovery from either an
-    /// explicit protocol cause or generic-family input-overflow semantics.
-    #[must_use]
-    pub fn is_context_window_overflow(&self) -> bool {
-        self.kind() == Some(ErrorKind::ContextWindow)
-    }
-}
-
-/// Classify a recognized protocol cause or generic-family input overflow.
-/// Other unrecognized machine facts return `None` so the caller can apply its
-/// status ladder without reinterpretation through output-parameter prose.
-#[must_use]
-pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
-    StructuredLlmError::parse(body).and_then(|error| error.kind())
-}
-
-/// The whitelisted `error.code` of a provider error envelope, for surfacing
-/// in user-visible failure messages. Only codes that
-/// [`structured_llm_error_kind`] classifies are returned — they are fixed
-/// protocol tokens, never free-text provider diagnostics, so they are safe to
-/// show to users. Returns the classified kind alongside the code.
-#[must_use]
-pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
-    StructuredLlmError::parse(body).and_then(|error| error.code())
 }
 
 /// Classify a single provider error-envelope code token.
 ///
-/// This is the same whitelist [`structured_llm_error_code`] applies to
+/// This is the same whitelist [`StructuredLlmError::code`] applies to
 /// envelope bodies, exposed for boundaries that already hold the bare token
 /// (e.g. the negotiated MOI model gateway contract). Returns the classified
 /// kind alongside the canonical static token; unrecognized codes return
@@ -847,33 +824,6 @@ pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
         is_uuid(value)
     };
     valid.then(|| value.to_string())
-}
-
-/// Extract a nested `error.request_id` or Anthropic's top-level `request_id`
-/// for log correlation. The id is validated before use.
-#[must_use]
-pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
-    StructuredLlmError::parse(body).and_then(|error| error.request_id())
-}
-
-/// Whether the body carries a parsed provider error envelope with at least
-/// one machine-readable cause token (`code`, `type`, or `param`).
-///
-/// This is the *presence* responsibility of the envelope boundary, kept
-/// distinct from [`structured_llm_error_code`] (safe diagnostic-token
-/// projection for user-visible messages) and [`structured_llm_error_kind`]
-/// (recovery classification of recognized cause tokens). When machine facts
-/// are present, HTTP status and those facts — never message prose — must
-/// drive the failure kind: an unrecognized structured category is bounded by
-/// the status ladder instead of authorizing context compaction via needle
-/// matching, and only an explicit context-overflow code may claim
-/// [`ErrorKind::ContextWindow`], apart from generic-family input overflow
-/// recognized by [`StructuredLlmError::is_context_window_overflow`]. A
-/// message-only error
-/// object is prose in JSON and does not count.
-#[must_use]
-pub fn has_structured_llm_error_facts(body: &str) -> bool {
-    StructuredLlmError::parse(body).is_some_and(|error| error.has_facts())
 }
 
 // ── LLM error-message fallback classifier ────────────────────────────────────
@@ -1655,10 +1605,12 @@ mod tests {
         assert!(!is_llm_context_window_error(""));
     }
 
-    // ── structured_llm_error_kind ──
+    fn projected_kind(body: &str) -> Option<ErrorKind> {
+        StructuredLlmError::parse(body).and_then(|error| error.kind())
+    }
 
     #[test]
-    fn structured_llm_error_kind_cases() {
+    fn structured_kind_cases() {
         let cases: &[(&str, Option<ErrorKind>)] = &[
             // A 413 gateway byte limit is never model context overflow.
             (
@@ -1705,7 +1657,7 @@ mod tests {
             ),
             // Both cause tokens unrecognized → still None: no alias
             // whitelist extension. Presence of machine facts
-            // ([`has_structured_llm_error_facts`]), not this classifier, is
+            // ([`StructuredLlmError::has_facts`]), not this classifier, is
             // what keeps the prose fallback from reclaiming the envelope.
             (
                 r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
@@ -1726,9 +1678,9 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(
-                structured_llm_error_kind(input),
+                projected_kind(input),
                 *expected,
-                "structured_llm_error_kind({input:?}) should be {expected:?}"
+                "projected_kind({input:?}) should be {expected:?}"
             );
         }
     }
@@ -1739,53 +1691,61 @@ mod tests {
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
         )
         .expect("Anthropic envelope");
-        assert!(anthropic.is_context_window_overflow());
         assert_eq!(anthropic.kind(), Some(ErrorKind::ContextWindow));
 
         let openai = StructuredLlmError::parse(
             r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
         )
         .expect("OpenAI envelope");
-        assert!(openai.is_context_window_overflow());
         assert_eq!(openai.kind(), Some(ErrorKind::ContextWindow));
 
+        let numeric_input_code = StructuredLlmError::parse(
+            r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
+        )
+        .expect("numeric-code input-overflow envelope");
+        assert_eq!(numeric_input_code.kind(), Some(ErrorKind::ContextWindow));
+
         for body in [
+            r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
             r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
             r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":null,"code":null}}"#,
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","code":"some_future_code"}}"#,
             r#"{"error":{"message":"prompt is too long","type":"invalid_request_error","param":"max_tokens"}}"#,
         ] {
             let error = StructuredLlmError::parse(body).expect("structured envelope");
-            assert!(
-                !error.is_context_window_overflow(),
+            assert_ne!(
+                error.kind(),
+                Some(ErrorKind::ContextWindow),
                 "specific or unrecognized machine facts must not authorize compaction: {body}"
             );
         }
     }
 
+    fn projected_request_id(body: &str) -> Option<String> {
+        StructuredLlmError::parse(body).and_then(|error| error.request_id())
+    }
+
     #[test]
-    fn structured_llm_error_request_id_extraction() {
+    fn structured_request_id_extraction() {
         assert_eq!(
-            structured_llm_error_request_id(
+            projected_request_id(
                 r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123de"}}"#
             ),
             Some("req_abc123de".to_string())
         );
         assert_eq!(
-            structured_llm_error_request_id(
+            projected_request_id(
                 r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def45678"}}"#
             ),
             Some("req_def45678".to_string())
         );
         assert_eq!(
-            structured_llm_error_request_id(
-                r#"{"error":{"message":"bad param","code":"invalid_request"}}"#
-            ),
+            projected_request_id(r#"{"error":{"message":"bad param","code":"invalid_request"}}"#),
             None
         );
-        assert_eq!(structured_llm_error_request_id("not json"), None);
+        assert_eq!(projected_request_id("not json"), None);
         assert_eq!(
-            structured_llm_error_request_id(
+            projected_request_id(
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#
             ),
             Some("req_011CSHoEeqs5C35K2UUqR7Fy".to_string()),
@@ -1794,17 +1754,17 @@ mod tests {
     }
 
     #[test]
-    fn structured_llm_error_request_id_rejects_untrusted_values() {
+    fn structured_request_id_rejects_untrusted_values() {
         // Documented identifier shapes pass: TaaS's `req_<hyphenated-uuid>`,
         // legacy `req_<hex>`, and bare UUID gateway ids.
         assert_eq!(
-            structured_llm_error_request_id(
+            projected_request_id(
                 r#"{"error":{"code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
             ),
             Some("req_3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
         );
         assert_eq!(
-            structured_llm_error_request_id(
+            projected_request_id(
                 r#"{"error":{"code":"invalid_request","request_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
             ),
             Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
@@ -1825,7 +1785,7 @@ mod tests {
             r#"{"error":{"code":"invalid_request","request_id":"req spaced"}}"#,
         ] {
             assert_eq!(
-                structured_llm_error_request_id(body),
+                projected_request_id(body),
                 None,
                 "untrusted request_id must be rejected: {body}"
             );
@@ -1835,11 +1795,15 @@ mod tests {
             r#"{{"error":{{"code":"invalid_request","request_id":"req_{}"}}}}"#,
             "a".repeat(256)
         );
-        assert_eq!(structured_llm_error_request_id(&overlong), None);
+        assert_eq!(projected_request_id(&overlong), None);
+    }
+
+    fn projected_has_facts(body: &str) -> bool {
+        StructuredLlmError::parse(body).is_some_and(|error| error.has_facts())
     }
 
     #[test]
-    fn has_structured_llm_error_facts_detects_machine_tokens() {
+    fn structured_facts_detect_machine_tokens() {
         // Any machine-readable cause token (code, type, or param) marks a
         // parsed provider error — even when every token is unrecognized and
         // the classification whitelist yields None.
@@ -1849,7 +1813,7 @@ mod tests {
             r#"{"error":{"param":"max_tokens","message":"x"}}"#,
             r#"LLM error 400: {"error":{"type":"invalid_request_error","message":"x"}}"#,
         ] {
-            assert!(has_structured_llm_error_facts(body), "{body}");
+            assert!(projected_has_facts(body), "{body}");
         }
         // A message-only error object is prose in JSON; absent envelopes,
         // unusable token values, and plain text leave the needle fallback in
@@ -1861,12 +1825,16 @@ mod tests {
             "maximum context length exceeded",
             "",
         ] {
-            assert!(!has_structured_llm_error_facts(body), "{body}");
+            assert!(!projected_has_facts(body), "{body}");
         }
     }
 
+    fn projected_code(body: &str) -> Option<(ErrorKind, &'static str)> {
+        StructuredLlmError::parse(body).and_then(|error| error.code())
+    }
+
     #[test]
-    fn structured_llm_error_code_is_whitelisted() {
+    fn structured_code_is_whitelisted() {
         // Only fixed protocol tokens are surfaced for user-visible messages;
         // unrecognized codes yield None so free-text diagnostics never leak.
         let cases: &[(&str, Option<&str>)] = &[
@@ -1933,9 +1901,9 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(
-                structured_llm_error_code(input).map(|(_, code)| code),
+                projected_code(input).map(|(_, code)| code),
                 *expected,
-                "structured_llm_error_code({input:?}) should be {expected:?}"
+                "projected_code({input:?}) should be {expected:?}"
             );
         }
     }

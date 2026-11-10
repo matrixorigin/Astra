@@ -340,35 +340,28 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            // Structured envelopes (e.g. TaaS) are authoritative: a 413
-            // gateway byte limit must not count as context overflow.
-            if let Some(kind) = astra_core::structured_llm_error_kind(err) {
-                if kind == astra_core::ErrorKind::ContextWindow {
-                    *st.consecutive_context_window_errors =
-                        st.consecutive_context_window_errors.saturating_add(1);
-                } else {
-                    *st.consecutive_context_window_errors = 0;
-                }
-                kind
-            } else if astra_core::has_structured_llm_error_facts(err) {
-                // A parsed provider error with an unrecognized cause must
-                // not be re-read through message prose: both prose rules
-                // below match the same context needles against the
-                // envelope's own message, so a non-whitelist 400 parameter
-                // rejection (e.g. `max_tokens is too large`) would be
-                // funneled into context compaction. Keep the kind Unknown
-                // and clear the context streak; recovery has no reliable
-                // status or category to bound it further here.
-                *st.consecutive_context_window_errors = 0;
-                astra_core::ErrorKind::Unknown
-            } else if astra_core::is_llm_context_window_error(err) {
+            // Parse once at the provider boundary. Structured facts own their
+            // recovery semantics; genuinely unstructured messages use the
+            // existing classifier, whose rate-limit precedence prevents broad
+            // context prose from stealing a 429 recovery outcome.
+            let structured = astra_core::StructuredLlmError::parse(err);
+            let kind = structured
+                .as_ref()
+                .and_then(|error| error.kind())
+                .unwrap_or_else(|| {
+                    if structured.as_ref().is_some_and(|error| error.has_facts()) {
+                        astra_core::ErrorKind::Unknown
+                    } else {
+                        astra_core::classify_llm_error_message(err)
+                    }
+                });
+            if kind == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
-                astra_core::ErrorKind::ContextWindow
             } else {
                 *st.consecutive_context_window_errors = 0;
-                astra_core::classify_llm_error_message(err)
             }
+            kind
         };
         return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
             kind,
@@ -1225,9 +1218,29 @@ mod tests {
                 2,
             ),
             (
+                r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+            (
                 r#"{"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#,
                 astra_core::ErrorKind::Unknown,
                 0,
+            ),
+            (
+                "429 rate limit: too many tokens per minute",
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                "prompt is too long",
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
         ] {
             let mut accum = ChatTurnSseAccum::default();
