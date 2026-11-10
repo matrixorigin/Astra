@@ -11,7 +11,7 @@
 │  › user message                                                 │  ← UserCell
 │                                                                 │
 │    assistant response, streamed word by word, markdown-rendered │  ← AssistantCell
-│    prose indented with plain spaces; code blocks verbatim       │
+│    prose and code aligned; code blocks remain verbatim         │
 │                                                                 │
 │  • Ran bash (52ms)                                              │  ← ToolCell
 │    │ $ echo hello                                               │
@@ -104,7 +104,7 @@ All cells live in `history_cell/` and implement the `HistoryCell` trait
 | Cell | File | Role |
 |------|------|------|
 | **UserCell** | `user.rs` | `›` accent-bold prefix + user message text |
-| **AssistantCell** | `assistant.rs` | Streaming markdown; settled prose rows are space-indented with no glyph marker and code-block rows retain logical line boundaries through the final writer without a gutter or width-generated hard breaks; blinking cursor while live |
+| **AssistantCell** | `assistant.rs` | Streaming markdown; settled prose and code share a left edge, while code-block rows retain logical line boundaries through the final writer without a gutter or width-generated hard breaks; blinking cursor while live |
 | **ReasoningCell** | `reasoning.rs` | `💭 Thinking` header + compact body; committed on `ReasoningDone` or first answer delta |
 | **ToolCell** | `tool.rs` | `• Ran tool (Nms)` header + `│` args + `└` output; diff-aware coloring |
 | **SystemCell** | `system.rs` | info / warning / error; error text is humanized (strips `<tool_use_error>` wrappers) |
@@ -262,8 +262,8 @@ The current product contract and phased implementation plan live in
 
 The Markdown renderer marks code rows and the immutable cached rows retain that
 classification through lazy history batching and the final terminal writer.
-Code rows start at column zero and use terminal soft wrapping; ordinary prose
-keeps its existing layout. Final writes count physical rows at the current
+Prose and code start at the same left edge. Code rows use terminal soft
+wrapping and preserve source indentation. Final writes count physical rows at the current
 terminal width without inserting hard line breaks into the code itself.
 Sanitization and structured-link trust remain independent of this layout hint.
 Zellij lets content flow before reserving space for the input area, preserving
