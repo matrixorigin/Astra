@@ -8927,14 +8927,15 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
     }
 }
 
-/// Derive a bounded user-facing size-limit cause from HTTP semantics when no
-/// structured cause exists. Both transports use this same error owner.
+/// Derive a bounded user-facing size-limit cause from HTTP semantics unless
+/// a specific protocol cause already explains the rejection. Generic error
+/// categories do not suppress the actionable 413 guidance.
 fn provider_http_rejection_message(
     status: u16,
     structured: Option<&astra_core::StructuredLlmError>,
     fallback: String,
 ) -> String {
-    if status == 413 && structured.and_then(|error| error.code()).is_none() {
+    if status == 413 && !structured.is_some_and(|error| error.has_specific_cause()) {
         "LLM request rejected: HTTP 413 request size limit exceeded; reduce request size".to_owned()
     } else {
         fallback
@@ -17338,6 +17339,17 @@ mod tests {
         }
     }
 
+    async fn responses_http_error(base: &str) -> astra_core::ClassifiedError {
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let mut call = collect_call(base, &messages);
+        call.route.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
+        call.route.response_scope = Some("scope");
+        call.thinking = &ThinkingConfig::ModelDefault;
+        call_llm_and_collect(call, LlmCancel::None)
+            .await
+            .expect_err("Responses provider rejection must fail")
+    }
+
     /// Mock server that returns 400 with a TaaS-style invalid_request
     /// envelope carrying a hyphenated-uuid request id.
     async fn mock_400_invalid_request_envelope() -> Response {
@@ -17579,6 +17591,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_cause_projection_is_shared_by_chat_and_responses() {
+        for (status, body, expected_kind, normalized_cause, expect_size_guidance) in [
+            (
+                400,
+                r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                Some("context_length_exceeded"),
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"input_too_long","type":"invalid_request_error","message":"request rejected"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                Some("context_length_exceeded"),
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                None,
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                None,
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"code":null,"type":"invalid_request","param":"max_tokens","message":"max_tokens is too large"}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+                None,
+                false,
+            ),
+            (
+                413,
+                r#"{"error":{"code":null,"type":"invalid_request","message":"request too large"}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+                None,
+                true,
+            ),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/chat/completions",
+                    post(move || async move {
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }),
+                )
+                .route(
+                    "/responses",
+                    post(move || async move {
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }),
+                );
+            let base = spawn_local_http_server(app).await;
+            for transport in ["chat-nonstream", "chat-stream", "responses-stream"] {
+                let error = match transport {
+                    "chat-nonstream" => provider_http_error(&base, "openai", false).await,
+                    "chat-stream" => provider_http_error(&base, "openai", true).await,
+                    _ => responses_http_error(&base).await,
+                };
+                assert_eq!(error.kind, expected_kind, "{transport}: {body}");
+                if transport != "chat-nonstream" {
+                    if let Some(normalized_cause) = normalized_cause {
+                        assert!(
+                            error.message.contains(normalized_cause),
+                            "{transport} must expose only the normalized cause: {}",
+                            error.message
+                        );
+                    }
+                }
+                if expect_size_guidance {
+                    assert!(
+                        error.message.contains("request size") && error.message.contains("reduce"),
+                        "{transport} must explain the HTTP 413 action: {}",
+                        error.message
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn responses_bare_413_uses_shared_size_limit_explanation() {
         for (body, has_request_id) in [
             ("", false),
@@ -17598,14 +17703,7 @@ mod tests {
                 }),
             );
             let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let mut call = collect_call(&base, &messages);
-            call.route.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
-            call.route.response_scope = Some("scope");
-            call.thinking = &ThinkingConfig::ModelDefault;
-            let error = call_llm_and_collect(call, LlmCancel::None)
-                .await
-                .expect_err("Responses 413 must fail");
+            let error = responses_http_error(&base).await;
             assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
             assert!(
                 error.message.contains("request size") && error.message.contains("reduce"),

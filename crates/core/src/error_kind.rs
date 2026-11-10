@@ -706,36 +706,59 @@ impl StructuredLlmError {
         self.error().get(key)?.as_str()
     }
 
-    /// The whitelisted machine-readable cause and its recovery kind.
+    /// The whitelisted machine-readable cause and its recovery kind. A
+    /// specific `type` cause outranks a generic `code` category.
     #[must_use]
     pub fn code(&self) -> Option<(ErrorKind, &'static str)> {
         let token = |key: &str| {
             self.error_field(key)
                 .filter(|token| !token.trim().is_empty())
         };
-        // A present but unrecognized `code` must not block a recognized
-        // `type`; only when neither classifies do callers fall back.
-        token("code")
-            .and_then(llm_error_envelope_code_class)
-            .or_else(|| token("type").and_then(llm_error_envelope_code_class))
+        let code = token("code").and_then(llm_error_envelope_code_class);
+        let category = token("type").and_then(llm_error_envelope_code_class);
+        code.filter(|(_, token)| *token != "invalid_request")
+            .or(category)
+            .or(code)
     }
 
-    /// Derive recovery once for HTTP and untyped SSE consumers. Explicit
-    /// protocol causes win. Otherwise a generic family, numeric HTTP code, or
-    /// input parameter does not contradict an explicit input-overflow message;
-    /// specific string codes and non-input parameters still bound recovery.
+    /// Whether the normalized protocol cause is more specific than the
+    /// generic `invalid_request` family.
+    #[must_use]
+    pub fn has_specific_cause(&self) -> bool {
+        self.code()
+            .is_some_and(|(_, token)| token != "invalid_request")
+    }
+
+    /// Derive recovery once for HTTP and untyped SSE consumers. Specific
+    /// protocol causes (including rate limits) win. Generic or empty
+    /// categories and numeric HTTP codes do not contradict explicit
+    /// input-overflow semantics; specific string codes and non-input
+    /// parameters still bound recovery.
     #[must_use]
     pub fn kind(&self) -> Option<ErrorKind> {
-        self.code().map(|(kind, _)| kind).or_else(|| {
-            (self.error_field("code").is_none()
-                && self.error_field("param").is_none_or(|parameter| {
-                    matches!(parameter, "input" | "input_tokens" | "messages" | "prompt")
-                })
-                && self.error_field("message").is_some_and(|message| {
-                    is_explicit_input_context_window_message_lower(&message.to_ascii_lowercase())
-                }))
-            .then_some(ErrorKind::ContextWindow)
-        })
+        let cause = self.code();
+        if let Some((kind, token)) = cause
+            && token != "invalid_request"
+        {
+            return Some(kind);
+        }
+        let specific_code = self
+            .error_field("code")
+            .filter(|token| !token.trim().is_empty())
+            .is_some_and(|token| token != "invalid_request");
+        let input_parameter = self.error_field("param").is_none_or(|parameter| {
+            matches!(parameter, "input" | "input_tokens" | "messages" | "prompt")
+        });
+        if !specific_code
+            && input_parameter
+            && self.error_field("message").is_some_and(|message| {
+                is_explicit_input_context_window_message_lower(&message.to_ascii_lowercase())
+            })
+        {
+            Some(ErrorKind::ContextWindow)
+        } else {
+            cause.map(|(kind, _)| kind)
+        }
     }
 
     /// Extract and validate either the OpenAI-compatible nested request ID or
@@ -772,11 +795,17 @@ impl StructuredLlmError {
 /// `None` so callers keep their existing fallback.
 #[must_use]
 pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static str)> {
+    // Responses already owns protocol alias normalization; every envelope
+    // consumer uses that canonical cause instead of maintaining another list.
+    let code = crate::model_wire::responses::provider_error(code)
+        .map(|(normalized, _)| normalized)
+        .unwrap_or(code);
     match code {
         "context_length_exceeded" => Some((ErrorKind::ContextWindow, "context_length_exceeded")),
         "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
         "invalid_request" => Some((ErrorKind::InvalidRequest, "invalid_request")),
         "provider_schema_error" => Some((ErrorKind::InvalidRequest, "provider_schema_error")),
+        "rate_limit_error" => Some((ErrorKind::RateLimit, "rate_limit_error")),
         _ => None,
     }
 }
@@ -1705,6 +1734,31 @@ mod tests {
         .expect("numeric-code input-overflow envelope");
         assert_eq!(numeric_input_code.kind(), Some(ErrorKind::ContextWindow));
 
+        for (body, normalized_cause) in [
+            (
+                r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            (
+                r#"{"error":{"code":"input_too_long","type":"invalid_request_error","message":"request rejected"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            (
+                r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
+                None,
+            ),
+        ] {
+            let error = StructuredLlmError::parse(body).expect("structured envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::ContextWindow), "{body}");
+            if let Some(normalized_cause) = normalized_cause {
+                assert_eq!(error.code().map(|(_, code)| code), Some(normalized_cause));
+            }
+        }
+
         for body in [
             r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
             r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
@@ -1718,6 +1772,19 @@ mod tests {
                 Some(ErrorKind::ContextWindow),
                 "specific or unrecognized machine facts must not authorize compaction: {body}"
             );
+        }
+    }
+
+    #[test]
+    fn structured_rate_limit_cause_precedes_context_prose() {
+        for message in [
+            "This request would exceed the rate limit of 50,000 input tokens per minute",
+            "Rate limit: too many tokens in the input per minute",
+        ] {
+            let body = serde_json::json!({"error":{"type":"rate_limit_error","message":message}});
+            let error = StructuredLlmError::parse(&body.to_string()).expect("rate-limit envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::RateLimit), "{message}");
+            assert_eq!(error.code().map(|(_, code)| code), Some("rate_limit_error"));
         }
     }
 

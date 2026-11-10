@@ -1218,6 +1218,31 @@ mod tests {
                 2,
             ),
             (
+                r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the rate limit of 50,000 input tokens per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                r#"{"error":{"type":"rate_limit_error","message":"Rate limit: too many tokens in the input per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
                 r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
                 astra_core::ErrorKind::ContextWindow,
                 2,
