@@ -35,12 +35,46 @@ static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 static STARTUP_CANCELLED: AtomicBool = AtomicBool::new(false);
 static PARENT_RELEASED: AtomicBool = AtomicBool::new(false);
-/// The parent disappeared before it accepted readiness. The child must exit.
-static READY_REJECTED: AtomicBool = AtomicBool::new(false);
+/// Epoch of the attempt whose ready byte was written, if any.
+static SENT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A ready byte for `SENT_EPOCH` is in the parent socket.
+static READY_SENT: AtomicBool = AtomicBool::new(false);
 static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState {
     epoch: 0,
     connected: None,
 });
+
+#[derive(Debug)]
+enum StartupAcceptError {
+    /// The starting command closed its end of the readiness socket.
+    ParentGone,
+    /// This attempt left `connected` before the parent accepted it.
+    ConnectionEnded,
+}
+
+impl std::fmt::Display for StartupAcceptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParentGone => write!(
+                formatter,
+                "the starting command is gone; runner startup was not accepted"
+            ),
+            Self::ConnectionEnded => write!(
+                formatter,
+                "the connection ended before startup was accepted"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+fn startup_io_error(error: StartupAcceptError) -> io::Error {
+    let kind = match error {
+        StartupAcceptError::ParentGone => ErrorKind::BrokenPipe,
+        StartupAcceptError::ConnectionEnded => ErrorKind::ConnectionAborted,
+    };
+    io::Error::new(kind, error.to_string())
+}
 
 struct PhaseState {
     epoch: u64,
@@ -153,14 +187,79 @@ pub fn signal_ready_for_epoch(epoch: u64) {
         .ok()
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
-    let ready_fd = std::env::var(READY_FD_ENV)
+    let ready_fd = ready_fd_from_env();
+    if let Err(error) = signal_ready_for_epoch_with(&PHASE_STATE, epoch, dir.as_deref(), ready_fd) {
+        eprintln!("Error: {error}.");
+        std::process::exit(1);
+    }
+}
+
+fn ready_fd_from_env() -> Option<i32> {
+    std::env::var(READY_FD_ENV)
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
-        .filter(|fd| *fd >= 0);
-    signal_ready_for_epoch_with(&PHASE_STATE, epoch, dir.as_deref(), ready_fd);
-    if READY_REJECTED.load(Ordering::SeqCst) {
-        eprintln!("Error: the starting command is gone; runner startup was not accepted.");
-        std::process::exit(1);
+        .filter(|fd| *fd >= 0)
+}
+
+/// The ready byte was published and this process has since left that attempt
+/// without the starting command accepting it.
+pub fn readiness_abandoned() -> bool {
+    READY_SENT.load(Ordering::SeqCst)
+        && !PARENT_RELEASED.load(Ordering::SeqCst)
+        && phase_epoch(&PHASE_STATE) != SENT_EPOCH.load(Ordering::SeqCst)
+}
+
+/// Completes when the starting command's socket is closed before acceptance.
+/// After acceptance the future stays pending: the parent is expected to exit.
+pub async fn until_starting_command_lost() {
+    until_parent_fd_lost(ready_fd_from_env()).await;
+}
+
+async fn until_parent_fd_lost(fd: Option<i32>) {
+    let Some(fd) = fd else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if PARENT_RELEASED.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        match parent_socket_is_closed(fd) {
+            Ok(true) if !PARENT_RELEASED.load(Ordering::SeqCst) => return,
+            Ok(_) => {}
+            Err(_) => {
+                if !PARENT_RELEASED.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn parent_socket_is_closed(fd: i32) -> io::Result<bool> {
+    let mut buf = [0u8; 1];
+    // Peek so the acceptance read still observes the parent's byte.
+    let read = unsafe {
+        nix::libc::recv(
+            fd,
+            buf.as_mut_ptr().cast::<nix::libc::c_void>(),
+            buf.len(),
+            nix::libc::MSG_PEEK | nix::libc::MSG_DONTWAIT,
+        )
+    };
+    if read == 0 {
+        return Ok(true);
+    }
+    if read > 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::Interrupted {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 
@@ -190,36 +289,56 @@ fn signal_ready_for_epoch_with(
     epoch: u64,
     dir: Option<&Path>,
     ready_fd: Option<i32>,
-) {
+) -> Result<(), StartupAcceptError> {
     // Phase publication and the ready byte stay in this critical section.
     // The parent's acknowledgement is waited for only after the guard drops,
     // so a later disconnect can still be recorded while the parent answers.
+    // Acceptance is committed under the lock again, after that answer.
     let pending_ack = {
         let gate = lock_phase(state);
         if gate.epoch != epoch {
-            return;
+            return Ok(());
         }
         if let Some(connected) = gate.connected.as_ref()
             && let Err(error) = connected.lock_exclusive()
         {
             tracing::warn!(target: "astra.edge", error = %error, "cannot publish the connected state");
-            return;
+            return Ok(());
         }
-        publish_connected_ready(dir, ready_fd)
+        publish_connected_ready(dir, ready_fd, epoch)?
     };
-    if let Some(mut channel) = pending_ack {
-        match read_parent_ack(&mut channel) {
-            Ok(()) => PARENT_RELEASED.store(true, Ordering::SeqCst),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra.edge",
-                    error = %error,
-                    "the starting command did not accept readiness"
-                );
-                READY_REJECTED.store(true, Ordering::SeqCst);
-            }
-        }
+    let Some(mut channel) = pending_ack else {
+        return Ok(());
+    };
+    finish_parent_acceptance(state, epoch, &mut channel)
+}
+
+fn finish_parent_acceptance(
+    state: &Mutex<PhaseState>,
+    epoch: u64,
+    channel: &mut File,
+) -> Result<(), StartupAcceptError> {
+    read_parent_ack(channel)?;
+    // Commit only if this attempt is still the connected one. The confirm
+    // byte is written before the lock is released, so a disconnect either
+    // happens first and refuses acceptance, or happens after the parent has
+    // a confirm that was true at that moment.
+    let held = lock_phase(state);
+    if held.epoch != epoch {
+        return Err(StartupAcceptError::ConnectionEnded);
     }
+    PARENT_RELEASED.store(true, Ordering::SeqCst);
+    if let Err(error) = write_confirm(channel) {
+        PARENT_RELEASED.store(false, Ordering::SeqCst);
+        tracing::warn!(
+            target: "astra.edge",
+            error = %error,
+            "the starting command did not accept readiness"
+        );
+        return Err(StartupAcceptError::ParentGone);
+    }
+    drop(held);
+    Ok(())
 }
 
 fn lock_phase(state: &Mutex<PhaseState>) -> std::sync::MutexGuard<'_, PhaseState> {
@@ -228,23 +347,30 @@ fn lock_phase(state: &Mutex<PhaseState>) -> std::sync::MutexGuard<'_, PhaseState
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn publish_connected_ready(dir: Option<&Path>, ready_fd: Option<i32>) -> Option<File> {
+fn publish_connected_ready(
+    dir: Option<&Path>,
+    ready_fd: Option<i32>,
+    epoch: u64,
+) -> Result<Option<File>, StartupAcceptError> {
     if let Some(dir) = dir {
         let _ = write_private(&dir.join("phase"), b"connected");
     }
     static NOTIFIED: Once = Once::new();
-    let mut pending_ack = None;
+    let mut pending_ack = Ok(None);
     NOTIFIED.call_once(|| {
         if let Some(fd) = ready_fd {
+            SENT_EPOCH.store(epoch, Ordering::SeqCst);
+            READY_SENT.store(true, Ordering::SeqCst);
             match write_ready_byte(fd) {
-                Ok(channel) => pending_ack = Some(channel),
+                Ok(channel) => pending_ack = Ok(Some(channel)),
                 Err(error) => {
+                    READY_SENT.store(false, Ordering::SeqCst);
                     tracing::warn!(
                         target: "astra.edge",
                         error = %error,
                         "the starting command did not accept readiness"
                     );
-                    READY_REJECTED.store(true, Ordering::SeqCst);
+                    pending_ack = Err(StartupAcceptError::ParentGone);
                 }
             }
         }
@@ -255,32 +381,96 @@ fn publish_connected_ready(dir: Option<&Path>, ready_fd: Option<i32>) -> Option<
 #[cfg(test)]
 fn notify_parent_ready_fd(fd: i32) -> io::Result<()> {
     let mut channel = write_ready_byte(fd)?;
-    read_parent_ack(&mut channel)
+    read_parent_ack(&mut channel).map_err(startup_io_error)?;
+    write_confirm(&mut channel)
 }
 
 fn write_ready_byte(fd: i32) -> io::Result<File> {
     // The parent owns the other end of this socket. Writing the ready byte
-    // only fills the buffer; acceptance is the byte the parent writes back.
+    // only fills the buffer; acceptance is the byte the parent writes back,
+    // followed by this process confirming it is still that connection.
     let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(b"1")?;
     file.flush()?;
     Ok(file)
 }
 
-fn read_parent_ack(channel: &mut File) -> io::Result<()> {
-    let mut ack = [0u8; 1];
-    match channel.read_exact(&mut ack) {
-        Ok(()) if ack == *b"1" => Ok(()),
-        Ok(()) => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "the starting command did not accept readiness",
-        )),
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(io::Error::new(
-            ErrorKind::BrokenPipe,
-            "the starting command is gone",
-        )),
-        Err(error) => Err(error),
+fn write_confirm(channel: &mut File) -> io::Result<()> {
+    let mut written = false;
+    for _ in 0..50 {
+        match channel.write_all(b"1") {
+            Ok(()) => {
+                written = true;
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let _ = poll_fd(as_fd_raw(channel), nix::libc::POLLOUT, 20);
+            }
+            Err(error) => return Err(error),
+        }
     }
+    if !written {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "the starting command did not accept readiness",
+        ));
+    }
+    channel.flush()
+}
+
+fn read_parent_ack(channel: &mut File) -> Result<(), StartupAcceptError> {
+    set_nonblocking(channel);
+    loop {
+        if shutdown_requested() || readiness_abandoned() {
+            return Err(StartupAcceptError::ConnectionEnded);
+        }
+        let mut ack = [0u8; 1];
+        match channel.read(&mut ack) {
+            Ok(1) if ack == *b"1" => return Ok(()),
+            Ok(1) => {
+                return Err(StartupAcceptError::ParentGone);
+            }
+            Ok(0) | Ok(_) => return Err(StartupAcceptError::ParentGone),
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    || error.kind() == ErrorKind::Interrupted =>
+            {
+                let _ = poll_read(as_fd_raw(channel), 200);
+            }
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                return Err(StartupAcceptError::ParentGone);
+            }
+            Err(_) => return Err(StartupAcceptError::ParentGone),
+        }
+    }
+}
+
+fn set_nonblocking(file: &File) {
+    let _ = nix::fcntl::fcntl(
+        file,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    );
+}
+
+fn poll_read(fd: i32, timeout_ms: i32) -> io::Result<bool> {
+    poll_fd(fd, nix::libc::POLLIN, timeout_ms)
+}
+
+fn poll_fd(fd: i32, events: i16, timeout_ms: i32) -> io::Result<bool> {
+    let mut fds = [nix::libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }];
+    let ready = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(ready > 0)
 }
 
 fn readiness_channel() -> io::Result<(File, File)> {
@@ -348,7 +538,10 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
             return 1;
         }
     };
-    let _start_guard = Unlock(&start);
+    // Released once the child owns `instance.lock`, so `stop` can signal that
+    // process without waiting for authentication. Until then this guard still
+    // covers directory publication.
+    let mut start_guard = Some(Unlock(&start));
     match lock_names_file(&dir, &start) {
         Ok(true) => {}
         Ok(false) => {
@@ -383,7 +576,9 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
         eprintln!("Error: cannot record runner state: {error}");
         return 1;
     }
-    match spawn_and_wait(executable, args, &dir, &identity.workspace) {
+    match spawn_and_wait(executable, args, &dir, &identity.workspace, &mut || {
+        start_guard.take();
+    }) {
         Ok(()) => {
             print_connected(executable, &identity.edge_id, &identity.server_url);
             0
@@ -616,6 +811,7 @@ fn spawn_and_wait(
     args: &[String],
     dir: &Path,
     workspace: &Path,
+    release_start: &mut dyn FnMut(),
 ) -> Result<(), String> {
     let startup = StartupCancel::arm().map_err(|error| error.to_string())?;
     let args = command_with_workspace(args, workspace);
@@ -638,28 +834,47 @@ fn spawn_and_wait(
         .map_err(|error| format!("cannot start the background runner: {error}"))?;
     drop(child_fd);
     let mut channel = parent_fd;
-    if let Err(error) = wait_for_ready(&mut child, &mut channel, READY_TIMEOUT, startup.flag()) {
+    if let Err(error) = wait_for_ready_in(
+        &mut child,
+        &mut channel,
+        READY_TIMEOUT,
+        startup.flag(),
+        Some(dir),
+        release_start,
+    ) {
         kill_child(&mut child);
         return Err(error);
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn wait_for_ready(
     child: &mut Child,
     channel: &mut File,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    let raw = as_fd_raw(channel);
-    let _ = nix::fcntl::fcntl(
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) },
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    );
+    wait_for_ready_in(child, channel, timeout, cancelled, None, &mut || {})
+}
+
+fn wait_for_ready_in(
+    child: &mut Child,
+    channel: &mut File,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    dir: Option<&Path>,
+    release_start: &mut dyn FnMut(),
+) -> Result<(), String> {
+    set_nonblocking(channel);
     let started = Instant::now();
+    let deadline = started + timeout;
     loop {
+        release_start_if_running(dir, release_start);
         match read_ready_byte(channel)? {
-            ReadyByte::Ready => return accept_parent_ready(child, channel, cancelled),
+            ReadyByte::Ready => {
+                return accept_parent_ready(child, channel, cancelled, dir, deadline);
+            }
             ReadyByte::Pending => {}
         }
         if cancelled.load(Ordering::Relaxed) {
@@ -672,14 +887,20 @@ fn wait_for_ready(
             // A byte left in the pipe by a child that has already exited is
             // not a running runner.
             if read_ready_byte(channel)? == ReadyByte::Ready {
-                return accept_parent_ready(child, channel, cancelled);
+                return accept_parent_ready(child, channel, cancelled, dir, deadline);
             }
             return Err(format!("runner exited before it was ready ({status})"));
         }
-        if started.elapsed() > timeout {
+        if Instant::now() >= deadline {
             return Err("timed out waiting for the runner to authenticate".into());
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn release_start_if_running(dir: Option<&Path>, release_start: &mut dyn FnMut()) {
+    if dir.is_some_and(|dir| matches!(instance_is_locked(dir), Ok(true))) {
+        release_start();
     }
 }
 
@@ -693,12 +914,40 @@ fn accept_parent_ready(
     child: &mut Child,
     channel: &mut File,
     cancelled: &AtomicBool,
+    dir: Option<&Path>,
+    deadline: Instant,
 ) -> Result<(), String> {
     accept_ready(child, cancelled)?;
+    if let Some(dir) = dir {
+        match phase_label(dir) {
+            Ok(phase) if phase == "connected" => {}
+            Ok(phase) => {
+                return Err(format!(
+                    "runner is {phase}; the starting command did not accept readiness"
+                ));
+            }
+            Err(error) => return Err(format!("cannot inspect the runner: {error}")),
+        }
+    }
     channel
         .write_all(b"1")
         .and_then(|()| channel.flush())
-        .map_err(|error| format!("cannot accept runner readiness: {error}"))
+        .map_err(|error| format!("cannot accept runner readiness: {error}"))?;
+    read_confirm(channel, deadline)
+}
+
+fn read_confirm(channel: &mut File, deadline: Instant) -> Result<(), String> {
+    loop {
+        match read_ready_byte(channel)? {
+            ReadyByte::Ready => return Ok(()),
+            ReadyByte::Pending => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for the runner to authenticate".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 fn accept_ready(child: &mut Child, cancelled: &AtomicBool) -> Result<(), String> {
@@ -1717,9 +1966,23 @@ fn rotate_log(path: &Path) -> io::Result<()> {
 }
 
 fn rotate_log_file(path: &Path, limit: u64) -> io::Result<Option<File>> {
+    rotate_log_file_opening(path, limit, open_log_append)
+}
+
+fn open_log_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn rotate_log_file_opening(
+    path: &Path,
+    limit: u64,
+    mut open_replacement: impl FnMut(&Path) -> io::Result<File>,
+) -> io::Result<Option<File>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        // A previous rotation can rename the live file and then fail to create
+        // its replacement. The archived inode is still the current log.
+        Err(error) if error.kind() == ErrorKind::NotFound => return restore_current_log(path),
         Err(error) => return Err(error),
     };
     if metadata.len() <= limit {
@@ -1727,10 +1990,28 @@ fn rotate_log_file(path: &Path, limit: u64) -> io::Result<Option<File>> {
     }
     let rotated = path.with_extension("log.1");
     let _ = std::fs::remove_file(&rotated);
-    std::fs::rename(path, rotated)?;
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    set_mode(path, 0o600);
-    Ok(Some(file))
+    std::fs::rename(path, &rotated)?;
+    match open_replacement(path) {
+        Ok(file) => {
+            set_mode(path, 0o600);
+            Ok(Some(file))
+        }
+        Err(error) => {
+            // Put the archived inode back so the next attempt can rotate it.
+            // Stdout still refers to that inode until redirection succeeds.
+            let _ = std::fs::rename(&rotated, path);
+            Err(error)
+        }
+    }
+}
+
+fn restore_current_log(path: &Path) -> io::Result<Option<File>> {
+    let rotated = path.with_extension("log.1");
+    if !rotated.exists() {
+        return Ok(None);
+    }
+    std::fs::rename(&rotated, path)?;
+    Ok(None)
 }
 
 /// Runs on the runner's tokio runtime; no dedicated thread.
@@ -1744,11 +2025,64 @@ pub fn spawn_log_rotator() {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if let Ok(Some(file)) = rotate_log_file(&log, LOG_ROTATE_BYTES) {
-                let _ = redirect_log_fd(&file);
+            match rotate_log_file(&log, LOG_ROTATE_BYTES) {
+                Ok(Some(file)) => {
+                    if let Err(error) = redirect_log_fd(&file) {
+                        tracing::warn!(
+                            target: "astra.edge",
+                            error = %error,
+                            "cannot switch the runner log; rotation will be retried"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    if let Err(error) = redirect_stdio_if_different(&log) {
+                        tracing::warn!(
+                            target: "astra.edge",
+                            error = %error,
+                            "cannot point the runner log at the current file"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra.edge",
+                        error = %error,
+                        "cannot rotate the runner log; it will be retried"
+                    );
+                }
             }
         }
     });
+}
+
+fn redirect_stdio_if_different(path: &Path) -> io::Result<()> {
+    let _ = redirect_fd_if_different(1, path)?;
+    let _ = redirect_fd_if_different(2, path)?;
+    Ok(())
+}
+
+fn redirect_fd_if_different(fd: i32, path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file = OpenOptions::new().append(true).read(true).open(path)?;
+    let desired = file.metadata()?;
+    let (device, inode) = fd_identity(fd)?;
+    if device == desired.dev() && inode == desired.ino() {
+        return Ok(false);
+    }
+    let result = unsafe { nix::libc::dup2(as_fd_raw(&file), fd) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+fn fd_identity(fd: i32) -> io::Result<(u64, u64)> {
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let stat = nix::sys::stat::fstat(borrowed).map_err(io_error)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 fn redirect_log_fd(file: &File) -> io::Result<()> {
@@ -1820,6 +2154,7 @@ impl Drop for Unlock<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     fn args(parts: &[&str]) -> Vec<String> {
@@ -2032,6 +2367,52 @@ mod tests {
         assert!(lines.last().unwrap().contains("line-0999"));
     }
 
+    #[test]
+    fn a_failed_log_replacement_keeps_the_current_file_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("edge.log");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let error = rotate_log_file_opening(&path, 3, |_| Err(io::Error::from_raw_os_error(24)))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(24));
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+        assert!(!path.with_extension("log.1").exists());
+        let rotated = rotate_log_file(&path, 3).unwrap().unwrap();
+        drop(rotated);
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"0123456789"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_missing_current_log_is_restored_from_the_rotated_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("edge.log");
+        std::fs::write(path.with_extension("log.1"), b"still-growing").unwrap();
+        assert!(rotate_log_file(&path, 3).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"still-growing");
+        assert!(!path.with_extension("log.1").exists());
+    }
+
+    #[test]
+    fn stdio_follows_the_current_log_after_a_failed_redirection() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("edge.log");
+        let archived = root.path().join("edge.log.1");
+        std::fs::write(&archived, b"old").unwrap();
+        std::fs::write(&current, b"new").unwrap();
+        let old = File::open(&archived).unwrap();
+        let fd = as_fd_raw(&old);
+        assert!(redirect_fd_if_different(fd, &current).unwrap());
+        let (device, inode) = fd_identity(fd).unwrap();
+        let desired = std::fs::metadata(&current).unwrap();
+        assert_eq!(device, desired.dev());
+        assert_eq!(inode, desired.ino());
+        assert!(!redirect_fd_if_different(fd, &current).unwrap());
+    }
+
     #[tokio::test]
     async fn cancellation_interrupts_pending_work() {
         let token = CancellationToken::new();
@@ -2074,7 +2455,15 @@ mod tests {
                     Ok(1) => {
                         parent.write_all(b"1").unwrap();
                         parent.flush().unwrap();
-                        return;
+                        let mut confirm = [0u8; 1];
+                        let confirm_started = Instant::now();
+                        loop {
+                            match parent.read(&mut confirm) {
+                                Ok(1) => return,
+                                _ if confirm_started.elapsed() > Duration::from_secs(2) => return,
+                                _ => std::thread::sleep(Duration::from_millis(10)),
+                            }
+                        }
                     }
                     _ if started.elapsed() > Duration::from_secs(2) => return,
                     _ => std::thread::sleep(Duration::from_millis(10)),
@@ -2082,16 +2471,17 @@ mod tests {
             }
         });
         let epoch = phase_epoch(&state);
-        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), Some(raw));
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), Some(raw))
+            .expect("current readiness is accepted");
         acker.join().unwrap();
         note_phase_with(&state, root.path(), "reconnecting");
-        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None);
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("phase")).unwrap(),
             "reconnecting"
         );
         let epoch = phase_epoch(&state);
-        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None);
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("phase")).unwrap(),
             "connected"
@@ -2110,7 +2500,7 @@ mod tests {
         let callback_state = std::sync::Arc::clone(&state);
         let dir = root.path().to_path_buf();
         let callback = std::thread::spawn(move || {
-            signal_ready_for_epoch_with(&callback_state, epoch, Some(&dir), None);
+            signal_ready_for_epoch_with(&callback_state, epoch, Some(&dir), None).unwrap();
         });
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -2142,7 +2532,7 @@ mod tests {
         let dir = root.path().to_path_buf();
         tokio::spawn(async move {
             if receiver.await.is_ok() {
-                signal_ready_for_epoch_with(&task_state, epoch, Some(&dir), None);
+                signal_ready_for_epoch_with(&task_state, epoch, Some(&dir), None).unwrap();
             }
             let _ = done_sender.send(());
         });
@@ -2164,7 +2554,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("printf 1; sleep 30")
+            .arg("printf 1 >&1; dd bs=1 count=1 of=/dev/null <&1 >/dev/null 2>/dev/null; printf 1 >&1; sleep 30")
             .env(READY_FD_ENV, "1")
             .stdout(Stdio::from(child_fd));
         let mut child = command.spawn().unwrap();
@@ -2326,6 +2716,7 @@ mod tests {
     const HOLD_DIR_ENV: &str = "ASTRA_EDGE_TEST_HOLD_DIR";
     const HOLD_CONNECTED_ENV: &str = "ASTRA_EDGE_TEST_HOLD_CONNECTED";
     const HOLD_DELAY_ENV: &str = "ASTRA_EDGE_TEST_HOLD_DELAY_MS";
+    const HOLD_READY_DELAY_ENV: &str = "ASTRA_EDGE_TEST_HOLD_READY_DELAY_MS";
     const HOLDER_TEST: &str = "managed_background::tests::runner_lock_holder";
     const HOLDER_READY: &str = "astra-edge-test-holder-ready";
 
@@ -2356,6 +2747,12 @@ mod tests {
         let connected = open_lock_file(&dir.join("connected.lock")).unwrap();
         if std::env::var(HOLD_CONNECTED_ENV).as_deref() != Ok("0") {
             connected.lock_exclusive().unwrap();
+        }
+        if let Some(delay) = std::env::var(HOLD_READY_DELAY_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(delay));
         }
         if let Some(fd) = std::env::var(READY_FD_ENV)
             .ok()
@@ -2439,12 +2836,21 @@ mod tests {
     /// A stand-in runner executable for `supervise`: it records its argv and
     /// then owns the runner's locks, connected, and reports readiness.
     fn holder_executable(root: &Path, name: &str, delay_ms: u64) -> (PathBuf, PathBuf) {
+        holder_executable_with(root, name, delay_ms, 0)
+    }
+
+    fn holder_executable_with(
+        root: &Path,
+        name: &str,
+        delay_ms: u64,
+        ready_delay_ms: u64,
+    ) -> (PathBuf, PathBuf) {
         let argv_log = root.join(format!("{name}.argv"));
         let script = root.join(name);
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {argv}\n{HOLD_DIR_ENV}=\"$ASTRA_EDGE_STATE_DIR\" {HOLD_DELAY_ENV}={delay_ms} exec {exe} {HOLDER_TEST} --exact --nocapture --test-threads=1\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {argv}\n{HOLD_DIR_ENV}=\"$ASTRA_EDGE_STATE_DIR\" {HOLD_DELAY_ENV}={delay_ms} {HOLD_READY_DELAY_ENV}={ready_delay_ms} exec {exe} {HOLDER_TEST} --exact --nocapture --test-threads=1\n",
                 argv = shell_quote(&argv_log.display().to_string()),
                 exe = shell_quote(&std::env::current_exe().unwrap().display().to_string()),
             ),
@@ -2538,7 +2944,7 @@ mod tests {
             connected: Some(open_lock_file(&dir.join("connected.lock")).unwrap()),
         });
         let epoch = phase_epoch(&state);
-        signal_ready_for_epoch_with(&state, epoch, Some(dir), None);
+        signal_ready_for_epoch_with(&state, epoch, Some(dir), None).unwrap();
         assert_eq!(phase_label(dir).unwrap(), "connected");
         set_mode(dir, 0o500);
         let restore = RestoreMode(dir.to_path_buf(), 0o700);
@@ -2684,13 +3090,58 @@ mod tests {
                 "https://example.test",
             ],
         );
-        assert_eq!(start.join().unwrap(), 0);
+        let start_code = start.join().unwrap();
         assert_eq!(stopped, 0);
         assert_eq!(
             instance_owner(&dir).unwrap(),
             None,
             "a runner started during stop remained running"
         );
+        assert!(
+            start_code == 0 || start_code == 1,
+            "start exited {start_code}"
+        );
+    }
+
+    #[test]
+    fn stop_does_not_wait_for_authentication_once_the_runner_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let (slow, _) = holder_executable_with(root.path(), "slow-ready.sh", 0, 5_000);
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        let _cleanup = KillOwner(dir.clone());
+        let start_root = root.path().to_path_buf();
+        let start = std::thread::spawn(move || supervise(&slow, &command, &start_root));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !instance_is_locked(&dir).unwrap_or(false) || start_lock_is_held(&dir).unwrap_or(true)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "startup did not release its lock after the runner existed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        let stopped = management(
+            root.path(),
+            &[
+                "stop",
+                "--edge-id",
+                "runner-abc",
+                "--server-url",
+                "https://example.test",
+            ],
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop waited for authentication"
+        );
+        assert_eq!(stopped, 0);
+        assert_ne!(start.join().unwrap(), 0);
+        assert_eq!(instance_owner(&dir).unwrap(), None);
     }
 
     #[test]
@@ -2867,7 +3318,13 @@ mod tests {
         );
         assert_eq!(status.join().unwrap(), 0);
         assert_eq!(first.join().unwrap(), 0);
-        assert_eq!(duplicate.join().unwrap(), 0);
+        // The duplicate may observe the runner as soon as it owns its process,
+        // which can be before the first command has accepted readiness.
+        let duplicate_code = duplicate.join().unwrap();
+        assert!(
+            duplicate_code == 0 || duplicate_code == 1,
+            "duplicate start exited {duplicate_code}"
+        );
     }
 
     #[test]
@@ -3078,6 +3535,83 @@ mod tests {
         drop(parent);
         let error = worker.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_buffered_ready_byte_is_refused_when_the_connection_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let _runner = Holder::spawn(dir, false);
+        write_private(&dir.join("phase"), b"reconnecting").unwrap();
+        let (mut parent, mut child_end) = readiness_channel().unwrap();
+        child_end.write_all(b"1").unwrap();
+        child_end.flush().unwrap();
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let error = wait_for_ready_in(
+            &mut sleeper,
+            &mut parent,
+            Duration::from_secs(2),
+            &AtomicBool::new(false),
+            Some(dir),
+            &mut || {},
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("reconnecting"),
+            "a stale ready byte was accepted: {error}"
+        );
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    #[test]
+    fn an_acknowledgement_after_disconnect_does_not_accept_startup() {
+        let state = Mutex::new(PhaseState {
+            epoch: 0,
+            connected: None,
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (mut parent, child) = readiness_channel().unwrap();
+        let raw = as_fd_raw(&child);
+        std::mem::forget(child);
+        let epoch = phase_epoch(&state);
+        let worker = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let mut channel = unsafe { File::from_raw_fd(raw) };
+                finish_parent_acceptance(&state, epoch, &mut channel)
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            note_phase_with(&state, root.path(), "reconnecting");
+            parent.write_all(b"1").unwrap();
+            parent.flush().unwrap();
+            handle.join().expect("acceptance task panicked")
+        });
+        assert!(
+            matches!(worker, Err(StartupAcceptError::ConnectionEnded)),
+            "startup was accepted after the connection ended: {worker:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_starting_command_is_observed_before_acceptance() {
+        let (parent, child) = readiness_channel().unwrap();
+        let raw = as_fd_raw(&child);
+        std::mem::forget(child);
+        let waiting = tokio::spawn(async move {
+            loop {
+                if parent_socket_is_closed(raw).unwrap_or(true) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(parent);
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("parent loss was not observed")
+            .unwrap();
     }
 
     #[test]

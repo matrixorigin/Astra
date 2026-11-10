@@ -710,7 +710,13 @@ fn managed_ready_sender() -> Option<tokio::sync::oneshot::Sender<()>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if receiver.await.is_ok() {
-            managed_background::signal_ready_for_epoch(epoch);
+            // The acknowledgement read waits for the starting command. Keep
+            // that wait off the runtime so a suspended parent cannot stall
+            // connection timers, and so shutdown can end it.
+            let _ = tokio::task::spawn_blocking(move || {
+                managed_background::signal_ready_for_epoch(epoch);
+            })
+            .await;
         }
     });
     Some(sender)
@@ -1104,13 +1110,25 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        match run_edge_connection(config).instrument(edge_span).await {
+        let connect_result = tokio::select! {
+            biased;
+            _ = managed_background::until_starting_command_lost() => {
+                eprintln!(
+                    "Error: the starting command is gone; runner startup was not accepted."
+                );
+                return true;
+            }
+            result = run_edge_connection(config).instrument(edge_span) => result,
+        };
+        match connect_result {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
                 if !config.reconnect || managed_background::shutdown_requested() {
                     return false;
                 }
-                managed_background::note_phase("reconnecting");
+                if abandon_unaccepted("reconnecting") {
+                    return true;
+                }
                 tracing::info!(
                     delay = reconnect_delay_secs,
                     "Disconnected, reconnecting..."
@@ -1142,7 +1160,9 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
                                 delay = reconnect_delay_secs,
                                 "Authentication failed — retrying once the handed-off credential is readable"
                             );
-                            managed_background::note_phase("reconnecting");
+                            if abandon_unaccepted("reconnecting") {
+                                return true;
+                            }
                         }
                         Handoff::None => {
                             // The previous credential may be revoked (e.g. a
@@ -1174,7 +1194,9 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
                     if !config.reconnect {
                         return true;
                     }
-                    managed_background::note_phase("reconnecting");
+                    if abandon_unaccepted("reconnecting") {
+                        return true;
+                    }
                     tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
                 }
             }
@@ -1182,16 +1204,29 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
         // Exponential backoff with jitter
         // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
         let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
-        if managed_background::until_cancelled(
-            &managed_background::connection_shutdown(),
-            tokio::time::sleep(Duration::from_secs_f64(jitter)),
-        )
-        .await
-        .is_err()
-        {
-            return false;
+        let shutdown = managed_background::connection_shutdown();
+        tokio::select! {
+            biased;
+            _ = managed_background::until_starting_command_lost() => {
+                eprintln!(
+                    "Error: the starting command is gone; runner startup was not accepted."
+                );
+                return true;
+            }
+            _ = shutdown.cancelled() => return false,
+            _ = tokio::time::sleep(Duration::from_secs_f64(jitter)) => {}
         }
         reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
+    }
+}
+
+fn abandon_unaccepted(phase: &str) -> bool {
+    managed_background::note_phase(phase);
+    if managed_background::readiness_abandoned() {
+        eprintln!("Error: the connection ended before startup was accepted.");
+        true
+    } else {
+        false
     }
 }
 
