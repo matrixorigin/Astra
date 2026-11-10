@@ -924,9 +924,8 @@ pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
     ClassifiedError, ErrorKind, StructuredLlmError, ToolFailureCause, ToolFailureEvidence,
-    ToolRecoveryAction, classify_llm_error_message, classify_model_resolution_error_message,
-    classify_tool_output, is_llm_context_window_error, llm_error_envelope_code_class,
-    validated_llm_provider_request_id,
+    ToolRecoveryAction, classify_model_resolution_error_message, classify_tool_output,
+    llm_error_envelope_code_class, validated_llm_provider_request_id,
 };
 pub use observation::{
     EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

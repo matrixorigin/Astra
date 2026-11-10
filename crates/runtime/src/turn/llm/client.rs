@@ -6794,7 +6794,7 @@ async fn call_prepared_llm_attempts(
             );
             Some(ProviderHttpRejection {
                 classified: astra_core::ClassifiedError::new(
-                    provider_http_error_kind_with_projection(status, body_facts, &text),
+                    provider_http_error_kind_with_projection(status, body_facts, None),
                     message,
                 )
                 .with_details_json(
@@ -6837,8 +6837,8 @@ async fn call_prepared_llm_attempts(
 
         // For other 4xx errors, suppress the raw response body to avoid
         // leaking secrets that providers may echo back. Retain body for 5xx
-        // (helpful for diagnosing transient backend failures) and the 400
-        // context-window check below (which still needs to inspect text).
+        // (helpful for diagnosing transient backend failures); recovery never
+        // inspects provider prose.
         let base_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
@@ -6933,9 +6933,7 @@ async fn call_prepared_llm_attempts(
         // Every ordinary-provider terminal response consumes the same kind
         // owner as Responses and the non-stream adapter. Unnegotiated gateway
         // bodies contribute no prose or structured facts to this decision.
-        let classification_body = if ordinary_provider { &text } else { "" };
-        let kind =
-            provider_http_error_kind_with_projection(status, body_facts, classification_body);
+        let kind = provider_http_error_kind_with_projection(status, body_facts, None);
         let error = attach_provider_request_id(
             astra_core::ClassifiedError::new(kind, last_err),
             status,
@@ -8783,7 +8781,7 @@ async fn call_llm_nonstream_attempts(
             return Err(error);
         }
         let kind = if ordinary_provider {
-            provider_http_error_kind_with_projection(status, structured_body.as_ref(), &text)
+            provider_http_error_kind_with_projection(status, structured_body.as_ref(), None)
         } else {
             provider_http_error_kind(status, "")
         };
@@ -8791,12 +8789,19 @@ async fn call_llm_nonstream_attempts(
             format!("LLM request rejected: {status}")
         } else if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
+        } else if structured_body.is_some() {
+            format!("LLM request rejected: {status}")
         } else {
             let detail = redact_provider_secrets(&text);
             let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
             format!("LLM non-stream request error {status}: {detail}")
         };
         let message = provider_http_rejection_message(status, structured_body.as_ref(), message);
+        let message = if let Some(structured) = structured_body.as_ref() {
+            append_envelope_cause(message, structured.code(), response_request_id.as_deref())
+        } else {
+            message
+        };
         let error = attach_provider_request_id(
             astra_core::ClassifiedError::new(kind, message),
             status,
@@ -9221,15 +9226,15 @@ fn provider_http_rejection_message(
 }
 
 /// Canonical HTTP recovery classification shared by inference protocols.
-fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
-    let structured = astra_core::StructuredLlmError::parse(body);
-    provider_http_error_kind_with_projection(status, structured.as_ref(), body)
+fn provider_http_error_kind(status: u16, body_or_code: &str) -> astra_core::ErrorKind {
+    let structured = astra_core::StructuredLlmError::parse(body_or_code);
+    provider_http_error_kind_with_projection(status, structured.as_ref(), Some(body_or_code))
 }
 
 fn provider_http_error_kind_with_projection(
     status: u16,
     structured: Option<&astra_core::StructuredLlmError>,
-    body: &str,
+    normalized_code: Option<&str>,
 ) -> astra_core::ErrorKind {
     use astra_core::ErrorKind;
     if status == 401 {
@@ -9244,16 +9249,15 @@ fn provider_http_error_kind_with_projection(
         // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
         // byte limit is a request-size problem, never context overflow.
         kind
-    } else if status == 400
-        && !structured.is_some_and(|error| error.has_facts())
-        && astra_core::is_llm_context_window_error(body)
+    } else if let Some((kind, _)) =
+        normalized_code.and_then(astra_core::llm_error_envelope_code_class)
     {
-        // Unrecognized structured causes remain bounded by HTTP status;
-        // unstructured upstreams retain the existing prose fallback.
-        ErrorKind::ContextWindow
+        // Responses and subscription failures may already hold a normalized
+        // protocol code instead of a raw envelope. It remains a typed fact.
+        kind
     } else if matches!(status, 400 | 413) {
-        // HTTP 413 is a terminal request-size rejection even for HTML bodies;
-        // it is neither model context overflow nor a retryable server fault.
+        // Unknown and prose-only causes remain bounded by HTTP status. HTTP
+        // 413 is a terminal request-size rejection even for HTML bodies.
         ErrorKind::InvalidRequest
     } else {
         ErrorKind::Unknown
@@ -19809,13 +19813,13 @@ mod tests {
         .await
         .expect_err("unrecognized structured cause must fail the non-stream call");
         // Even maximal context-window prose does not authorize compaction for
-        // an unrecognized structured family; only an explicit overflow code
-        // or the shared generic-family input-overflow semantics may do that.
+        // an unrecognized structured family; only an explicit typed overflow
+        // protocol cause may do that.
         assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
     }
 
     #[tokio::test]
-    async fn generic_input_context_overflow_is_recoverable_in_both_http_adapters() {
+    async fn generic_provider_prose_is_bounded_without_losing_request_id() {
         const REQUEST_ID: &str = "req_011CSHoEeqs5C35K2UUqR7Fy";
         const ANTHROPIC_WITH_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#;
         const ANTHROPIC_WITHOUT_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"}}"#;
@@ -19846,8 +19850,8 @@ mod tests {
                 let error = provider_http_error(&base, provider, streaming).await;
                 assert_eq!(
                     error.kind,
-                    astra_core::ErrorKind::ContextWindow,
-                    "provider={provider}, streaming={streaming}"
+                    astra_core::ErrorKind::InvalidRequest,
+                    "provider prose must not drive recovery: provider={provider}, streaming={streaming}"
                 );
                 if correlated {
                     assert!(
@@ -19870,11 +19874,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn numeric_code_distinguishes_input_overflow_from_output_limit_in_both_http_adapters() {
+    async fn numeric_code_does_not_turn_provider_prose_into_recovery() {
         for (body, expected_kind) in [
             (
                 r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
-                astra_core::ErrorKind::ContextWindow,
+                astra_core::ErrorKind::InvalidRequest,
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
@@ -19950,14 +19954,14 @@ mod tests {
             (
                 400,
                 r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::ContextWindow,
+                astra_core::ErrorKind::InvalidRequest,
                 None,
                 false,
             ),
             (
                 400,
                 r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::ContextWindow,
+                astra_core::ErrorKind::InvalidRequest,
                 None,
                 false,
             ),
@@ -20003,14 +20007,12 @@ mod tests {
                     _ => responses_http_error(&base).await,
                 };
                 assert_eq!(error.kind, expected_kind, "{transport}: {body}");
-                if transport != "chat-nonstream" {
-                    if let Some(normalized_cause) = normalized_cause {
-                        assert!(
-                            error.message.contains(normalized_cause),
-                            "{transport} must expose only the normalized cause: {}",
-                            error.message
-                        );
-                    }
+                if let Some(normalized_cause) = normalized_cause {
+                    assert!(
+                        error.message.contains(normalized_cause),
+                        "{transport} must expose only the normalized cause: {}",
+                        error.message
+                    );
                 }
                 if expect_size_guidance {
                     assert!(
@@ -20021,6 +20023,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bare_protocol_code_preserves_typed_recovery() {
+        assert_eq!(
+            provider_http_error_kind(400, "context_length_exceeded"),
+            astra_core::ErrorKind::ContextWindow
+        );
+        assert_eq!(
+            provider_http_error_kind(413, "request_body_too_large"),
+            astra_core::ErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            provider_http_error_kind(500, "context_length_exceeded"),
+            astra_core::ErrorKind::ServerError
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_recovery_requires_typed_overflow_facts() {
+        for (status, body, expected_kind) in [
+            (
+                413,
+                r#"{"error":{"type":"invalid_request_error","message":"Request body too large for this gateway; reduce the context window payload."}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"The context window setting is not supported by this model"}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                400,
+                "This model's maximum context length is 128000 tokens",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"context_length_exceeded","message":"request rejected"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+            ),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/chat/completions",
+                    post(move || async move {
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }),
+                )
+                .route(
+                    "/responses",
+                    post(move || async move {
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }),
+                );
+            let base = spawn_local_http_server(app).await;
+            for transport in ["chat-nonstream", "chat-stream", "responses-stream"] {
+                let error = match transport {
+                    "chat-nonstream" => provider_http_error(&base, "openai", false).await,
+                    "chat-stream" => provider_http_error(&base, "openai", true).await,
+                    _ => responses_http_error(&base).await,
+                };
+                assert_eq!(error.kind, expected_kind, "{transport}: {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_structured_rejection_uses_bounded_projection() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Response::builder()
+                    .status(413)
+                    .body(Body::from(
+                        r#"{"error":{"code":"request_body_too_large","message":"fixture-private-session-material","request_id":"req_0123456789abcdef"}}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let error = provider_http_error(&base, "openai", false).await;
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(error.message.contains("request_body_too_large"));
+        assert!(error.message.contains("req_0123456789abcdef"));
+        assert!(
+            !error.message.contains("fixture-private-session-material"),
+            "structured provider text must not cross the non-stream boundary: {}",
+            error.message
+        );
+        let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["http_status"], 413);
+        assert_eq!(details["request_id"], "req_0123456789abcdef");
     }
 
     #[tokio::test]

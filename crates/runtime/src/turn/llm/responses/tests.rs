@@ -224,7 +224,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter"}}))).into_response();
             }
             if body["input"].to_string().contains("context failure") {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"maximum context length secret provider detail"}}))).into_response();
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"context_length_exceeded","message":"maximum context length secret provider detail"}}))).into_response();
             }
             if body["input"].to_string().contains("billing failure") {
                 return (StatusCode::PAYMENT_REQUIRED, Json(json!({"error":{"code":"insufficient_credit"}}))).into_response();

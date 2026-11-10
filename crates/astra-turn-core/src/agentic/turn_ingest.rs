@@ -330,7 +330,7 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(err) = snap.error_message {
         // Use pre-classified error_kind when available (from HostTurnResult),
-        // falling back to string-based classification for SSE-path errors.
+        // falling back to the typed provider-envelope projection for SSE errors.
         let kind = if let Some(k) = snap.error_kind {
             if k == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
@@ -340,21 +340,13 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            // Parse once at the provider boundary. Structured facts own their
-            // recovery semantics; genuinely unstructured messages use the
-            // existing classifier, whose rate-limit precedence prevents broad
-            // context prose from stealing a 429 recovery outcome.
-            let structured = astra_core::StructuredLlmError::parse(err);
-            let kind = structured
+            // Recovery requires typed provider facts. Unknown, unstructured,
+            // and prose-only failures stay Unknown instead of guessing a
+            // context transition from provider-controlled text.
+            let kind = astra_core::StructuredLlmError::parse(err)
                 .as_ref()
                 .and_then(|error| error.kind())
-                .unwrap_or_else(|| {
-                    if structured.as_ref().is_some_and(|error| error.has_facts()) {
-                        astra_core::ErrorKind::Unknown
-                    } else {
-                        astra_core::classify_llm_error_message(err)
-                    }
-                });
+                .unwrap_or(astra_core::ErrorKind::Unknown);
             if kind == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
@@ -1109,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn fatal_context_window_increments_ptl_streak() {
+    fn fatal_preclassified_context_window_increments_ptl_streak() {
         let err = Some("prompt is too long".to_string());
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
@@ -1127,7 +1119,7 @@ mod tests {
             current_request_usage: None,
             has_usage: true,
             error_message: &err,
-            error_kind: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 1;
@@ -1209,13 +1201,13 @@ mod tests {
         for (message, expected_kind, expected_streak) in [
             (
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                astra_core::ErrorKind::Unknown,
+                0,
             ),
             (
                 r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                astra_core::ErrorKind::Unknown,
+                0,
             ),
             (
                 r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
@@ -1224,13 +1216,13 @@ mod tests {
             ),
             (
                 r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                astra_core::ErrorKind::InvalidRequest,
+                0,
             ),
             (
                 r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                astra_core::ErrorKind::Unknown,
+                0,
             ),
             (
                 r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the rate limit of 50,000 input tokens per minute"}}"#,
@@ -1244,8 +1236,8 @@ mod tests {
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                astra_core::ErrorKind::Unknown,
+                0,
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
@@ -1258,15 +1250,21 @@ mod tests {
                 0,
             ),
             (
-                "429 rate limit: too many tokens per minute",
+                r#"{"error":{"code":429,"message":"Too many tokens in the input per minute"}}"#,
                 astra_core::ErrorKind::RateLimit,
                 0,
             ),
             (
-                "prompt is too long",
-                astra_core::ErrorKind::ContextWindow,
-                2,
+                r#"{"error":{"code":429,"type":"invalid_request","message":"Too many tokens in the input per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
             ),
+            (
+                "429 rate limit: too many tokens per minute",
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+            ("prompt is too long", astra_core::ErrorKind::Unknown, 0),
         ] {
             let mut accum = ChatTurnSseAccum::default();
             crate::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
@@ -1326,21 +1324,11 @@ mod tests {
     }
 
     #[test]
-    fn fatal_unclassified_error_uses_core_llm_classifier() {
-        let cases = [
-            (
-                "Error: pool timed out while waiting for an open connection",
-                astra_core::ErrorKind::ConnectionPoolExhausted,
-            ),
-            (
-                "Error: Could not validate credentials",
-                astra_core::ErrorKind::Auth,
-            ),
-            (
-                "The security token included in the request is expired",
-                astra_core::ErrorKind::Auth,
-            ),
-        ];
+    fn fatal_unstructured_error_is_unknown() {
+        let cases = [(
+            "Error: Could not validate credentials",
+            astra_core::ErrorKind::Unknown,
+        )];
 
         for (message, expected_kind) in cases {
             let err = Some(message.to_string());
@@ -2032,7 +2020,7 @@ mod tests {
             current_request_usage: None,
             has_usage: true,
             error_message: &err_msg,
-            error_kind: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
         };
         let outcome = ingest_agentic_turn_stream(&snap, "", pack.ingest_mut());
         assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
