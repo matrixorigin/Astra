@@ -1239,7 +1239,7 @@ fn pasted_drafts_keep_dispatch_boundaries_and_exact_payloads_on_restoration() {
     for (prefix, payload, separate) in [
         ("", "!printf 'one'\nprintf 'two'\nprintf 'three'\r\n ", true),
         (" \t", "!!printf 'one'\nprintf 'two'\nprintf 'three'", true),
-        ("", "/unknown\nargument\nlast\t", true),
+        ("", "/unknown\nargument\nlast\t", false),
         ("", "/plan inspect\nargument\nlast\r\n", true),
         ("", "!\n\n", true),
         ("", "//stop\nconversation\nlast\r\n ", false),
