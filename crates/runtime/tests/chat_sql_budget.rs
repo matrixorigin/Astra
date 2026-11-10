@@ -916,11 +916,12 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             scenario,
             readonly_rounds,
             warm_context,
+            held_for_control,
             control_observation_sql,
             statements,
         ));
     }
-    for (scenario, rounds, warm_context, polls, statements) in &budgets {
+    for (scenario, rounds, warm_context, held, polls, statements) in &budgets {
         // Keep every query in the total budget, including periodic controls.
         assert!(
             statements.len() <= 20,
@@ -934,13 +935,15 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         }
         let baseline = budgets
             .iter()
-            .find(|(name, _, warm, _, _)| *name == "ordinary" && warm == warm_context)
+            .find(|(name, _, warm, baseline_held, _, _)| {
+                *name == "ordinary" && warm == warm_context && baseline_held == held
+            })
             .unwrap();
         // Explain exact periodic reads and at most one request-auth cache
         // miss. The independent raw total budget above never deducts a query.
-        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64
+        let expected = baseline.5.len() as i64 + *polls as i64 - baseline.4 as i64
             + authentication_reads as i64
-            - authentication_snapshot_count(&baseline.4) as i64;
+            - authentication_snapshot_count(&baseline.5) as i64;
         assert_eq!(
             statements.len() as i64,
             expected,
