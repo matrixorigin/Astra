@@ -191,7 +191,10 @@ fn signal_ready_for_epoch_with(
     dir: Option<&Path>,
     ready_fd: Option<i32>,
 ) {
-    {
+    // Phase publication and the ready byte stay in this critical section.
+    // The parent's acknowledgement is waited for only after the guard drops,
+    // so a later disconnect can still be recorded while the parent answers.
+    let pending_ack = {
         let gate = lock_phase(state);
         if gate.epoch != epoch {
             return;
@@ -202,10 +205,21 @@ fn signal_ready_for_epoch_with(
             tracing::warn!(target: "astra.edge", error = %error, "cannot publish the connected state");
             return;
         }
+        publish_connected_ready(dir, ready_fd)
+    };
+    if let Some(mut channel) = pending_ack {
+        match read_parent_ack(&mut channel) {
+            Ok(()) => PARENT_RELEASED.store(true, Ordering::SeqCst),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra.edge",
+                    error = %error,
+                    "the starting command did not accept readiness"
+                );
+                READY_REJECTED.store(true, Ordering::SeqCst);
+            }
+        }
     }
-    // The acceptance read waits for the starting command. It must not hold
-    // the phase mutex across that wait.
-    signal_ready_in(dir, ready_fd);
 }
 
 fn lock_phase(state: &Mutex<PhaseState>) -> std::sync::MutexGuard<'_, PhaseState> {
@@ -214,15 +228,16 @@ fn lock_phase(state: &Mutex<PhaseState>) -> std::sync::MutexGuard<'_, PhaseState
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
+fn publish_connected_ready(dir: Option<&Path>, ready_fd: Option<i32>) -> Option<File> {
     if let Some(dir) = dir {
         let _ = write_private(&dir.join("phase"), b"connected");
     }
     static NOTIFIED: Once = Once::new();
+    let mut pending_ack = None;
     NOTIFIED.call_once(|| {
         if let Some(fd) = ready_fd {
-            match notify_parent_ready_fd(fd) {
-                Ok(()) => PARENT_RELEASED.store(true, Ordering::SeqCst),
+            match write_ready_byte(fd) {
+                Ok(channel) => pending_ack = Some(channel),
                 Err(error) => {
                     tracing::warn!(
                         target: "astra.edge",
@@ -234,17 +249,27 @@ fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
             }
         }
     });
+    pending_ack
 }
 
+#[cfg(test)]
 fn notify_parent_ready_fd(fd: i32) -> io::Result<()> {
+    let mut channel = write_ready_byte(fd)?;
+    read_parent_ack(&mut channel)
+}
+
+fn write_ready_byte(fd: i32) -> io::Result<File> {
     // The parent owns the other end of this socket. Writing the ready byte
-    // only fills the buffer; the starting command accepts startup by writing
-    // one byte back. EOF before that byte means the command is gone.
+    // only fills the buffer; acceptance is the byte the parent writes back.
     let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(b"1")?;
     file.flush()?;
+    Ok(file)
+}
+
+fn read_parent_ack(channel: &mut File) -> io::Result<()> {
     let mut ack = [0u8; 1];
-    match file.read_exact(&mut ack) {
+    match channel.read_exact(&mut ack) {
         Ok(()) if ack == *b"1" => Ok(()),
         Ok(()) => Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -311,22 +336,12 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
             return 1;
         }
     };
-    // Hold the registry across directory creation and `start.lock`. Stop
-    // takes the same registry lock before it lists runners, so it cannot
-    // observe this directory before the start lock is held.
-    let registry = match lock_registry(root) {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!("Error: cannot lock runner startup: {error}");
-            return 1;
-        }
-    };
     let dir = state_dir(root, &identity);
-    if let Err(error) = ensure_private_dir(&dir) {
-        eprintln!("Error: cannot create runner state: {error}");
-        return 1;
-    }
-    let start = match lock_start(&dir) {
+    // The registry lock covers directory creation and an uncontended
+    // `start.lock` only. A start already in progress holds that per-runner
+    // lock; waiting for it happens after the registry lock is released, so
+    // other runners can still be listed and stopped.
+    let start = match lock_published_start(root, &dir) {
         Ok(file) => file,
         Err(error) => {
             eprintln!("Error: cannot lock runner startup: {error}");
@@ -345,7 +360,6 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
             return 1;
         }
     }
-    drop(registry);
     let token = option_value(args, "--token").unwrap_or("");
     match instance_is_locked(&dir) {
         Ok(true) => return running_instance(&dir, &identity, token, executable),
@@ -552,6 +566,28 @@ fn lock_start(dir: &Path) -> io::Result<File> {
     let file = open_lock_file(&dir.join("start.lock"))?;
     file.lock_exclusive()?;
     Ok(file)
+}
+
+fn try_lock_start(dir: &Path) -> io::Result<Option<File>> {
+    let file = open_lock_file(&dir.join("start.lock"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Publish `dir` only while `start.lock` is held, without waiting for another
+/// start while the registry lock is held.
+fn lock_published_start(root: &Path, dir: &Path) -> io::Result<File> {
+    let registry = lock_registry(root)?;
+    ensure_private_dir(dir)?;
+    if let Some(file) = try_lock_start(dir)? {
+        drop(registry);
+        return Ok(file);
+    }
+    drop(registry);
+    lock_start(dir)
 }
 
 /// Orders publication of a runner directory with `stop`. A start holds this
@@ -2062,6 +2098,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reconnect_that_wins_the_phase_lock_is_not_published_as_connected() {
+        let state = std::sync::Arc::new(Mutex::new(PhaseState {
+            epoch: 0,
+            connected: None,
+        }));
+        let root = tempfile::tempdir().unwrap();
+        let epoch = phase_epoch(&state);
+        let mut held = lock_phase(&state);
+        let callback_state = std::sync::Arc::clone(&state);
+        let dir = root.path().to_path_buf();
+        let callback = std::thread::spawn(move || {
+            signal_ready_for_epoch_with(&callback_state, epoch, Some(&dir), None);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !callback.is_finished(),
+            "readiness was published without the phase lock"
+        );
+        std::fs::write(root.path().join("phase"), b"reconnecting").unwrap();
+        held.epoch = held.epoch.wrapping_add(1);
+        drop(held);
+        callback.join().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("phase")).unwrap(),
+            b"reconnecting"
+        );
+    }
+
     #[tokio::test]
     async fn delayed_readiness_cannot_overwrite_a_newer_phase() {
         let state = std::sync::Arc::new(Mutex::new(PhaseState {
@@ -2744,6 +2809,65 @@ mod tests {
             !dir.exists(),
             "the unpublished start can still launch after stop"
         );
+    }
+
+    #[test]
+    fn a_duplicate_start_does_not_block_another_runners_status() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let (slow, _) = holder_executable(root.path(), "slow-holder.sh", 1_500);
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        let _cleanup = KillOwner(dir.clone());
+        let start_root = root.path().to_path_buf();
+        let start_command = command.clone();
+        let first_slow = slow.clone();
+        let first = std::thread::spawn(move || supervise(&first_slow, &start_command, &start_root));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !start_lock_is_held(&dir).unwrap_or(false) {
+            assert!(
+                Instant::now() < deadline,
+                "the first start did not take its lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let duplicate_root = root.path().to_path_buf();
+        let duplicate_command = command.clone();
+        let duplicate_slow = slow.clone();
+        let duplicate = std::thread::spawn(move || {
+            supervise(&duplicate_slow, &duplicate_command, &duplicate_root)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !duplicate.is_finished(),
+            "the duplicate start did not wait for the runner already starting"
+        );
+        let status_root = root.path().to_path_buf();
+        let started = Instant::now();
+        let status = std::thread::spawn(move || {
+            management(
+                &status_root,
+                &[
+                    "status",
+                    "--edge-id",
+                    "runner-other",
+                    "--server-url",
+                    "https://other.example",
+                ],
+            )
+        });
+        while started.elapsed() < Duration::from_millis(400) && !status.is_finished() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            status.is_finished(),
+            "status waited for a different runner's start"
+        );
+        assert_eq!(status.join().unwrap(), 0);
+        assert_eq!(first.join().unwrap(), 0);
+        assert_eq!(duplicate.join().unwrap(), 0);
     }
 
     #[test]
