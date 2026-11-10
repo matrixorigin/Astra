@@ -11073,12 +11073,6 @@ pub(crate) async fn run_tui_session(
                                                                     );
                                                                 }
                                                             }
-                                                            chat_widget.commit_concurrent_system(
-                                                                history_cell::system::SystemCell::runtime_control(
-                                                                    "Message received · waiting to take effect."
-                                                                        .to_string(),
-                                                                ),
-                                                            );
                                                         }
                                                         Err(GuidanceSubmissionError::Rejected(error)) => {
                                                             preinstalled_run_control.release_remote_user_intent_submission(

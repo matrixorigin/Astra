@@ -677,6 +677,22 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         sent_rx.try_recv().is_err(),
         "second message overtook the delayed first acknowledgement"
     );
+    // The disposition can beat the POST response. The queue must settle now
+    // and must not be recreated by the later acceptance receipt.
+    let (intent_id, content, event_index) = received.lock().unwrap()[0].clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    astra.wait_for_screen(
+        "first applied before POST ACK",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› first instruction")
+                && !screen.contains("received · first instruction")
+        },
+    );
     release_first.notify_one();
     let second = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -698,6 +714,31 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
             "Bearer gateway-token".into()
         )
     );
+    astra.wait_for_screen("second POST accepted", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("received · second instruction")
+    });
+    let (intent_id, content, event_index) = received.lock().unwrap()[1].clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    astra.wait_for_screen(
+        "live guidance settled before terminal",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› first instruction")
+                && screen.contains("› second instruction")
+                && !screen.contains("received · first instruction")
+                && !screen.contains("received · second instruction")
+        },
+    );
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "live disposition must not wait for the terminal lookup"
+    );
+    assert_eq!(mock.received_requests().len(), 1, "the turn remains open");
     astra.paste_and_submit("needs correction");
     let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await

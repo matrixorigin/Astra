@@ -4242,6 +4242,33 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     SseRenderEffect::SystemWarning(message) => {
                         Some(StreamEvent::SystemWarning(message.clone()))
                     }
+                    SseRenderEffect::GuidanceDisposition { intent, status } => {
+                        let intent_id = intent.intent_id.clone();
+                        let delivery = intent.delivery;
+                        let event_index = intent.event_index;
+                        let content = intent.content.clone();
+                        match status {
+                            astra_turn_types::UserIntentStatus::Applied => {
+                                Some(StreamEvent::UserIntentApplied {
+                                    intent_id,
+                                    delivery,
+                                    status: *status,
+                                    event_index,
+                                    content,
+                                })
+                            }
+                            astra_turn_types::UserIntentStatus::Returned => {
+                                Some(StreamEvent::UserIntentReturned {
+                                    intent_id,
+                                    delivery,
+                                    status: *status,
+                                    event_index,
+                                    content,
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
                     SseRenderEffect::StreamText {
                         model_item_id,
                         text: s,
@@ -4261,9 +4288,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    if matches!(ev, StreamEvent::SystemWarning(_)) {
-                        // Configuration diagnostics are rare control messages;
-                        // preserve each one when the interactive queue is full.
+                    if matches!(
+                        ev,
+                        StreamEvent::SystemWarning(_)
+                            | StreamEvent::UserIntentApplied { .. }
+                            | StreamEvent::UserIntentReturned { .. }
+                    ) {
+                        // Preserve control updates when the interactive queue is full.
                         self.emit_stream_event(ev).await;
                     } else {
                         self.emit_stream_observation(ev).await;
@@ -4292,7 +4323,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText { .. } | SseRenderEffect::SystemWarning(_) => {} // suppressed or already rendered
+                        SseRenderEffect::StreamText { .. }
+                        | SseRenderEffect::SystemWarning(_)
+                        | SseRenderEffect::GuidanceDisposition { .. } => {} // suppressed or already rendered
                     }
                 }
                 return;
@@ -4303,7 +4336,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
-                SseRenderEffect::SystemWarning(_) => {
+                SseRenderEffect::SystemWarning(_) | SseRenderEffect::GuidanceDisposition { .. } => {
                     i += 1;
                 }
                 SseRenderEffect::StopThinkingSpinner => {
@@ -7801,6 +7834,7 @@ fn apply_sse_render_effects(
     for effect in effects {
         match effect {
             SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
+            SseRenderEffect::GuidanceDisposition { .. } => {}
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -8339,6 +8373,82 @@ mod tests {
             });
             host.on_render_effects(vec![]).await;
             assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn guidance_dispositions_reach_silent_tui_under_backpressure() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx.clone()),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let bootstrap = "data: {\"type\":\"run_started\",\"run_id\":\"root\"}\n\n";
+        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            bootstrap,
+            &mut accum,
+            &mut pending,
+        );
+        for (kind, status) in [
+            ("user_intent_applied", "applied"),
+            ("user_intent_returned", "returned"),
+        ] {
+            let event = serde_json::json!({"type":kind, "run_id":"root", "intent_id":kind,
+                "delivery":"guide_current_run", "status":status, "event_index":7, "content":"guide"});
+            let effects =
+                astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut pending,
+                );
+            tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+                .await
+                .unwrap();
+            let delivery = host.on_render_effects(effects);
+            tokio::pin!(delivery);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(chat_stream::StreamEvent::StatusLine(_))
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                .await
+                .unwrap();
+            let observed = rx.recv().await.unwrap();
+            assert!(match observed {
+                chat_stream::StreamEvent::UserIntentApplied { intent_id, .. } =>
+                    status == "applied" && intent_id == kind,
+                chat_stream::StreamEvent::UserIntentReturned { intent_id, .. } =>
+                    status == "returned" && intent_id == kind,
+                _ => false,
+            });
         }
     }
 
