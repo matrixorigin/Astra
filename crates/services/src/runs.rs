@@ -42884,6 +42884,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                usage_attestation: None,
                 responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope: None,

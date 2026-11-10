@@ -2330,6 +2330,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2388,6 +2389,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2459,6 +2461,7 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2538,6 +2541,7 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2618,6 +2622,7 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2678,6 +2683,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2736,6 +2742,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2791,6 +2798,7 @@ mod tests {
 
         let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2859,6 +2867,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2934,6 +2943,7 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let first = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -2950,6 +2960,7 @@ mod tests {
             request_timeout: None,
         };
         let second = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,

@@ -1174,6 +1174,8 @@ pub struct UcNativeSettings {
     pub client_secret: String,
     pub moi_api_url: String,
     pub genesis_url: String,
+    /// Optional dedicated server key for Genesis usage provenance.
+    pub genesis_usage_signing_key: Option<String>,
     /// Explicit server-side access to the product's built-in memory service.
     /// Independent of the local-password self-hosted fallback.
     pub builtin_memory: bool,
@@ -1209,6 +1211,17 @@ impl UcNativeSettings {
             client_secret: required("ASTRA_UC_CLIENT_SECRET")?,
             moi_api_url: required("ASTRA_MOI_API_URL")?,
             genesis_url: required("ASTRA_GENESIS_URL")?,
+            genesis_usage_signing_key: lookup("ASTRA_GENESIS_USAGE_SIGNING_KEY")
+                .map(|key| {
+                    if key.len() < 32 || key.trim() != key || key.contains(['\r', '\n']) {
+                        Err(ConfigError::Validation(
+                            "ASTRA_GENESIS_USAGE_SIGNING_KEY must contain at least 32 bytes with no surrounding whitespace or newlines".into(),
+                        ))
+                    } else {
+                        Ok(key)
+                    }
+                })
+                .transpose()?,
             builtin_memory: match lookup("ASTRA_UC_MEMORY_ENABLED").as_deref() {
                 None | Some("0") => false,
                 Some("1") => true,
@@ -1765,6 +1778,26 @@ mod tests {
             );
         }
         // Existing Memoria and self-hosted deployments do not enable UC.
+        values.remove("ASTRA_UC_MEMORY_ENABLED");
+        for key in [
+            "",
+            "too-short",
+            " synthetic-attribution-key-32-bytes",
+            "synthetic-attribution-key-32-bytes\n",
+        ] {
+            values.insert("ASTRA_GENESIS_USAGE_SIGNING_KEY", key);
+            assert!(
+                UcNativeSettings::from_lookup(&|name| values.get(name).map(|v| (*v).into()))
+                    .is_err()
+            );
+        }
+        const KEY: &str = "synthetic-attribution-key-32-bytes";
+        values.insert("ASTRA_GENESIS_USAGE_SIGNING_KEY", KEY);
+        let parsed = UcNativeSettings::from_lookup(&|name| values.get(name).map(|v| (*v).into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.genesis_usage_signing_key.as_deref(), Some(KEY));
+        assert!(!format!("{parsed:?}").contains(KEY));
         assert!(UcNativeSettings::from_lookup(&|_| None).unwrap().is_none());
     }
 

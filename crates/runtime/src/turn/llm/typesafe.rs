@@ -143,6 +143,7 @@ mod tests {
     }
     fn client(base_url: String, api_key: String) -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,

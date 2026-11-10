@@ -19,6 +19,8 @@ use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_prot
 use astra_turn_types::ModelSelector;
 mod catalog_reader;
 mod genesis;
+mod genesis_usage;
+pub use genesis_usage::GenesisUsageAttestation;
 mod thinking_probe;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
@@ -1223,6 +1225,8 @@ impl RuntimeModelReasoningControl {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    /// Server-only provenance bound to this admitted Genesis execution.
+    pub usage_attestation: Option<GenesisUsageAttestation>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub response_scope: Option<String>,
@@ -1320,6 +1324,27 @@ fn response_scope(
 }
 
 impl AdmittedModelExecution {
+    /// Attach server-held provenance only to an already admitted Genesis route.
+    /// This adds no inference authority and never derives a source from a PAT.
+    pub fn with_genesis_usage_attestation(mut self, key: &str) -> Result<Self, &'static str> {
+        if self.access_kind != ModelAccessKind::AstraCloud
+            || self.execution_placement != ModelExecutionPlacement::Server
+            || self.provider != "openai"
+            || self.subscription.is_some()
+            || self.completions_url_override.is_some()
+            || !self.header_overrides.is_empty()
+        {
+            return Err("Genesis usage attestation requires the admitted Genesis route");
+        }
+        self.usage_attestation = Some(GenesisUsageAttestation::new(
+            key,
+            &self.base_url,
+            self.upstream_model_name(),
+            &self.api_key,
+        )?);
+        Ok(self)
+    }
+
     /// Whether refreshed admission still refers to the same selected model.
     ///
     /// Credentials, endpoint URLs, and capability metadata may legitimately
@@ -1360,6 +1385,7 @@ impl AdmittedModelExecution {
         let header_overrides = offering.model.execution_header_overrides()?;
         let scope_key = offering.model.response_scope_key.clone();
         let mut execution = Self {
+            usage_attestation: None,
             inference_protocol: offering.model.inference_protocol,
             responses_reasoning_history: offering.model.responses_reasoning_history,
             response_scope: None,
@@ -1407,6 +1433,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            usage_attestation: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -2790,6 +2817,7 @@ fn admitted_user_model_from_row(
     let cache_capability =
         personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
+        usage_attestation: None,
         responses_reasoning_history,
         inference_protocol,
         response_scope: None,
@@ -8891,6 +8919,7 @@ mod tests {
         .expect("unchanged catalog identity is admitted");
 
         let changed_name = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -8907,6 +8936,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT);
 
         let changed_source = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9347,6 +9377,7 @@ mod tests {
         .expect("admitted execution");
 
         let refreshed_material = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9358,6 +9389,7 @@ mod tests {
         assert!(selected.has_same_execution_identity(&refreshed_material));
 
         let changed_upstream = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9367,6 +9399,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_upstream));
 
         let changed_provider = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9376,6 +9409,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_provider));
 
         let changed_source = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,

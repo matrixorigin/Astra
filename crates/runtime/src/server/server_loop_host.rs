@@ -1995,6 +1995,7 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    usage_attestation: Option<astra_services::models::GenesisUsageAttestation>,
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     response_scope: Option<String>,
@@ -2047,6 +2048,7 @@ impl ResolvedTurnLlmConfig {
 
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            usage_attestation: self.usage_attestation.clone(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.clone(),
             subscription: self.subscription.clone(),
@@ -3278,6 +3280,7 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        usage_attestation: execution.usage_attestation.clone(),
         inference_protocol: execution.inference_protocol,
         responses_reasoning_history: execution.responses_reasoning_history,
         response_scope: execution.response_scope.clone(),
@@ -30469,6 +30472,7 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            usage_attestation: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -53500,6 +53504,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,

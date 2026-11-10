@@ -201,6 +201,7 @@ local CLI**. Enabling `ASTRA_UC_ISSUER` requires all remaining settings:
 | `ASTRA_UC_CLIENT_SECRET` | Confidential `astra-api-rs` resource-service credential |
 | `ASTRA_MOI_API_URL` | Product API base advertised to native clients |
 | `ASTRA_GENESIS_URL` | Genesis service origin |
+| `ASTRA_GENESIS_USAGE_SIGNING_KEY` | Optional dedicated server-only key (at least 32 bytes) for Genesis runtime usage provenance; enable after the TaaS verifier is deployed. Never ship it to CLI profiles or reuse the UC client secret. |
 | `ASTRA_UC_MEMORY_ENABLED=1` | Explicitly enable MOI built-in memory for UC users; otherwise disabled |
 
 ### Built-in memory
