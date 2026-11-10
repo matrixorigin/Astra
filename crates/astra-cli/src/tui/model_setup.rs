@@ -14,7 +14,10 @@ pub(crate) enum Action {
     Connect(Option<String>),
     Models(String),
     Manage,
-    Create(UserModelCreateRequestData),
+    Create {
+        request: UserModelCreateRequestData,
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    },
     Subscription {
         connection_id: String,
         model: String,
@@ -138,6 +141,32 @@ pub(crate) fn model_form(
     connection: Option<String>,
     model: Option<String>,
 ) {
+    model_form_with_values(pane, provider, connection, model, None, None);
+}
+
+pub(crate) fn retry_model_form(
+    pane: &mut BottomPane,
+    request: UserModelCreateRequestData,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) {
+    model_form_with_values(
+        pane,
+        request.provider.clone(),
+        request.connection_id.clone(),
+        Some(request.model.clone()),
+        Some(request),
+        Some(owner),
+    );
+}
+
+fn model_form_with_values(
+    pane: &mut BottomPane,
+    provider: String,
+    connection: Option<String>,
+    model: Option<String>,
+    previous: Option<UserModelCreateRequestData>,
+    owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+) {
     let subscription = connection.is_some();
     let compatible = provider == "openai-compatible";
     let mut fields = vec![
@@ -173,7 +202,33 @@ pub(crate) fn model_form(
         });
         values.push(String::new());
     }
-    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let choose_format = !subscription && provider != "anthropic";
+    if choose_format {
+        fields.push(FieldSpec {
+            label: "API format (chat or responses)",
+            kind: FieldKind::Plain,
+        });
+        values.push("chat".into());
+    }
+    if let Some(request) = previous {
+        values[0] = request.name;
+        values[1] = request.model;
+        values[2] = request.context_window.to_string();
+        if !subscription {
+            values[3] = request.api_key;
+        }
+        if compatible {
+            values[4] = request.base_url.unwrap_or_default();
+        }
+        if choose_format
+            && request.inference_protocol
+                == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        {
+            *values.last_mut().expect("format field exists") = "responses".into();
+        }
+    }
+    let owner = owner.unwrap_or_else(crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot);
+    let form_owner = owner.clone();
     pane.push_view(Box::new(
         FormView::new(
             "Personal model · stored encrypted on this Astra deployment",
@@ -187,11 +242,27 @@ pub(crate) fn model_form(
                     .ok()
                     .filter(|value| *value > 0)
                     .ok_or("Context tokens must be a positive number")?;
-                Ok(ViewResult::ModelSetup(Action::Create(
-                    UserModelCreateRequestData {
+                Ok(ViewResult::ModelSetup(Action::Create {
+                    request: UserModelCreateRequestData {
                         connection_id: connection.clone(),
+                        responses_reasoning_history: None,
                         name: values[0].trim().into(),
                         provider: provider.clone(),
+                        inference_protocol: if choose_format {
+                            match values
+                                .last()
+                                .map(|value| value.trim().to_ascii_lowercase())
+                                .as_deref()
+                            {
+                                Some("chat") => None,
+                                Some("responses") => Some(
+                                    astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                                ),
+                                _ => return Err("API format must be chat or responses".into()),
+                            }
+                        } else {
+                            None
+                        },
                         model: values[1].trim().into(),
                         context_window,
                         api_key: if subscription {
@@ -202,10 +273,12 @@ pub(crate) fn model_form(
                         base_url: compatible.then(|| values[4].trim().into()),
                         is_default: false,
                     },
-                )))
+                    owner: owner.clone(),
+                }))
             },
         )
-        .with_initial_values(values),
+        .with_initial_values(values)
+        .while_valid(move || form_owner.is_current()),
     ));
 }
 
@@ -227,6 +300,10 @@ pub(crate) enum Outcome {
     Saved {
         model_id: String,
         catalog: Result<Vec<astra_services::ModelListItemResponse>, String>,
+    },
+    CreateRejected {
+        request: UserModelCreateRequestData,
+        message: String,
     },
     Disconnected,
     Removed,
@@ -263,10 +340,18 @@ pub(crate) async fn run(
         model_connections,
     };
     use serde_json::{Value, json};
+    if let Action::Create {
+        owner: form_owner, ..
+    } = &action
+        && (form_owner != &owner || !form_owner.is_current())
+    {
+        return Err("Account changed; reopen /model".into());
+    }
     if owner.native_binding.is_some() {
         return Err("This deployment manages your model access through MOI. Your existing model choices are unchanged.".into());
     }
     let api = api.without_bearer_provider();
+    let preflight: Result<(String, Value), String> = async {
     let token = tokio::select! {
         _ = cancel.cancelled() => return Err("Model setup cancelled".into()),
         token = owner_access_token(&api, &owner, None) => token.ok_or("Sign in before configuring a personal model")?,
@@ -284,6 +369,23 @@ pub(crate) async fn run(
     if availability["management_available"] != true {
         return Err("Personal model configuration is unavailable for this account.".into());
     }
+    Ok((token, availability))
+    }.await;
+    let (token, availability) = match preflight {
+        Ok(result) => result,
+        Err(message) => {
+            if !cancel.is_cancelled()
+                && owner.is_current()
+                && let Action::Create { request, .. } = action
+            {
+                return Ok(Outcome::CreateRejected {
+                    request,
+                    message: format!("Model setup failed; the model was not saved. {message}"),
+                });
+            }
+            return Err(message);
+        }
+    };
     if matches!(action, Action::Sources) {
         return Ok(Outcome::Sources(availability["chatgpt"].clone()));
     }
@@ -368,15 +470,33 @@ pub(crate) async fn run(
                 existing,
             });
         }
-        Action::Create(request) => {
+        Action::Create { request, .. } => {
             begin_write()?;
             let payload = json!({"name":request.name,"provider":request.provider,"model":request.model,
                 "connection_id":request.connection_id,"api_key":request.api_key,"base_url":request.base_url,
+                "inference_protocol":request.inference_protocol,"responses_reasoning_history":request.responses_reasoning_history,
                 "context_window":request.context_window,"is_default":false});
-            let body = api
+            let body = match api
                 .post_bearer_path_json_text(&token, astra_thin_client::paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
+            {
+                Ok(body) => body,
+                Err(error)
+                    if crate::cli::cli_config::cli_utils::model_creation_definitely_rejected(
+                        &error,
+                    ) =>
+                {
+                    return Ok(Outcome::CreateRejected {
+                        request,
+                        message: crate::cli::cli_config::cli_utils::model_creation_error(error),
+                    });
+                }
+                Err(error) => {
+                    return Err(crate::cli::cli_config::cli_utils::model_creation_error(
+                        error,
+                    ));
+                }
+            };
             let created: Value =
                 serde_json::from_str(&body).map_err(|_| "Invalid model creation response")?;
             let id = created["model_id"]
@@ -469,6 +589,11 @@ mod tests {
         key(&mut pane, KeyCode::Tab);
         pane.handle_paste("synthetic-private-key");
         pane.handle_paste("rejected\nsecond-line");
+        key(&mut pane, KeyCode::Tab);
+        for _ in 0..4 {
+            key(&mut pane, KeyCode::Backspace);
+        }
+        text(&mut pane, "responses");
         assert_eq!(pane.composer.text(), "unsent conversation");
         let area = ratatui::layout::Rect::new(0, 0, 100, 14);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -476,7 +601,7 @@ mod tests {
         let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(!rendered.contains("synthetic-private-key"));
         let BottomPaneAction::ViewCompleted {
-            result: Some(ViewResult::ModelSetup(Action::Create(request))),
+            result: Some(ViewResult::ModelSetup(Action::Create { request, .. })),
             ..
         } = key(&mut pane, KeyCode::Enter)
         else {
@@ -486,9 +611,88 @@ mod tests {
         assert_eq!(request.model, "fixture-model");
         assert_eq!(request.api_key, "synthetic-private-key");
         assert_eq!(request.context_window, 128000);
+        assert_eq!(
+            request.inference_protocol,
+            Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        );
         assert!(!request.is_default);
         assert!(!format!("{request:?}").contains("synthetic-private-key"));
         assert_eq!(pane.composer.text(), "unsent conversation");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_probe_restores_editable_form_without_exposing_key() {
+        let mut pane = BottomPane::new();
+        let request = UserModelCreateRequestData {
+            connection_id: None,
+            name: "personal".into(),
+            provider: "openai-compatible".into(),
+            inference_protocol: Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses),
+            responses_reasoning_history: None,
+            model: "fixture-model".into(),
+            base_url: Some("https://models.example/v1".into()),
+            api_key: "synthetic-private-key".into(),
+            context_window: 64000,
+            is_default: false,
+        };
+        retry_model_form(
+            &mut pane,
+            request.clone(),
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 100, 16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("fixture-model"));
+        assert!(!rendered.contains("synthetic-private-key"));
+        let BottomPaneAction::ViewCompleted {
+            result:
+                Some(ViewResult::ModelSetup(Action::Create {
+                    request: resubmitted,
+                    ..
+                })),
+            ..
+        } = key(&mut pane, KeyCode::Enter)
+        else {
+            panic!("restored form did not submit");
+        };
+        assert_eq!(resubmitted, request);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restored_secret_form_is_discarded_when_owner_changes() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        let _first =
+            install_cli_profile_identity_for_test("model-form-first", Some("first-user")).unwrap();
+        let owner = cli_owner_auth_snapshot();
+        let mut pane = BottomPane::new();
+        retry_model_form(
+            &mut pane,
+            UserModelCreateRequestData {
+                connection_id: None,
+                name: "mine".into(),
+                provider: "openai".into(),
+                inference_protocol: None,
+                responses_reasoning_history: None,
+                model: "fixture".into(),
+                base_url: None,
+                api_key: "synthetic-key".into(),
+                context_window: 128000,
+                is_default: false,
+            },
+            owner,
+        );
+        assert!(pane.has_active_view());
+        let _second =
+            install_cli_profile_identity_for_test("model-form-second", Some("second-user"))
+                .unwrap();
+        pane.pre_draw_tick(std::time::Instant::now());
+        assert!(!pane.has_active_view());
     }
     #[test]
     #[serial_test::serial]

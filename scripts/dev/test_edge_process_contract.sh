@@ -23,15 +23,17 @@ mkdir -p "${fixture_root}/scripts/dev"
 # Exercise the real scripts in an isolated checkout, without sourcing the
 # developer's .env or allowing its PID/lock settings to affect the test.
 cp "${script_dir}/edge-process.sh" "${script_dir}/stop-edge.sh" "${fixture_root}/scripts/dev/"
-cp /bin/sleep "${fixture_root}/target/debug/astra-edge"
-# macOS may reject a relocated platform binary with SIGKILL. Ad-hoc sign
-# only the disposable fixture; do not change /bin/sleep or host security policy.
 if [ "$(uname -s)" = "Darwin" ]; then
-    if ! command -v codesign >/dev/null 2>&1; then
-        echo "macOS edge-process fixture requires codesign (Command Line Tools)" >&2
+    # A relocated system binary can be killed even after ad-hoc signing.
+    # Build a disposable process instead of changing host security settings.
+    if ! command -v cc >/dev/null 2>&1; then
+        echo "macOS edge-process fixture requires a C compiler (Command Line Tools)" >&2
         exit 1
     fi
-    codesign --force --sign - "${fixture_root}/target/debug/astra-edge"
+    printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' |
+        cc -x c - -o "${fixture_root}/target/debug/astra-edge"
+else
+    cp /bin/sleep "${fixture_root}/target/debug/astra-edge"
 fi
 "${fixture_root}/target/debug/astra-edge" 30 &
 owned_pid=$!

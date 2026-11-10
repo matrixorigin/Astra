@@ -617,6 +617,8 @@ fn returning_to_run_tree_preserves_agent_conversation_tab() {
     ));
     assert!(pane.activate_agent_monitor());
     assert!(pane.activate_agent_transcript("reviewer@active", "run-active"));
+    assert!(pane.activate_agent_transcript("resolved-agent", "run-active"));
+    assert!(!pane.activate_agent_transcript("reviewer@active", "another-run"));
     assert!(matches!(
         pane.active_conversation_tab_id(),
         Some(super::view::ConversationTabId::Run { agent_id, run_id })

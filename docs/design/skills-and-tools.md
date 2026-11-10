@@ -109,6 +109,12 @@ wrappers are retired. Runtime admission owns provider-batch partitioning and
 ordered result reconciliation; the shared invocation parser and canonical
 history evidence remain the carrier and recovery contracts.
 
+Malformed carrier arguments return the canonical parser's specific, static
+reason through the existing tool-level rejection. Missing target names are
+never inferred from selection history, even when only one tool is selected.
+Rejected calls do not dispatch tools or change capability authority; corrected
+calls still pass the same current-schema and provider-binding admission.
+
 Ordinary `agent` spawn, status (`list`), result collection (`get_result`), wait (`wait`), and
 communication (`send_message`) share a compact resident contract when the
 delegation capability is admitted. Its fields and per-action requirements and
@@ -204,6 +210,22 @@ limit. Absolute paths, traversal and URLs are rejected. Resource reads do not
 activate the Skill again or register additional execution authority. Source
 discovery remains with its admitted discovery tool; `discover_skills` searches
 only an admitted, enumerable directory.
+
+## Executable descriptor identity and planning
+
+Discovery snapshots include presentation and provenance. An invocation's exact
+descriptor version covers its executable input/output contract, owner, trusted
+claims and execution semantics. Help-text or model-directory refreshes do not
+revoke an unchanged selection. Current admission still rejects schema, owner or
+authority changes and reports a bounded structured difference; historical
+selection does not grant current execution authority.
+
+Model-authored planning retains the user's execution policy. Finishing a plan
+under Auto or Bypass does not add a human approval step unless explicitly
+requested. Other policies keep their trusted review gate. The default approval choice
+retains current permissions; no countdown changes permission. Finalization
+checks the submitted revision and session binding atomically, so approval of an
+older draft cannot release a newer draft's authoring guard.
 
 ## Skill lifecycle
 

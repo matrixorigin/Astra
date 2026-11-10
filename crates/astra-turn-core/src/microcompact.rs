@@ -608,11 +608,15 @@ fn compact_tool_results_with_pin_list(
 
     let maps = build_tool_call_maps(messages);
     let id_to_name = maps.name_ref_map();
+    let referenced = crate::compression_types::duplicate_output_referenced_targets(messages);
 
     // Collect compactable results, split into pinned vs unpinned
     let mut unpinned: Vec<(usize, usize)> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
-        if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+        if should_preserve_protected_prefix_result(i, protected_prefix_len)
+            || referenced[i]
+            || crate::compression_types::duplicate_output_reference(msg).is_some()
+        {
             continue;
         }
         if !is_compactable_tool_result(msg, &id_to_name) {
@@ -739,13 +743,17 @@ fn compact_tool_results_with_config(
 
     let maps = build_tool_call_maps(messages);
     let id_to_name = maps.name_ref_map();
+    let referenced = crate::compression_types::duplicate_output_referenced_targets(messages);
 
     // Collect (index, content_tokens) of compactable tool result messages.
     let compactable: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter_map(|(i, msg)| {
-            if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+            if should_preserve_protected_prefix_result(i, protected_prefix_len)
+                || referenced[i]
+                || crate::compression_types::duplicate_output_reference(msg).is_some()
+            {
                 return None;
             }
             if !is_compactable_tool_result(msg, &id_to_name) {
@@ -818,12 +826,16 @@ fn compact_tool_results_with_persistence(
 
     let maps = build_tool_call_maps(messages);
     let id_to_name = maps.name_ref_map();
+    let referenced = crate::compression_types::duplicate_output_referenced_targets(messages);
 
     let compactable: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter_map(|(i, msg)| {
-            if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+            if should_preserve_protected_prefix_result(i, protected_prefix_len)
+                || referenced[i]
+                || crate::compression_types::duplicate_output_reference(msg).is_some()
+            {
                 return None;
             }
             if !is_compactable_tool_result(msg, &id_to_name) {
@@ -956,6 +968,65 @@ mod tests {
         // Short content rounds down
         assert_eq!(estimate_tokens("abc"), 0);
         assert_eq!(estimate_tokens("你好世界"), 4);
+    }
+
+    #[test]
+    fn duplicate_placeholder_keeps_its_referenced_evidence() {
+        let call = |id: &str| {
+            json!({"role":"assistant", "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]})
+        };
+        let evidence = "important evidence ".repeat(100);
+        let mut source = tool_result("source", "same result retained below");
+        source["_synthetic"] = json!(true);
+        source[crate::compression_types::DUPLICATE_OUTPUT_CALL_ID_FIELD] = json!("target");
+        let target = tool_result("target", &evidence);
+        let mut history = vec![
+            json!({"role":"user", "content":"goal"}),
+            call("source"),
+            source.clone(),
+            call("target"),
+            target.clone(),
+        ];
+        for index in 0..8 {
+            let id = format!("other-{index}");
+            history.push(call(&id));
+            history.push(tool_result(&id, &evidence));
+        }
+        assert_eq!(
+            crate::compression_types::duplicate_output_targets(&history)[2],
+            Some(4)
+        );
+        for mode in 0..3 {
+            let mut messages = history.clone();
+            let stats = match mode {
+                0 => compact_tool_results(&mut messages, Some(1), CompactStrategy::Normalized),
+                1 => compact_tool_results_adaptive_with_persistence_protected_prefix(
+                    &mut messages,
+                    0.95,
+                    CompactStrategy::Normalized,
+                    None,
+                    Some(0),
+                ),
+                _ => compact_tool_results_state_aware_with_persistence_protected_prefix(
+                    &mut messages,
+                    0.95,
+                    &Default::default(),
+                    5,
+                    CompactStrategy::Normalized,
+                    None,
+                    Some(0),
+                ),
+            };
+            assert!(stats.results_compacted > 0);
+            assert_eq!(messages[2], source);
+            assert_eq!(messages[4], target);
+            assert_eq!(
+                crate::compression_types::duplicate_output_targets(&messages)[2],
+                Some(4)
+            );
+        }
     }
 
     #[test]

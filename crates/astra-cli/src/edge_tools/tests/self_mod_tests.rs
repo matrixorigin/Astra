@@ -301,20 +301,46 @@ async fn projection_failure_preserves_durable_receipt_and_rollback_handle() {
 #[cfg(feature = "e2e-hooks")]
 #[tokio::test]
 #[serial_test::serial]
+async fn direct_adjust_config_preserves_unknown_commit_fact() {
+    let (_tmp, _guard, exe, session, _session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let changed = (1..=20).find(|value| *value != baseline).unwrap();
+    astra_services::session_workspace::inject_workspace_commit_parent_sync_failure_once();
+    let result = exe
+        .execute_with_metadata(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await;
+    assert_eq!(
+        result.tool_result_fields.as_ref().unwrap()["execution_fact"],
+        "unknown"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).unwrap()["error"],
+        "config_commit_outcome_unknown"
+    );
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test]
+#[serial_test::serial]
 async fn post_rename_sync_unknown_projects_readback_and_records_exact_owner() {
     let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
     let baseline = session.read().unwrap().config.memory.retrieval_top_k;
     let changed = (1..=20).find(|value| *value != baseline).unwrap();
     astra_services::session_workspace::inject_workspace_commit_parent_sync_failure_once();
 
-    let unknown: Value = serde_json::from_str(
-        &exe.execute(
+    let result = exe.execute_with_metadata(
             "session",
             &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
-        .await,
-    )
-    .unwrap();
+        .await;
+    assert_eq!(
+        result.tool_result_fields.as_ref().unwrap()["execution_fact"],
+        "unknown"
+    );
+    let unknown: Value = serde_json::from_str(&result.output).unwrap();
     assert_eq!(unknown["error"], "config_commit_outcome_unknown");
     assert_eq!(unknown["side_effects_maybe"], true);
     assert_eq!(unknown["proposed_revision"], 1);

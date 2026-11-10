@@ -239,6 +239,20 @@ pub struct BackgroundLocalAgentTaskProjection {
     pub fanout: Option<BackgroundLocalAgentFanoutProjection>,
 }
 
+/// Local checkout selection, or an explicit unknown after local metadata loss.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SelectedWorktree {
+    Selected {
+        path: PathBuf,
+        branch: String,
+        original_root: PathBuf,
+        original_head_commit: Option<String>,
+        git_identity: String,
+    },
+    Unknown,
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -255,6 +269,9 @@ pub struct WorkspaceMetadata {
     /// Git HEAD commit at session start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
+    /// Local checkout selection, restored when this session is resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_worktree: Option<SelectedWorktree>,
     /// Concrete LLM model override used to start the session.
     ///
     /// `None` means the runtime used the server/API default. Symbolic values
@@ -437,6 +454,7 @@ impl WorkspaceMetadata {
             git_root,
             git_branch,
             git_head,
+            selected_worktree: None,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
             permission_mode: None,
@@ -480,6 +498,7 @@ impl WorkspaceMetadata {
             git_root: None,
             git_branch: git_branch.map(|s| s.to_string()),
             git_head: None,
+            selected_worktree: None,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
             permission_mode: None,
@@ -554,7 +573,9 @@ pub fn to_remote_artifact_record(
     metadata: &WorkspaceMetadata,
     user_id: &str,
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
-    let metadata = canonical_workspace_metadata(metadata);
+    let mut metadata = canonical_workspace_metadata(metadata);
+    // A selected checkout belongs to the local execution boundary.
+    metadata.selected_worktree = None;
     Ok(SessionArtifactJsonRecord {
         artifact_id: WORKSPACE_METADATA_PROJECTION_ID.to_string(),
         session_id: metadata.session_id.clone(),
@@ -617,6 +638,10 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let _lock = lock_workspace(&dir)?;
     let mut candidate = metadata.clone();
     if let Some(current) = read_workspace_optional(&metadata.session_id)? {
+        // Worktree selection is changed atomically by its owner. A stale
+        // whole-session snapshot must not overwrite that selection.
+        candidate.selected_worktree = current.selected_worktree;
+        candidate.cwd = current.cwd;
         candidate.tuned_config_json = current.tuned_config_json;
         candidate.config_mutation_revision = current.config_mutation_revision;
         candidate.projection_revision = current.projection_revision;
@@ -1571,6 +1596,32 @@ mod tests {
             !yaml.contains("health_avoidance_tools"),
             "tool health belongs in turn health surfaces, not workspace metadata"
         );
+    }
+
+    #[test]
+    fn selected_worktree_is_local_and_survives_stale_workspace_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let initial = WorkspaceMetadata::with_context("selected-worktree", "model", "/repo", None);
+        write_workspace(&initial).unwrap();
+        let selected = SelectedWorktree::Selected {
+            path: PathBuf::from("/local/checkout"),
+            branch: "feature".into(),
+            original_root: PathBuf::from("/repo"),
+            original_head_commit: Some("abc".into()),
+            git_identity: "fixture".into(),
+        };
+        update_workspace(
+            &initial.session_id,
+            || unreachable!(),
+            |metadata| metadata.selected_worktree = Some(selected.clone()),
+        )
+        .unwrap();
+        write_workspace(&initial).unwrap();
+        let current = read_workspace(&initial.session_id).unwrap();
+        assert_eq!(current.selected_worktree, Some(selected));
+        let remote = to_remote_artifact_record(&current, "user").unwrap();
+        assert!(remote.content.get("selected_worktree").is_none());
     }
 
     #[test]

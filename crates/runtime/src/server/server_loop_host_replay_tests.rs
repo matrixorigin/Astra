@@ -85,7 +85,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
             state.messages, canonical_before,
             "wire projection cannot rewrite canonical transcript"
         );
-        let assistant = assistant_message_with_tool_calls_and_reasoning(
+        let mut assistant = assistant_message_with_tool_calls_and_reasoning(
             &result.accum.tool_calls,
             &result.accum.reasoning_content,
             false,
@@ -93,6 +93,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
         assert_eq!(assistant["reasoning_content"], expected["reasoning_content"]);
         assert_ne!(assistant["tool_calls"][0]["id"], expected["tool_calls"][0]["id"]);
         assert!(result.accum.error_message.is_none());
+        host.attest_current_model_message(&state, &mut assistant);
         // This projection fixture supplies tool results manually. Adopt the
         // actual provider decision through the same lease owner used by normal
         // execute_turn_and_ingest_phase before starting its next request.

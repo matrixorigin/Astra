@@ -221,6 +221,6 @@ pub(crate) async fn seed_live_edge_invocation(
     );
     assert!(matches!(dispatch.admit_and_claim_direct_dispatch(&dispatch_identity, "selected-runner", &json!({
             "identity":identity, "request_id":identity.storage_key(), "tool":"native_codex", "args":{"task":"native interaction"}
-        }).to_string()).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
+        })).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
     (ledger, identity)
 }

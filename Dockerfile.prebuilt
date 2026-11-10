@@ -5,7 +5,7 @@
 #   target/x86_64-unknown-linux-gnu/release/astra
 #
 # Build with cargo-zigbuild first (run from the repo root):
-#   cargo zigbuild --release --no-default-features \
+#   cargo zigbuild --release --no-default-features --features astra-runtime/otel \
 #     --target x86_64-unknown-linux-gnu \
 #     -p astra-runtime --bin astra-server \
 #     -p astra-cli --bin astra

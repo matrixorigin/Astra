@@ -4,7 +4,7 @@ import type {
   RunInterruptedEvent,
   StreamErrorEvent,
 } from "@astra/sdk";
-import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1, cancelledContextObservation } from "@astra/sdk";
 import {
   setChatActiveRun,
   updateStreamingAssistantMessage,
@@ -421,6 +421,10 @@ export function applyStreamEvent(
       if (state.errorCode === "canonical_persistence_failed" ||
         state.lastStatus === "failed" && status !== "failed") break;
       state.terminalStatus = status;
+      const contextNotSaved = cancelledContextObservation(event as RunFinishedEvent);
+      if (contextNotSaved !== undefined) updateStreamingAssistantMessage(
+        ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { contextNotSaved },
+      );
       if (status === "failed") {
         applyRunFailure((event as RunFinishedEvent).error);
         break;

@@ -90,7 +90,7 @@ async fn callback_through_pipeline(
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            turn_rollback_on_failure: false,
+            compensate_non_file_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
@@ -190,6 +190,8 @@ async fn callback_through_pipeline(
     recorder.begin_turn(1);
     run_agentic_headless_tool_round(HeadlessToolRoundCtx {
         provider_continuation: None,
+        canonical_result_budget: 1024 * 1024,
+        round_records_start: 0,
         turn_index: 0,
         session_turn: 1,
         quiet: true,
@@ -315,15 +317,18 @@ async fn mcp_lost_ack_reconnect_outcomes_preserve_uncertainty_through_callback_a
             record
                 .runtime_advisories
                 .join("\n")
-                .contains("First reconcile the provider's state")
+                .contains("reconcile the provider state or invocation receipt")
         );
         let content = message["content"].as_str().unwrap();
         assert!(content.contains("unknown outcome"), "{content}");
         assert!(
-            content.contains("First reconcile the provider's state"),
+            content.contains("reconcile the provider state or invocation receipt"),
             "{content}"
         );
-        assert!(content.contains("Do NOT retry this operation"), "{content}");
+        assert!(
+            content.contains("Before repeating any state-changing effect"),
+            "{content}"
+        );
         assert!(!content.contains("capability denied"), "{content}");
         assert!(
             !content.contains("retry only with corrected arguments"),
@@ -356,9 +361,12 @@ async fn mcp_acknowledged_rpc_error_preserves_correction_through_callback_and_pi
     let content = message["content"].as_str().unwrap();
     assert!(content.contains("fixture parameter rejection"), "{content}");
     assert!(!content.contains("unknown outcome"), "{content}");
-    assert!(!content.contains("First reconcile"), "{content}");
     assert!(
-        content.contains("Correct the named fields and make one new call"),
+        !content.contains("Before repeating any state-changing effect"),
+        "{content}"
+    );
+    assert!(
+        content.contains("correct the target or named fields, and make one new call"),
         "{content}"
     );
 }

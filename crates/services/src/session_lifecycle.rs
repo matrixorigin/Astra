@@ -243,10 +243,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "plans",
-        sql: "DELETE FROM plans WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "tool_invocation_ledger",
         sql: "DELETE FROM tool_invocation_ledger WHERE session_id = ? AND user_id = ?",
     },
@@ -668,6 +664,102 @@ async fn delete_unpinned_orphan_manifests(
     Ok(())
 }
 
+async fn delete_session_plans(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    outcome: &mut SessionDatabaseDeleteOutcome,
+) -> Result<(), String> {
+    // The session was marked deleting before this transaction. Discover the
+    // actual active plan as well as advisory hints, then lock exact plan keys
+    // in the same order used by plan binding.
+    let observed: Option<(Option<String>,)> =
+        query_as("SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| format!("delete_session.read_plan_binding: {error}"))?;
+    let active = observed.as_ref().and_then(|(active,)| active.clone());
+    let mut ids: Vec<String> = query_scalar(
+        "SELECT plan_id FROM plans FORCE INDEX (idx_plans_owner_session_updated) WHERE user_id = ? AND session_id = ?",
+    ).bind(user_id).bind(session_id).fetch_all(&mut **tx).await
+        .map_err(|error| format!("delete_session.find_plans: {error}"))?;
+    ids.extend(active.iter().cloned());
+    ids.sort_unstable();
+    ids.dedup();
+    let mut locked = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row: Option<(Option<String>,)> =
+            query_as("SELECT session_id FROM plans WHERE user_id = ? AND plan_id = ? FOR UPDATE")
+                .bind(user_id)
+                .bind(&id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|error| format!("delete_session.lock_plan: {error}"))?;
+        if let Some((hint,)) = row {
+            locked.push((id, hint));
+        }
+    }
+    let current: Option<(Option<String>, String)> = query_as(
+        "SELECT active_plan_id, status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    ).bind(user_id).bind(session_id).fetch_optional(&mut **tx).await
+        .map_err(|error| format!("delete_session.lock_plan_binding: {error}"))?;
+    if current.as_ref().map(|(active, _)| active.clone()) != observed.map(|(active,)| active)
+        || current
+            .as_ref()
+            .is_some_and(|(_, status)| status != "deleting")
+    {
+        return Err("delete_session.plan_binding_changed: retry session deletion".into());
+    }
+
+    for (id, hint) in locked {
+        let holders: Vec<String> = query_scalar(
+            "SELECT session_id FROM agent_sessions FORCE INDEX (idx_agent_sessions_active_plan_id) WHERE user_id = ? AND active_plan_id = ? LIMIT 2 FOR UPDATE",
+        ).bind(user_id).bind(&id).fetch_all(&mut **tx).await
+            .map_err(|error| format!("delete_session.read_plan_holder: {error}"))?;
+        if holders.len() > 1 {
+            return Err(
+                "delete_session.plan_binding_conflict: a plan has multiple active sessions".into(),
+            );
+        }
+        if let Some(holder) = holders.first()
+            && holder != session_id
+            && hint.as_deref() == Some(session_id)
+        {
+            // A routing hint is not authority to delete another live
+            // session's plan. Repair it while its plan row is locked.
+            query("UPDATE plans SET session_id = ? WHERE user_id = ? AND plan_id = ?")
+                .bind(holder)
+                .bind(user_id)
+                .bind(&id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| format!("delete_session.repair_plan_hint: {error}"))?;
+        }
+    }
+
+    // Delete in one statement so index maintenance is not repeated for each
+    // plan. An active plan is included even if its old hint was missing.
+    let rows = if let Some(active) = active {
+        query("DELETE FROM plans WHERE user_id = ? AND (session_id = ? OR plan_id = ?)")
+            .bind(user_id)
+            .bind(session_id)
+            .bind(active)
+            .execute(&mut **tx)
+            .await
+    } else {
+        query("DELETE FROM plans WHERE user_id = ? AND session_id = ?")
+            .bind(user_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await
+    }
+    .map_err(|error| format!("delete_session.plans: {error}"))?
+    .rows_affected();
+    record_table_delete(outcome, "plans", rows)
+}
+
 pub(crate) async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -686,6 +778,8 @@ pub(crate) async fn hard_delete_session_rows(
         })?;
 
     ensure_no_live_work_recovery_points(tx, session_id, user_id).await?;
+
+    delete_session_plans(tx, session_id, user_id, &mut outcome).await?;
 
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or

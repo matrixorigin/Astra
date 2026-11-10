@@ -232,13 +232,6 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
-        }
-    }
-
     fn execute_snapshot_rollback(
         &self,
         entry: &DatabaseSnapshotRollbackEntry,
@@ -267,10 +260,6 @@ impl ToolExecutor {
     /// unless the caller explicitly passes `"allow_destructive": true`.
     /// Mutating queries capture a pre-state snapshot before execution so the
     /// runtime can surface a concrete rollback hint on staged mutations.
-    pub(crate) fn mo_query(&self, args: &Value) -> String {
-        self.mo_query_with_metadata(args, None).output
-    }
-
     pub(crate) fn mo_query_with_metadata(
         &self,
         args: &Value,
@@ -694,14 +683,18 @@ mod tests {
     #[test]
     fn mo_query_missing_sql() {
         let executor = ToolExecutor::new(std::env::temp_dir());
-        let result = executor.mo_query(&serde_json::json!({}));
+        let result = executor
+            .mo_query_with_metadata(&serde_json::json!({}), None)
+            .output;
         assert!(result.contains("Error"), "should error: {result}");
     }
 
     #[test]
     fn mo_query_empty_sql() {
         let executor = ToolExecutor::new(std::env::temp_dir());
-        let result = executor.mo_query(&serde_json::json!({"sql": ""}));
+        let result = executor
+            .mo_query_with_metadata(&serde_json::json!({"sql": ""}), None)
+            .output;
         assert!(result.contains("Error"), "should error on empty: {result}");
     }
 
@@ -910,7 +903,9 @@ mod tests {
     #[test]
     fn mo_query_blocks_destructive_by_default() {
         let executor = ToolExecutor::new(std::env::temp_dir());
-        let result = executor.mo_query(&serde_json::json!({"sql": "DROP TABLE users"}));
+        let result = executor
+            .mo_query_with_metadata(&serde_json::json!({"sql": "DROP TABLE users"}), None)
+            .output;
         assert!(result.contains("blocked"), "should block DROP: {result}");
         assert!(
             result.contains("allow_destructive"),
@@ -927,9 +922,10 @@ mod tests {
         }
         let executor = ToolExecutor::new(std::env::temp_dir());
         // This will fail at the mysql connection level, but NOT at the safety check
-        let result = executor.mo_query(
+        let result = executor.mo_query_with_metadata(
             &serde_json::json!({"sql": "DROP TABLE IF EXISTS _test_table", "allow_destructive": true}),
-        );
+            None,
+        ).output;
         // Should NOT contain "blocked" — it should attempt execution
         assert!(
             !result.contains("blocked"),

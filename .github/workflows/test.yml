@@ -97,7 +97,9 @@ jobs:
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # This job also builds and exercises the fresh Server compatibility target;
+    # cold builds can exhaust the old deadline after the CLI inventory passes.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -121,7 +123,9 @@ jobs:
             cli::edge_lifecycle::native_delivery::tests::authenticated_shared_ws_executes_native_provider_through_cli_entrypoint \
             edge_tools::native_codex::tests::discovery_preserves_the_whole_budget_across_protocol_phases \
             cli::edge_lifecycle::native_delivery::tests::discovery_publishes_only_the_first_verified_path_client
-      - name: Start isolated historical-client dependencies
+      - name: Build the current Edge
+        run: cargo build --locked -p astra-edge --bin astra-edge
+      - name: Start isolated candidate-client dependencies
         env:
           MEMORIA_MASTER_KEY: ci-test-master-key
           MEMORIA_EMBEDDING_PROVIDER: mock
@@ -129,12 +133,7 @@ jobs:
           docker compose --env-file .env.example
           -f deployment/all-in-one/docker-compose.deps.yml
           up -d --wait --wait-timeout 180 matrixone memoria
-      - name: Restore released client components
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/historical-clients/*.tar.gz
-          key: historical-clients-linux-amd64-${{ hashFiles('scripts/ci/historical-clients.json') }}
-      - name: Test historical and already-built current CLI against the fresh Server
+      - name: Test current CLI and Edge against the fresh Server
         env:
           MATRIXONE_HOST: localhost
           MATRIXONE_PORT: "6001"
@@ -147,13 +146,13 @@ jobs:
           MEMORIA_BASE_URL: http://localhost:8100
           MEMORIA_MASTER_KEY: ci-test-master-key
           MEMORIA_SELF_HOSTED_MASTER_ACCESS: "1"
-          ASTRA_COMPAT_ARTIFACTS: ${{ github.workspace }}/target/historical-clients
           ASTRA_COMPAT_REPORT: ${{ github.workspace }}/target/client-compatibility.json
           ASTRA_COMPAT_CURRENT_CLI_BIN: ${{ github.workspace }}/target/debug/astra
+          ASTRA_COMPAT_CURRENT_EDGE_BIN: ${{ github.workspace }}/target/debug/astra-edge
           ASTRA_COMPAT_SERVER_SOURCE: ${{ github.sha }}
           RUST_MIN_STACK: "16777216"
         run: cargo test --locked -p astra-runtime --features moi-compat-tests --test client_compatibility -- --include-ignored --nocapture
-      - name: Stop isolated historical-client dependencies
+      - name: Stop isolated candidate-client dependencies
         if: always()
         run: >-
           docker compose --env-file .env.example
@@ -255,6 +254,10 @@ jobs:
           -p astra-harness -p astra-test-harness
           -p astra-logging -p astra-sync-protocol
           --profile ci
+      - name: Test astra-logging otel
+        run: >-
+          cargo nextest run --manifest-path Cargo.toml -p astra-logging
+          --features otel --profile ci
       - name: Test server e2e-hooks (selective)
         env:
           RUST_MIN_STACK: "16777216"

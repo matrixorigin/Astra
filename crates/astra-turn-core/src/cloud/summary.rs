@@ -157,6 +157,10 @@ pub struct SummaryResponse {
     /// Aggregate evidence for all dispatched attempts, distinct from the
     /// final response's physical usage. Missing evidence is not measured zero.
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Inclusive input was measured, even if its value is zero or unpartitioned.
+    pub input_was_measured: bool,
+    /// Observed inclusive input not assigned to a proven billing lane.
+    pub unpartitioned_input_tokens: u64,
     /// Actual durable execution that produced this response. Absence means
     /// the adapter cannot prove an admitted invocation and must never be
     /// replaced with a requested attempt or generated correlation ID.
@@ -170,11 +174,27 @@ pub struct SummaryExecutionProvenance {
     pub provider: String,
 }
 
+/// Usage already observed when a summary future is dropped before returning.
+#[derive(Clone, Debug)]
+pub struct InterruptedSummaryUsage {
+    pub usage: Map<String, Value>,
+    /// At least one dispatched attempt reported a validated inclusive input, including zero.
+    pub input_was_measured: bool,
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    pub unpartitioned_input_tokens: u64,
+}
+
+pub type InterruptedSummaryUsageSink =
+    std::sync::Arc<dyn Fn(InterruptedSummaryUsage) + Send + Sync>;
+
 /// Abstraction over the LLM API for summary generation.
 /// Provider execution belongs to the runtime; this crate only owns summary
 /// behavior and the test seam.
 #[async_trait]
 pub trait SummaryLlmClient: Send + Sync {
+    /// Install the owner of usage when an in-flight call is dropped.
+    fn set_interrupted_usage_sink(&mut self, _sink: InterruptedSummaryUsageSink) {}
+
     /// Send a summary request. Returns the response or an error.
     async fn summarize(
         &self,
@@ -458,6 +478,8 @@ pub mod test_support {
         pub fn success(text: &str) -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    input_was_measured: false,
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),
@@ -477,6 +499,8 @@ pub mod test_support {
             Self {
                 responses: vec![
                     Ok(SummaryResponse {
+                        input_was_measured: false,
+                        unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
@@ -487,6 +511,8 @@ pub mod test_support {
                         execution: None,
                     }),
                     Ok(SummaryResponse {
+                        input_was_measured: false,
+                        unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
@@ -506,6 +532,8 @@ pub mod test_support {
         pub fn always_ptl() -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    input_was_measured: false,
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),

@@ -42,12 +42,6 @@ pub enum EvalSignal {
     /// instead of fresh observational evidence. Carries the count.
     NoOpToolResults(usize),
 
-    /// Multiple read tool calls requested line ranges already fully covered
-    /// by prior successful reads of the same unchanged file. Carries the
-    /// number of redundant read events. Partial overlaps that extend into
-    /// unseen content are not redundant, and an output-bounded unbounded read
-    /// does not claim that the whole file reached the model.
-    RedundantOverlappingReads(usize),
     /// Many search-like tool calls (grep/rg/find) were issued in one turn,
     /// suggesting the model fanned out exploratory search instead of
     /// narrowing the search space or batching more effectively. Carries the
@@ -100,12 +94,6 @@ pub enum EvalSignal {
     BlockedToolCall { count: usize },
 }
 
-/// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
-/// count of redundant read events needed before flagging the turn. Calibrated
-/// against production journals: at this level the signal catches repeated
-/// context re-reads while leaving healthy short turns silent.
-pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
-
 /// Default threshold for [`EvalSignal::SearchFanout`]: minimum count of
 /// grep/rg/find-like tool calls in a turn before flagging passive search
 /// fan-out. False-positive risk is higher than redundant reads because some
@@ -136,7 +124,6 @@ const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationThresholds {
-    pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
     pub redundant_validation_retries: usize,
     pub llm_round_churn: usize,
@@ -146,7 +133,6 @@ pub struct EvaluationThresholds {
 impl Default for EvaluationThresholds {
     fn default() -> Self {
         Self {
-            redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
             search_fanout: SEARCH_FANOUT_THRESHOLD,
             redundant_validation_retries: REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
             llm_round_churn: LLM_ROUND_CHURN_THRESHOLD,
@@ -178,52 +164,6 @@ pub struct TurnEvaluation {
     pub thresholds: EvaluationThresholds,
 }
 
-fn outcome_failure_labels(eval: &TurnEvaluation) -> Vec<String> {
-    eval.signals
-        .iter()
-        .filter_map(|signal| match signal {
-            EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
-            EvalSignal::BlockedToolCall { count } => Some(format!("blocked_tool x{count}")),
-            _ => None,
-        })
-        .collect()
-}
-
-fn unresolved_outcome_notice(labels: &[String]) -> String {
-    format!(
-        "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
-        labels.join(", ")
-    )
-}
-
-pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
-    let outcome_failures = outcome_failure_labels(eval);
-    if !outcome_failures.is_empty() {
-        if turn_evaluation_has_unresolved_execution_failure(eval) {
-            return Some(unresolved_outcome_notice(&outcome_failures));
-        }
-        // A minority failure is retained in the evaluation signals and
-        // journal, but it is not a user-facing incomplete state. Review and
-        // diagnosis turns routinely contain optional probes that can fail
-        // while the requested evidence is still sufficient.
-        return None;
-    }
-
-    if eval.success {
-        return None;
-    }
-
-    let reason = eval
-        .signals
-        .iter()
-        .find_map(turn_evaluation_signal_reason)
-        .unwrap_or("turn evaluation failed");
-    Some(format!(
-        "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
-        eval.quality
-    ))
-}
-
 /// Whether a retained failed record represents a completion-critical outcome.
 /// This shared semantic predicate is used by the CLI status surface and by
 /// runtime lifecycle projection. A read-only probe stays advisory even when
@@ -235,8 +175,12 @@ pub fn tool_outcome_requires_terminal_attention(
 ) -> bool {
     if matches!(
         result_class,
-        RESULT_CLASS_AGENT_INCOMPLETE | RESULT_CLASS_FANOUT_INCOMPLETE
-    ) {
+        "test_failure" | RESULT_CLASS_AGENT_INCOMPLETE | RESULT_CLASS_FANOUT_INCOMPLETE
+    ) || record.outcome_is_unknown()
+        || (record.effective_disposition()
+            == astra_services::session_journal::ToolCallDisposition::Rejected
+            && result_class == "execution_error")
+    {
         return true;
     }
     let args = record
@@ -250,119 +194,9 @@ pub fn tool_outcome_requires_terminal_attention(
     {
         return true;
     }
-    crate::tool::categories::classify(&record.name, args.as_ref())
-        .category
-        .is_mutating()
-}
-
-/// Build a user-facing evaluation notice with the source records available.
-/// The aggregate evaluator intentionally retains a coverage-rate fallback for
-/// external callers that only have signals. The CLI has the authoritative
-/// records, so it uses semantic criticality instead of treating a 1/2 split
-/// as incomplete merely because a diagnostic probe failed.
-pub fn turn_evaluation_status_notice_for_records(
-    eval: &TurnEvaluation,
-    records: &[ToolCallRecord],
-) -> Option<String> {
-    let labels = outcome_failure_labels(eval);
-    if labels.is_empty() {
-        return turn_evaluation_status_notice(eval);
-    }
-
-    let facts = records
-        .iter()
-        .map(ToolEvaluationFact::from_record)
-        .collect::<Vec<_>>();
-    let unresolved = unresolved_tool_outcome_facts(&facts);
-    if unresolved.is_empty() {
-        // No source records means this caller cannot establish that an
-        // aggregate failure was advisory. Preserve the conservative fallback.
-        return turn_evaluation_status_notice(eval);
-    }
-    let has_terminal_failure = unresolved.values().any(|failure| {
-        records.get(failure.fact_index).is_none_or(|record| {
-            tool_outcome_requires_terminal_attention(record, &failure.result_class)
-        })
-    });
-    if has_terminal_failure {
-        Some(unresolved_outcome_notice(&labels))
-    } else {
-        None
-    }
-}
-
-/// Whether the turn contains unresolved execution evidence for diagnostics.
-///
-/// This is narrower than `!eval.success`: conversational turns and low-quality
-/// answers may score unsuccessfully without having an execution failure. This
-/// is an outcome-quality signal, not lifecycle authority: callers must never
-/// rewrite an explicitly completed/cancelled/failed run from this heuristic.
-pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -> bool {
-    let has_nested_incomplete_run = eval.signals.iter().any(|signal| {
-        matches!(
-            signal,
-            EvalSignal::ToolOutcomeFailure { class, .. }
-                if class == RESULT_CLASS_AGENT_INCOMPLETE
-                    || class == RESULT_CLASS_FANOUT_INCOMPLETE
-        )
-    });
-    if has_nested_incomplete_run {
-        return true;
-    }
-
-    let has_execution_failure = eval.signals.iter().any(|signal| {
-        matches!(
-            signal,
-            EvalSignal::ToolOutcomeFailure { .. } | EvalSignal::BlockedToolCall { .. }
-        )
-    });
-    if !has_execution_failure {
-        return false;
-    }
-
-    // A minority failure in an otherwise productive turn remains visible as
-    // evaluation evidence without classifying the overall execution evidence
-    // as unresolved. Review agents commonly use optional probes; one
-    // unavailable probe among many successful reads does not erase the useful
-    // evidence they returned.
-    // A majority failure or even split means diagnostic evidence remains
-    // unresolved. Evaluations without a rate are treated conservatively because
-    // hand-built/external evaluations cannot prove successful recovery. This
-    // threshold affects outcome diagnostics only, never run lifecycle.
-    if let Some(is_majority) = eval.signals.iter().find_map(|signal| match signal {
-        EvalSignal::ToolOutcomeFailureCoverage {
-            unresolved,
-            observed,
-        } => Some(*observed == 0 || unresolved.saturating_mul(2) >= *observed),
-        _ => None,
-    }) {
-        return is_majority;
-    }
-
-    eval.signals
-        .iter()
-        .find_map(|signal| match signal {
-            EvalSignal::ToolErrorRate(rate) => Some(*rate >= 0.5),
-            _ => None,
-        })
-        .unwrap_or(true)
-}
-
-pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
-    match signal {
-        EvalSignal::ToolErrorRate(rate) if *rate >= 0.5 => Some("tool error rate is high"),
-        EvalSignal::StallDetected => Some("stall/divergence was detected"),
-        EvalSignal::VerdictWarning => Some("TurnGuard emitted a warning"),
-        EvalSignal::NoToolsNeeded => Some("needed tools were not used"),
-        EvalSignal::BlockedToolCall { .. } => Some("tool calls were blocked before execution"),
-        EvalSignal::HighCostLowYield { .. } => Some("high-cost exploration produced low yield"),
-        EvalSignal::LlmRoundChurn { .. } => Some("too many LLM rounds were used"),
-        EvalSignal::PromptGrowthChurn { .. } => Some("prompt size ballooned across rounds"),
-        EvalSignal::RedundantValidationRetries(_) => Some("validation was retried redundantly"),
-        EvalSignal::RedundantOverlappingReads(_) => Some("content was re-read redundantly"),
-        EvalSignal::ExplorationFamilyChurn { .. } => Some("exploration stayed in one tool family"),
-        _ => None,
-    }
+    // Observation failures inform the next decision without implying unfinished
+    // task effects. Unknown tools/effects retain their execution obligation.
+    !crate::tool::categories::registry().is_read_only_for_recovery(&record.name, args.as_ref())
 }
 
 /// Per-tool-call record for evaluation (matches ToolCallRecord shape).
@@ -649,24 +483,6 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     );
     eval.thresholds = thresholds;
 
-    // ─── Redundant overlapping read detection ───────────────────────────
-    // Detects the failure mode where the model re-reads the SAME file/line
-    // range multiple times across a turn instead of referring back to its
-    // own prior tool outputs. The detector excludes the legitimate
-    // "mutate then re-read to verify" pattern: any workspace-mutating tool
-    // call clears the per-file read history, so a re-read AFTER an edit
-    // does NOT contribute to the count. Strictly observational at this
-    // tier — no mid-loop intervention.
-    let redundant_reads = count_redundant_overlapping_reads(tool_call_records);
-    if redundant_reads >= thresholds.redundant_overlapping_reads {
-        eval.signals
-            .push(EvalSignal::RedundantOverlappingReads(redundant_reads));
-        let penalty = (0.03
-            + 0.01 * (redundant_reads - thresholds.redundant_overlapping_reads) as f64)
-            .clamp(0.03, 0.15);
-        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
-    }
-
     // ─── Search fan-out detection ────────────────────────────────────────
     // Detects turns that spray many grep/rg/find-like searches instead of
     // narrowing the search space or switching to more direct reads. This
@@ -804,7 +620,6 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::RepeatToolCall(_)
             | EvalSignal::VerdictWarning
             | EvalSignal::NoOpToolResults(_)
-            | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::SearchFanout(_)
             | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::LlmRoundChurn { .. }
@@ -830,7 +645,6 @@ fn is_strong_low_yield_signal(signal: &EvalSignal) -> bool {
         signal,
         EvalSignal::RepeatToolCall(_)
             | EvalSignal::NoOpToolResults(_)
-            | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::ExplorationFamilyChurn { .. }
     )
@@ -842,7 +656,6 @@ fn is_low_yield_signal(signal: &EvalSignal) -> bool {
         EvalSignal::EmptyToolOutput
             | EvalSignal::RepeatToolCall(_)
             | EvalSignal::NoOpToolResults(_)
-            | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::SearchFanout(_)
             | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::ExplorationFamilyChurn { .. }
@@ -984,48 +797,16 @@ fn hash_bounded_key(value: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
-    let class = effective_tool_result_class(record)?;
-    if !result_class_is_outcome_failure(&class) && !result_class_resolves_outcome_failure(&class) {
-        return None;
-    }
-
-    operation_identity_key(record)
-}
-
-fn fallback_tool_outcome_identity(record: &ToolCallRecord) -> Option<String> {
-    operation_identity_key(record)
-}
-
 /// Stable identity of the governed operation, independent of result class,
 /// disposition, provider attempt id, or JSON object key order. Outcome
 /// classifiers are ledger values; they must never change the operation key
-/// used to correlate a failure with a later retry.
+/// used to correlate a failure with a later retry. Display previews and call
+/// IDs cannot establish command equality after arguments have been redacted.
 fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
-    let args = record.authoritative_args_full().unwrap_or("").trim();
-    if !args.is_empty() {
-        // A validation command prefix is only a recognition hint: it drops
-        // working directories and other arguments that distinguish targets.
-        // Without an authoritative target binding, preserve the full request
-        // identity rather than clearing an unrelated verification failure.
-        return Some(operation_args_identity(&record.name, args));
-    }
-
-    let preview = record.args_preview.as_deref().unwrap_or("").trim();
-    if !preview.is_empty() {
-        return Some(format!(
-            "tool::{}::preview::{}",
-            record.name,
-            hash_bounded_key(&crate::stall::canonical_tool_args(preview))
-        ));
-    }
-
-    record
-        .tool_call_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| format!("tool::{}::call::{}", record.name, hash_bounded_key(id)))
+    let args = record.authoritative_args_full()?.trim();
+    // A validation prefix drops target details; preserve the complete request
+    // rather than clearing an unrelated verification failure.
+    (!args.is_empty()).then(|| operation_args_identity(&record.name, args))
 }
 
 fn operation_args_identity(name: &str, args: &str) -> String {
@@ -1071,7 +852,7 @@ fn unresolved_tool_outcome_fact_counts(
     facts: &[ToolEvaluationFact],
 ) -> std::collections::BTreeMap<String, usize> {
     let mut counts = std::collections::BTreeMap::new();
-    for failure in unresolved_tool_outcome_facts(facts).values() {
+    for failure in unresolved_execution_outcome_facts(facts).values() {
         *counts.entry(failure.result_class.clone()).or_insert(0) += 1;
     }
     counts
@@ -1090,6 +871,19 @@ pub struct UnresolvedToolOutcome {
 /// Opaque failures remain in this result and never match a later success.
 pub fn unresolved_tool_outcome_facts(
     facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeMap<EvaluationOutcomeKey, UnresolvedToolOutcome> {
+    reduce_tool_outcome_facts(facts, |_| true)
+}
+
+fn unresolved_execution_outcome_facts(
+    facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeMap<EvaluationOutcomeKey, UnresolvedToolOutcome> {
+    reduce_tool_outcome_facts(facts, |fact| fact.requires_terminal_attention)
+}
+
+fn reduce_tool_outcome_facts(
+    facts: &[ToolEvaluationFact],
+    include_failure: impl Fn(&ToolEvaluationFact) -> bool,
 ) -> std::collections::BTreeMap<EvaluationOutcomeKey, UnresolvedToolOutcome> {
     let mut unresolved_by_key = std::collections::BTreeMap::new();
 
@@ -1112,6 +906,13 @@ pub fn unresolved_tool_outcome_facts(
         if disposition == astra_services::session_journal::ToolCallDisposition::Rejected
             && record.effective_result_class.as_deref() != Some("execution_error")
         {
+            continue;
+        }
+
+        // Filter failure evidence before it can replace a prior obligation.
+        // An observational failure neither resolves an unknown outcome nor
+        // proves recovery. Typed domain failures still win over envelope ok.
+        if record.has_failed_outcome() && !include_failure(record) {
             continue;
         }
 
@@ -1171,127 +972,51 @@ pub fn unresolved_tool_outcome_facts(
     unresolved_by_key
 }
 
-/// Return the canonical operation identity used by the terminal outcome
-/// ledger for a record.  Runtime policy and terminal evaluation must share
-/// this exact identity; callers should not derive a second key from tool names
-/// or ad-hoc argument fields.
-pub fn tool_outcome_operation_key(record: &ToolCallRecord) -> Option<String> {
-    outcome_resolution_key(record).or_else(|| {
-        if record.ok {
-            untyped_operation_key(record)
-        } else {
-            fallback_tool_outcome_identity(record)
-        }
-    })
-}
-
-/// All canonical identities a successful execution may use to resolve an
-/// earlier failure. The list is intentionally produced by the same core
-/// ledger, including typed, untyped-argument, and fallback identities.
-pub fn tool_outcome_recovery_keys(record: &ToolCallRecord) -> Vec<String> {
-    let mut keys = Vec::with_capacity(3);
-    for key in [
-        tool_outcome_operation_key(record),
-        fallback_tool_outcome_identity(record),
-        untyped_operation_key(record),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-    keys
-}
-
-/// Return currently active failed execution obligations using the same ledger
-/// semantics as [`count_unresolved_tool_outcome_failures`]. Records without a
-/// stable identity remain countable by terminal evaluation, but are omitted
-/// from this set because a later success cannot safely prove that it resolved
-/// that opaque failure.
-pub fn active_execution_failure_operation_keys(
-    records: &[ToolCallRecord],
-) -> std::collections::BTreeSet<String> {
-    active_failure_keys(records.iter().map(|record| {
-        (
-            record_was_executed(record),
-            record.ok,
-            record_is_non_failure_outcome(record),
-            operation_identity_key(record),
-        )
-    }))
-}
-
 /// Return active failures that are strong enough to affect a terminal CLI
-/// outcome.  The ordinary active-failure projection intentionally preserves
-/// every unresolved execution observation for audit and policy feedback.  A
-/// process exit code and completion disposition need a narrower projection so
-/// an expected read-only probe failure does not turn an otherwise completed
-/// turn into a failed process.
+/// outcome, using the same reduction as runtime policy and evaluation counts.
+/// Opaque failures remain distinct because no later operation can establish
+/// their identity. Observation-only errors remain in the raw audit projection.
 pub fn active_terminal_execution_failure_operation_keys(
     records: &[ToolCallRecord],
 ) -> std::collections::BTreeSet<String> {
-    let mut unresolved = std::collections::BTreeSet::new();
-    for (index, record) in records.iter().enumerate() {
-        if !record_was_executed(record) {
-            continue;
-        }
-
-        let stable_key = operation_identity_key(record);
-        let key = stable_key
-            .clone()
-            .unwrap_or_else(|| format!("opaque-terminal::{index}"));
-        if !record.ok && !record_is_non_failure_outcome(record) {
-            let result_class = effective_tool_result_class(record)
-                .unwrap_or_else(|| "execution_error".to_string());
-            if tool_outcome_requires_terminal_attention(record, &result_class) {
-                unresolved.insert(key);
-            }
-        } else if let Some(stable_key) = stable_key {
-            // A matching successful execution resolves only the same stable
-            // operation; opaque records never authorize cross-call recovery.
-            unresolved.remove(&stable_key);
-        }
-    }
-    unresolved
+    let facts: Vec<_> = records
+        .iter()
+        .map(ToolEvaluationFact::from_record)
+        .collect();
+    unresolved_execution_outcome_facts(&facts)
+        .values()
+        .map(|failure| {
+            operation_identity_key(&records[failure.fact_index])
+                .unwrap_or_else(|| format!("opaque-terminal::{}", failure.fact_index))
+        })
+        .collect()
 }
 
-fn active_failure_keys<K: Ord>(
-    facts: impl IntoIterator<Item = (bool, bool, bool, Option<K>)>,
-) -> std::collections::BTreeSet<K> {
-    let mut unresolved = std::collections::BTreeSet::new();
-    for (executed, ok, non_failure, key) in facts {
-        if !executed {
-            continue;
+/// A lost mutation result remains unresolved because repeating a mutation
+/// cannot establish the first outcome. Reads can be retried or replaced by
+/// another observation; leave that choice to the agent.
+pub fn has_unresolved_tool_result_delivery_failure(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|record| {
+        if !record.was_executed() || record.ok || record.execution_ok.is_none() {
+            return false;
         }
-        let Some(key) = key else {
-            continue;
-        };
-        if !ok && !non_failure {
-            unresolved.insert(key);
-        } else {
-            unresolved.remove(&key);
-        }
-    }
-    unresolved
+        let args = record
+            .authoritative_args_full()
+            .and_then(|args| serde_json::from_str(args).ok());
+        !crate::tool::categories::registry().is_read_only_for_recovery(&record.name, args.as_ref())
+    })
 }
 
 pub fn active_execution_failure_fact_keys(
     facts: &[ToolEvaluationFact],
 ) -> std::collections::BTreeSet<EvaluationIdentity> {
-    active_failure_keys(facts.iter().map(|fact| {
-        (
-            fact.was_executed(),
-            fact.ok,
-            fact.non_failure_outcome,
-            fact.operation_identity,
-        )
-    }))
-}
-
-fn untyped_operation_key(record: &ToolCallRecord) -> Option<String> {
-    operation_identity_key(record)
+    unresolved_execution_outcome_facts(facts)
+        .into_keys()
+        .filter_map(|key| match key {
+            EvaluationOutcomeKey::Stable(identity) => Some(identity),
+            EvaluationOutcomeKey::Opaque { .. } => None,
+        })
+        .collect()
 }
 
 /// Return currently active rejected-operation obligations using the same
@@ -1357,6 +1082,9 @@ pub fn tool_outcome_is_positive_success(record: &ToolCallRecord) -> bool {
 }
 
 fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
+    if record.outcome_is_unknown() {
+        return Some("execution_error".into());
+    }
     if matches!(record.name.as_str(), "agent" | "agent_fanout") {
         if let Some(class) = record
             .result_class
@@ -1529,9 +1257,6 @@ fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFam
         "read_file" => Some(ExplorationFamily::Read),
         "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
         "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
-        "bash" if extract_read_target(&record.name, args).is_some() => {
-            Some(ExplorationFamily::Read)
-        }
         _ => None,
     }
 }
@@ -1698,13 +1423,15 @@ pub struct ToolEvaluationFact {
     /// policy window. Absence never authorizes a guessed recovery reference.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+    /// Present only when the source retained full authoritative arguments.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     operation_identity: Option<EvaluationIdentity>,
-    /// False when the outcome key used only a preview or other partial evidence.
-    operation_identity_complete: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     effective_result_class: Option<String>,
     non_failure_outcome: bool,
+    /// Frozen by the same effect classifier as terminal notices. Failed
+    /// observations remain history without becoming unfinished task effects.
+    requires_terminal_attention: bool,
     is_rejected_attempt: bool,
     /// A terminal rejection prevents repair; invalid arguments instead need
     /// a corrected invocation, even though the original call is not retryable.
@@ -1716,9 +1443,7 @@ pub struct ToolEvaluationFact {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     exploration_family: Option<ExplorationFamily>,
     is_search: bool,
-    read_invalidation: ReadInvalidation,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    read_target: Option<ReadRange>,
+    workspace_mutated: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     validation_prefix: Option<EvaluationIdentity>,
     /// Identity of a successful read-only request and the exact result
@@ -1807,14 +1532,6 @@ pub enum EvaluationOutcomeKey {
     Opaque { tool_name: String, index: usize },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", content = "file", deny_unknown_fields)]
-enum ReadInvalidation {
-    None,
-    File(String),
-    All,
-}
-
 /// Equality-only evidence identity. It is domain-separated from execution and
 /// health identities and grants no permission to reuse a result.
 #[derive(
@@ -1848,9 +1565,6 @@ impl ToolEvaluationFact {
         if self.rejection_non_retryable && !self.is_rejected_attempt {
             return Err("non-retryable rejection without rejected attempt");
         }
-        if self.operation_identity_complete && self.operation_identity.is_none() {
-            return Err("complete operation evidence without identity");
-        }
         let class = self.effective_result_class.as_deref().unwrap_or("");
         let resolves = result_class_resolves_outcome_failure(class);
         if (result_class_is_outcome_failure(class) && self.non_failure_outcome)
@@ -1868,14 +1582,19 @@ impl ToolEvaluationFact {
             observation_evidence_identities(record);
         let observation_coverage = observation_coverage(record);
         let observation_scope = observation_scope(record);
+        let effective_result_class = effective_tool_result_class(record);
+        let requires_terminal_attention = tool_outcome_requires_terminal_attention(
+            record,
+            effective_result_class.as_deref().unwrap_or("tool_failure"),
+        );
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
-            operation_identity_complete: !args.trim().is_empty(),
-            effective_result_class: effective_tool_result_class(record),
+            effective_result_class,
             non_failure_outcome: record_is_non_failure_outcome(record),
+            requires_terminal_attention,
             is_rejected_attempt: record_is_rejected_attempt(record),
             rejection_non_retryable: record_is_rejected_attempt(record)
                 && record.error_kind != Some(astra_core::ErrorKind::ToolInvalidArgs)
@@ -1893,13 +1612,7 @@ impl ToolEvaluationFact {
             ok: record.ok,
             exploration_family: classify_exploration_family(record),
             is_search: is_search_like_tool_call(&record.name, args),
-            read_invalidation: if is_mutation_for_redundant_read(&record.name, args) {
-                mutation_target_file(&record.name, args)
-                    .map_or(ReadInvalidation::All, ReadInvalidation::File)
-            } else {
-                ReadInvalidation::None
-            },
-            read_target: extract_read_target(&record.name, args),
+            workspace_mutated: invalidates_validation_evidence(&record.name, args),
             validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
             observation_request_identity,
@@ -1911,6 +1624,16 @@ impl ToolEvaluationFact {
 
     pub fn was_executed(&self) -> bool {
         self.disposition == astra_services::session_journal::ToolCallDisposition::Executed
+    }
+
+    /// A delivered envelope can still report a failed test or incomplete
+    /// child. Domain-negative observations are not failed execution evidence.
+    pub fn has_failed_outcome(&self) -> bool {
+        (!self.ok && !self.non_failure_outcome)
+            || self
+                .effective_result_class
+                .as_deref()
+                .is_some_and(result_class_is_outcome_failure)
     }
 
     pub fn execution_completion(
@@ -1929,14 +1652,9 @@ impl ToolEvaluationFact {
         )
     }
 
+    /// Repetition requires full authoritative arguments, not a shared preview.
     pub fn operation_identity(&self) -> Option<EvaluationIdentity> {
         self.operation_identity
-    }
-
-    /// Repetition requires full authoritative arguments, not a shared preview.
-    pub fn complete_operation_identity(&self) -> Option<EvaluationIdentity> {
-        self.operation_identity
-            .filter(|_| self.operation_identity_complete)
     }
 
     /// Equality-only identity for a read-only result that was actually
@@ -2684,14 +2402,7 @@ pub fn classify_validation_attempt(name: &str, args: &str) -> Option<ValidationA
         None => Some(ValidationAttempt::Opaque(operation_args_identity(
             name, args,
         ))),
-        Some(false) => serde_json::from_str::<Value>(args)
-            .ok()
-            .filter(|args| {
-                astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                    name, args,
-                )
-            })
-            .map(|_| ValidationAttempt::Opaque(operation_args_identity(name, args))),
+        Some(false) => None,
     }
 }
 
@@ -3912,7 +3623,7 @@ pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> u
         if !rec.was_executed() {
             continue;
         }
-        if !matches!(rec.read_invalidation, ReadInvalidation::None) {
+        if rec.workspace_mutated {
             seen.clear();
             continue;
         }
@@ -3925,140 +3636,9 @@ pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> u
     best
 }
 
-/// Parsed read target for redundancy detection.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadRange {
-    file: String,
-    /// Line range, or `None` for whole-file reads.
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    range: Option<(u32, u32)>,
-}
-
-#[derive(Debug, Default)]
-struct ReadCoverage {
-    unbounded_requested: bool,
-    /// Sorted, disjoint inclusive ranges requested from the unchanged file.
-    ranges: Vec<(u32, u32)>,
-}
-
-impl ReadCoverage {
-    fn already_covers(&self, current: &ReadRange) -> bool {
-        // An unbounded request is not proof that the whole file reached the
-        // model: read_file may truncate or return an outline at its output
-        // boundary. A repeated unbounded request asks for the same projection
-        // again, but it must not make later targeted ranges look known.
-        let Some((current_start, current_end)) = current.range else {
-            return self.unbounded_requested;
-        };
-        self.ranges
-            .iter()
-            .any(|(start, end)| *start <= current_start && *end >= current_end)
-    }
-
-    fn record(&mut self, current: &ReadRange) {
-        let Some((mut start, mut end)) = current.range else {
-            self.unbounded_requested = true;
-            return;
-        };
-
-        let mut merged = Vec::with_capacity(self.ranges.len().saturating_add(1));
-        let mut inserted = false;
-        for (prior_start, prior_end) in self.ranges.drain(..) {
-            if prior_end.saturating_add(1) < start {
-                merged.push((prior_start, prior_end));
-            } else if end.saturating_add(1) < prior_start {
-                if !inserted {
-                    merged.push((start, end));
-                    inserted = true;
-                }
-                merged.push((prior_start, prior_end));
-            } else {
-                start = start.min(prior_start);
-                end = end.max(prior_end);
-            }
-        }
-        if !inserted {
-            merged.push((start, end));
-        }
-        self.ranges = merged;
-    }
-}
-
-/// Best-effort extraction of a read target from a tool-call's full args.
-/// Returns `None` for tools that don't read file content (grep/ls/glob),
-/// for ambiguous bash commands, and for parse failures. Recognized:
-///   - `bash` with `sed -n '<a>,<b>p' <file>`
-///   - `bash` with bare `cat <file>` (no shell redirection / pipe input)
-///   - `read_file` tool with JSON args like `{"path":"<f>","start_line":a,"end_line":b}`
-fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
-    use regex::Regex;
-    use std::sync::OnceLock;
-    static SED_RANGE: OnceLock<Regex> = OnceLock::new();
-    static CAT_FILE: OnceLock<Regex> = OnceLock::new();
-
-    if name == "read_file" {
-        // Prefer JSON parsing — `read_file` args_full is always JSON.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
-            let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let s = v
-                .get("start_line")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32);
-            let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
-            let range = s.zip(e);
-            return Some(ReadRange { file: path, range });
-        }
-        return None;
-    }
-    if name != "bash" {
-        return None;
-    }
-    // `sed -n 'A,Bp' file`  (with or without quotes around the range)
-    let sed_re = SED_RANGE
-        .get_or_init(|| Regex::new(r#"\bsed\s+-n\s+['"]?(\d+),(\d+)p['"]?\s+(\S+)"#).unwrap());
-    if let Some(c) = sed_re.captures(args) {
-        let s: u32 = c.get(1)?.as_str().parse().ok()?;
-        let e: u32 = c.get(2)?.as_str().parse().ok()?;
-        let f = c
-            .get(3)?
-            .as_str()
-            .trim_matches(|x| x == '\'' || x == '"')
-            .to_string();
-        return Some(ReadRange {
-            file: f,
-            range: Some((s, e)),
-        });
-    }
-    // Bare `cat <file>` — must NOT be part of a pipeline that accepts
-    // input (heredoc, `<`, `<<`) and must NOT be a mutation (`>`/`>>`/`tee`).
-    if args.contains('>') || args.contains("<<") {
-        return None;
-    }
-    let cat_re = CAT_FILE.get_or_init(|| Regex::new(r#"\bcat\s+(\S+)"#).unwrap());
-    if let Some(c) = cat_re.captures(args)
-        && let Some(f) = c.get(1)
-    {
-        let f = f
-            .as_str()
-            .trim_matches(|x| x == '\'' || x == '"')
-            .to_string();
-        // Skip if the "file" looks like an option (e.g. `-n`).
-        if !f.starts_with('-') {
-            return Some(ReadRange {
-                file: f,
-                range: None,
-            });
-        }
-    }
-    None
-}
-
-/// Whether a tool call mutates workspace state in a way that justifies
-/// a re-read of the same content. Conservative — any plausible mutation
-/// clears the per-file read history so we don't over-flag legitimate
-/// "edit then verify" patterns.
-fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
+/// Whether a tool call can change the program being validated. A possible
+/// workspace mutation invalidates earlier validation retry evidence.
+fn invalidates_validation_evidence(name: &str, args: &str) -> bool {
     matches!(
         name,
         "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
@@ -4104,108 +3684,6 @@ fn bash_args_look_mutating(args: &str) -> bool {
     ];
     let padded = format!(" {args} ");
     MUT_NEEDLES.iter().any(|n| padded.contains(n))
-}
-
-/// Best-effort extraction of the file targeted by a mutation, used to scope
-/// per-file history clears. Returns `None` if the target file is unclear,
-/// in which case the caller clears ALL per-file histories (conservative).
-fn mutation_target_file(name: &str, args: &str) -> Option<String> {
-    if matches!(
-        name,
-        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
-    ) {
-        // Astra's file mutation tools take JSON args with a `path` field.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
-            return v.get("path").and_then(|p| p.as_str()).map(String::from);
-        }
-    }
-    None
-}
-
-/// Count redundant overlapping reads — see `EvalSignal::RedundantOverlappingReads`.
-///
-/// Public so the runtime can call it mid-loop for an advisory observation,
-/// not just post-mortem. The runtime uses a slightly higher threshold than
-/// the eval-signal threshold to err on the side of underkill for the
-/// behavioral intervention.
-pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
-    use std::collections::HashMap;
-    let mut per_file: HashMap<String, ReadCoverage> = HashMap::new();
-    let mut redundant = 0usize;
-    for rec in records {
-        if !record_was_executed(rec) {
-            continue;
-        }
-        let args = rec.authoritative_args_full().unwrap_or("");
-        if is_mutation_for_redundant_read(&rec.name, args) {
-            // Mutation: invalidate the relevant file's read history (or all
-            // file histories if we can't pinpoint the target).
-            match mutation_target_file(&rec.name, args) {
-                Some(f) => {
-                    per_file.remove(&f);
-                }
-                None => per_file.clear(),
-            }
-            continue;
-        }
-        if let Some(target) = extract_read_target(&rec.name, args) {
-            let coverage = per_file.entry(target.file.clone()).or_default();
-            if coverage.already_covers(&target) {
-                redundant += 1;
-            }
-            coverage.record(&target);
-        }
-    }
-    redundant
-}
-
-/// Count redundant reads that are still actionable at the current boundary.
-///
-/// Unlike [`count_redundant_overlapping_reads`], this projection forgets a
-/// file's prior redundancy after an authoritative workspace mutation.  The
-/// historical counter remains appropriate for terminal audit; runtime policy
-/// must not keep advising against behavior that the agent has already left.
-pub fn count_active_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
-    count_active_redundant_overlapping_read_facts(
-        &records
-            .iter()
-            .map(ToolEvaluationFact::from_record)
-            .collect::<Vec<_>>(),
-    )
-}
-
-pub fn count_active_redundant_overlapping_read_facts(facts: &[ToolEvaluationFact]) -> usize {
-    use std::collections::HashMap;
-
-    let mut per_file: HashMap<String, ReadCoverage> = HashMap::new();
-    let mut redundant_per_file: HashMap<String, usize> = HashMap::new();
-    for rec in facts {
-        if !rec.was_executed() || !rec.ok {
-            continue;
-        }
-        match &rec.read_invalidation {
-            ReadInvalidation::File(file) => {
-                per_file.remove(file);
-                redundant_per_file.remove(file);
-                continue;
-            }
-            ReadInvalidation::All => {
-                per_file.clear();
-                redundant_per_file.clear();
-                continue;
-            }
-            ReadInvalidation::None => {}
-        }
-        if let Some(target) = &rec.read_target {
-            let coverage = per_file.entry(target.file.clone()).or_default();
-            if coverage.already_covers(target) {
-                let count = redundant_per_file.entry(target.file.clone()).or_default();
-                *count = count.saturating_add(1);
-            }
-            coverage.record(target);
-        }
-    }
-    redundant_per_file.values().copied().sum()
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -4258,14 +3736,6 @@ pub fn eval_signal_to_json_with_thresholds(
             ),
         }),
 
-        EvalSignal::RedundantOverlappingReads(count) => json!({
-            "kind": "redundant_overlapping_reads",
-            "count": count,
-            "threshold": thresholds.redundant_overlapping_reads,
-            "message": format!(
-                "Detected {count} redundant read(s) with no intervening workspace mutation — the model likely re-read content already in context"
-            ),
-        }),
         EvalSignal::SearchFanout(count) => json!({
             "kind": "search_fanout",
             "count": count,
@@ -4813,6 +4283,50 @@ mod tests {
     }
 
     #[test]
+    fn read_delivery_failure_does_not_permanently_block_the_turn() {
+        let mut failed = journal_ok_call("read_file");
+        failed.ok = false;
+        failed.execution_ok = Some(true);
+        failed.args_full = Some(r#"{"path":"one.txt"}"#.into());
+        let mut other = journal_ok_call("read_file");
+        other.args_full = Some(r#"{"path":"two.txt"}"#.into());
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            other
+        ]));
+        let mut recovered = journal_ok_call("read_file");
+        recovered.args_full = failed.args_full.clone();
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            recovered.clone()
+        ]));
+        failed.name = "write_file".into();
+        recovered.name = "write_file".into();
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            failed,
+            recovered.clone()
+        ]));
+        assert!(!has_unresolved_tool_result_delivery_failure(&[recovered]));
+
+        let mut database_write = journal_ok_call("mo_query");
+        database_write.ok = false;
+        database_write.execution_ok = Some(true);
+        database_write.args_full = Some(r#"{"sql":"DELETE FROM example"}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            database_write
+        ]));
+        let mut rename = journal_ok_call("lsp");
+        rename.ok = false;
+        rename.execution_ok = Some(true);
+        rename.args_full = Some(r#"{"action":"rename","dry_run":false}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[rename]));
+        let mut symbols = journal_ok_call("symbols");
+        symbols.ok = false;
+        symbols.execution_ok = Some(true);
+        assert!(!has_unresolved_tool_result_delivery_failure(&[symbols]));
+    }
+
+    #[test]
     fn unclassified_failed_execution_is_feedback_and_matching_success_resolves_it() {
         let args = serde_json::json!({"command": "cargo test"}).to_string();
         let mut failed = journal_ok_call("bash");
@@ -4843,7 +4357,7 @@ mod tests {
         record.args_full = Some(serde_json::json!({"command": "grep missing file"}).to_string());
         record.exit_semantics = Some("domain_negative".to_string());
         assert_eq!(count_unresolved_tool_outcome_failures(&[record.clone()]), 0);
-        assert!(active_execution_failure_operation_keys(&[record]).is_empty());
+        assert!(active_terminal_execution_failure_operation_keys(&[record]).is_empty());
     }
 
     #[test]
@@ -4877,7 +4391,7 @@ mod tests {
             count_unresolved_tool_outcome_failures(std::slice::from_ref(&record)),
             0
         );
-        assert!(active_execution_failure_operation_keys(&[record]).is_empty());
+        assert!(active_terminal_execution_failure_operation_keys(&[record]).is_empty());
     }
 
     #[test]
@@ -5031,7 +4545,10 @@ mod tests {
         record.result_class = Some("test_failure".to_string());
         record.exit_semantics = Some("domain_negative".to_string());
         assert_eq!(count_unresolved_tool_outcome_failures(&[record.clone()]), 1);
-        assert_eq!(active_execution_failure_operation_keys(&[record]).len(), 1);
+        assert_eq!(
+            active_terminal_execution_failure_operation_keys(&[record]).len(),
+            1
+        );
     }
 
     #[test]
@@ -5051,12 +4568,14 @@ mod tests {
         failed_with_id.ok = false;
         failed_with_id.result_class = None;
         failed_with_id.tool_call_id = Some("call-1".to_string());
+        failed_with_id.round = Some(1);
         let mut recovered_with_id = journal_ok_call("bash");
         recovered_with_id.tool_call_id = Some("call-1".to_string());
+        recovered_with_id.round = Some(2);
         assert_eq!(
             count_unresolved_tool_outcome_failures(&[failed_with_id, recovered_with_id]),
-            0,
-            "a shared provider call identity is sufficient to resolve the fallback failure"
+            1,
+            "an unscoped provider call ID does not establish that two commands match"
         );
 
         let args = serde_json::json!({"command": "cargo test"}).to_string();
@@ -5092,7 +4611,8 @@ mod tests {
         let mut matching_success = journal_ok_call("bash");
         matching_success.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
         assert!(
-            active_execution_failure_operation_keys(&[failed, matching_success.clone()]).is_empty()
+            active_terminal_execution_failure_operation_keys(&[failed, matching_success.clone()])
+                .is_empty()
         );
         assert_eq!(
             count_unresolved_tool_outcome_failures(&[
@@ -5121,8 +4641,8 @@ mod tests {
         untyped_retry.args_full = Some(r#"{"options":{"a":2,"z":1},"command":"probe"}"#.into());
 
         assert_eq!(
-            tool_outcome_operation_key(&typed_failure),
-            tool_outcome_operation_key(&untyped_retry),
+            operation_identity_key(&typed_failure),
+            operation_identity_key(&untyped_retry),
             "result classification and JSON object ordering must not change operation identity"
         );
         assert_eq!(
@@ -5143,8 +4663,8 @@ mod tests {
         different.args_full = Some(r#"{"command":"probe-b"}"#.into());
 
         assert_ne!(
-            tool_outcome_operation_key(&first),
-            tool_outcome_operation_key(&different)
+            operation_identity_key(&first),
+            operation_identity_key(&different)
         );
         assert_eq!(
             count_unresolved_tool_outcome_failures(&[first, different]),
@@ -5515,14 +5035,18 @@ mod tests {
             matching_success.args_full = failed.args_full.clone();
             let records = [failed.clone(), success];
             assert_eq!(count_unresolved_tool_outcome_failures(&records), 1);
-            assert_eq!(active_execution_failure_operation_keys(&records).len(), 1);
+            assert_eq!(
+                active_terminal_execution_failure_operation_keys(&records).len(),
+                1
+            );
             assert_eq!(
                 count_unresolved_tool_outcome_failures(&[failed.clone(), matching_success.clone()]),
                 0,
                 "an exact retry at the original target must still resolve its failure"
             );
             assert!(
-                active_execution_failure_operation_keys(&[failed, matching_success]).is_empty()
+                active_terminal_execution_failure_operation_keys(&[failed, matching_success])
+                    .is_empty()
             );
         }
     }
@@ -5609,60 +5133,6 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, EvalSignal::ToolErrorRate(_)))
         );
-    }
-
-    #[test]
-    fn unresolved_execution_failure_is_distinct_from_generic_low_quality() {
-        let low_quality = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.8,
-            signals: vec![EvalSignal::VerdictWarning],
-            thresholds: EvaluationThresholds::default(),
-        };
-        assert!(!turn_evaluation_has_unresolved_execution_failure(
-            &low_quality
-        ));
-
-        let execution_incomplete = TurnEvaluation {
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "transport_unavailable".to_string(),
-                count: 2,
-            }],
-            ..low_quality.clone()
-        };
-        assert!(turn_evaluation_has_unresolved_execution_failure(
-            &execution_incomplete
-        ));
-
-        let recovered_with_partial_evidence = TurnEvaluation {
-            signals: vec![
-                EvalSignal::ToolErrorRate(0.01),
-                EvalSignal::ToolOutcomeFailure {
-                    class: "execution_error".to_string(),
-                    count: 1,
-                },
-            ],
-            ..low_quality.clone()
-        };
-        assert!(
-            !turn_evaluation_has_unresolved_execution_failure(&recovered_with_partial_evidence),
-            "a minority optional-probe failure is advisory evidence, not a failed child lifecycle"
-        );
-
-        let nested_agent_incomplete = TurnEvaluation {
-            signals: vec![
-                EvalSignal::ToolErrorRate(0.01),
-                EvalSignal::ToolOutcomeFailure {
-                    class: RESULT_CLASS_AGENT_INCOMPLETE.to_string(),
-                    count: 1,
-                },
-            ],
-            ..low_quality
-        };
-        assert!(turn_evaluation_has_unresolved_execution_failure(
-            &nested_agent_incomplete
-        ));
     }
 
     #[test]
@@ -5909,7 +5379,6 @@ mod tests {
             EvalSignal::ToolOutcomeFailure { class, count }
                 if class == "execution_error" && *count == 1
         )));
-        assert!(turn_evaluation_has_unresolved_execution_failure(&eval));
     }
 
     #[test]
@@ -5933,82 +5402,21 @@ mod tests {
         let eval =
             evaluate_tool_call_records("review the implementation", &[], &records, 0, false, 0.2);
 
-        assert!(eval.signals.iter().any(|signal| matches!(
-            signal,
-            EvalSignal::ToolOutcomeFailureCoverage {
-                unresolved: 1,
-                observed: 4
-            }
-        )));
-        assert!(
-            !turn_evaluation_has_unresolved_execution_failure(&eval),
-            "the failed probe remains advisory evidence without erasing the productive evidence"
+        let facts: Vec<_> = records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect();
+        assert_eq!(
+            unresolved_tool_outcome_facts(&facts).len(),
+            1,
+            "retain the failed probe history"
         );
         assert!(
-            turn_evaluation_status_notice(&eval).is_none(),
-            "a minority probe failure must not render the user-facing turn incomplete"
-        );
-        assert!(
-            turn_evaluation_status_notice_for_records(&eval, &records).is_none(),
-            "record-aware status must keep a read-only probe advisory even at 1/4"
-        );
-    }
-
-    #[test]
-    fn record_aware_status_keeps_diagnostic_probes_neutral_without_recovery() {
-        let mut first = journal_ok_call("bash");
-        first.ok = false;
-        first.args_full = Some(serde_json::json!({"command": "lsof -p 1"}).to_string());
-        first.result_class = Some("execution_error".into());
-        let mut second = first.clone();
-        second.tool_call_id = Some("probe-2".into());
-        second.args_full = Some(serde_json::json!({"command": "ps -p 1"}).to_string());
-
-        let eval = evaluate_tool_call_records(
-            "inspect process state",
-            &[],
-            &[first.clone(), second.clone()],
-            0,
-            false,
-            0.2,
-        );
-        assert!(
-            turn_evaluation_status_notice_for_records(&eval, &[first, second]).is_none(),
-            "diagnostic probe failures remain evidence rather than an incomplete execution"
-        );
-    }
-
-    #[test]
-    fn record_aware_status_keeps_real_validation_failure_strict() {
-        let mut failed = journal_ok_call("bash");
-        failed.ok = false;
-        failed.args_full =
-            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
-        failed.result_class = Some("test_failure".into());
-        let mut read = journal_ok_call("read_file");
-        read.args_full = Some(serde_json::json!({"path": "README.md"}).to_string());
-        let records = vec![failed, read];
-        let eval =
-            evaluate_tool_call_records("validate the artifact", &[], &records, 0, false, 0.2);
-        let notice = turn_evaluation_status_notice_for_records(&eval, &records)
-            .expect("validation failures remain visible as incomplete");
-        assert!(notice.contains("test_failure x1"));
-        assert!(notice.contains("incomplete"));
-    }
-
-    #[test]
-    fn record_aware_status_fails_closed_for_opaque_shell_failure() {
-        let mut failed = journal_ok_call("bash");
-        failed.ok = false;
-        failed.args_full =
-            Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
-        failed.result_class = Some("execution_error".into());
-        let records = vec![failed];
-        let eval =
-            evaluate_tool_call_records("inspect the environment", &[], &records, 0, false, 0.2);
-        assert!(
-            turn_evaluation_status_notice_for_records(&eval, &records).is_some(),
-            "an opaque shell command is not proof of a harmless diagnostic probe"
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailureCoverage { .. })),
+            "observations do not create unfinished execution obligations"
         );
     }
 
@@ -6290,12 +5698,6 @@ mod tests {
         );
 
         assert!(!eval.success, "{eval:?}");
-        assert_eq!(
-            turn_evaluation_status_notice(&eval).as_deref(),
-            Some(
-                "Turn finished with unresolved tool/runtime failure(s): fanout_incomplete x1. Treat the final answer as incomplete until validation passes or the provider surface changes."
-            )
-        );
         let metadata = event.metadata.expect("turn evaluation metadata");
         assert_eq!(metadata["success"], false);
         assert_eq!(metadata["tool_call_count"], 1);
@@ -7748,15 +7150,6 @@ mod tests {
         assert_eq!(value["threshold"], 2);
     }
 
-    // ─── Redundant overlapping reads detection ──────────────────────────
-    //
-    // Calibration fixtures (real session shapes; see commit message):
-    //   - 8ba9d165 turn 2: 4×`sed -n '159,200p' execution_phase.rs`,
-    //     4×`sed -n '840,870p' …`, etc. — count >= 17.
-    //   - eafda07e turn 2: 19 redundant reads, 18 rounds, 259k tokens.
-    // Threshold 3 catches all known waste fixtures while leaving healthy
-    // turns silent.
-
     fn record_with_args(name: &str, round: u32, args_full: &str) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -7779,348 +7172,253 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_detects_repeated_sed_ranges_in_same_file() {
-        // Mirrors 8ba9d165 turn 2: same line range read 4 times across rounds,
-        // no edits in between — pure waste.
-        let records = vec![
-            record_with_args(
-                "bash",
-                0,
-                "sed -n '159,200p' crates/runtime/src/turn/agentic_loop_execution_phase.rs",
-            ),
-            record_with_args(
-                "bash",
-                3,
-                "sed -n '159,200p' crates/runtime/src/turn/agentic_loop_execution_phase.rs",
-            ),
-            record_with_args(
-                "bash",
-                6,
-                "sed -n '159,200p' crates/runtime/src/turn/agentic_loop_execution_phase.rs",
-            ),
-            record_with_args(
-                "bash",
-                9,
-                "sed -n '159,200p' crates/runtime/src/turn/agentic_loop_execution_phase.rs",
-            ),
-        ];
-        let eval = evaluate_tool_call_records("修复优化", &[], &records, 0, false, 0.3);
-        let count = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(
-            count,
-            Some(3), // 3 reads after the first overlap = 3 redundant events
-            "expected RedundantOverlappingReads(3), got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn extending_overlapping_ranges_are_new_evidence() {
-        // Every request extends beyond the previously delivered range. Partial
-        // overlap alone is not redundancy because the model receives unseen
-        // content on each call.
-        let records = vec![
-            record_with_args("bash", 0, "sed -n '100,150p' src/foo.rs"),
-            record_with_args("bash", 1, "sed -n '120,180p' src/foo.rs"),
-            record_with_args("bash", 2, "sed -n '140,200p' src/foo.rs"),
-        ];
-        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
-        let count = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(
-            count, None,
-            "extending ranges must not be classified as redundant"
-        );
-    }
-
-    #[test]
-    fn redundant_reads_excludes_mutate_then_verify_pattern() {
-        // Read → edit → read of same range is healthy verification, not waste.
-        // We need 4 reads to potentially cross threshold; with an edit
-        // between the first 2 and last 2, the count must reset and stay <3.
-        let records = vec![
-            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
-            // Edit invalidates per-file history.
-            record_with_args(
-                "str_replace",
-                2,
-                r#"{"path":"src/foo.rs","old_str":"x","new_str":"y"}"#,
-            ),
-            record_with_args("bash", 3, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 4, "sed -n '10,50p' src/foo.rs"),
-        ];
-        let eval = evaluate_tool_call_records("fix bug", &[], &records, 0, false, 0.3);
-        let count = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
-            _ => None,
-        });
-        // Pre-edit: 1 redundant. Post-edit: 1 redundant. Total = 2 < threshold(3).
-        assert_eq!(
-            count, None,
-            "mutate→verify pattern must not flag — got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn redundant_reads_does_not_flag_distinct_files() {
-        // Three reads of different files = no overlap, no signal.
-        let records = vec![
-            record_with_args("bash", 0, "sed -n '1,50p' src/a.rs"),
-            record_with_args("bash", 1, "sed -n '1,50p' src/b.rs"),
-            record_with_args("bash", 2, "sed -n '1,50p' src/c.rs"),
-            record_with_args("bash", 3, "sed -n '1,50p' src/d.rs"),
-        ];
-        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
-            "distinct files should not trigger redundancy; got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn redundant_reads_signal_requires_full_prior_coverage() {
-        // Prior ranges can jointly cover a later request. This is redundant
-        // even when no single prior request contains the whole range.
-        let records = vec![
-            record_with_args(
-                "read_file",
-                0,
-                r#"{"path":"src/foo.rs","start_line":10,"end_line":50}"#,
-            ),
-            record_with_args(
-                "read_file",
-                1,
-                r#"{"path":"src/foo.rs","start_line":51,"end_line":80}"#,
-            ),
-            record_with_args(
-                "read_file",
-                2,
-                r#"{"path":"src/foo.rs","start_line":20,"end_line":70}"#,
-            ),
-            record_with_args(
-                "read_file",
-                3,
-                r#"{"path":"src/foo.rs","start_line":25,"end_line":65}"#,
-            ),
-            record_with_args(
-                "read_file",
-                4,
-                r#"{"path":"src/foo.rs","start_line":30,"end_line":60}"#,
-            ),
-        ];
-        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
-        let count = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(count, Some(3), "got {:?}", eval.signals);
-    }
-
-    #[test]
-    fn redundant_reads_recognizes_read_file_tool() {
-        let records = vec![
-            record_with_args("read_file", 0, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 1, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 2, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 3, r#"{"path":"src/main.rs"}"#),
-        ];
-        let count = count_redundant_overlapping_reads(&records);
-        assert_eq!(
-            count, 3,
-            "read_file re-reads of the same file should count as redundant"
-        );
-    }
-
-    #[test]
-    fn active_redundant_reads_resolve_after_authoritative_mutation() {
-        let mut records = vec![
-            record_with_args("read_file", 0, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 1, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 2, r#"{"path":"src/main.rs"}"#),
-            record_with_args("read_file", 3, r#"{"path":"src/main.rs"}"#),
-        ];
-        assert_eq!(count_active_redundant_overlapping_reads(&records), 3);
-
-        let mut failed_mutation = record_with_args("str_replace", 4, r#"{"path":"src/main.rs"}"#);
-        failed_mutation.ok = false;
-        records.push(failed_mutation);
-        assert_eq!(
-            count_active_redundant_overlapping_reads(&records),
-            3,
-            "a failed mutation cannot invalidate successful read evidence"
-        );
-
-        records.push(record_with_args(
-            "str_replace",
-            5,
-            r#"{"path":"src/main.rs"}"#,
-        ));
-        assert_eq!(
-            count_redundant_overlapping_reads(&records),
-            3,
-            "terminal audit retains the historical inefficiency"
-        );
-        assert_eq!(
-            count_active_redundant_overlapping_reads(&records),
+    fn requested_read_ranges_do_not_imply_redundancy_or_delivery() {
+        let mut records = vec![record_with_args(
+            "read_file",
             0,
-            "online feedback resolves after the relevant state changed"
-        );
-
-        let mut failed_reads = vec![
-            record_with_args("read_file", 0, r#"{"path":"src/failed.rs"}"#),
-            record_with_args("read_file", 1, r#"{"path":"src/failed.rs"}"#),
-            record_with_args("read_file", 2, r#"{"path":"src/failed.rs"}"#),
-            record_with_args("read_file", 3, r#"{"path":"src/failed.rs"}"#),
-        ];
-        failed_reads.iter_mut().for_each(|record| record.ok = false);
+            r#"{"path":"review.rs","start_line":50,"end_line":400}"#,
+        )];
+        records[0].result_full =
+            Some("50\tfirst line\n114\tlast delivered line\n[truncated; continue at 115]".into());
+        for (round, (start, end)) in [(115, 145), (146, 200), (201, 250)].into_iter().enumerate() {
+            let args = serde_json::json!({"path":"review.rs", "start_line":start, "end_line":end});
+            let mut record = record_with_args("read_file", round as u32 + 1, &args.to_string());
+            record.result_full = Some(format!("{start}\tnew evidence\n{end}\tlast line"));
+            records.push(record);
+        }
+        let observed = evaluate_tool_call_records("review this file", &[], &records, 0, false, 0.3);
+        // The first call's oversized requested end is not a delivered fact.
+        let mut delivered_control = records.clone();
+        delivered_control[0].args_full =
+            Some(r#"{"path":"review.rs","start_line":50,"end_line":114}"#.into());
+        let control =
+            evaluate_tool_call_records("review this file", &[], &delivered_control, 0, false, 0.3);
         assert_eq!(
-            count_active_redundant_overlapping_reads(&failed_reads),
-            0,
-            "failed reads never become online behavioral evidence"
+            format!("{:?}", observed.signals),
+            format!("{:?}", control.signals)
         );
+        assert_eq!(observed.quality, control.quality);
     }
 
     #[test]
-    fn extending_read_file_ranges_are_not_redundant() {
-        let records = vec![
-            record_with_args(
-                "read_file",
-                0,
-                r#"{"path":"src/lib.rs","start_line":1,"end_line":50}"#,
-            ),
-            record_with_args(
-                "read_file",
-                1,
-                r#"{"path":"src/lib.rs","start_line":20,"end_line":80}"#,
-            ),
-            record_with_args(
-                "read_file",
-                2,
-                r#"{"path":"src/lib.rs","start_line":40,"end_line":100}"#,
-            ),
-        ];
-        let count = count_redundant_overlapping_reads(&records);
-        assert_eq!(count, 0, "each read contributes previously unseen lines");
-    }
-
-    #[test]
-    fn unbounded_read_does_not_claim_full_file_delivery() {
-        let records = vec![
-            record_with_args("read_file", 0, r#"{"path":"src/lib.rs"}"#),
-            record_with_args(
-                "read_file",
-                1,
-                r#"{"path":"src/lib.rs","start_line":200,"end_line":260}"#,
-            ),
-        ];
-        assert_eq!(
-            count_redundant_overlapping_reads(&records),
-            0,
-            "an output-bounded whole-file request cannot prove later lines were delivered"
-        );
-    }
-
-    #[test]
-    fn redundant_reads_signal_serializes_to_json() {
-        let v = eval_signal_to_json(&EvalSignal::RedundantOverlappingReads(5));
-        assert_eq!(v["kind"], "redundant_overlapping_reads");
-        assert_eq!(v["count"], 5);
-        assert_eq!(v["threshold"], REDUNDANT_OVERLAPPING_READS_THRESHOLD as i64);
-        assert!(v["message"].as_str().unwrap().contains("redundant"));
-    }
-
-    #[test]
-    fn redundant_reads_custom_threshold_flows_into_journal_json() {
-        let records = vec![
-            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 2, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 3, "sed -n '10,50p' src/foo.rs"),
-        ];
-        let eval = evaluate_tool_call_records_with_thresholds(
-            "fix bug",
-            &[],
-            &records,
-            0,
-            false,
-            0.3,
-            EvaluationThresholds {
-                redundant_overlapping_reads: 3,
-                ..Default::default()
-            },
-        );
-        let event = build_turn_evaluation_journal_event(
-            Some("sess-1"),
-            Some(1),
-            "cli_repl",
-            "fix bug",
-            &[],
-            &records,
-            0,
-            false,
-            0.3,
-            &eval,
-        );
-        let metadata = event.metadata.expect("turn evaluation metadata");
-        let redundant = metadata["signals"]
-            .as_array()
-            .unwrap()
+    fn corrected_exploratory_read_preserves_history_without_execution_obligation() {
+        let mut failed = record_with_args("read_file", 0, r#"{"path":"wrong.rs"}"#);
+        failed.ok = false;
+        failed.error_kind = Some(astra_core::ErrorKind::ToolNotFound);
+        failed.error = Some("missing resource".into());
+        let recovered = record_with_args("read_file", 1, r#"{"path":"correct.rs"}"#);
+        let records = [failed, recovered];
+        let facts: Vec<_> = records
             .iter()
-            .find(|signal| signal["kind"] == "redundant_overlapping_reads")
-            .expect("redundant signal");
-        assert_eq!(redundant["count"], 3);
-        assert_eq!(redundant["threshold"], 3);
-    }
-
-    #[test]
-    fn redundant_reads_below_threshold_is_silent() {
-        // 2 redundant reads (threshold=3) must not emit signal.
-        let records = vec![
-            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
-            record_with_args("bash", 2, "sed -n '10,50p' src/foo.rs"),
-        ];
-        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+            .map(ToolEvaluationFact::from_record)
+            .collect();
+        assert_eq!(
+            unresolved_tool_outcome_facts(&facts).len(),
+            1,
+            "changed arguments do not erase historical failures"
+        );
+        assert_eq!(count_unresolved_tool_outcome_failures(&records), 0);
+        assert!(active_terminal_execution_failure_operation_keys(&records).is_empty());
+        assert!(active_execution_failure_fact_keys(&facts).is_empty());
+        let eval = evaluate_tool_call_records("review the file", &[], &records, 0, false, 0.3);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::ToolErrorRate(_)))
+        );
         assert!(
             !eval
                 .signals
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
-            "2 redundant reads must be silent (threshold=3); got {:?}",
-            eval.signals
+                .any(|s| matches!(s, EvalSignal::ToolOutcomeFailure { .. }))
         );
     }
 
     #[test]
-    fn redundant_reads_grep_and_other_search_tools_not_counted() {
-        // grep/ls/glob are search tools, not "read region of file" — they
-        // must not contribute to redundancy even if same path repeats.
-        let records = vec![
-            record_with_args("bash", 0, "grep -n 'foo' src/x.rs"),
-            record_with_args("bash", 1, "grep -n 'bar' src/x.rs"),
-            record_with_args("bash", 2, "grep -n 'baz' src/x.rs"),
-            record_with_args("bash", 3, "grep -n 'qux' src/x.rs"),
-        ];
-        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
+    fn observation_success_does_not_resolve_validation_mutation_or_unknown_effects() {
+        for (name, args, class, kind) in [
+            (
+                "bash",
+                r#"{"command":"cargo test -p example"}"#,
+                Some("test_failure"),
+                None,
+            ),
+            (
+                "write_file",
+                r#"{"path":"result.txt","content":"new"}"#,
+                None,
+                None,
+            ),
+            ("foreign_tool", r#"{"path":"result.txt"}"#, None, None),
+            (
+                "read_file",
+                r#"{"path":"result.txt"}"#,
+                Some("test_failure"),
+                None,
+            ),
+            (
+                "read_file",
+                r#"{"path":"result.txt"}"#,
+                None,
+                Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+            ),
+        ] {
+            let mut failed = record_with_args(name, 0, args);
+            failed.ok = false;
+            failed.result_class = class.map(str::to_string);
+            failed.error_kind = kind;
+            let unrelated = record_with_args("read_file", 1, r#"{"path":"other.txt"}"#);
+            let records = [failed.clone(), unrelated];
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(&records),
+                1,
+                "{name}/{class:?}"
+            );
+            let facts: Vec<_> = records
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
-            "grep calls must not be classified as reads; got {:?}",
-            eval.signals
+                .map(ToolEvaluationFact::from_record)
+                .collect();
+            assert_eq!(
+                active_execution_failure_fact_keys(&facts).len(),
+                1,
+                "{name}/{class:?}"
+            );
+            let matching = record_with_args(name, 2, args);
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(&[failed, matching]),
+                0,
+                "exact success remains valid recovery evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_redacted_arguments_neither_merge_nor_resolve_failures() {
+        let records: Vec<_> = ["fixture-alpha", "fixture-beta", "fixture-gamma"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| ToolCallRecord {
+                name: "bash".into(),
+                args_full: Some(r#"{"command":"cargo test --token [REDACTED:secret]"}"#.into()),
+                runtime_args_full: Some(
+                    json!({"command":format!("cargo test --token {target}")}).to_string(),
+                ),
+                args_preview: Some("cargo test --token ...".into()),
+                tool_call_id: Some(format!("call-{index}")),
+                ok: index == 2,
+                result_class: Some(
+                    if index == 2 {
+                        "success"
+                    } else {
+                        "test_failure"
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(count_unresolved_tool_outcome_failures(&records), 2);
+        let restored: Vec<ToolCallRecord> =
+            serde_json::from_value(serde_json::to_value(records).unwrap()).unwrap();
+        assert!(
+            restored
+                .iter()
+                .all(|record| record.authoritative_args_full().is_none())
         );
+        let facts: Vec<_> = restored
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect();
+        assert!(facts.iter().all(|fact| fact.operation_identity().is_none()));
+        assert_eq!(unresolved_tool_outcome_facts(&facts).len(), 2);
+        assert_eq!(count_unresolved_tool_outcome_failures(&restored), 2);
+        assert_eq!(
+            active_terminal_execution_failure_operation_keys(&restored).len(),
+            2
+        );
+        assert!(
+            active_execution_failure_fact_keys(&facts).is_empty(),
+            "opaque history cannot authorize policy recovery"
+        );
+    }
+
+    #[test]
+    fn delivered_typed_failures_remain_execution_evidence() {
+        for (name, class) in [
+            ("read_file", "test_failure"),
+            ("agent", RESULT_CLASS_AGENT_INCOMPLETE),
+            ("agent_fanout", RESULT_CLASS_FANOUT_INCOMPLETE),
+        ] {
+            let mut failed = record_with_args(name, 0, r#"{"target":"requested-work"}"#);
+            assert!(failed.ok, "the tool envelope was delivered successfully");
+            failed.result_class = Some(class.into());
+            let unrelated = record_with_args("read_file", 1, r#"{"path":"other.txt"}"#);
+            let records = [failed, unrelated];
+            let facts: Vec<_> = records
+                .iter()
+                .map(ToolEvaluationFact::from_record)
+                .collect();
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(&records),
+                1,
+                "{class}"
+            );
+            assert_eq!(
+                active_execution_failure_fact_keys(&facts).len(),
+                1,
+                "{class}"
+            );
+            assert_eq!(
+                active_terminal_execution_failure_operation_keys(&records).len(),
+                1,
+                "{class} must not become successful because its envelope arrived"
+            );
+        }
+    }
+
+    #[test]
+    fn observational_failure_does_not_replace_unknown_outcome() {
+        let args = r#"{"path":"requested.txt"}"#;
+        let mut unknown = record_with_args("read_file", 0, args);
+        unknown.ok = false;
+        unknown.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+        let mut missing = record_with_args("read_file", 1, args);
+        missing.ok = false;
+        missing.error_kind = Some(astra_core::ErrorKind::ToolNotFound);
+        let records = [unknown.clone(), missing.clone()];
+        let facts: Vec<_> = records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect();
+        assert_eq!(
+            unresolved_tool_outcome_facts(&facts)
+                .values()
+                .next()
+                .unwrap()
+                .fact_index,
+            1,
+            "the raw audit still retains the latest failed observation"
+        );
+        assert_eq!(
+            unresolved_execution_outcome_facts(&facts)
+                .values()
+                .next()
+                .unwrap()
+                .fact_index,
+            0,
+            "a different failure cannot establish the unknown operation's outcome"
+        );
+        assert_eq!(count_unresolved_tool_outcome_failures(&records), 1);
+        assert_eq!(active_execution_failure_fact_keys(&facts).len(), 1);
+        assert_eq!(
+            active_terminal_execution_failure_operation_keys(&records).len(),
+            1
+        );
+
+        let recovered = record_with_args("read_file", 2, args);
+        let records = [unknown, missing, recovered];
+        assert_eq!(count_unresolved_tool_outcome_failures(&records), 0);
+        assert!(active_terminal_execution_failure_operation_keys(&records).is_empty());
     }
 
     #[test]
@@ -8292,55 +7590,6 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
-    }
-
-    #[test]
-    fn declared_custom_verifiers_keep_exact_opaque_attempt_identity() {
-        for command in [
-            "python3 -c 'assert 1 == 1'",
-            "python3 - <<'PY'\nassert 1 == 1\nPY",
-        ] {
-            let args = json!({"command": command, "mode": "verify"}).to_string();
-            let Some(ValidationAttempt::Opaque(identity)) =
-                classify_validation_attempt("bash", &args)
-            else {
-                panic!("declared custom verifier must retain opaque identity: {command}");
-            };
-            assert_eq!(
-                normalize_validation_attempt_prefix("bash", &args).as_deref(),
-                Some(identity.as_str())
-            );
-            assert!(!identity.contains(command));
-            let different =
-                json!({"command": command, "mode": "verify", "workdir": "nested"}).to_string();
-            assert_ne!(
-                normalize_validation_attempt_prefix("bash", &different),
-                Some(identity)
-            );
-        }
-        for command in [
-            "cargo test --workspace",
-            "python3 -m pytest tests",
-            "GOFLAGS=-n go test ./...",
-            "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
-        ] {
-            let args = json!({"command": command, "mode": "verify"}).to_string();
-            let Some(ValidationAttempt::Recognized(identity)) =
-                classify_validation_attempt("bash", &args)
-            else {
-                panic!("known validator must remain recognized: {command}");
-            };
-            assert!(!identity.contains("synthetic-secret-value"));
-        }
-        let opaque = json!({"command": "python3 - <<'PY'\npass\nPY"}).to_string();
-        assert!(matches!(
-            classify_validation_attempt("bash", &opaque),
-            Some(ValidationAttempt::Opaque(_))
-        ));
-        assert!(
-            normalize_validation_prefix("bash", &opaque).is_none(),
-            "an inferred opaque attempt must not grant validation proof"
-        );
     }
 
     #[test]

@@ -95,6 +95,8 @@ pub async fn create_user_model_handler(
                 connection_id: request.connection_id,
                 name: request.name,
                 provider: request.provider,
+                inference_protocol: request.inference_protocol,
+                responses_reasoning_history: request.responses_reasoning_history,
                 model: request.model,
                 base_url: request.base_url,
                 api_key: request.api_key,
@@ -142,6 +144,8 @@ pub async fn update_user_model_handler(
             model_id,
             UserModelUpdateRequestData {
                 api_key: request.api_key,
+                inference_protocol: request.inference_protocol,
+                responses_reasoning_history: request.responses_reasoning_history,
                 context_window: request.context_window,
                 is_default: request.is_default,
                 is_active: request.is_active,

@@ -542,6 +542,10 @@ def row_checks(row):
     return lines
 
 
+def display_status(row):
+    return "passed (warnings)" if row["status"] == "passed" and row["has_warnings"] else row["status"]
+
+
 def safe_row(row):
     if set(row) != {"case", "model", "run_index", "status", "has_warnings", "failure_class",
                     "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported",
@@ -690,7 +694,7 @@ class Replay:
             counts = self.counts()
             elapsed = "not executed" if row["case_elapsed_ms"] is None else f"{row['case_elapsed_ms']/1000:.2f}s"
             label = json.dumps(f"{row['case']} / {row['model']} / run {row['run_index']+1}", ensure_ascii=False)
-            print(f"[harness] {row['status'].upper()} [{counts['completed']}/{self.total}] {label} · {elapsed}"
+            print(f"[harness] {display_status(row).upper()} [{counts['completed']}/{self.total}] {label} · {elapsed}"
                   f" · exit={row['exit_code']} · error={row['failure_class'] or 'none'}"
                   f" · counts: {counts['passed']} passed, {counts['failed']} failed,"
                   f" {counts['cancelled']} cancelled, {counts['unavailable']} unavailable", flush=True)
@@ -844,7 +848,7 @@ def publish(root):
         out.write("| Case / model / repetition | Result | Case elapsed | Error class |\n|---|---|---:|---|\n")
         for row in summary["runs"]:
             elapsed = "—" if row["case_elapsed_ms"] is None else f"{row['case_elapsed_ms']/1000:.2f}s"
-            out.write(f"| {cell(row['case'])} / {cell(row['model'])} / {row['run_index']+1} | {row['status']} | {elapsed} | {cell(row['failure_class'] or '—')} |\n")
+            out.write(f"| {cell(row['case'])} / {cell(row['model'])} / {row['run_index']+1} | {display_status(row)} | {elapsed} | {cell(row['failure_class'] or '—')} |\n")
         for group in ("running", "waiting"):
             for item in summary[group]:
                 out.write(f"| {cell(item['case'])} / {cell(item['model'])} / {item['run_index']+1} | {group} (not completed) | {item.get('elapsed_ms',0)/1000:.2f}s last observed | — |\n")

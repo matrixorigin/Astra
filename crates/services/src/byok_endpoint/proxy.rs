@@ -1,11 +1,12 @@
-//! A request-owned CONNECT adapter. Upstream proxies receive validated IPs,
-//! never provider hostnames; reqwest retains end-to-end origin TLS/SNI.
+//! Shared CONNECT adapter. Upstream proxies receive validated IPs, never
+//! provider hostnames; reqwest retains end-to-end origin TLS/SNI.
 use super::EndpointClient;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tokio::{
@@ -14,9 +15,11 @@ use tokio::{
     task::JoinSet,
 };
 
-pub(super) const PROXY_ENV: &str = "ASTRA_BYOK_PROXY_URL";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEAD: usize = 8192;
+const MAX_ROUTES: usize = 4096;
+const MAX_CONNECTIONS: usize = 4096;
+const MAX_PENDING_HANDSHAKES: usize = 64;
 
 trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelIo for T {}
@@ -31,7 +34,7 @@ pub(super) struct EgressProxy {
 }
 
 fn invalid() -> String {
-    "Invalid ASTRA_BYOK_PROXY_URL; use an explicit http://, https:// or socks5:// proxy URL".into()
+    "Invalid Server proxy URL; use an http://, https:// or socks5:// proxy".into()
 }
 fn failed(reason: &'static str) -> io::Error {
     io::Error::other(reason)
@@ -45,7 +48,12 @@ impl EgressProxy {
         if raw.len() > 2048 || raw.chars().any(char::is_control) {
             return Err(invalid());
         }
-        let url = reqwest::Url::parse(raw).map_err(|_| invalid())?;
+        let normalized = if raw.contains("://") {
+            std::borrow::Cow::Borrowed(raw)
+        } else {
+            std::borrow::Cow::Owned(format!("http://{raw}"))
+        };
+        let url = reqwest::Url::parse(&normalized).map_err(|_| invalid())?;
         if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
             || url.host_str().is_none()
             || url.port() == Some(0)
@@ -85,7 +93,8 @@ impl EgressProxy {
         let host = self.url.host_str().unwrap().trim_matches(['[', ']']);
         let port = self.url.port_or_known_default().unwrap_or(1080);
         // The proxy is operator-owned configuration, not a user-selected endpoint.
-        let tcp = TcpStream::connect((host, port)).await?;
+        let addresses = super::resolve_host(host, port).await?;
+        let tcp = TcpStream::connect(addresses.as_slice()).await?;
         tcp.set_nodelay(true)?;
         let mut stream: Stream = if self.url.scheme() == "https" {
             let name = rustls::pki_types::ServerName::try_from(host.to_owned())
@@ -197,30 +206,150 @@ async fn socks_connect(
     Ok(())
 }
 
+struct Route {
+    authority: String,
+    targets: Vec<SocketAddr>,
+    proxy: EgressProxy,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+type Routes = Arc<Mutex<HashMap<String, Arc<Route>>>>;
+
+struct Gateway {
+    address: SocketAddr,
+    routes: Routes,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(super) struct RouteLease {
+    gateway: Arc<Gateway>,
+    authorization: String,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for RouteLease {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.gateway
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.authorization);
+    }
+}
+
+impl Gateway {
+    fn current() -> Result<Arc<Self>, String> {
+        // Each Tokio runtime owns its listener. Weak entries do not keep an
+        // idle runtime, listener, or registered request alive.
+        static GATEWAYS: OnceLock<Mutex<HashMap<tokio::runtime::Id, Weak<Gateway>>>> =
+            OnceLock::new();
+        let runtime = tokio::runtime::Handle::current().id();
+        let mut gateways = GATEWAYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(gateway) = gateways.get(&runtime).and_then(Weak::upgrade)
+            && !gateway.task.is_finished()
+        {
+            return Ok(gateway);
+        }
+        gateways.retain(|_, gateway| gateway.strong_count() != 0);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|_| "Unable to initialize model proxy tunnel")?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "Unable to initialize model proxy tunnel")?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| "Unable to initialize model proxy tunnel")?;
+        let listener = TcpListener::from_std(listener)
+            .map_err(|_| "Unable to initialize model proxy tunnel")?;
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let active_routes = routes.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let mut permit = None;
+            loop {
+                tokio::select! {
+                    acquired = handshakes.clone().acquire_owned(), if permit.is_none() && connections.len() < MAX_CONNECTIONS => {
+                        permit = acquired.ok();
+                    }
+                    accepted = listener.accept(), if permit.is_some() => {
+                        let handshake = permit.take().expect("handshake admission reserved");
+                        match accepted {
+                            Ok((incoming, _)) => {
+                                let routes = active_routes.clone();
+                                connections.spawn(async move { let _ = bridge(incoming, routes, handshake).await; });
+                            }
+                            Err(error) => {
+                                // Resource pressure must not cancel unrelated active streams.
+                                drop(handshake);
+                                tracing::debug!(kind = ?error.kind(), "model proxy listener could not accept a connection");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        let gateway = Arc::new(Self {
+            address,
+            routes,
+            task,
+        });
+        gateways.insert(runtime, Arc::downgrade(&gateway));
+        Ok(gateway)
+    }
+}
+
 async fn bridge(
     mut incoming: TcpStream,
-    authority: &str,
-    authorization: &str,
-    targets: &[SocketAddr],
-    proxy: &EgressProxy,
+    routes: Routes,
+    handshake: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<()> {
     let setup = tokio::time::timeout(CONNECT_TIMEOUT, async {
         let head = read_head(&mut incoming).await?;
         let mut lines = head.lines();
-        if lines.next() != Some(format!("CONNECT {authority} HTTP/1.1").as_str()) {
+        let request = lines
+            .next()
+            .ok_or_else(|| failed("invalid tunnel request"))?;
+        let mut authorizations = lines
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"))
+            .map(|(_, value)| value.trim());
+        let authorization = authorizations
+            .next()
+            .ok_or_else(|| failed("unauthorized tunnel"))?;
+        if authorizations.next().is_some() {
+            return Err(failed("ambiguous tunnel authorization"));
+        }
+        let route = routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(authorization)
+            .cloned()
+            .ok_or_else(|| failed("unauthorized tunnel"))?;
+        if request != format!("CONNECT {} HTTP/1.1", route.authority) {
             return Err(failed("unadmitted tunnel destination"));
         }
-        let authenticated = lines
-            .filter_map(|line| line.split_once(':'))
-            .any(|(name, value)| {
-                name.eq_ignore_ascii_case("proxy-authorization") && value.trim() == authorization
-            });
-        if !authenticated {
-            return Err(failed("unauthorized tunnel"));
-        }
-        for &target in targets {
-            if let Ok(stream) = proxy.connect(target).await {
-                return Ok(stream);
+        drop(handshake);
+        for &target in &route.targets {
+            let stream = tokio::select! {
+                biased;
+                _ = route.cancel.cancelled() => return Err(failed("model request cancelled")),
+                result = route.proxy.connect(target) => result,
+            };
+            if let Ok(stream) = stream {
+                return Ok((stream, route));
             }
         }
         Err(failed(
@@ -228,7 +357,7 @@ async fn bridge(
         ))
     })
     .await;
-    let mut upstream = match setup {
+    let (mut upstream, route) = match setup {
         Ok(Ok(stream)) => stream,
         _ => {
             incoming
@@ -245,8 +374,12 @@ async fn bridge(
     // Only opaque, end-to-end TLS travels through the adapter. Neither proxy
     // authentication header is forwarded to the model endpoint. The request
     // owner enforces idle/cancellation/explicit deadlines; dropping its
-    // EndpointClient also aborts this bridge through the owning JoinSet.
-    tokio::io::copy_bidirectional(&mut incoming, &mut upstream).await?;
+    // EndpointClient cancels every connection belonging to its route.
+    tokio::select! {
+        biased;
+        _ = route.cancel.cancelled() => {},
+        result = tokio::io::copy_bidirectional(&mut incoming, &mut upstream) => { result?; }
+    }
     Ok(())
 }
 
@@ -262,15 +395,10 @@ pub(super) async fn client(
         url.host_str().unwrap(),
         url.port_or_known_default().unwrap()
     );
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|_| "Unable to initialize model proxy tunnel")?;
-    let address = listener
-        .local_addr()
-        .map_err(|_| "Unable to initialize model proxy tunnel")?;
+    let gateway = Gateway::current()?;
     let token = uuid::Uuid::new_v4().to_string();
     let authorization = format!("Basic {}", STANDARD.encode(format!("astra:{token}")));
-    let local_proxy = reqwest::Proxy::https(format!("http://{address}"))
+    let local_proxy = reqwest::Proxy::https(format!("http://{}", gateway.address))
         .map_err(|_| "Unable to initialize model proxy tunnel")?
         .basic_auth("astra", &token);
     let client = builder
@@ -279,24 +407,32 @@ pub(super) async fn client(
         .proxy(local_proxy)
         .build()
         .map_err(|_| "Unable to initialize model proxy client")?;
-    let targets = targets.to_vec();
-    let task = tokio::spawn(async move {
-        let mut connections = JoinSet::new();
-        loop {
-            tokio::select! {
-                accepted = listener.accept(), if connections.len() < 4 => {
-                    let Ok((incoming, _)) = accepted else { break; };
-                    let (authority, authorization, targets, proxy) = (authority.clone(), authorization.clone(), targets.clone(), proxy.clone());
-                    connections.spawn(async move { let _ = bridge(incoming, &authority, &authorization, &targets, &proxy).await; });
-                }
-                _ = connections.join_next(), if !connections.is_empty() => {}
-            }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let mut routes = gateway
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes.len() >= MAX_ROUTES {
+            return Err("Model proxy is busy; try again".into());
         }
-        // Dropping this task drops JoinSet, cancelling all owned connections.
-    });
+        routes.insert(
+            authorization.clone(),
+            Arc::new(Route {
+                authority,
+                targets: targets.to_vec(),
+                proxy,
+                cancel: cancel.clone(),
+            }),
+        );
+    }
     Ok(EndpointClient {
         client,
-        tunnel: Some(task),
+        _tunnel: Some(RouteLease {
+            gateway,
+            authorization,
+            cancel,
+        }),
     })
 }
 

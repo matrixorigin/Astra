@@ -29,7 +29,8 @@ pub struct MemoryInferenceRequest<'a> {
     pub invocation_scope: &'a astra_turn_types::InferenceInvocationScope,
     pub messages: &'a [Value],
     pub max_output_tokens: usize,
-    pub temperature: f64,
+    /// Internal preference for deterministic judgments; a route without verified sampling support uses its provider default.
+    pub preferred_temperature: f64,
     pub deadline: Duration,
 }
 
@@ -78,6 +79,9 @@ where
 /// Server-only direct-provider implementation of [`MemoryInferencePort`].
 #[derive(Clone)]
 pub(crate) struct DirectMemoryInferenceClient {
+    pub(crate) inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub(crate) response_scope: Option<String>,
+    pub(crate) supported_reasoning_efforts: Option<Vec<String>>,
     pub(crate) fixed_temperature: Option<f64>,
     pub(crate) thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub(crate) base_url: String,
@@ -94,9 +98,11 @@ pub(crate) struct DirectMemoryInferenceClient {
 impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.as_deref(),
             subscription: None,
             fixed_temperature: self.fixed_temperature,
-            supported_reasoning_efforts: None,
+            supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
             thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
@@ -197,7 +203,37 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 "memory judgment Offering output limit is below the required typed answer budget",
             ));
         }
+        let memory_thinking = if execution.inference_protocol
+            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        {
+            ThinkingConfig::bounded_auxiliary(
+                &execution.provider,
+                execution
+                    .thinking_capability
+                    .map(|capability| capability.as_str()),
+                execution.thinking_protocol.unwrap_or_else(|| {
+                    astra_core::model_wire::thinking::canonical_thinking_protocol(
+                        &execution.provider,
+                        &execution.base_url,
+                        execution.upstream_model_name(),
+                    )
+                }),
+                execution.supported_reasoning_efforts.as_deref(),
+            )
+        } else {
+            ThinkingConfig::Off
+        };
+        let memory_temperature = if execution.inference_protocol
+            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        {
+            None
+        } else {
+            Some(request.preferred_temperature)
+        };
         let direct = DirectMemoryInferenceClient {
+            inference_protocol: execution.inference_protocol,
+            response_scope: execution.response_scope.clone(),
+            supported_reasoning_efforts: execution.supported_reasoning_efforts.clone(),
             fixed_temperature: execution.fixed_temperature,
             thinking_protocol: execution.thinking_protocol,
             base_url: execution.base_url.clone(),
@@ -226,8 +262,8 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                     cache_capability: None,
                     route: direct.execution_route(),
                     max_output_tokens: Some(request.max_output_tokens),
-                    temperature: Some(request.temperature),
-                    thinking: &ThinkingConfig::Off,
+                    temperature: memory_temperature,
+                    thinking: &memory_thinking,
                 },
                 request.deadline,
             )
@@ -282,7 +318,7 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
                 cache_capability: None,
                 route: self.execution_route(),
                 max_output_tokens: Some(request.max_output_tokens),
-                temperature: Some(request.temperature),
+                temperature: Some(request.preferred_temperature),
                 thinking: &ThinkingConfig::Off,
             },
             request.deadline,
@@ -302,6 +338,9 @@ mod tests {
 
     fn direct_client() -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "https://api.example.com/v1".into(),

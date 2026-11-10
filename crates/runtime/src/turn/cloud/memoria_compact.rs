@@ -454,6 +454,16 @@ impl HttpMemoriaPort {
     }
 
     fn status_error(&self, operation: &str, status: reqwest::StatusCode) -> String {
+        if operation == "idempotent store"
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            return format!(
+                "Memoria {operation} HTTP {status}: this backend does not provide the required idempotent write endpoint; upgrade Memoria before retrying session memory maintenance"
+            );
+        }
         if self.owner_scoped_master && status == reqwest::StatusCode::UNAUTHORIZED {
             return format!(
                 "Memoria {operation} HTTP {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme"
@@ -653,6 +663,14 @@ impl MemoriaPort for UserScopedMemoriaPort {
             .await
             .map_err(|error| error.to_string())?;
         Ok(Some(transport))
+    }
+
+    async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        match self.transport(true).await {
+            Ok(transport) => Ok(Some(transport)),
+            Err(MemoriaOperationError::Disabled(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     async fn retrieve_for_prompt(
@@ -1776,6 +1794,30 @@ mod tests {
         (address, captured, server)
     }
 
+    #[tokio::test]
+    async fn missing_idempotent_endpoint_explains_the_backend_requirement() {
+        let (address, captured, server) =
+            capture_one_http_request("405 Method Not Allowed", b"{}").await;
+        let client = HttpMemoriaPort::new(format!("http://{address}"), "fixture".into())
+            .with_owner_user_id("owner");
+        let error = client
+            .store_idempotent("content", "working", "session", "T3", "key")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .starts_with("POST /v1/memories/idempotent ")
+        );
+        assert!(
+            error.contains("required idempotent write endpoint"),
+            "{error}"
+        );
+        assert!(error.contains("upgrade Memoria"), "{error}");
+    }
+
     #[test]
     fn long_term_episode_and_scene_writers_emit_recallable_layered_protocol() {
         let episode = encode_episode_memory(
@@ -2364,6 +2406,8 @@ mod tests {
             self.requests.lock().unwrap().push(messages.to_vec());
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    input_was_measured: false,
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),

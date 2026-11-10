@@ -188,8 +188,7 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
 
 /// Conservative execution-boundary predicate for any state mutation, not just
 /// files in the bound workspace. A started cancellation of one of these calls
-/// can leave local, external, control-plane, or lifecycle state uncertain and
-/// therefore must participate in terminal settlement.
+/// can leave local, external, control-plane, or lifecycle state uncertain.
 pub fn tool_call_may_mutate_any_state(name: &str, args: Option<&Value>) -> bool {
     astra_turn_core::tool::categories::classify(name, args)
         .category

@@ -114,12 +114,17 @@ impl ServerLocalToolTransport for PendingLocalTransport {
 struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     inserted_identities: Mutex<Vec<EdgeDispatchIdentity>>,
+    delivered_receipts: Mutex<Vec<(EdgeDispatchIdentity, String, String)>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
     result_status: &'static str,
     terminal_admission_result: Option<String>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
+    wait_error: bool,
     direct_claimed: AtomicBool,
+    receipt_result: Result<bool, &'static str>,
+    fail_result: Result<bool, &'static str>,
+    unconfirmed_direct_settlements: AtomicUsize,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -127,12 +132,17 @@ impl Default for StaticEdgeDispatch {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             inserted_identities: Mutex::new(Vec::new()),
+            delivered_receipts: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "completed",
             terminal_admission_result: None,
             admission_error: None,
+            wait_error: false,
             direct_claimed: AtomicBool::new(false),
+            receipt_result: Ok(true),
+            fail_result: Ok(true),
+            unconfirmed_direct_settlements: AtomicUsize::new(0),
         }
     }
 }
@@ -140,27 +150,15 @@ impl Default for StaticEdgeDispatch {
 impl StaticEdgeDispatch {
     fn no_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
     fn failed_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
-            return_result: true,
             result_status: "failed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -179,16 +177,11 @@ impl StaticEdgeDispatch {
             },
         );
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
             terminal_admission_result: Some(
                 serde_json::to_string(&result).expect("terminal result fixture must serialize"),
             ),
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -203,11 +196,14 @@ impl StaticEdgeDispatch {
         }
     }
 
-    fn admission_outcome_unknown(message: &str) -> Self {
+    fn admission_outcome_unknown() -> Self {
         Self {
             admission_error: Some(
                 astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
-                    message.to_string(),
+                    astra_services::multi_agent::EdgeDispatchFailure {
+                        stage: astra_services::multi_agent::EdgeDispatchFailureStage::Commit,
+                        cause: astra_services::multi_agent::EdgeDispatchFailureCause::Connection,
+                    },
                 ),
             ),
             ..Self::default()
@@ -217,28 +213,16 @@ impl StaticEdgeDispatch {
 
 #[async_trait]
 impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
-    async fn insert_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        _payload_json: &str,
-    ) -> Result<(), String> {
-        self.inserted_edge_agent_ids
-            .lock()
-            .expect("inserted edge agent ids lock")
-            .push(edge_agent_id.to_string());
-        self.inserted_identities
-            .lock()
-            .expect("inserted identities lock")
-            .push(identity.clone());
-        Ok(())
+    fn record_unconfirmed_direct_settlement(&self) {
+        self.unconfirmed_direct_settlements
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     async fn admit_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
+        _payload: &serde_json::Value,
     ) -> Result<
         astra_services::multi_agent::EdgeDispatchAdmission,
         astra_services::multi_agent::EdgeDispatchAdmissionError,
@@ -248,9 +232,14 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         {
             return Err(error.clone());
         }
-        self.insert_dispatch(identity, edge_agent_id, payload_json)
-            .await
-            .map_err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown)?;
+        self.inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .push(edge_agent_id.to_string());
+        self.inserted_identities
+            .lock()
+            .expect("inserted identities lock")
+            .push(identity.clone());
         if let Some(error) = &self.admission_error {
             return Err(error.clone());
         }
@@ -270,24 +259,49 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         Ok(Vec::new())
     }
 
-    async fn claim_direct_dispatch(
+    async fn admit_and_claim_direct_dispatch(
         &self,
-        _identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        Ok(self
-            .direct_claimed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok())
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<
+        astra_services::multi_agent::EdgeDirectDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
+        use astra_services::multi_agent::{EdgeDirectDispatchAdmission, EdgeDispatchAdmission};
+        match self
+            .admit_dispatch(identity, edge_agent_id, payload)
+            .await?
+        {
+            EdgeDispatchAdmission::Terminal(result) => {
+                Ok(EdgeDirectDispatchAdmission::Terminal(result))
+            }
+            EdgeDispatchAdmission::Pending => Ok(
+                if self
+                    .direct_claimed
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    EdgeDirectDispatchAdmission::Claimed
+                } else {
+                    EdgeDirectDispatchAdmission::Observing
+                },
+            ),
+        }
     }
 
     async fn deliver_result(
         &self,
-        _identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-        _result_json: &str,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
     ) -> Result<bool, String> {
-        Ok(true)
+        self.delivered_receipts.lock().unwrap().push((
+            identity.clone(),
+            edge_agent_id.to_owned(),
+            result_json.to_owned(),
+        ));
+        self.receipt_result.map_err(str::to_owned)
     }
 
     async fn fail_dispatch(
@@ -300,7 +314,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .lock()
             .expect("failed dispatches lock")
             .push((identity.request_id.clone(), reason.to_string()));
-        Ok(true)
+        self.fail_result.map_err(str::to_owned)
     }
 
     async fn wait_result(
@@ -308,6 +322,9 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
+        if self.wait_error {
+            return Err("database observation failed".into());
+        }
         if !self.return_result {
             return Ok(None);
         }
@@ -356,17 +373,20 @@ impl PendingEdgeDispatch {
 
 #[async_trait]
 impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
-    async fn insert_dispatch(
+    async fn admit_dispatch(
         &self,
         _identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        _payload_json: &str,
-    ) -> Result<(), String> {
+        _payload_json: &serde_json::Value,
+    ) -> Result<
+        astra_services::multi_agent::EdgeDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
         self.inserted_edge_agent_ids
             .lock()
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
-        Ok(())
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
     }
 
     async fn poll_pending(
@@ -455,12 +475,15 @@ impl SharedNoStickyEdgeDispatch {
 
 #[async_trait]
 impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDispatch {
-    async fn insert_dispatch(
+    async fn admit_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        payload_json: &str,
-    ) -> Result<(), String> {
+        payload_json: &serde_json::Value,
+    ) -> Result<
+        astra_services::multi_agent::EdgeDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
         rows.entry(identity.clone())
             .or_insert_with(|| SharedNoStickyDispatchRow {
@@ -472,7 +495,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
             });
         drop(rows);
         self.inserted.notify_waiters();
-        Ok(())
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
     }
 
     async fn poll_pending(
@@ -818,7 +841,7 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
         .unwrap();
     assert!(!plan.requires_live_provider_interaction());
-    assert!(plan.dispatch_payload_json().is_err());
+    assert!(plan.dispatch_payload().is_err());
 
     let read_only_binding = astra_runtime_env::RunBinding::resolve(
         astra_runtime_env::WorkspaceBinding::edge_workspace(
@@ -907,7 +930,7 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     );
     assert_eq!(ceiling.runtime_read_paths, ["/usr/bin/worker", "/usr/lib"]);
     let payload: astra_server_types::EdgeServerMessage =
-        serde_json::from_str(&bound.dispatch_payload_json().unwrap()).unwrap();
+        serde_json::from_value(bound.dispatch_payload().unwrap()).unwrap();
     let astra_server_types::EdgeServerMessage::ToolRequest {
         execution_ceiling, ..
     } = payload
@@ -1609,9 +1632,7 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
         Some(std::time::Duration::from_secs(310))
     );
 
-    let payload: Value =
-        serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
-            .expect("payload json");
+    let payload: Value = plan.dispatch_payload().expect("dispatch payload");
     assert_eq!(payload["type"], "edge_tool_request");
     assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "bash");
@@ -1657,10 +1678,14 @@ fn durable_edge_payload_never_contains_runtime_process_authorization() {
     request.runtime_process_authorization_required = true;
 
     let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
-    let payload = plan.dispatch_payload_json().expect("dispatch payload");
-    let parsed: Value = serde_json::from_str(&payload).expect("payload json");
+    let payload = plan.dispatch_payload().expect("dispatch payload");
+    let parsed = payload.clone();
 
-    assert!(!payload.contains("durable-secret-must-not-appear"));
+    assert!(
+        !payload
+            .to_string()
+            .contains("durable-secret-must-not-appear")
+    );
     assert_eq!(parsed["runtime_process_authorization"], Value::Null);
     assert_eq!(parsed["runtime_process_authorization_required"], true);
     assert!(plan.runtime_process_authorization().is_some());
@@ -1687,7 +1712,7 @@ fn edge_dispatch_preserves_admitted_work_budget_without_rewriting_arguments() {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
     request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
     let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
-    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    let payload: Value = plan.dispatch_payload().unwrap();
     assert_eq!(
         payload["identity"],
         serde_json::to_value(plan.identity()).unwrap()
@@ -1706,7 +1731,7 @@ fn edge_dispatch_preserves_admitted_work_budget_without_rewriting_arguments() {
     let binding = request.runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins());
     let governed =
         EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
-    let governed: Value = serde_json::from_str(&governed.dispatch_payload_json().unwrap()).unwrap();
+    let governed: Value = governed.dispatch_payload().unwrap();
     assert_eq!(governed["command_timeout_cap_ms"], 8_000);
     assert!(
         governed["execution_timeout_ms"].as_u64().unwrap() > 590_000,
@@ -1746,7 +1771,7 @@ async fn admitted_edge_plan_remaining_never_renews_and_rejects_partial_pair() {
         plan.wait_timeout(),
         Some(std::time::Duration::from_secs(310))
     );
-    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    let payload: Value = plan.dispatch_payload().unwrap();
     assert_eq!(payload["execution_timeout_ms"], remaining);
     tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
     assert_eq!(plan.execution_timeout_ms(), Some(0));
@@ -1790,9 +1815,7 @@ fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
         plan.wait_timeout(),
         Some(std::time::Duration::from_secs(40))
     );
-    let payload: Value =
-        serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
-            .expect("payload json");
+    let payload: Value = plan.dispatch_payload().expect("dispatch payload");
     assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "read_file");
     assert_eq!(payload["timeout_secs"], 30);
@@ -1824,9 +1847,7 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
         plan.wait_timeout(),
         Some(std::time::Duration::from_secs(18))
     );
-    let payload: Value =
-        serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
-            .expect("payload json");
+    let payload: Value = plan.dispatch_payload().expect("dispatch payload");
     assert_eq!(payload["timeout_secs"], 8);
     assert_eq!(
         binding.policy.resources.max_execution_secs,
@@ -2529,7 +2550,8 @@ async fn edge_offline_does_not_call_server_local() {
 #[tokio::test]
 async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register(
         "user-1",
         "edge-other",
@@ -2596,7 +2618,8 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 #[tokio::test]
 async fn unscoped_edge_binding_does_not_route_to_another_users_connected_edge() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-2",
         "edge-selected",
@@ -2650,7 +2673,8 @@ async fn unscoped_edge_binding_does_not_route_to_another_users_connected_edge() 
 #[tokio::test]
 async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -2732,7 +2756,8 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -2772,7 +2797,9 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
             .execute(tool_request, &CountingLocalTransport::new())
             .await
     });
-    let message = rx.recv().await.expect("authorized edge tool request");
+    let mut queued = rx.recv().await.expect("authorized edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -2849,7 +2876,8 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(2);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(2);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -2901,7 +2929,9 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
     }
     start.wait().await;
 
-    let message = rx.recv().await.expect("claimed edge tool request");
+    let mut queued = rx.recv().await.expect("claimed edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -2948,6 +2978,16 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
 
 #[tokio::test]
 async fn revoked_provider_executor_authorization_closes_claim_before_socket_dispatch() {
+    for fail_result in [
+        Ok(true),
+        Ok(false),
+        Err("fixture-secret-in-settlement-error"),
+    ] {
+        revoked_provider_executor_authorization_case(fail_result).await;
+    }
+}
+
+async fn revoked_provider_executor_authorization_case(fail_result: Result<bool, &'static str>) {
     let authorization_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&authorization_calls);
     let app = axum::Router::new().route(
@@ -2974,7 +3014,8 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -2984,7 +3025,10 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
         None,
         tx,
     );
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        fail_result,
+        ..StaticEdgeDispatch::default()
+    });
     let service = ToolExecutionService::builder()
         .edge_connection_pool(pool)
         .edge_dispatch_service(dispatch.clone())
@@ -3014,6 +3058,12 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
         .await;
 
     assert!(result.is_error, "{result:?}");
+    assert!(!result.output.contains("fixture-secret-in-settlement-error"));
+    assert!(!format!("{:?}", result.metadata).contains("fixture-secret-in-settlement-error"));
+    if !matches!(fail_result, Ok(true)) {
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome_certainty"], "unknown");
+    }
     assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
     assert!(
         rx.try_recv().is_err(),
@@ -3037,13 +3087,20 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
         1,
         "a denied claim must become terminal before it can reach the Edge"
     );
+    assert_eq!(
+        dispatch
+            .unconfirmed_direct_settlements
+            .load(Ordering::SeqCst),
+        usize::from(!matches!(fail_result, Ok(true)))
+    );
     server.abort();
 }
 
 #[tokio::test]
 async fn completed_authorized_dispatch_replays_without_provider_reauthorization() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -3130,7 +3187,8 @@ async fn authorized_provider_executor_cannot_fall_back_to_server_sandbox_local_e
 #[tokio::test]
 async fn replayed_authorized_provider_executor_without_context_fails_before_dispatch() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -3208,7 +3266,8 @@ async fn replayed_authorized_provider_executor_without_context_fails_before_disp
 async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -3256,7 +3315,8 @@ async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
 async fn workspace_service_account_edge_separates_route_owner_from_invocation_owner() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "sandbox-service-account",
         "edge-selected",
@@ -3301,7 +3361,9 @@ async fn workspace_service_account_edge_separates_route_owner_from_invocation_ow
             .await
     });
 
-    let message = rx.recv().await.expect("service-account edge tool request");
+    let mut queued = rx.recv().await.expect("service-account edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation, identity) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -3347,7 +3409,8 @@ async fn workspace_service_account_edge_separates_route_owner_from_invocation_ow
 async fn edge_ws_result_preserves_tool_result_fields() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -3380,7 +3443,9 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         service.execute(request, &local).await
     });
 
-    let message = rx.recv().await.expect("edge tool request");
+    let mut queued = rx.recv().await.expect("edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     assert_eq!(
         *dispatch
             .inserted_edge_agent_ids
@@ -3423,6 +3488,91 @@ async fn edge_ws_result_preserves_tool_result_fields() {
     assert_eq!(metadata["transport"], "edge_ws");
     assert_eq!(metadata["exit_code"], 7);
     assert_eq!(metadata["result_class"], "execution_error");
+}
+
+#[tokio::test]
+async fn dropped_unattempted_direct_request_records_nonexecution_receipt() {
+    for receipt_result in [Ok(true), Ok(false), Err("receipt response lost")] {
+        dropped_unattempted_direct_request_case(receipt_result).await;
+    }
+}
+
+async fn dropped_unattempted_direct_request_case(receipt_result: Result<bool, &'static str>) {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".into()),
+        Some("/Users/test/project".into()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        receipt_result,
+        ..StaticEdgeDispatch::default()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let handle = tokio::spawn(async move {
+        service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        ExecutorStatus::Online,
+                    ),
+                ),
+                &CountingLocalTransport::new(),
+            )
+            .await
+    });
+    drop(rx.recv().await.expect("durably admitted direct request"));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("unattempted request must wake its owner")
+        .unwrap();
+    assert!(result.is_error);
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["execution_fact"], "not_executed");
+    let unconfirmed = !matches!(receipt_result, Ok(true));
+    assert_eq!(
+        metadata
+            .get("dispatch_receipt_unconfirmed")
+            .and_then(Value::as_bool),
+        unconfirmed.then_some(true)
+    );
+    assert_eq!(
+        dispatch
+            .unconfirmed_direct_settlements
+            .load(Ordering::SeqCst),
+        usize::from(unconfirmed)
+    );
+    let receipts = dispatch.delivered_receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].0,
+        dispatch.inserted_identities.lock().unwrap()[0]
+    );
+    assert_eq!(receipts[0].1, "edge-selected");
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(&receipts[0].2).unwrap();
+    assert_eq!(receipt.status, "rejected");
+    assert_eq!(
+        receipt.tool_result_fields.unwrap()["execution_fact"],
+        "not_executed"
+    );
 }
 
 #[tokio::test]
@@ -3793,9 +3943,7 @@ async fn edge_admission_rejection_is_reported_as_certain_and_is_not_retried() {
 
 #[tokio::test]
 async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
-    let dispatch = Arc::new(StaticEdgeDispatch::admission_outcome_unknown(
-        "database response was lost after insert",
-    ));
+    let dispatch = Arc::new(StaticEdgeDispatch::admission_outcome_unknown());
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
@@ -3833,9 +3981,10 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert_eq!(metadata["side_effects_maybe"], true);
     assert!(result.output.contains("reconcile its durable invocation"));
+    assert!(result.output.contains("database connection failed"));
     assert_eq!(
         metadata["diagnostics"][0],
-        "edge-dispatch: admission outcome is unknown: database response was lost after insert"
+        "edge-dispatch: admission outcome is unknown: database commit: database connection failed"
     );
     assert_eq!(
         local.calls(),
@@ -3920,6 +4069,45 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         .expect("failed dispatches lock");
     assert_eq!(failed_dispatches.len(), 1);
     assert_eq!(failed_dispatches[0].1, "expired");
+}
+
+#[tokio::test]
+async fn edge_dispatch_observation_error_does_not_expire_running_work() {
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        wait_error: true,
+        ..StaticEdgeDispatch::default()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error);
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert!(dispatch.failed_dispatches.lock().unwrap().is_empty());
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]

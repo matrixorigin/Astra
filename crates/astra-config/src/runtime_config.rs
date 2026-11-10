@@ -632,18 +632,6 @@ pub struct ToolPolicyConfig {
     #[serde(default)]
     pub parallel_batching_force_streak: u32,
 
-    /// Mid-loop guard: count of redundant overlapping reads of the same file.
-    #[serde(default)]
-    pub redundant_reads_midloop_threshold: u32,
-
-    /// Post-mortem eval signal threshold for sequential read churn.
-    #[serde(default)]
-    pub sequential_read_churn_eval_threshold: u32,
-
-    /// Post-mortem eval signal threshold for redundant overlapping reads.
-    #[serde(default)]
-    pub redundant_reads_eval_threshold: u32,
-
     /// Post-mortem eval signal threshold for search fanout.
     #[serde(default)]
     pub search_fanout_eval_threshold: u32,
@@ -779,18 +767,6 @@ impl ToolPolicyConfig {
 
     pub fn effective_parallel_batching_force_streak(&self) -> u32 {
         resolve_parallel_batching_force_streak(self.parallel_batching_force_streak)
-    }
-
-    pub fn effective_redundant_reads_midloop_threshold(&self) -> u32 {
-        resolve_threshold(self.redundant_reads_midloop_threshold, 4, 2)
-    }
-
-    pub fn effective_sequential_read_churn_eval_threshold(&self) -> u32 {
-        resolve_threshold(self.sequential_read_churn_eval_threshold, 8, 2)
-    }
-
-    pub fn effective_redundant_reads_eval_threshold(&self) -> u32 {
-        resolve_threshold(self.redundant_reads_eval_threshold, 3, 2)
     }
 
     pub fn effective_search_fanout_eval_threshold(&self) -> u32 {
@@ -1855,61 +1831,6 @@ mod tests {
             "floor for parallel_batching_force_streak must be symmetric \
              between global and per-profile paths"
         );
-    }
-
-    #[test]
-    fn redundant_reads_midloop_threshold_default_and_floor() {
-        // 0 → default 4
-        let cfg = ToolPolicyConfig::default();
-        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 4);
-        // explicit override respected
-        let cfg = ToolPolicyConfig {
-            redundant_reads_midloop_threshold: 6,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 6);
-        // pathological override 1 floors to 2
-        let cfg = ToolPolicyConfig {
-            redundant_reads_midloop_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 2);
-    }
-
-    #[test]
-    fn sequential_read_churn_eval_threshold_default_and_floor() {
-        let cfg = ToolPolicyConfig::default();
-        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 8);
-
-        let cfg = ToolPolicyConfig {
-            sequential_read_churn_eval_threshold: 10,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 10);
-
-        let cfg = ToolPolicyConfig {
-            sequential_read_churn_eval_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 2);
-    }
-
-    #[test]
-    fn redundant_reads_eval_threshold_default_and_floor() {
-        let cfg = ToolPolicyConfig::default();
-        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 3);
-
-        let cfg = ToolPolicyConfig {
-            redundant_reads_eval_threshold: 6,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 6);
-
-        let cfg = ToolPolicyConfig {
-            redundant_reads_eval_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 2);
     }
 
     #[test]

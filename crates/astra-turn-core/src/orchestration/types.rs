@@ -66,6 +66,8 @@ pub enum AgentStatus {
         finish_reason: String,
     },
     Failed {
+        /// Retained assistant output; empty means unavailable, not no work.
+        partial_result: String,
         error: String,
         #[allow(dead_code)]
         finish_reason: Option<String>,
@@ -79,6 +81,8 @@ pub enum AgentStatus {
         reason: String,
     },
     Cancelled {
+        /// Retained assistant output, independent of the cancellation origin.
+        partial_result: String,
         /// Whether the cancellation was triggered by the user (Ctrl+C
         /// / Ctrl+G x) as opposed to a system condition (parent
         /// cancel, depth violation, etc.). When `true`, the wire
@@ -94,6 +98,31 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// Assistant output retained by its terminal owner, including partial work.
+    /// Presence does not imply that execution completed successfully.
+    pub fn retained_output(&self) -> Option<&str> {
+        let text = match self {
+            Self::Completed { result, .. } => result,
+            Self::Interrupted { partial_result, .. }
+            | Self::Failed { partial_result, .. }
+            | Self::Cancelled { partial_result, .. } => partial_result,
+            _ => return None,
+        };
+        (!text.trim().is_empty()).then_some(text.as_str())
+    }
+
+    /// Attach retained output without changing terminal outcome or origin.
+    pub fn with_partial_result(mut self, text: &str) -> Self {
+        match &mut self {
+            Self::Failed { partial_result, .. } | Self::Cancelled { partial_result, .. } => {
+                partial_result.clear();
+                partial_result.push_str(text);
+            }
+            _ => {}
+        }
+        self
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -110,6 +139,7 @@ impl AgentStatus {
         Self::Cancelled {
             by_user: false,
             reason: String::new(),
+            partial_result: String::new(),
         }
     }
 
@@ -118,6 +148,7 @@ impl AgentStatus {
         Self::Cancelled {
             by_user: true,
             reason: reason.into(),
+            partial_result: String::new(),
         }
     }
 }
@@ -168,11 +199,14 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
         AgentStatus::Failed {
             error,
             finish_reason,
+            ..
         } => (
             AgentFanoutSlotStatus::Failed,
             finish_reason.clone().or_else(|| Some(error.clone())),
         ),
-        AgentStatus::Cancelled { by_user, reason } => {
+        AgentStatus::Cancelled {
+            by_user, reason, ..
+        } => {
             let reason = if reason.is_empty() {
                 None
             } else {
@@ -211,6 +245,23 @@ pub struct SpawnedAgentMetrics {
     pub tools_blocked: u32,
 }
 
+impl SpawnedAgentMetrics {
+    pub fn coverage(&self) -> &'static str {
+        if self.turns_completed > 0
+            || self.tool_calls > 0
+            || self.prompt_tokens > 0
+            || self.completion_tokens > 0
+            || self.permission_requests > 0
+            || self.permission_requests_approved > 0
+            || self.tools_blocked > 0
+        {
+            "partial"
+        } else {
+            "unknown"
+        }
+    }
+}
+
 /// Summary info for a spawned agent (no runtime dependencies).
 #[derive(Debug, Clone)]
 pub struct SpawnedAgentInfo {
@@ -240,6 +291,16 @@ pub fn random_edge_executor_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounting_coverage_requires_provenance_even_for_zero_counters() {
+        let mut metrics = SpawnedAgentMetrics::default();
+        assert_eq!(metrics.coverage(), "unknown");
+        metrics.tools_blocked = 1;
+        assert_eq!(metrics.coverage(), "partial");
+        metrics.tools_blocked = 0;
+        assert_eq!(metrics.coverage(), "unknown");
+    }
 
     #[test]
     fn paused_is_a_nonterminal_waiting_presentation_not_interrupted() {

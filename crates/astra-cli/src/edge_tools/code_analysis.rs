@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{
     ToolExecutor, categorize_reference, code_intel, parse_grep_file_line, per_tool_output_limit,
-    truncate_output, validate_path,
+    truncate_output,
 };
 
 impl ToolExecutor {
@@ -24,24 +24,10 @@ impl ToolExecutor {
             None => return "Error: missing 'path' parameter".to_string(),
         };
 
-        let path = if path_str.starts_with('/') {
-            PathBuf::from(path_str)
-        } else {
-            self.project_root.join(path_str)
+        let path = match self.resolve_checked(path_str) {
+            Ok(path) => path,
+            Err(error) => return error,
         };
-
-        // Sandbox check
-        {
-            let sp_guard = self
-                .sandbox_policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && let Err(e) = validate_path(policy, path_str)
-            {
-                return format!("Sandbox: path blocked: {e}");
-            }
-        }
 
         if !path.exists() {
             return format!("Error: No such file: {}", path.display());
@@ -164,6 +150,7 @@ impl ToolExecutor {
         lines: &[&'a str],
         symbol: &str,
     ) -> Vec<&'a str> {
+        let workspace_root = self.effective_project_root();
         use std::collections::HashMap;
 
         // Group lines by file path for efficient per-file parsing
@@ -177,7 +164,7 @@ impl ToolExecutor {
         let mut result = Vec::with_capacity(lines.len());
 
         for (file, matches) in &by_file {
-            let file_path = self.project_root.join(file);
+            let file_path = workspace_root.join(file);
             let lang = match code_intel::detect_language(&file_path) {
                 Some(l) => l,
                 None => {
@@ -231,6 +218,7 @@ impl ToolExecutor {
         target: &str,
         _origin_file: &std::path::Path,
     ) -> Vec<(String, String, String, usize)> {
+        let workspace_root = self.effective_project_root();
         let skip_names = [
             "node_modules",
             "target",
@@ -275,7 +263,7 @@ impl ToolExecutor {
 
             let symbols = code_intel::extract_symbols(&content, lang);
             let rel_path = file_path
-                .strip_prefix(&self.project_root)
+                .strip_prefix(&workspace_root)
                 .unwrap_or(file_path)
                 .display()
                 .to_string();
@@ -315,12 +303,13 @@ impl ToolExecutor {
         symbol: &str,
         extensions: &[&str],
     ) -> Vec<PathBuf> {
+        let workspace_root = self.effective_project_root();
         let mut cmd = std::process::Command::new("rg");
         cmd.arg("--files-with-matches")
             .arg("--no-heading")
             .arg("--color=never")
             .arg("-w") // word boundary
-            .current_dir(&self.project_root);
+            .current_dir(&workspace_root);
 
         // Add extension filters
         for ext in extensions {
@@ -337,7 +326,7 @@ impl ToolExecutor {
         match cmd.output() {
             Ok(out) => String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .map(|l| self.project_root.join(l.trim()))
+                .map(|l| workspace_root.join(l.trim()))
                 .filter(|p| p.exists())
                 .collect(),
             Err(_) => Vec::new(), // Fallback handled by caller
@@ -351,8 +340,9 @@ impl ToolExecutor {
         extensions: &[&str],
         max_files: usize,
     ) -> Vec<PathBuf> {
+        let workspace_root = self.effective_project_root();
         let mut result = Vec::new();
-        let mut dirs_to_visit = vec![self.project_root.clone()];
+        let mut dirs_to_visit = vec![workspace_root.clone()];
 
         while let Some(dir) = dirs_to_visit.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
@@ -481,6 +471,7 @@ impl ToolExecutor {
         file_paths: &[PathBuf],
         context_file: &Path,
     ) -> Vec<usize> {
+        let workspace_root = self.effective_project_root();
         match lang {
             code_intel::Language::Python if import.path.starts_with('.') => {
                 let leading_dots = import.path.chars().take_while(|ch| *ch == '.').count();
@@ -490,7 +481,7 @@ impl ToolExecutor {
 
                 let mut base_dir = context_file
                     .parent()
-                    .unwrap_or(self.project_root.as_path())
+                    .unwrap_or(workspace_root.as_path())
                     .to_path_buf();
                 for _ in 1..leading_dots {
                     base_dir.pop();
@@ -534,7 +525,7 @@ impl ToolExecutor {
             {
                 let base_dir = context_file
                     .parent()
-                    .unwrap_or(self.project_root.as_path())
+                    .unwrap_or(workspace_root.as_path())
                     .to_path_buf();
                 let module_root = Self::normalize_virtual_path(&base_dir.join(&import.path));
                 let extensions: &[&str] = match lang {
@@ -692,15 +683,19 @@ impl ToolExecutor {
     /// When a `file` parameter is provided, analyzes imports in that file to
     /// prioritize the most likely definition (import-aware resolution).
     pub(super) fn find_definition(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let symbol = match args.get("symbol").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
             _ => return "Error: 'symbol' parameter is required".to_string(),
         };
 
         let search_root = if let Some(p) = args.get("path").and_then(Value::as_str) {
-            self.project_root.join(p)
+            match self.resolve_checked(p) {
+                Ok(path) => path,
+                Err(error) => return error,
+            }
         } else {
-            self.project_root.clone()
+            workspace_root.clone()
         };
 
         // Determine file extensions to search
@@ -798,10 +793,9 @@ impl ToolExecutor {
         let context_file = args.get("file").and_then(Value::as_str);
 
         if let Some(ctx_file) = context_file {
-            let ctx_path = if ctx_file.starts_with('/') {
-                PathBuf::from(ctx_file)
-            } else {
-                self.project_root.join(ctx_file)
+            let ctx_path = match self.resolve_checked(ctx_file) {
+                Ok(path) => path,
+                Err(error) => return error,
             };
             if ctx_path.exists()
                 && let Some(ctx_lang) = code_intel::detect_language(&ctx_path)
@@ -886,7 +880,7 @@ impl ToolExecutor {
             if idx < file_paths.len() {
                 scanned_indices.insert(idx);
                 files_scanned += 1;
-                for (hit, _) in scan_file(&file_paths[idx], &self.project_root) {
+                for (hit, _) in scan_file(&file_paths[idx], &workspace_root) {
                     import_results.push(hit);
                 }
             }
@@ -902,7 +896,7 @@ impl ToolExecutor {
                 results.push(format!("\n[stopped after scanning {max_files} files]"));
                 break;
             }
-            for (hit, _) in scan_file(path, &self.project_root) {
+            for (hit, _) in scan_file(path, &workspace_root) {
                 results.push(hit);
             }
         }
@@ -942,15 +936,19 @@ impl ToolExecutor {
     /// Find all references to a symbol across the codebase.
     /// Uses grep for speed, with word-boundary matching for precision.
     pub(super) fn find_references(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let symbol = match args.get("symbol").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
             _ => return "Error: 'symbol' parameter is required".to_string(),
         };
 
         let search_path = if let Some(p) = args.get("path").and_then(Value::as_str) {
-            self.project_root.join(p)
+            match self.resolve_checked(p) {
+                Ok(path) => path,
+                Err(error) => return error,
+            }
         } else {
-            self.project_root.clone()
+            workspace_root.clone()
         };
 
         // Build ripgrep command for word-boundary matching
@@ -960,7 +958,7 @@ impl ToolExecutor {
             .arg("--color=never")
             .arg("--max-count=5") // Max per file
             .arg("-w") // Word boundary
-            .current_dir(&self.project_root);
+            .current_dir(&workspace_root);
 
         // Apply include filter
         if let Some(include) = args.get("include").and_then(Value::as_str) {
@@ -1086,7 +1084,7 @@ impl ToolExecutor {
                         symbol,
                     ])
                     .arg(search_path.to_string_lossy().to_string())
-                    .current_dir(&self.project_root)
+                    .current_dir(&workspace_root)
                     .output();
                 match out {
                     Ok(o) => {
@@ -1290,11 +1288,15 @@ impl ToolExecutor {
 
     /// Dead code detection: find symbols with zero external references.
     pub(super) fn dead_code(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let scan_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let include = args.get("include").and_then(Value::as_str);
         let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
 
-        let scan_dir = self.project_root.join(scan_path);
+        let scan_dir = match self.resolve_checked(scan_path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
         if !scan_dir.exists() {
             return format!("Error: path '{}' not found", scan_path);
         }
@@ -1358,7 +1360,7 @@ impl ToolExecutor {
                 Err(_) => continue,
             };
             let rel = file_path
-                .strip_prefix(&self.project_root)
+                .strip_prefix(&workspace_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .to_string();
@@ -1484,6 +1486,7 @@ impl ToolExecutor {
 
     /// Count how many times a symbol appears in the project (word-boundary match).
     pub(super) fn count_symbol_references(&self, symbol: &str) -> usize {
+        let workspace_root = self.effective_project_root();
         // Try ripgrep first, fall back to grep
         let output = {
             let mut cmd = std::process::Command::new("rg");
@@ -1491,7 +1494,7 @@ impl ToolExecutor {
                 .arg("-w")
                 .arg("--no-heading")
                 .arg(symbol)
-                .current_dir(&self.project_root);
+                .current_dir(&workspace_root);
             for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
                 cmd.arg("--glob").arg(format!("!{}", exc));
             }
@@ -1499,7 +1502,7 @@ impl ToolExecutor {
                 Ok(o) => o,
                 Err(_) => {
                     let mut cmd = std::process::Command::new("grep");
-                    cmd.arg("-rcw").arg(symbol).current_dir(&self.project_root);
+                    cmd.arg("-rcw").arg(symbol).current_dir(&workspace_root);
                     for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
                         cmd.arg("--exclude-dir").arg(*exc);
                     }
@@ -1525,6 +1528,7 @@ impl ToolExecutor {
     // ── extract_members tool ─────────────────────────────────────────────────
 
     pub(super) fn extract_members(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let file = match args.get("file").and_then(Value::as_str) {
             Some(f) => match self.resolve_checked(f) {
                 Ok(safe) => safe,
@@ -1561,7 +1565,7 @@ impl ToolExecutor {
 
         let mut parts = Vec::new();
         let rel_path = file
-            .strip_prefix(&self.project_root)
+            .strip_prefix(&workspace_root)
             .unwrap_or(&file)
             .display();
         parts.push(format!("Members of type at {}:{}", rel_path, line));
@@ -1596,6 +1600,7 @@ impl ToolExecutor {
     // ── type_hierarchy tool ──────────────────────────────────────────────────
 
     pub(super) fn type_hierarchy(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let name = match args.get("name").and_then(Value::as_str) {
             Some(n) if !n.trim().is_empty() => n.trim(),
             _ => return "Error: missing 'name'".to_string(),
@@ -1611,13 +1616,13 @@ impl ToolExecutor {
 
         // Collect Rust source files
         let mut files = Vec::new();
-        self.collect_files_with_glob(&self.project_root, include_glob, &mut files);
+        self.collect_files_with_glob(&workspace_root, include_glob, &mut files);
 
         let mut all_impls: Vec<code_intel::ImplRelation> = Vec::new();
         for file in &files {
             if let Ok(source) = std::fs::read_to_string(file) {
                 let rel_path = file
-                    .strip_prefix(&self.project_root)
+                    .strip_prefix(&workspace_root)
                     .unwrap_or(file)
                     .to_string_lossy()
                     .to_string();
@@ -1669,6 +1674,7 @@ impl ToolExecutor {
     // ── hover_info tool ──────────────────────────────────────────────────
 
     pub(super) fn hover_info(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let file = match args.get("file").and_then(Value::as_str) {
             Some(f) => match self.resolve_checked(f) {
                 Ok(safe) => safe,
@@ -1690,7 +1696,7 @@ impl ToolExecutor {
             Ok(s) => s,
             Err(e) => return format!("Error: {e}"),
         };
-        let rel_path = file.strip_prefix(&self.project_root).unwrap_or(&file);
+        let rel_path = file.strip_prefix(&workspace_root).unwrap_or(&file);
 
         let mut parts = Vec::new();
 
@@ -1829,6 +1835,7 @@ impl ToolExecutor {
     // ── symbol_search tool ───────────────────────────────────────────────
 
     pub(super) fn symbol_search(&self, args: &Value) -> String {
+        let workspace_root = self.effective_project_root();
         let query = match args.get("query").and_then(Value::as_str) {
             Some(q) if !q.trim().is_empty() => q.trim().to_lowercase(),
             _ => return "Error: missing 'query'".to_string(),
@@ -1880,7 +1887,7 @@ impl ToolExecutor {
                 Err(_) => continue,
             };
             let rel = file_path
-                .strip_prefix(&self.project_root)
+                .strip_prefix(&workspace_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .to_string();

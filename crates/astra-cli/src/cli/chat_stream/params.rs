@@ -129,6 +129,11 @@ pub enum StreamEvent {
     /// loop. Active-run guidance must target this identity, never the CLI's
     /// local orchestration id.
     RunBound(String),
+    RunModelOutcome {
+        run_id: String,
+        session_id: String,
+        outcome: astra_turn_types::RunModelOutcome,
+    },
     /// Catalog-backed raw window and the exact usable input ceiling after
     /// deterministic output/summary/protocol reserves.
     ContextWindowPolicy {
@@ -487,7 +492,7 @@ pub type AskUserRequestTx = mpsc::Sender<AskUserRequest>;
 pub enum PlanReviewDecision {
     /// User approved and chose an execution mode.
     Approve {
-        mode: crate::cli::permission_manager::PermissionMode,
+        mode: Option<crate::cli::permission_manager::PermissionMode>,
     },
     /// User wants to keep planning — provide feedback on next turn.
     KeepPlanning,
@@ -654,8 +659,8 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// When present, tool executor pushes spawn/kill/output commands here.
-    pub(crate) bg_task_commands:
-        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    pub(crate) background_tasks:
+        Option<crate::edge_tools::background_tasks::BackgroundTaskRegistry>,
     /// Shared background task list cache.
     /// When the TUI is active the event loop refreshes this every tick.
     /// [`ToolExecutor::task_list_bg`] reads it directly, bypassing the
@@ -664,7 +669,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Detach slot for bash Ctrl+B promotion. When present, the
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
-    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
+    pub(crate) foreground_wait_control: Option<astra_tools::detach::ForegroundWaitControl>,
     /// 1-based local journal turn currently in progress. Every local tool
     /// mutation, checkpoint, trace and rollback scope uses this clock. Server
     /// admission and Server feedback own an independent turn sequence.
@@ -730,14 +735,14 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
-    pub bg_task_commands:
-        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    pub(crate) background_tasks:
+        Option<crate::edge_tools::background_tasks::BackgroundTaskRegistry>,
     /// Shared background task list cache for direct reads.
     pub bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
     /// this between tool calls; the bash runner takes from it on
     /// entry. `None` for headless paths.
-    pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
+    pub foreground_wait_control: Option<astra_tools::detach::ForegroundWaitControl>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Strict protocol observation sink used only by `stream-json`.
@@ -818,9 +823,9 @@ impl<'a> ChatTurnParams<'a> {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: ctx.bg_task_commands.clone(),
+            background_tasks: ctx.background_tasks.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),
-            bash_detach_slot: ctx.bash_detach_slot.clone(),
+            foreground_wait_control: ctx.foreground_wait_control.clone(),
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,

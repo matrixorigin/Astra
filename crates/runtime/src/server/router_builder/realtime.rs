@@ -206,7 +206,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/chat/runs/{run_id}/cancel",
-            post(crate::server::run::handlers::cancel_run_handler),
+            post(crate::server::run::handlers::cancel_run_handler)
+                .get(crate::server::run::handlers::get_run_execution_settlement_handler),
         )
         .route(
             "/chat/runs/{run_id}/permission-mode",
@@ -214,8 +215,17 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
                 .get(crate::server::run::handlers::permission_mode_snapshot_handler),
         )
         .route(
+            "/chat/runs/{run_id}/model",
+            post(crate::server::run::handlers::request_run_model_handler)
+                .get(crate::server::run::handlers::run_model_snapshot_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/intents",
             post(crate::server::run::handlers::submit_run_user_intent_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/intents/{intent_id}",
+            get(crate::server::run::handlers::run_user_intent_status_handler),
         )
         .route(
             "/chat/runs/{run_id}/delegate",

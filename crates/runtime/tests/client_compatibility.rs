@@ -1,5 +1,4 @@
-//! Real reviewed historical clients cross the production router and fresh storage.
-//! Candidate-image CI uses the same Python driver against the actual image.
+//! Current clients cross the production router and fresh storage.
 
 use std::{path::Path, process::Stdio, time::Duration};
 
@@ -10,11 +9,13 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real disposable MatrixOne/Memoria and reviewed linux/amd64 clients; dedicated compatibility CI"]
-async fn historical_clients_use_the_fresh_server() {
+#[ignore = "real disposable MatrixOne/Memoria and current linux/amd64 clients; dedicated integration CI"]
+async fn candidate_clients_use_the_fresh_server() {
     assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
-    let artifacts = std::env::var("ASTRA_COMPAT_ARTIFACTS")
-        .expect("dedicated compatibility CI must provide the reviewed artifact directory");
+    let current_cli = std::env::var("ASTRA_COMPAT_CURRENT_CLI_BIN")
+        .expect("candidate integration must provide the current CLI");
+    let current_edge = std::env::var("ASTRA_COMPAT_CURRENT_EDGE_BIN")
+        .expect("candidate integration must provide the current Edge");
     let report = std::env::var("ASTRA_COMPAT_REPORT")
         .expect("dedicated compatibility CI must provide its report path");
     let source = std::env::var("ASTRA_COMPAT_SERVER_SOURCE")
@@ -26,17 +27,10 @@ async fn historical_clients_use_the_fresh_server() {
         .await
         .expect("isolated MatrixOne");
     let database = format!("astra_test_clients_{}", Uuid::new_v4().simple());
-    let rollback_database = format!("astra_test_rollback_{}", Uuid::new_v4().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .expect("create isolated client compatibility database");
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE DATABASE `{rollback_database}`"
-    )))
-    .execute(&mut admin)
-    .await
-    .expect("create separate released-Server database");
     settings.matrixone.database = database.clone();
     let state = build_server_state(settings)
         .await
@@ -53,10 +47,12 @@ async fn historical_clients_use_the_fresh_server() {
         .args([
             "--api-url",
             &origin,
-            "--artifacts",
-            &artifacts,
             "--report",
             &report,
+            "--current-cli",
+            &current_cli,
+            "--current-edge",
+            &current_edge,
             "--disposable-server",
         ])
         .env("ASTRA_COMPAT_SERVER_SOURCE", &source)
@@ -64,14 +60,6 @@ async fn historical_clients_use_the_fresh_server() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Ok(current_cli) = std::env::var("ASTRA_COMPAT_CURRENT_CLI_BIN") {
-        driver.args([
-            "--current-cli",
-            &current_cli,
-            "--rollback-database",
-            &rollback_database,
-        ]);
-    }
     let result = tokio::time::timeout(Duration::from_secs(10 * 60), driver.output()).await;
     let settled = state.drain_background_runs(Duration::from_secs(15)).await;
     server.abort();
@@ -81,23 +69,17 @@ async fn historical_clients_use_the_fresh_server() {
         .execute(&mut admin)
         .await
         .expect("remove the fixture-owned database");
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP DATABASE `{rollback_database}`"
-    )))
-    .execute(&mut admin)
-    .await
-    .expect("remove the released-Server fixture database");
     assert!(settled, "compatibility runs must settle before cleanup");
     let output = result
-        .expect("historical client driver exceeded its bound")
-        .expect("historical client driver must start");
+        .expect("candidate client driver exceeded its bound")
+        .expect("candidate client driver must start");
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(report).expect("driver must create its categorical report"),
     )
     .expect("compatibility report must be valid JSON");
     assert!(
         output.status.success(),
-        "historical client compatibility failed: client={}, case={}, category={}, diagnostics={}, provider_errors={}, provider_phases={}; inspect the job summary",
+        "candidate client integration failed: client={}, case={}, category={}, diagnostics={}, provider_errors={}, provider_phases={}; inspect the job summary",
         report["active_client"],
         report["active_case"],
         report["failure_category"],

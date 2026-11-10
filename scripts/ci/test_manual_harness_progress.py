@@ -65,6 +65,31 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_successful_case_with_efficiency_warning_is_visible_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("passed",))
+            completed = next(event for event in data if event["type"] == "case_completed")
+            completed["row"]["has_warnings"] = True
+            completed["row"]["criteria"].append({
+                "type":"duration_between", "severity":"soft", "score":None,
+                "passed":False, "evaluation":"reported",
+                "diagnostic":{"kind":"count", "min":0, "max":90000, "actual":90001},
+            })
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":0, "termination":"finished"}))
+            replay = h.Replay(SHA)
+            with patch("builtins.print") as printed:
+                replay.read(root / "progress.jsonl", emit=True)
+            self.assertTrue(any("PASSED (WARNINGS)" in str(call) for call in printed.call_args_list))
+            code, summary = self.publish(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(summary["success"])
+            self.assertEqual(summary["runs"][0]["status"], "passed")
+            published = (root / "job-summary").read_text()
+            self.assertIn("passed (warnings)", published)
+            self.assertIn("duration_between (soft)", published)
+
     def test_execution_diagnostics_survive_failed_summary_without_regrading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

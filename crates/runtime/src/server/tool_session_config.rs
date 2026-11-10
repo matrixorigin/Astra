@@ -555,6 +555,7 @@ where
                 "proposed_revision": revision,
                 "observed_revision": observed_revision,
                 "detail": bounded_warning(reason),
+                "executed": null,
                 "side_effects_maybe": true,
                 "owner_confirmed": rollback_recorded,
                 "rollback_recorded": rollback_recorded,
@@ -725,6 +726,7 @@ where
                         "compensation_revision": revision,
                         "observed_revision": observed_revision,
                         "compensation_detail": bounded_warning(reason),
+                        "executed": null,
                         "side_effects_maybe": true,
                         "recovery_recorded": !compensation_owner_confirmed,
                         "rollback_recorded": !compensation_owner_confirmed,
@@ -785,6 +787,7 @@ where
         Err(error) => session_tool_output(json!({
             "error": "config_settlement_task_failed",
             "detail": bounded_warning(error),
+            "executed": null,
             "side_effects_maybe": true,
             "projection_recorded": join_projection.recorded,
             "projection_warning": join_projection.warning,

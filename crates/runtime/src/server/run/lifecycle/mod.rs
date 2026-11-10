@@ -669,6 +669,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "provider_interaction_required"
                 | "provider_interaction_resolved"
                 | "permission_mode_applied"
+                | "run_model_outcome"
                 | "user_intent_applied"
                 | "user_intent_returned"
                 | "stream_gap"
@@ -1244,11 +1245,12 @@ fn canonical_edge_interaction_events(event: &Value) -> Vec<Value> {
 }
 
 fn incrementally_persisted_edge_interaction_event(event: &Value) -> bool {
-    // Permission application is committed by the round-control owner before
-    // emitting its flat client projection. Never append that projection as a
-    // second (and differently shaped) durable permission receipt at settlement.
-    event.get("type").and_then(Value::as_str) == Some("permission_mode_applied")
-        || !canonical_edge_interaction_events(event).is_empty()
+    // Setting outcomes are committed before their client projection. Never
+    // append that projection as a second durable receipt at settlement.
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("permission_mode_applied" | "run_model_outcome")
+    ) || !canonical_edge_interaction_events(event).is_empty()
 }
 
 #[cfg(test)]
@@ -1832,6 +1834,8 @@ async fn wait_for_shared_run_interaction(
     waiting_for: &str,
     timeout: Duration,
 ) -> Option<Value> {
+    let _user_input =
+        (waiting_for == "user_input").then(crate::server::run_trace::suspend_for_user_input);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(Some(event)) = run_engine
@@ -2260,6 +2264,7 @@ async fn load_exact_indexed_interaction_event(
 /// durable run is still active when a decision arrives.
 struct DurableRunApprovalGate {
     user_id: String,
+    initial_interaction_mode: RequestedTurnInteractionMode,
     context: astra_turn_core::ws_approval_gate::ApprovalJournalContext,
     run_engine: RunEngine,
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -2328,6 +2333,7 @@ impl DurableRunApprovalGate {
         stream_event_tx: Option<mpsc::Sender<Value>>,
     ) -> Self {
         Self {
+            initial_interaction_mode: RequestedTurnInteractionMode::Prompt,
             user_id,
             context: astra_turn_core::ws_approval_gate::ApprovalJournalContext::new(
                 session_id, run_id, turn,
@@ -2341,6 +2347,11 @@ impl DurableRunApprovalGate {
             #[cfg(test)]
             wait_started_tx: std::sync::Mutex::new(None),
         }
+    }
+
+    fn with_interaction_mode(mut self, mode: RequestedTurnInteractionMode) -> Self {
+        self.initial_interaction_mode = mode;
+        self
     }
 
     fn with_cancel_token(mut self, cancel_token: Arc<CancellationToken>) -> Self {
@@ -2636,6 +2647,29 @@ impl DurableRunApprovalGate {
 
 #[async_trait]
 impl astra_tools::ToolApprovalGate for DurableRunApprovalGate {
+    async fn plan_review_required(&self) -> bool {
+        match self
+            .run_engine
+            .permission_mode_snapshot(
+                &self.user_id,
+                &self.context.session_id,
+                &self.context.run_id,
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot.applied.as_ref().map_or(
+                self.initial_interaction_mode != RequestedTurnInteractionMode::Auto,
+                |applied| {
+                    !matches!(
+                        applied.selection.mode,
+                        PermissionMode::Auto | PermissionMode::Bypass
+                    )
+                },
+            ),
+            Ok(None) | Err(_) => true,
+        }
+    }
+
     async fn request_approval(
         &self,
         request_id: &str,
@@ -3490,6 +3524,7 @@ async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
     {
         Ok(outcome) => outcome,
         Err(payload) => {
+            host.on_turn_usage_settlement(state).await;
             let message = format!(
                 "agentic loop panicked: {}",
                 panic_payload_message(payload.as_ref())
@@ -3827,12 +3862,6 @@ fn build_runtime_turn_evaluation_event(
             json!(state.current_run_owner_generation),
         );
         metadata.insert("llm_rounds".into(), json!(state.llm_rounds_completed));
-        if let Some(notice) = astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
-            &eval,
-            &state.stall.tool_call_records,
-        ) {
-            metadata.insert("status_notice".into(), Value::String(notice));
-        }
         metadata.insert("tool_evaluation_success".into(), Value::Bool(eval.success));
         metadata.insert("run_status".into(), Value::String(settled_status.into()));
         metadata.insert(
@@ -4435,6 +4464,7 @@ impl LoopExecutionFacts {
                 canonical_turn_chain_id,
                 root_user_query_event_id: None,
                 total_prompt: 0,
+                unpartitioned_input_tokens: 0,
                 total_completion: 0,
                 total_cache_read: 0,
                 total_cache_creation: 0,
@@ -5388,6 +5418,7 @@ struct CanonicalTurnAdmission {
     authority: astra_services::session_context_coordinator::RunContextAuthority,
     opening_hash: Option<String>,
     prior_messages: Vec<Value>,
+    authorized_session_ids: Option<HashSet<String>>,
     had_canonical_head: bool,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
 }
@@ -5448,6 +5479,7 @@ struct RootTurnStartParticipant<'a> {
     admission: Option<CanonicalTurnAdmission>,
     prepared: Option<PreparedRootContextAdmission>,
     rejection: Option<(StatusCode, Json<ErrorResponse>)>,
+    full_llm_capture: Option<bool>,
 }
 
 #[async_trait]
@@ -5510,6 +5542,9 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;
+        self.full_llm_capture = run_admission
+            .session_capture_override()
+            .map(crate::turn::llm::exchange_capture::session_full_llm_capture_override_enabled);
         self.admission = Some(admission);
         Ok(())
     }
@@ -5578,6 +5613,7 @@ impl RunExecutionCapacity {
 }
 
 pub struct AgenticRunLifecycleService {
+    default_execution_timeout_s: Result<Option<u64>, String>,
     /// Process-local run handles (run_id -> state) for live cancellation, pause,
     /// and active SSE fanout. Durable state is the user-visible authority.
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -5683,25 +5719,52 @@ pub struct AgenticRunLifecycleService {
 }
 
 impl AgenticRunLifecycleService {
-    /// A process-local execution record is authoritative for this process even
-    /// after its durable lease has been released. Only fall back to the
-    /// durable lease when this process has no matching record at all.
+    /// A live executor or durable owner lease independently prevents settlement.
+    /// A stopped local cache entry cannot retire a newer remote owner.
     async fn cancellation_execution_is_settled(
         &self,
         user_id: &str,
         run_id: &str,
         durable_owner_lease_live: bool,
     ) -> bool {
-        match self
-            .runs
-            .read()
-            .await
-            .get(run_id)
-            .filter(|run| run.user_id == user_id)
-            .map(|run| run.execution_live)
-        {
-            Some(execution_live) => !execution_live,
-            None => !durable_owner_lease_live,
+        !durable_owner_lease_live
+            && !self
+                .runs
+                .read()
+                .await
+                .get(run_id)
+                .is_some_and(|run| run.user_id == user_id && run.execution_live)
+    }
+
+    /// A cancellation result is a cold path. Read only the exact Run's
+    /// terminal receipt; never hydrate its event history to report Context.
+    async fn cancelled_context_not_saved(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        settled: bool,
+    ) -> Option<bool> {
+        if !settled {
+            return None;
+        }
+        let pool = self.shared_pool.as_ref()?;
+        let (encoded, last_index): (Option<String>, i64) = sqlx::query_as(
+            "SELECT terminal_receipt_json, last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ).bind(user_id).bind(run_id).fetch_optional(pool.get()).await.ok()??;
+        let receipt = astra_services::runs::CommittedRunTerminalReceipt::decode(
+            encoded.as_deref()?,
+            last_index,
+        )
+        .ok()?
+        .receipt;
+        if receipt.user_id != user_id || receipt.run_id != run_id {
+            return None;
+        }
+        match receipt.context {
+            astra_services::runs::CanonicalTerminalContext::Revoked => Some(true),
+            astra_services::runs::CanonicalTerminalContext::Advanced { .. }
+            | astra_services::runs::CanonicalTerminalContext::Unchanged => Some(false),
+            astra_services::runs::CanonicalTerminalContext::Unowned => None,
         }
     }
 
@@ -5733,6 +5796,7 @@ impl AgenticRunLifecycleService {
             .map(|id| ServerWorkspaceProvisioner::from_env(id.to_owned()));
         let admission_limits = canonical_session_admission_limits();
         Self {
+            default_execution_timeout_s: astra_core::RuntimeLimits::global().turn_timeout_s.clone(),
             runs: Arc::new(RwLock::new(HashMap::new())),
             matrixone,
             encryptor,
@@ -5876,6 +5940,7 @@ impl AgenticRunLifecycleService {
             authority,
             opening_hash: None,
             prior_messages: Vec::new(),
+            authorized_session_ids: None,
             _weighted_permit: weighted_permit,
         })
     }
@@ -5885,6 +5950,7 @@ impl AgenticRunLifecycleService {
         messages: &[Value],
         rewrite_proof: Option<&CanonicalRewriteProof>,
         allow_empty_delta: bool,
+        completed_reasoning_scope: Option<(&str, &str)>,
         run_id: &str,
     ) -> Result<
         Option<astra_services::session_context_coordinator::PreparedSessionContextCommit>,
@@ -5897,7 +5963,7 @@ impl AgenticRunLifecycleService {
             if admission.authority.run_id != run_id {
                 return Err("canonical Context belongs to another Run".into());
             }
-            let Some((mode, logical_segments)) = canonical_commit_delta(
+            let Some((mode, mut logical_segments)) = canonical_commit_delta(
                 &admission.prior_messages,
                 admission.had_canonical_head,
                 messages,
@@ -5907,6 +5973,14 @@ impl AgenticRunLifecycleService {
             else {
                 return Ok(None);
             };
+            // A completed CurrentTurn route no longer needs its reasoning in
+            // either an appended suffix or an authorized replacement. Other
+            // routes' continuation state stays untouched.
+            if let Some(route) = completed_reasoning_scope {
+                for message in logical_segments.iter_mut().flatten() {
+                    crate::turn::llm::private_continuation::discard_reasoning(message, Some(route));
+                }
+            }
             let base = admission
                 .authority
                 .base_head
@@ -5959,6 +6033,12 @@ impl AgenticRunLifecycleService {
             delta,
         )
         .map(Some)
+    }
+
+    pub fn with_runtime_config(mut self, config: &astra_core::ServerRuntimeConfig) -> Self {
+        self.default_execution_timeout_s =
+            astra_core::RuntimeLimits::from_config_with_env(config).turn_timeout_s;
+        self
     }
 
     pub fn with_memory_extraction_service(
@@ -7092,6 +7172,7 @@ impl AgenticRunLifecycleService {
         turn: u32,
         token: Arc<CancellationToken>,
         interactive: bool,
+        interaction_mode: RequestedTurnInteractionMode,
         provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     ) {
         let (approval_tx, approval_rx) = interactive.then(|| mpsc::channel::<Value>(64)).unzip();
@@ -7105,6 +7186,7 @@ impl AgenticRunLifecycleService {
             approval_tx,
             None,
         )
+        .with_interaction_mode(interaction_mode)
         .with_cancel_token(token.clone());
         executor.set_approval_gate(Arc::new(approval_gate));
         if let Some(rx) = approval_rx {
@@ -7740,6 +7822,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run(failure_code.as_str());
+        }
         runs.write().await.remove(run_id);
         committed
     }
@@ -7809,6 +7894,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run("cancelled");
+        }
         runs.write().await.remove(run_id);
         committed.then_some(terminal_events)
     }
@@ -7912,6 +8000,13 @@ impl AgenticRunLifecycleService {
                 Err(error) if error.kind == astra_core::ErrorKind::Cancelled
             )
         {
+            if !loop_state.final_text.is_empty() {
+                events.push(json!({"event_type":"text_done", "data": {
+                    "full_text":loop_state.final_text,
+                    "model_item_id":loop_state.final_text_model_item_id,
+                    "partial":true,
+                }}));
+            }
             let mut data = usage;
             data["cancelled"] = Value::Bool(true);
             events.push(json!({
@@ -8026,7 +8121,7 @@ impl AgenticRunLifecycleService {
                     finished["error"] = json!(message);
                     finished["error_code"] = json!(code);
                     finished["error_kind"] = json!(error_kind);
-                    if interruption.kind == InterruptionKind::ExecutionIncomplete {
+                    if error_kind.is_none() {
                         finished["interruption"] = interruption.public_projection().to_json();
                     }
                     events.push(json!({"event_type":"run_finished", "data":finished}));
@@ -8132,6 +8227,20 @@ impl AgenticRunLifecycleService {
                 }
             }
         };
+
+        match final_status {
+            RunStatus::Failed => crate::server::run_trace::fail_active_run(
+                error_kind
+                    .map(astra_core::ErrorKind::as_str)
+                    .unwrap_or("failed"),
+            ),
+            RunStatus::Cancelled => crate::server::run_trace::fail_active_run("cancelled"),
+            RunStatus::Running
+            | RunStatus::Paused
+            | RunStatus::Waiting
+            | RunStatus::Completed
+            | RunStatus::Delegated => {}
+        }
 
         (events, final_status, error_msg)
     }
@@ -9600,7 +9709,28 @@ impl AgenticRunLifecycleService {
                 "model_identity_invalid",
             )?;
         }
+        if request.admitted_execution_deadline.is_some() && request.execution_time_budget.is_none()
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "admitted execution deadline requires its original time budget",
+                "execution_time_budget_invalid",
+            ));
+        }
         if request.admitted_execution_deadline.is_none() {
+            if request.execution_time_budget.is_none() {
+                let seconds = self.default_execution_timeout_s.as_ref().map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error.clone(),
+                        "runtime_timeout_invalid",
+                    )
+                })?;
+                request.execution_time_budget =
+                    seconds.map(|seconds| astra_services::runs::ExecutionTimeBudget {
+                        remaining_seconds: seconds,
+                    });
+            }
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| {
@@ -11396,7 +11526,7 @@ impl AgenticRunLifecycleService {
         };
         Self::append_runtime_stable_prompt_text(
             edge_profile,
-            "For delegation, omit agent_type for the bounded read-only default, or select a builtin persona when needed. Runtime permissions remain authoritative.".to_string(),
+            "For delegation, omit agent_type to inherit parent-authorized capabilities, or select a restricted persona explicitly. Runtime permissions remain authoritative.".to_string(),
         );
         if let Some(stable_runtime_system_prompt) = stable_runtime_system_prompt {
             Self::append_runtime_stable_prompt_text(
@@ -12077,6 +12207,7 @@ impl AgenticRunLifecycleService {
             final_text_streamed: facts.original.final_text_streamed,
             final_output_ready_notified: facts.original.final_output_ready_notified,
             total_prompt: facts.original.total_prompt,
+            unpartitioned_input_tokens: facts.original.unpartitioned_input_tokens,
             total_completion: facts.original.total_completion,
             total_cache_read: facts.original.total_cache_read,
             total_cache_creation: facts.original.total_cache_creation,
@@ -13729,8 +13860,9 @@ impl AgenticRunLifecycleService {
         // through event_tx incrementally; the HTTP handler streams them.
         let bg_task_count_2 = Arc::clone(&self.background_task_count);
         let task_guard = TaskCountGuard::new(Arc::clone(&bg_task_count_2));
+        let inbound = crate::server::run_trace::inbound_carrier();
         let run_abort_handle = spawn_observed(
-            async move {
+            crate::server::run_trace::bind(inbound, async move {
                 // The task is in flight from spawn, including while it waits
                 // for capacity.  Construct this guard before admission so a
                 // cancellation in that wait cannot leak shutdown accounting.
@@ -13918,12 +14050,12 @@ impl AgenticRunLifecycleService {
                         .user_intents
                         .bind_opening_wake(input_wake.subscribe(), tail);
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_opening_wake(input_wake.subscribe(), tail);
                 } else {
                     state.user_intents.bind_wake(Some(input_wake.subscribe()));
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_wake(input_wake.subscribe());
                 }
                 let mut control_watcher = start_active_run_control_watcher(
@@ -14088,11 +14220,19 @@ impl AgenticRunLifecycleService {
                     allow_empty_delta
                         || bg_cancel_flag.load(Ordering::Acquire)
                         || bg_llm_cancel_token.is_cancelled(),
+                    (matches!(&loop_result, Ok(AgenticLoopOutcome::Completed))
+                        && state.interruption.is_none()
+                        && !bg_cancel_flag.load(Ordering::Acquire)
+                        && !bg_llm_cancel_token.is_cancelled())
+                    .then(|| host.completed_responses_reasoning_scope())
+                    .flatten(),
                     &bg_run_id,
                 );
 
+                let mut context_not_saved = false;
                 let context_commit = match context_commit {
                     Err(astra_services::SessionContextCoordinatorError::ResourceLimit(detail)) => {
+                        context_not_saved = true;
                         if matches!(&loop_result, Ok(AgenticLoopOutcome::Completed))
                             && state.interruption.is_none()
                         {
@@ -14463,6 +14603,7 @@ impl AgenticRunLifecycleService {
                                             .filter(|_| persisted_status == RunStatus::Failed),
                                         terminal_cancellation_origin,
                                         context_commit.as_ref(),
+                                        context_not_saved,
                                     )
                                     .await
                             }
@@ -15058,7 +15199,7 @@ impl AgenticRunLifecycleService {
                 // Release resident capacity after dropping the resident
                 // context and its interaction sender clones. This run task
                 // retains cleanup custody without keeping the stream open.
-            },
+            }),
             "agentic_loop_owned_execution",
         );
         self.track_background_run_abort_handle(run_abort_handle);
@@ -15254,6 +15395,7 @@ impl AgenticRunLifecycleService {
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         });
         // Win the durable session slot before provisioning any resources.
         // Exact retries attach to the winner instead of repeating preparation.
@@ -15289,7 +15431,11 @@ impl AgenticRunLifecycleService {
             }
         };
         let mut canonical_turn = root_start.as_mut().and_then(|p| p.admission.take());
+        let full_llm_capture = root_start.as_ref().and_then(|p| p.full_llm_capture);
         drop(root_start);
+        if let Some(enabled) = full_llm_capture {
+            request.full_llm_capture = enabled;
+        }
         let execution_start_authority = match start_claim {
             DurableRunStartClaim::Started { authority } => authority,
             DurableRunStartClaim::Existing {
@@ -15397,18 +15543,20 @@ impl AgenticRunLifecycleService {
             if let Some(admission) = canonical_turn.as_mut()
                 && let Some(head) = admission.authority.base_head.as_ref()
             {
-                admission.prior_messages = admission
-                    .coordinator
-                    .materialize(head)
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
-                            StatusCode::CONFLICT,
-                            format!("canonical Context requires repair: {error}"),
-                            "session_context_needs_repair",
-                        )
-                    })?
-                    .messages;
+                let materialized =
+                    admission
+                        .coordinator
+                        .materialize(head)
+                        .await
+                        .map_err(|error| {
+                            error_response_coded(
+                                StatusCode::CONFLICT,
+                                format!("canonical Context requires repair: {error}"),
+                                "session_context_needs_repair",
+                            )
+                        })?;
+                admission.prior_messages = materialized.messages;
+                admission.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
 
             // Provision explicit workspace bindings early so build_initial_state
@@ -15621,6 +15769,18 @@ impl AgenticRunLifecycleService {
                     );
                 }
             }
+            // A newly admitted empty base is also a stable rewrite boundary.
+            // This lets a long first turn compact without replacing prior data.
+            if let Some(admission) = canonical_turn.as_ref()
+                && !admission.had_canonical_head
+                && admission.prior_messages.is_empty()
+            {
+                state.initialize_canonical_rewrite_proof(
+                    &admission.prior_messages,
+                    &astra_turn_types::canonical_conversation_root(&admission.prior_messages),
+                    0,
+                );
+            }
             let fresh_session_current_date = state
                 .pipeline_session
                 .as_ref()
@@ -15687,6 +15847,9 @@ impl AgenticRunLifecycleService {
                 runtime_capabilities.authenticated_edge_discovery.clone(),
             );
             if let Some(admission) = canonical_turn.as_ref() {
+                if let Some(origins) = admission.authorized_session_ids.as_ref() {
+                    host.set_private_reasoning_origins(origins.clone());
+                }
                 host.bind_execution_handoff(
                     self.execution_handoff_requested.clone(),
                     self.run_engine.clone(),
@@ -15894,6 +16057,7 @@ impl AgenticRunLifecycleService {
                         Some(approval_tx),
                         event_tx.clone(),
                     )
+                    .with_interaction_mode(Self::effective_requested_interaction_mode(&request))
                     .with_cancel_token(llm_cancel_token.clone());
                     executor.set_approval_gate(std::sync::Arc::new(approval_gate));
                     self.approval_channels
@@ -16303,6 +16467,61 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         Ok(status)
     }
 
+    async fn get_run_execution_settlement(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let control = self
+            .run_engine
+            .load_run_control(&user_id, &run_id)
+            .await
+            .map_err(|error| {
+                Self::durable_persist_error("execution settlement observation", error)
+            })?;
+        let Some(control) = control else {
+            let locally_admitted = self
+                .runs
+                .read()
+                .await
+                .get(&run_id)
+                .is_some_and(|run| run.user_id == user_id && run.execution_live);
+            return if locally_admitted {
+                Ok(CancelRunRecord {
+                    run_id,
+                    status: "cancellation_requested".into(),
+                    execution_settled: false,
+                    context_not_saved: None,
+                })
+            } else {
+                Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+            };
+        };
+        let status = Self::run_status_from_durable(&control.status)?;
+        let execution_stopped = self
+            .cancellation_execution_is_settled(&user_id, &run_id, control.owner_lease_live)
+            .await;
+        if !status.is_terminal() && execution_stopped {
+            // A read cannot seize an expired owner. Ask the caller to reissue
+            // the existing exact-generation cancellation command instead.
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "Cancellation requires owner recovery; repeat the cancellation command",
+                "cancellation_recovery_required",
+            ));
+        }
+        let execution_settled = status.is_terminal() && execution_stopped;
+        let context_not_saved = self
+            .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+            .await;
+        Ok(CancelRunRecord {
+            run_id,
+            status: control.status,
+            execution_settled,
+            context_not_saved,
+        })
+    }
+
     async fn get_run_interaction_projection(
         &self,
         run_id: String,
@@ -16398,57 +16617,115 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("stream live delta", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        // A terminal status is not the Explain Analyze publication boundary.
-        // The owner commits `run_finished` first and persists the report just
-        // after it. Load the immutable run metadata once so a cross-process
-        // observer can distinguish an ordinary terminal from an Explain run
-        // that still owes its publication outcome.
-        let durable_run = self
+        // Ordinary live attachments need the opening and current owner, not
+        // the entire event history. Explain needs its exceptional publication
+        // proof even when it predates the caller's replay cursor.
+        let admission = self
             .run_engine
-            .load_run(&user_id, &run_id)
+            .load_run_admission(&user_id, &run_id)
             .await
             .map_err(|error| Self::durable_persist_error("stream live run metadata", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        let explain_requested = astra_services::runs::run_requested_explain_analyze(&durable_run);
+        let admitted_run = admission.run();
+        let started = admitted_run.original_admission_data().map_err(|error| {
+            Self::durable_persist_error("stream live run admission", error.to_string())
+        })?;
+        let explain_requested = match started.get("explain_analyze_requested") {
+            None => false,
+            Some(Value::Bool(requested)) => *requested,
+            Some(_) => {
+                return Err(Self::durable_persist_error(
+                    "stream live run admission",
+                    "invalid Explain request flag".to_string(),
+                ));
+            }
+        };
         let mut replay_events = initial.events;
-        // `load_run_event_delta` reports the latest high watermark even when
-        // its event list is empty.  Keep the cursor at the greatest event we
-        // actually replayed so the metadata read below can fill the exact
-        // gap opened between the two reads (publication is often that gap).
         let mut event_cursor = replay_events
             .iter()
             .filter_map(|event| event.get("index").and_then(Value::as_i64))
             .max()
             .unwrap_or(after_event_idx);
-        for (position, event) in durable_run.events.iter().enumerate() {
-            let index = durable_event_index(event, position);
-            if index <= event_cursor {
-                continue;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object.insert("index".to_string(), Value::from(index));
-            }
-            event_cursor = event_cursor.max(index);
-            replay_events.push(event);
-        }
-        let mut publication_seen = replay_events
-            .iter()
-            .any(durable_event_is_valid_explain_publication)
-            || durable_run
-                .events
-                .iter()
-                .enumerate()
-                .any(|(position, event)| {
-                    durable_event_index(event, position) <= after_event_idx
-                        && durable_event_is_valid_explain_publication(event)
-                });
-        let turn_id = explain_turn_id_from_durable_run(&durable_run);
-        let owner_generation = durable_run.run_generation;
-        let latest_complete = Self::durable_live_attach_complete(
-            &durable_run.status,
-            self.run_execution_is_live(&durable_run).await,
-        );
+        let (mut publication_seen, turn_id, owner_generation, latest_complete) =
+            if explain_requested {
+                let durable_run = self
+                    .run_engine
+                    .load_run(&user_id, &run_id)
+                    .await
+                    .map_err(|error| Self::durable_persist_error("stream live Explain", error))?
+                    .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                for (position, event) in durable_run.events.iter().enumerate() {
+                    let index = durable_event_index(event, position);
+                    if index <= event_cursor {
+                        continue;
+                    }
+                    let mut event = event.clone();
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert("index".to_string(), Value::from(index));
+                    }
+                    event_cursor = event_cursor.max(index);
+                    replay_events.push(event);
+                }
+                let seen = replay_events
+                    .iter()
+                    .any(durable_event_is_valid_explain_publication)
+                    || durable_run
+                        .events
+                        .iter()
+                        .enumerate()
+                        .any(|(position, event)| {
+                            durable_event_index(event, position) <= after_event_idx
+                                && durable_event_is_valid_explain_publication(event)
+                        });
+                (
+                    seen,
+                    explain_turn_id_from_durable_run(&durable_run),
+                    durable_run.run_generation,
+                    Self::durable_live_attach_complete(
+                        &durable_run.status,
+                        self.run_execution_is_live(&durable_run).await,
+                    ),
+                )
+            } else {
+                // Drain a concurrent append before using the later opening's
+                // terminal status. Never advance beyond an event actually read.
+                let mut status = admitted_run.status.clone();
+                let mut execution_live = self.run_execution_is_live(admitted_run).await;
+                if admitted_run.last_event_idx > event_cursor {
+                    let gap = self
+                        .run_engine
+                        .load_run_event_delta(&user_id, &run_id, event_cursor)
+                        .await
+                        .map_err(|error| Self::durable_persist_error("stream live gap", error))?
+                        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+                    for event in gap.events {
+                        if let Some(index) = event.get("index").and_then(Value::as_i64) {
+                            event_cursor = event_cursor.max(index);
+                        }
+                        replay_events.push(event);
+                    }
+                    if event_cursor < admitted_run.last_event_idx {
+                        return Err(Self::durable_persist_error(
+                            "stream live gap",
+                            "event tail did not reach the observed watermark".to_string(),
+                        ));
+                    }
+                    status = gap.status;
+                    execution_live = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .filter(|run| run.user_id == user_id && run.session_id == gap.session_id)
+                        .map_or(gap.execution_live, |run| run.execution_live);
+                }
+                (
+                    false,
+                    String::new(),
+                    admitted_run.run_generation,
+                    Self::durable_live_attach_complete(&status, execution_live),
+                )
+            };
         if latest_complete && (!explain_requested || publication_seen) {
             return Ok(ChatStreamRecord {
                 session_id: initial.session_id,
@@ -16930,13 +17207,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| {
                 let status = match e.as_str() {
-                    "permission run not found" => StatusCode::NOT_FOUND,
-                    "permission request identity conflict"
-                    | "permission run is inactive"
-                    | "permission run is cancelled" => StatusCode::CONFLICT,
-                    _ if e.starts_with("permission request requires") => {
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    }
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict"
+                    | "run setting cannot be changed after the run is inactive"
+                    | "run setting target is cancelled" => StatusCode::CONFLICT,
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
                     _ => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 error_response(status, &e)
@@ -16950,6 +17225,61 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         Ok(selection)
     }
+    async fn request_run_model(
+        &self,
+        user_id: String,
+        run_id: String,
+        request: astra_services::runs::RunModelRequest,
+    ) -> Result<astra_services::runs::RunModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        let selection = self
+            .run_engine
+            .request_run_model(&user_id, &run_id, &request)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e.as_str(),
+                    "run setting cannot be changed after the run is inactive"
+                        | "run setting target is cancelled"
+                ) {
+                    return error_response_coded(
+                        StatusCode::CONFLICT,
+                        &e,
+                        "run_model_target_inactive",
+                    );
+                }
+                let status = match e.as_str() {
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict" => StatusCode::CONFLICT,
+                    "Offering ID selector is invalid" | "reasoning budget must be positive" => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                error_response(status, &e)
+            })?;
+        if let Some(run) = self.runs.read().await.get(&run_id) {
+            run.input_wake.send_if_modified(|current| {
+                let changed = selection.revision > *current;
+                *current = (*current).max(selection.revision);
+                changed
+            });
+        }
+        Ok(selection)
+    }
+    async fn run_model_snapshot(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+    ) -> Result<astra_turn_types::RunModelSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        self.run_engine
+            .run_settings_snapshot(&user_id, &session_id, &run_id)
+            .await
+            .map_err(|e| Self::durable_persist_error("model setting lookup", e))?
+            .map(|snapshot| snapshot.model.client_snapshot())
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
     async fn permission_mode_snapshot(
         &self,
         user_id: String,
@@ -16962,6 +17292,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| Self::durable_persist_error("permission mode lookup", e))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    async fn run_user_intent_status(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+        intent_id: String,
+    ) -> Result<UserIntentStatus, (StatusCode, Json<ErrorResponse>)> {
+        if intent_id.is_empty() || intent_id.trim() != intent_id {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid intent identity",
+            ));
+        }
+        self.run_engine
+            .store()
+            .run_user_intent_status(&user_id, &session_id, &run_id, &intent_id)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Intent not found"))
     }
 
     async fn submit_run_user_intent(
@@ -16990,18 +17341,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
         }
 
-        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let source_key = format!("user_intent:{intent_id}");
+        let durable = self
+            .run_engine
+            .store()
+            .load_run_guidance_preflight(&user_id, &run_id, &source_key)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         // An admitted source already passed native input validation. Retry
         // reconciliation belongs to the atomic admission owner, including
         // immutable-content conflicts and terminal runs; it must not depend
         // on the current collaborator directory being available.
-        let source_key = format!("user_intent:{intent_id}");
-        let source_already_admitted = durable.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) == Some(source_key.as_str())
-        });
         let native_target = if input.delivery
             == astra_turn_types::UserIntentDelivery::GuideCurrentRun
-            && !source_already_admitted
+            && !durable.source_already_admitted
         {
             self.native_collaborator_target(&durable)
                 .await
@@ -17182,10 +17536,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let execution_settled = self
                 .cancellation_execution_is_settled(&user_id, &run_id, control.owner_lease_live)
                 .await;
+            let context_not_saved = self
+                .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                .await;
             return Ok(CancelRunRecord {
                 run_id,
                 status: control.status,
                 execution_settled,
+                context_not_saved,
             });
         }
         if !self
@@ -17213,10 +17571,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let execution_settled = self
                     .cancellation_execution_is_settled(&user_id, &run_id, current.owner_lease_live)
                     .await;
+                let context_not_saved = self
+                    .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                    .await;
                 return Ok(CancelRunRecord {
                     run_id,
                     status: current.status,
                     execution_settled,
+                    context_not_saved,
                 });
             }
             return Err(Self::durable_persist_error(
@@ -17246,6 +17608,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 execution_settled: false,
                 run_id,
                 status: "cancellation_requested".to_string(),
+                context_not_saved: None,
             });
         }
 
@@ -17289,6 +17652,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 execution_settled: true,
                 run_id,
                 status: STATUS_CANCELLED.to_string(),
+                context_not_saved: None,
             });
         }
 
@@ -17308,10 +17672,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let execution_settled = self
                 .cancellation_execution_is_settled(&user_id, &run_id, current.owner_lease_live)
                 .await;
+            let context_not_saved = self
+                .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                .await;
             return Ok(CancelRunRecord {
                 run_id,
                 status: current.status,
                 execution_settled,
+                context_not_saved,
             });
         }
         if !current.cancellation_requested {
@@ -17324,6 +17692,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_settled: false,
             run_id,
             status: "cancellation_requested".to_string(),
+            context_not_saved: None,
         })
     }
 
@@ -17332,7 +17701,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         session_id: String,
         user_id: String,
     ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.converge_session_cancellation(&session_id, &user_id)
+        self.converge_session_cancellation(&session_id, &user_id, true)
+            .await
+    }
+
+    async fn get_session_execution_settlement(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.converge_session_cancellation(&session_id, &user_id, false)
             .await
     }
 
@@ -17871,7 +18249,7 @@ impl AgenticRunLifecycleService {
     /// only on this explicit control path; ordinary turns do not pay for it.
     async fn native_collaborator_target(
         &self,
-        run: &DurableRunRecord,
+        run: &astra_services::runs::RunGuidancePreflight,
     ) -> Result<Option<astra_messaging::AgentAddress>, astra_services::runs::RunAdmissionError>
     {
         let Some(agent_id) = run.agent_id.as_deref().map(str::trim) else {
@@ -17880,7 +18258,7 @@ impl AgenticRunLifecycleService {
         if agent_id.is_empty() {
             return Ok(None);
         }
-        if native_stage_admitted_on_run(run) {
+        if run.native_anchor {
             return Ok(Some(astra_messaging::AgentAddress::new(
                 run.run_id.clone(),
                 agent_id,
@@ -17907,19 +18285,6 @@ impl AgenticRunLifecycleService {
             }
         }
     }
-}
-
-/// Find the native child target from stage admission facts already present on
-/// the requested run. The run record is the capability fact; no model name,
-/// executable version, or display label is consulted.
-fn native_stage_admitted_on_run(run: &DurableRunRecord) -> bool {
-    run.events.iter().rev().any(|event| {
-        event.get("event_type").and_then(Value::as_str) == Some("collaborator_stage_admitted")
-            && serde_json::from_value::<astra_services::runs::CollaboratorStageAdmission>(
-                event.get("admission").cloned().unwrap_or(Value::Null),
-            )
-            .is_ok_and(|admission| admission.anchor_run_id == run.run_id)
-    })
 }
 
 impl AgenticRunLifecycleService {
@@ -18736,7 +19101,8 @@ impl ServerSpawnAgentExecutor {
                         }
                     },
                 )
-                .await?;
+                .await?
+                .0;
         }
         Ok(context)
     }
@@ -20918,6 +21284,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                         crate::orchestration::AgentStatus::Cancelled {
                             by_user: false,
                             reason,
+                            partial_result: String::new(),
                         }
                     }
                     DurableCancellationOrigin::Unverified => {
@@ -23457,6 +23824,7 @@ async fn settle_subrun_activation_cancellation(
                         crate::orchestration::AgentStatus::Cancelled {
                             by_user: false,
                             reason: "cancelled during durable activation".to_string(),
+                            partial_result: String::new(),
                         }
                     },
                 ),
@@ -23541,6 +23909,11 @@ async fn settle_subrun_activation_cancellation(
         );
     }
     crate::server::delegation::engine::SubRunExecutionResult {
+        cancellation_origin: if user_terminal_winner {
+            CancellationOrigin::User
+        } else {
+            CancellationOrigin::Unverified
+        },
         result,
         committed_frontier,
         applied_user_intents,
@@ -24369,6 +24742,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None,
                         None,
                     )
+                    .with_interaction_mode(config.interaction_mode)
                     .with_cancel_token(local_cancel_token.clone()),
                 ));
                 let user_prompt_gate = Arc::new(
@@ -24520,7 +24894,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
-        loop_state.permission_mode_observation.bind_wake(input_wake.subscribe());
+        loop_state.run_settings_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
             config.user_id.clone(),
@@ -24686,6 +25060,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,
                 context_commit: None,
+                context_not_saved: false,
             })
         } else {
             None
@@ -25111,7 +25486,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: projected_status.to_string(),
-                output: None,
+                output: (!loop_state.final_text.is_empty()).then_some(loop_state.final_text),
                 error: Some(err),
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
@@ -25137,7 +25512,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: projected_status.to_string(),
-                output: None,
+                output: (!loop_state.final_text.is_empty()).then_some(loop_state.final_text),
                 error: Some(err.to_string()),
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
@@ -25186,6 +25561,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             }
             drop(owner_lease_heartbeat.take());
             execution_result.map(|result| crate::server::delegation::engine::SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result,
                 committed_frontier,
                 applied_user_intents,

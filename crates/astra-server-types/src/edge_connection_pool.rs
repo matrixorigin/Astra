@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::edge_ws_protocol::{
     EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
     MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
+    supports_w3c_trace_context,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -70,7 +71,72 @@ pub fn admitted_work_deadline(
 pub const EDGE_WS_CHANNEL_CAPACITY: usize = 256;
 
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
-pub type EdgeWsSender = mpsc::Sender<EdgeServerMessage>;
+pub type EdgeWsSender = mpsc::Sender<EdgeOutbound>;
+
+/// A queued frame owns the proof that its direct request has not been sent.
+/// Dropping the queue, its receiver, or an unpolled send wakes the caller.
+#[derive(Debug)]
+pub struct EdgeOutbound {
+    message: EdgeServerMessage,
+    unsent: Option<UnsentDirectRequest>,
+}
+
+#[derive(Debug)]
+struct UnsentDirectRequest {
+    results: Arc<DashMap<String, PendingEdgeResult>>,
+    requests: Arc<DashMap<String, PendingRequestEntry>>,
+    request_id: String,
+    delivery_generation: u64,
+    attempted: bool,
+}
+
+impl Drop for UnsentDirectRequest {
+    fn drop(&mut self) {
+        if self.attempted {
+            return;
+        }
+        let pending = self.results.remove_if(&self.request_id, |_, result| {
+            result.delivery_generation == self.delivery_generation
+        });
+        self.requests.remove_if(&self.request_id, |_, request| {
+            request.delivery_generation == self.delivery_generation
+        });
+        if let Some((_, result)) = pending {
+            let _ = result.sender.send(Err(EdgeInvocationDeliveryError::NotSent(
+                "request was not sent to Edge",
+            )));
+        }
+    }
+}
+
+impl From<EdgeServerMessage> for EdgeOutbound {
+    fn from(message: EdgeServerMessage) -> Self {
+        // Direct ToolRequest frames must use the guarded queue path below.
+        Self {
+            message,
+            unsent: None,
+        }
+    }
+}
+
+impl EdgeOutbound {
+    pub fn message(&self) -> &EdgeServerMessage {
+        &self.message
+    }
+
+    /// Called immediately before the first socket send poll.
+    pub fn mark_attempted(&mut self) {
+        if let Some(unsent) = &mut self.unsent {
+            unsent.attempted = true;
+        }
+    }
+
+    /// Extract a frame whose delivery has already been attempted.
+    pub fn into_attempted_message(mut self) -> EdgeServerMessage {
+        self.mark_attempted();
+        self.message
+    }
+}
 
 /// Delivery certainty is independent of receipt cleanup or socket liveness.
 /// Only NotSent permits the invocation owner to record non-execution.
@@ -106,6 +172,9 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub execution_timeout_ms: Option<u64>,
     pub command_timeout_cap_ms: Option<u64>,
     pub cancel_token: Option<&'a CancellationToken>,
+    /// This call's W3C carrier. The pool copies it onto the tool request.
+    pub traceparent: Option<&'a str>,
+    pub tracestate: Option<&'a str>,
 }
 
 /// Information about a tool request dispatched to an edge, stored for
@@ -166,7 +235,7 @@ pub struct EdgeConnection {
 #[derive(Debug)]
 struct PendingEdgeResult {
     delivery_generation: u64,
-    sender: oneshot::Sender<EdgeToolResult>,
+    sender: oneshot::Sender<Result<EdgeToolResult, EdgeInvocationDeliveryError>>,
 }
 
 #[derive(Debug)]
@@ -442,7 +511,7 @@ impl EdgeConnectionPool {
         // fences route selection and enqueue against connection replacement.
         connection
             .sender
-            .try_send(message)
+            .try_send(message.into())
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => CapacityRpcFailure::Busy,
                 mpsc::error::TrySendError::Closed(_) => CapacityRpcFailure::Offline,
@@ -827,6 +896,26 @@ impl EdgeConnectionPool {
         drop(reservation);
     }
 
+    /// Stop selecting this generation while preserving its in-flight result
+    /// callbacks until the connection owner finishes processing them. Returns
+    /// false when a newer socket already replaced it.
+    pub fn quiesce_generation(&self, user_id: &str, edge_agent_id: &str, generation: u64) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        let Some(mut connection) = self.connections.get_mut(&key) else {
+            return false;
+        };
+        if connection.generation != generation {
+            return false;
+        }
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        connection.sender = sender;
+        drop(connection);
+        self.capacity_rpc
+            .disconnect(user_id, edge_agent_id, generation);
+        true
+    }
+
     /// Remove only the connection incarnation registered by the caller.
     /// Returns false when a newer socket already replaced it.
     pub fn unregister_generation(
@@ -1081,6 +1170,9 @@ impl EdgeConnectionPool {
                 execution_timeout_ms: None,
                 command_timeout_cap_ms: None,
                 cancel_token,
+
+                traceparent: None,
+                tracestate: None,
             },
         )
         .await
@@ -1111,6 +1203,8 @@ impl EdgeConnectionPool {
             execution_timeout_ms,
             command_timeout_cap_ms,
             cancel_token,
+            traceparent,
+            tracestate,
         } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return Err(EdgeInvocationDeliveryError::NotSent(
@@ -1141,7 +1235,8 @@ impl EdgeConnectionPool {
         let result_deadline = execution_deadline
             .map(|deadline| deadline + Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS));
         let key = pool_key(connection_user_id, edge_agent_id);
-        let (pending_results, sender, connection_generation, materialization_id) = {
+        let has_trace_carrier = traceparent.is_some() || tracestate.is_some();
+        let (pending_results, sender, connection_generation, materialization_id, trace_supported) = {
             let Some(entry) = self.connections.get(&key) else {
                 tracing::warn!(
                     target: "astra_runtime::edge_dispatch_diag",
@@ -1159,8 +1254,6 @@ impl EdgeConnectionPool {
                     key = %key,
                     "edge_dispatch: execute_tool_with_cancel pool entry sender already closed"
                 );
-                drop(entry);
-                self.connections.remove(&key);
                 return Err(EdgeInvocationDeliveryError::NotSent(
                     "Edge connection closed",
                 ));
@@ -1170,7 +1263,13 @@ impl EdgeConnectionPool {
                 conn.sender.clone(),
                 conn.generation,
                 conn.materialization_id.clone(),
+                has_trace_carrier && supports_w3c_trace_context(conn.capabilities.as_ref()),
             )
+        };
+        let (traceparent, tracestate) = if trace_supported {
+            (traceparent, tracestate)
+        } else {
+            (None, None)
         };
 
         let request_id = identity.storage_key();
@@ -1228,11 +1327,23 @@ impl EdgeConnectionPool {
             execution_deadline_unix_ms,
             execution_timeout_ms,
             command_timeout_cap_ms,
+            traceparent: traceparent.map(str::to_owned),
+            tracestate: tracestate.map(str::to_owned),
         };
 
         let send_deadline = (now + PROVIDER_STAGE_INPUT_ACK_TIMEOUT)
             .min(execution_deadline.unwrap_or(now + PROVIDER_STAGE_INPUT_ACK_TIMEOUT));
-        let sending = tokio::time::timeout_at(send_deadline, sender.send(msg));
+        let queued = EdgeOutbound {
+            message: msg,
+            unsent: Some(UnsentDirectRequest {
+                results: pending_results.clone(),
+                requests: self.pending_requests.clone(),
+                request_id: request_id.clone(),
+                delivery_generation,
+                attempted: false,
+            }),
+        };
+        let sending = tokio::time::timeout_at(send_deadline, sender.send(queued));
         let sent = if let Some(token) = cancel_token {
             tokio::select! {
                 biased;
@@ -1249,8 +1360,12 @@ impl EdgeConnectionPool {
                 request_id = %request_id,
                 "edge_dispatch: channel send failed or admitted work deadline expired"
             );
-            pending_results.remove(&request_id);
-            self.remove_pending_request(&request_id);
+            pending_results.remove_if(&request_id, |_, pending| {
+                pending.delivery_generation == delivery_generation
+            });
+            self.pending_requests.remove_if(&request_id, |_, pending| {
+                pending.delivery_generation == delivery_generation
+            });
             return Err(EdgeInvocationDeliveryError::NotSent(
                 "enqueue failed or cancelled",
             ));
@@ -1295,9 +1410,17 @@ impl EdgeConnectionPool {
             wait.await
         };
         match result {
-            Some(result) => {
-                self.remove_pending_request(&request_id);
+            Some(Ok(result)) => {
+                self.pending_requests.remove_if(&request_id, |_, pending| {
+                    pending.delivery_generation == delivery_generation
+                });
                 Ok(result)
+            }
+            Some(Err(error)) => {
+                self.pending_requests.remove_if(&request_id, |_, request| {
+                    request.delivery_generation == delivery_generation
+                });
+                Err(error)
             }
             _ => {
                 // Timed out waiting for the edge. Tell it to abort so the
@@ -1339,7 +1462,7 @@ impl EdgeConnectionPool {
             self.pending_requests.remove_if(request_id, |_, request| {
                 request.delivery_generation == delivery_generation
             });
-            return pending.sender.send(result).is_ok();
+            return pending.sender.send(Ok(result)).is_ok();
         }
         if let Some(connection) = self.connections.get(&key) {
             let settled = self.pending_requests.remove_if(request_id, |_, request| {
@@ -1448,8 +1571,22 @@ impl EdgeConnectionPool {
             .collect()
     }
 
-    /// Queue admission is not socket delivery. An expired queued request must
-    /// not acquire physical execution authority after its custody disappeared.
+    /// Run a synchronous first-send poll only while this generation is current.
+    pub fn with_current_generation<T>(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        generation: u64,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let connection = self.connections.get(&pool_key(user_id, edge_agent_id))?;
+        if connection.generation != generation || connection.sender.is_closed() {
+            return None;
+        }
+        Some(action())
+    }
+
+    /// An expired or cancelled queued request must not begin socket delivery.
     pub fn queued_request_is_live(
         &self,
         user_id: &str,
@@ -1473,6 +1610,7 @@ impl EdgeConnectionPool {
                     && pending.connection_generation == generation
                     && pending.connection_key.as_deref()
                         == Some(pool_key(user_id, edge_agent_id).as_str())
+                    && pending.cancellation.is_none()
                     && pending
                         .expires_at
                         .is_none_or(|deadline| deadline > tokio::time::Instant::now())
@@ -1625,11 +1763,14 @@ impl EdgeConnectionPool {
         let sent = {
             let sending = tokio::time::timeout_at(
                 deadline,
-                sender.send(EdgeServerMessage::ToolInput {
-                    request_id: request_id.clone(),
-                    delivery_generation,
-                    input: input.clone(),
-                }),
+                sender.send(
+                    EdgeServerMessage::ToolInput {
+                        request_id: request_id.clone(),
+                        delivery_generation,
+                        input: input.clone(),
+                    }
+                    .into(),
+                ),
             );
             if let Some(token) = cancel_token {
                 tokio::select! {
@@ -1698,7 +1839,11 @@ impl EdgeConnectionPool {
 
     /// Remove stale connections (sender closed) and expired pending requests.
     pub fn cleanup_stale(&self) {
-        self.connections.retain(|_, conn| !conn.sender.is_closed());
+        self.connections.retain(|_, conn| {
+            !conn.sender.is_closed()
+                || !conn.pending_results.is_empty()
+                || !conn.pending_inputs.is_empty()
+        });
         self.reclaim_expired_requests();
     }
 
@@ -1810,7 +1955,7 @@ impl EdgeConnectionPool {
 
         for (user_id, edge_agent_id, _) in &connections {
             if let Some(entry) = self.connections.get(&pool_key(user_id, edge_agent_id)) {
-                let _ = entry.sender.try_send(closing.clone());
+                let _ = entry.sender.try_send(closing.clone().into());
             }
         }
 
@@ -1926,6 +2071,9 @@ mod tests {
                             execution_timeout_ms: None,
                             command_timeout_cap_ms: Some(8_000),
                             cancel_token: None,
+
+                            traceparent: None,
+                            tracestate: None,
                         },
                     )
                     .await
@@ -1935,7 +2083,7 @@ mod tests {
                 delivery_generation,
                 timeout_secs: None,
                 ..
-            } = rx.recv().await.unwrap()
+            } = rx.recv().await.unwrap().into_attempted_message()
             else {
                 panic!("expected an unbudgeted task request");
             };
@@ -2020,6 +2168,9 @@ mod tests {
                         execution_timeout_ms: Some(86_400_000),
                         command_timeout_cap_ms: Some(8_000),
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
@@ -2029,7 +2180,7 @@ mod tests {
             request_id,
             delivery_generation,
             ..
-        } = rx.recv().await.unwrap()
+        } = rx.recv().await.unwrap().into_attempted_message()
         else {
             panic!("day work request");
         };
@@ -2091,6 +2242,9 @@ mod tests {
                         execution_timeout_ms: remaining,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await;
@@ -2118,6 +2272,9 @@ mod tests {
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
@@ -2127,7 +2284,7 @@ mod tests {
             request_id,
             delivery_generation,
             ..
-        } = rx.recv().await.unwrap()
+        } = rx.recv().await.unwrap().into_attempted_message()
         else {
             panic!("bounded command request");
         };
@@ -2157,7 +2314,7 @@ mod tests {
         for cancel_first in [false, true] {
             let pool = EdgeConnectionPool::new();
             let (tx, mut rx) = mpsc::channel(1);
-            tx.send(EdgeServerMessage::Pong {}).await.unwrap();
+            tx.send(EdgeServerMessage::Pong {}.into()).await.unwrap();
             pool.register("user-1", "edge-a", None, None, tx);
             let identity = admitted_identity("blocked-send");
             let cancel = CancellationToken::new();
@@ -2180,6 +2337,9 @@ mod tests {
                             execution_timeout_ms: Some(1_000),
                             command_timeout_cap_ms: None,
                             cancel_token: Some(&caller_cancel),
+
+                            traceparent: None,
+                            tracestate: None,
                         },
                     )
                     .await
@@ -2194,7 +2354,7 @@ mod tests {
             assert!(caller.await.unwrap().is_err());
             assert!(pool.get_pending_requests_for_user("user-1").is_empty());
             assert!(matches!(
-                rx.recv().await.unwrap(),
+                rx.recv().await.unwrap().into_attempted_message(),
                 EdgeServerMessage::Pong {}
             ));
             assert!(
@@ -2238,7 +2398,7 @@ mod tests {
         let other_wake = pool
             .cancellation_wake("user-2", "edge-b", other_generation)
             .unwrap();
-        tx.send(EdgeServerMessage::Pong {}).await.unwrap();
+        tx.send(EdgeServerMessage::Pong {}.into()).await.unwrap();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(
@@ -2351,6 +2511,77 @@ mod tests {
 
     fn admitted_identity(call_id: &str) -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user-1", "session", "run", "turn", call_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_request_omits_trace_carrier_until_edge_advertises_it() {
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "old-edge",
+            None,
+            None,
+            Some(json!({"protocol_capabilities": {"runtime_process_authorization_v1": true}})),
+            None,
+            old_tx,
+        );
+        pool.register_with_capabilities(
+            "user-1",
+            "new-edge",
+            None,
+            None,
+            Some(json!({"protocol_capabilities": {"w3c_trace_context_v1": true}})),
+            None,
+            new_tx,
+        );
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let ceiling = task_ceiling();
+        for (edge_agent_id, receiver) in [("old-edge", &mut old_rx), ("new-edge", &mut new_rx)] {
+            let identity = admitted_identity(edge_agent_id);
+            let caller = tokio::spawn({
+                let pool = pool.clone();
+                let identity = identity.clone();
+                let ceiling = ceiling.clone();
+                async move {
+                    pool.execute_durably_admitted_invocation_on_connection_with_cancel(
+                        DurablyAdmittedEdgeInvocation {
+                            provider_stage_dispatch: None,
+                            execution_ceiling: Some(&ceiling),
+                            connection_user_id: "user-1",
+                            identity: &identity,
+                            edge_agent_id,
+                            tool: "bash",
+                            args: &json!({"command": "true"}),
+                            runtime_process_authorization: None,
+                            timeout_secs: Some(30),
+                            execution_deadline_unix_ms: None,
+                            execution_timeout_ms: None,
+                            command_timeout_cap_ms: None,
+                            cancel_token: None,
+                            traceparent: Some(parent),
+                            tracestate: Some("vendor=value"),
+                        },
+                    )
+                    .await
+                }
+            });
+            let message = receiver
+                .recv()
+                .await
+                .expect("tool request")
+                .into_attempted_message();
+            caller.abort();
+            let encoded = serde_json::to_value(&message).expect("tool request encodes");
+            if edge_agent_id == "old-edge" {
+                assert!(encoded.get("traceparent").is_none());
+                assert!(encoded.get("tracestate").is_none());
+            } else {
+                assert_eq!(encoded["traceparent"], parent);
+                assert_eq!(encoded["tracestate"], "vendor=value");
+            }
+        }
     }
 
     #[test]
@@ -2489,6 +2720,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpolled_queue_drop_wakes_unbudgeted_caller_across_reconnect() {
+        for mode in [
+            "queued",
+            "dequeued",
+            "attempted",
+            "reserved",
+            "cleared",
+            "permit",
+        ] {
+            let pool = EdgeConnectionPool::new();
+            let (old_tx, mut old_rx) = mpsc::channel(1);
+            let permit = if mode == "permit" {
+                Some(old_tx.clone().reserve_owned().await.unwrap())
+            } else {
+                None
+            };
+            let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+            let identity = admitted_identity(mode);
+            let caller_pool = pool.clone();
+            let caller = tokio::spawn(async move {
+                let ceiling = task_ceiling();
+                caller_pool
+                    .execute_durably_admitted_invocation_on_connection_with_cancel(
+                        DurablyAdmittedEdgeInvocation {
+                            provider_stage_dispatch: None,
+                            execution_ceiling: Some(&ceiling),
+                            connection_user_id: "user-1",
+                            identity: &identity,
+                            edge_agent_id: "edge-a",
+                            tool: "bash",
+                            args: &json!({"command": "effect"}),
+                            runtime_process_authorization: None,
+                            timeout_secs: None,
+                            execution_deadline_unix_ms: None,
+                            execution_timeout_ms: None,
+                            command_timeout_cap_ms: None,
+                            cancel_token: None,
+                            traceparent: None,
+                            tracestate: None,
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while if mode == "permit" {
+                    pool.get_pending_requests_for_user("user-1").is_empty()
+                } else {
+                    old_rx.is_empty()
+                } {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("direct invocation must be queued");
+
+            let mut message = if matches!(mode, "dequeued" | "attempted") {
+                Some(old_rx.recv().await.unwrap())
+            } else {
+                None
+            };
+            let attempted_identity = if mode == "attempted" {
+                let message = message.as_mut().unwrap();
+                let EdgeServerMessage::ToolRequest {
+                    request_id,
+                    delivery_generation,
+                    ..
+                } = message.message()
+                else {
+                    panic!("expected a tool request");
+                };
+                let identity = (request_id.clone(), *delivery_generation);
+                message.mark_attempted();
+                Some(identity)
+            } else {
+                None
+            };
+            let reservation = if mode == "reserved" {
+                let reservation = pool.begin_reconnect("user-1", "edge-a");
+                assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
+                Some(reservation)
+            } else {
+                let (new_tx, _new_rx) = mpsc::channel(1);
+                let new_generation = pool.register("user-1", "edge-a", None, None, new_tx);
+                if mode == "cleared" {
+                    assert!(pool.unregister_generation("user-1", "edge-a", new_generation));
+                }
+                None
+            };
+            drop(old_rx);
+            drop(permit);
+            drop(message);
+            if let Some((request_id, delivery_generation)) = attempted_identity {
+                assert!(!caller.is_finished(), "a polled request remains uncertain");
+                assert!(pool.deliver_tool_result(
+                    "user-1",
+                    "edge-a",
+                    &request_id,
+                    delivery_generation,
+                    EdgeToolResult {
+                        output: "completed".into(),
+                        is_error: false,
+                        duration_ms: None,
+                        tool_result_fields: None,
+                    },
+                ));
+                assert_eq!(caller.await.unwrap().unwrap().output, "completed");
+            } else {
+                let outcome = tokio::time::timeout(Duration::from_secs(2), caller)
+                    .await
+                    .expect("queue loss must not strand the caller")
+                    .unwrap();
+                if mode == "cleared" {
+                    assert!(matches!(
+                        outcome,
+                        Err(EdgeInvocationDeliveryError::Unknown(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        Err(EdgeInvocationDeliveryError::NotSent(_))
+                    ));
+                }
+            }
+            drop(reservation);
+        }
+    }
+
+    #[tokio::test]
     async fn replacement_connection_preserves_exact_pending_result_waiters() {
         let pool = EdgeConnectionPool::new();
         let (old_tx, mut old_rx) = mpsc::channel(1);
@@ -2506,7 +2865,11 @@ mod tests {
                 )
                 .await
         });
-        let request = old_rx.recv().await.expect("old socket request");
+        let request = old_rx
+            .recv()
+            .await
+            .expect("old socket request")
+            .into_attempted_message();
         let (request_id, delivery_generation) = match request {
             EdgeServerMessage::ToolRequest {
                 request_id,
@@ -2596,14 +2959,15 @@ mod tests {
                 )
                 .await
         });
-        let (request_id, delivery_generation) = match rx.recv().await.unwrap() {
-            EdgeServerMessage::ToolRequest {
-                request_id,
-                delivery_generation,
-                ..
-            } => (request_id, delivery_generation),
-            other => panic!("expected tool request, got {other:?}"),
-        };
+        let (request_id, delivery_generation) =
+            match rx.recv().await.unwrap().into_attempted_message() {
+                EdgeServerMessage::ToolRequest {
+                    request_id,
+                    delivery_generation,
+                    ..
+                } => (request_id, delivery_generation),
+                other => panic!("expected tool request, got {other:?}"),
+            };
 
         let input = astra_turn_types::ProviderStageInput::Text {
             input_id: "message-1".into(),
@@ -2648,17 +3012,18 @@ mod tests {
                 )
                 .await
         });
-        let (observed_request_id, observed_generation) = match rx.recv().await.unwrap() {
-            EdgeServerMessage::ToolInput {
-                request_id,
-                delivery_generation,
-                input: observed,
-            } => {
-                assert_eq!(observed, input_for_ack);
-                (request_id, delivery_generation)
-            }
-            other => panic!("expected provider input, got {other:?}"),
-        };
+        let (observed_request_id, observed_generation) =
+            match rx.recv().await.unwrap().into_attempted_message() {
+                EdgeServerMessage::ToolInput {
+                    request_id,
+                    delivery_generation,
+                    input: observed,
+                } => {
+                    assert_eq!(observed, input_for_ack);
+                    (request_id, delivery_generation)
+                }
+                other => panic!("expected provider input, got {other:?}"),
+            };
         assert_eq!(observed_request_id, request_id);
         assert_eq!(observed_generation, delivery_generation);
 
@@ -2725,7 +3090,7 @@ mod tests {
     async fn admit_on_edge_a(
         pool: &EdgeConnectionPool,
         label: &str,
-        socket_rx: &mut mpsc::Receiver<EdgeServerMessage>,
+        socket_rx: &mut mpsc::Receiver<EdgeOutbound>,
     ) -> (
         tokio::task::JoinHandle<Result<EdgeToolResult, EdgeInvocationDeliveryError>>,
         String,
@@ -2744,7 +3109,11 @@ mod tests {
                 )
                 .await
         });
-        let request = socket_rx.recv().await.expect("socket request");
+        let request = socket_rx
+            .recv()
+            .await
+            .expect("socket request")
+            .into_attempted_message();
         match request {
             EdgeServerMessage::ToolRequest {
                 request_id,
@@ -2793,12 +3162,19 @@ mod tests {
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
         });
 
-        let request = rx.recv().await.expect("socket request");
+        let request = rx
+            .recv()
+            .await
+            .expect("socket request")
+            .into_attempted_message();
         let (request_id, delivery_generation, timeout_secs) = match request {
             EdgeServerMessage::ToolRequest {
                 request_id,
@@ -3136,7 +3512,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Read the tool request from the receiver
-        let msg = rx.recv().await.unwrap();
+        let msg = rx.recv().await.unwrap().into_attempted_message();
         let (request_id, delivery_generation) = match msg {
             EdgeServerMessage::ToolRequest {
                 request_id,
@@ -3336,7 +3712,7 @@ mod tests {
         assert_eq!(pool.connection_count(), 0);
 
         // Edge should receive a Closing frame.
-        let msg = rx.try_recv().unwrap();
+        let msg = rx.try_recv().unwrap().into_attempted_message();
         assert!(matches!(msg, EdgeServerMessage::Closing { .. }));
     }
 
@@ -3389,7 +3765,7 @@ mod tests {
 
         // Read the ToolRequest so the oneshot is stored in pending_results.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let _msg = rx.recv().await.unwrap();
+        let _msg = rx.recv().await.unwrap().into_attempted_message();
 
         // Drain should unregister the connection, dropping the oneshot sender.
         let count = pool.drain().await;

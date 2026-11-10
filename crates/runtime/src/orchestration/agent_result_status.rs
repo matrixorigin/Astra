@@ -137,6 +137,7 @@ pub fn project_agent_tool_budget_record(
             | AgentToolWireOutcomeKind::TimedOut
             | AgentToolWireOutcomeKind::Cancelled
             | AgentToolWireOutcomeKind::Running => {
+                partial_result = astra_turn_core::orchestration::agent_result_wire::agent_tool_partial_result_text(parsed);
                 incomplete_reason = agent_tool_incomplete_reason(parsed);
             }
             AgentToolWireOutcomeKind::NoChange => {}
@@ -291,8 +292,12 @@ mod tests {
         let status = AgentStatus::Running {
             activity: "review".into(),
         };
-        let out =
-            render_wait_timeout_outcome("reviewer-tests", Some(&status), Duration::from_secs(120));
+        let out = render_wait_timeout_outcome(
+            "reviewer-tests",
+            Some(&status),
+            Duration::from_secs(120),
+            None,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["status"],
@@ -318,11 +323,13 @@ mod tests {
             AgentStatus::Failed {
                 error: "boom".into(),
                 finish_reason: Some("failed".into()),
+                partial_result: String::new(),
             },
             AgentStatus::cancelled_anonymous(),
         ];
         for terminal in terminals {
-            let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
+            let out =
+                render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30), None);
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert_eq!(v["status"], AgentToolResultStatusKind::TimedOut.as_str());
         }
@@ -333,6 +340,7 @@ mod tests {
         let failed = AgentStatus::Failed {
             error: "boom".into(),
             finish_reason: Some("failed".into()),
+            partial_result: String::new(),
         };
         let failed_out = render_wait_for_agent_status("ag", &failed);
         let failed_json: serde_json::Value = serde_json::from_str(&failed_out).unwrap();

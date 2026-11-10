@@ -75,9 +75,10 @@ use serde_json::{Value, json};
 
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
-use astra_tools::build_test;
 pub use astra_tools::code_intel;
 use astra_tools::truncate_output;
+#[path = "edge_tools/background_tasks.rs"]
+pub(crate) mod background_tasks;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 #[path = "edge_tools/lsp_stdio_session.rs"]
@@ -100,10 +101,54 @@ pub(crate) use shell::shell_escape;
 mod code_analysis;
 
 pub fn all_tool_schemas() -> Vec<Value> {
+    tool_schemas_with_background(shell::environment_background_authorized())
+}
+
+fn tool_schemas_with_background(authorized: bool) -> Vec<Value> {
     let mut schemas = full_tool_schemas();
-    // The projector checks the same platform capability as the executor, so
-    // unsupported arguments are never advertised.
-    astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
+    if authorized {
+        astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
+    }
+    if let Some(bash) = schemas
+        .iter_mut()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("bash"))
+    {
+        if let Some(properties) = bash
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("source_artifacts");
+        }
+        if let Some(description) = bash.pointer_mut("/function/description") {
+            *description = Value::String(if authorized
+                && astra_tools::schemas::managed_background_bash_supported()
+            {
+                "Execute a command and report its output and exit status. workdir is call-local. Environment-lifetime services use run_in_background and ready_check."
+            } else {
+                "Execute a command and report its output and exit status. workdir is call-local."
+            }.into());
+        }
+    }
+    if let Some(rollback) = schemas.iter_mut().find(|schema| {
+        schema.pointer("/function/name").and_then(Value::as_str) == Some("rollback_file_edits")
+    }) {
+        if let Some(properties) = rollback
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("receipt_id");
+            if let Some(scopes) = properties
+                .get_mut("scope")
+                .and_then(|scope| scope.get_mut("enum"))
+                .and_then(Value::as_array_mut)
+            {
+                scopes.retain(|scope| scope.as_str() != Some("source_receipt"));
+            }
+        }
+        if let Some(description) = rollback.pointer_mut("/function/description") {
+            *description = Value::String("List or restore file edits recorded by write_file and str_replace. Use scope=current_turn, file, turn, or list.".into());
+        }
+    }
     schemas
 }
 
@@ -140,6 +185,7 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "session",
     "symbol_search",
     "task_list",
+    "task_input",
     "task_output",
     "task_stop",
     "type_hierarchy",
@@ -455,6 +501,68 @@ fn tool_result_from_cli_outcome(outcome: ToolExecutionOutcome) -> astra_tools::T
     }
 }
 
+fn control_tool_result(
+    mut outcome: ToolExecutionOutcome,
+    snapshot: Option<serde_json::Map<String, Value>>,
+) -> astra_tools::ToolResult {
+    // Redact individual strings before JSON escaping. Redacting the encoded
+    // envelope can miss credentials whose quotes have already been escaped.
+    let structured = snapshot
+        .map(Value::Object)
+        .or_else(|| serde_json::from_str::<Value>(&outcome.output).ok());
+    if let Some(mut value) = structured {
+        astra_text_utils::credential_redaction::redact_credentials_in_json(&mut value);
+        outcome.output = value.to_string();
+    } else {
+        outcome.output =
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&outcome.output)
+                .0;
+    }
+    if let Some(fields) = outcome.tool_result_fields.as_mut() {
+        for (key, value) in fields {
+            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+        }
+    }
+    tool_result_from_cli_outcome(outcome)
+}
+
+fn unknown_shell_tasks<'a>(
+    tool: &str,
+    fields: Option<&'a serde_json::Map<String, Value>>,
+) -> Vec<&'a str> {
+    let Some(fields) = fields else {
+        return Vec::new();
+    };
+    match tool {
+        "bash" if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) => fields
+            .get("task_id")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        "task_output" => fields
+            .get("task")
+            .filter(|task| {
+                task.get("execution")
+                    .and_then(Value::as_object)
+                    .is_some_and(|execution| {
+                        astra_tools::execution_outcome::outcome_is_unknown(Some(execution))
+                    })
+            })
+            .and_then(|task| task.get("task_id"))
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        "agent" if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) => fields
+            .get("nested_unknown_shell_tasks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Lift the shared work-unit protocol out of structured tool output.
 ///
 /// Runtime/server executors already perform this projection before the
@@ -545,6 +653,8 @@ impl EdgeToolRun {
         if let Ok(value) = serde_json::to_value(&evidence) {
             fields.insert("recovery_evidence".to_string(), value);
         }
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
         Self {
             output,
             is_error: true,
@@ -607,13 +717,29 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
 pub(crate) fn workspace_lease_failure_tool_execution_outcome(
     name: &str,
     failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    root: &std::path::Path,
 ) -> ToolExecutionOutcome {
-    let result = astra_tools::workspace_lease_failure_tool_result(name, failure);
+    let result = local_workspace_lease_failure(name, failure, root);
     ToolExecutionOutcome {
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
     }
+}
+
+fn local_workspace_lease_failure(
+    name: &str,
+    failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    root: &std::path::Path,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::workspace_lease_failure_tool_result(name, failure);
+    if failure == astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled {
+        result.output.push_str(&format!(
+            " After checking that all commands stopped, run `astra workspace confirm-stopped` from {} and resume the session from that same workspace. If another system user started the work, that user must confirm it or ask the host administrator for help.",
+            root.display()
+        ));
+    }
+    result
 }
 
 /// Parse a grep output line to extract the file path and line number.
@@ -707,6 +833,9 @@ pub struct BgTaskOutputSnapshot {
     pub total_lines: u64,
     pub status: BgTaskOutputStatus,
     pub output_ref: String,
+    /// Producer activity observed before reading the live capture, not a byte cursor.
+    pub output_revision: Option<u64>,
+    pub output_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -725,45 +854,7 @@ pub struct BgTaskOutputSearchSnapshot {
     pub truncated: bool,
     pub status: BgTaskOutputStatus,
     pub output_ref: String,
-}
-
-pub(crate) enum BgTaskCommand {
-    Kill {
-        task_id: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), BackgroundTaskError>>,
-    },
-    GetOutputSince {
-        task_id: String,
-        offset: u64,
-        max_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Result<BgTaskOutputSnapshot, BackgroundTaskError>>,
-    },
-    SearchOutput {
-        task_id: String,
-        pattern: String,
-        context_lines: usize,
-        max_bytes: usize,
-        reply:
-            tokio::sync::oneshot::Sender<Result<BgTaskOutputSearchSnapshot, BackgroundTaskError>>,
-    },
-    List {
-        reply: tokio::sync::oneshot::Sender<String>,
-    },
-}
-
-#[cfg(not(test))]
-const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 1_000;
-#[cfg(test)]
-const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 25;
-#[cfg(not(test))]
-const BG_TASK_WAIT_POLL_INTERVAL_MS: u64 = 500;
-#[cfg(test)]
-const BG_TASK_WAIT_POLL_INTERVAL_MS: u64 = 5;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BgTaskReplyError {
-    Closed,
-    TimedOut,
+    pub output_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,74 +863,69 @@ enum BgTaskOutputReadMode {
     Historical,
 }
 
-fn background_task_reply_timeout(timeout_ms: u64) -> Duration {
-    Duration::from_millis(timeout_ms.clamp(1, BG_TASK_COMMAND_REPLY_TIMEOUT_MS))
-}
-
 async fn request_background_task_output_snapshot(
-    bg_commands: &std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    executor: &ToolExecutor,
     task_id: &str,
     offset: u64,
     max_bytes: usize,
-    reply_timeout: Duration,
+    latest_if_incomplete: bool,
 ) -> Result<BgTaskOutputSnapshot, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut commands = bg_commands.lock_recover();
-        commands.push(BgTaskCommand::GetOutputSince {
-            task_id: task_id.to_string(),
+    let mut tasks = executor.background_tasks.clone();
+    if tasks.get(task_id).is_some() {
+        return crate::tui::bg_task_proxy::background_task_output_snapshot(
+            &mut tasks,
+            task_id,
             offset,
             max_bytes,
-            reply: tx,
-        });
+            latest_if_incomplete,
+        )
+        .await
+        .map_err(|error| format_background_task_error(&error));
     }
-    match await_bg_task_command_reply(rx, reply_timeout).await {
-        Ok(Ok(snapshot)) => Ok(snapshot),
-        Ok(Err(error)) => Err(format_background_task_error(&error)),
-        Err(BgTaskReplyError::Closed) => Err(format_background_task_registry_closed(Some(task_id))),
-        Err(BgTaskReplyError::TimedOut) => Err(format_background_task_output_registry_timeout(
-            task_id,
-            reply_timeout,
-        )),
+    if let Some(ctx) = &executor.spawn_context
+        && let Some(state) = ctx
+            .spawner
+            .child_status_snapshot(&ctx.agent_id)
+            .await
+            .into_iter()
+            .find(|state| state.agent_id == task_id)
+    {
+        let info = astra_turn_core::orchestration_types::SpawnedAgentInfo::from(&state);
+        return Ok(
+            crate::tui::bg_task_proxy::background_task_output_snapshot_for_local_agent(
+                &info, offset, max_bytes,
+            ),
+        );
     }
+    Err(format_background_task_error(
+        &BackgroundTaskError::not_found(task_id),
+    ))
 }
 
 async fn request_background_task_output_search(
-    bg_commands: &std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    executor: &ToolExecutor,
     task_id: &str,
     pattern: &str,
     context_lines: usize,
     max_bytes: usize,
-    reply_timeout: Duration,
 ) -> Result<BgTaskOutputSearchSnapshot, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut commands = bg_commands.lock_recover();
-        commands.push(BgTaskCommand::SearchOutput {
-            task_id: task_id.to_string(),
-            pattern: pattern.to_string(),
-            context_lines,
-            max_bytes,
-            reply: tx,
-        });
-    }
-    match await_bg_task_command_reply(rx, reply_timeout).await {
-        Ok(Ok(snapshot)) => Ok(snapshot),
-        Ok(Err(error)) => Err(format_background_task_error(&error)),
-        Err(BgTaskReplyError::Closed) => Err(format_background_task_registry_closed(Some(task_id))),
-        Err(BgTaskReplyError::TimedOut) => Err(format_background_task_output_registry_timeout(
-            task_id,
-            reply_timeout,
-        )),
-    }
+    let mut tasks = executor.background_tasks.clone();
+    crate::tui::bg_task_proxy::background_task_output_search_snapshot(
+        &mut tasks,
+        task_id,
+        pattern,
+        context_lines,
+        max_bytes,
+    )
+    .await
+    .map_err(|error| format_background_task_error(&error))
 }
 
 async fn background_task_output_view(
-    bg_commands: &std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    bg_commands: &ToolExecutor,
     task_id: &str,
     requested_offset: Option<u64>,
     max_bytes: usize,
-    reply_timeout: Duration,
 ) -> Result<(u64, BgTaskOutputSnapshot), String> {
     let first_offset = requested_offset.unwrap_or(0);
     let first = request_background_task_output_snapshot(
@@ -847,10 +933,14 @@ async fn background_task_output_view(
         task_id,
         first_offset,
         max_bytes,
-        reply_timeout,
+        requested_offset.is_none(),
     )
     .await?;
-    if requested_offset.is_some() || first.kind != "shell" || first.total_bytes <= max_bytes as u64
+    if requested_offset.is_some()
+        || first.kind != "shell"
+        || !first.status.is_terminal()
+        || first.output_complete == Some(false)
+        || first.total_bytes <= max_bytes as u64
     {
         return Ok((first_offset, first));
     }
@@ -864,7 +954,7 @@ async fn background_task_output_view(
         task_id,
         tail_offset,
         max_bytes,
-        reply_timeout,
+        false,
     )
     .await?;
     if tail.end_offset >= tail.total_bytes {
@@ -880,25 +970,10 @@ async fn background_task_output_view(
         task_id,
         latest_offset,
         max_bytes,
-        reply_timeout,
+        false,
     )
     .await?;
     Ok((latest_offset, latest))
-}
-
-async fn await_bg_task_command_reply<T>(
-    rx: tokio::sync::oneshot::Receiver<T>,
-    timeout: Duration,
-) -> Result<T, BgTaskReplyError> {
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(_)) => Err(BgTaskReplyError::Closed),
-        Err(_) => Err(BgTaskReplyError::TimedOut),
-    }
-}
-
-fn duration_ms_u64(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn format_background_task_error(error: &BackgroundTaskError) -> String {
@@ -908,10 +983,10 @@ fn format_background_task_error(error: &BackgroundTaskError) -> String {
             "not_found",
             format!("Background task not found: {task_id}"),
         ),
-        BackgroundTaskError::OutputArtifactMissing { task_id, path } => (
+        BackgroundTaskError::OutputArtifactMissing { task_id, .. } => (
             task_id.as_str(),
             "output_missing",
-            format!("Output artifact missing: {}", path.display()),
+            "Output artifact missing".to_string(),
         ),
         BackgroundTaskError::OutputUnavailable { task_id, detail } => {
             (task_id.as_str(), "output_unavailable", detail.clone())
@@ -1002,144 +1077,88 @@ fn format_background_task_argument_error(error: &str) -> String {
     .to_string()
 }
 
-fn format_background_task_registry_closed(task_id: Option<&str>) -> String {
-    let mut response = serde_json::json!({
-        "ok": false,
-        "kind": if task_id.is_some() { "background_task" } else { "background_task_list" },
-        "status": "registry_unavailable",
-        "error": "background task registry is not available",
-    });
-    if let Some(task_id) = task_id {
-        response["task_id"] = serde_json::Value::String(task_id.to_string());
-    }
-    response.to_string()
-}
-
 fn format_background_task_output(
     task_id: &str,
     offset: u64,
     snapshot: &BgTaskOutputSnapshot,
     read_mode: BgTaskOutputReadMode,
 ) -> String {
-    let kind = snapshot.kind.trim();
-    let kind = if kind.is_empty() { "shell" } else { kind };
-    let header = match kind {
-        "shell" => format!("Read shell output {task_id}"),
-        "local agent" => format!("Read local agent output {task_id}"),
-        "cloud session" => format!("Read cloud session output {task_id}"),
-        "main session" => format!("Read main session output {task_id}"),
-        "monitor" => format!("Read monitor output {task_id}"),
-        other => format!("Read {other} output {task_id}"),
+    let kind = if snapshot.kind.trim().is_empty() {
+        "shell"
+    } else {
+        snapshot.kind.trim()
     };
-    let status_label = match snapshot.status {
-        BgTaskOutputStatus::Pending => "pending",
-        BgTaskOutputStatus::Running => "still running",
-        BgTaskOutputStatus::WaitingForInput => "needs input",
-        BgTaskOutputStatus::Stopping => "stopping",
-        BgTaskOutputStatus::Completed => "completed",
-        BgTaskOutputStatus::CompletedWithIssues => "completed with issues",
-        BgTaskOutputStatus::Failed => "failed",
-        BgTaskOutputStatus::Interrupted => "interrupted",
-        BgTaskOutputStatus::Cancelled => "stopped",
-        BgTaskOutputStatus::Unavailable => "unavailable",
-    };
-    let mut metadata_parts = vec![
-        format!("offset {offset} -> {}", snapshot.end_offset),
-        format!("next_offset {}", snapshot.end_offset),
-        format!("total {} bytes", snapshot.total_bytes),
-        format!("{} total lines", snapshot.total_lines),
-        format!(
-            "terminal {}",
-            if snapshot.status.is_terminal() {
-                "true"
-            } else {
-                "false"
-            }
-        ),
-    ];
-    if (read_mode == BgTaskOutputReadMode::Historical || kind != "shell")
-        && snapshot.end_offset < snapshot.total_bytes
-    {
-        metadata_parts.push(format!(
-            "next_call task_output(task_id='{task_id}', offset={}, block=false)",
-            snapshot.end_offset
-        ));
-    } else if !snapshot.status.is_terminal()
-        && snapshot.status != BgTaskOutputStatus::WaitingForInput
-    {
-        metadata_parts.push(format!(
-            "later_call task_output(task_id='{task_id}', block=false)"
-        ));
-        metadata_parts.push("do_not_poll_again_this_turn".to_string());
-    } else if snapshot.status == BgTaskOutputStatus::WaitingForInput {
-        metadata_parts.push("requires_input true".to_string());
-    }
-    if !snapshot.output_ref.trim().is_empty() {
-        metadata_parts.push(format!("output_ref {}", snapshot.output_ref));
-    }
-    if kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed {
-        metadata_parts.push("failure_cause unverified".to_string());
-        metadata_parts.push("diagnostic_search_available true".to_string());
-    }
+    let live_shell = kind == "shell" && !snapshot.status.is_terminal();
+    // The model and journal receive the same structured observation. A task
+    // description is data, never part of the output or terminal evidence.
+    let mut result = json!({
+        "ok": true,
+        "task_id": task_id,
+        "kind": kind,
+        "status": snapshot.status.as_str(),
+        "terminal": snapshot.status.is_terminal(),
+        "output": snapshot.output,
+        "total_bytes": snapshot.total_bytes,
+        "total_lines": snapshot.total_lines,
+    });
     if let Some(title) = snapshot
         .title
         .as_deref()
         .filter(|title| !title.trim().is_empty())
     {
-        metadata_parts.push(format!("title {}", title.trim()));
+        result["title"] = json!(title);
     }
-    let metadata = metadata_parts.join(" · ");
-    if snapshot.output.is_empty() {
-        let state = match (kind, snapshot.status) {
-            ("local agent", BgTaskOutputStatus::Pending) => "Pending · local agent has not started",
-            ("local agent", BgTaskOutputStatus::Running) => {
-                "No result yet · local agent still running"
-            }
-            ("local agent", BgTaskOutputStatus::WaitingForInput) => {
-                "Local agent waiting for input · no result yet"
-            }
-            ("local agent", BgTaskOutputStatus::Completed) => {
-                "Local agent completed with no result"
-            }
-            ("local agent", BgTaskOutputStatus::CompletedWithIssues) => {
-                "Local agent completed with issues and no result"
-            }
-            ("local agent", BgTaskOutputStatus::Failed) => "Local agent failed with no output",
-            ("local agent", BgTaskOutputStatus::Interrupted) => {
-                "Local agent interrupted with no result"
-            }
-            ("local agent", BgTaskOutputStatus::Cancelled) => "Local agent stopped with no result",
-            ("local agent", BgTaskOutputStatus::Unavailable) => {
-                "Local agent unavailable · stale handle or unsupported runner"
-            }
-            (_, BgTaskOutputStatus::Pending) => "Pending · no output yet",
-            (_, BgTaskOutputStatus::Running) => "No output yet · still running",
-            (_, BgTaskOutputStatus::WaitingForInput) => "Waiting for input · no new output",
-            (_, BgTaskOutputStatus::Stopping) => "Stopping · no new output",
-            (_, BgTaskOutputStatus::Completed) => "Completed with no output",
-            (_, BgTaskOutputStatus::CompletedWithIssues) => "Completed with issues and no output",
-            (_, BgTaskOutputStatus::Failed) => "Failed with no output",
-            (_, BgTaskOutputStatus::Interrupted) => "Interrupted with no output",
-            (_, BgTaskOutputStatus::Cancelled) => "Stopped with no output",
-            (_, BgTaskOutputStatus::Unavailable) => {
-                "Unavailable · stale handle or unsupported runner"
-            }
-        };
-        let diagnosis = (kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed).then_some(
-            "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
+    if !snapshot.output_ref.trim().is_empty() {
+        result["output_ref"] = json!(snapshot.output_ref);
+    }
+    if let Some(complete) = snapshot.output_complete {
+        result["output_complete"] = json!(complete);
+        if !complete {
+            result["output_note"] = if live_shell {
+                json!("The retained history is incomplete; live output is bounded.")
+            } else if kind == "shell" && read_mode == BgTaskOutputReadMode::Current {
+                json!("The retained history is incomplete; this is recent available output.")
+            } else {
+                json!("Only retained output is available; later output may be missing.")
+            };
+        }
+    }
+    if live_shell {
+        result["note"] = json!(
+            "Current snapshot; earlier output may be outside this window and incomplete sensitive values may be withheld."
         );
-        return format!("{header}\n{state} · {metadata}{}", diagnosis.unwrap_or(""));
+        if let Some(revision) = snapshot.output_revision {
+            result["output_revision"] = json!(revision);
+        }
+    } else if snapshot.output_complete == Some(false)
+        && kind == "shell"
+        && read_mode == BgTaskOutputReadMode::Current
+    {
+        result["note"] =
+            json!("Recent bounded output; use offset to inspect the retained history.");
+    } else {
+        result["offset"] = json!(offset);
+        result["next_offset"] = json!(snapshot.end_offset);
+        if (read_mode == BgTaskOutputReadMode::Historical || kind != "shell")
+            && snapshot.end_offset < snapshot.total_bytes
+        {
+            result["more_output"] = json!(true);
+        }
     }
-
-    let chunk = snapshot.output.trim_end();
-    let line_count = chunk.lines().count();
-    let diagnosis = (kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed).then_some(
-        "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
-    );
-    format!(
-        "{header}\n{line_count} new {} · {metadata} · {status_label}\nOutput chunk:\n{chunk}",
-        if line_count == 1 { "line" } else { "lines" }
-    ) + diagnosis.unwrap_or("")
+    if kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed {
+        result["diagnosis"] = json!(
+            "The failure cause is unverified. Search captured output before assigning a cause; a failed status alone does not establish a flaky test."
+        );
+    }
+    if live_shell
+        && (snapshot.output.contains("[REDACTED:")
+            || snapshot.output.contains("[Live output withheld:"))
+    {
+        result["withheld_output"] = json!(
+            "Some output may be redacted or withheld. In the local task panel, the user can press V to inspect the original output. If this client supports user interaction, ask for a non-secret answer; otherwise wait for more output or explain the limitation. Do not rerun a potentially side-effecting command just to change its output."
+        );
+    }
+    result.to_string()
 }
 
 fn format_background_task_output_search(
@@ -1148,6 +1167,7 @@ fn format_background_task_output_search(
     context_lines: usize,
     snapshot: &BgTaskOutputSearchSnapshot,
 ) -> String {
+    let pattern = astra_text_utils::credential_redaction::redact_credentials_for_display(pattern).0;
     let kind = snapshot.kind.trim();
     let kind = if kind.is_empty() { "shell" } else { kind };
     let status_label = match snapshot.status.as_str() {
@@ -1163,20 +1183,33 @@ fn format_background_task_output_search(
         .title
         .as_deref()
         .filter(|title| !title.trim().is_empty())
-        .map(|title| format!(" · title {}", title.trim()))
+        .map(|title| {
+            let title =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(title).0;
+            format!(" · title {}", title.trim())
+        })
         .unwrap_or_default();
     let output_ref = if snapshot.output_ref.trim().is_empty() {
         String::new()
     } else {
-        format!(" · output_ref {}", snapshot.output_ref)
+        let output_ref = astra_text_utils::credential_redaction::redact_credentials_for_display(
+            &snapshot.output_ref,
+        )
+        .0;
+        format!(" · output_ref {output_ref}")
     };
     let truncation = if snapshot.truncated {
         " · result_truncated true"
     } else {
         ""
     };
+    let incomplete = if snapshot.output_complete == Some(false) {
+        " · output_complete false (search covers captured output only)"
+    } else {
+        ""
+    };
     let header = format!(
-        "Search {kind} output {task_id}\npattern {pattern:?} · {} matching {} · context_lines {context_lines} · terminal {} · {status_label}{truncation}{title}{output_ref}",
+        "Search {kind} output {task_id}\npattern {pattern:?} · {} matching {} · context_lines {context_lines} · terminal {} · {status_label}{truncation}{incomplete}{title}{output_ref}",
         snapshot.matching_lines,
         if snapshot.matching_lines == 1 {
             "line"
@@ -1205,10 +1238,18 @@ fn format_background_task_output_wait_timeout(
     timeout_ms: u64,
     snapshot: &BgTaskOutputSnapshot,
 ) -> String {
-    format!(
-        "{}\nWait timed out after {timeout_ms}ms; the task is still non-terminal. Do not poll again in this turn; completion will be delivered automatically.",
-        format_background_task_output(task_id, offset, snapshot, BgTaskOutputReadMode::Current)
-    )
+    let mut result: Value = serde_json::from_str(&format_background_task_output(
+        task_id,
+        offset,
+        snapshot,
+        BgTaskOutputReadMode::Current,
+    ))
+    .expect("task output is a JSON object");
+    result["wait_result"] = json!("timeout");
+    result["notice"] = json!(format!(
+        "Wait timed out after {timeout_ms}ms. The task was not stopped and remains available for observation, input when supported, or cancellation."
+    ));
+    result.to_string()
 }
 
 fn background_task_output_result_fields(
@@ -1225,16 +1266,20 @@ fn background_task_output_result_fields(
             BgTaskOutputReadMode::Historical => "historical",
         }
     };
-    serde_json::Map::from_iter([(
-        "background_task_observation".to_string(),
-        serde_json::json!({
-            "task_id": task_id,
-            "task_kind": snapshot.kind,
-            "status": snapshot.status.as_str(),
-            "terminal": snapshot.status.is_terminal(),
-            "mode": observation_mode,
-        }),
-    )])
+    let mut observation = serde_json::json!({
+        "task_id": task_id,
+        "task_kind": snapshot.kind,
+        "status": snapshot.status.as_str(),
+        "terminal": snapshot.status.is_terminal(),
+        "mode": observation_mode,
+    });
+    if let Some(revision) = snapshot.output_revision {
+        observation["output_revision"] = json!(revision);
+    }
+    if let Some(complete) = snapshot.output_complete {
+        observation["output_complete"] = json!(complete);
+    }
+    serde_json::Map::from_iter([("background_task_observation".to_string(), observation)])
 }
 
 fn background_task_output_search_result_fields(
@@ -1253,67 +1298,9 @@ fn background_task_output_search_result_fields(
             "pattern": pattern,
             "matching_lines": snapshot.matching_lines,
             "truncated": snapshot.truncated,
+            "output_complete": snapshot.output_complete,
         }),
     )])
-}
-
-fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
-    serde_json::json!({
-        "ok": false,
-        "kind": "background_task",
-        "task_id": task_id,
-        "status": "registry_timeout",
-        "error": format!(
-            "Background task registry did not respond within {}ms. The task may still be running.",
-            duration_ms_u64(timeout)
-        ),
-    })
-    .to_string()
-}
-
-fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration) -> String {
-    serde_json::json!({
-        "ok": false,
-        "kind": "background_task",
-        "task_id": task_id,
-        "status": "stop_status_unknown",
-        "error": format!(
-            "Background task registry did not respond within {}ms. The task may still be running; query task_list before issuing another stop request.",
-            duration_ms_u64(timeout)
-        ),
-    })
-    .to_string()
-}
-
-fn format_background_task_list_registry_timeout(timeout: Duration) -> String {
-    serde_json::json!({
-        "ok": false,
-        "kind": "background_task_list",
-        "status": "registry_timeout",
-        "error": format!(
-            "Timed out after {}ms waiting for the interactive session to answer. Background tasks may still be running; retry task_list later.",
-            duration_ms_u64(timeout)
-        ),
-    })
-    .to_string()
-}
-
-fn format_background_task_unavailable(cloud_session: bool, task_id: Option<&str>) -> String {
-    let error = if cloud_session {
-        "no edge runner is attached to this cloud session"
-    } else {
-        "local background tasks require an interactive CLI session"
-    };
-    let mut response = serde_json::json!({
-        "ok": false,
-        "kind": if task_id.is_some() { "background_task" } else { "background_task_list" },
-        "status": "unavailable",
-        "error": error,
-    });
-    if let Some(task_id) = task_id {
-        response["task_id"] = serde_json::Value::String(task_id.to_string());
-    }
-    response.to_string()
 }
 
 fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> {
@@ -1339,6 +1326,9 @@ pub(crate) struct PermissionSandboxBasis {
 }
 
 pub struct ToolExecutor {
+    pub(crate) background_tasks: background_tasks::BackgroundTaskRegistry,
+    // A task may outlive a turn only when a session owner holds this registry.
+    background_tasks_shared: bool,
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
     /// so the server can add user_id for proper multi-user isolation.
@@ -1352,13 +1342,14 @@ pub struct ToolExecutor {
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
     pub(crate) permission_sandbox_basis: std::sync::Mutex<Option<PermissionSandboxBasis>>,
+    /// Request policy published by the canonical permission owner, not selected
+    /// by model plan-authoring arguments.
+    permission_mode: std::sync::RwLock<crate::cli::permission_manager::PermissionMode>,
 
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
     /// variable-size output to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
-    /// Per-command diagnostic deltas rendered by CLI Bash build/test calls.
-    build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Shared-state circuit breaker for process-lived Memoria availability.
     memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker,
     /// Whether the user has been notified about Memoria being down.
@@ -1415,27 +1406,11 @@ pub struct ToolExecutor {
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
     /// the worktree path instead of the original `project_root`.
-    worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
-    /// Command queue for background task operations. Drained by the
-    /// TUI event loop each tick. Allows the tool executor (which runs
-    /// inside the agentic loop) to spawn/kill background tasks without
-    /// owning the registry directly.
-    ///
-    /// `None` when no TUI/REPL is attached — in that case background
-    /// task actions fail fast with a clear error rather than pushing
-    /// to a queue nobody drains (which would hang the LLM turn forever).
-    pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
-    /// Shared background task list cache.
-    /// When the TUI event loop is active, it writes rendered
-    /// task-list XML here every tick so [`Self::task_list_bg`] can
-    /// bypass the BG command queue.
-    pub(crate) bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
-    /// Detach slot for the bash tool. Renewed before each tool call
-    /// by the TUI event loop so a fresh one-shot reply channel is
-    /// available for every bash invocation. `None` outside the TUI
-    /// (server mode, headless tests) — bash there remains a normal
-    /// foreground command.
-    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
+    worktree_session: std::sync::Arc<std::sync::Mutex<Option<WorktreeSession>>>,
+    worktree_transition: std::sync::Arc<tokio::sync::RwLock<()>>,
+    /// Presentation control for this caller's current waits. Releasing it
+    /// neither transfers task ownership nor sends process input.
+    pub(crate) foreground_wait_control: astra_tools::detach::ForegroundWaitControl,
     /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
     pub spawn_context: Option<agent_spawning::AgentActionContext>,
     /// CLI has no trusted natural-language binder for inherited descendant
@@ -1505,6 +1480,8 @@ pub struct ToolExecutor {
     /// before each turn so the `ask_user` tool can reach the
     /// bottom-pane overlay.
     ask_user_request_tx: std::sync::Mutex<Option<crate::cli::chat_stream::AskUserRequestTx>>,
+    /// Avoid presenting the same recovery prompt for parallel tool calls.
+    workspace_recovery_prompt: tokio::sync::Mutex<Option<PathBuf>>,
     /// Per-turn plan-review channel — installed by the host before
     /// each turn so `exit_plan_mode` can surface the dedicated
     /// plan-review overlay (scrollable plan body + 4-way radio).
@@ -1527,6 +1504,28 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    pub(crate) fn acknowledge_delivered_task_result(
+        &self,
+        tool: &str,
+        fields: Option<&serde_json::Map<String, Value>>,
+    ) {
+        for id in unknown_shell_tasks(tool, fields) {
+            self.background_tasks.acknowledge_terminal(id);
+        }
+    }
+
+    pub(crate) fn shell_task_controls_available(&self) -> bool {
+        self.background_tasks_shared && !self.read_only_execution
+    }
+
+    pub(crate) fn bound_local_tool_schemas(&self) -> Vec<Value> {
+        let mut schemas = local_tool_schemas();
+        if !self.shell_task_controls_available() {
+            astra_tools::schemas::hide_shell_task_controls(&mut schemas);
+        }
+        schemas
+    }
+
     pub(crate) fn set_read_only_execution(&mut self) {
         self.read_only_execution = true;
     }
@@ -1535,6 +1534,7 @@ impl ToolExecutor {
         &self,
         mode: crate::cli::permission_manager::PermissionMode,
     ) {
+        *astra_core::sync_poison::recover_rwlock_write(&self.permission_mode) = mode;
         let basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
         let Some(basis) = basis.as_ref() else {
             return;
@@ -1547,10 +1547,38 @@ impl ToolExecutor {
         *astra_core::sync_poison::recover_rwlock_write(&self.sandbox_policy) = next;
     }
 
+    /// Retain explicitly added directories when bypass mode removes the
+    /// active sandbox overlay for a turn.
+    fn additional_workspace_paths(&self) -> Vec<PathBuf> {
+        let basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
+        let policy = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy);
+        policy
+            .as_ref()
+            .or_else(|| basis.as_ref().and_then(|basis| basis.baseline.as_ref()))
+            .map(|policy| policy.non_default_allowed_paths().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
+        let worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            worktree::GitWorktreeRollbackJournal::default(),
+        ));
+        let (worktree_session, worktree_transition) = {
+            let owner = worktree_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (owner.active_session.clone(), owner.transition.clone())
+        };
         let executor = Self {
+            background_tasks: background_tasks::BackgroundTaskRegistry::new(
+                std::env::temp_dir()
+                    .join("astra")
+                    .join("bg_tasks")
+                    .join(uuid::Uuid::new_v4().to_string()),
+            ),
+            background_tasks_shared: false,
             project_root: root.clone(),
             cloud_base: None,
             cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -1564,9 +1592,11 @@ impl ToolExecutor {
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             permission_sandbox_basis: std::sync::Mutex::new(None),
+            permission_mode: std::sync::RwLock::new(
+                crate::cli::permission_manager::PermissionMode::Prompt,
+            ),
 
             budget_pressure: std::sync::Mutex::new(0.0),
-            build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker::default(),
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             memory_attribution_id: None,
@@ -1584,17 +1614,14 @@ impl ToolExecutor {
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                worktree::GitWorktreeRollbackJournal::default(),
-            )),
+            git_worktree_journal: worktree_journal,
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 session_state::SessionStateRollbackJournal::default(),
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
-            worktree_session: std::sync::Mutex::new(None),
-            bg_task_commands: None,
-            bg_task_list_cache: None,
-            bash_detach_slot: None,
+            worktree_session,
+            worktree_transition,
+            foreground_wait_control: astra_tools::detach::ForegroundWaitControl::default(),
             spawn_context: None,
             delegation_requires_admission: false,
             read_only_execution: false,
@@ -1620,6 +1647,7 @@ impl ToolExecutor {
             .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
+            workspace_recovery_prompt: tokio::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
             pending_round_tool_boost: std::sync::Mutex::new(None),
@@ -1661,6 +1689,248 @@ impl ToolExecutor {
             e.into_inner()
         });
         *guard = tx;
+    }
+
+    async fn confirm_workspace_recovery_in_tui(
+        &self,
+        root: &std::path::Path,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> bool {
+        use crate::cli::chat_stream::{AskUserRequest, AskUserResponse};
+
+        let Some(tx) = self
+            .ask_user_request_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let root_key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let (mut prompt_guard, waited) = match self.workspace_recovery_prompt.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(_) => {
+                let guard = if let Some(cancel) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return false,
+                        guard = self.workspace_recovery_prompt.lock() => guard,
+                    }
+                } else {
+                    self.workspace_recovery_prompt.lock().await
+                };
+                (guard, true)
+            }
+        };
+        let recovery = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                result = astra_tools::workspace_observation::begin_workspace_recovery(root) => result,
+            }
+        } else {
+            astra_tools::workspace_observation::begin_workspace_recovery(root).await
+        };
+        let Ok(recovery) = recovery else {
+            return false;
+        };
+        if !recovery.ownership_is_unsettled() {
+            return true;
+        }
+        if waited && prompt_guard.as_ref() == Some(&root_key) {
+            return false;
+        }
+        *prompt_guard = None;
+        let prompt = astra_tools::AskUserPrompt {
+            context: Some(format!("Workspace: {}", root.display())),
+            questions: vec![astra_tools::AskUserQuestion {
+                id: Some("workspace_recovery".into()),
+                header: "Earlier work".into(),
+                question: "Earlier work may still be changing files. Has it stopped?".into(),
+                options: ["Not sure", "It has stopped"]
+                    .into_iter()
+                    .map(|label| astra_tools::AskUserChoice {
+                        label: label.into(),
+                        description: None,
+                        preview: None,
+                    })
+                    .collect(),
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: None,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if crate::cli::chat_stream::enqueue_interactive_request(
+            &tx,
+            AskUserRequest {
+                prompt,
+                response_tx,
+            },
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let response = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                response = response_rx => response,
+            }
+        } else {
+            response_rx.await
+        };
+        let Ok(AskUserResponse::Submitted(answers)) = response else {
+            return false;
+        };
+        if !answers.answers.iter().any(|answer| {
+            answer.id.as_deref() == Some("workspace_recovery")
+                && answer.answers.as_slice() == ["It has stopped"]
+        }) {
+            *prompt_guard = Some(root_key);
+            return false;
+        }
+        recovery.confirm().await.is_ok()
+    }
+
+    async fn confirm_current_workspace_in_tui(
+        &self,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> bool {
+        use crate::cli::chat_stream::{AskUserRequest, AskUserResponse};
+        let Some(tx) = self
+            .ask_user_request_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let Ok(workspace) =
+            astra_tools::workspace_observation::begin_workspace_recovery(&self.project_root).await
+        else {
+            return false;
+        };
+        let prompt = astra_tools::AskUserPrompt {
+            context: Some(format!("Current directory: {}", self.project_root.display())),
+            questions: vec![astra_tools::AskUserQuestion {
+                id: Some("workspace_selection".into()),
+                header: "Workspace".into(),
+                question: "The saved workspace could not be recovered. Use this directory for the session?".into(),
+                options: ["Not now", "Use this directory"].into_iter().map(|label| astra_tools::AskUserChoice {
+                    label: label.into(), description: None, preview: None,
+                }).collect(),
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: None,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if crate::cli::chat_stream::enqueue_interactive_request(
+            &tx,
+            AskUserRequest {
+                prompt,
+                response_tx,
+            },
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let response = if let Some(cancel) = cancel {
+            tokio::select! { biased; _ = cancel.cancelled() => return false, response = response_rx => response }
+        } else {
+            response_rx.await
+        };
+        workspace.binding_is_unchanged()
+            && matches!(response, Ok(AskUserResponse::Submitted(answers)) if answers.answers.iter().any(|answer| {
+                answer.id.as_deref() == Some("workspace_selection") && answer.answers.as_slice() == ["Use this directory"]
+            }))
+    }
+
+    pub(super) async fn acquire_local_workspace_lease(
+        &self,
+        root: &std::path::Path,
+        additional_roots: &[PathBuf],
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        max_wait: std::time::Duration,
+        admission_deadline: Option<std::time::Instant>,
+    ) -> Result<
+        astra_tools::workspace_observation::WorkspaceObservationLease,
+        astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    > {
+        use astra_tools::workspace_observation::{
+            WorkspaceLeaseFailure, acquire_workspace_mutation_lease_with_paths,
+        };
+
+        let mut remaining = max_wait;
+        let mut confirmed = std::collections::HashSet::new();
+        loop {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(WorkspaceLeaseFailure::Cancelled);
+            }
+            let attempt_wait = admission_deadline
+                .map(|deadline| {
+                    remaining.min(deadline.saturating_duration_since(std::time::Instant::now()))
+                })
+                .unwrap_or(remaining);
+            if attempt_wait.is_zero() {
+                return Err(WorkspaceLeaseFailure::Contended);
+            }
+            let started = std::time::Instant::now();
+            let result = acquire_workspace_mutation_lease_with_paths(
+                root,
+                additional_roots,
+                cancel,
+                attempt_wait,
+            )
+            .await;
+            remaining = remaining.saturating_sub(started.elapsed());
+            if !matches!(&result, Err(WorkspaceLeaseFailure::OwnershipUnsettled)) {
+                return result;
+            }
+            let blocked = self.unsettled_workspace_root(root, additional_roots);
+            let key = blocked.canonicalize().unwrap_or_else(|_| blocked.clone());
+            if !confirmed.insert(key) {
+                return result;
+            }
+            // Human confirmation does not consume a command's execution or
+            // lock-contention budget. A server admission deadline still applies.
+            let confirmation = self.confirm_workspace_recovery_in_tui(&blocked, cancel);
+            let accepted = if let Some(deadline) = admission_deadline {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), confirmation)
+                    .await
+                    .map_err(|_| WorkspaceLeaseFailure::Contended)?
+            } else {
+                confirmation.await
+            };
+            if !accepted {
+                return if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    Err(WorkspaceLeaseFailure::Cancelled)
+                } else {
+                    result
+                };
+            }
+        }
+    }
+
+    fn unsettled_workspace_root(&self, root: &Path, additional_roots: &[PathBuf]) -> PathBuf {
+        std::iter::once(root)
+            .chain(additional_roots.iter().map(PathBuf::as_path))
+            .map(|path| {
+                if path.is_file() {
+                    path.parent().unwrap_or(path)
+                } else {
+                    path
+                }
+            })
+            .find(|path| {
+                astra_tools::workspace_observation::workspace_ownership_is_unsettled(path)
+                    == Some(true)
+            })
+            .unwrap_or(root)
+            .to_path_buf()
     }
 
     /// Install the per-turn plan-review channel so `exit_plan_mode`
@@ -1980,7 +2250,7 @@ impl ToolExecutor {
     }
 
     fn runtime_available_tool_schemas(&self) -> Vec<Value> {
-        let mut schemas = local_tool_schemas();
+        let mut schemas = self.bound_local_tool_schemas();
         schemas.extend(self.provider_owned_schemas_snapshot("shared_tool_executor_surface"));
         let mut seen = HashSet::new();
         let mut schemas: Vec<Value> = self
@@ -2067,7 +2337,7 @@ impl ToolExecutor {
         }
 
         astra_runtime_env::RunBinding::local_developer(
-            self.project_root.display().to_string(),
+            self.effective_project_root().display().to_string(),
             registry,
         )
     }
@@ -2169,7 +2439,10 @@ impl ToolExecutor {
         match capability {
             Capability::AgentSpawner => self.spawn_context.is_some(),
 
-            Capability::LocalBackgroundTasks => self.bg_task_commands.is_some(),
+            Capability::LocalBackgroundTasks => {
+                !self.read_only_execution
+                    && (self.background_tasks_shared || self.spawn_context.is_some())
+            }
             // Fail-closed: unknown executor-gated capabilities are denied.
             // If a new executor-gated variant is added here, it MUST get an
             // explicit match arm — the wildcard is a safety net, not a policy.
@@ -2428,6 +2701,12 @@ impl ToolExecutor {
             }
         }
         if session_changed {
+            if previous_session_id.is_some() {
+                *self
+                    .worktree_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
             if let Ok(mut pending_mode) = self.pending_permission_mode_change.lock() {
                 *pending_mode = None;
             }
@@ -2450,6 +2729,7 @@ impl ToolExecutor {
         if let Ok(mut guard) = self.active_session_id.lock() {
             *guard = Some(session_id);
         }
+        self.restore_selected_worktree();
     }
 
     pub(crate) fn active_session_id(&self) -> Option<String> {
@@ -2597,7 +2877,15 @@ impl ToolExecutor {
         mut self,
         journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
     ) -> Self {
+        {
+            let owner = journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.worktree_session = owner.active_session.clone();
+            self.worktree_transition = owner.transition.clone();
+        }
         self.git_worktree_journal = journal;
+        self.restore_selected_worktree();
         self
     }
 
@@ -2610,28 +2898,19 @@ impl ToolExecutor {
         self
     }
 
-    pub(crate) fn with_bg_task_commands(
+    pub(crate) fn with_background_tasks(
         mut self,
-        commands: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+        tasks: background_tasks::BackgroundTaskRegistry,
     ) -> Self {
-        self.bg_task_commands = Some(commands);
+        self.background_tasks = tasks;
+        self.background_tasks_shared = true;
         self
     }
 
-    pub(crate) fn with_bg_task_list_cache(
+    pub fn with_foreground_wait_control(
         mut self,
-        cache: std::sync::Arc<tokio::sync::RwLock<String>>,
+        slot: astra_tools::detach::ForegroundWaitControl,
     ) -> Self {
-        self.bg_task_list_cache = Some(cache);
-        self
-    }
-
-    /// Install the host-owned detach slot so the bash tool can
-    /// observe Ctrl+B and transfer its child to the background
-    /// registry. The slot is shared (`Arc`) — both the executor and
-    /// the TUI hold the same instance so the TUI can refill it
-    /// between tool calls without rebuilding the executor.
-    pub fn with_bash_detach_slot(mut self, slot: astra_tools::detach::DetachShellSlot) -> Self {
         // Keep the slot on the top-level responsive Bash lane only.  The
         // DefaultToolExecutor is also used as the nested `run_script` RPC
         // delegate; giving it the host's live-child handle would allow a
@@ -2639,7 +2918,7 @@ impl ToolExecutor {
         // window.  The shared shell runner still has its own shape gate as a
         // defense in depth, but nested calls must not receive the transport
         // capability in the first place.
-        self.bash_detach_slot = Some(slot);
+        self.foreground_wait_control = slot;
         self
     }
 
@@ -2697,21 +2976,11 @@ impl ToolExecutor {
             .filter(|goal| !goal.is_empty())
             .unwrap_or("(pending)");
 
-        self.stage_pending_plan_mode();
         self.set_plan_mode_authoring_cache_for_active_session(true)
             .await;
         format!(
             "Entered plan mode. goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
         )
-    }
-
-    /// Stage `PermissionMode::Plan` on the pending slot so the host
-    /// applies it on the next turn boundary. Idempotent — repeated
-    /// calls within the same turn collapse to a single switch.
-    fn stage_pending_plan_mode(&self) {
-        if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
-            *slot = Some(crate::cli::permission_manager::PermissionMode::Plan);
-        }
     }
 
     fn stage_pending_permission_mode_change(
@@ -2751,14 +3020,37 @@ impl ToolExecutor {
             .map(str::trim)
             .filter(|plan| !plan.is_empty())
             .map(str::to_string);
-        self.exit_plan_mode_local_path(plan_markdown.as_deref())
-            .await
+        self.exit_plan_mode_local_path(
+            plan_markdown.as_deref(),
+            args.get("review").and_then(Value::as_bool).unwrap_or(false),
+        )
+        .await
     }
 
-    /// `exit_plan_mode` here is a permission-state pivot driven by
-    /// the plan-review overlay. When the user approves, writes unlock
-    /// and the host advances to the chosen execution mode.
-    async fn exit_plan_mode_local_path(&self, plan_markdown: Option<&str>) -> String {
+    /// Finish local plan authoring under the current policy. When review is
+    /// required, only the trusted overlay can approve it or select a mode.
+    async fn exit_plan_mode_local_path(
+        &self,
+        plan_markdown: Option<&str>,
+        explicit_review: bool,
+    ) -> String {
+        let mode = *astra_core::sync_poison::recover_rwlock_read(&self.permission_mode);
+        if mode.auto_resolves_approval_prompts() && !explicit_review {
+            self.set_plan_mode_authoring_cache_for_active_session(false)
+                .await;
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
+            return format!(
+                "Plan finalized; continuing under your existing permissions.{}",
+                plan_markdown
+                    .map(|plan| format!("\n{plan}"))
+                    .unwrap_or_default()
+            );
+        }
         let (approved, follow_up_mode) =
             match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
                 Ok(decision) => decision,
@@ -2766,8 +3058,6 @@ impl ToolExecutor {
             };
 
         if approved {
-            let next_mode =
-                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
             // Local guard cache is informational only here — there
             // is no cloud guard to mirror. Setting it to `Some(false)`
             // keeps the cached flag consistent with "writes are
@@ -2775,7 +3065,7 @@ impl ToolExecutor {
             // outcome the cloud path would have set.
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
-            self.stage_pending_permission_mode_change(next_mode);
+            let next_mode = self.stage_plan_review_mode(follow_up_mode);
             self.stage_pending_round_tool_boost(&[
                 "bash",
                 "read_file",
@@ -2786,7 +3076,9 @@ impl ToolExecutor {
                 .filter(|plan| !plan.is_empty())
                 .map(|plan| format!(" Plan recorded:\n{plan}"))
                 .unwrap_or_default();
-            let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
+            let mode_suffix = next_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_else(|| " Existing execution permissions remain unchanged.".into());
             format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
         } else {
             // Keep planning: the local perm_manager mode is unchanged
@@ -2796,6 +3088,21 @@ impl ToolExecutor {
                 .await;
             "Plan left open for another authoring pass. Address the user's feedback and call exit_plan_mode again when ready.".to_string()
         }
+    }
+
+    fn stage_plan_review_mode(
+        &self,
+        selected: Option<crate::cli::permission_manager::PermissionMode>,
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
+        use crate::cli::permission_manager::PermissionMode;
+        let current = *astra_core::sync_poison::recover_rwlock_read(&self.permission_mode);
+        // An explicit Plan mode is non-executing. Otherwise keeping the
+        // current permissions must not enqueue a stale mode change.
+        let next = selected.or((current == PermissionMode::Plan).then_some(PermissionMode::Prompt));
+        if let Some(mode) = next {
+            self.stage_pending_permission_mode_change(mode);
+        }
+        next
     }
 
     /// Surface the Approve / Keep-planning overlay through the
@@ -2840,7 +3147,7 @@ impl ToolExecutor {
         }
 
         match response_rx.await.unwrap_or(PlanReviewDecision::Cancelled) {
-            PlanReviewDecision::Approve { mode } => Ok((true, Some(mode))),
+            PlanReviewDecision::Approve { mode } => Ok((true, mode)),
             PlanReviewDecision::KeepPlanning | PlanReviewDecision::Cancelled => Ok((false, None)),
         }
     }
@@ -2859,9 +3166,7 @@ impl ToolExecutor {
         self.set_plan_mode_authoring_cache_for_active_session(!approved)
             .await;
         if approved {
-            let next_mode =
-                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
-            self.stage_pending_permission_mode_change(next_mode);
+            self.stage_plan_review_mode(follow_up_mode);
             self.stage_pending_round_tool_boost(&[
                 "bash",
                 "read_file",
@@ -2873,41 +3178,20 @@ impl ToolExecutor {
     }
 
     async fn task_list_bg(&self) -> String {
-        // Fast path: read the latest snapshot directly from the shared
-        // cache. The TUI event loop refreshes this every tick, so we
-        // completely bypass the BG command queue and event-loop tick
-        // latency.
-        if let Some(ref cache) = self.bg_task_list_cache {
-            let cached = cache.read().await;
-            if !cached.is_empty() {
-                return self
-                    .attach_recoverable_fanouts_to_task_list(cached.clone())
-                    .await;
-            }
-            // Cache not yet populated (first call before the event
-            // loop has rendered). Fall through to the queue path so
-            // we still return a valid response.
-        }
-        // Fallback: queue path for when no cache is available
-        let Some(ref bg_commands) = self.bg_task_commands else {
-            if let Some(addendum) = self.recoverable_fanout_task_list_addendum().await {
-                return Self::empty_background_task_list_with_fanouts(&addendum);
-            }
-            return format_background_task_unavailable(self.cloud_base.is_some(), None);
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut cmds = bg_commands.lock_recover();
-            cmds.push(BgTaskCommand::List { reply: tx });
-        }
-        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
-        match await_bg_task_command_reply(rx, reply_timeout).await {
-            Ok(output) => self.attach_recoverable_fanouts_to_task_list(output).await,
-            Err(BgTaskReplyError::Closed) => format_background_task_registry_closed(None),
-            Err(BgTaskReplyError::TimedOut) => {
-                format_background_task_list_registry_timeout(reply_timeout)
+        let mut tasks = self.background_tasks.clone();
+        let mut rows = crate::tui::bg_task_rendering::background_task_rows(&mut tasks);
+        if let Some(ctx) = &self.spawn_context {
+            for state in ctx.spawner.child_status_snapshot(&ctx.agent_id).await {
+                let info = astra_turn_core::orchestration_types::SpawnedAgentInfo::from(&state);
+                if let Some(row) =
+                    crate::tui::bg_task_rendering::background_task_row_for_local_agent(&info)
+                {
+                    rows.push(row);
+                }
             }
         }
+        let output = crate::tui::bg_task_rendering::render_background_task_rows_xml(&rows);
+        self.attach_recoverable_fanouts_to_task_list(output).await
     }
 
     async fn attach_recoverable_fanouts_to_task_list(&self, output: String) -> String {
@@ -2996,24 +3280,20 @@ impl ToolExecutor {
     }
 
     fn xml_attr(value: &str) -> String {
-        value
-            .replace('&', "&amp;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
+        background_tasks::xml_escape(value)
     }
 
     #[cfg(test)]
     async fn task_output(&self, args: &Value) -> String {
         let mut fields = None;
-        self.task_output_with_fields(args, &mut fields).await
+        self.task_output_with_fields(args, &mut fields, None).await
     }
 
     async fn task_output_with_fields(
         &self,
         args: &Value,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
+        observation_deadline: Option<tokio::time::Instant>,
     ) -> String {
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
@@ -3021,7 +3301,30 @@ impl ToolExecutor {
             Ok(None) => return format_background_task_argument_error("task_id is required"),
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
+        let wake_on_output = args
+            .get("wake_on_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if wake_on_output && !block {
+            return format_background_task_argument_error("wake_on_output requires block=true");
+        }
         let requested_offset = args.get("offset").and_then(Value::as_u64);
+        let after_output_revision = match args.get("after_output_revision") {
+            Some(value) => match value.as_u64() {
+                Some(revision) => Some(revision),
+                None => {
+                    return format_background_task_argument_error(
+                        "after_output_revision must be a non-negative integer",
+                    );
+                }
+            },
+            None => None,
+        };
+        if after_output_revision.is_some() && (!wake_on_output || requested_offset.is_some()) {
+            return format_background_task_argument_error(
+                "after_output_revision requires block=true, wake_on_output=true and no offset",
+            );
+        }
         let pattern = match args.get("pattern") {
             None => None,
             Some(Value::String(pattern)) => {
@@ -3081,15 +3384,39 @@ impl ToolExecutor {
                 )
                 .await
             {
+                if wake_on_output {
+                    *tool_result_fields = None;
+                    return format_background_task_argument_error(
+                        "wake_on_output is available only for shell tasks",
+                    );
+                }
                 return output;
             }
         }
 
-        let Some(ref bg_commands) = self.bg_task_commands else {
-            return format_background_task_unavailable(self.cloud_base.is_some(), Some(&task_id));
-        };
+        if wake_on_output && self.background_tasks.get(&task_id).is_none() {
+            return match request_background_task_output_snapshot(self, &task_id, 0, 1, false).await
+            {
+                Ok(_) => format_background_task_argument_error(
+                    "wake_on_output is available only for shell tasks",
+                ),
+                Err(error) => error,
+            };
+        }
 
-        let reply_timeout = background_task_reply_timeout(timeout_ms);
+        let bg_commands = self;
+
+        if requested_offset.is_some()
+            && self
+                .background_tasks
+                .get(&task_id)
+                .is_some_and(|task| !task.status().is_terminal())
+        {
+            return format_background_task_argument_error(
+                "Live shell output is a current snapshot; use offset after the task ends.",
+            );
+        }
+
         if let Some(pattern) = pattern.as_deref() {
             return match request_background_task_output_search(
                 bg_commands,
@@ -3097,7 +3424,6 @@ impl ToolExecutor {
                 pattern,
                 context_lines,
                 max_bytes,
-                reply_timeout,
             )
             .await
             {
@@ -3121,7 +3447,6 @@ impl ToolExecutor {
                 &task_id,
                 requested_offset,
                 max_bytes,
-                reply_timeout,
             )
             .await
             {
@@ -3135,93 +3460,141 @@ impl ToolExecutor {
             };
         }
 
-        // Blocking is owned by the runtime, not by repeated model calls. Take
-        // one baseline, then wait for terminal state (or the bounded timeout),
-        // ignoring ordinary output growth while the TUI continues to project it.
-        let probe_offset = requested_offset.unwrap_or(0);
-        let mut latest = match request_background_task_output_snapshot(
-            bg_commands,
-            &task_id,
-            probe_offset,
-            max_bytes,
-            reply_timeout,
-        )
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return error,
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            if latest.status.requires_attention_or_terminal_wake() {
-                return match background_task_output_view(
-                    bg_commands,
-                    &task_id,
-                    requested_offset,
-                    max_bytes,
-                    reply_timeout,
-                )
-                .await
-                {
-                    Ok((offset, snapshot)) => {
-                        *tool_result_fields = Some(background_task_output_result_fields(
-                            &task_id, &snapshot, read_mode, true,
-                        ));
-                        format_background_task_output(&task_id, offset, &snapshot, read_mode)
-                    }
-                    Err(error) => error,
-                };
+        let timeout = Duration::from_millis(timeout_ms);
+        let deadline =
+            observation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + timeout);
+        let mut interrupted = self.foreground_wait_control.begin_wait();
+        let mut initial_snapshot = None;
+        let reason = if let Ok(mut task) = self.background_tasks.subscription(&task_id) {
+            let mut activity = wake_on_output
+                .then(|| self.background_tasks.output_activity(&task_id))
+                .flatten();
+            if let Some(activity) = activity.as_mut() {
+                activity.borrow_and_update();
             }
-
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return match background_task_output_view(
-                    bg_commands,
-                    &task_id,
-                    requested_offset,
-                    max_bytes,
-                    reply_timeout,
-                )
-                .await
-                {
-                    Ok((offset, snapshot)) => {
-                        *tool_result_fields = Some(background_task_output_result_fields(
-                            &task_id, &snapshot, read_mode, true,
-                        ));
-                        if snapshot.status.requires_attention_or_terminal_wake() {
-                            format_background_task_output(&task_id, offset, &snapshot, read_mode)
-                        } else {
-                            format_background_task_output_wait_timeout(
-                                &task_id, offset, timeout_ms, &snapshot,
-                            )
-                        }
+            // Subscribe before observing: a write racing with this snapshot
+            // remains visible to `changed`, without polling or a new task state.
+            if wake_on_output {
+                let initial =
+                    match background_task_output_view(self, &task_id, requested_offset, max_bytes)
+                        .await
+                    {
+                        Ok(initial) => initial,
+                        Err(error) => return error,
+                    };
+                let newer_output = match (after_output_revision, initial.1.output_revision) {
+                    (_, _) if initial.1.status.is_terminal() => true,
+                    (Some(previous), Some(current)) if previous > current => {
+                        return format_background_task_argument_error(
+                            "after_output_revision is newer than this task's output",
+                        );
                     }
-                    Err(error) => error,
+                    (Some(previous), Some(current)) => current > previous,
+                    (Some(_), None) => {
+                        return format_background_task_error(&BackgroundTaskError::StaleHandle {
+                            task_id,
+                        });
+                    }
+                    (None, _) => !initial.1.output.is_empty(),
                 };
-            }
-
-            let sleep_for = Duration::from_millis(BG_TASK_WAIT_POLL_INTERVAL_MS).min(remaining);
-            tokio::time::sleep(sleep_for).await;
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining <= Duration::from_millis(BG_TASK_WAIT_POLL_INTERVAL_MS) {
-                if !remaining.is_zero() {
-                    tokio::time::sleep(remaining).await;
+                if newer_output {
+                    let reason = if initial.1.status.is_terminal() {
+                        "terminal"
+                    } else {
+                        "output"
+                    };
+                    *tool_result_fields = Some(background_task_output_result_fields(
+                        &task_id, &initial.1, read_mode, true,
+                    ));
+                    tool_result_fields
+                        .as_mut()
+                        .expect("output fields")
+                        .insert("wait_result".into(), json!(reason));
+                    return format_background_task_output(
+                        &task_id, initial.0, &initial.1, read_mode,
+                    );
                 }
-                continue;
+                initial_snapshot = Some(initial);
             }
-            let next_probe_offset = latest.total_bytes;
-            latest = match request_background_task_output_snapshot(
-                bg_commands,
-                &task_id,
-                next_probe_offset,
-                max_bytes,
-                reply_timeout.min(remaining),
-            )
-            .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => return error,
-            };
+            tokio::select! {
+                biased;
+                result = task.wait() => {
+                    if let Err(error) = result { return format_background_task_error(&error); }
+                    "terminal"
+                },
+                _ = async {
+                    if let Some(activity) = activity.as_mut() {
+                        if activity.changed().await.is_ok() { return; }
+                    }
+                    std::future::pending::<()>().await
+                } => "output",
+                _ = interrupted.released() => "released",
+                _ = tokio::time::sleep_until(deadline) => "timeout",
+            }
+        } else if let Some(handle) = self.background_tasks.get(&task_id) {
+            if handle.status().is_terminal() {
+                "terminal"
+            } else {
+                return format_background_task_error(&BackgroundTaskError::StaleHandle { task_id });
+            }
+        } else if let Some(ctx) = &self.spawn_context
+            && ctx
+                .spawner
+                .child_status_snapshot(&ctx.agent_id)
+                .await
+                .iter()
+                .any(|state| state.agent_id == task_id)
+        {
+            tokio::select! {
+                outcome = ctx.spawner.wait_for_agent_outcome(
+                    &task_id,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ) => match outcome {
+                    astra_runtime::orchestration::WaitForAgentOutcome::Status(_) => "terminal",
+                    astra_runtime::orchestration::WaitForAgentOutcome::TimedOut => "timeout",
+                    astra_runtime::orchestration::WaitForAgentOutcome::Unknown => {
+                        return format_background_task_error(&BackgroundTaskError::not_found(&task_id));
+                    }
+                },
+                _ = interrupted.released() => "released",
+                _ = tokio::time::sleep_until(deadline) => "timeout",
+            }
+        } else {
+            return format_background_task_error(&BackgroundTaskError::not_found(&task_id));
+        };
+        let observed = if reason == "timeout" {
+            if let Some(initial) = initial_snapshot {
+                Ok(initial)
+            } else {
+                tool_result_fields
+                    .get_or_insert_default()
+                    .insert("wait_result".into(), json!("timeout"));
+                return format!(
+                    "Wait timed out after {timeout_ms}ms. The task was not stopped; use task_output without block to inspect its current state."
+                );
+            }
+        } else {
+            background_task_output_view(self, &task_id, requested_offset, max_bytes).await
+        };
+        match observed {
+            Ok((offset, snapshot)) => {
+                *tool_result_fields = Some(background_task_output_result_fields(
+                    &task_id, &snapshot, read_mode, true,
+                ));
+                let terminal = snapshot.status.requires_attention_or_terminal_wake();
+                tool_result_fields.as_mut().expect("output fields").insert(
+                    "wait_result".into(),
+                    json!(if terminal { "terminal" } else { reason }),
+                );
+                if terminal || reason != "timeout" {
+                    format_background_task_output(&task_id, offset, &snapshot, read_mode)
+                } else {
+                    format_background_task_output_wait_timeout(
+                        &task_id, offset, timeout_ms, &snapshot,
+                    )
+                }
+            }
+            Err(error) => error,
         }
     }
 
@@ -3333,7 +3706,7 @@ impl ToolExecutor {
                 })
             })
             .collect();
-        let output = json!({
+        let mut output = json!({
             "type": "agent_fanout_group",
             "group_id": &group.group_id,
             "title": &group.title,
@@ -3362,8 +3735,11 @@ impl ToolExecutor {
                 "do_not_rerun_when_user_asks_for_results": true,
             },
             "hint": "This id belongs to a recoverable agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
-        })
-        .to_string();
+        });
+        // This JSON is embedded as a string in the task_output envelope.
+        // Redact its fields before quotes are escaped by serialization.
+        astra_text_utils::credential_redaction::redact_credentials_in_json(&mut output);
+        let output = output.to_string();
         let (chunk, end, total_bytes, total_lines) =
             astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
@@ -3384,6 +3760,8 @@ impl ToolExecutor {
                 total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{}", group.group_id),
+                output_revision: None,
+                output_complete: None,
             },
         })
     }
@@ -3476,7 +3854,7 @@ impl ToolExecutor {
         } else {
             WorkUnitStatus::CompletedWithIssues
         };
-        let output = json!({
+        let mut output = json!({
             "type": "agent_fanout_group",
             "group_id": group_id,
             "title": group_id,
@@ -3490,7 +3868,9 @@ impl ToolExecutor {
                 "do_not_rerun_when_user_asks_for_results": true,
             },
             "hint": "Recovered from the durable session journal; this is a settled historical observation, not a live fanout control handle.",
-        }).to_string();
+        });
+        astra_text_utils::credential_redaction::redact_credentials_in_json(&mut output);
+        let output = output.to_string();
         let (chunk, end, total_bytes, total_lines) =
             astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
@@ -3509,6 +3889,8 @@ impl ToolExecutor {
                 total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{group_id}"),
+                output_revision: None,
+                output_complete: None,
             },
         })
     }
@@ -3519,35 +3901,32 @@ impl ToolExecutor {
             Err(error) => return format_background_task_argument_error(error),
             Ok(None) => return format_background_task_argument_error("task_id is required"),
         };
-        let Some(ref bg_commands) = self.bg_task_commands else {
-            return format_background_task_unavailable(self.cloud_base.is_some(), Some(&task_id));
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tasks = self.background_tasks.clone();
+        let result = if tasks.get(&task_id).is_some() {
+            tasks.kill(&task_id)
+        } else if let Some(ctx) = &self.spawn_context
+            && ctx
+                .spawner
+                .child_status_snapshot(&ctx.agent_id)
+                .await
+                .iter()
+                .any(|state| state.agent_id == task_id)
         {
-            let mut cmds = bg_commands.lock_recover();
-            cmds.push(BgTaskCommand::Kill {
-                task_id: task_id.clone(),
-                reply: tx,
-            });
-        }
-        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
-        match await_bg_task_command_reply(rx, reply_timeout).await {
-            Ok(Ok(())) => serde_json::json!({
-                "ok": true,
-                "kind": "background_task",
-                "task_id": task_id,
-                "status": "stop_requested",
-                "terminal": false,
-                "message": "Cancellation was accepted; terminal status will be surfaced automatically.",
-            })
-            .to_string(),
-            Ok(Err(e)) => format_background_task_stop_error(&e),
-            Err(BgTaskReplyError::Closed) => {
-                format_background_task_registry_closed(Some(&task_id))
-            }
-            Err(BgTaskReplyError::TimedOut) => {
-                format_background_task_stop_registry_timeout(&task_id, reply_timeout)
-            }
+            crate::tui::bg_task_rendering::stop_background_task_with_agents(
+                &mut tasks,
+                Some(&ctx.spawner),
+                &[],
+                &task_id,
+            )
+            .await
+            .map(|_| ())
+        } else {
+            Err(BackgroundTaskError::not_found(&task_id))
+        };
+        match result {
+            Ok(()) => serde_json::json!({ "ok": true, "kind": "background_task", "task_id": task_id, "status": "stop_requested", "terminal": false,
+                "message": "Cancellation accepted; observe the task for confirmed exit." }).to_string(),
+            Err(error) => format_background_task_stop_error(&error),
         }
     }
 
@@ -4275,30 +4654,9 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> ToolExecutionOutcome {
-        // The sync shell path bypasses `execute_run`, so it owns admission.
-        // Every other tool falls through to the invocation-aware async path,
-        // which validates and admits exactly once.
-        let is_blocking_shell = name == "bash" || (cfg!(windows) && name == "powershell");
-        if is_blocking_shell {
-            if let Some(denied) = self.tool_admission_denial(name, args) {
-                return denied.into_outcome();
-            }
-            if name == "bash" {
-                let mut outcome = self
-                    .bash_outcome_with_cancel_async(args, invocation, cancel_token)
-                    .await;
-                outcome.output = self.finalize_tool_output(outcome.output, name);
-                self.record_output_size(outcome.output.len());
-                return outcome;
-            }
-            if let Some(outcome) =
-                self.execute_blocking_shell_tool(name, args, invocation, cancel_token)
-            {
-                return outcome;
-            }
-        }
-        self.execute_with_invocation_metadata_and_cancel(name, args, invocation, cancel_token)
+        self.execute_run_with_cancel(name, args, invocation, cancel_token)
             .await
+            .into_outcome()
     }
 
     /// Synchronous core for Windows `powershell` execution. Returns
@@ -4342,69 +4700,15 @@ impl ToolExecutor {
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     ) -> ToolExecutionOutcome {
-        self.execute_with_invocation_metadata_and_cancel(name, args, invocation, None)
-            .await
-    }
-
-    /// Invocation-aware dispatch shared by the normal and cancellation-aware
-    /// entry points.  Keeping the special `mo_query` and Git metadata paths in
-    /// this helper is important: routing cancellation straight to
-    /// `execute_run_with_cancel` silently drops their structured fields.
-    async fn execute_with_invocation_metadata_and_cancel(
-        &self,
-        name: &str,
-        args: &Value,
-        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> ToolExecutionOutcome {
-        // Admission gate (fail-closed). This is a public entry point called
-        // directly by the server executor; without this gate, `mo_query`
-        // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
-        if let Some(denied) = self.tool_admission_denial(name, args) {
-            return denied.into_outcome();
-        }
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return cancelled_tool_execution_outcome(name, false);
-        }
-        if name == "bash" {
-            let mut outcome = self
-                .bash_outcome_with_cancel_async(args, invocation, cancel_token)
-                .await;
-            outcome.output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(outcome.output.len());
-            return outcome;
-        }
-        if name == "mo_query" {
-            let mut outcome = self.mo_query_with_metadata(args, cancel_token);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-
-        self.execute_run_with_cancel(name, args, invocation, cancel_token)
+        self.execute_run_with_cancel(name, args, invocation, None)
             .await
             .into_outcome()
     }
 
+    /// Test convenience; production entrypoints preserve structured outcomes.
+    #[cfg(test)]
     pub async fn execute(&self, name: &str, args: &Value) -> String {
-        self.execute_run(
-            name,
-            args,
-            astra_tools::tool_engine::ToolInvocationMetadata::default(),
-        )
-        .await
-        .output
-    }
-
-    async fn execute_run(
-        &self,
-        name: &str,
-        args: &Value,
-        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
-    ) -> EdgeToolRun {
-        self.execute_run_with_cancel(name, args, invocation, None)
-            .await
+        self.execute_with_metadata(name, args).await.output
     }
 
     async fn execute_run_with_cancel(
@@ -4419,6 +4723,7 @@ impl ToolExecutor {
             args,
             invocation,
             cancel_token,
+            None,
             None,
             None,
             None,
@@ -4458,6 +4763,7 @@ impl ToolExecutor {
             runtime_approval,
             Some(input_rx),
             Some(validate_dispatch),
+            None,
         )
         .await
         .into_outcome()
@@ -4477,6 +4783,7 @@ impl ToolExecutor {
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
         validate_dispatch: Option<&(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync)>,
+        workspace_transition: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     ) -> EdgeToolRun {
         let canonical_native = runtime_approval.filter(|approval| {
             native_protocol.is_none_or(|protocol| protocol == approval.protocol)
@@ -4547,6 +4854,178 @@ impl ToolExecutor {
                 return error;
             }
         }
+        // Check authoring policy before dispatching controls or acquiring a
+        // workspace lease. Sending child input can cause real side effects.
+        if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(format!(
+                    "Tool '{name}' is blocked while plan mode is active. Finish investigation, then call exit_plan_mode with the plan; execution follows the user's current permissions."
+                )).with_execution_not_started(),
+            );
+        }
+        if matches!(
+            name,
+            "task_output" | "task_stop" | "task_list" | "task_input"
+        ) {
+            let task_id = background_task_id_arg(args).ok().flatten();
+            if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(
+                    name, false,
+                ));
+            }
+            if name == "task_input" {
+                let mut outcome = self.background_tasks.input(args, cancel_token).await;
+                if let Some(id) = task_id.as_deref()
+                    && let Some(context) = self.background_tasks.model_context(id)
+                {
+                    outcome
+                        .tool_result_fields
+                        .get_or_insert_default()
+                        .insert("task".into(), context);
+                }
+                return EdgeToolRun::from_tool_result(control_tool_result(outcome, None));
+            }
+            // The same capture owner stays alive through the asynchronous read
+            // and result assembly, including concurrent retention pruning.
+            let _output_owner = (name == "task_output")
+                .then_some(task_id.as_deref())
+                .flatten()
+                .and_then(|id| self.background_tasks.get(id));
+            let mut fields = None;
+            let output = match name {
+                "task_output" => {
+                    let timeout = std::time::Duration::from_millis(
+                        args.get("timeout_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(30_000)
+                            .clamp(1, 300_000),
+                    );
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    tokio::select! {
+                        biased;
+                        result = self.task_output_with_fields(args, &mut fields, Some(deadline)) => result,
+                        _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let mut outcome = ToolExecutionOutcome::error_with_evidence(
+                                "Task observation timed out. The task was not stopped; check its status or retry the observation.".into(),
+                                astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::ToolTimeout),
+                            );
+                            let fields = outcome.tool_result_fields.get_or_insert_default();
+                            fields.insert("stage".into(), json!("observation"));
+                            fields.insert("side_effects_maybe".into(), json!(false));
+                            fields.insert("retryable".into(), json!(true));
+                            if let Some(id) = task_id.as_deref() {
+                                fields.insert("task_id".into(), json!(id));
+                            }
+                            return EdgeToolRun::from_tool_result(control_tool_result(outcome, None));
+                        }
+                    }
+                }
+                "task_stop" => self.task_kill_bg(args).await,
+                _ => self.task_list_bg().await,
+            };
+            let mut outcome = tool_execution_outcome_from_output(output);
+            let mut snapshot = (name == "task_output")
+                .then(|| serde_json::from_str::<Value>(&outcome.output).ok())
+                .flatten()
+                .and_then(|value| match value {
+                    Value::Object(object) => Some(object),
+                    _ => None,
+                });
+            if let Some(fields) = fields {
+                if let Some(result) = snapshot.as_mut()
+                    && let Some(wait_result) = fields.get("wait_result")
+                {
+                    result.insert("wait_result".into(), wait_result.clone());
+                }
+                outcome
+                    .tool_result_fields
+                    .get_or_insert_default()
+                    .extend(fields);
+            }
+            let read_failed = snapshot.as_ref().is_some_and(|result| {
+                matches!(
+                    result.get("status").and_then(Value::as_str),
+                    Some("output_missing" | "output_unavailable")
+                )
+            });
+            if let Some(id) = task_id.as_deref()
+                && let Some(mut context) = self.background_tasks.model_context(id)
+                && (name != "task_output" || read_failed || {
+                    let observed = snapshot
+                        .as_ref()
+                        .and_then(|result| result.get("status"))
+                        .or_else(|| {
+                            outcome
+                                .tool_result_fields
+                                .as_ref()
+                                .and_then(|fields| fields.get("background_task_observation"))
+                                .and_then(|observation| observation.get("status"))
+                        })
+                        .and_then(Value::as_str);
+                    let current = context.get("status").and_then(Value::as_str);
+                    observed.is_some()
+                        && (observed == current
+                            || (observed == Some("cancelled") && current == Some("killed")))
+                })
+            {
+                if name == "task_output" {
+                    // `killed` is the shell owner's spelling of the canonical
+                    // work-unit status `cancelled`.
+                    if !read_failed
+                        && let Some(status) = snapshot
+                            .as_ref()
+                            .and_then(|value| value.get("status"))
+                            .or_else(|| {
+                                outcome
+                                    .tool_result_fields
+                                    .as_ref()
+                                    .and_then(|fields| fields.get("background_task_observation"))
+                                    .and_then(|observation| observation.get("status"))
+                            })
+                    {
+                        context["status"] = status.clone();
+                    }
+                    let unknown = ["execution_fact", "outcome_certainty"].iter().any(|key| {
+                        context
+                            .get("execution")
+                            .and_then(|facts| facts.get(*key))
+                            .and_then(Value::as_str)
+                            == Some("unknown")
+                    });
+                    if let Some(result) = snapshot.as_mut() {
+                        if read_failed {
+                            // The read error and the owner's current state are
+                            // distinct facts; neither replaces the other.
+                            result.insert("task".into(), context.clone());
+                        }
+                        if let Some(controls) = context.get("controls") {
+                            result.insert("controls".into(), controls.clone());
+                        }
+                        if let Some(execution) =
+                            context.get("execution").filter(|value| !value.is_null())
+                        {
+                            result.insert("execution".into(), execution.clone());
+                        }
+                        if unknown {
+                            result.insert("execution_notice".into(), json!("The execution outcome is unknown and may have side effects. Inspect the resulting state before deciding whether to retry."));
+                        }
+                    } else if unknown {
+                        outcome.output.push_str("\nThe execution outcome is unknown and may have side effects. Inspect the resulting state before deciding whether to retry.");
+                    }
+                }
+                outcome
+                    .tool_result_fields
+                    .get_or_insert_default()
+                    .insert("task".into(), context);
+            }
+            return EdgeToolRun::from_tool_result(control_tool_result(outcome, snapshot));
+        }
+        if let Some(error) = self.worktree_recovery_error(name, args) {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(error).with_execution_not_started(),
+            );
+        }
         // Edge-owned typed writers share the same per-workspace lease as the
         // Bash pre/post observer. Bash acquires it inside its shell boundary;
         // excluding Bash here avoids a nested-lock deadlock.
@@ -4555,6 +5034,89 @@ impl ToolExecutor {
             return EdgeToolRun::error(
                 "run_script cannot recursively start another opaque script writer".to_string(),
             );
+        }
+        if name == "worktree" && nested_run_script_callback {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(
+                    "A running script cannot change the session workspace".to_string(),
+                )
+                .with_execution_not_started(),
+            );
+        }
+        // A session transition must not race another operation resolving the
+        // effective root. Nested script callbacks inherit their parent's guard.
+        let _transition = if name == "worktree" && workspace_transition.is_none() {
+            if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(
+                    name, false,
+                ));
+            }
+            match self.worktree_transition.try_write() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    let mut rejected = EdgeToolRun::classified_error(
+                        "The workspace is still in use. Finish or stop its running work before switching worktrees; no switch was made.".to_string(),
+                        astra_core::ErrorKind::ToolUnavailable,
+                    );
+                    astra_tools::execution_outcome::insert_not_executed_fact(
+                        rejected
+                            .tool_result_fields
+                            .get_or_insert_with(serde_json::Map::new),
+                    );
+                    return rejected;
+                }
+            }
+        } else {
+            None
+        };
+        // A chain owns the workspace guard across its steps itself so it can
+        // release it before an exclusive rollback.
+        let chain_owns_workspace = name == "agent"
+            && matches!(
+                astra_tools::agent_tool_contract::agent_action_from_args(args),
+                Ok(astra_tools::agent_tool_contract::AgentAction::RunChain)
+            );
+        let _workspace = if name != "worktree"
+            && !chain_owns_workspace
+            && (name != "bash" || native_protocol.is_some())
+            && !nested_run_script_callback
+        {
+            Some(if let Some(cancel) = cancel_token {
+                tokio::select! {
+                    guard = self.worktree_transition.read() => guard,
+                    _ = cancel.cancelled() => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                }
+            } else {
+                self.worktree_transition.read().await
+            })
+        } else {
+            None
+        };
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false));
+        }
+        if name == "worktree"
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && args
+                .get("exit_action")
+                .and_then(Value::as_str)
+                .unwrap_or("keep")
+                == "keep"
+            && self.workspace_selection_is_unknown()
+        {
+            if !self.confirm_current_workspace_in_tui(cancel_token).await {
+                return EdgeToolRun::from_tool_result(astra_tools::ToolResult::error(
+                    "The workspace is unknown. Resume this session interactively and confirm the directory before running local tools.".into(),
+                ).with_execution_not_started());
+            }
+            return match self.accept_current_workspace() {
+                Ok(message) => {
+                    EdgeToolRun::from_tool_result(astra_tools::ToolResult::text(message))
+                }
+                Err(error) => EdgeToolRun::from_tool_result(
+                    astra_tools::ToolResult::error(error).with_execution_not_started(),
+                ),
+            };
         }
         let convergence_authority = invocation
             .run_id
@@ -4567,13 +5129,17 @@ impl ToolExecutor {
             .map(|(run_id, turn_chain_id)| {
                 format!("{run_id}:{turn_chain_id}:{}", self.convergence_authority)
             });
+        // The worktree lifecycle mutates the original repository and may
+        // remove the selected checkout; its coordination root must survive
+        // the operation itself.
+        let execution_root = if matches!(name, "worktree" | "rollback_git_worktrees") {
+            self.session_project_root()
+        } else {
+            self.effective_project_root()
+        };
         let targeted_observer = convergence_authority.as_deref().is_some_and(|authority| {
-            self.convergence_tracker.requires_snapshot_lease(
-                authority,
-                name,
-                args,
-                &self.project_root,
-            )
+            self.convergence_tracker
+                .requires_snapshot_lease(authority, name, args, &execution_root)
         });
         let mcp_prepared = if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             match self.prepare_mcp_tool_call(name).await {
@@ -4589,11 +5155,6 @@ impl ToolExecutor {
         let mcp_workspace_effect = mcp_prepared
             .as_ref()
             .map(|(_, prepared)| prepared.policy().effect);
-        let execution_root = if native_protocol.is_some() {
-            self.effective_project_root()
-        } else {
-            self.project_root.clone()
-        };
         // Freeze the native write ceiling before choosing workspace ownership.
         // Read-only native work reads the live root; it is not a snapshot.
         let native_read_only = native_protocol.is_some()
@@ -4608,8 +5169,15 @@ impl ToolExecutor {
                 astra_tools::mcp_workspace_effect_undeclared_tool_result(name),
             );
         }
+        // Exiting while keeping a checkout only changes session state, which
+        // is already protected by the transition guard; do not wait for Git.
+        let keeping_worktree = name == "worktree"
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && (cfg!(target_os = "macos")
+                || args.get("exit_action").and_then(Value::as_str) != Some("remove"));
         let _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
+            && !keeping_worktree
             // MCP effects are resolved once from the discovered provider
             // declaration; typed tools use the shared built-in predicate.
             && ((native_protocol.is_some() && !native_read_only)
@@ -4618,16 +5186,47 @@ impl ToolExecutor {
                 || targeted_observer)
             && !nested_run_script_callback
         {
-            match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                &execution_root,
-                cancel_token,
-                invocation
-                    .admission_deadline
-                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
-                    .unwrap_or(std::time::Duration::from_secs(120))
-                    .min(std::time::Duration::from_secs(120)),
-            )
-            .await
+            // Worktree operations acquire checkout leases below. File
+            // rollback acquires its target scopes separately after admission.
+            let mut additional_roots = if matches!(
+                name,
+                "worktree" | "rollback_git_worktrees" | "rollback_file_edits"
+            ) {
+                Vec::new()
+            } else {
+                self.additional_workspace_paths()
+            };
+            // A single-file operation only needs the extra roots containing
+            // its actual target. Opaque or multi-file operations retain the
+            // conservative all-root admission.
+            if matches!(
+                name,
+                "write_file" | "str_replace" | "multi_edit" | "delete_file"
+            ) && let Some(target) = args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| self.resolve_checked(path).ok())
+                .and_then(|path| self.bind_file_mutation_target(&path).ok())
+            {
+                additional_roots.retain(|root| {
+                    target.starts_with(root.canonicalize().unwrap_or_else(|_| root.clone()))
+                });
+            }
+            match self
+                .acquire_local_workspace_lease(
+                    &execution_root,
+                    &additional_roots,
+                    cancel_token,
+                    invocation
+                        .admission_deadline
+                        .map(|deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        })
+                        .unwrap_or(std::time::Duration::from_secs(120))
+                        .min(std::time::Duration::from_secs(120)),
+                    invocation.admission_deadline,
+                )
+                .await
             {
                 Ok(guard) => Some(guard),
                 Err(failure) => {
@@ -4637,55 +5236,69 @@ impl ToolExecutor {
                         }
                         return cancelled_edge_tool_run(name, false);
                     }
-                    return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_failure_tool_result(name, failure),
-                    );
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &self.unsettled_workspace_root(&execution_root, &additional_roots),
+                    ));
                 }
             }
         } else {
             None
         };
-        if let Some(validate) = validate_dispatch
-            && let Err(result) = validate()
+        // Removing a linked checkout affects both the parent repository and
+        // the checkout itself. An independent executor can own the latter,
+        // so hold its existing cross-process lease until removal completes.
+        let _checkout_lease = if name == "worktree"
+            && !keeping_worktree
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && args.get("exit_action").and_then(Value::as_str) == Some("remove")
+            && let Some(session) = self.get_worktree_session()
         {
-            return EdgeToolRun::from_tool_result(result);
-        }
-        // Structured writers have no trustworthy success fact in their
-        // display string. Capture an owner-side bounded preimage while the
-        // workspace lease is held, then stamp the result only if the bound
-        // workspace actually changed. An unavailable/ambiguous capture is
-        // deliberately not upgraded to a mutation receipt.
-        // Direct file writers below have an exact owner-side applied/no-op
-        // result and must never pay for (or depend on) a whole-tree scan.
-        // Other mutation-capable handlers retain the bounded fingerprint as
-        // a conservative fallback until their own commit boundary reports the
-        // same typed fact.
-        let owner_reports_structured_writer_fact = matches!(name, "write_file" | "str_replace");
-        let writer_fingerprint_before =
-            if astra_tools::executor::is_workspace_mutation_tool(name, args)
-                && !owner_reports_structured_writer_fact
-            {
-                astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                    &self.project_root,
+            let checkout_lease = if let Some(parent) = _workspace_mutation_lease.as_ref() {
+                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_parent(
+                    &session.worktree_path,
+                    parent,
+                    cancel_token,
+                    invocation
+                        .admission_deadline
+                        .map(|deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        })
+                        .unwrap_or(std::time::Duration::from_secs(120))
+                        .min(std::time::Duration::from_secs(120)),
                 )
+                .await
             } else {
-                None
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable)
             };
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            if let Some(authority) = convergence_authority.as_deref() {
-                self.convergence_tracker.clear_authority(authority);
-            }
-            return cancelled_edge_tool_run(name, false);
-        }
-        let _recursive_writer_epoch = if name == "run_script" {
-            match astra_tools::workspace_observation::begin_workspace_writer_with_options(
-                &self.project_root,
-                cancel_token,
-                std::time::Duration::from_secs(120),
-            )
-            .await
-            {
+            match checkout_lease {
                 Ok(guard) => Some(guard),
+                Err(failure) => {
+                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        return cancelled_edge_tool_run(name, false);
+                    }
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &session.worktree_path,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let _rollback_checkout_leases = if name == "rollback_git_worktrees" {
+            let Some(parent) = _workspace_mutation_lease.as_ref() else {
+                return EdgeToolRun::from_tool_result(astra_tools::workspace_lease_failure_tool_result(
+                    name, astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
+                ));
+            };
+            match self
+                .acquire_git_worktree_rollback_leases(args, None, parent, cancel_token)
+                .await
+            {
+                Ok(leases) => leases,
                 Err(failure) => {
                     return EdgeToolRun::from_tool_result(
                         astra_tools::workspace_lease_failure_tool_result(name, failure),
@@ -4693,8 +5306,59 @@ impl ToolExecutor {
                 }
             }
         } else {
+            Vec::new()
+        };
+        if let Some(validate) = validate_dispatch
+            && let Err(result) = validate()
+        {
+            return EdgeToolRun::from_tool_result(result);
+        }
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            if let Some(authority) = convergence_authority.as_deref() {
+                self.convergence_tracker.clear_authority(authority);
+            }
+            return cancelled_edge_tool_run(name, false);
+        }
+        let _recursive_writer_epoch = if name == "run_script" {
+            let additional_roots = self.additional_workspace_paths();
+            match self.acquire_local_workspace_lease(
+                &execution_root,
+                &additional_roots,
+                cancel_token,
+                std::time::Duration::from_secs(120),
+                invocation.admission_deadline,
+            ).await {
+                Ok(lease) => match astra_tools::workspace_observation::begin_workspace_writer_after_lease(
+                    &execution_root,
+                    lease,
+                ) {
+                    Some(guard) => Some(guard),
+                    None => return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
+                        &execution_root,
+                    )),
+                },
+                Err(failure) => {
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &self.unsettled_workspace_root(&execution_root, &additional_roots),
+                    ));
+                }
+            }
+        } else {
             None
         };
+        // Admission can wait for a prior command or a user's confirmation.
+        // Recheck the selected checkout after that wait, before dispatch.
+        if (_workspace_mutation_lease.is_some() || _recursive_writer_epoch.is_some())
+            && let Some(error) = self.worktree_recovery_error(name, args)
+        {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(error).with_execution_not_started(),
+            );
+        }
         let mut facts = ToolExecutionFacts::default();
         let mut output = self
             .execute_raw(
@@ -4715,46 +5379,8 @@ impl ToolExecutor {
             .await;
         let ToolExecutionFacts {
             fields: mut tool_result_fields,
-            is_error: mut source_is_error,
+            is_error: source_is_error,
         } = facts;
-        if native_protocol.is_some()
-            || matches!(
-                mcp_workspace_effect,
-                Some(astra_turn_types::ResolvedToolEffect::Mutating)
-            )
-        {
-            let result = astra_tools::ToolResult {
-                output,
-                metadata: tool_result_fields,
-                is_error: source_is_error.unwrap_or(false),
-                exit_semantics: None,
-            };
-            let dispatched = result.metadata.as_ref().is_some_and(|fields| {
-                fields.get("mcp_call_dispatched").and_then(Value::as_bool) == Some(true)
-                    || (native_protocol.is_some()
-                        && fields
-                            .get("native_collaborator")
-                            .and_then(|native| native.get("target_released"))
-                            != Some(&Value::Bool(false)))
-            });
-            let settled = result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("workspace_effect_settled"))
-                .and_then(Value::as_bool)
-                == Some(true);
-            let result = if dispatched && !settled {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    &execution_root,
-                );
-                astra_tools::workspace_effect_unsettled_tool_result(name, result)
-            } else {
-                result
-            };
-            output = result.output;
-            tool_result_fields = result.metadata;
-            source_is_error = Some(result.is_error);
-        }
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
@@ -4777,9 +5403,15 @@ impl ToolExecutor {
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
         if !coordination_integrity_valid {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &self.project_root,
-            );
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.mark_unsettled();
+            } else if let Some(writer) = &_recursive_writer_epoch {
+                writer.mark_unsettled();
+            } else {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &execution_root,
+                );
+            }
             if let Some(fields) = tool_result_fields.as_mut() {
                 fields.remove("workspace_mutation_applied");
                 astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
@@ -4790,6 +5422,10 @@ impl ToolExecutor {
             output.push_str(
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
+            let fields = tool_result_fields.get_or_insert_with(Default::default);
+            fields.insert("execution_fact".into(), json!("unknown"));
+            fields.insert("side_effects_maybe".into(), json!(true));
+            fields.insert("retryable".into(), json!(false));
         }
         let direct_writer_applied = coordination_integrity_valid
             && !nested_run_script_callback
@@ -4798,25 +5434,33 @@ impl ToolExecutor {
                 .and_then(|fields| fields.get("workspace_mutation_applied"))
                 .and_then(Value::as_bool)
                 == Some(true);
-        let writer_applied_by_owner = receipt_authority_valid && direct_writer_applied;
-        let writer_applied_by_fingerprint = if writer_applied_by_owner {
-            false
-        } else {
-            receipt_authority_valid
-                && writer_fingerprint_before
-                    .zip(
-                        astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                            &self.project_root,
-                        ),
-                    )
-                    .is_some_and(|(before, after)| before.changed_from(Some(after)))
-        };
         // Redact before constructing EdgeToolRun.  This is deliberately
         // before status classification, event emission, callback posting, and
         // cache insertion: tool_call_end and the Edge→server transport must
         // never become an earlier/raw persistence lane than headless record.
-        let (mut output, _) =
-            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
+        let mut output = if matches!(name, "agent" | "agent_fanout") {
+            match serde_json::from_str::<Value>(&output) {
+                Ok(mut value) => {
+                    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut value);
+                    value.to_string()
+                }
+                Err(_) => {
+                    astra_text_utils::credential_redaction::redact_credentials_for_display(&output)
+                        .0
+                }
+            }
+        } else {
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output).0
+        };
+        if matches!(name, "agent" | "agent_fanout")
+            && let Some(fields) = tool_result_fields.as_mut()
+        {
+            for (key, value) in fields {
+                astra_text_utils::credential_redaction::redact_credentials_in_json_field(
+                    value, key,
+                );
+            }
+        }
         let embedded_work_observation = embedded_work_unit_observation(&output);
         // Only control-handler output is a producer-owned execution fact;
         // file contents and process stdout cannot certify non-execution.
@@ -4828,17 +5472,13 @@ impl ToolExecutor {
                 tool_result_fields.get_or_insert_with(Default::default),
             );
         }
-
         // Source status wins over result prose. Unmigrated String handlers
         // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
             || !coordination_integrity_valid;
-        // Owner metadata is the primary structured-writer fact. A whole-tree
-        // fingerprint remains only a conservative fallback for older/opaque
-        // handlers: large non-Git task roots can legitimately exceed its
-        // bounded scan even when a one-file write committed successfully.
-        // No output prose or exit-zero result participates in this decision.
-        let writer_applied = writer_applied_by_owner || writer_applied_by_fingerprint;
+        // Only the writer can report that it applied a change. A whole-tree
+        // snapshot cannot attribute concurrent edits to this invocation.
+        let writer_applied = receipt_authority_valid && direct_writer_applied;
         // Execution failure does not erase the producer's execution facts.
         // In particular, timeout and partial mutation remain independently
         // observable. Do not reconstruct a second metadata schema here.
@@ -4853,7 +5493,7 @@ impl ToolExecutor {
         let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
             &mut tool_result_fields,
             args,
-            &self.project_root,
+            &execution_root,
         ) {
             Ok(desired_state) => desired_state,
             Err(error) => {
@@ -4866,7 +5506,7 @@ impl ToolExecutor {
             && astra_tools::workspace_observation::typed_workspace_tool_applied_bound(
                 name,
                 args,
-                &self.project_root,
+                &execution_root,
                 is_error,
                 direct_writer_applied,
             )
@@ -4887,7 +5527,7 @@ impl ToolExecutor {
             astra_tools::workspace_observation::typed_workspace_tool_receipt_for_applied(
                 name,
                 args,
-                &self.project_root,
+                &execution_root,
                 is_error,
                 writer_applied,
             )
@@ -4901,7 +5541,7 @@ impl ToolExecutor {
             convergence_authority.as_deref(),
             name,
             args,
-            &self.project_root,
+            &execution_root,
             is_error,
             desired_state.as_ref(),
             receipt_authority_valid && !nested_run_script_callback,
@@ -4980,13 +5620,6 @@ impl ToolExecutor {
             *source_is_error = Some(result.is_error);
             *tool_result_fields = result.metadata;
             result.output
-        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
-            format!(
-                "Error: Tool '{name}' is blocked while plan mode is active. \
-                 Use read-only tools to finish the plan, then call \
-                 `exit_plan_mode(plan='...')` to submit it through the trusted \
-                 plan-review overlay before write tools can run."
-            )
         } else {
             match name {
                 "bash" => {
@@ -5041,7 +5674,7 @@ impl ToolExecutor {
                             );
                         if let Some(desired_state) =
                             astra_tools::fs_ops::write_file_desired_state_identity(
-                                &self.project_root,
+                                execution_root,
                                 args,
                             )
                         {
@@ -5068,9 +5701,22 @@ impl ToolExecutor {
                     }
                     output
                 }
-                "rollback_database_snapshots" => self.rollback_database_snapshots(args),
-                "rollback_file_edits" => self.rollback_file_edits(args),
-                "rollback_session_state" => self.rollback_session_state(args).await,
+                "rollback_database_snapshots"
+                | "rollback_file_edits"
+                | "rollback_session_state" => {
+                    let result = match name {
+                        "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                        "rollback_file_edits" => self.rollback_file_edits(args).await,
+                        _ => self.rollback_session_state(args).await,
+                    };
+                    if let Some(success) = serde_json::from_str::<Value>(&result)
+                        .ok()
+                        .and_then(|value| value.get("success").and_then(Value::as_bool))
+                    {
+                        *source_is_error = Some(!success);
+                    }
+                    result
+                }
                 "str_replace" => {
                     let args =
                         match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
@@ -5120,12 +5766,13 @@ impl ToolExecutor {
                 // CLI+Server edge callbacks, and pure Server runs have one
                 // traversal, ignore, pagination, and failure contract.
                 "glob" => {
-                    let result = astra_tools::ToolExecutor::execute_with_metadata(
-                        &self.default_executor,
-                        "glob",
-                        args,
-                    )
-                    .await;
+                    let mut context = self.default_executor.context().clone();
+                    context.project_root = execution_root.to_path_buf();
+                    context.workspace_root = execution_root.to_path_buf();
+                    context.sandbox.project_root = execution_root.to_path_buf();
+                    context.cancel_token =
+                        cancel_token.map(|token| std::sync::Arc::new(token.clone()));
+                    let result = astra_tools::shell_ops::glob(&context, args).await;
                     *source_is_error = Some(result.is_error);
                     *tool_result_fields = result.metadata.clone();
                     result.output
@@ -5147,7 +5794,12 @@ impl ToolExecutor {
                 "hover_info" => self.hover_info(args),
                 "symbol_search" => self.symbol_search(args),
                 "symbols" => self.symbols(args),
-                "mo_query" => self.mo_query(args),
+                "mo_query" => {
+                    let outcome = self.mo_query_with_metadata(args, cancel_token);
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
+                }
 
                 "web_fetch" => {
                     let cache_scope = self
@@ -5167,8 +5819,21 @@ impl ToolExecutor {
                     result.output
                 }
                 "display_sixel" => {
+                    let mut resolved = args.clone();
+                    if let Some(path) = args.get("path").and_then(Value::as_str) {
+                        match self.resolve_checked(path) {
+                            Ok(path) => {
+                                resolved["path"] =
+                                    Value::String(path.to_string_lossy().into_owned())
+                            }
+                            Err(error) => {
+                                *source_is_error = Some(true);
+                                return error;
+                            }
+                        }
+                    }
                     let result =
-                        astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                        astra_tools::ToolExecutor::execute(&self.default_executor, name, &resolved)
                             .await;
                     *source_is_error = Some(result.is_error);
                     result.output
@@ -5176,7 +5841,10 @@ impl ToolExecutor {
                 "run_script" => {
                     #[cfg(unix)]
                     {
-                        let config = astra_tools::run_script::RunScriptConfig::default();
+                        let config = astra_tools::run_script::RunScriptConfig {
+                            session_cwd: Some(self.effective_project_root()),
+                            ..Default::default()
+                        };
                         let result = astra_tools::run_script::handle_run_script(
                             args,
                             self,
@@ -5185,6 +5853,7 @@ impl ToolExecutor {
                         )
                         .await;
                         *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata;
                         result.output
                     }
                     #[cfg(not(unix))]
@@ -5224,7 +5893,7 @@ impl ToolExecutor {
                 }
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
-                "adjust_config" => self.adjust_config(args),
+                "adjust_config" => self.adjust_config(args, tool_result_fields),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -5329,6 +5998,13 @@ impl ToolExecutor {
                     };
                     match action {
                         astra_tools::agent_tool_contract::AgentAction::RunChain => {
+                            if args.get("rollback_on_failure").is_some() {
+                                *source_is_error = Some(true);
+                                astra_tools::execution_outcome::insert_not_executed_fact(
+                                    tool_result_fields.get_or_insert_with(Default::default),
+                                );
+                                return "Error: run_chain does not support automatic rollback; completed steps remain in the workspace if a later step fails.".to_string();
+                            }
                             match serde_json::from_value::<
                                 astra_turn_core::tool_registry_chain::ToolChain,
                             >(args.clone())
@@ -5349,8 +6025,15 @@ impl ToolExecutor {
                                         .get("input")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({}));
-                                    let outcome = self.execute_chain_outcome(&chain, input).await;
+                                    let outcome = self
+                                        .execute_chain_outcome(&chain, input, cancel_token)
+                                        .await;
                                     *source_is_error = Some(outcome.is_error);
+                                    if let Some(fields) = outcome.tool_result_fields {
+                                        tool_result_fields
+                                            .get_or_insert_with(Default::default)
+                                            .extend(fields);
+                                    }
                                     outcome.output
                                 }
                                 Err(e) => format!("Error: Invalid chain format: {e}"),
@@ -5429,16 +6112,13 @@ impl ToolExecutor {
                         };
                     match action {
                         astra_tools::session_tool_contract::SessionAction::Config => {
-                            self.adjust_config(args)
+                            self.adjust_config(args, tool_result_fields)
                         }
                         astra_tools::session_tool_contract::SessionAction::Sleep => {
                             self.sleep_tool(args).await
                         }
                     }
                 }
-                "task_output" => self.task_output_with_fields(args, tool_result_fields).await,
-                "task_stop" => self.task_kill_bg(args).await,
-                "task_list" => self.task_list_bg().await,
                 "web_search" => {
                     let cache_scope = self
                         .active_session_id
@@ -5570,7 +6250,7 @@ impl ToolExecutor {
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
-        let outcome = self.execute_chain_outcome(chain, input);
+        let outcome = self.execute_chain_outcome(chain, input, None);
         Box::pin(async move { outcome.await.output })
     }
 
@@ -5578,11 +6258,12 @@ impl ToolExecutor {
     ///
     /// Returns a JSON summary with per-step outputs and the final result.
     /// Execution stops on the first error unless the step has a skip condition.
-    fn execute_chain_outcome(
-        &self,
+    fn execute_chain_outcome<'a>(
+        &'a self,
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + '_>>
+        cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + 'a>>
     {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
 
@@ -5604,27 +6285,28 @@ impl ToolExecutor {
         }
 
         let chain_name = chain.name.clone();
-        let rollback_on_failure = chain.rollback_on_failure;
-        let rollback_turn_index = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Acquire);
-        let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
-        let database_checkpoint =
-            rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
-
-        let worktree_checkpoint =
-            rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
-        let session_state_checkpoint =
-            rollback_on_failure.then(|| self.session_state_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
+            let mut workspace = Some(if let Some(cancel) = cancel_token {
+                tokio::select! {
+                    guard = self.worktree_transition.read() => guard,
+                    _ = cancel.cancelled() => return cancelled_tool_execution_outcome("agent", false),
+                }
+            } else {
+                self.worktree_transition.read().await
+            });
             let mut ctx = ChainContext::new(input);
             let mut step_results = Vec::new();
-            let mut rollback = None;
             let mut failed = false;
+            let mut unknown_tasks = Vec::<String>::new();
 
             for (idx, step) in steps.iter().enumerate() {
+                if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    failed = true;
+                    ctx.prev_output = "Chain cancelled; remaining steps were not run.".into();
+                    break;
+                }
                 if ctx.should_skip(step) {
                     step_results.push(serde_json::json!({
                         "step": idx,
@@ -5635,7 +6317,51 @@ impl ToolExecutor {
                 }
 
                 let resolved = resolve_args(&step.args, &ctx);
-                let outcome = self.execute_with_metadata(&step.tool, &resolved).await;
+                let outcome = if step.tool == "worktree" {
+                    drop(workspace.take());
+                    match self.worktree_transition.try_write() {
+                        Ok(transition) => {
+                            let outcome = self
+                                .execute_run_with_native_interaction(
+                                    &step.tool,
+                                    &resolved,
+                                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                                    cancel_token,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(&transition),
+                                )
+                                .await
+                                .into_outcome();
+                            workspace = Some(tokio::sync::RwLockWriteGuard::downgrade(transition));
+                            outcome
+                        }
+                        Err(_) => {
+                            let mut rejected = EdgeToolRun::classified_error(
+                                "The workspace is still in use; no switch was made.".to_string(),
+                                astra_core::ErrorKind::ToolUnavailable,
+                            );
+                            astra_tools::execution_outcome::insert_not_executed_fact(
+                                rejected
+                                    .tool_result_fields
+                                    .get_or_insert_with(Default::default),
+                            );
+                            rejected.into_outcome()
+                        }
+                    }
+                } else {
+                    self.execute_with_metadata_cancelable(&step.tool, &resolved, cancel_token)
+                        .await
+                };
+                for id in unknown_shell_tasks(&step.tool, outcome.tool_result_fields.as_ref()) {
+                    if !unknown_tasks.iter().any(|known| known == id) {
+                        unknown_tasks.push(id.to_owned());
+                    }
+                }
                 let is_err = outcome.is_error;
                 let output = outcome.output;
 
@@ -5655,63 +6381,9 @@ impl ToolExecutor {
                 }));
 
                 if is_err {
+                    // Completed steps can contain useful work. Undoing them here
+                    // could also overwrite edits made since those steps ran.
                     failed = true;
-                    if rollback_on_failure {
-                        if let (
-                            Some(file_checkpoint),
-                            Some(database_checkpoint),
-                            Some(worktree_checkpoint),
-                            Some(session_state_checkpoint),
-                        ) = (
-                            file_checkpoint,
-                            database_checkpoint,
-                            worktree_checkpoint,
-                            session_state_checkpoint,
-                        ) {
-                            let file_entries_added = self
-                                .file_journal_checkpoint()
-                                .saturating_sub(file_checkpoint);
-                            let database_entries_added = self
-                                .database_snapshot_journal_checkpoint()
-                                .saturating_sub(database_checkpoint);
-
-                            let worktree_entries_added = self
-                                .git_worktree_journal_checkpoint()
-                                .saturating_sub(worktree_checkpoint);
-                            let session_state_entries_added = self
-                                .session_state_journal_checkpoint()
-                                .saturating_sub(session_state_checkpoint);
-                            if file_entries_added > 0
-                                || database_entries_added > 0
-                                || worktree_entries_added > 0
-                                || session_state_entries_added > 0
-                            {
-                                let rollback_output = self
-                                    .rollback_recorded_turn_mutations(&serde_json::json!({
-                                        "scope": "turn",
-                                        "turn_index": rollback_turn_index,
-                                        "file_after_sequence": file_checkpoint,
-                                        "database_after_sequence": database_checkpoint,
-
-
-                                        "worktree_after_sequence": worktree_checkpoint,
-                                        "session_state_after_sequence": session_state_checkpoint,
-                                    }))
-                                    .await;
-                                rollback = Some(
-                                    serde_json::from_str(&rollback_output).unwrap_or_else(
-                                        |error| {
-                                            serde_json::json!({
-                                                "success": false,
-                                                "error": format!("invalid recorded turn rollback output: {error}"),
-                                                "raw_output": rollback_output,
-                                            })
-                                        },
-                                    ),
-                                );
-                            }
-                        }
-                    }
                     break;
                 }
             }
@@ -5729,12 +6401,25 @@ impl ToolExecutor {
                 ),
                 ("steps".to_string(), serde_json::json!(step_results)),
             ]);
-            if let Some(rollback) = rollback {
-                result.insert("rollback".to_string(), rollback);
-            }
+            let fields = if unknown_tasks.is_empty() {
+                None
+            } else {
+                result.insert("unknown_shell_tasks".into(), json!(unknown_tasks));
+                result.insert("execution_notice".into(), json!(
+                    "Some shell outcomes are unknown and may have side effects; inspect their tasks before retrying."
+                ));
+                Some(serde_json::Map::from_iter([
+                    ("execution_fact".into(), json!("unknown")),
+                    ("side_effects_maybe".into(), json!(true)),
+                    ("retryable".into(), json!(false)),
+                    ("nested_unknown_shell_tasks".into(), json!(unknown_tasks)),
+                ]))
+            };
+            let mut result = Value::Object(result);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(&mut result);
             ToolExecutionOutcome {
-                output: Value::Object(result).to_string(),
-                tool_result_fields: None,
+                output: result.to_string(),
+                tool_result_fields: fields,
                 is_error: failed,
             }
         })
@@ -5863,6 +6548,7 @@ impl ToolExecutor {
                 "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
+                "shell_task_controls": self.shell_task_controls_available(),
                 "tools_visible": model.capabilities.tool_names,
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
@@ -5887,6 +6573,7 @@ impl ToolExecutor {
                 "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
+                "shell_task_controls": self.shell_task_controls_available(),
                 "tools_visible": caps.visible_names,
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
@@ -5902,7 +6589,8 @@ impl ToolExecutor {
 
         let caps = cli_default_capabilities(
             self.spawn_context.is_some(),
-            self.bg_task_commands.is_some(),
+            !self.read_only_execution
+                && (self.background_tasks_shared || self.spawn_context.is_some()),
         );
         let mut active_names = Vec::new();
         let mut inactive_names = Vec::new();
@@ -6029,7 +6717,9 @@ impl ToolExecutor {
         if self.spawn_context.is_some() {
             extra.push(astra_runtime_env::CAP_MULTI_AGENT);
         }
-        if self.bg_task_commands.is_some() {
+        if self.capability_has_runtime_binding(
+            astra_turn_core::capability::Capability::LocalBackgroundTasks,
+        ) {
             extra.push(astra_runtime_env::CAP_LOCAL_BACKGROUND_TASKS);
         }
         astra_runtime_env::CapacityProviderCoverageEntry::ready(
@@ -6137,9 +6827,6 @@ impl ToolExecutor {
         if let Some(dp) = session.last_denial_pressure {
             snapshot = snapshot.with_denial_pressure(dp);
         }
-        if !session.recent_failing_tests.is_empty() {
-            snapshot = snapshot.with_recent_failing_tests(session.recent_failing_tests.clone());
-        }
         if !session.recent_rejections.is_empty() {
             snapshot = snapshot.with_recent_rejections(session.recent_rejections.clone());
         }
@@ -6183,7 +6870,11 @@ impl ToolExecutor {
 #[async_trait::async_trait]
 impl astra_tools::ToolExecutor for ToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+        let outcome = ToolExecutor::execute_with_metadata(self, name, args).await;
+        if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+            self.acknowledge_delivered_task_result(name, outcome.tool_result_fields.as_ref());
+        }
+        tool_result_from_cli_outcome(outcome)
     }
 
     async fn execute_with_cancel(
@@ -6196,15 +6887,18 @@ impl astra_tools::ToolExecutor for ToolExecutor {
         // cancellation-aware edge dispatch as top-level calls. The trait
         // default only races the future against cancellation and can drop a
         // child/lease owner before its post-execution cleanup runs.
-        tool_result_from_cli_outcome(
-            self.execute_with_invocation_metadata_cancelable(
+        let outcome = self
+            .execute_with_invocation_metadata_cancelable(
                 name,
                 args,
                 astra_tools::tool_engine::ToolInvocationMetadata::default(),
                 cancel_token,
             )
-            .await,
-        )
+            .await;
+        if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+            self.acknowledge_delivered_task_result(name, outcome.tool_result_fields.as_ref());
+        }
+        tool_result_from_cli_outcome(outcome)
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
@@ -6215,18 +6909,57 @@ impl astra_tools::ToolExecutor for ToolExecutor {
         &self.project_root
     }
 
-    fn workspace_root(&self) -> &Path {
-        &self.project_root
+    fn workspace_root(&self) -> PathBuf {
+        self.effective_project_root()
     }
 
     async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+        let outcome = ToolExecutor::execute_with_metadata(self, name, args).await;
+        if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+            self.acknowledge_delivered_task_result(name, outcome.tool_result_fields.as_ref());
+        }
+        tool_result_from_cli_outcome(outcome)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn typed_write_ignores_unrelated_unsettled_directory() {
+        let (workspace, executor) = temp_executor();
+        let additional = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = additional.path().canonicalize().unwrap();
+        executor.expand_sandbox_path(root.clone()).unwrap();
+        assert!(astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root));
+
+        let local = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"local.txt", "content":"local"}),
+            )
+            .await;
+        let blocked = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":root.join("shared.txt"), "content":"shared"}),
+            )
+            .await;
+        astra_tools::workspace_observation::begin_workspace_recovery(&root)
+            .await
+            .unwrap()
+            .confirm()
+            .await
+            .unwrap();
+        assert!(!local.is_error, "{local:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("local.txt")).unwrap(),
+            "local\n"
+        );
+        assert!(blocked.is_error, "{blocked:?}");
+        assert!(!root.join("shared.txt").exists());
+    }
     #[tokio::test]
     async fn sandbox_path_refusals_preserve_non_execution_through_dispatch() {
         let (directory, executor) = temp_executor();
@@ -6277,8 +7010,8 @@ pub(crate) mod tests {
     }
 
     use super::{
-        BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot, BgTaskOutputSnapshot,
-        BgTaskOutputStatus, ToolExecutor, WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
+        BgTaskOutputReadMode, BgTaskOutputSnapshot, BgTaskOutputStatus, ToolExecutor,
+        WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
         background_task_output_result_fields, cli_tool_output_is_error,
         embedded_work_unit_observation, file_checkpoint_dir_for, format_background_task_error,
         format_background_task_output, format_background_task_output_wait_timeout,
@@ -6362,34 +7095,124 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn local_background_tools_require_a_live_registry_binding() {
+    fn local_background_tools_require_a_retained_session_owner() {
         use astra_turn_core::capability::Capability;
-
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let candidates = || {
-            vec![
-                function_schema("task_list"),
-                function_schema("task_output"),
-                function_schema("task_stop"),
-            ]
-        };
         assert!(!executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
-        assert!(executor.runtime_bound_tool_schemas(candidates()).is_empty());
+        let has_shell_fields = |executor: &ToolExecutor| {
+            executor
+                .bound_local_tool_schemas()
+                .into_iter()
+                .find(|schema| {
+                    schema.pointer("/function/name").and_then(Value::as_str) == Some("bash")
+                })
+                .and_then(|schema| {
+                    schema
+                        .pointer("/function/parameters/properties/stdin")
+                        .cloned()
+                })
+                .is_some()
+        };
+        assert!(!has_shell_fields(&executor));
+        assert!(
+            !astra_tools::ToolExecutor::tool_schemas(&executor)
+                .iter()
+                .any(|schema| {
+                    schema.pointer("/function/name").and_then(Value::as_str) == Some("bash")
+                        && schema
+                            .pointer("/function/parameters/properties/stdin")
+                            .is_some()
+                })
+        );
+        let mut executor = executor.with_background_tasks(
+            super::background_tasks::BackgroundTaskRegistry::new(dir.path().join("tasks")),
+        );
+        assert!(executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert_eq!(executor.capability_info_json()["shell_task_controls"], true);
+        assert!(has_shell_fields(&executor));
+        assert!(
+            astra_tools::ToolExecutor::tool_schemas(&executor)
+                .iter()
+                .any(|schema| {
+                    schema.pointer("/function/name").and_then(Value::as_str) == Some("bash")
+                        && schema
+                            .pointer("/function/parameters/properties/stdin")
+                            .is_some()
+                })
+        );
+        executor.set_read_only_execution();
+        assert!(!executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert!(!has_shell_fields(&executor));
+    }
 
+    #[test]
+    fn shell_tool_search_uses_the_selected_owners_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let without_owner = ToolExecutor::new(dir.path());
+        let with_owner = ToolExecutor::new(dir.path()).with_background_tasks(
+            super::background_tasks::BackgroundTaskRegistry::new(dir.path().join("tasks")),
+        );
+        for (executor, expected) in [(without_owner, false), (with_owner, true)] {
+            executor.set_current_tool_surface(&[], HashSet::from(["bash".to_string()]));
+            let result = executor.tool_search(&json!({"query":"select:bash"}));
+            assert!(!result.is_error, "{result:?}");
+            let selected: Value = serde_json::from_str(&result.output).unwrap();
+            for name in ["stdin", "yield_time_ms"] {
+                assert_eq!(
+                    selected["matches"][0]["parameters"]["properties"]
+                        .get(name)
+                        .is_some(),
+                    expected
+                );
+            }
+            if expected {
+                let properties = &selected["matches"][0]["parameters"]["properties"];
+                assert!(
+                    properties["stdin"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not a PTY")
+                );
+                assert!(
+                    properties["yield_time_ms"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not a process timeout")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_controls_do_not_imply_detachable_shell_controls() {
+        use astra_turn_core::capability::Capability;
+        let dir = tempfile::tempdir().unwrap();
         let executor =
-            executor.with_bg_task_commands(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+            ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
         assert!(executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
         assert_eq!(
-            astra_turn_core::tool::schema::tool_names_from_schemas(
-                &executor.runtime_bound_tool_schemas(candidates())
-            ),
-            HashSet::from([
-                "task_list".to_string(),
-                "task_output".to_string(),
-                "task_stop".to_string(),
-            ])
+            executor.capability_info_json()["shell_task_controls"],
+            false
         );
+        assert!(!executor.bound_local_tool_schemas().iter().any(|schema| {
+            schema.pointer("/function/name").and_then(Value::as_str) == Some("bash")
+                && schema
+                    .pointer("/function/parameters/properties/yield_time_ms")
+                    .is_some()
+        }));
+        let outcome = executor
+            .execute_with_metadata(
+                "bash",
+                &json!({"command":"printf finished","yield_time_ms":0}),
+            )
+            .await;
+        assert!(outcome.is_error, "{outcome:?}");
+        let rejected = executor
+            .execute_with_metadata("bash", &json!({"command":"touch unintended","stdin":true}))
+            .await;
+        assert!(rejected.is_error);
+        assert!(!dir.path().join("unintended").exists());
     }
 
     #[test]
@@ -6846,6 +7669,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn read_file_dispatch_preserves_source_io_failure() {
+        use astra_core::{ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction};
         use serde_json::Value;
         let (_dir, executor) = temp_executor();
 
@@ -6855,18 +7679,29 @@ pub(crate) mod tests {
 
         assert!(outcome.is_error);
         assert!(outcome.output.starts_with("Error:"));
-        let fields = outcome.tool_result_fields.as_ref();
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("dispatch must retain the source I/O facts");
         assert_ne!(
-            fields
-                .and_then(|fields| fields.get("disposition"))
-                .and_then(Value::as_str),
+            fields.get("disposition").and_then(Value::as_str),
             Some("rejected"),
             "an attempted read's I/O failure is not an admission rejection"
         );
-        assert!(
-            fields.and_then(|fields| fields.get("error_kind")).is_none(),
-            "unknown I/O cause must not be guessed from its message"
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(ErrorKind::ToolNotFound.as_str()),
+            "dispatch must preserve the OS-derived failure kind"
         );
+        let evidence: ToolFailureEvidence =
+            serde_json::from_value(fields["recovery_evidence"].clone()).unwrap();
+        assert_eq!(evidence.kind, ErrorKind::ToolNotFound);
+        assert_eq!(evidence.cause, ToolFailureCause::ResourceMissing);
+        assert_eq!(
+            evidence.recovery_actions,
+            [ToolRecoveryAction::VerifyResource]
+        );
+        assert!(!evidence.retryable);
     }
 
     fn assert_typed_workspace_mutation_receipt(outcome: &super::ToolExecutionOutcome) {
@@ -7643,7 +8478,7 @@ pub(crate) mod tests {
         assert_eq!(
             names.contains("run_script"),
             astra_sandbox::process_scope_available(),
-            "run_script visibility must follow the invocation-ownership capability"
+            "run_script visibility follows the available process scope"
         );
         assert!(!names.contains("task_board"));
         assert_eq!(
@@ -7659,7 +8494,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn cli_edge_bash_exposes_managed_background_contract() {
-        let schemas = super::local_tool_schemas();
+        let schemas = super::tool_schemas_with_background(true);
         let bash = schemas
             .iter()
             .find(|schema| {
@@ -7673,15 +8508,17 @@ pub(crate) mod tests {
             .pointer("/function/parameters/properties")
             .and_then(serde_json::Value::as_object)
             .expect("bash properties");
-        assert!(properties.contains_key("run_in_background"));
-        assert!(properties.contains_key("ready_check"));
-        assert!(properties.contains_key("background_ttl"));
+        for field in ["run_in_background", "ready_check", "background_ttl"] {
+            assert_eq!(
+                properties.contains_key(field),
+                astra_tools::schemas::managed_background_bash_supported()
+            );
+        }
     }
 
-    #[cfg(not(unix))]
     #[test]
     fn cli_edge_bash_hides_unsupported_managed_background_contract() {
-        let schemas = super::local_tool_schemas();
+        let schemas = super::tool_schemas_with_background(false);
         let bash = schemas
             .iter()
             .find(|schema| {
@@ -7765,11 +8602,11 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn cli_run_script_is_explicit_shared_tool_delegate() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
+        if !astra_tools::run_script::python3_available()
+            || !astra_sandbox::process_scope_available()
+        {
             return;
         }
-        drop(scope);
         let executor = test_executor();
         let output = executor
             .execute(
@@ -7787,14 +8624,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn run_script_nested_bash_stays_out_of_detach_lane() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
+        if !astra_tools::run_script::python3_available()
+            || !astra_sandbox::process_scope_available()
+        {
             return;
         }
-        drop(scope);
         let (dir, executor) = temp_executor();
-        let (slot, listener) = astra_tools::detach::new_slot_with_handle();
-        let executor = executor.with_bash_detach_slot(slot);
+        let control = astra_tools::detach::ForegroundWaitControl::default();
+        let executor = executor.with_foreground_wait_control(control.clone());
         let future = tokio::spawn(async move {
             executor
                 .execute(
@@ -7811,10 +8648,10 @@ pub(crate) mod tests {
         // script finishes, even without a Ctrl+B signal.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
-            !listener.is_active(),
+            !control.is_active(),
             "run_script RPC Bash must remain foreground-only"
         );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), future)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), future)
             .await
             .expect("nested run_script timeout")
             .expect("nested run_script task");
@@ -8065,96 +8902,11 @@ pub(crate) mod tests {
     // for plugin tools on CLI.
 
     #[tokio::test]
-    async fn task_kill_bg_fails_fast_when_unwired() {
-        let executor = test_executor();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["kind"], "background_task", "{result}");
-        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert!(cli_tool_output_is_error(&result), "{result}");
-    }
-
-    #[tokio::test]
-    async fn task_output_fails_fast_when_unwired() {
-        let executor = test_executor();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_output(&serde_json::json!({
-                "task_id": "bg-shell-1",
-                "block": false
-            })),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["kind"], "background_task", "{result}");
-        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert!(cli_tool_output_is_error(&result), "{result}");
-    }
-
-    #[tokio::test]
-    async fn task_output_cloud_without_edge_runner_names_missing_runner() {
-        let executor = test_executor().with_cloud("https://cloud.example", "token");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_output(&serde_json::json!({
-                "task_id": "bg-shell-1",
-                "block": false
-            })),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["kind"], "background_task", "{result}");
-        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert_eq!(
-            parsed["error"],
-            "no edge runner is attached to this cloud session"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_output_nonblocking_times_out_when_registry_does_not_answer() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_output(&serde_json::json!({
-                "task_id": "bg-shell-1",
-                "block": false,
-                "timeout_ms": 5
-            })),
-        )
-        .await
-        .expect("registry reply timeout should bound task_output");
-
-        assert!(
-            result.contains("Background task registry did not respond within 5ms"),
-            "{result}"
-        );
-        assert!(result.contains("task may still be running"), "{result}");
-    }
-
-    #[tokio::test]
     async fn task_output_projects_fanout_group_when_registry_does_not_answer() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let spawner = test_spawner();
         let ctx = fanout_test_context(spawner.clone());
         let parent = ctx.fanout_admission.clone();
-        let executor = test_executor()
-            .with_spawn_context(ctx)
-            .with_bg_task_commands(commands);
+        let executor = test_executor().with_spawn_context(ctx);
 
         let completed = executor
             .execute(
@@ -8162,6 +8914,7 @@ pub(crate) mod tests {
                 &serde_json::json!({
                     "action": "start",
                     "group_id": "review-fanout",
+                    "title": "Review --token \"fanout-test-secret-987654321\"",
                     "target_count": 1,
                     "slots": [{
                         "id": "review",
@@ -8172,6 +8925,7 @@ pub(crate) mod tests {
             )
             .await;
         let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert!(!completed.contains("fanout-test-secret-987654321"));
         assert_eq!(completed_value["status"], "started", "{completed}");
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -8194,12 +8948,22 @@ pub(crate) mod tests {
                     "timeout_ms": 5
                 }),
                 &mut result_fields,
+                None,
             )
             .await;
 
+        let projected: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(projected["kind"], "agent fanout");
+        assert_eq!(projected["task_id"], "review-fanout");
+        let public_output = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id": "review-fanout"}),
+            )
+            .await;
         assert!(
-            result.contains("Read agent fanout output review-fanout"),
-            "{result}"
+            !public_output.contains("fanout-test-secret-987654321"),
+            "quoted credentials must be redacted before both JSON encodings: {public_output}"
         );
         assert!(result.contains("agent_fanout_group"), "{result}");
         assert!(
@@ -8237,12 +9001,12 @@ pub(crate) mod tests {
             .task_output_with_fields(
                 &serde_json::json!({ "task_id": child_id }),
                 &mut alias_fields,
+                None,
             )
             .await;
-        assert!(
-            alias_result.contains("Read agent fanout output review-fanout"),
-            "{alias_result}"
-        );
+        let alias_projected: Value = serde_json::from_str(&alias_result).unwrap();
+        assert_eq!(alias_projected["kind"], "agent fanout");
+        assert_eq!(alias_projected["task_id"], "review-fanout");
         let alias_observation = alias_fields
             .as_ref()
             .and_then(WorkUnitObservation::from_fields)
@@ -8328,14 +9092,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn repeated_live_child_reads_resolve_to_the_running_fanout_group() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let spawner = gated_test_spawner(release.clone());
-        let executor = Arc::new(
-            test_executor()
-                .with_spawn_context(fanout_test_context(spawner.clone()))
-                .with_bg_task_commands(commands),
-        );
+        let executor =
+            Arc::new(test_executor().with_spawn_context(fanout_test_context(spawner.clone())));
         let launch_executor = executor.clone();
         let launch = tokio::spawn(async move {
             launch_executor
@@ -8376,13 +9136,18 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let mut fields = None;
             let output = executor
-                .task_output_with_fields(&serde_json::json!({"task_id": &child_id}), &mut fields)
+                .task_output_with_fields(
+                    &serde_json::json!({"task_id": &child_id}),
+                    &mut fields,
+                    None,
+                )
                 .await;
-            assert!(
-                output.contains("Read agent fanout output live-review-fanout"),
-                "a known live child must never fall through to background-task not_found: {output}"
-            );
-            assert!(!output.contains("not_found"), "{output}");
+            let snapshot: serde_json::Value = serde_json::from_str(&output)
+                .expect("a live child must return a structured fanout snapshot");
+            assert_eq!(snapshot["ok"], true, "{snapshot}");
+            assert_eq!(snapshot["kind"], "agent fanout", "{snapshot}");
+            assert_eq!(snapshot["task_id"], "live-review-fanout", "{snapshot}");
+            assert_eq!(snapshot["status"], "running", "{snapshot}");
             let observation = fields
                 .as_ref()
                 .and_then(WorkUnitObservation::from_fields)
@@ -8390,6 +9155,14 @@ pub(crate) mod tests {
             assert_eq!(observation.id, "live-review-fanout");
             assert_eq!(observation.status, WorkUnitStatus::Running);
         }
+
+        let unsupported = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":"live-review-fanout","block":true,"wake_on_output":true}),
+            )
+            .await;
+        assert!(unsupported.contains("invalid_argument"), "{unsupported}");
 
         release.add_permits(3);
         let parent = spawner.fanout_parent("run-parent");
@@ -8457,6 +9230,60 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_waits_for_the_actual_local_agent_outcome() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let spawner = gated_test_spawner(release.clone());
+        let executor =
+            Arc::new(test_executor().with_spawn_context(fanout_test_context(spawner.clone())));
+        let launched = executor
+            .execute(
+                "agent",
+                &serde_json::json!({"action":"spawn", "description":"Review", "prompt":"Review"}),
+            )
+            .await;
+        let launched: serde_json::Value = serde_json::from_str(&launched).unwrap();
+        let id = launched["agent_id"].as_str().unwrap();
+        let timed_out = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":id,"block":true,"timeout_ms":10}),
+            )
+            .await;
+        assert!(timed_out.contains("Wait timed out"), "{timed_out}");
+
+        let waiting = executor.clone();
+        let task_id = id.to_string();
+        let wait = tokio::spawn(async move {
+            waiting
+                .execute(
+                    "task_output",
+                    &serde_json::json!({"task_id":task_id,"block":true,"timeout_ms":2000}),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        let completed = wait.await.unwrap();
+        assert!(completed.contains("child result"), "{completed}");
+        assert!(!completed.contains("Wait timed out"), "{completed}");
+        let already_done = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":id,"block":true,"timeout_ms":2000}),
+            )
+            .await;
+        assert!(already_done.contains("child result"), "{already_done}");
+
+        let unknown = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":"unknown-task","block":true,"timeout_ms":2000}),
+            )
+            .await;
+        assert!(unknown.contains("not_found"), "{unknown}");
+    }
+
+    #[tokio::test]
     async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
         let spawner = test_spawner();
         let ctx = fanout_test_context(spawner.clone());
@@ -8469,6 +9296,7 @@ pub(crate) mod tests {
                 &serde_json::json!({
                     "action": "start",
                     "group_id": "review-fanout",
+                    "title": "Review --token \"fanout-test-secret-987654321\"",
                     "target_count": 1,
                     "slots": [{
                         "id": "review",
@@ -8494,8 +9322,9 @@ pub(crate) mod tests {
         assert_eq!(group.summary().active, 0);
 
         let result = executor.task_list_bg().await;
+        assert!(!result.contains("fanout-test-secret-987654321"));
 
-        assert!(result.contains("<background_tasks count=\"0\""), "{result}");
+        assert!(result.contains("<background_tasks count=\"1\""), "{result}");
         assert!(result.contains("<agent_fanouts count=\"1\""), "{result}");
         assert!(result.contains("id=\"review-fanout\""), "{result}");
         assert!(
@@ -8515,201 +9344,6 @@ pub(crate) mod tests {
         assert!(
             !result.contains("Background task unavailable"),
             "recoverable fanout results are a valid task_list surface even without a shell background runner: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_output_blocking_times_out_when_registry_does_not_answer() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_output(&serde_json::json!({
-                "task_id": "bg-shell-1",
-                "block": true,
-                "timeout_ms": 5
-            })),
-        )
-        .await
-        .expect("registry reply timeout should bound blocking task_output");
-
-        assert!(
-            result.contains("Background task registry did not respond within"),
-            "{result}"
-        );
-        assert!(result.contains("task may still be running"), "{result}");
-    }
-
-    #[tokio::test]
-    async fn task_output_defaults_to_nonblocking_snapshot() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "bg-shell-1",
-            "timeout_ms": 10_000
-        });
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let output_fut = executor.task_output(&args);
-            tokio::pin!(output_fut);
-
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        let command = commands.lock_recover().pop();
-                        if let Some(BgTaskCommand::GetOutputSince {
-                            task_id,
-                            offset,
-                            reply,
-                            ..
-                        }) = command
-                        {
-                            assert_eq!(task_id, "bg-shell-1");
-                            assert_eq!(offset, 0);
-                            let _ = reply.send(Ok(bg_snapshot(0, 0, 0, "running", "")));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("default task_output should return the first snapshot without waiting");
-
-        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
-        assert!(output.contains("No output yet"), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_output_without_offset_returns_latest_bounded_shell_tail() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "bg-shell-1",
-            "max_bytes": 100,
-            "timeout_ms": 10_000
-        });
-        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let request_count = requests.clone();
-        let mut result_fields = None;
-        let output = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-            let output_fut = executor.task_output_with_fields(&args, &mut result_fields);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::GetOutputSince { offset, reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let request = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            match request {
-                                0 => {
-                                    assert_eq!(offset, 0);
-                                    let _ = reply.send(Ok(bg_snapshot(100, 1_000, 200, "running", "old prefix")));
-                                }
-                                1 => {
-                                    assert_eq!(offset, 900);
-                                    let _ = reply.send(Ok(bg_snapshot(1_000, 1_000, 200, "running", "latest progress")));
-                                }
-                                _ => panic!("unexpected background output request {request}"),
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("offset-free snapshot should return a bounded tail promptly");
-
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(output.contains("offset 900 -> 1000"), "{output}");
-        assert!(output.contains("latest progress"), "{output}");
-        assert!(!output.contains("old prefix"), "{output}");
-        assert!(output.contains("do_not_poll_again_this_turn"), "{output}");
-        let observation = result_fields
-            .as_ref()
-            .and_then(|fields| fields.get("background_task_observation"))
-            .expect("current shell observation must be structured");
-        assert_eq!(observation["task_id"], "bg-shell-1");
-        assert_eq!(observation["task_kind"], "shell");
-        assert_eq!(observation["mode"], "current");
-        assert!(
-            result_fields
-                .as_ref()
-                .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-                .is_none(),
-            "task_output is a reader; only the shell producer may advance lifecycle revision"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_output_pattern_uses_typed_bounded_diagnostic_search() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "bg-shell-1",
-            "pattern": "failing_test_name",
-            "context_lines": 5,
-            "max_bytes": 4096,
-            "timeout_ms": 10_000
-        });
-        let mut result_fields = None;
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let output_fut = executor.task_output_with_fields(&args, &mut result_fields);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::SearchOutput {
-                            task_id,
-                            pattern,
-                            context_lines,
-                            max_bytes,
-                            reply,
-                        }) = commands.lock_recover().pop()
-                        {
-                            assert_eq!(task_id, "bg-shell-1");
-                            assert_eq!(pattern, "failing_test_name");
-                            assert_eq!(context_lines, 5);
-                            assert_eq!(max_bytes, 4096);
-                            let _ = reply.send(Ok(BgTaskOutputSearchSnapshot {
-                                kind: "shell".to_string(),
-                                title: Some("cargo test".to_string()),
-                                output: "[stdout lines 40-42]\n41: panic detail\n".to_string(),
-                                matching_lines: 1,
-                                truncated: false,
-                                status: BgTaskOutputStatus::Failed,
-                                output_ref: "stdout: /tmp/bg-shell-1.stdout".to_string(),
-                            }));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("diagnostic search should return promptly");
-
-        assert!(
-            output.contains("Search shell output bg-shell-1"),
-            "{output}"
-        );
-        assert!(output.contains("pattern \"failing_test_name\""), "{output}");
-        assert!(output.contains("panic detail"), "{output}");
-        assert!(output.contains("not a classification"), "{output}");
-        let observation = result_fields
-            .as_ref()
-            .and_then(|fields| fields.get("background_task_observation"))
-            .expect("diagnostic search observation must be structured");
-        assert_eq!(observation["mode"], "diagnostic");
-        assert_eq!(observation["terminal"], true);
-        assert_eq!(observation["matching_lines"], 1);
-        assert!(
-            result_fields
-                .as_ref()
-                .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-                .is_none(),
-            "diagnostic reads must not publish lifecycle identity or revision"
         );
     }
 
@@ -8753,365 +9387,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn task_output_blocking_waits_for_terminal_not_ordinary_output_growth() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "bg-shell-1",
-            "block": true,
-            "max_bytes": 100,
-            "timeout_ms": 500
-        });
-        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let request_count = requests.clone();
-        let output = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-            let output_fut = executor.task_output(&args);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::GetOutputSince { offset, reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let request = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            match request {
-                                0 => {
-                                    assert_eq!(offset, 0);
-                                    let _ = reply.send(Ok(bg_snapshot(100, 100, 10, "running", "initial")));
-                                }
-                                1 => {
-                                    assert_eq!(offset, 100);
-                                    let _ = reply.send(Ok(bg_snapshot(120, 120, 12, "running", "ordinary progress")));
-                                }
-                                2 => {
-                                    assert_eq!(offset, 120);
-                                    let _ = reply.send(Ok(bg_snapshot(130, 130, 13, "completed", "done")));
-                                }
-                                3 => {
-                                    assert_eq!(offset, 0);
-                                    let _ = reply.send(Ok(bg_snapshot(100, 130, 13, "completed", "old final prefix")));
-                                }
-                                4 => {
-                                    assert_eq!(offset, 30);
-                                    let _ = reply.send(Ok(bg_snapshot(130, 130, 13, "completed", "latest final tail")));
-                                }
-                                _ => panic!("unexpected background output request {request}"),
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("one blocking call should own the wait through terminal state");
-
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
-        assert!(output.contains("terminal true"), "{output}");
-        assert!(output.contains("completed"), "{output}");
-        assert!(output.contains("latest final tail"), "{output}");
-        assert!(!output.contains("ordinary progress"), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_output_blocking_wakes_when_local_agent_needs_input() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "agent-1",
-            "block": true,
-            "timeout_ms": 500
-        });
-        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let request_count = requests.clone();
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let output_fut = executor.task_output(&args);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::GetOutputSince { offset, reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            assert_eq!(offset, 0);
-                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let mut snapshot = bg_snapshot(
-                                28,
-                                28,
-                                1,
-                                "waiting_for_input",
-                                "Agent is waiting for input.",
-                            );
-                            snapshot.kind = "local agent".to_string();
-                            let _ = reply.send(Ok(snapshot));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("required input must wake one blocking observation promptly");
-
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(output.contains("needs input"), "{output}");
-        assert!(output.contains("Agent is waiting for input"), "{output}");
-        assert!(!output.contains("Wait timed out"), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_output_blocking_owns_wait_until_timeout_despite_output_growth() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({
-            "task_id": "bg-shell-1",
-            "block": true,
-            "timeout_ms": 25
-        });
-        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let request_count = requests.clone();
-        let started = std::time::Instant::now();
-        let output = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-            let output_fut = executor.task_output(&args);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::GetOutputSince { offset, reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let request = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let total = (request as u64 + 1) * 10;
-                            let _ = reply.send(Ok(bg_snapshot(
-                                total.max(offset),
-                                total.max(offset),
-                                request as u64 + 1,
-                                "running",
-                                "ordinary progress",
-                            )));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("runtime-owned wait must remain bounded");
-
-        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
-        assert!(
-            requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "wait should observe growth internally before timing out"
-        );
-        assert!(output.contains("Wait timed out after 25ms"), "{output}");
-        assert!(output.contains("ordinary progress"), "{output}");
-        assert!(
-            output.contains("Do not poll again in this turn"),
-            "{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_output_maps_typed_not_found_reply_without_text_classification() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({"task_id": "bg-shell-missing"});
-
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let output_fut = executor.task_output(&args);
-            tokio::pin!(output_fut);
-            loop {
-                tokio::select! {
-                    output = &mut output_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::GetOutputSince { reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let _ = reply.send(Err(BackgroundTaskError::NotFound {
-                                task_id: "bg-shell-missing".into(),
-                            }));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("typed registry error should return promptly");
-
-        let result = parse_control_result(&output);
-        assert_eq!(result["ok"], false, "{output}");
-        assert_eq!(result["status"], "not_found", "{output}");
-        assert_eq!(result["task_id"], "bg-shell-missing", "{output}");
-        assert!(cli_tool_output_is_error(&output), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_stop_cloud_without_edge_runner_names_missing_runner() {
-        let executor = test_executor().with_cloud("https://cloud.example", "token");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["kind"], "background_task", "{result}");
-        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert_eq!(
-            parsed["error"],
-            "no edge runner is attached to this cloud session"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_stop_times_out_when_registry_does_not_answer() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
-        )
-        .await
-        .expect("registry reply timeout should bound task_stop");
-
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["status"], "stop_status_unknown", "{result}");
-        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
-        assert!(cli_tool_output_is_error(&result), "{result}");
-    }
-
-    #[tokio::test]
-    async fn task_stop_maps_typed_terminal_reply_without_text_classification() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({"task_id": "bg-shell-1"});
-
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let stop_fut = executor.task_kill_bg(&args);
-            tokio::pin!(stop_fut);
-            loop {
-                tokio::select! {
-                    output = &mut stop_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::Kill { reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let _ = reply.send(Err(BackgroundTaskError::AlreadyTerminated {
-                                task_id: "bg-shell-1".into(),
-                            }));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("typed registry error should return promptly");
-
-        let result = parse_control_result(&output);
-        assert_eq!(result["ok"], true, "{output}");
-        assert_eq!(result["status"], "already_terminal", "{output}");
-        assert_eq!(result["terminal"], true, "{output}");
-        assert!(!cli_tool_output_is_error(&output), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_stop_reports_accepted_request_without_claiming_terminal_state() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands.clone());
-        let args = serde_json::json!({"task_id": "bg-shell-1"});
-
-        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let stop_fut = executor.task_kill_bg(&args);
-            tokio::pin!(stop_fut);
-            loop {
-                tokio::select! {
-                    output = &mut stop_fut => break output,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        if let Some(BgTaskCommand::Kill { reply, .. }) =
-                            commands.lock_recover().pop()
-                        {
-                            let _ = reply.send(Ok(()));
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("typed stop receipt should return promptly");
-
-        let result = parse_control_result(&output);
-        assert_eq!(result["ok"], true, "{output}");
-        assert_eq!(result["status"], "stop_requested", "{output}");
-        assert_eq!(result["terminal"], false, "{output}");
-        assert!(!cli_tool_output_is_error(&output), "{output}");
-    }
-
-    #[tokio::test]
-    async fn task_list_cloud_without_edge_runner_names_missing_runner() {
-        let executor = test_executor().with_cloud("https://cloud.example", "token");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_list_bg(),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["kind"], "background_task_list", "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert_eq!(
-            parsed["error"],
-            "no edge runner is attached to this cloud session"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_times_out_when_registry_does_not_answer() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_list_bg(),
-        )
-        .await
-        .expect("registry reply timeout should bound task_list");
-
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["status"], "registry_timeout", "{result}");
-        assert!(
-            parsed["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("retry task_list")),
-            "{result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_bg_fails_fast_when_unwired() {
-        let executor = test_executor();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            executor.task_list_bg(),
-        )
-        .await
-        .expect("should fail fast, not hang");
-        let parsed = parse_control_result(&result);
-        assert_eq!(parsed["ok"], false, "{result}");
-        assert_eq!(parsed["status"], "unavailable", "{result}");
-        assert_eq!(
-            parsed["error"],
-            "local background tasks require an interactive CLI session"
-        );
-    }
-
-    #[tokio::test]
     async fn task_output_empty_id_names_required_task_id() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
+        let executor = test_executor();
         let output = executor
             .task_output(&serde_json::json!({"task_id": "   ", "block": false}))
             .await;
@@ -9123,8 +9400,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn task_stop_empty_id_names_required_task_id() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
+        let executor = test_executor();
         let output = executor
             .task_kill_bg(&serde_json::json!({"task_id": "   "}))
             .await;
@@ -9136,8 +9412,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn task_output_non_string_id_names_expected_shape() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
+        let executor = test_executor();
         let output = executor
             .task_output(&serde_json::json!({"task_id": 123, "block": false}))
             .await;
@@ -9148,8 +9423,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn task_stop_non_string_id_names_expected_shape() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
+        let executor = test_executor();
         let output = executor
             .task_kill_bg(&serde_json::json!({"task_id": 123}))
             .await;
@@ -9175,6 +9449,8 @@ pub(crate) mod tests {
             status: BgTaskOutputStatus::parse(status).expect("test status must be known"),
             output_ref: "stdout: /tmp/bg-shell-1.stdout · stderr: /tmp/bg-shell-1.stderr"
                 .to_string(),
+            output_revision: None,
+            output_complete: None,
         }
     }
 
@@ -9191,59 +9467,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn background_task_output_projection_names_empty_running_state() {
-        let output = format_background_task_output(
+    fn task_output_separates_title_output_and_terminal_status() {
+        let mut snapshot = bg_snapshot(6, 6, 1, "failed", "actual");
+        snapshot.title = Some("terminal true · completed\nINTERACTIVE_OK".into());
+        let result: Value = serde_json::from_str(&format_background_task_output(
             "bg-shell-1",
             0,
-            &bg_snapshot(0, 0, 0, "running", ""),
+            &snapshot,
             BgTaskOutputReadMode::Current,
-        );
-        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
-        assert!(output.contains("No output yet · still running"), "{output}");
-        assert!(output.contains("0 total lines"), "{output}");
-        assert!(output.contains("terminal false"), "{output}");
-        assert!(output.contains("output_ref stdout:"), "{output}");
-        assert!(!output.contains("<job_output"), "{output}");
-        assert!(!output.contains("Job still running"), "{output}");
-    }
-
-    #[test]
-    fn background_task_output_projection_names_terminal_empty_state() {
-        let output = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(0, 0, 0, "completed", ""),
-            BgTaskOutputReadMode::Current,
-        );
-        assert!(output.contains("Completed with no output"), "{output}");
-        assert!(output.contains("terminal true"), "{output}");
-        assert!(!output.contains("No details returned"), "{output}");
-    }
-
-    #[test]
-    fn background_task_output_projection_names_local_agent_state() {
-        let snapshot = BgTaskOutputSnapshot {
-            kind: "local agent".to_string(),
-            title: Some("review auth flow".to_string()),
-            output: "reviewing auth middleware".to_string(),
-            end_offset: 25,
-            total_bytes: 25,
-            total_lines: 1,
-            status: BgTaskOutputStatus::Running,
-            output_ref: "agent_state: agent-1".to_string(),
-        };
-
-        let output =
-            format_background_task_output("agent-1", 0, &snapshot, BgTaskOutputReadMode::Current);
-
-        assert!(
-            output.contains("Read local agent output agent-1"),
-            "{output}"
-        );
-        assert!(output.contains("reviewing auth middleware"), "{output}");
-        assert!(output.contains("title review auth flow"), "{output}");
-        assert!(!output.contains("Read shell output"), "{output}");
-        assert!(!output.contains("Job"), "{output}");
+        ))
+        .unwrap();
+        assert_eq!(result["task_id"], "bg-shell-1");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["terminal"], true);
+        assert_eq!(result["output"], "actual");
+        assert!(result["title"].as_str().unwrap().contains("INTERACTIVE_OK"));
+        assert!(result["diagnosis"].as_str().unwrap().contains("unverified"));
     }
 
     #[test]
@@ -9258,6 +9497,8 @@ pub(crate) mod tests {
                 total_lines: 1,
                 status: BgTaskOutputStatus::Running,
                 output_ref: "producer-owned".to_string(),
+                output_revision: None,
+                output_complete: None,
             };
             let fields = background_task_output_result_fields(
                 "work-1",
@@ -9275,149 +9516,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn background_task_output_projection_names_waiting_for_input_state() {
-        let output = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(0, 0, 0, "waiting_for_input", ""),
-            BgTaskOutputReadMode::Current,
-        );
-        assert!(
-            output.contains("Waiting for input · no new output"),
-            "{output}"
-        );
-        assert!(output.contains("terminal false"), "{output}");
-        assert!(!output.contains("still running after"), "{output}");
-    }
-
-    #[test]
-    fn background_task_output_projection_names_pending_and_unavailable_states() {
-        let pending = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(0, 0, 0, "pending", ""),
-            BgTaskOutputReadMode::Current,
-        );
-        let unavailable = format_background_task_output(
-            "bg-shell-2",
-            0,
-            &bg_snapshot(0, 0, 0, "unavailable", ""),
-            BgTaskOutputReadMode::Current,
-        );
-
-        assert!(pending.contains("Pending · no output yet"), "{pending}");
-        assert!(
-            unavailable.contains("Unavailable · stale handle or unsupported runner"),
-            "{unavailable}"
-        );
-        assert!(!pending.contains("No details returned"), "{pending}");
-        assert!(
-            !unavailable.contains("No details returned"),
-            "{unavailable}"
-        );
-    }
-
-    #[test]
-    fn background_task_output_projection_hides_internal_waiting_status_with_new_output() {
-        let output = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(14, 14, 1, "waiting_for_input", "Continue? (y/n)\n"),
-            BgTaskOutputReadMode::Current,
-        );
-        assert!(output.contains("needs input"), "{output}");
-        assert!(output.contains("Continue? (y/n)"), "{output}");
-        assert!(!output.contains("waiting_for_input"), "{output}");
-    }
-
-    #[test]
-    fn background_task_output_projection_names_failed_and_cancelled_empty_states() {
-        let failed = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(0, 0, 0, "failed", ""),
-            BgTaskOutputReadMode::Current,
-        );
-        let cancelled = format_background_task_output(
-            "bg-shell-2",
-            0,
-            &bg_snapshot(0, 0, 0, "cancelled", ""),
-            BgTaskOutputReadMode::Current,
-        );
-        assert!(failed.contains("Failed with no output"), "{failed}");
-        assert!(cancelled.contains("Stopped with no output"), "{cancelled}");
-        assert!(!failed.contains("Completed with no output"), "{failed}");
-        assert!(
-            !cancelled.contains("Completed with no output"),
-            "{cancelled}"
-        );
-        assert!(failed.contains("failure_cause unverified"), "{failed}");
-        assert!(failed.contains("task_output(pattern=...)"), "{failed}");
-        assert!(
-            failed.contains("not evidence that a test is flaky"),
-            "{failed}"
-        );
-    }
-
-    #[test]
-    fn background_task_output_projection_reports_total_lines() {
-        let output = format_background_task_output(
-            "bg-shell-1",
-            0,
-            &bg_snapshot(12, 12, 2, "running", "hello\nworld\n"),
-            BgTaskOutputReadMode::Current,
-        );
-        assert!(output.contains("2 new lines"), "{output}");
-        assert!(output.contains("2 total lines"), "{output}");
-        assert!(output.contains("Output chunk:"), "{output}");
-        assert!(output.contains("hello"), "{output}");
-        assert!(output.contains("world"), "{output}");
-        assert!(output.contains("next_offset 12"), "{output}");
-        assert!(
-            output.contains("later_call task_output(task_id='bg-shell-1', block=false)"),
-            "{output}"
-        );
-        assert!(output.contains("do_not_poll_again_this_turn"), "{output}");
-        assert!(!output.contains("\n└ world"), "{output}");
-    }
-
-    #[test]
-    fn current_snapshot_never_invites_live_log_pagination() {
-        let snapshot = bg_snapshot(900, 1_000, 20, "running", "latest bounded chunk");
-        let current = format_background_task_output(
+    fn task_output_reports_status_and_live_or_historical_cursor() {
+        for (status, terminal) in [
+            ("pending", false),
+            ("running", false),
+            ("waiting_for_input", false),
+            ("completed", true),
+            ("failed", true),
+            ("cancelled", true),
+            ("unavailable", true),
+        ] {
+            let snapshot = bg_snapshot(900, 1_000, 20, status, "latest bounded chunk");
+            let result: Value = serde_json::from_str(&format_background_task_output(
+                "bg-shell-1",
+                800,
+                &snapshot,
+                BgTaskOutputReadMode::Current,
+            ))
+            .unwrap();
+            assert_eq!(result["status"], status);
+            assert_eq!(result["terminal"], terminal);
+            assert_eq!(result["output"], "latest bounded chunk");
+            if !terminal {
+                assert!(result.get("next_offset").is_none(), "{result}");
+            }
+        }
+        let result: Value = serde_json::from_str(&format_background_task_output(
             "bg-shell-1",
             800,
-            &snapshot,
-            BgTaskOutputReadMode::Current,
-        );
-        let historical = format_background_task_output(
-            "bg-shell-1",
-            800,
-            &snapshot,
+            &bg_snapshot(900, 1_000, 20, "completed", "tail"),
             BgTaskOutputReadMode::Historical,
-        );
-
-        assert!(current.contains("do_not_poll_again_this_turn"), "{current}");
-        assert!(!current.contains("offset=900"), "{current}");
-        assert!(historical.contains("offset=900"), "{historical}");
+        ))
+        .unwrap();
+        assert_eq!(result["next_offset"], 900);
+        assert_eq!(result["more_output"], true);
     }
 
     #[test]
-    fn background_task_output_projection_names_wait_timeout_without_job_vocabulary() {
-        let output = format_background_task_output_wait_timeout(
+    fn task_output_timeout_is_an_observation_not_a_stop() {
+        let result: Value = serde_json::from_str(&format_background_task_output_wait_timeout(
             "bg-shell-1",
-            42,
+            0,
             250,
-            &bg_snapshot(42, 42, 2, "running", ""),
-        );
-        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
-        assert!(output.contains("Wait timed out after 250ms"), "{output}");
-        assert!(output.contains("still non-terminal"), "{output}");
+            &bg_snapshot(0, 0, 0, "running", ""),
+        ))
+        .unwrap();
+        assert_eq!(result["wait_result"], "timeout");
+        assert_eq!(result["terminal"], false);
         assert!(
-            output.contains("Do not poll again in this turn"),
-            "{output}"
+            result["notice"]
+                .as_str()
+                .unwrap()
+                .contains("was not stopped")
         );
-        assert!(!output.contains("Job"), "{output}");
     }
 
     #[test]
@@ -9446,9 +9597,10 @@ pub(crate) mod tests {
         assert!(
             result["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("/tmp/astra/bg-shell-1.stdout")),
+                .is_some_and(|error| error.contains("missing")),
             "{output}"
         );
+        assert!(!output.contains("/tmp/astra/bg-shell-1.stdout"), "{output}");
     }
 
     #[test]
@@ -9700,36 +9852,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_future_agent_action_fails_closed_on_runtime_binding() {
-        let executor = test_executor();
-        executor.set_current_visible_tool_schemas(&[
-            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
-            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
-        ]);
-
-        let outcome = executor
-            .execute_with_metadata(
-                "agent",
-                &serde_json::json!({"action": "stop", "agent_id": "a1"}),
-            )
-            .await;
-        let output = &outcome.output;
-
-        assert!(
-            output.contains("multi-agent runtime is not connected"),
-            "future executor action must fail closed on missing binding; got: {output}"
-        );
-        assert_eq!(
-            outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("error_kind"))
-                .and_then(serde_json::Value::as_str),
-            Some(astra_core::ErrorKind::ToolBinding.as_str())
-        );
-    }
-
-    #[tokio::test]
     async fn tool_search_select_cannot_activate_policy_hidden_tool() {
         let executor = test_executor();
         executor.set_current_visible_tool_schemas(&[
@@ -9831,6 +9953,7 @@ pub(crate) mod tests {
             .await;
         let parsed: serde_json::Value =
             serde_json::from_str(&out).expect("introspect must return JSON");
+        assert_eq!(parsed["shell_task_controls"], false);
 
         let inactive: Vec<&str> = parsed["capabilities_inactive"]
             .as_array()
@@ -9842,7 +9965,7 @@ pub(crate) mod tests {
         );
         assert!(
             inactive.contains(&"LocalBackgroundTasks"),
-            "bare executor must report LocalBackgroundTasks inactive; got {out}"
+            "a headless executor without a session owner must report task controls inactive; got {out}"
         );
         assert!(
             !inactive.contains(&"PlanLifecycle"),
@@ -9863,20 +9986,25 @@ pub(crate) mod tests {
             .unwrap_or_default();
         assert!(missing.contains(&"AgentSpawner"));
 
-        let task_output_drop = dropped.iter().find(|entry| entry["name"] == "task_output");
         assert!(
-            task_output_drop.is_some(),
-            "task_output must be capability-dropped without a background registry; got {out}"
+            dropped.iter().any(|entry| entry["name"] == "task_output"),
+            "headless task output must not be advertised without an owner: {out}"
         );
-        let missing: Vec<&str> = task_output_drop.unwrap()["missing"]
-            .as_array()
-            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
-            .unwrap_or_default();
-        assert!(missing.contains(&"LocalBackgroundTasks"));
 
         let providers = parsed["capacity_provider_coverage"]
             .as_array()
             .expect("capacity_provider_coverage");
+        let control = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "control_plane")
+            .unwrap();
+        assert!(
+            !control["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == "local_background_tasks")
+        );
         let cli_local = providers
             .iter()
             .find(|provider| provider["provider_type"] == "cli_local")
@@ -9898,53 +10026,6 @@ pub(crate) mod tests {
         assert_eq!(
             mcp["unavailable_reason"].as_str(),
             Some("no_cli_mcp_provider_bound")
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_info_capability_reports_background_tasks_active_when_wired() {
-        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executor = test_executor().with_bg_task_commands(commands);
-        let out = executor
-            .execute(
-                "get_agent_info",
-                &serde_json::json!({"dimension": "capability"}),
-            )
-            .await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&out).expect("introspect must return JSON");
-
-        let active: Vec<&str> = parsed["capabilities_active"]
-            .as_array()
-            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
-            .unwrap_or_default();
-        assert!(
-            active.contains(&"LocalBackgroundTasks"),
-            "wired executor must report LocalBackgroundTasks active; got {out}"
-        );
-
-        let dropped = parsed["tools_dropped_by_capability"]
-            .as_array()
-            .expect("tools_dropped_by_capability");
-        assert!(
-            !dropped.iter().any(|entry| entry["name"] == "task_output"),
-            "task_output must be visible when LocalBackgroundTasks is active; got {out}"
-        );
-
-        let providers = parsed["capacity_provider_coverage"]
-            .as_array()
-            .expect("capacity_provider_coverage");
-        let control_plane = providers
-            .iter()
-            .find(|provider| provider["provider_type"] == "control_plane")
-            .expect("CLI introspect must expose control-plane provider coverage");
-        assert!(
-            control_plane["capabilities"]
-                .as_array()
-                .is_some_and(|capabilities| capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == Some("local_background_tasks"))),
-            "control-plane provider should report local background task capacity when wired; got {out}"
         );
     }
 
@@ -10897,7 +10978,7 @@ pub(crate) mod tests {
         assert!(astra_services::session_journal::journal_content_redact_enabled());
         let (work, executor) = temp_executor();
         let executor = executor.with_active_session_id("private-file-edits");
-        let path = work.path().join("result.txt");
+        let path = executor.effective_project_root().join("result.txt");
         let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
             "path": "result.txt", "content": "18\n"
         }));
@@ -10909,7 +10990,11 @@ pub(crate) mod tests {
             let entry = journal.entries().next().unwrap();
             assert!(entry.before_content.is_none());
             assert_eq!(entry.after_content, b"18\n");
-            journal.undo_file(&path).unwrap().unwrap();
+            assert_eq!(
+                entry.path.canonicalize().unwrap(),
+                path.canonicalize().unwrap()
+            );
+            journal.undo_file(&entry.path).unwrap().unwrap();
         }
         assert!(!path.exists());
 
@@ -10919,12 +11004,15 @@ pub(crate) mod tests {
             "path": "result.txt", "content": "private replacement\n"
         }));
         assert!(applied);
-        executor
-            .file_journal
-            .lock_recover()
-            .undo_file(&path)
-            .unwrap()
-            .unwrap();
+        {
+            let journal = executor.file_journal.lock_recover();
+            let recorded = &journal.entries().last().unwrap().path;
+            assert_eq!(
+                recorded.canonicalize().unwrap(),
+                path.canonicalize().unwrap()
+            );
+            journal.undo_file(recorded).unwrap().unwrap();
+        }
         assert_eq!(std::fs::read(&path).unwrap(), b"private preimage\n");
         assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
 
@@ -10985,10 +11073,12 @@ pub(crate) mod tests {
                 assert!(applied);
                 let journal = shared.lock_recover();
                 assert_eq!(journal.len(), usize::from(prebound) + 1);
-                journal
-                    .undo_file(&work.path().join("private.txt"))
-                    .unwrap()
-                    .unwrap();
+                let recorded = &journal.entries().last().unwrap().path;
+                assert_eq!(
+                    recorded.canonicalize().unwrap(),
+                    work.path().join("private.txt").canonicalize().unwrap()
+                );
+                journal.undo_file(recorded).unwrap().unwrap();
                 assert!(!work.path().join("private.txt").exists());
                 assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
                 if let Some(original) = original {
@@ -11174,6 +11264,9 @@ pub(crate) mod tests {
         let prior = astra_turn_core::file_edit_journal::FileEditEntry {
             sequence: 0,
             path: PathBuf::from("/tmp/prior.txt"),
+            workspace_root: None,
+            #[cfg(unix)]
+            parent_binding: None,
             turn_index: 5,
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             before_content: Some(b"p".to_vec()),
@@ -11219,6 +11312,9 @@ pub(crate) mod tests {
             let entry = astra_turn_core::file_edit_journal::FileEditEntry {
                 sequence: i,
                 path: PathBuf::from(format!("/tmp/prior-{i}.txt")),
+                workspace_root: None,
+                #[cfg(unix)]
+                parent_binding: None,
                 turn_index: 0,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 before_content: None,
@@ -11485,6 +11581,7 @@ pub(crate) mod tests {
     mod cross_file_caller_tests;
     mod env_tests;
     mod executor_core_tests;
+    mod task_execution_tests;
 
     mod lsp_tests;
     mod read_file_range_tests;

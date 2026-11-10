@@ -106,13 +106,15 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-02-v119";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-09-v123";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             model_alias VARCHAR(100) NOT NULL,
             model_name VARCHAR(255) NOT NULL,
             provider VARCHAR(50) NOT NULL,
+            inference_protocol VARCHAR(32) NULL,
+            responses_reasoning_history VARCHAR(16) NULL,
             api_key_encrypted TEXT NULL,
             connection_id VARCHAR(64) NULL,
             base_url VARCHAR(500) NOT NULL,
@@ -1219,7 +1221,7 @@ where
 /// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
 /// decorrelating an EXISTS, letting another Session hide this one's owner.
 /// Callers retain the lifecycle/Session fence and current-read locks.
-fn push_session_execution_activity(
+fn push_session_active_runs(
     query: &mut sqlx::QueryBuilder<MySql>,
     user_id: &str,
     session_id: &str,
@@ -1237,8 +1239,23 @@ fn push_session_execution_activity(
     if let Some(run_id) = except_run_id {
         query.push(" AND executor.run_id <> ").push_bind(run_id);
     }
-    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active, CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ")
-        .push_bind(user_id).push(" AND custody.session_id = ").push_bind(session_id)
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active");
+}
+
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    push_session_active_runs(query, user_id, session_id, except_run_id);
+    query
+        .push(
+            ", CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ",
+        )
+        .push_bind(user_id)
+        .push(" AND custody.session_id = ")
+        .push_bind(session_id)
         .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
     if let Some(run_id) = except_run_id {
         query.push(" AND custody.run_id <> ").push_bind(run_id);
@@ -1268,12 +1285,14 @@ impl SessionExecutionActivity {
 /// New independent executions check occupancy in their existing owned Session
 /// read, before inserting a Run. Excluding the requested Run key permits only
 /// the unique-key replay path; a duplicate never returns a new execution grant.
+/// Return the capture override from the same locked read. The outer `None`
+/// means occupied; the inner `None` uses the runtime's default.
 pub(crate) async fn admit_independent_run_creation<T>(
     tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
-) -> Result<bool, sqlx::Error>
+) -> Result<Option<Option<bool>>, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1285,8 +1304,15 @@ where
             }
             error => error,
         })?;
-    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT session.status, ");
-    push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT session.status, CAST(CASE \
+         WHEN JSON_TYPE(session.metadata) = 'OBJECT' \
+          AND JSON_TYPE(JSON_EXTRACT(session.metadata, '$.full_llm_capture')) = 'BOOLEAN' \
+         THEN CASE JSON_UNQUOTE(JSON_EXTRACT(session.metadata, '$.full_llm_capture')) \
+          WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE -1 END \
+         ELSE NULL END AS SIGNED) AS full_llm_capture_override, ",
+    );
+    push_session_active_runs(&mut query, user_id, session_id, Some(run_id));
     query
         .push(" FROM agent_sessions session WHERE session.user_id = ")
         .push_bind(user_id)
@@ -1302,7 +1328,37 @@ where
     if status != "active" {
         return Err(sqlx::Error::RowNotFound);
     }
-    Ok(SessionExecutionActivity::from_row(&row)?.is_idle())
+    if row.try_get::<i64, _>("execution_active")? != 0 {
+        return Ok(None);
+    }
+    let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => {
+            return Err(sqlx::Error::Protocol(
+                "invalid session capture override".into(),
+            ));
+        }
+    };
+    Ok(Some(capture))
+}
+
+/// Read live Run owners under an existing Session fence. Old unknown tool
+/// outcomes remain in their invocation ledger, but are not live Run owners.
+pub(crate) async fn session_has_active_run<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_active_runs(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    Ok(row.try_get::<i64, _>("execution_active")? != 0)
 }
 
 /// Read actual Run/lease/effect custody under an already held Session fence.
@@ -1900,51 +1956,67 @@ fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> 
     })
 }
 
-fn validate_edge_pending_dispatch_result_storage(
+fn validate_edge_pending_dispatch_text_storage(
+    column: &str,
     data_type: &str,
     nullable: bool,
+    expected_nullable: bool,
 ) -> Result<(), sqlx::Error> {
     // MatrixOne reports declared LONGTEXT as TEXT.
-    if nullable
+    if nullable == expected_nullable
         && (data_type.eq_ignore_ascii_case("longtext") || data_type.eq_ignore_ascii_case("text"))
     {
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "edge_pending_dispatch.result_json requires nullable lossless text storage, found {data_type} (nullable={nullable}); recreate the database"
+        "edge_pending_dispatch.{column} requires lossless text storage (nullable={expected_nullable}), found {data_type} (nullable={nullable}); recreate the database"
     )))
 }
 
-/// Validate lossless storage for the bytes hashed by the Edge dispatch protocol.
-async fn ensure_edge_pending_dispatch_result_json_lossless(
+/// Both the request and receipt must survive storage without JSON normalization.
+async fn ensure_edge_pending_dispatch_text_storage(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
     validate_schema_identifier(database, "matrixone database")?;
-    let row = query(
-        "SELECT DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+    let rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'edge_pending_dispatch' \
-           AND COLUMN_NAME = 'result_json' LIMIT 1",
+           AND COLUMN_NAME IN ('payload_json', 'result_json')",
     )
     .bind(database)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| {
-        sqlx::Error::Protocol(
-            "edge_pending_dispatch.result_json is missing after table creation".to_string(),
-        )
-    })?;
-    let data_type: String = row.try_get("DATA_TYPE")?;
-    let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-        "YES" => true,
-        "NO" => false,
-        value => {
-            return Err(sqlx::Error::Protocol(format!(
-                "edge_pending_dispatch.result_json has invalid IS_NULLABLE value {value}"
-            )));
-        }
-    };
-    validate_edge_pending_dispatch_result_storage(&data_type, nullable)
+    .fetch_all(pool)
+    .await?;
+    for (column, expected_nullable) in [("payload_json", false), ("result_json", true)] {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.try_get::<String, _>("COLUMN_NAME")
+                    .is_ok_and(|name| name.eq_ignore_ascii_case(column))
+            })
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(format!(
+                    "edge_pending_dispatch.{column} is missing after table creation"
+                ))
+            })?;
+        let data_type: String = row.try_get("DATA_TYPE")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "edge_pending_dispatch.{column} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        validate_edge_pending_dispatch_text_storage(
+            column,
+            &data_type,
+            nullable,
+            expected_nullable,
+        )?;
+    }
+    Ok(())
 }
 
 async fn existing_table_columns(
@@ -3103,7 +3175,7 @@ async fn ensure_core_schema_while_leased(
                 (delete_requested_at, user_id, session_id),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
-            INDEX idx_agent_sessions_active_plan_id (active_plan_id),
+            INDEX idx_agent_sessions_active_plan_id (user_id, active_plan_id),
             INDEX idx_agent_sessions_config_version (config_version_id),
             INDEX idx_sessions_project (user_id, project_id, updated_at)
         )",
@@ -4333,7 +4405,7 @@ async fn ensure_core_schema_while_leased(
             turn_chain_id VARCHAR(128) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
-            payload_json JSON NOT NULL,
+            payload_json LONGTEXT NOT NULL,
             result_json LONGTEXT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             pod_id VARCHAR(128) NULL,
@@ -4341,7 +4413,7 @@ async fn ensure_core_schema_while_leased(
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_status_user (status, user_id, edge_agent_id, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -4757,6 +4829,26 @@ async fn verify_core_schema_shape(
                 )));
             }
         }
+        if table == "user_llm_models"
+            && matches!(
+                column.as_str(),
+                "inference_protocol" | "responses_reasoning_history"
+            )
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")?
+                    != Some(if column == "inference_protocol" {
+                        32
+                    } else {
+                        16
+                    }))
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid user_llm_models.{column} shape"
+            )));
+        }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
             && (!row
@@ -4901,7 +4993,13 @@ async fn verify_core_schema_shape(
         ("infra_llm_models", &["thinking_probe_json"][..]),
         (
             "user_llm_models",
-            &["thinking_probe_json", "api_key_encrypted", "connection_id"][..],
+            &[
+                "thinking_probe_json",
+                "api_key_encrypted",
+                "responses_reasoning_history",
+                "connection_id",
+                "inference_protocol",
+            ][..],
         ),
     ] {
         for column in required {
@@ -5584,7 +5682,7 @@ async fn verify_core_schema_shape(
         "PRIMARY",
         &["user_id", "registry_id"],
     )?;
-    ensure_edge_pending_dispatch_result_json_lossless(pool, database).await?;
+    ensure_edge_pending_dispatch_text_storage(pool, database).await?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -5603,11 +5701,11 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "edge_pending_dispatch",
-        "idx_edge_dispatch_user_status",
+        "idx_edge_dispatch_status_user",
         &[
+            "status",
             "user_id",
             "edge_agent_id",
-            "status",
             "created_at",
             "session_id",
             "run_id",
@@ -6460,13 +6558,30 @@ mod tests {
     }
 
     #[test]
-    fn edge_dispatch_result_storage_requires_nullable_lossless_text() {
-        for data_type in ["longtext", "text", "TEXT"] {
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_ok());
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, false).is_err());
-        }
-        for data_type in ["json", "mediumtext"] {
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_err());
+    fn edge_dispatch_storage_requires_lossless_text_with_correct_nullability() {
+        for (column, nullable) in [("payload_json", false), ("result_json", true)] {
+            for data_type in ["longtext", "text", "TEXT"] {
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, nullable, nullable
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, !nullable, nullable
+                    )
+                    .is_err()
+                );
+            }
+            for data_type in ["json", "mediumtext"] {
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, nullable, nullable
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 

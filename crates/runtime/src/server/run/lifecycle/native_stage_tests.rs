@@ -250,7 +250,8 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         let request = tokio::time::timeout(Duration::from_secs(10), edge_rx.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_attempted_message();
         let EdgeServerMessage::ToolRequest {
             request_id,
             delivery_generation,
@@ -283,6 +284,7 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
                     .await
                     .unwrap()
                     .unwrap()
+                    .into_attempted_message()
             else {
                 panic!("expected guidance")
             };
@@ -392,13 +394,13 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         }
     }
     .unwrap();
-    let delivered = if matches!(scenario, Scenario::BindingFailure) {
-        assert!(receipt.result.output.is_none());
-        receipt.result.error.as_deref()
-    } else {
-        receipt.result.output.as_deref()
-    };
-    assert_eq!(delivered, Some("Original delivered result."), "{receipt:?}");
+    // Failed child runs retain their real partial output independently of the
+    // terminal failure classification; successful runs use the same result field.
+    assert_eq!(
+        receipt.result.output.as_deref(),
+        Some("Original delivered result."),
+        "{receipt:?}"
+    );
     assert_eq!(
         receipt.result.status,
         match scenario {

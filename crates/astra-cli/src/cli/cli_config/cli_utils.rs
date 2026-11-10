@@ -295,6 +295,24 @@ pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
 }
 
+impl PartialEq for CliOwnerAuthSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        fn same<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        self.owner_scope == other.owner_scope
+            && self.profile_name == other.profile_name
+            && self.server_account_id == other.server_account_id
+            && same(&self.legacy_binding, &other.legacy_binding)
+            && same(&self.native_binding, &other.native_binding)
+    }
+}
+impl Eq for CliOwnerAuthSnapshot {}
+
 impl CliOwnerAuthSnapshot {
     pub(crate) fn is_current(&self) -> bool {
         self.owner_scope == astra_services::local_owner_scope()
@@ -306,6 +324,39 @@ impl CliOwnerAuthSnapshot {
                     .is_none_or(|binding| binding.is_active()),
                 _ => false,
             }
+    }
+
+    /// A new authenticated binding for the same account may inspect its old
+    /// local drafts. This does not authorize effects using the old binding.
+    pub(crate) fn same_presentation_owner(&self, other: &Self) -> bool {
+        self == other
+            || (self.server_account_id.is_some()
+                && self.server_account_id == other.server_account_id
+                && self.profile_name == other.profile_name
+                && self.owner_scope == other.owner_scope)
+    }
+
+    pub(crate) fn can_view_local_draft(&self) -> bool {
+        if self.is_current() {
+            return true;
+        }
+        let (profile, account) = installed_cli_owner_metadata();
+        if account.is_none()
+            || self.server_account_id != account
+            || self.profile_name != profile
+            || self.owner_scope != astra_services::local_owner_scope()
+        {
+            return false;
+        }
+        let Some(profile) = profile else { return false };
+        if let Some(binding) = crate::cli::native_auth::active() {
+            return binding.profile_name() == profile;
+        }
+        let key = (credential_store().path().clone(), profile);
+        astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS)
+            .get(&key)
+            .and_then(|entry| entry.binding.upgrade())
+            .is_some_and(|binding| binding.is_active())
     }
 
     pub(crate) async fn access_token(&self) -> Option<String> {
@@ -922,6 +973,18 @@ pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
 /// Error-code-aware hint. Human-readable detail is presentation and must not
 /// be parsed to recover a failure category.
 pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    match error_code {
+        Some("model_probe_credentials_or_access") => {
+            return Some("Check the API key and the account's access to this model.");
+        }
+        Some("model_probe_request_rejected" | "model_probe_configuration") => {
+            return Some("Check the model ID, API format and endpoint.");
+        }
+        Some("model_probe_network") => {
+            return Some("Check the Astra Server's network, DNS, proxy and TLS settings.");
+        }
+        _ => {}
+    }
     if status == 503 {
         match error_code {
             Some("chatgpt_subscription_disabled") => {
@@ -1033,6 +1096,30 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
             "Execution deadline expired before Server admission".to_string()
         }
+    }
+}
+
+pub(crate) fn model_creation_definitely_rejected(
+    error: &astra_thin_client::ThinClientError,
+) -> bool {
+    match error {
+        astra_thin_client::ThinClientError::Api { body, .. } => {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.pointer("/metadata/model_saved")?.as_bool())
+                == Some(false)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn model_creation_error(error: astra_thin_client::ThinClientError) -> String {
+    let not_saved = model_creation_definitely_rejected(&error);
+    let detail = map_thin_err(error);
+    if not_saved {
+        format!("Model setup failed; the model was not saved. {detail}")
+    } else {
+        format!("Could not confirm model setup. {detail}\nCheck your model list before retrying.")
     }
 }
 
@@ -1677,6 +1764,33 @@ mod tests {
             assert!(!error.contains('{'));
         }
         assert!(read_api_error(503, "upstream unavailable").contains("try again shortly"));
+    }
+
+    #[test]
+    fn model_setup_reports_rejected_probe_and_uncertain_delivery_distinctly() {
+        let rejected = super::model_creation_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: serde_json::json!({
+                "detail": "Could not connect",
+                "error_code": "model_probe_network",
+                "request_id": "test-request",
+                "metadata": {"model_saved": false}
+            })
+            .to_string(),
+        });
+        assert!(rejected.contains("model was not saved"), "{rejected}");
+        assert!(rejected.contains("DNS, proxy and TLS"), "{rejected}");
+        assert!(rejected.contains("test-request"), "{rejected}");
+        let uncertain = super::model_creation_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "unexpected server error".into(),
+        });
+        assert!(
+            uncertain.contains("Could not confirm model setup"),
+            "{uncertain}"
+        );
+        assert!(uncertain.contains("Check your model list"), "{uncertain}");
+        assert!(!uncertain.contains("model was not saved"), "{uncertain}");
     }
 
     #[test]

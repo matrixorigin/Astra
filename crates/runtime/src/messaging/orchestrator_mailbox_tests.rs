@@ -70,6 +70,7 @@ mod tests {
                 .push((agent_id.clone(), send_result));
 
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id,
                     run_id,
@@ -440,6 +441,7 @@ mod tests {
                 .push((agent_id.clone(), send_result));
 
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id,
                     run_id,
@@ -705,6 +707,7 @@ mod tests {
             let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
             let _ = rx.await;
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id,
                     run_id,

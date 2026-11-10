@@ -100,23 +100,43 @@ async fn large_file_valid_range_and_exact_eof_keep_requested_lines() {
 }
 
 #[tokio::test]
-async fn reversed_ranges_are_rejected_for_small_large_and_empty_files() {
+async fn reversed_ranges_are_normalized_for_small_large_and_empty_files() {
     let root = tempfile::tempdir().unwrap();
     write_file(root.path(), "small.txt", 6, 0);
-    write_file(root.path(), "large.txt", 200, 80);
+    write_file(root.path(), "large.txt", 600, 80);
     write_file(root.path(), "empty.txt", 0, 0);
     let executor = executor(root.path());
-    for path in ["small.txt", "large.txt", "empty.txt"] {
-        let result = executor
-            .execute_with_metadata(
-                "read_file",
-                &json!({"path":path, "start_line":3, "end_line":2}),
-            )
-            .await;
-        assert!(result.is_error, "{path}: {result:?}");
-        assert!(result.output.contains("must not exceed"), "{result:?}");
-        assert!(!result.output.contains("Auto-expanded"), "{result:?}");
-    }
+    let small = executor
+        .execute_with_metadata(
+            "read_file",
+            &json!({"path":"small.txt", "start_line":3, "end_line":2}),
+        )
+        .await;
+    assert!(
+        !small.is_error && small.output.contains("Auto-expanded"),
+        "{small:?}"
+    );
+    let large = executor
+        .execute_with_metadata(
+            "read_file",
+            &json!({"path":"large.txt", "start_line":459, "end_line":330}),
+        )
+        .await;
+    assert!(
+        !large.is_error && large.output.contains("330\tline 330:"),
+        "{large:?}"
+    );
+    assert!(large.output.contains("330–459"), "{large:?}");
+    let empty = executor
+        .execute_with_metadata(
+            "read_file",
+            &json!({"path":"empty.txt", "start_line":3, "end_line":2}),
+        )
+        .await;
+    assert!(
+        empty.is_error && empty.output.contains("start_line 2 exceeds file length 0"),
+        "{empty:?}"
+    );
 }
 
 #[tokio::test]

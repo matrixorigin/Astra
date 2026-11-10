@@ -13,13 +13,12 @@ otel = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
-    "dep:tokio",
 ]
 
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true, optional = true }
+tokio.workspace = true
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

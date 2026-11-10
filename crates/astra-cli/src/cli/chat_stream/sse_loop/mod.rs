@@ -293,6 +293,13 @@ async fn stream_chat_sse_inner(
         let ex = edge_tools::ToolExecutor::new(&project_root)
             .with_cloud(p.api.api_origin(), p.token)
             .with_memory_attribution_id(parent_turn_run_id.clone());
+        // Bind the shared owner before restoring the session so a selected
+        // checkout is validated once per session, not once per turn.
+        let ex = if let Some(ref journal) = p.git_worktree_journal {
+            ex.with_shared_git_worktree_journal(journal.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(session_id) = p.session_id {
             ex.with_active_session_id(session_id.to_string())
         } else {
@@ -316,28 +323,18 @@ async fn stream_chat_sse_inner(
             ex
         };
 
-        let ex = if let Some(ref journal) = p.git_worktree_journal {
-            ex.with_shared_git_worktree_journal(journal.clone())
-        } else {
-            ex
-        };
         let ex = if let Some(ref journal) = p.session_state_journal {
             ex.with_shared_session_state_journal(journal.clone())
         } else {
             ex
         };
-        let ex = if let Some(ref cmds) = p.bg_task_commands {
-            ex.with_bg_task_commands(cmds.clone())
+        let ex = if let Some(ref cmds) = p.background_tasks {
+            ex.with_background_tasks(cmds.clone())
         } else {
             ex
         };
-        let ex = if let Some(ref cache) = p.bg_task_list_cache {
-            ex.with_bg_task_list_cache(cache.clone())
-        } else {
-            ex
-        };
-        let ex = if let Some(ref slot) = p.bash_detach_slot {
-            ex.with_bash_detach_slot(slot.clone())
+        let ex = if let Some(ref slot) = p.foreground_wait_control {
+            ex.with_foreground_wait_control(slot.clone())
         } else {
             ex
         };
@@ -460,11 +457,11 @@ async fn stream_chat_sse_inner(
     };
     let cli_capabilities = edge_tools::cli_default_capabilities(
         p.agent_spawner.is_some(),
-        p.bg_task_commands.is_some(),
+        p.background_tasks.is_some() || p.agent_spawner.is_some(),
     );
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
-            edge_tools::local_tool_schemas(),
+            executor.bound_local_tool_schemas(),
             mcp_schemas.clone(),
             &cli_capabilities,
         ),
@@ -914,6 +911,7 @@ async fn stream_chat_sse_inner(
                 failure_kind,
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
+                cancel_context_not_saved: None,
                 admission_rejected: is_pre_admission_rejection(
                     host.last_error_code.as_deref(),
                     host.last_error_metadata.as_ref(),

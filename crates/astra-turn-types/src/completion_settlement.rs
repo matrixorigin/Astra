@@ -24,53 +24,11 @@ pub struct CompletionSettlementState {
     /// Number of same-turn recovery calls made after the provider returned a
     /// successful response with neither tool calls nor user-visible text.
     pub textless_response_retries: u32,
-    /// Number of bounded same-turn retries after a task whose typed profile
-    /// requires a workspace change attempted to finish without recording one.
-    /// This is deliberately separate from the read-only escalation advisory:
-    /// the latter guides exploration while this field protects the terminal
-    /// completion boundary.
-    pub workspace_mutation_retries: u32,
-    /// Number of bounded same-turn retries after the final successful
-    /// workspace mutation had no later successful observation.  A mutation is
-    /// progress, but it is not evidence that the resulting workspace is
-    /// coherent; the retry gives the agent one chance to inspect or validate
-    /// the state it actually created.
-    pub post_mutation_observation_retries: u32,
-    /// Number of bounded same-action retries after an admitted post-mutation
-    /// observation could not produce observation evidence because the
-    /// selected capability was unavailable. This is not repair authority:
-    /// the workspace is unchanged and the retry remains restricted to the
-    /// original observation obligation.
-    pub post_mutation_observation_failed_action_retries: u32,
-    /// A failed, executor-attested post-mutation observation may authorize
-    /// exactly one repair followed by exactly one final observation. This is
-    /// chain state, not an ordinary turn-budget renewal.
-    pub post_mutation_repair_retries: u32,
-    /// Exact normalized validator that proved the post-mutation result wrong.
-    /// A repair may be settled only by rerunning this same validator; a
-    /// generic workspace read cannot substitute for its failed assertion.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub post_mutation_repair_validation_operation: Option<String>,
     /// Number of bounded retries after an explicit verification contract was
     /// not satisfied at the terminal boundary.  This is intentionally
     /// separate from observation: reading the changed workspace is not a
     /// passing verification receipt.
     pub verification_retries: u32,
-    /// A failed, runtime-recognized canonical Work validation earns one
-    /// narrowly-scoped repair-and-revalidation cycle.  This is intentionally
-    /// separate from ordinary budget renewal: the repair must be followed by
-    /// the same canonical validation and then a truthful Work settlement.
-    pub canonical_validation_recovery_retries: u32,
-    /// A matching repair tool can fail before it establishes a successful
-    /// correction. Permit one outcome-aware retry of that repair while
-    /// preserving the independent request-shape correction budget on the
-    /// completion-action window. This never grants another repair cycle.
-    pub canonical_validation_recovery_failed_action_retries: u32,
-    /// Normalized identity of the failed validation that authorized the
-    /// bounded repair. The following revalidation must match this operation;
-    /// an unrelated build/test cannot erase the original failure.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub canonical_validation_recovery_operation: Option<String>,
     /// A single typed completion action that was already justified by the
     /// user's structured intent and the executed-tool ledger.  This is not a
     /// general budget extension: it is consumed once and is followed by a
@@ -139,31 +97,8 @@ pub struct ForegroundFanoutPagination {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum CompletionAction {
-    #[serde(rename = "required_workspace_mutation")]
-    RequiredWorkspaceMutation,
-    /// Spend one terminal boundary on a task-facing tool action when the
-    /// structured workspace intent is unknown or merely permits mutation.
-    /// Ordinary admission and safety policy still own executable authority;
-    /// this variant only prevents the terminal window from guessing that the
-    /// remaining action must be either a write or a read.
-    #[serde(rename = "completion_task_action")]
-    CompletionTaskAction,
-    #[serde(rename = "post_mutation_observation")]
-    PostMutationObservation,
-    #[serde(rename = "post_mutation_repair")]
-    PostMutationRepair,
     #[serde(rename = "explicit_verification")]
     ExplicitVerification { missing_labels: Vec<String> },
-    /// Re-run one canonical validator when the current durable Work attempt's
-    /// latest validation failed or was invalidated by a later mutation. This
-    /// is settlement authority, not a general execution-budget extension.
-    #[serde(rename = "canonical_work_validation")]
-    CanonicalWorkValidation,
-    /// Make one focused workspace change after a failed canonical Work
-    /// validation.  The next action is always canonical revalidation; this
-    /// never opens a general exploratory slice.
-    #[serde(rename = "canonical_work_repair")]
-    CanonicalWorkRepair,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -210,20 +145,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_inferred_actions_and_state_cannot_restore_execution_authority() {
+        for action in [
+            "required_workspace_mutation",
+            "completion_task_action",
+            "post_mutation_observation",
+            "canonical_work_validation",
+            "canonical_work_repair",
+            "post_mutation_repair",
+        ] {
+            assert!(serde_json::from_value::<CompletionAction>(serde_json::json!(action)).is_err());
+        }
+        for field in [
+            "workspace_mutation_retries",
+            "post_mutation_observation_retries",
+            "post_mutation_observation_failed_action_retries",
+            "post_mutation_repair_retries",
+            "post_mutation_repair_validation_operation",
+            "canonical_validation_recovery_retries",
+            "canonical_validation_recovery_failed_action_retries",
+            "canonical_validation_recovery_operation",
+        ] {
+            let mut wire = serde_json::to_value(CompletionSettlementState::default()).unwrap();
+            wire[field] = serde_json::json!(0);
+            assert!(
+                serde_json::from_value::<CompletionSettlementState>(wire).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
     fn completion_control_never_defaults_missing_authority() {
         let state = CompletionSettlementState {
             canonical_work_establishment_retries: 1,
             output_cap_continuations: 1,
             textless_response_retries: 1,
-            workspace_mutation_retries: 3,
-            post_mutation_observation_retries: 5,
-            post_mutation_observation_failed_action_retries: 6,
-            post_mutation_repair_retries: 7,
-            post_mutation_repair_validation_operation: Some("validator-a".into()),
+
             verification_retries: 8,
-            canonical_validation_recovery_retries: 9,
-            canonical_validation_recovery_failed_action_retries: 10,
-            canonical_validation_recovery_operation: Some("validator-b".into()),
             deferred_success_completion: Some(RuntimeSuccessfulToolCompletion {
                 tool_name: "validator".into(),
                 final_text: Some("observed completion".into()),

@@ -283,9 +283,6 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
             return Ok(TurnObserverOutcome::NotConfigured);
         };
         let port = template.bind_owner(&request.user_id)?;
-        if !port.admits_operation(true).await? {
-            return Ok(TurnObserverOutcome::AccessDisabled);
-        }
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -300,10 +297,9 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let queue_reservation = reserve_memory_extraction_payload(&payload);
         // Resolve fresh write authority after preparation, just as memory tools
         // do. A denied/revoked grant never falls back to deployment credentials.
-        let transport = port
-            .resolve_tool_transport(true)
-            .await?
-            .ok_or("Memoria observer requires an authorized HTTP transport")?;
+        let Some(transport) = port.resolve_observer_transport().await? else {
+            return Ok(TurnObserverOutcome::AccessDisabled);
+        };
         let response = client
             .post(format!(
                 "{}/v1/observe",

@@ -3,7 +3,7 @@
 //! an execution grant or evidence that an external effect has settled.
 
 use super::*;
-use astra_turn_types::interruption::{InterruptionKind, InterruptionRecord};
+use astra_turn_types::interruption::InterruptionRecord;
 use astra_turn_types::{
     CanonicalTokenUsage, SessionCursorV1, tool_ledger_receipt::ToolLedgerReceipt,
 };
@@ -62,8 +62,8 @@ pub enum CanonicalTerminalContext {
     /// Legitimately empty outcome: validate the admitted base without
     /// fabricating an empty conversation turn.
     Unchanged,
-    /// A real control revocation forbids a Context write, even when the Run's
-    /// cancellation and original raw history can still be committed.
+    /// This Run's Context was not saved, while its raw history and terminal
+    /// may still be committed (for example after revocation or a size limit).
     Revoked,
     Unowned,
 }
@@ -200,6 +200,13 @@ impl CanonicalRunTerminalReceipt {
                 data["cancelled"] = true.into();
                 data["cancellation_origin"] = origin.as_str().into();
             }
+            match &self.context {
+                CanonicalTerminalContext::Revoked => data["context_not_saved"] = true.into(),
+                CanonicalTerminalContext::Advanced { .. } | CanonicalTerminalContext::Unchanged => {
+                    data["context_not_saved"] = false.into();
+                }
+                CanonicalTerminalContext::Unowned => {}
+            }
             if let Some(interruption) = &self.interruption {
                 data["interruption"] = interruption.to_json();
             }
@@ -271,7 +278,7 @@ impl CanonicalRunTerminalReceipt {
         }
         if let Some(interruption) = &self.interruption
             && (!matches!(self.outcome, CanonicalTerminalOutcome::Failed)
-                || interruption.kind != InterruptionKind::ExecutionIncomplete
+                || astra_core::ErrorKind::parse_tag(interruption.kind.label()).is_some()
                 || self.error_kind.is_some()
                 || self.error_metadata.is_some()
                 || self.error_code.as_deref() != Some(interruption.kind.label())
@@ -711,6 +718,7 @@ impl DatabaseRunStateStore {
             opening_hash: Some(receipt.opening_hash.clone()),
             context_admission_hash: receipt.context_admission_hash.clone(),
             operation: RunMutationOperation::Terminal,
+            session_capture_override: None,
         }))
     }
 
@@ -755,39 +763,7 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?
             .ok_or("canonical terminal answer is missing")?;
-            let role: String = row.try_get("role").map_err(|error| error.to_string())?;
-            let content: String = row.try_get("content").map_err(|error| error.to_string())?;
-            let payload: Option<String> = row
-                .try_get("payload_json")
-                .map_err(|error| error.to_string())?;
-            let hash: String = row
-                .try_get("content_hash")
-                .map_err(|error| error.to_string())?;
-            if role != "assistant"
-                || astra_turn_types::transcript_content_hash(&role, &content, payload.as_deref())
-                    != hash
-            {
-                return Err("canonical terminal answer has invalid raw identity".into());
-            }
-            let payload: Option<serde_json::Value> = payload
-                .map(|payload| serde_json::from_str(&payload))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            if payload.as_ref().is_some_and(|payload| !payload.is_object()) {
-                return Err("invalid terminal answer payload".into());
-            }
-            let model_item_id = payload
-                .as_ref()
-                .and_then(|payload| payload.get("model_item_id"));
-            if model_item_id.is_some_and(|id| !id.is_null() && !id.is_string()) {
-                return Err("invalid terminal model item identity".into());
-            }
-            Some((
-                content,
-                model_item_id
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            ))
+            Some(decode_terminal_answer(&row)?)
         } else {
             None
         };
@@ -810,6 +786,140 @@ impl DatabaseRunStateStore {
         events.sort_by_key(|event| event["index"].as_i64());
         events.dedup_by_key(|event| event["index"].as_i64());
         Ok(events)
+    }
+
+    /// Hydrate canonical terminal projections in one bounded read wave. Raw C3
+    /// terminal rows are intentionally absent for canonical C0/C1 settlement.
+    pub(super) async fn hydrate_canonical_recovery_terminals(
+        &self,
+        runs: &mut [DurableRunRecord],
+    ) -> Result<(), String> {
+        let mut receipts = Vec::new();
+        for (index, run) in runs.iter().enumerate() {
+            if let Some(stored) = committed_terminal_for_run(run)? {
+                receipts.push((index, stored));
+            }
+        }
+        let mut answers = HashMap::new();
+        let mut answer_bytes = 0usize;
+        for batch in receipts.chunks(AGENT_RECOVERY_ID_BATCH_SIZE) {
+            let selected = batch
+                .iter()
+                .filter(|(_, stored)| {
+                    stored
+                        .receipt
+                        .transcript
+                        .assistant_source_event_id
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let scope = &runs[selected[0].0];
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT run_id, source_event_id, role, content_hash,
+                 CASE WHEN OCTET_LENGTH(content) <= {AGENT_RECOVERY_MAX_EVENT_BYTES} THEN content ELSE NULL END AS content,
+                 CASE WHEN OCTET_LENGTH(payload_json) <= {AGENT_RECOVERY_MAX_EVENT_BYTES} THEN payload_json ELSE NULL END AS payload_json,
+                 OCTET_LENGTH(payload_json) AS payload_bytes
+                 FROM session_transcript_items WHERE user_id = "));
+            query
+                .push_bind(&scope.user_id)
+                .push(" AND session_id = ")
+                .push_bind(&scope.session_id)
+                .push(" AND source_event_id IN (");
+            for (position, (index, stored)) in selected.iter().enumerate() {
+                let run = &runs[*index];
+                if run.user_id != scope.user_id || run.session_id != scope.session_id {
+                    return Err("canonical recovery batch crosses owner/session scope".into());
+                }
+                if position > 0 {
+                    query.push(",");
+                }
+                query.push_bind(&stored.receipt.transcript.assistant_source_event_id);
+            }
+            query
+                .push(") LIMIT ")
+                .push_bind((selected.len() + 1) as i64);
+            let query = query.build();
+            let mut rows = query.fetch(self.pool.get());
+            let mut count = 0usize;
+            while let Some(row) = rows.try_next().await.map_err(|error| error.to_string())? {
+                count += 1;
+                if count > selected.len() {
+                    return Err("duplicate canonical terminal answer".into());
+                }
+                let payload_bytes: Option<i64> = row
+                    .try_get("payload_bytes")
+                    .map_err(|error| error.to_string())?;
+                if payload_bytes.is_some_and(|bytes| bytes > AGENT_RECOVERY_MAX_EVENT_BYTES as i64)
+                {
+                    return Err("canonical terminal payload exceeds recovery bound".into());
+                }
+                let run_id: String = row.try_get("run_id").map_err(|error| error.to_string())?;
+                let source: String = row
+                    .try_get("source_event_id")
+                    .map_err(|error| error.to_string())?;
+                if !selected.iter().any(|(index, stored)| {
+                    runs[*index].run_id == run_id
+                        && stored
+                            .receipt
+                            .transcript
+                            .assistant_source_event_id
+                            .as_deref()
+                            == Some(source.as_str())
+                }) {
+                    return Err("canonical terminal answer belongs to a different Run".into());
+                }
+                let answer = decode_terminal_answer(&row)?;
+                answer_bytes = answer_bytes.saturating_add(answer.0.len());
+                if answer_bytes > AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES {
+                    return Err("canonical terminal answers exceed recovery bound".into());
+                }
+                if answers.insert(run_id, answer).is_some() {
+                    return Err("duplicate canonical terminal answer identity".into());
+                }
+            }
+        }
+        let mut total_bytes = runs
+            .iter()
+            .flat_map(|run| &run.events)
+            .map(|event| event.to_string().len())
+            .sum::<usize>();
+        for (index, stored) in receipts {
+            let run = &mut runs[index];
+            let answer = answers.remove(&run.run_id);
+            if stored
+                .receipt
+                .transcript
+                .assistant_source_event_id
+                .is_some()
+                && answer.is_none()
+            {
+                return Err("canonical terminal answer is missing".into());
+            }
+            let events = stored.receipt.completion_events(
+                answer.as_ref().map(|(text, _)| text.as_str()),
+                answer.as_ref().and_then(|(_, model)| model.as_deref()),
+                run.error_message.as_deref(),
+                Some(stored.completion_first()),
+                -1,
+                run.last_event_idx,
+            )?;
+            total_bytes = total_bytes.saturating_add(
+                events
+                    .iter()
+                    .map(|event| event.to_string().len())
+                    .sum::<usize>(),
+            );
+            if total_bytes > AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES {
+                return Err("canonical terminal projections exceed recovery bound".into());
+            }
+            // Physical recovery payloads intentionally omit their SQL index.
+            // Preserve every admission/control envelope; None is not identity.
+            run.events.extend(events);
+        }
+        Ok(())
     }
 
     async fn load_terminal_control_rows(
@@ -1042,6 +1152,41 @@ impl CommittedRunTerminalReceipt {
     }
 }
 
+fn decode_terminal_answer(row: &sqlx::mysql::MySqlRow) -> Result<(String, Option<String>), String> {
+    let role: String = row.try_get("role").map_err(|error| error.to_string())?;
+    let content: String = row.try_get("content").map_err(|error| error.to_string())?;
+    let payload: Option<String> = row
+        .try_get("payload_json")
+        .map_err(|error| error.to_string())?;
+    let hash: String = row
+        .try_get("content_hash")
+        .map_err(|error| error.to_string())?;
+    if role != "assistant"
+        || astra_turn_types::transcript_content_hash(&role, &content, payload.as_deref()) != hash
+    {
+        return Err("canonical terminal answer has invalid raw identity".into());
+    }
+    let payload: Option<serde_json::Value> = payload
+        .map(|payload| serde_json::from_str(&payload))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if payload.as_ref().is_some_and(|payload| !payload.is_object()) {
+        return Err("invalid terminal answer payload".into());
+    }
+    let model_item_id = payload
+        .as_ref()
+        .and_then(|payload| payload.get("model_item_id"));
+    if model_item_id.is_some_and(|id| !id.is_null() && !id.is_string()) {
+        return Err("invalid terminal model item identity".into());
+    }
+    Ok((
+        content,
+        model_item_id
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,47 +1233,54 @@ mod tests {
 
     #[test]
     fn cold_terminal_interruption_requires_coherent_sanitized_outcome() {
-        use astra_turn_types::interruption::{InterruptionStateSummary, ResumeAction};
-        let mut stored = failed_receipt();
-        let record = InterruptionRecord::new(
+        use astra_turn_types::interruption::{
+            InterruptionKind, InterruptionStateSummary, ResumeAction,
+        };
+        for kind in [
             InterruptionKind::ExecutionIncomplete,
-            ResumeAction::ContinueImmediately,
-            InterruptionStateSummary::default(),
-        );
-        stored.receipt.error_kind = None;
-        stored.receipt.error_metadata = None;
-        stored.receipt.error_code = Some(record.kind.label().into());
-        stored.receipt.error_hash =
-            CanonicalRunTerminalReceipt::error_hash(Some(&record.user_message));
-        stored.receipt.interruption = Some(record);
-        let encoded = serde_json::to_string(&stored).unwrap();
-        assert_eq!(
-            CommittedRunTerminalReceipt::decode(&encoded, 2).unwrap(),
-            stored
-        );
-        for (path, value) in [
-            (
-                "/receipt/interruption/error_detail",
-                serde_json::json!("private"),
-            ),
-            (
-                "/receipt/interruption/user_message",
-                serde_json::json!("changed error"),
-            ),
-            (
-                "/receipt/interruption/kind",
-                serde_json::json!("budget_exhausted"),
-            ),
-            ("/receipt/error_kind", serde_json::json!("network")),
-            ("/receipt/error_code", serde_json::json!("other_error")),
-            ("/receipt/outcome/status", serde_json::json!("completed")),
+            InterruptionKind::TokenBudgetExceeded,
         ] {
-            let mut corrupt: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-            *corrupt.pointer_mut(path).unwrap() = value;
-            assert!(
-                CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err(),
-                "{path}"
+            let mut stored = failed_receipt();
+            let record = InterruptionRecord::new(
+                kind,
+                ResumeAction::ContinueImmediately,
+                InterruptionStateSummary::default(),
             );
+            stored.receipt.error_kind = None;
+            stored.receipt.error_metadata = None;
+            stored.receipt.error_code = Some(record.kind.label().into());
+            stored.receipt.error_hash =
+                CanonicalRunTerminalReceipt::error_hash(Some(&record.user_message));
+            stored.receipt.interruption = Some(record);
+            let encoded = serde_json::to_string(&stored).unwrap();
+            assert_eq!(
+                CommittedRunTerminalReceipt::decode(&encoded, 2).unwrap(),
+                stored
+            );
+            for (path, value) in [
+                (
+                    "/receipt/interruption/error_detail",
+                    serde_json::json!("private"),
+                ),
+                (
+                    "/receipt/interruption/user_message",
+                    serde_json::json!("changed error"),
+                ),
+                (
+                    "/receipt/interruption/kind",
+                    serde_json::json!("budget_exhausted"),
+                ),
+                ("/receipt/error_kind", serde_json::json!("network")),
+                ("/receipt/error_code", serde_json::json!("other_error")),
+                ("/receipt/outcome/status", serde_json::json!("completed")),
+            ] {
+                let mut corrupt: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                *corrupt.pointer_mut(path).unwrap() = value;
+                assert!(
+                    CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err(),
+                    "{path}"
+                );
+            }
         }
     }
 

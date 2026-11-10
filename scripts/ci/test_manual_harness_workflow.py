@@ -248,6 +248,16 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
     def test_regression_runs_reviewed_cases_without_disabling_grading(self):
         self.run_live_command("regression")
 
+    def test_edge_shell_contract_runs_in_harness_job_even_if_live_cases_fail(self):
+        workflow = WORKFLOW.read_text()
+        step = workflow.split("- name: Harness regression - Edge WS shell contract\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("!cancelled() && steps.seed.outcome == 'success'", step)
+        self.assertIn("scripts/ci/client_compatibility.py", step)
+        self.assertIn("--edge-shell-only", step)
+        self.assertIn("--existing-admin", step)
+        self.assertIn("-p astra-edge --bin astra-edge", workflow)
+        self.assertIn("/harness/edge-shell.json", workflow)
+
     def run_live_command(self, profile):
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
@@ -267,7 +277,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             subprocess.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], cwd=root, check=True)
             binaries = root / "target/debug"
             binaries.mkdir(parents=True)
-            for name in ("astra", "astra-server"):
+            for name in ("astra", "astra-edge", "astra-server"):
                 (binaries / name).touch()
             stub = binaries / "astra-test"
             stub.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"

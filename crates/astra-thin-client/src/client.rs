@@ -832,6 +832,21 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    async fn get_session_execution_settlement_text(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::session_cancel(session_id))?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .send()
+            .await?;
+        Self::text_or_api(response).await
+    }
+
     /// Request cancellation and wait for the server's execution-settlement
     /// proof. A display status alone is not evidence that tools have stopped.
     /// Polling is bounded and never deletes history or forces a checkout unlock.
@@ -842,6 +857,8 @@ impl ThinClient {
         budget: Duration,
     ) -> Result<String, ThinClientError> {
         let deadline = tokio::time::Instant::now() + budget;
+        let mut accepted = false;
+        let mut poll_delay = Duration::from_millis(200);
         let mut reason = "execution shutdown is not yet confirmed".to_owned();
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -850,13 +867,32 @@ impl ThinClient {
                     reason,
                 });
             }
-            let body =
-                tokio::time::timeout_at(deadline, self.post_session_cancel_text(token, session_id))
-                    .await
-                    .map_err(|_| ThinClientError::SessionCancellationPending {
-                        session_id: session_id.to_owned(),
-                        reason: reason.clone(),
-                    })??;
+            let body = tokio::time::timeout_at(deadline, async {
+                if accepted {
+                    self.get_session_execution_settlement_text(token, session_id)
+                        .await
+                } else {
+                    self.post_session_cancel_text(token, session_id).await
+                }
+            })
+            .await
+            .map_err(|_| ThinClientError::SessionCancellationPending {
+                session_id: session_id.to_owned(),
+                reason: reason.clone(),
+            })?;
+            let body = match body {
+                Err(error) if error.cancellation_recovery_required() => {
+                    accepted = false;
+                    reason = "session execution changed during cancellation".into();
+                    tokio::time::sleep_until(
+                        deadline.min(tokio::time::Instant::now() + poll_delay),
+                    )
+                    .await;
+                    poll_delay = (poll_delay * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+                result => result?,
+            };
             let value: Value = serde_json::from_str(&body)?;
             if value.get("session_id").and_then(Value::as_str) != Some(session_id) {
                 return Err(ThinClientError::InvalidSessionCancellationResponse(
@@ -864,12 +900,21 @@ impl ThinClient {
                 ));
             }
             match value.get("execution_settled").and_then(Value::as_bool) {
+                Some(true) if accepted => {
+                    // Commit the existing session transition once execution
+                    // has stopped. A read-only projection is not durable state.
+                    accepted = false;
+                    continue;
+                }
                 Some(true) if value.get("status").and_then(Value::as_str) == Some("cancelled") => {
                     return Ok(body);
                 }
                 Some(false)
                     if value.get("status").and_then(Value::as_str)
-                        == Some("cancellation_requested") => {}
+                        == Some("cancellation_requested") =>
+                {
+                    accepted = true;
+                }
                 _ => {
                     return Err(ThinClientError::InvalidSessionCancellationResponse(
                         "server did not provide consistent execution-settlement evidence; upgrade or restart the Server".into(),
@@ -897,10 +942,8 @@ impl ThinClient {
                     reason,
                 });
             }
-            tokio::time::sleep_until(
-                deadline.min(tokio::time::Instant::now() + Duration::from_millis(200)),
-            )
-            .await;
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll_delay)).await;
+            poll_delay = (poll_delay * 2).min(Duration::from_secs(1));
         }
     }
 
@@ -1916,6 +1959,24 @@ impl ThinClient {
         Self::typed_json_or_error(resp).await
     }
 
+    pub async fn get_run_activity(
+        &self,
+        token: &str,
+        session_id: &str,
+        run_id: &str,
+        before: Option<i64>,
+    ) -> Result<crate::protocol::RunActivityPage, ThinClientError> {
+        let url = self.url(&paths::session_run_activity(session_id, run_id))?;
+        let mut request = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?);
+        if let Some(before) = before {
+            request = request.query(&[("before_event_idx", before)]);
+        }
+        Self::typed_json_or_error(request.send().await?).await
+    }
+
     /// Durable transcript projection with an explicit server-owned scope.
     pub async fn get_session_transcript(
         &self,
@@ -1997,6 +2058,61 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// Request a model for the next available round; acceptance is not application.
+    pub async fn request_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &astra_turn_types::RunModelRequest,
+    ) -> Result<astra_turn_types::RunModelSelection, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile one guidance receipt without replaying the Run stream.
+    pub async fn get_run_user_intent(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+        intent_id: &str,
+    ) -> Result<astra_turn_types::UserIntentStatus, ThinClientError> {
+        let url = self.url(&paths::chat_run_user_intent(run_id, intent_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile an uncertain model change without automatically resubmitting it.
+    pub async fn get_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+    ) -> Result<astra_turn_types::RunModelSnapshot, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     /// Request a policy for the next model round; acceptance is not application.
     pub async fn request_run_permission_mode(
         &self,
@@ -2048,6 +2164,22 @@ impl ThinClient {
             .send()
             .await?;
         Self::typed_json_or_error(resp).await
+    }
+
+    /// Observe whether the exact run's execution has settled, without mutation.
+    pub async fn get_run_execution_settlement(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_cancel(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
     }
 
     /// `DELETE /chat/runs/{run_id}` — cancel a durable run.
@@ -3886,25 +4018,31 @@ mod tests {
 
     #[tokio::test]
     async fn session_cancel_waits_for_execution_settlement_not_display_status() {
+        let srv = MockServer::start().await;
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let srv = MockServer::start().await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        Mock::given(method("POST"))
-            .and(path("/sessions/session-1/cancel"))
-            .and(header("authorization", "Bearer tok"))
+        let posts = Arc::new(AtomicUsize::new(0));
+        let posted = posts.clone();
+        Mock::given(method("POST")).and(path("/sessions/session-1/cancel"))
             .respond_with(move |_: &wiremock::Request| {
-                let settled = observed.fetch_add(1, Ordering::SeqCst) > 0;
-                ResponseTemplate::new(if settled { 200 } else { 202 }).set_body_json(
-                    serde_json::json!({
-                        "session_id": "session-1", "status": if settled { "cancelled" } else { "cancellation_requested" },
-                        "execution_settled": settled,
-                    }),
-                )
-            })
+                if posted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                        "session_id":"session-1", "status":"cancellation_requested", "execution_settled":false
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "session_id":"session-1", "status":"cancelled", "execution_settled":true
+                    }))
+                }
+            }).expect(2).mount(&srv).await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session-1/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id":"session-1", "status":"active", "execution_settled":true
+            })))
+            .expect(1)
             .mount(&srv)
             .await;
         let client = ThinClient::new(&srv.uri(), None).unwrap();
@@ -3913,10 +4051,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&body).unwrap()["execution_settled"],
-            true
+            serde_json::from_str::<Value>(&body).unwrap()["status"],
+            "cancelled"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn session_cancel_retries_typed_recovery_from_initial_or_final_command() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for first_command_conflicts in [false, true] {
+            let srv = MockServer::start().await;
+            let posts = Arc::new(AtomicUsize::new(0));
+            let posted = posts.clone();
+            Mock::given(method("POST")).and(path("/sessions/session-1/cancel"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let index = posted.fetch_add(1, Ordering::SeqCst);
+                    if index == usize::from(!first_command_conflicts) {
+                        ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                            "detail":"repeat cancellation", "error_code":"cancellation_recovery_required"
+                        }))
+                    } else if index == 2 {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "session_id":"session-1", "status":"cancelled", "execution_settled":true
+                        }))
+                    } else {
+                        ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                            "session_id":"session-1", "status":"cancellation_requested", "execution_settled":false
+                        }))
+                    }
+                }).expect(3).mount(&srv).await;
+            Mock::given(method("GET"))
+                .and(path("/sessions/session-1/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "session_id":"session-1", "status":"active", "execution_settled":true
+                })))
+                .expect(1)
+                .mount(&srv)
+                .await;
+            let result = ThinClient::new(&srv.uri(), None)
+                .unwrap()
+                .cancel_session_until_settled_text("tok", "session-1", Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&result).unwrap()["status"],
+                "cancelled"
+            );
+            assert_eq!(posts.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[tokio::test]
@@ -3930,6 +4116,11 @@ mod tests {
             })))
             .mount(&srv)
             .await;
+        Mock::given(method("GET")).and(path("/sessions/session-1/cancel"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "session_id":"session-1", "status":"cancellation_requested", "execution_settled":false,
+                "execution_blocker":"unresolved_tool"
+            }))).mount(&srv).await;
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let result = client
             .cancel_session_until_settled_text("tok", "session-1", Duration::from_millis(500))
@@ -3942,7 +4133,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .all(|request| request.method == "POST"
+                .all(|request| matches!(request.method.as_str(), "POST" | "GET")
                     && request.url.path() == "/sessions/session-1/cancel")
         );
     }
@@ -3987,7 +4178,7 @@ mod tests {
         )
         .with_offering_id("offer-memory");
         request.max_tokens = 128;
-        request.temperature = 0.0;
+        request.temperature = Some(0.0);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer token"))

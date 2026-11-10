@@ -113,62 +113,33 @@ from those provider requests; callbacks do not create additional tool slots or
 replacement identities. A callback without a request ID cannot establish
 execution custody or recovery evidence.
 
-A successful executor-owned verify-mode v2 receipt proves that the bound
-workspace did not change. Parallel verification calls carrying that receipt do
-not invalidate each other's evidence. Opaque commands, failed or malformed
-receipts, and a concurrent writer retain the freshness barrier.
+A successful declared check records the executed command and its successful
+exit. It does not prove that the workspace stayed unchanged or that a different
+executor could not write concurrently. Known concurrent mutations retain the
+freshness barrier.
 
-Canonical Go observations include `go test`, `go build`, and `go vet`, with
-literal scope-preserving environment assignments such as `GOWORK=off`. They
-require a positively successful executed result within the bound workspace;
-dry-run, redirected-scope and opaque wrapper forms are not positive proof.
-Environment configuration and ordered validation stages remain part of operation
-identity: a successful vet does not clear a failed test or a failed build/vet
-chain. A literal external scratch setup followed by `&&` may precede a Go check,
-using the existing scratch-scope contract and a concrete bound root. Its entire
-command remains the operation identity, so a bare check cannot clear a failure
-that may have occurred during setup. Shell configuration changes, opaque
-preparation and concurrent setup do not grant this proof. Scratch paths must not
-overlap the workspace in either direction; ancestor setup is rejected even for a
-benign mkdir. Shell configuration writes invalidate later validation proof with
-or without scratch preparation. Plain output and static printf formats using
-literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
-do not. Go checks use the complete invocation as identity, including any
-fallible prefix reader or output stage. A recognizable unsafe check retains only
-attempt identity. Sensitive or unscannable invocations reuse the existing opaque
-exact-argument identity, so failures remain debts without copying credentials
-into recovery state. Only an exact retry can resolve a named validation debt;
-an unproven success still needs a separate eligible validation. An explicit
-verify receipt proves workspace freshness under the executor-owned lease,
-successful exit and unchanged fingerprint contract. This declared custom verifier path is
-independent of shell syntax and language. An unsuccessful or unverified custom
-invocation retains exact-argument failure debt until the same invocation produces
-a valid full-scope verify receipt; a changed command or a raw unchanged
-fingerprint cannot clear it. That receipt does not certify which tests ran or
-clear named Work validation debts. A failed custom invocation without an
-authoritative unchanged fingerprint also makes earlier named proof stale. Go
-semantic inference owns inferred observations and named Work validation
-independently; a freshness receipt never overrides an existing named debt. A
-completed custom-verifier failure at a bounded observation may receive one
-retry: active Work binds the exact verifier, while ordinary completion may use
-a different typed observation. Unsettled, partial or changed execution cannot
-authorize this retry. These are invocation receipts under the
-existing trusted executor environment, not a guarantee about inherited tool
-configuration or test counts. Executors enable pipefail for pipelines; commands
-that may disable that setting cannot use the final pipeline stage's success as
-validation evidence. An unchanged Bash fingerprint prevents a false mutation
-barrier but is not, by itself, evidence that any workspace observation or
-requested validation occurred.
+Tool outcomes record what the executor observed: whether execution started,
+output, exit status, and any reported uncertainty or partial effects. Neither a
+zero exit status nor a command's language or framework proves task correctness.
+Ordinary shell calls do not create project-validation debt, a repair budget, or
+a second Work settlement gate. Canonical Work retains assignment and settlement
+ownership; a task that can be answered from its context needs no unrelated tool
+call to acquire delivery authority.
 
-A matched post-mutation observer rejected for an unavailable capability may
-use the existing single alternative-observer attempt only when the executor
-explicitly reports no execution and no possible side effects. The journal
-retains that pre-dispatch capability rejection; it is never execution or
-verification success. Missing facts, partial effects and unsettled processes
-do not grant this recovery, and required validation debts remain independent.
-If the alternative is also rejected as unavailable, completion retains the
-successful tool results and reports a capability blocker through the existing
-incomplete terminal and intervention guidance instead of claiming validation.
+Only explicitly declared authoritative checks create runtime check obligations.
+The normal Bash tool executes the exact declared command with its declared
+`workdir`; no separate verification mode or whole-workspace scan is needed.
+Executed, positively classified results satisfy those checks. Executor-reported
+workspace changes invalidate earlier check ordering; opaque shell commands do
+not manufacture change facts. This records observed invocations and known
+changes, not global workspace immutability or guarantees about other processes.
+The model uses the tool results and user acceptance criteria to choose further
+inspection, correction, or a truthful final answer.
+
+A pre-dispatch capability rejection remains a rejection with no execution or
+verification success. It does not create a separate observation/retry state.
+Explicit checks and canonical Work settlement use their existing admitted
+round allowance.
 
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption
@@ -466,31 +437,48 @@ An `authority_lost` receipt still fails closed.
 
 ### Bounded continuation and completion
 
-An execution slice is a capacity checkpoint, not a task-completion boundary.
-Task profiles choose the initial slice and renewal step, not an implicit
-terminal cutoff or a fixed number of renewals. Root and child runs resolve the
-same optional hard boundary from administrator configuration and any explicit
-caller limit. Without either limit, there is no built-in total-round cutoff;
-execution continues in renewable slices, including across long tasks. With a
-limit, renewal cannot exceed it. A bounded closing allowance is
-separate from ordinary execution capacity and cannot reopen exploration.
+Task profiles and persona hints size internal execution slices for roots and
+children; they do not limit the lifetime of the user's task. The shared loop
+renews the existing iteration boundary before a slice can trigger final
+reporting or child cancellation. Cumulative charged iterations are preserved
+in checkpoints. Waiting for input does not charge model iterations, and a
+restored input wait can cross a slice boundary without cancelling its children.
 
-Fresh executor-confirmed workspace changes, new authoritative observations, or
-recovery of a failed operation can justify another bounded slice, including
-during an implementation task. A successful edit need not be followed by full
-validation before another edit is allowed.
+Explicit caller limits and administrator configuration can impose a total round
+or wall-clock limit. Admission intersects round ceilings and freezes the effective
+limits, including final reporting and explicit Work settlement; slice renewal,
+activity, retry, reconnect and recovery cannot expand them. An omitted total time
+limit stays absent. Children retain the parent's original execution deadline
+when present; restoring a remaining
+duration cannot create a new clock window. Per-operation timeouts, cancellation,
+capacity admission and execution-health checks remain independent.
 
-Missing progress receipts do not establish a stall: capabilities have different
-evidence coverage. In the absence of an authoritative stop condition, another
-bounded slice is allowed without a separate progress-credit ledger or mandatory
-reflection call. Explicit hard limits, cancellation, workspace quarantine,
-and explicit execution limits remain authoritative. Historical guard verdicts remain
-audit and recovery advice, not sticky execution vetoes. Continuation
-does not make unexecuted requests successful or grant them completion evidence.
-Model-facing capacity reminders must not imply that renewal proves progress,
-unfinished work, or authorization for additional scope. The requested outcome
-is not evidence of what actually executed; completion claims must use observed
-results even when they differ from the request.
+The existing infrastructure circuit breaker retains its independent absolute
+round ceiling (1000 by default) as a final runaway-execution backstop. Slice
+renewal and recovery do not reset its observations. Reaching that ceiling stops
+before another provider call, cancels unfinished children through the canonical
+runtime cancellation owner, and checkpoints an incomplete result. Repetition
+advice alone never establishes that a legitimate long investigation has stalled.
+
+Ordinary conversation does not acquire a runtime requirement to mutate a
+workspace, execute a matching completion action or perform a post-mutation
+observation. The model reports the work and its verification limits. Explicit
+caller-declared verification hooks and canonical Work validation keep their
+own contracts. No prose, generic successful tool or inferred task profile can
+settle an unknown external effect, pending child or newer Work owner.
+When workspace custody permits continuation, an unknown tool result is delivered
+to the model with its execution facts so it can inspect the outcome using
+permitted tools. The invocation ledger does not
+automatically redispatch it, and a later observation does not rewrite that
+invocation as successful. Completing an agent turn is not confirmation that
+the uncertain operation succeeded; workspace ownership remains a separate gate.
+
+The runtime reserves reporting/settlement space inside an explicit allowance.
+When it cannot fit, it preserves partial text and tool facts and closes with a
+truthful incomplete result. Useful output is not erased to narrate an internal
+completion obligation. Old execution snapshots containing the retired renewal
+protocol are unsupported; no history migration or compatibility decoder is
+provided.
 
 Repeated tool signatures establish a repeated request pattern, not unchanged
 results or lack of progress. Signature-only advice must preserve legitimate
@@ -504,10 +492,12 @@ or low task value. They must not create a separate risk score, retry-cautioned
 tool list, or extra correction pressure without independent outcome evidence.
 Read tools may report overlapping delivery for the same captured content, but
 must not infer current prompt coverage or require stopping from read counts.
-Policy feedback names these observations `read_coverage_overlap` and
-`round_activity`, with coverage/progress review recommendations rather than
-semantic judgments of redundancy or low value. Both observation stages remain
-advisory; persistence of a signal is not proof that the model ignored feedback.
+Requested file ranges do not prove delivered content. The argument-derived
+read-overlap metric and its configuration, harness verifier and policy signal
+are removed. The filesystem executor may report which numbered lines it
+previously produced for the same captured bytes, without claiming they remain
+in model context. Exact observable-result identity and `round_activity` remain
+advisory evidence; persistence of a signal does not prove ignored feedback.
 Policy feedback schema v4 includes current, bounded recovery evidence from
 TurnGuard alongside behavioral observations. One pre-provider policy projection
 owns model-facing signature/operation repetition feedback; post-tool evaluation retains health,
@@ -531,9 +521,8 @@ contents or that earlier results remain in context. Explicit debugger pauses
 retain their separate control semantics; benchmark profiles need no exception
 to the observation-only rule.
 
-Progress does not discharge completion obligations. Required validation must
-still apply to the final mutation state; a renewed slice must not be reported
-as successful completion or bypass provider and permission boundaries.
+Progress does not discharge explicit verification or canonical Work obligations.
+Their validation remains bound to the actual final state and provider authority.
 
 ### Execution failures and task resolution
 
@@ -790,6 +779,10 @@ Required invariants:
 Plan mode is a policy overlay. Plan persistence owns authoring state and active
 session bindings. Execution attempts, cancellation and custody remain in Work
 and Run; there is no separate plan-step attempt audit.
+An active plan remains owned by its current session. Another session must
+wait for that session to finish or release it; deleting an active plan is
+likewise rejected. A failed binding acknowledgement leaves the write guard
+unavailable until the current binding can be checked.
 
 Allowed by default:
 
@@ -810,9 +803,11 @@ A denial must explain policy and continuation options. It must not pretend the t
 
 Server root executors share the host’s plan authoring and resume-context handles
 through the same construction path for Run and SSE entrypoints. Entering plan
-mode refreshes the next provider request and the host permission gate. Trusted
-approval clears the complete plan hint, including its multiline guidance, while
-other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
+mode refreshes the next provider request and the host permission gate. Finishing
+authoring clears the complete plan hint, including its multiline guidance, while
+other turn-start facts remain fixed. Explicitly requested or policy-required
+review needs a trusted decision; Auto or Bypass can otherwise continue under the
+existing authorization. Model tool arguments cannot approve a plan.
 
 A live Server control watcher owns cross-pod pause/cancel polling and updates
 shared execution flags. Model boundaries consume those observations without
@@ -864,56 +859,93 @@ delayed. The ordinary client currently negotiates MCP 2025-11-25, whose
 [cancellation contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
 does not promise a response after cancellation. Retaining the receiver only
 preserves the chance to observe a racing completion; it does not require a
-cancelled provider to respond. A late response to a workspace-mutating call
-still needs the existing explicit workspace-effect settlement evidence. The
-notification acknowledgement, connection closure and token alone cannot prove
-process termination. Missing execution evidence retains the existing cleanup
-deadline and workspace quarantine. Complete cooperative cleanup convergence
-requires a provider-owned settlement contract beyond the one-way notification.
+cancelled provider to respond. A correlated tool response is reported as the
+provider's result; it does not need an Astra-specific workspace receipt. A
+notification acknowledgement, connection closure or token alone cannot prove
+completion. When a dispatched call loses its result, report the outcome as
+unknown and retain its invocation identity without automatically sending it again.
 
 Agent Binding HTTP admits a result or provider error only from a JSON-RPC 2.0
 response with the exact, typed protocol request ID of that exchange. SSE
 notifications and other request IDs cannot settle it. A missing/mismatched ID,
 malformed envelope or disconnected transport retains unknown-outcome handling;
 even a response carrying `astra.workspace_effect.settled` cannot discharge a
-different invocation. A correlated completion still requires the existing
-workspace-effect marker and valid workspace receipt authority before releasing
-a workspace-mutating call. Correlation does not independently prove provider
+different invocation. Correlation does not independently prove provider
 cleanup or make a cancellation acknowledgement into a completion receipt.
+
+An earlier unresolved tool call does not by itself prevent a new Run after the
+previous Run and its owner are no longer active. The new Run and streaming
+client receive a general advisory from the existing admission result; it does
+not infer which call or effect is involved. Available tool details remain in
+the conversation and execution history. No extra query is needed. A new
+invocation has a new identity and can overlap the earlier operation,
+which may still be running; the model should inspect the current state before
+repeating a potentially effectful action. Binding changes, controller operations
+and deletion retain their own stricter admission rules.
+
+When the active owner settles a cancelled Run, it commits the available
+conversation Context together with the terminal. Recorded tool results remain
+unchanged; a valid call whose result was lost receives a provider-compatible
+message saying its outcome is unknown. If the Context authority changed or its
+size budget prevents storage, cancellation may still settle without that turn's
+Context. The terminal and exact-run cancellation response expose
+`context_not_saved` when known; an absent value means the result is unknown.
+Interactive and one-shot clients warn about a lost or unconfirmed Context. An
+executor crash before settlement, or an owner that has already been fenced,
+cannot promise to save its in-memory history.
+
+Web projects the same Context observation separately from assistant text. It
+retains the exact-run cancellation response even after Stop closes the stream;
+an acknowledgement without execution settlement remains unconfirmed. Once the
+existing Stop reconciliation observes a terminal, the bounded conversation
+read projects its receipt within the original Stop response budget. A slow
+read leaves saving unconfirmed and does not retain a terminal active slot.
+Cold history attaches that observation to the
+recorded terminal assistant, or a display-only cancellation item in the same
+Run when no assistant is visible. Historical cancellations remain attached to
+their own Run after a successor starts. This extends the existing snapshot
+projection, without another ordinary execution query or persistence owner.
 
 The MOI receiving boundary is outside Astra. Matrixflow
 [PR #18920](https://github.com/matrixorigin/matrixflow/pull/18920) adds protocol-ID
 propagation and authenticated, process-local cooperative cancellation; it does
-not establish remote execution settlement. The remaining gateway/provider
-contract must reach the exact invocation owner across replica and
-ownership-generation changes. That owner must cancel and
-settle its execution boundary, expose idempotent owner-scoped readback, and
-verify subprocess termination/reaping and absence of later writes. Astra's
-sender and response validation do not supply those receiving/provider facts;
-unknown outcomes keep the current cleanup deadline and quarantine protection.
+not establish remote execution settlement. Astra's sender and response
+validation cannot prove that the provider has stopped. An unknown outcome
+retains its invocation identity and is not automatically redelivered; a later
+distinct invocation may overlap the earlier operation.
 
 ### Session cancellation convergence
 
 `POST /sessions/{id}/cancel` accepts cancellation through the canonical Run
-control path and spends a bounded interval converging its execution. Its JSON
+control path and reports the current execution-settlement observation. Its JSON
 retains the Session fields and adds required `execution_settled` and `runs`
 fields. Each run entry contains `run_id`, its observed `status`, and
 `execution_settled`. HTTP 202 with `status: "cancellation_requested"` and
 `execution_settled: false` is pending, including when the run list is empty.
 Only HTTP 200 with `status: "cancelled"` and `execution_settled: true` reports
 convergence. Pending responses do not write a cancelled Session projection.
-Clients may repeat the same owner-scoped endpoint; a deadline, missing proof,
-or storage failure must not become cancellation success.
+After acceptance, clients use `GET /sessions/{id}/cancel` to observe settlement.
+The exact-run equivalents are `DELETE /chat/runs/{id}` and read-only
+`GET /chat/runs/{id}/cancel`. Observation uses the same owner-scoped settlement
+proof, not the ordinary display status. Clients use bounded backoff within one
+absolute deadline. An acknowledged mutation is retried only when the read
+returns the typed `cancellation_recovery_required` conflict, asking the
+canonical command to reconcile retained authority. Once a Session read proves
+physical settlement, one final POST commits the durable cancelled Session
+projection. GET remains read-only throughout. A deadline, missing proof
+or storage failure cannot become cancellation success.
 Pending responses may include `execution_blocker`, the typed result of the
 latest canonical idle proof. Missing proof is not an inferred blocker or
 success. The database Run store publishes all currently active Runs' existing
 cancellation markers in one owner/Session-scoped atomic write, with a bounded,
 cancellation-safe database attempt. An ambiguous acknowledgement fails closed;
 retry is idempotent. This precedes settlement discovery, so slow pages cannot
-starve later intent. The subsequent one-second settlement budget is cooperative:
-checks occur between completed operations, never by dropping an in-flight SQL
-transaction. An individual operation can exceed that budget; CLI callers enforce
-their own hard deadline.
+starve later intent. The command bounds best-effort convergence to one second after publishing
+intent. If discovery reaches that bound, it performs one separately bounded
+read of the exact owner/idle proof; read-only observations never repeat broad
+history discovery. The Server does not
+repeat cancellation writes or hold an HTTP request in a polling loop. Storage
+and remote settlement can remain pending; callers retain their absolute deadline.
 
 Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
@@ -1114,7 +1146,7 @@ request identities.
 
 Execution-slice guidance is assembled through the canonical context pipeline.
 The retired journal-based resource policy did not control execution capacity;
-adaptive renewal and settlement retain their existing owners. Runtime config
+admitted resource limits and canonical settlement retain their existing owners. Runtime config
 and handoff facts reject the retired `budget_policy` field, and pending context
 rejects the retired `self_status` kind. Provider output ending with `length`
 still receives the terminal truncation marker outside exploratory tasks.

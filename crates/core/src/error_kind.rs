@@ -26,9 +26,13 @@ pub enum ErrorKind {
     RateLimit,
     /// 402, provider balance or billing limit prevents inference.
     PaymentRequired,
+    /// An explicit provider machine code reports exhausted balance or quota.
+    ProviderQuotaExhausted,
+    /// Provider denied inference (403), without evidence of invalid credentials.
+    ProviderForbidden,
     /// 5xx from provider.
     ServerError,
-    /// 401/403, bad API key or expired token.
+    /// 401 or an explicit invalid-credential code; never inferred from 403 alone.
     Auth,
     /// Prompt too long for the model's context window.
     ContextWindow,
@@ -227,6 +231,8 @@ impl ErrorKind {
         match self {
             Self::RateLimit => "rate_limit",
             Self::PaymentRequired => "payment_required",
+            Self::ProviderQuotaExhausted => "provider_quota_exhausted",
+            Self::ProviderForbidden => "provider_forbidden",
             Self::ServerError => "server_error",
             Self::Auth => "auth",
             Self::ContextWindow => "context_window",
@@ -296,6 +302,14 @@ impl ErrorKind {
     #[must_use]
     pub fn guidance(self) -> &'static str {
         match self {
+            Self::ProviderQuotaExhausted => {
+                "The model provider account has exhausted its balance or quota. \
+                 Do NOT retry or re-authenticate; ask the provider account owner to resolve the restriction."
+            }
+            Self::ProviderForbidden => {
+                "The model provider denied inference. The cause is not known. \
+                 Do NOT retry automatically; ask the model administrator to check the provider rejection."
+            }
             Self::PaymentRequired => {
                 "Model inference requires available credit or a higher billing limit. \
                  Do NOT retry or re-authenticate; resolve the provider billing restriction first."
@@ -309,7 +323,7 @@ impl ErrorKind {
                  Retrying automatically with backoff."
             }
             Self::Auth => {
-                "Authentication failed (401/403). \
+                "Authentication failed. \
                  Do NOT retry — credentials need to be refreshed."
             }
             Self::ContextWindow => {
@@ -418,6 +432,12 @@ impl ErrorKind {
     pub fn diagnosis_hint(self) -> &'static str {
         match self {
             Self::PaymentRequired => "Check the model provider balance and billing limits.",
+            Self::ProviderQuotaExhausted => {
+                "Ask the model provider account owner to check its balance and quota."
+            }
+            Self::ProviderForbidden => {
+                "Ask the model administrator to inspect the provider rejection; a 403 alone does not identify its cause."
+            }
             Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
             Self::ServerError => {
                 "Transient provider issue. If it persists, switch model or provider."
@@ -538,6 +558,8 @@ impl ErrorKind {
         match s {
             "rate_limit" => Some(Self::RateLimit),
             "payment_required" => Some(Self::PaymentRequired),
+            "provider_quota_exhausted" => Some(Self::ProviderQuotaExhausted),
+            "provider_forbidden" => Some(Self::ProviderForbidden),
             "server_error" => Some(Self::ServerError),
             "auth" => Some(Self::Auth),
             "context_window" => Some(Self::ContextWindow),
@@ -1162,6 +1184,8 @@ mod tests {
     const ALL_VARIANTS: &[ErrorKind] = &[
         ErrorKind::RateLimit,
         ErrorKind::PaymentRequired,
+        ErrorKind::ProviderQuotaExhausted,
+        ErrorKind::ProviderForbidden,
         ErrorKind::ServerError,
         ErrorKind::Auth,
         ErrorKind::ContextWindow,

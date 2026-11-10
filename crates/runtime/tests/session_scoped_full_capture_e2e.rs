@@ -451,6 +451,7 @@ impl RunLifecycleService for RecordingLifecycle {
             run_id,
             status: "cancellation_requested".into(),
             execution_settled: false,
+            context_not_saved: None,
         })
     }
 

@@ -1,9 +1,6 @@
 //! Real model service + isolated DB + strict, non-billable provider fixture.
-//! Run with ASTRA_TEST_DB_IT=1, ASTRA_TEST_DATABASE=$ASTRA_DATABASE,
-//! ASTRA_ALLOW_INSECURE_DEFAULTS=1 and ASTRA_BYOK_DEEPSEEK_BASE_URL set to
-//! an unused loopback HTTP origin (e.g. http://127.0.0.1:18994).
-//! Explicitly selected with --features external-contract-tests; ordinary
-//! online lanes do not provide this operator-only endpoint override.
+//! Run with ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DATABASE=$ASTRA_DATABASE.
+//! Explicitly selected with --features external-contract-tests.
 mod common;
 #[path = "common/isolated_database.rs"]
 mod isolated_database;
@@ -12,34 +9,49 @@ use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService,
     models::{UserModelCreateRequestData, UserModelUpdateRequestData},
 };
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[tokio::test]
-#[ignore = "requires isolated MatrixOne DB and loopback DeepSeek fixture override"]
+#[ignore = "requires an isolated MatrixOne database"]
 async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
-    assert_eq!(
-        std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
-        Ok("1")
-    );
-    let base = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL").expect("loopback fixture origin");
-    let url = reqwest::Url::parse(&base).unwrap();
-    assert_eq!(url.scheme(), "http");
-    assert_eq!(url.host_str(), Some("127.0.0.1"));
     let fail_probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[derive(Default)]
     struct ConnectivityHold {
-        // 1/2 hold connectivity success/failure; 3 holds thinking; 0 passes.
+        // 1/2 hold connectivity success/failure; 3 holds thinking; 5 fails connectivity.
         next: std::sync::atomic::AtomicU8,
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
     let hold = Arc::new(ConnectivityHold::default());
     let app = Router::new()
+        .route(
+            "/responses",
+            post(|axum::extract::State((fail, _, hold)): axum::extract::State<(
+                    Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>, Arc<ConnectivityHold>
+                )>, headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                if headers.get("authorization").is_none_or(|v| v != "Bearer valid-key" && v != "Bearer rotated-key")
+                    || body["model"] != "deepseek-chat" || body["stream"] != true || body["store"] != false {
+                    return (StatusCode::BAD_REQUEST, "invalid Responses request").into_response();
+                }
+                if body["reasoning"]["effort"] == "high" && fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::BAD_REQUEST, "high is not supported").into_response();
+                }
+                if body["reasoning"]["effort"] == "high" && hold.next.compare_exchange(4, 0, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                    hold.started.notify_one();
+                    hold.release.notified().await;
+                }
+                let event = json!({"type":"response.completed","response":{"id":"fixture","status":"completed","output":[
+                    {"type":"reasoning","id":"reason","summary":[],"encrypted_content":"opaque"},
+                    {"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"391"}]}
+                ]}});
+                ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+            }),
+        )
         .route(
             "/chat/completions",
             post(
@@ -76,6 +88,18 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                     };
                     if status == StatusCode::OK {
                         let outcome = hold.next.load(std::sync::atomic::Ordering::SeqCst);
+                        if body[limit] == 32 && outcome == 5 {
+                            hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
+                            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"fixture failure"})));
+                        }
+                        if body[limit] == 32 && outcome == 6 {
+                            hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
+                            return (StatusCode::OK, Json(json!({"status":"ok"})));
+                        }
+                        if body[limit] == 32 && outcome == 7 {
+                            hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
+                            return (StatusCode::OK, Json(json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}]})));
+                        }
                         let matches = (body[limit] == 32 && matches!(outcome, 1 | 2))
                             || (body[limit] == 1024 && outcome == 3);
                         if matches
@@ -118,10 +142,12 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                             Json(json!({"choices":[{"message":message,"finish_reason":"stop"}]})),
                         );
                     }
-                    (
-                        status,
-                        Json(json!({"error":{"message":"strict fixture rejection"}})),
-                    )
+                    let body = if status == StatusCode::OK {
+                        json!({"choices":[{"message":{"content":"ok"}}]})
+                    } else {
+                        json!({"error":{"message":"strict fixture rejection"}})
+                    };
+                    (status, Json(body))
                 },
             ),
         )
@@ -146,25 +172,33 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                     } else {
                         StatusCode::OK
                     };
-                    (
-                        status,
-                        Json(json!({"error":{"message":"strict fixture rejection"}})),
-                    )
+                    let body = if status == StatusCode::OK {
+                        json!({"content":[{"type":"text","text":"ok"}]})
+                    } else {
+                        json!({"error":{"message":"strict fixture rejection"}})
+                    };
+                    (status, Json(body))
                 },
             ),
         )
         .with_state((fail_probe.clone(), requests.clone(), hold.clone()));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", url.port().unwrap()))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let base = format!("http://{endpoint}");
     let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (pool, settings) = common::setup_pool_and_settings().await;
     let encryptor = FernetTokenEncryptor::new("provider-wire-test-only-key").unwrap();
     let service = DatabaseModelService::new(settings.clone(), Arc::new(encryptor.clone()))
-        .with_pool(pool.clone());
+        .with_pool(pool.clone())
+        .with_deepseek_test_endpoint(endpoint)
+        .unwrap();
     let owner = uuid::Uuid::new_v4().to_string();
     let make_request = |name: &str, model: &str, key: &str| UserModelCreateRequestData {
         connection_id: None,
+        inference_protocol: None,
+        responses_reasoning_history: None,
         name: name.into(),
         provider: "deepseek".into(),
         model: model.into(),
@@ -173,15 +207,21 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         context_window: 128000,
         is_default: true,
     };
-    for (model, key) in [
-        ("deepseek-chat", "invalid-key"),
-        ("missing-model", "valid-key"),
+    for (model, key, code) in [
+        (
+            "deepseek-chat",
+            "invalid-key",
+            "model_probe_credentials_or_access",
+        ),
+        ("missing-model", "valid-key", "model_probe_request_rejected"),
     ] {
         let error = service
             .create_user_model(owner.clone(), make_request("rejected", model, key))
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1.0.error_code.as_deref(), Some(code));
+        assert_eq!(error.1.0.metadata.as_ref().unwrap()["model_saved"], false);
         assert!(
             service
                 .list_user_models(owner.clone())
@@ -191,6 +231,49 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             "failed create persisted data"
         );
     }
+    hold.next.store(5, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_user_model(
+            owner.clone(),
+            make_request("unavailable", "deepseek-chat", "valid-key"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_upstream")
+    );
+    assert!(
+        service
+            .list_user_models(owner.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    hold.next.store(6, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_user_model(
+            owner.clone(),
+            make_request("invalid-response", "deepseek-chat", "valid-key"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_response")
+    );
+    assert!(
+        service
+            .list_user_models(owner.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A reasoning-only truncated response is sufficient to save a working
+    // model and must not trigger another paid inference.
+    let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+    hold.next.store(7, std::sync::atomic::Ordering::SeqCst);
     let created = service
         .create_user_model(
             owner.clone(),
@@ -198,6 +281,370 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
+    assert!(created.is_active);
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst) - before,
+        1
+    );
+    let duplicate = service
+        .create_user_model(
+            owner.clone(),
+            make_request("fixture", "deepseek-chat", "valid-key"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.0, StatusCode::CONFLICT);
+    assert_eq!(
+        duplicate.1.0.metadata.as_ref().unwrap()["model_saved"],
+        false
+    );
+    hold.next.store(5, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .check_user_model(owner.clone(), created.model_id.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+    let after = service
+        .get_user_model(owner.clone(), created.model_id.clone())
+        .await
+        .unwrap();
+    assert!(after.is_active);
+    assert!(after.thinking_probe.is_none());
+    // A provider failure belongs to the snapshot actually probed. A later
+    // credential rotation must not make that old failure look current.
+    for update in [false, true] {
+        hold.next.store(2, std::sync::atomic::Ordering::SeqCst);
+        let stale = async {
+            if update {
+                service
+                    .update_user_model(
+                        owner.clone(),
+                        created.model_id.clone(),
+                        UserModelUpdateRequestData {
+                            api_key: Some("valid-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            } else {
+                service
+                    .check_user_model(owner.clone(), created.model_id.clone())
+                    .await
+            }
+        };
+        let rotate = async {
+            hold.started.notified().await;
+            let result = service
+                .update_user_model(
+                    owner.clone(),
+                    created.model_id.clone(),
+                    UserModelUpdateRequestData {
+                        api_key: Some("rotated-key".into()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            hold.release.notify_one();
+            result.unwrap();
+        };
+        let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(stale, rotate)
+        })
+        .await
+        .unwrap();
+        assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
+    }
+    let mut disposable = make_request("disposable", "deepseek-chat", "valid-key");
+    disposable.is_default = false;
+    let disposable = service
+        .create_user_model(owner.clone(), disposable)
+        .await
+        .unwrap();
+    hold.next.store(2, std::sync::atomic::Ordering::SeqCst);
+    let stale = service.check_user_model(owner.clone(), disposable.model_id.clone());
+    let delete = async {
+        hold.started.notified().await;
+        let result = service
+            .delete_user_model(owner.clone(), disposable.model_id.clone())
+            .await;
+        hold.release.notify_one();
+        result.unwrap();
+    };
+    let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(stale, delete)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
+    // The selected protocol is durable configuration, independent of checks
+    // and key encryption, and route identity follows the actual credential.
+    use astra_core::model_wire::LlmProviderProtocol;
+    let mut responses_request = make_request("responses", "deepseek-chat", "valid-key");
+    responses_request.is_default = false;
+    responses_request.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
+    let mut incompatible = responses_request.clone();
+    incompatible.provider = "anthropic".into();
+    assert_eq!(
+        service
+            .create_user_model(owner.clone(), incompatible)
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let responses = service
+        .create_user_model(owner.clone(), responses_request)
+        .await
+        .unwrap();
+    assert_eq!(
+        responses.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    let admitted = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    let original_scope = admitted
+        .response_scope
+        .clone()
+        .expect("BYOK Responses route scope");
+    assert_eq!(
+        admitted.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    assert!(admitted.cache_capability.is_none());
+    // Admission reads the effective route, independently of model alias or
+    // the connectivity probe that created this isolated fixture row.
+    sqlx::query(
+        "UPDATE user_llm_models SET provider = ?, base_url = ? WHERE user_id = ? AND model_id = ?",
+    )
+    .bind("openai")
+    .bind("https://api.openai.com/v1")
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let native = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    let cache = native
+        .cache_capability
+        .expect("native Responses cache layout");
+    assert_eq!(
+        cache.protocol,
+        astra_services::models::PromptCacheProtocolData::OpenAiAutoPrefix
+    );
+    assert_eq!(
+        cache.volatile_placement,
+        astra_services::models::PromptCacheVolatilePlacementData::AppendOnlyUserTail
+    );
+    assert_eq!(
+        cache.volatile_delivery,
+        astra_services::models::PromptCacheVolatileDeliveryData::All
+    );
+    assert_eq!(cache.reuse_scope, None);
+    sqlx::query("UPDATE user_llm_models SET provider = ? WHERE user_id = ? AND model_id = ?")
+        .bind("deepseek")
+        .bind(&owner)
+        .bind(&responses.model_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    // A query in the persisted route must survive both connectivity and thinking probes.
+    sqlx::query("UPDATE user_llm_models SET base_url = ? WHERE user_id = ? AND model_id = ?")
+        .bind(format!("{base}?workspace=one"))
+        .bind(&owner)
+        .bind(&responses.model_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    fail_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed_check = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(failed_check.is_active);
+    assert!(failed_check.thinking_probe.unwrap().error.is_some());
+    let unknown = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(unknown.thinking_capability.is_none());
+    assert!(unknown.supported_reasoning_efforts.is_none());
+    fail_probe.store(false, std::sync::atomic::Ordering::SeqCst);
+    let checked = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        checked.thinking_probe.unwrap().capability,
+        astra_services::models::ThinkingCapability::EffortOnly
+    );
+    let admitted = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_ne!(
+        admitted.response_scope.as_deref(),
+        Some(original_scope.as_str())
+    );
+    assert!(admitted.supported_reasoning_efforts.is_none());
+    let catalog = service.list_models(owner.clone(), false).await.unwrap();
+    let personal = catalog
+        .iter()
+        .find(|item| item.offering_id == responses.model_id)
+        .unwrap();
+    assert!(personal.supported_reasoning_efforts.is_none());
+    let probe_before: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(thinking_probe_json AS CHAR) FROM user_llm_models WHERE user_id = ? AND model_id = ?",
+    )
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert!(probe_before.is_some());
+    let history_update = service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                responses_reasoning_history: Some(
+                    astra_core::model_wire::responses::ReasoningHistory::CurrentTurn,
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(history_update.thinking_probe.is_some());
+    let probe_after: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(thinking_probe_json AS CHAR) FROM user_llm_models WHERE user_id = ? AND model_id = ?",
+    )
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(probe_after, probe_before);
+    let same_scope = admitted.response_scope.clone();
+    let bad_update = service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::AnthropicMessages),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(bad_update.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        service
+            .get_user_model(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    let rotated = service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                api_key: Some("valid-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rotated.thinking_probe.is_none());
+    assert_eq!(
+        service
+            .admit_model_offering(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .response_scope,
+        same_scope
+    );
+    service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::OpenAiCompatible),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let chat = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        chat.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiCompatible)
+    );
+    assert!(chat.thinking_probe.is_some());
+    service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .admit_model_offering(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .response_scope,
+        same_scope
+    );
+    hold.next.store(4, std::sync::atomic::Ordering::SeqCst);
+    let stale_check = service.check_user_model(owner.clone(), responses.model_id.clone());
+    let rotation = async {
+        hold.started.notified().await;
+        let rotated = service
+            .update_user_model(
+                owner.clone(),
+                responses.model_id.clone(),
+                UserModelUpdateRequestData {
+                    api_key: Some("rotated-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        hold.release.notify_one();
+        rotated.unwrap();
+    };
+    let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(stale_check, rotation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
+    let rotated = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_ne!(rotated.response_scope, same_scope);
+    assert!(
+        service
+            .get_user_model(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .thinking_probe
+            .is_none()
+    );
     // Fixed official endpoints are not user-overridable. Seed their *test row*
     // with this loopback fixture to exercise the real rotate/probe service paths
     // without adding a production transport bypass or spending a live API key.
@@ -358,8 +805,77 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             ..Default::default()
         }),
     };
+    let mut rejected = request.clone();
+    rejected.name = "admin-failed".into();
+    rejected.api_key = "invalid-key".into();
+    let failure = service
+        .create_model(owner.clone(), rejected.clone())
+        .await
+        .err()
+        .expect("invalid credential must be rejected");
+    assert_eq!(failure.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_credentials_or_access")
+    );
+    assert_eq!(
+        service
+            .get_model(rejected.name.clone())
+            .await
+            .err()
+            .expect("failed model must not be stored")
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    rejected.api_key = "valid-key".into();
+    hold.next.store(5, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_model(owner.clone(), rejected.clone())
+        .await
+        .err()
+        .expect("unavailable provider must be rejected");
+    assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_upstream")
+    );
+    hold.next.store(6, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_model(owner.clone(), rejected.clone())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_response")
+    );
+    assert_eq!(
+        service
+            .get_model(rejected.name)
+            .await
+            .err()
+            .expect("failed model must not be stored")
+            .0,
+        StatusCode::NOT_FOUND
+    );
     service
         .create_model(owner.clone(), request.clone())
+        .await
+        .unwrap();
+    service
+        .update_model("admin-fixture".into(), patch(None, Some(false)))
+        .await
+        .unwrap();
+    let refreshed = service
+        .update_model("admin-fixture".into(), patch(Some("valid-key"), None))
+        .await
+        .unwrap();
+    assert!(
+        !refreshed.is_active,
+        "a credential check must not reactivate a disabled model"
+    );
+    service
+        .update_model("admin-fixture".into(), patch(None, Some(true)))
         .await
         .unwrap();
     let mut verified_request = request.clone();
@@ -373,6 +889,35 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .check_model("admin-verified-fixture".into())
         .await
         .unwrap();
+    let mut responses_admin = request.clone();
+    responses_admin.name = "admin-responses-fixture".into();
+    responses_admin.quirks.as_mut().unwrap().inference_protocol =
+        Some(LlmProviderProtocol::OpenAiResponses);
+    service
+        .create_model(owner.clone(), responses_admin)
+        .await
+        .unwrap();
+    service
+        .check_model("admin-responses-fixture".into())
+        .await
+        .unwrap();
+    let catalog = service.list_models(owner.clone(), true).await.unwrap();
+    let admin = catalog
+        .iter()
+        .find(|item| item.name == "admin-responses-fixture")
+        .unwrap();
+    assert_eq!(
+        admin.supported_reasoning_efforts.as_deref(),
+        Some(["high".to_string()].as_slice())
+    );
+    let resolved = service
+        .revalidate_model_offering(admin.offering_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.model.supported_reasoning_efforts,
+        admin.supported_reasoning_efforts
+    );
     let assert_views = |expected, expected_error: Option<bool>| {
         let service = &service;
         let settings = &settings;
@@ -449,6 +994,27 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         assert_eq!(result.error.is_some(), fail);
         assert_views(expected, Some(fail)).await;
     }
+    let before_failure: (i16, String, Option<String>) = sqlx::query_as(
+        "SELECT is_active, CAST(updated_at AS CHAR), CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    hold.next.store(5, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .check_model("admin-fixture".into())
+        .await
+        .err()
+        .expect("unavailable provider must fail the check");
+    assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_upstream")
+    );
+    let after_failure: (i16, String, Option<String>) = sqlx::query_as(
+        "SELECT is_active, CAST(updated_at AS CHAR), CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(
+        after_failure, before_failure,
+        "a failed check must not change the existing model"
+    );
     let raw: String = sqlx::query_scalar("SELECT CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'")
         .fetch_one(pool.get()).await.unwrap();
     let snapshot: Value = serde_json::from_str(&raw).unwrap();
@@ -471,8 +1037,8 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     .await
     .unwrap();
     assert_views(None, None).await;
-    // Hold an actual connectivity request, rotate through the public service,
-    // then release either success or failure from the superseded configuration.
+    // Hold an actual connectivity request, then update the key or status through
+    // the public service before releasing the older success or failure.
     fail_probe.store(false, std::sync::atomic::Ordering::SeqCst);
     for outcome in [1, 2] {
         let before = requests.load(std::sync::atomic::Ordering::SeqCst);
@@ -506,7 +1072,17 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             outcome == 2,
             "old success or failure cannot change the replacement status"
         );
-        assert!(current.thinking_probe.is_none());
+        if outcome == 1 {
+            assert!(
+                current.thinking_probe.is_none(),
+                "a new key invalidates the prior observation"
+            );
+        } else {
+            assert!(
+                current.thinking_probe.is_some(),
+                "reusing the same key preserves the prior observation"
+            );
+        }
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst) - before,
             2,
@@ -630,16 +1206,30 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     assert_eq!(restored, saved);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), before);
 
-    // Credential updates inherit a stored endpoint/header only when quirks
-    // is absent. A replacement object must clear both of these old controls.
-    for (configured, expected_error) in [
+    // An idempotent credential update retains the encrypted identity and its
+    // probe evidence instead of invalidating active model controls.
+    let before_key: (String, String) = sqlx::query_as(
+        "SELECT api_key_encrypted, CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    service
+        .update_model("admin-fixture".into(), patch(Some("rotated-key"), None))
+        .await
+        .unwrap();
+    let after_key: (String, String) = sqlx::query_as(
+        "SELECT api_key_encrypted, CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(before_key, after_key);
+
+    // Credential rotations use the stored probe configuration and must not
+    // save any field when the probe fails, even with explicit activation.
+    for (configured, expected_code) in [
         (
             QuirksData {
                 wire_model_name: Some("deepseek-chat".into()),
                 probe_endpoint: Some("/missing-probe".into()),
                 ..Default::default()
             },
-            "HTTP 404",
+            "model_probe_request_rejected",
         ),
         (
             QuirksData {
@@ -649,7 +1239,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                 ),
                 ..Default::default()
             },
-            "HTTP 401",
+            "model_probe_credentials_or_access",
         ),
     ] {
         let mut stored = patch(None, None);
@@ -658,62 +1248,49 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             .update_model("admin-fixture".into(), stored)
             .await
             .unwrap();
-        let inherited = service
-            .update_model("admin-fixture".into(), patch(Some("valid-key"), None))
+        let before = service.get_model("admin-fixture".into()).await.unwrap();
+        let failure = service
+            .update_model("admin-fixture".into(), patch(Some("valid-key"), Some(true)))
             .await
-            .unwrap();
-        assert!(!inherited.is_active);
-        assert!(
-            inherited
-                .connectivity
-                .as_deref()
-                .expect("stored probe failed")
-                .starts_with(expected_error)
-        );
-        let mut reset = patch(Some("valid-key"), None);
+            .err()
+            .expect("failed probe must reject the update");
+        assert_eq!(failure.1.0.error_code.as_deref(), Some(expected_code));
+        let after = service.get_model("admin-fixture".into()).await.unwrap();
+        assert_eq!(after.quirks, before.quirks);
+        assert_eq!(after.is_active, before.is_active);
+        assert_eq!(after.thinking_probe, before.thinking_probe);
+        let mut reset = patch(None, None);
         reset.quirks = request.quirks.clone();
-        let cleared = service
+        service
             .update_model("admin-fixture".into(), reset)
             .await
             .unwrap();
-        assert!(cleared.is_active);
-        assert_eq!(cleared.connectivity.as_deref(), Some("ok"));
     }
 
     // A supplied quirks object is a full replacement. Removing its upstream
     // override makes the fixture reject the local alias, unlike the old merge.
     let mut replacement = patch(Some("valid-key"), None);
     replacement.quirks = Some(QuirksData::default());
-    let disabled = service
+    let failure = service
         .update_model("admin-fixture".into(), replacement.clone())
         .await
-        .unwrap();
-    assert!(!disabled.is_active);
-    assert!(
-        disabled
-            .connectivity
-            .as_deref()
-            .expect("failed probe result")
-            .starts_with("HTTP 404")
+        .err()
+        .expect("failed probe must reject the replacement");
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_request_rejected")
     );
-    assert!(disabled.quirks.wire_model_name.is_none());
-    assert!(disabled.thinking_probe.is_none());
+    let retained = service.get_model("admin-fixture".into()).await.unwrap();
+    assert_eq!(
+        retained.quirks.wire_model_name.as_deref(),
+        Some("deepseek-chat")
+    );
     replacement.is_active = Some(true);
     assert!(
         service
             .update_model("admin-fixture".into(), replacement)
             .await
-            .unwrap()
-            .is_active
-    );
-    let mut restore = patch(Some("valid-key"), None);
-    restore.quirks = request.quirks.clone();
-    assert!(
-        service
-            .update_model("admin-fixture".into(), restore)
-            .await
-            .unwrap()
-            .is_active
+            .is_err()
     );
 
     // Name reuse is a new durable row, never the delayed PATCH's original target.
@@ -777,6 +1354,10 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
 
     service
         .delete_model("admin-verified-fixture".into())
+        .await
+        .unwrap();
+    service
+        .delete_user_model(owner.clone(), responses.model_id)
         .await
         .unwrap();
     service

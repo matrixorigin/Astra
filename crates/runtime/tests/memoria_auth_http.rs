@@ -251,6 +251,7 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         Err(MemoriaOperationError::AuthorityUnavailable(_))
     ));
     assert_no_summary(&unbound).await;
+    assert!(unbound.resolve_observer_transport().await.is_err());
     assert_eq!(reads.count(), 0, "unbound authority never reaches Memoria");
     let local = auth
         .register(AuthRegisterRequestData {
@@ -267,6 +268,13 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     )
     .with_self_hosted_fallback(base.clone(), "self-hosted-fallback-key".into());
     assert!(local_port.admits_operation(true).await.unwrap());
+    let observer_transport = local_port
+        .resolve_observer_transport()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observer_transport.owner_user_id, local.user_id);
+    assert!(observer_transport.owner_scoped_master);
     assert!(
         local_port
             .retrieve("local read", None, 1)
@@ -382,6 +390,13 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .with_self_hosted_fallback(base, "self-hosted-fallback-key".into());
     assert!(retained_scoped_port.admits_operation(false).await.unwrap());
     assert!(!retained_scoped_port.admits_operation(true).await.unwrap());
+    assert!(
+        retained_scoped_port
+            .resolve_observer_transport()
+            .await
+            .unwrap()
+            .is_none()
+    );
     let scoped_transport = retained_scoped_port
         .resolve_tool_transport(false)
         .await
@@ -466,6 +481,13 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .bind(changed.to_string()).bind(user_id).execute(pool.get()).await.unwrap();
     let before = reads.count();
     let writes_before = calls.load(Ordering::SeqCst);
+    assert!(
+        retained_scoped_port
+            .resolve_observer_transport()
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         retained_scoped_port.retrieve("revoked", None, 1).await,
         Err(MemoriaOperationError::Disabled(_))
@@ -597,6 +619,13 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .await
         .unwrap();
     assert!(!local_port.admits_operation(true).await.unwrap());
+    assert!(
+        local_port
+            .resolve_observer_transport()
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         local_port.retrieve("query", None, 1).await,
         Err(MemoriaOperationError::Disabled(_))

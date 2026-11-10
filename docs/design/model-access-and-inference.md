@@ -38,12 +38,76 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Provider rejection contract
+
+The shared ordinary-provider HTTP boundary distinguishes authentication (`auth`), an
+explicit provider balance/quota denial (`provider_quota_exhausted`), and a
+provider denial without a proven cause (`provider_forbidden`). HTTP 401 is
+authentication failure. HTTP 403 alone, including `upstream_forbidden`, is not
+evidence of expired credentials or exhausted credit. Only the bounded machine
+codes `invalid_api_key`, `invalid_token`, `authentication_error`,
+`insufficient_quota`, and `insufficient_balance` refine that classification;
+provider message text never does. A quota-coded 429 is terminal, unlike a
+transient rate limit. These access rejections do not trigger automatic retry,
+credential refresh, provider fallback, or a waiting run.
+
+Both streaming and nonstreaming calls preserve these classifications through
+the shared agent loop and failed Run outcome. The negotiated MOI gateway can
+carry the same provider facts using `provider_authentication_failed`,
+`provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
+(for example `insufficient_credit`) keep their separate versioned contract.
+Provider diagnostics, balances, and echoed credentials never enter public
+error messages. Clients must not infer an end-user billing remedy from a
+provider-account failure. Real input/authorization waits retain their existing
+lifecycle semantics.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
 the shared Responses codec; it does not create another session state machine.
+Administrator-managed and personal API-key Offerings can explicitly select the same Responses
+wire protocol. Protocol selection is independent of credential ownership: API
+keys use their admitted endpoint and headers, while subscriptions retain their
+connection fencing and refresh rules. API-key continuation state is scoped to
+the Offering, provider route, request headers, and credential generation;
+header names are case-insensitive, and invalid or duplicate configured headers
+are rejected at configuration and execution admission. Probe-only and unrelated
+capability changes do not invalidate it. Model checks use
+the selected wire protocol; the ordinary provider default remains unchanged.
+Personal and administrator model creation validates connectivity before storing
+the model. Credential updates are also checked before committing. A failed
+check returns a coded error and leaves existing model configuration and
+activation unchanged; a successful administrator check can activate it.
+Authentication/access, rejected requests, rate limits, upstream failures,
+timeouts and network failures have distinct error codes across both wire
+protocols. Probes do not automatically repeat potentially billable requests
+after uncertain delivery. A Chat Completions 2xx response must be bounded JSON
+without an error; an HTML page or embedded error is not a successful check.
+Personal model configuration stores the protocol separately from the optional
+thinking observation. Credential rotation and concurrent checks are fenced by
+the existing model row. A Responses tool group retains its scoped provider
+evidence across canonical projection; incomplete or inconsistent evidence
+stops the current continuation before provider dispatch. A later human turn can
+continue with the completed canonical tool pairs. No separate continuation
+table or per-request database lookup is introduced.
+An effort accepted by one probe is an observation, not a complete provider
+inventory. Personal Responses models can try an unverified effort; a provider
+rejection is reported without silently changing the requested setting. The
+model default sends no effort override. Subscription catalogs retain their
+declared effort lists; administrator routes without a declaration continue to
+limit explicit controls to observed values.
+Explicit request temperatures are not silently discarded. Internal memory
+judgments express a deterministic sampling preference; when Responses sampling
+support is not established they use the provider default and the admitted
+reasoning policy instead of inventing an unsupported control.
+The completion proxy retains whether temperature was supplied: omission keeps
+the historical `0.1` default for Chat Completions and uses the provider default
+for API-key Responses; an explicitly supplied unsupported value is rejected.
+Subscription completions retain their existing behavior of using provider sampling
+defaults. Older clients that always send a temperature must be upgraded before
+using an API-key Responses Offering.
 The supported deployment and CLI/API contracts are documented in
 [configuration](../reference/configuration.md#chatgpt-subscription-connections),
 [CLI commands](../reference/cli-commands.md#chatgpt-subscription-models), and
@@ -106,11 +170,26 @@ decoding and its connection fences, including cancellation during a stream.
 Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
 before wire encoding, including direct auxiliary calls. Requests send full
 history with `store:false` and `stream:true`.
-Astra functions occupy the `astra` namespace. Completed provider output items,
-including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Opaque
-provider-encrypted reasoning is base64 encoded for storage so generic text
-redaction cannot corrupt ciphertext. Function arguments come from the canonical
+Personal API-key models using the native OpenAI Responses endpoint select the
+existing append-only runtime-context layout at admission. This preserves reusable
+conversation prefixes without dropping optional or required context. Custom
+OpenAI-compatible gateways retain their existing provider defaults because their
+message and caching semantics are not established by the API format alone.
+Functions use the standard flat Responses tool format. Completed provider output items,
+including reasoning and message phase, live in private canonical assistant-message
+metadata before tool execution/final checkpoint. Stateless OpenAI Responses
+returns encrypted reasoning without an `include` override; compatible endpoints
+can instead return replayable `reasoning_text` content. A tool round containing
+a reasoning item without replayable content stops before executing its calls.
+Provider reasoning, including provider-supplied opaque state, is sealed by the
+Server before canonical storage. The capsule is authenticated against the owner,
+session lineage, admitted route, model, item and tool calls; its encoded bytes
+survive credential sanitization. It can contain credential-shaped provider
+reasoning in encrypted form so replay preserves the provider's exact state;
+plaintext remains excluded from public history and diagnostic captures. The inference owner opens it only for an
+authorized continuation. Raw reasoning is omitted from user-visible streams,
+observers and diagnostic artifacts; resume and segment APIs retain only the
+sealed capsule. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No
@@ -124,6 +203,13 @@ Inference performs no catalog fetch. The shared `responses_reasoning` adapter
 emits `reasoning.effort`; Model default omits the field. Unsupported effort,
 binary suppression and token-budget requests fail before provider dispatch.
 
+For a personal API-key model using Responses, the model create/update API also
+accepts `responses_reasoning_history`: `current_turn` only for an endpoint whose
+contract has been verified to need reasoning within the active human turn, or
+`all_turns` to retain it across turns. Omission is conservative. This is a route
+capability, not a setting inferred from the provider's name; changing it adds no
+per-turn database query.
+
 Only completed responses authorize tool dispatch and replayable provider state.
 A typed `max_output_tokens` truncation retains partial text, response identity,
 usage and `length` even without output items. Empty-terminal text fallback
@@ -134,8 +220,10 @@ guessing ownership; done-only text is not recovered on that error path. It creat
 calls nor continuation metadata, including when individual function items look
 complete. The existing output-cap owner handles continuation or interruption;
 other incomplete reasons remain failures. Explicitly unfinished saved items
-cannot be replayed. Connectivity probes and summary acceptance reject truncated
-results even when their partial text is nonempty or structurally complete.
+cannot be replayed. Summary acceptance rejects truncated results even when
+partial text is present. A connectivity probe only checks that the configured
+route produced valid output; a typed output-limit response can establish that
+fact without authorizing a complete answer, tool call, or capability.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas
 alone cannot establish a replayable response or authorize tools.
@@ -250,9 +338,10 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set as
-the frozen format version 2, including `thinking_protocol` and `pricing`. A
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
 same frozen format; current thin-client and TypeScript SDK requests negotiate
 the current format `3` on every page.
@@ -260,14 +349,9 @@ Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
 
-Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
-The Server must not infer a version from identity or strip protocol metadata
-needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
-its embedded schema-v1 executor are outside the support baseline, as is
-standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
-The installed CLI can still report an unknown-field/invalid-JSON error before
-execution; a new Server error code cannot repair that old diagnostic. This
-policy does not claim to repair the original 0.2.10 conversation failure.
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
 
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
@@ -309,10 +393,8 @@ verify that the selected format can represent the required semantics.
 Authentication, execution requests, approvals, and Edge advertisements are not
 made permissive.
 
-Historical fixtures and binary identities do not move with the producer.
-Support changes must be reviewed separately and document affected features
-and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the fixed artifact inventory and required behavior.
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before
@@ -380,7 +462,10 @@ their own provider account.
 
 - `POST /me/models` accepts a provider credential once over an authenticated
   TLS connection. Owner identity is derived from the Astra access token; the
-  request cannot select another owner.
+  request cannot select another owner. Failures known to precede the creation
+  transaction include `metadata.model_saved: false`; clients may retain the
+  form for correction. An ambiguous response requires checking the model list
+  before retrying.
 - Astra Server encrypts the credential with the configured secret backend and
   stores only ciphertext in `user_llm_models`.
 - `GET /me/models`, `GET /me/models/{model_id}`, catalog, trace, error, and
@@ -397,22 +482,16 @@ their own provider account.
   existing administrator registry; a host-only entry admits port 443 only.
   The default is `public-https`; invalid configuration fails closed.
 - Custom endpoint policy is rechecked at create, credential rotation, probe,
-  activation, and inference admission. Each outbound attempt pins a freshly
-  validated public DNS address set and forbids redirects. DNS queries go directly
-  to system-configured nameservers instead of OS synthetic-address caches;
-  `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
-  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
-  attempt or UDP fallback. This is an explicit operator route, not automatic
-  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
-  instead of racing answers from different DNS servers. There is no hardcoded
-  public DNS or OS resolver fallback.
-  Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
-  HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
-  loopback adapter sends only validated public IP targets to that proxy,
-  retaining the origin hostname for end-to-end TLS, SNI and Host. SOCKS5h does
-  not delegate target DNS. Dropping the client cancels its tunnel tasks.
-  Ambient proxy variables cannot override this route; proxy failure never
-  falls back to direct access. Private/Fake-IP DNS answers remain rejected.
+  activation, and inference admission. Each outbound attempt resolves with the
+  Server's system DNS, validates every address as public, pins the result, and
+  forbids redirects. `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` select the same
+  Server egress configuration as other providers. For proxied requests, a
+  shared tunnel listener authenticates each request's short-lived route and
+  sends only its validated IP targets to the proxy while retaining the origin
+  hostname for TLS, SNI and Host. Dropping the client revokes its route and
+  cancels its connections. Proxy failure never falls back to direct access. If system
+  DNS returns private or Fake-IP addresses, the operator must configure it to
+  return public addresses; proxy DNS cannot bypass validation.
 - Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and
   returns `204` after URL, policy, and DNS checks, without provider HTTP traffic,
   credentials, or stored model state. CLI runs it immediately after custom URL
@@ -522,6 +601,14 @@ measurement separately as `last_request_input_tokens` or nested
 `last_request_usage.input_total_tokens`. CLI context observers forward that
 validated measurement independently of complete billing lanes, including
 updates that arrive while those lanes remain unknown.
+Run input totals include each settled attempt fact’s validated inclusive input
+once, including auxiliary calls and failed attempts. The portion not assigned to known
+billing lanes is retained separately through continuation; it never becomes fresh
+input or proves a zero cache-hit rate. Missing measurements remain incomplete
+evidence, while known lane subtotals still count toward the run budget. Older
+handoffs without this observed subtotal remain readable, without claiming complete
+measurement. Handoffs written by a newer binary are not a downgrade format:
+upgrade execution workers before assigning them runs written by the new version.
 
 ```text
 Primary agent       120k tokens   Personal Cloud
@@ -947,6 +1034,91 @@ handoff checkpoints carry their complete checked continuation without loading a
 provider-attempt WAL. Run/Context commits and tool side-effect admission and
 deduplication keep their independent contracts.
 
+### DSML tool-call decoding
+
+The OpenAI-compatible response boundary uses the existing turn-core tool-call
+decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
+and streaming/final visible-text projection share one markup lexer. It recognizes
+`tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
+single-delimiter format and the observed doubled-delimiter spelling. Markdown
+code spans, quote/list-contained fences, and indented code remain literal data.
+HTML elements, comments, CDATA, declarations and processing instructions also
+own literal content. CommonMark determines block ownership at the start of a
+line, including block names recognized before the tag closes. A terminator ends
+its block after the closing line; other HTML blocks end at a blank line.
+Matching inline elements and quote/list exits release their literal context.
+Container prefixes and reserved tags use resumable cursors, with completed
+prefix bytes checkpointed across chunks. One exact incremental grammar owns
+both complete and partial tag recognition; suffixed DSML names such as
+`invoke-example` are ordinary text. A fence consumes only its opening containers;
+blank lines may omit list indentation without ending that fence.
+CommonMark also validates the fence opening line and info string. Block
+interruption and fence entry share the same checkpointed backtick lookahead:
+a later backtick in the info string can invalidate the candidate fence.
+Backticks in a tilde fence's info string do not affect ownership.
+Tabs retain physical columns and virtual padding. Indentation within established
+containers can be streamed once its meaning is settled. Indentation after a new
+marker remains provisional until the new block is known. Indented paragraph
+continuations retain inline delimiter state; actual code blocks remain literal.
+DSML, bare `invoke`/`parameter`, and legacy `tool_call` tags share one indexed
+scope stack. Parameter bodies are not independent tool-call sources. Every
+invocation owns its full subtree before name/argument validation, including
+malformed unnamed openers and nested wrappers from another syntax family;
+nested content cannot escape as another call. Only DSML invocations can be
+recovered independently inside a DSML calls wrapper.
+When an invocation body or a typed DSML parameter starts with a JSON object,
+array or string, matching delimiters, quotes and escapes determine where the
+value ends. Protocol spellings inside JSON strings remain argument data even
+when they match an enclosing close tag. An invocation still requires an
+argument object; a typed parameter is decoded as a JSON value.
+Invocation and parameter attributes come only from their own lexical opening
+tags; descendants and quoted values of other attributes cannot supply a name.
+Both invocation families use the shared bounded argument decoder, retaining
+invalid named bodies for existing pre-execution feedback.
+Complete-input scans use a cursor and compact once per batch; long indentation,
+delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
+accumulated prefix on each delta. Candidate decoding walks the ordered tokens
+instead of rescanning earlier families' owned ranges for each candidate.
+DSML projection precedes legacy bare-XML cleanup, and carries literal ranges
+through that cleanup so argument markup cannot consume answer text and examples
+remain unchanged. Escaped tag openers and their
+matching markup are literal scopes within their CommonMark block, never
+executable invocations. An unmatched escaped opener cannot absorb a real call in
+a later block. Per-kind scope
+indexes make unmatched closers constant-time and matching pops amortized linear.
+Physical line-prefix state follows every byte consumed, including newlines inside
+tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
+deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
+remain unchanged. A new empty item can take its first block on the next line;
+a blank separator before that block ends the empty item. The block probe
+retains the first unmatched container's shape so CommonMark can distinguish a
+sibling item from a setext underline without reparsing the deeper nesting for
+each lazy continuation. After a possible
+inline code opener, the stream publishes prose before potential markup and
+releases the prefix when there is no competing delimiter to reconsider.
+Matching runs make any remaining tail literal; at a block boundary or EOF the
+lexer replays an unmatched tail once with indexed delimiter runs, including
+when indentation consumes the last bytes of the response. This allows
+real calls outside matched spans to be recovered. The existing CommonMark parser
+determines paragraph continuation, heading boundaries and new container facts.
+When it rejects a provisional container, that marker is scanned as content,
+so a marker-only paragraph line cannot be mistaken for a blank line.
+Structural prefixes are classified through their
+first inline payload character: ordinary list, heading and punctuation-led
+prose streams before newline or EOF. Ambiguous marker-only prefixes remain
+pending until their structure can be determined. This does not change tool
+dispatch or admission.
+
+Native structured calls take precedence. Recovered calls remain subject to the
+exact request tool surface and the ordinary argument, capability, policy and
+approval boundaries; decoding grants no execution authority. String parameters
+retain their bytes and `string="false"` values require valid JSON. Incomplete or
+undecodable named invocations retain invalid argument evidence for the existing
+pre-execution rejection/model-feedback path, rather than becoming empty calls.
+Orphan protocol closers are removed from visible text without inventing a tool
+call or triggering a model retry. The normalized completion feeds the existing
+canonical history and transcript paths; raw provider diagnostics are unchanged.
+
 ### Provider timeout ownership
 
 Ordinary agent streaming calls use rolling transport-idle and semantic-progress
@@ -1030,6 +1202,27 @@ enum InferenceStreamEvent {
 ```
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
+
+The OpenAI-compatible usage normalizer also accepts the documented
+[OpenCode usage extension](https://dev.opencode.ai/v2/docs/console/api/inference#cost).
+`opencode.tokens.input`, `cache_read`, and `output` are disjoint fresh input,
+cached input, and output evidence. Output already includes reasoning. The checked
+sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
+both counts are reported; a missing lifetime is unknown, not zero. Mirrored
+generic and OpenCode fields must agree, and a complete input partition must
+match an inclusive prompt total. A reported write lifetime contributes to the
+input lower bound even when the full write count is unknown. If that bound
+exceeds the inclusive prompt total in one raw sample, later stream updates
+cannot qualify that attempt's input usage. The generic fields retain their
+existing inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible
+responses reconcile the extension through the same OpenAI usage normalizer.
+Aliases are decoded independently: null fields carry no evidence, and reported
+`input_tokens`/`output_tokens` remain subject to reconciliation even when
+`prompt_tokens`/`completion_tokens` are also present.
+The existing streaming collector retains
+partial cumulative samples and rejects invalid or contradictory raw evidence.
+This extends usage normalization, not the model invocation protocol or billing
+authority; it does not introduce another run lifecycle.
 
 OpenAI-compatible response decoding accepts string `reasoning_content` and
 `reasoning` fields in both streamed deltas and non-streaming assistant messages.

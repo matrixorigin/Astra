@@ -494,7 +494,7 @@ async fn run_selector_prompt(
             // Budget for every fixed ID plus the two result lists, rather than
             // truncating a valid batched decision at a fixed candidate count.
             max_output_tokens: judgment.output_token_budget(),
-            temperature: 0.0,
+            preferred_temperature: 0.0,
             deadline: Duration::from_secs(3),
         })
         .await;
@@ -959,6 +959,9 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_empty_input_returns_empty() {
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "http://nonexistent:9999".into(),
@@ -978,6 +981,9 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_unreachable_server_uses_lexical_fallback() {
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "http://127.0.0.1:1".into(),
@@ -1049,6 +1055,9 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1077,6 +1086,9 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1108,6 +1120,9 @@ mod tests {
         )
         .await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1130,6 +1145,9 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1162,6 +1180,9 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["1"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1184,6 +1205,9 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), r#"{"true":[],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,
@@ -1210,6 +1234,9 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: base,

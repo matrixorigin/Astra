@@ -337,6 +337,14 @@ independent Session in the same directory. The canonical binding generation
 fences delayed work for its own Session. The executor-owned workspace lease is
 the only physical-operation serialization boundary.
 
+Once a Run and its owner are no longer active, a prior unfinished tool call
+does not permanently block a new conversation turn. The model and streaming
+client receive a general advisory based on existing admission evidence. A new call
+may overlap an earlier external operation, so neither the advisory nor a new
+Run claims that operation stopped; repeating it requires inspecting current
+state. The same invocation identity is never automatically redelivered merely
+because its result was lost.
+
 Idle controller changes and recovery-point capture inspect actual Session
 execution occupancy under the same canonical Session/Run fences as Run admission. An
 active child, paused Run awaiting input, or terminal executor

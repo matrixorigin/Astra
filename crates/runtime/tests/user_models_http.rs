@@ -441,6 +441,8 @@ impl ModelService for TestModelService {
         let model_id = format!("model-{}-{}", user_id, rows.len() + 1);
         let record = UserModelRecord {
             thinking_probe: None,
+            inference_protocol: request.inference_protocol,
+            responses_reasoning_history: request.responses_reasoning_history,
             model_id: model_id.clone(),
             name: request.name,
             provider: request.provider,
@@ -502,6 +504,12 @@ impl ModelService for TestModelService {
         }
         if let Some(api_key) = request.api_key {
             row.credential_configured = !api_key.is_empty();
+        }
+        if let Some(protocol) = request.inference_protocol {
+            row.inference_protocol = Some(protocol);
+        }
+        if let Some(history) = request.responses_reasoning_history {
+            row.responses_reasoning_history = Some(history);
         }
         Ok(row.clone())
     }
@@ -850,6 +858,7 @@ async fn user_model_crud_is_authenticated_owner_scoped_and_secret_negative() {
         "provider": "deepseek",
         "model": "deepseek-chat",
         "api_key": secret,
+        "inference_protocol": "openai_responses",
         "is_default": true
     });
     let (status, body) = request(
@@ -865,6 +874,7 @@ async fn user_model_crud_is_authenticated_owner_scoped_and_secret_negative() {
     let created: serde_json::Value = serde_json::from_str(&body).expect("create json");
     let model_id = created["model_id"].as_str().expect("model id");
     assert_eq!(created["credential_configured"], true);
+    assert_eq!(created["inference_protocol"], "openai_responses");
 
     let (status, body) = request(
         app(service.clone()),
@@ -914,6 +924,19 @@ async fn user_model_crud_is_authenticated_owner_scoped_and_secret_negative() {
     );
 
     let check_path = format!("{path}/check");
+    let (status, body) = request(
+        app(service.clone()),
+        "PUT",
+        &path,
+        Some("user-a"),
+        Some(serde_json::json!({"inference_protocol":"openai_compatible"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["inference_protocol"],
+        "openai_compatible"
+    );
     let (status, body) = request(
         app(service.clone()),
         "POST",

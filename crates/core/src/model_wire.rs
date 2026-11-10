@@ -5,6 +5,64 @@ use serde_json::{Value, json};
 pub mod purpose;
 pub mod responses;
 pub mod thinking;
+pub mod token_estimate;
+
+/// Append an API path without placing it after the base URL's query.
+pub fn endpoint_url(base_url: &str, endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_owned();
+    };
+    let path = format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+    url.set_path(&path);
+    url.into()
+}
+
+/// Wire format used for inference, independent of credential ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProviderProtocol {
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    AnthropicMessages,
+    BedrockConverse,
+    #[serde(rename = "typesafe_systemone")]
+    TypeSafeSystemOne,
+}
+
+impl LlmProviderProtocol {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "openai_responses",
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::BedrockConverse => "bedrock_converse",
+            Self::TypeSafeSystemOne => "typesafe_systemone",
+        }
+    }
+
+    #[must_use]
+    pub fn preserves_appended_message_boundaries(self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
+    }
+}
+
+#[must_use]
+pub fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
+    match provider {
+        "chatgpt" => LlmProviderProtocol::OpenAiResponses,
+        "anthropic" => LlmProviderProtocol::AnthropicMessages,
+        "bedrock" => LlmProviderProtocol::BedrockConverse,
+        "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
+        _ => LlmProviderProtocol::OpenAiCompatible,
+    }
+}
 
 /// Apply a caller-bounded output budget to Anthropic Messages or OpenAI-style
 /// chat completions. Bedrock Converse has a separate inferenceConfig shape.

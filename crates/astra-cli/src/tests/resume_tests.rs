@@ -322,6 +322,13 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         );
         let old_file = temp.path().join(format!("historical-{local_turn}.txt"));
         let new_file = temp.path().join(format!("current-{local_turn}.txt"));
+        let workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &sid,
+            "mock-model",
+            &std::env::current_dir().unwrap().display().to_string(),
+            None,
+        );
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         if local_turn > 0 {
             let local = ActiveConversation::empty(owner, &sid)
@@ -467,7 +474,7 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         }
         for round in 0..2 {
             let mut ui = TestUi::default();
-            let outcome = handle_chat_input_with_ui(
+            let outcome = Box::pin(handle_chat_input_with_ui(
                 ChatInput::Conversation("write then undo only this turn".into()),
                 Some("test-token"),
                 session_runtime::AccessMiss::NotLoggedIn,
@@ -480,7 +487,7 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
                     explain_analyze_terminal_degraded: None,
                 },
                 &mut ui,
-            )
+            ))
             .await
             .unwrap();
             assert!(

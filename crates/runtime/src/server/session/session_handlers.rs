@@ -597,6 +597,183 @@ pub(crate) async fn get_session_state_handler(
     }))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RunActivityQuery {
+    before_event_idx: Option<i64>,
+}
+
+/// Read existing facts on demand. Never duplicate tool traces into C1 storage.
+pub(crate) async fn run_activity_handler(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<RunActivityQuery>,
+) -> Result<Json<astra_thin_client::protocol::RunActivityPage>, (StatusCode, Json<ErrorResponse>)> {
+    use astra_thin_client::protocol::{RunActivityEvent, RunActivityPage};
+    const PAGE_ROWS: usize = 64;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/sessions/{session_id}/runs/{run_id}/activity",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    crate::server::run::handlers::authorize_provider_run_session(&state, &principal, &run_id)
+        .await?;
+    let user = &principal.user;
+    state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    // Child tool presentation is mirrored into the immutable root work-surface
+    // stream. It is not written into the child's own C3 terminal facts.
+    let source_run_id: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(child.root_run_id, child.run_id) FROM agent_runs child
+         JOIN agent_runs root ON root.user_id = child.user_id AND root.session_id = child.session_id
+          AND root.run_id = COALESCE(child.root_run_id, child.run_id)
+         WHERE child.user_id = ? AND child.session_id = ? AND child.run_id = ?",
+    )
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "activity source read failed");
+        internal_error("Run activity source could not be loaded")
+    })?;
+    let source_run_id = source_run_id
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run is not owned by this session"))?;
+    if source_run_id != run_id {
+        crate::server::run::handlers::authorize_provider_run_session(
+            &state,
+            &principal,
+            &source_run_id,
+        )
+        .await?;
+    }
+    // Page a contiguous raw index range, including non-tool facts: filtering
+    // by kind before LIMIT would make sparse activity scan unbounded history.
+    let rows = sqlx::query(
+        "SELECT event_idx, event_type,
+                CASE WHEN OCTET_LENGTH(payload_json) <= 32768 THEN payload_json ELSE NULL END AS payload
+         FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx < ?
+         ORDER BY event_idx DESC LIMIT 65"
+    ).bind(&user.user_id).bind(&session_id).bind(&source_run_id)
+        .bind(query.before_event_idx.unwrap_or(i64::MAX))
+        .fetch_all(pool.get()).await.map_err(|error| {
+            tracing::warn!(%error, "run activity read failed"); internal_error("Run activity could not be loaded")
+        })?;
+    let has_more = rows.len() > PAGE_ROWS;
+    let mut events = Vec::new();
+    let mut oldest = None;
+    for row in rows.iter().take(PAGE_ROWS) {
+        let index: i64 = row
+            .try_get("event_idx")
+            .map_err(|_| internal_error("Invalid activity index"))?;
+        oldest = Some(index);
+        let kind: String = row
+            .try_get("event_type")
+            .map_err(|_| internal_error("Invalid activity kind"))?;
+        if !matches!(
+            kind.as_str(),
+            "agent_live_event"
+                | "tool_call"
+                | "tool_call_start"
+                | "tool_result"
+                | "tool_call_end"
+                | "stream_gap"
+                | "durable_events_compacted"
+        ) {
+            continue;
+        }
+        let raw: Option<String> = row
+            .try_get("payload")
+            .map_err(|_| internal_error("Invalid activity payload"))?;
+        let event = if kind == "agent_live_event" {
+            match project_child_activity_event(raw.as_deref(), &run_id) {
+                Ok(Some(event)) => Some(event),
+                Ok(None) => continue,
+                Err(()) => None,
+            }
+        } else if source_run_id == run_id
+            || matches!(kind.as_str(), "stream_gap" | "durable_events_compacted")
+        {
+            project_run_activity_event(&kind, raw.as_deref())
+        } else {
+            continue;
+        };
+        events.push(RunActivityEvent {
+            event_idx: index,
+            event,
+        });
+    }
+    events.reverse();
+    Ok(Json(RunActivityPage {
+        session_id,
+        run_id,
+        source_run_id,
+        events,
+        next_before_event_idx: has_more.then_some(oldest).flatten(),
+        has_more,
+    }))
+}
+
+fn project_child_activity_event(raw: Option<&str>, run_id: &str) -> Result<Option<Value>, ()> {
+    let mut event = project_run_activity_event("agent_live_event", raw).ok_or(())?;
+    match event.get("run_id").and_then(Value::as_str) {
+        Some(id) if id == run_id => {}
+        Some(_) => return Ok(None),
+        None => return Err(()),
+    }
+    let kind = event.get("event_kind").and_then(Value::as_str).ok_or(())?;
+    let event_type = match kind {
+        "tool_started" => "tool_call_start",
+        "tool_completed" => "tool_call_end",
+        _ => return Ok(None),
+    };
+    event["type"] = event_type.into();
+    event["tool"] = event.get("name").cloned().unwrap_or(Value::Null);
+    event["call_id"] = event.get("tool_use_id").cloned().unwrap_or(Value::Null);
+    // These are recorded presentation facts, not invocation-ledger receipts.
+    if event_type == "tool_call_end" {
+        event["status"] = event
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|status| format!("reported {status}"))
+            .unwrap_or_else(|| "outcome unknown".into())
+            .into();
+    }
+    Ok(Some(event))
+}
+
+fn project_run_activity_event(kind: &str, raw: Option<&str>) -> Option<Value> {
+    if kind == "durable_events_compacted" {
+        return Some(serde_json::json!({"type":"stream_gap"}));
+    }
+    raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(|event| event.is_object())
+        .map(|mut event| {
+            if event.get("event_type").is_none() {
+                event["type"] = kind.into();
+            }
+            astra_services::runs::transform_run_event_for_client(event)
+        })
+        .filter(|event| event.is_object())
+}
+
 pub(crate) async fn get_session_transcript_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1894,6 +2071,21 @@ pub(crate) enum ResumeSessionResponse {
     },
 }
 
+fn ensure_private_continuation_is_sealed(
+    messages: &[Value],
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if messages
+        .iter()
+        .any(astra_core::model_wire::responses::has_unsealed_continuation)
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Session contains unprotected model continuation state",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1928,6 +2120,7 @@ pub(crate) async fn resume_session_handler(
         .materialize(&head)
         .await
         .map_err(session_context_http_error)?;
+    ensure_private_continuation_is_sealed(&materialized.messages)?;
     let materialized_root = astra_turn_types::canonical_conversation_root(&materialized.messages);
     let bundle = astra_turn_types::select_resume_bundle(
         Some(&head.cursor),
@@ -2727,6 +2920,9 @@ pub(crate) async fn get_session_segments_handler(
         )
         .await
         .map_err(session_context_http_error)?;
+    for segment in &segments {
+        ensure_private_continuation_is_sealed(&segment.messages)?;
+    }
     Ok(Json(SessionSegmentBatchResponse { segments }))
 }
 
@@ -3071,12 +3267,30 @@ pub(crate) async fn cancel_session_handler(
     ))
 }
 
+pub(crate) async fn get_session_execution_settlement_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<CancelSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let observation = state
+        .execution
+        .run_lifecycle_service
+        .get_session_execution_settlement(session_id, user.user_id)
+        .await?;
+    Ok(session_cancellation_response(session.into(), observation))
+}
+
 fn session_cancellation_response(
     mut session: SessionResponse,
     cancellation: astra_services::runs::CancelSessionRecord,
 ) -> (StatusCode, Json<CancelSessionResponse>) {
     let status = if cancellation.execution_settled {
-        session.status = STATUS_CANCELLED.to_string();
+        // Reads prove execution settlement, not a persisted session transition.
         StatusCode::OK
     } else {
         // This response describes the operation, not a premature durable
@@ -3824,6 +4038,27 @@ mod tests {
     use crate::{AppState, HealthChecker, ServiceInfo};
 
     #[test]
+    fn session_reads_reject_unsealed_private_reasoning() {
+        let key = astra_core::model_wire::responses::CONTINUATION_KEY;
+        let raw = json!({"role":"assistant", key:{"items":[
+            {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]}});
+        let error = ensure_private_continuation_is_sealed(&[raw]).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(!error.1.0.detail.contains("private"));
+        let sealed = json!({"role":"assistant", key:{
+            "connection_id":"11111111-1111-4111-8111-111111111111",
+            "model":astra_core::model_wire::responses::model_binding("model"), "items":[
+            {"type":"reasoning", astra_core::model_wire::responses::SEALED_ITEM:
+                {"origin":"session", "ciphertext":"opaque"}}
+        ]}});
+        assert!(ensure_private_continuation_is_sealed(std::slice::from_ref(&sealed)).is_ok());
+        let mut forged = sealed;
+        forged[key]["items"][0]["summary"] = json!([{"type":"summary_text", "text":"private"}]);
+        assert!(ensure_private_continuation_is_sealed(&[forged]).is_err());
+    }
+
+    #[test]
     fn session_cancel_wire_requires_explicit_convergence_even_with_no_active_runs() {
         for settled in [false, true] {
             let session = SessionResponse {
@@ -3859,7 +4094,7 @@ mod tests {
             assert_eq!(
                 wire["status"],
                 if settled {
-                    "cancelled"
+                    "active"
                 } else {
                     "cancellation_requested"
                 }
@@ -3887,6 +4122,24 @@ mod tests {
             "checkpoint reference changed".into(),
         ));
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn recorded_activity_projects_durable_envelopes_and_explicit_gaps() {
+        let raw = serde_json::json!({"event_type":"tool_call_start", "data":{
+            "call_id":"call-1", "tool":"bash", "arguments":{"command":"pwd"}
+        }})
+        .to_string();
+        let call = project_run_activity_event("tool_call_start", Some(&raw)).unwrap();
+        assert_eq!(call["call_id"], "call-1");
+        assert_eq!(call["tool"], "bash");
+        assert_eq!(
+            project_run_activity_event("durable_events_compacted", None).unwrap()["type"],
+            "stream_gap"
+        );
+        for raw in [None, Some("broken"), Some("[]"), Some("null")] {
+            assert!(project_run_activity_event("tool_call_end", raw).is_none());
+        }
     }
 
     fn transcript_item(run_id: &str, item_seq: i64, content: &str) -> TranscriptItemResponse {
@@ -4359,10 +4612,25 @@ mod tests {
             assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
         }
 
+        let activity_error = run_activity_handler(
+            State(state.clone()),
+            Path((session_id.clone(), "run-1".into())),
+            Method::GET,
+            "/sessions/session-456/runs/run-1/activity".parse().unwrap(),
+            auth_headers(),
+            Query(RunActivityQuery {
+                before_event_idx: None,
+            }),
+        )
+        .await
+        .expect_err("tool activity must stop at the ownership boundary before database access");
+        assert_eq!(activity_error.0, StatusCode::FORBIDDEN);
+
         let calls = session_service.get_session_calls.lock().await.clone();
         assert_eq!(
             calls,
             vec![
+                (session_id.clone(), "artifact-owner".to_string()),
                 (session_id.clone(), "artifact-owner".to_string()),
                 (session_id.clone(), "artifact-owner".to_string()),
                 (session_id, "artifact-owner".to_string()),

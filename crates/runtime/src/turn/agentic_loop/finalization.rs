@@ -309,6 +309,9 @@ pub(crate) fn build_current_heavy_checkpoint(
 }
 
 pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
+    if state.interruption.is_some() && !state.final_text.is_empty() {
+        bound_current_terminal_message(state);
+    }
     if state.current_session_id.is_none() {
         return;
     }
@@ -511,6 +514,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
+    host.on_turn_usage_settlement(state).await;
+
     // One loop exit owns turn facts and settlement. Round trace callbacks are
     // observations: they must not append the same cumulative tool facts again.
     // Waiting/delegated/rejected control does not settle an unfinished turn.
@@ -523,11 +528,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         )
     {
         update_session_facts_from_turn(state);
-        // Cancellation before any output has no assistant answer to render.
-        // Fatal errors retain their existing partial/checkpoint error path.
-        if result.is_ok()
-            && (matches!(&result, Ok(AgenticLoopOutcome::Completed))
-                || !state.final_text.is_empty())
+        // An error must retain already-produced provider text for terminal
+        // persistence without entering the successful render/checkpoint path.
+        if result.is_err() || cancellation_exit {
+            ensure_terminal_text(state, true);
+            let prior_messages = state.messages.len();
+            materialize_terminal_text_message(state);
+            host.attest_model_messages(state, prior_messages);
+            state.record_appended_prompt_history_from(prior_messages);
+            bound_current_terminal_message(state);
+            if cancellation_exit {
+                settle_terminal_turn_state(state).await;
+            }
+        } else if matches!(&result, Ok(AgenticLoopOutcome::Completed))
+            || !state.final_text.is_empty()
         {
             finalize_and_render(host, state).await;
         }
@@ -637,8 +651,23 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
     // checkpoint is slow.
-    ensure_terminal_text(state);
-    materialize_terminal_text_message(state);
+    ensure_terminal_text(state, false);
+    if !state.final_output_ready_notified {
+        let previous_message_count = state.messages.len();
+        materialize_terminal_text_message(state);
+        host.attest_model_messages(state, previous_message_count);
+        state.record_appended_prompt_history_from(previous_message_count);
+        if !state.final_text.is_empty()
+            && (state.interruption.is_some() || state.messages.len() != previous_message_count)
+        {
+            let current_turn_start = state
+                .messages
+                .iter()
+                .rposition(astra_turn_types::is_human_user_message)
+                .unwrap_or(0);
+            bound_ingested_terminal_message(state, current_turn_start);
+        }
+    }
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text, state.final_text_model_item_id.as_deref());
         state.final_text_streamed = true;
@@ -648,6 +677,13 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         state.final_output_ready_notified = true;
     }
 
+    settle_terminal_turn_state(state).await;
+
+    try_write_heavy_checkpoint(state);
+}
+
+/// Shared terminal cleanup does not publish a successful output or checkpoint.
+async fn settle_terminal_turn_state(state: &mut AgenticLoopState) {
     finalize_turn_trace(state).await;
 
     // Desired-state convergence authority is deliberately live-only. A
@@ -665,11 +701,23 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     reset_per_turn_advisory_state(state);
     update_working_memory_for_turn_settlement(state);
-
-    try_write_heavy_checkpoint(state);
 }
 
 fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
+    let current_turn_start = state
+        .messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+        .unwrap_or(0);
+    if state.messages[current_turn_start..]
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .is_some_and(|message| message[OVERSIZED_TERMINAL_MARKER] == true)
+    {
+        // The original was already captured before its Context replacement.
+        return;
+    }
     if let Some(mut message) =
         astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
             &state.messages,
@@ -683,7 +731,128 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
         {
             message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
         }
-        state.push_prompt_history_message(message);
+        state.messages.push(message);
+    }
+}
+
+const OVERSIZED_TERMINAL_DETAIL: &str = "Some response context was too large to save. If this conversation cannot continue, start a new session or choose another model.";
+const OVERSIZED_TERMINAL_CONTEXT: &str =
+    "[The preceding assistant response exceeded the context limit and was omitted.]";
+const OVERSIZED_TERMINAL_MARKER: &str = "_astra_omitted_terminal_response";
+
+fn terminal_message_fits(state: &AgenticLoopState, message: &serde_json::Value) -> bool {
+    // A terminal answer is a separate segment, but it shares the same
+    // commit frame as earlier tool results. Do not lose already-executed
+    // actions because the model produced an uncommittable final message.
+    let message_bytes = astra_turn_types::json_serialized_len(message).unwrap_or(u64::MAX);
+    let pending_bytes =
+        astra_turn_types::json_serialized_len(state.pending_canonical_messages_for_commit())
+            .unwrap_or(u64::MAX);
+    let fits_segment = message_bytes.saturating_add(2048)
+        <= astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES;
+    let fits_batch = pending_bytes
+        .saturating_add(message_bytes)
+        .saturating_add(2048)
+        <= astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES;
+    fits_segment && fits_batch
+}
+
+fn note_oversized_terminal(state: &mut AgenticLoopState) {
+    if let Some(interruption) = state.interruption.as_mut() {
+        if !interruption
+            .user_message
+            .contains(OVERSIZED_TERMINAL_DETAIL)
+        {
+            interruption.user_message.push(' ');
+            interruption
+                .user_message
+                .push_str(OVERSIZED_TERMINAL_DETAIL);
+        }
+    } else {
+        let summary = interruption_state_summary(state, Some(OVERSIZED_TERMINAL_DETAIL.into()));
+        let mut interruption = astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            summary,
+        );
+        interruption.user_message = OVERSIZED_TERMINAL_DETAIL.into();
+        state.interruption = Some(interruption);
+    }
+}
+
+/// Bound only model-facing history after the original answer has been captured.
+pub(crate) fn bound_ingested_terminal_message(state: &mut AgenticLoopState, start: usize) {
+    let Some(index) = (start..state.messages.len()).rev().find(|&index| {
+        state.messages[index]["role"] == "assistant"
+            && state.messages[index].get("tool_calls").is_none()
+    }) else {
+        return;
+    };
+    let mut message = std::mem::take(&mut state.messages[index]);
+    if message[OVERSIZED_TERMINAL_MARKER] != true && !terminal_message_fits(state, &message) {
+        note_oversized_terminal(state);
+        state.pending_provider_continuation = None;
+        // The answer remains visible in the transcript. Preserve only a
+        // scoped loss fact when provider reasoning cannot fit in context.
+        let lost_reasoning =
+            astra_core::model_wire::responses::has_reasoning_continuation(&message)
+                .then(|| &message[astra_core::model_wire::responses::CONTINUATION_KEY])
+                .and_then(|saved| {
+                    Some((saved["connection_id"].as_str()?, saved["model"].as_str()?))
+                })
+                .map(|(connection, model)| {
+                    serde_json::json!({
+                        "connection_id":connection, "model":model,
+                        astra_core::model_wire::responses::HISTORY_INCOMPLETE:true
+                    })
+                });
+        if let Some(object) = message.as_object_mut() {
+            object.remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+        }
+        if let Some(saved) = lost_reasoning {
+            message[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
+        }
+        message[OVERSIZED_TERMINAL_MARKER] = serde_json::json!(true);
+        if !terminal_message_fits(state, &message) {
+            let mut bounded = serde_json::json!({"role":"assistant", "content":OVERSIZED_TERMINAL_CONTEXT, OVERSIZED_TERMINAL_MARKER:true});
+            for field in [
+                astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_types::MODEL_ITEM_ID_FIELD,
+                astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD,
+                astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD,
+            ] {
+                if let Some(value) = message.get(field) {
+                    bounded[field] = value.clone();
+                }
+            }
+            message = bounded;
+        }
+    }
+    state.messages[index] = message;
+}
+
+pub(crate) fn bound_current_terminal_message(state: &mut AgenticLoopState) {
+    if state.final_text.is_empty() {
+        return;
+    }
+    let start = state
+        .messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+        .unwrap_or(0);
+    let index = (start..state.messages.len()).rev().find(|&index| {
+        let message = &state.messages[index];
+        message["role"] == "assistant"
+            && message.get("tool_calls").is_none()
+            && (message[OVERSIZED_TERMINAL_MARKER] == true
+                || state
+                    .final_text_model_item_id
+                    .as_deref()
+                    .is_some_and(|id| astra_turn_types::model_item_id(message) == Some(id))
+                || message["content"].as_str() == Some(state.final_text.as_str()))
+    });
+    if let Some(index) = index {
+        bound_ingested_terminal_message(state, index);
     }
 }
 
@@ -702,7 +871,7 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
-fn ensure_terminal_text(state: &mut AgenticLoopState) {
+fn ensure_terminal_text(state: &mut AgenticLoopState, terminal_error: bool) {
     let latest_provider_text = state
         .hooks
         .completion_settlement
@@ -740,7 +909,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // envelope to text that may already have streamed. Apart from leaking
     // internal details, re-rendering that envelope on an append-only stream
     // duplicates the provider response.
-    if state.interruption.is_some() {
+    if terminal_error || state.interruption.is_some() {
         // Prefer the latest provider response, then the bounded settlement
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
@@ -929,10 +1098,273 @@ mod tests {
     use crate::server::runtime_tool_executor::RuntimeToolExecutor;
     use crate::server::tool_transport::{ExecutorBinding, WorkspaceBinding};
     use crate::turn::agentic_loop::host::tests::{
-        MockHost, edge_tool_result, make_edge_tool, make_state, text_result,
+        MockHost, edge_tool_result, failed_partial_host, make_edge_tool, make_state, text_result,
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_private_continuation_preserves_the_delivered_answer() {
+        let key = astra_services::FernetTokenEncryptor::new("fixture-key").unwrap();
+        let route = "11111111-1111-4111-8111-111111111111";
+        let mut continuation = serde_json::json!({"connection_id":route, "model":"model", "items":[
+            {"type":"reasoning", "id":"reason", "content":[{"type":"reasoning_text", "text":"x".repeat(6 * 1024 * 1024)}]},
+            {"type":"message", "id":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(&mut continuation, &key, "owner", "session")
+            .unwrap();
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        let user = serde_json::json!({"role":"user", "content":"question"});
+        state.messages = vec![user.clone()];
+        state.initialize_provider_canonical_wal_base(&[user]);
+        state.final_text = "answer".into();
+        state.final_text_streamed = true;
+        state.final_text_model_item_id = Some("message".into());
+        state.current_model_item_id = Some("message".into());
+        state.pending_provider_continuation = Some(continuation);
+        state.begin_run_transcript_capture(std::iter::empty());
+        finalize_and_render(&mut host, &mut state).await;
+        assert_eq!(state.final_text, "answer");
+        assert!(state.interruption.is_some());
+        assert!(state.pending_provider_continuation.is_none());
+        assert_eq!(state.take_run_transcript_capture()[0]["content"], "answer");
+        let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+            &[],
+            false,
+            &state.messages,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(segments.concat()).unwrap();
+        assert!(
+            restored
+                .iter()
+                .any(|message| message["content"] == "answer")
+        );
+        restored.push(serde_json::json!({"role":"user", "content":"continue"}));
+        crate::turn::llm::private_continuation::open(
+            &mut restored,
+            &key,
+            "owner",
+            &std::collections::HashSet::from(["session".to_owned()]),
+            route,
+            "model",
+        )
+        .unwrap();
+        let request = |messages: &[serde_json::Value], scope| {
+            astra_core::model_wire::responses::request("model", messages, None, scope, false, None)
+        };
+        assert_eq!(
+            request(&restored, route).unwrap_err(),
+            astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE
+        );
+        assert!(request(&restored, "another-route").is_ok());
+        crate::turn::llm::private_continuation::discard_completed_turn_reasoning(&mut restored);
+        assert!(request(&restored, route).is_ok());
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_response_preserves_answer_and_prior_tool_results() {
+        for (ingested, model_item_id) in [
+            (false, None),
+            (true, None),
+            (false, Some("item-1")),
+            (true, Some("item-1")),
+        ] {
+            let mut host = MockHost::new(vec![]);
+            let mut state = make_state();
+            let user = serde_json::json!({"role":"user", "content":"perform the action"});
+            state.messages = vec![
+                user.clone(),
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"write_file", "arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":"call-1", "content":"written"}),
+            ];
+            state.initialize_provider_canonical_wal_base(std::slice::from_ref(&user));
+            state.final_text = "x"
+                .repeat(astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES as usize);
+            let answer = state.final_text.clone();
+            state.final_text_streamed = true;
+            state.begin_run_transcript_capture(std::iter::empty());
+            state.final_text_model_item_id = model_item_id.map(str::to_owned);
+            state.current_model_item_id = model_item_id.map(str::to_owned);
+            state.pending_provider_continuation = Some(
+                serde_json::json!({"items":[{"type":"message", "content":[{"type":"output_text", "text":state.final_text}]}]}),
+            );
+            if ingested {
+                let mut message = serde_json::json!({"role":"assistant", "content":state.final_text,
+                astra_core::model_wire::responses::CONTINUATION_KEY:state.pending_provider_continuation});
+                astra_turn_types::mark_model_message(&mut message, model_item_id);
+                let start = state.messages.len();
+                state.messages.push(message);
+                state.record_appended_prompt_history_from(start);
+                bound_ingested_terminal_message(&mut state, start);
+                assert!(state.interruption.is_some());
+            }
+            finalize_and_render(&mut host, &mut state).await;
+            assert!(state.interruption.is_some());
+            assert_eq!(state.final_text, answer);
+            assert!(host.rendered_final_text.is_empty());
+            assert_eq!(state.messages[2]["content"], "written");
+            assert_eq!(
+                state.messages.last().unwrap()["content"],
+                OVERSIZED_TERMINAL_CONTEXT
+            );
+            assert!(state.pending_provider_continuation.is_none());
+            let transcript = state.take_run_transcript_capture();
+            assert_eq!(transcript.len(), 1);
+            assert_eq!(transcript[0]["content"], answer);
+            let message_count = state.messages.len();
+            finalize_and_render(&mut host, &mut state).await;
+            assert_eq!(state.messages.len(), message_count);
+            assert!(state.take_run_transcript_capture().is_empty());
+            let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+                &[user],
+                true,
+                &state.messages,
+                None,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(segments.iter().all(|segment| {
+                astra_turn_types::json_serialized_fits(
+                    segment,
+                    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES,
+                )
+                .unwrap()
+            }));
+            assert!(
+                astra_turn_types::json_serialized_fits(
+                    &segments,
+                    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_after_tool_round_remains_recoverable() {
+        let oversized =
+            "x".repeat(astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES as usize);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("write_file", "written")],
+                20,
+                10,
+                Some(1),
+            ),
+            text_result(&oversized, 20, 10, Some(1)),
+        ])
+        .with_valid_tools(&["write_file"]);
+        let mut state = make_state();
+        let user = serde_json::json!({"role":"user", "content":"perform the action"});
+        state.messages.push(user.clone());
+        state.initialize_provider_canonical_wal_base(std::slice::from_ref(&user));
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(state.interruption.is_some());
+        assert_eq!(state.final_text, oversized);
+        assert_eq!(
+            state.messages.last().unwrap()["content"],
+            OVERSIZED_TERMINAL_CONTEXT
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| { message["role"] == "tool" && message["content"] == "written" })
+        );
+        let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+            &[user],
+            true,
+            &state.messages,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(segments.iter().all(|segment| {
+            astra_turn_types::json_serialized_fits(
+                segment,
+                astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES,
+            )
+            .unwrap()
+        }));
+    }
+
+    #[tokio::test]
+    async fn oversized_failed_stream_keeps_answer_and_bounded_tool_history() {
+        let answer =
+            "x".repeat(astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES as usize);
+        for kind in [
+            astra_core::ErrorKind::Network,
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::InvalidRequest,
+        ] {
+            let mut host = failed_partial_host(kind, &answer);
+            let mut state = make_state();
+            state
+                .messages
+                .push(serde_json::json!({"role":"user", "content":"inspect"}));
+            state.begin_run_transcript_capture(std::iter::empty());
+            let error = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, kind);
+            assert_eq!(state.final_text, answer);
+            assert!(
+                state
+                    .messages
+                    .iter()
+                    .any(|message| message["role"] == "tool")
+            );
+            assert_eq!(
+                state.messages.last().unwrap()["content"],
+                OVERSIZED_TERMINAL_CONTEXT
+            );
+            assert!(
+                state.take_run_transcript_capture().iter().any(|message| {
+                    message["role"] == "assistant" && message["content"] == answer
+                })
+            );
+            assert!(host.rendered_final_text.is_empty());
+        }
+    }
+
+    #[test]
+    fn interrupted_checkpoint_bounds_a_partial_answer_before_capture() {
+        let mut state = make_state();
+        state.current_session_id = None;
+        state.step_recorder.begin_turn(0);
+        state.final_text =
+            "x".repeat(astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES as usize);
+        state.messages = vec![
+            serde_json::json!({"role":"user", "content":"inspect"}),
+            serde_json::json!({"role":"assistant", "content":state.final_text}),
+        ];
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::ContextOverflow,
+            astra_turn_core::interruption::ResumeAction::CompactAndRetry,
+            interruption_state_summary(&state, None),
+        ));
+        try_write_heavy_checkpoint(&mut state);
+        let heavy = build_current_heavy_checkpoint(&mut state).unwrap();
+        assert_eq!(
+            heavy.messages.last().unwrap()["content"],
+            OVERSIZED_TERMINAL_CONTEXT
+        );
+        assert!(
+            state
+                .interruption
+                .unwrap()
+                .user_message
+                .contains(OVERSIZED_TERMINAL_DETAIL)
+        );
+    }
 
     fn attach_pipeline_session(state: &mut AgenticLoopState) {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
@@ -976,7 +1408,7 @@ mod tests {
                 state.final_text_streamed = true;
                 state.task_profile.exploratory_task = exploratory;
                 state.last_finish_reason = finish_reason.map(str::to_string);
-                ensure_terminal_text(&mut state);
+                ensure_terminal_text(&mut state, false);
                 let truncated = !exploratory && finish_reason == Some("length");
                 assert_eq!(
                     state.final_text,
@@ -1011,7 +1443,7 @@ mod tests {
                 ..Default::default()
             });
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "Done.");
         assert!(state.final_text_streamed);
@@ -1026,7 +1458,7 @@ mod tests {
             .hooks
             .completion_settlement
             .deferred_candidate_model_item_id = Some("accepted-A".into());
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
         assert_eq!(state.final_text, "accepted answer");
         assert_eq!(
             state.final_text_model_item_id.as_deref(),
@@ -1044,8 +1476,12 @@ mod tests {
         state.final_text = "Operation completed.".to_string();
         state.begin_run_transcript_capture(std::iter::empty());
 
+        let start = state.messages.len();
         materialize_terminal_text_message(&mut state);
+        state.record_appended_prompt_history_from(start);
+        let start = state.messages.len();
         materialize_terminal_text_message(&mut state);
+        state.record_appended_prompt_history_from(start);
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[1]["role"], "assistant");
@@ -1086,7 +1522,7 @@ mod tests {
         state.final_text = "The code style is consistent.".to_string();
         state.final_text_streamed = true;
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "The code style is consistent.");
         assert!(state.final_text_streamed);
@@ -1112,7 +1548,7 @@ mod tests {
             },
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "  The build passed its final check.\n");
         assert!(!state.final_text.contains("prompt budget"));
@@ -1129,9 +1565,19 @@ mod tests {
     #[test]
     fn unmet_completion_action_preserves_partial_answer_without_clearing_interruption() {
         let mut state = make_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "cargo test".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.hooks.completion_settlement.completion_action_window =
             Some(super::super::host::CompletionActionWindow {
-                action: super::super::host::CompletionAction::PostMutationObservation,
+                action: super::super::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 1,
                 mismatch_corrections_remaining: 0,
                 consumed: false,
@@ -1155,7 +1601,7 @@ mod tests {
             },
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "latest truthful handoff");
         assert_eq!(
@@ -1168,6 +1614,14 @@ mod tests {
     #[test]
     fn failed_matched_completion_action_preserves_answer_as_unverified_output() {
         let mut state = make_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "cargo test".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
                 true,
@@ -1184,7 +1638,9 @@ mod tests {
             });
         state.hooks.completion_settlement.completion_action_window =
             Some(super::super::host::CompletionActionWindow {
-                action: super::super::host::CompletionAction::PostMutationObservation,
+                action: super::super::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 0,
                 mismatch_corrections_remaining: 0,
                 consumed: true,
@@ -1210,7 +1666,7 @@ mod tests {
             Ok(Some(_))
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         // Provider prose is retained, not accepted as verification authority.
         assert_eq!(state.final_text, "Fixed and verified.");
@@ -1221,13 +1677,23 @@ mod tests {
         assert!(!state.final_text_streamed);
 
         // The same matched window can outlive a settled obligation.
-        state.stall.tool_call_records.clear();
-        state.task_profile = make_state().task_profile;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                args_full: Some(serde_json::json!({"command":"cargo test"}).to_string()),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                result_class: Some("success".into()),
+                exit_semantics: Some("success".into()),
+                ..Default::default()
+            });
         state.hooks.completion_settlement.latest_provider_text =
             Some("The edit was made; the final summary is partial.".to_string());
         let pending = super::super::execution_phase::pending_completion_action(&state);
         assert!(matches!(pending, Ok(None)), "{pending:?}");
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
         assert_eq!(
             state.final_text,
             "The edit was made; the final summary is partial."
@@ -1316,6 +1782,26 @@ mod tests {
         assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.messages, before);
         assert!(state.take_run_transcript_capture().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_read_delivery_does_not_permanently_block_the_turn() {
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.final_text = "Finished.".into();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                args_full: Some(r#"{"path":"data.txt"}"#.into()),
+                ..Default::default()
+            });
+        finalize_and_render(&mut host, &mut state).await;
+        assert!(state.interruption.is_none());
+        assert_eq!(state.final_text, "Finished.");
     }
 
     #[tokio::test]
@@ -1905,7 +2391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_profile_marks_repeated_no_change_explanation_incomplete() {
+    async fn inferred_mutation_profile_does_not_force_unnecessary_edits() {
         let answer = "No workspace mutation was needed based on the evidence.";
         let mut host = MockHost::new(vec![
             text_result(answer, 10, 5, Some(42)),
@@ -1920,23 +2406,9 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
-        assert_eq!(
-            host.turn_count(),
-            3,
-            "one action correction is bounded; a repeated omission is terminal"
-        );
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)
-        );
+        assert_eq!(host.turn_count(), 1);
+        assert!(state.interruption.is_none());
         assert_eq!(state.final_text, answer);
-        assert_eq!(
-            state
-                .interruption
-                .as_ref()
-                .and_then(|interruption| interruption.error_detail.as_deref()),
-            Some("typed completion action was not satisfied")
-        );
         assert_eq!(state.messages.len(), 1);
         assert!(astra_turn_types::model_item_id(&state.messages[0]).is_some());
         let mut provider_evidence = state.messages[0].clone();
@@ -2948,16 +3420,8 @@ mod tests {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // E2E: progressive warning penalty drains budget
-    // Verifies that consecutive warnings from TurnGuard reduce remaining_turns
-    // progressively (2, 4, 6, ...) so spinning loops terminate faster.
-    // ═══════════════════════════════════════════════════════════════════════
-
     #[tokio::test]
-    async fn progressive_warning_penalty_limits_loop_duration() {
-        // Simulate 20 tool rounds — without progressive penalty this would
-        // run all 20. With it, the loop should terminate earlier.
+    async fn cache_hit_advice_does_not_terminate_authorized_tool_work() {
         let mut results = Vec::new();
         for _ in 0..20 {
             results.push(edge_tool_result(
@@ -2967,12 +3431,14 @@ mod tests {
                 Some(10),
             ));
         }
-        // Final text in case loop completes normally
         results.push(text_result("Done", 100, 50, Some(10)));
 
         let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
         let mut state = make_state();
-        state.max_turns = 50; // generous budget
+        state.agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(4, None);
+        state.max_turns = 4;
+        state.remaining_turns = 4;
 
         // Pre-seed cache hits to trigger warnings from the start
         for _ in 0..4 {
@@ -2981,21 +3447,14 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // The loop should have terminated before using all 20 tool rounds.
-        // Use llm_rounds_completed directly — it is the authoritative count
-        // of attempted LLM calls (incremented once per execute_turn call,
-        // not influenced by render/tool-message bookkeeping). Combining
-        // render counts + tool-message counts is an indirect metric that
-        // can pass accidentally; `llm_rounds_completed` is what the
-        // progressive-penalty machinery is supposed to bound.
-        let llm_rounds = state.llm_rounds_completed;
-
-        // We don't assert exact count (depends on penalty math), but it
-        // must be significantly less than 20.
         assert!(
-            llm_rounds < 18,
-            "progressive penalty should limit loop to fewer LLM rounds, got llm_rounds={llm_rounds}. outcome={outcome:?}"
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
         );
+        assert_eq!(state.llm_rounds_completed, 21);
+        assert_eq!(state.stall.tool_call_records.len(), 20);
+        assert_eq!(state.final_text, "Done");
+        assert!(state.interruption.is_none(), "{:?}", state.interruption);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

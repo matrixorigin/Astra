@@ -1232,6 +1232,50 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
 }
 
 impl RunEngine {
+    pub async fn request_run_model(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &astra_services::runs::RunModelRequest,
+    ) -> Result<astra_services::runs::RunModelSelection, String> {
+        self.store.request_run_model(user_id, run_id, request).await
+    }
+
+    pub async fn run_settings_snapshot(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
+        self.store
+            .run_settings_snapshot(user_id, session_id, run_id)
+            .await
+    }
+
+    pub async fn inherited_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<astra_services::runs::InheritedRunModel, String> {
+        self.store
+            .inherited_run_model(user_id, session_id, run_id)
+            .await
+    }
+
+    pub async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &astra_services::runs::RunModelOutcome,
+        resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_services::runs::RunModelOutcome>, String> {
+        self.store
+            .finish_run_model(user_id, session_id, run_id, outcome, resolved)
+            .await
+    }
+
     pub async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -4508,13 +4552,23 @@ fn user_intent_indices_with_disposition(
 
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
-    async fn permission_mode_snapshot(
+    async fn run_settings_snapshot(
         &self,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<astra_services::runs::RunPermissionModeSnapshot>, String> {
-        RunEngine::permission_mode_snapshot(self, user_id, session_id, run_id).await
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
+        RunEngine::run_settings_snapshot(self, user_id, session_id, run_id).await
+    }
+    async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &astra_turn_types::RunModelOutcome,
+        resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_turn_types::RunModelOutcome>, String> {
+        RunEngine::finish_run_model(self, user_id, session_id, run_id, outcome, resolved).await
     }
     async fn apply_permission_mode(
         &self,

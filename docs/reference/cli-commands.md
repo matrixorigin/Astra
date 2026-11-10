@@ -47,6 +47,16 @@ Scripts can still supply both explicitly:
 astra model add work-model --provider deepseek --model deepseek-v4-flash --api-key-stdin
 ```
 
+When the provider requires the Responses API, select **Responses** in model
+settings or pass `--api-format responses` to `astra model add`. The default for
+OpenAI-compatible API-key models is Chat Completions. Use the API format
+documented by your provider; credential or network failures do not cause Astra
+to guess a different format.
+For a personal Responses model, `/model` offers reasoning settings even when
+the provider has not published a complete list. Such settings are marked as
+unverified; if the provider rejects one, choose another or **Model default**.
+The default leaves the provider's reasoning setting unchanged.
+
 With `--api-key-stdin`, the alias and required provider/model arguments remain
 mandatory; only the interactive wizard offers a default alias. Keys should be
 entered at the hidden prompt or supplied via stdin, never as command arguments.
@@ -61,17 +71,11 @@ Public HTTPS endpoints do not require individual administrator registration by
 default. Operators can opt into strict host/port approval by setting
 `ASTRA_BYOK_ENDPOINT_POLICY=trusted-domains` on every Server replica and using
 `PUT /admin/llm/trusted-domains`. Both modes block private/metadata addresses,
-validate and pin DNS results, and disable redirects. Custom BYOK uses direct
-queries to the Server's configured DNS servers, not OS Fake-IP caches. Operators
-may override DNS IPs with `ASTRA_BYOK_DNS_SERVERS` and select an HTTP(S) CONNECT
-or SOCKS5 proxy with `ASTRA_BYOK_PROXY_URL`. Proxies connect to validated public
-IPs, retaining origin TLS verification; ambient proxy variables are not used.
-Direct UDP DNS can still be intercepted by a VPN/proxy. Use an explicit
-TCP-only entry such as `ASTRA_BYOK_DNS_SERVERS=tcp://10.0.0.53:53` when a
-reachable DNS server supports TCP. TCP-only entries never fall back to UDP;
-private/Fake-IP answers remain rejected. DNS failures retain resolver diagnostics
-in Server logs without exposing them in public API errors.
-These are Server settings, not options ordinary CLI users need to fill in.
+validate and pin DNS results, and disable redirects. The Server uses its normal
+system DNS and HTTPS proxy settings; proxies connect to validated public IPs
+while retaining origin TLS verification. A Server using Fake-IP DNS must be
+configured to return public addresses for model providers. These are Server
+settings, not options ordinary CLI users need to fill in.
 The default policy is `public-https`; invalid values fail closed. Upgrade the
 Server together with the CLI to provide `/me/models/validate-endpoint`.
 
@@ -280,6 +284,10 @@ without the `mcpServers` wrapper. It supports `stdio` (the default, using
 (using `url`, optional `headers`, and optional `auth_token`). Use the exact
 `streamable_http` spelling in configuration; `http`, `streamable-http`, and
 `websocket` are not accepted aliases.
+For `streamable_http`, a JSON response or an individual SSE event is limited to
+16 MiB, and an HTTP error body to 64 KiB. Oversized JSON or error bodies fail
+the response; an oversized SSE event terminates that stream, which may reconnect.
+If a tool request has already been sent, its execution outcome may be unknown.
 `add` writes a stdio entry. Both commands default to project scope and reject
 an existing name in that file; remove the existing entry or edit the file to
 replace it. Adding configuration does not install an executable or test access.
@@ -380,6 +388,23 @@ fields and quirks: supplying quirks replaces the complete stored object.
 the observation and diagnostics. An `effort_only` result allows effort selection,
 not thinking Off. An inconclusive check establishes no new capability. A matching
 prior capability may remain available while diagnostics record the latest error.
+An unsuccessful connectivity check returns a nonzero exit status and does not
+disable an existing model. A successful administrator check activates it. Model
+loading reports failed checks with a nonzero exit status while retaining any
+other models already loaded. A lost response can leave a creation outcome
+unknown; check the model list before retrying.
+
+For an administrator-managed API-key model that requires the OpenAI Responses
+API, set `inference_protocol: openai_responses` in its YAML entry and reload it
+with `astra admin model load .models.yaml --update-existing`. Set
+`thinking_protocol: responses_reasoning`, or omit `thinking_protocol` to use
+that default. Replace any existing `thinking_protocol: reasoning_effort`, which
+is incompatible with Responses. The Responses adapter currently accepts text inputs and does not accept fixed temperature or
+arbitrary request-body overrides. Other model entries retain their existing
+transport. This option applies to administrator-managed models.
+For selectable reasoning levels, declare only verified values in
+`supported_reasoning_efforts`, for example `[high, max]`. Without a declaration,
+the model check makes only the successfully observed effort selectable.
 
 Explicit CLI model selectors such as `'<name>(thinking:low)'`,
 `'<name>(thinking:medium)'` and `'<name>(thinking:high)'` select depth. A plain
@@ -413,3 +438,14 @@ Ctrl+R also restores the latest conversation with its slash escape, so editing
 and resending `/exit` text keeps it a message. The transcript shows the original
 conversation text, without the composer escape.
 Unknown or ambiguous single-slash actions still report a command error.
+
+Older clients that always send a completion temperature must be upgraded before
+using an API-key Responses Offering.
+
+## Workspace recovery
+
+If a previous command could not be stopped reliably, check that it has stopped.
+The TUI can then confirm and retry in the current session. For a non-interactive
+session, run `astra workspace confirm-stopped` in the indicated workspace and
+resume from that workspace before retrying. Confirmation does not delete files
+or worktrees.

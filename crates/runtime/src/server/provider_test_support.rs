@@ -168,6 +168,7 @@ impl ProviderGateway {
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(provider_handler))
+            .route("/v1/responses", post(provider_handler))
             .route("/v1/messages", post(provider_handler))
             .route("/v1/systemone", post(provider_handler))
             .route("/model/{model}/converse", post(provider_handler))
@@ -645,6 +646,24 @@ impl ProviderObservationsFixture {
         .is_ok()
     }
 
+    pub async fn wait_for_measured_input(&self, expected: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.calls.lock().unwrap().values().any(|call| {
+                    call.attempts
+                        .iter()
+                        .any(|attempt| attempt.measured_input_tokens == Some(expected))
+                }) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("provider usage must be observed before cancellation");
+    }
+
     pub fn assert_quiescent(&self) {
         assert!(
             self.calls
@@ -677,6 +696,10 @@ pub fn admitted_execution(
     let offering = astra_services::ResolvedModelOffering {
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
+            inference_protocol: None,
+            response_scope_key: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: model.into(),
             wire_model_name: None,

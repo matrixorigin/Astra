@@ -282,15 +282,32 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for AdmittingEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
             self.admissions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
         }
 
         async fn poll_pending(
@@ -396,7 +413,8 @@ mod tests {
     #[tokio::test]
     async fn shared_tool_execution_service_wires_edge_websocket_transport() {
         let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
         pool.register_with_capabilities(
             "user-1",
             "edge-selected",
@@ -422,6 +440,9 @@ mod tests {
             .await
             .expect("durably admitted edge request is delivered without hanging")
             .expect("edge tool request is delivered");
+        let mut queued = message;
+        queued.mark_attempted();
+        let message = queued.message().clone();
         let (request_id, delivery_generation) = match message {
             astra_server_types::EdgeServerMessage::ToolRequest {
                 request_id,

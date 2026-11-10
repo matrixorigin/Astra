@@ -9,6 +9,41 @@ pub const TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION: u8 = 1;
 /// canonical persistence but must never be sent to a model or affect its cache.
 pub const MODEL_ITEM_ID_FIELD: &str = "model_item_id";
 
+/// Owner-attested route of a model-produced assistant item. It is internal
+/// continuation metadata, never an instruction or a provider wire field.
+pub const MODEL_REPLAY_ORIGIN_FIELD: &str = "_astra_model_replay_origin";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelReplayOrigin {
+    pub session_id: String,
+    pub run_id: String,
+    pub item_id: String,
+    /// `None` is the original selection; later values are durable request revisions.
+    pub selection_revision: Option<i64>,
+    pub route: String,
+    pub runtime_generated: bool,
+    pub tool_calls_digest: Option<String>,
+    pub reasoning_digest: Option<String>,
+    pub durable_tool_calls_digest: Option<String>,
+    pub durable_reasoning_digest: Option<String>,
+    pub proof: String,
+}
+
+pub fn model_replay_origin(message: &Value) -> Option<ModelReplayOrigin> {
+    (message.get("role")?.as_str()? == "assistant")
+        .then(|| serde_json::from_value(message.get(MODEL_REPLAY_ORIGIN_FIELD)?.clone()).ok())
+        .flatten()
+}
+
+pub fn mark_model_replay_origin(message: &mut Value, origin: &ModelReplayOrigin) {
+    if message.get("role").and_then(Value::as_str) == Some("assistant")
+        && let Some(object) = message.as_object_mut()
+    {
+        object.insert(MODEL_REPLAY_ORIGIN_FIELD.into(), json!(origin));
+    }
+}
+
 pub fn model_item_id(message: &Value) -> Option<&str> {
     (message.get("role").and_then(Value::as_str) == Some("assistant"))
         .then(|| message.get(MODEL_ITEM_ID_FIELD).and_then(Value::as_str))

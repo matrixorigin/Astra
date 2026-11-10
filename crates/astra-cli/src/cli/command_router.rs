@@ -5,6 +5,7 @@ use crate::cli::arg_render::{
 use crate::cli::auth_flow::{clear_profile_auth, do_login, do_memoria_login_with_key, do_register};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    WorkspaceCmd,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -953,7 +954,23 @@ fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option
         Some(format!("Session persistence degraded: {error}"))
     } else if sr.local_continuation_omitted {
         Some("Local conversation content omitted by privacy policy; this turn cannot be recovered or automatically resumed locally.".into())
+    } else if !sr.server_terminal_authoritative
+        && exit_code != ExitCode::Success
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        Some("A tool result could not be saved or delivered. Check what completed before continuing; do not repeat an action just to recover its output.".into())
     } else if exit_code == ExitCode::Partial {
+        if let Some(message) = sr
+            .interruption
+            .as_ref()
+            .and_then(|interruption| interruption.get("user_message"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+        {
+            return Some(message.to_string());
+        }
         Some(match sr.interruption_kind.as_deref() {
             Some(kind) => format!(
                 "Turn finished partially ({kind}). Inspect partial output before continuing."
@@ -1816,9 +1833,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: None,
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx: None,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -2434,6 +2451,14 @@ async fn execute_cli_command_impl(
                     &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 )
             };
+            // One-shot chat owns shell tasks for this turn only. The same
+            // registry is shared by every tool callback until shutdown.
+            let mut background_tasks =
+                crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                    astra_runtime_env::local_state_root()
+                        .join("bg_tasks")
+                        .join("one-shot"),
+                );
             let mut native_executor = None;
             let mut native_delivery = if let (Some(session_id), Some(account_id)) =
                 (session_id.as_deref(), cli_utils::cli_account_id())
@@ -2528,9 +2553,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: Some(background_tasks.clone()),
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -2566,6 +2591,7 @@ async fn execute_cli_command_impl(
             let mut user_interrupted = false;
             let mut wall_deadline_root_settled = false;
             let mut wall_deadline_server_terminal_settled = false;
+            let mut cancelled_context_observation = None;
             // First polled after the initial interruption, then retained through
             // every settlement phase. Never poll again after it completes.
             let second_interrupt = tokio::signal::ctrl_c();
@@ -2624,7 +2650,7 @@ async fn execute_cli_command_impl(
                                 let cancel = crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
                                 );
-                                if let Err(error) = tokio::select! {
+                                let context_observation = match tokio::select! {
                                     biased;
                                     _ = &mut second_interrupt => {
                                         second_interrupted = true;
@@ -2632,11 +2658,12 @@ async fn execute_cli_command_impl(
                                     }
                                     result = cancel => result,
                                 } {
-                                    return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                                        &error,
-                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
-                                    );
-                                }
+                                    Ok(observation) => observation,
+                                    Err(error) => return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &error, wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    ),
+                                };
+                                cancelled_context_observation = Some(context_observation);
                                 request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
@@ -2653,6 +2680,11 @@ async fn execute_cli_command_impl(
                                 match drained {
                                     Some(result) => {
                                         wall_deadline_root_settled = true;
+                                        if let Err(failure) = &result {
+                                            cancelled_context_observation = Some(
+                                                merge_cancelled_context_for_run(context_observation, &run_id, failure),
+                                            );
+                                        }
                                         match result {
                                             Ok(result) => Ok(result),
                                             Err(_) if !user_interrupted => Ok(stream_result_from_incremental_snapshot(
@@ -2721,6 +2753,40 @@ async fn execute_cli_command_impl(
                     &mut interruption_cleanup_settled,
                 );
             }
+
+            let mut shell_settlement_confirmed = false;
+            let shell_shutdown = settle_one_shot_cleanup_observing_interrupt(
+                async {
+                    let report = background_tasks.kill_all_and_wait(std::time::Duration::from_secs(2)).await;
+                    let unsettled = report.unsettled.len().saturating_add(report.evicted_unsettled);
+                    let unknown = report.unknown.len();
+                    shell_settlement_confirmed = unsettled == 0 && unknown == 0;
+                    if !shell_settlement_confirmed {
+                        Err(format!("one-shot shell shutdown could not confirm execution outcomes or cleanup: {unsettled} unsettled, {unknown} unobserved unknown"))
+                    } else if !report.requested.is_empty() {
+                        Err(format!("one-shot turn ended with {} shell task(s) still running; cancellation was requested during shutdown", report.requested.len()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                "shell task shutdown",
+                &mut interrupt,
+                &mut second_interrupt,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut terminal_deadline,
+            ).await;
+            if !shell_settlement_confirmed {
+                request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+            }
+            turn_result = apply_one_shot_cleanup_result(
+                turn_result,
+                shell_shutdown,
+                wall_deadline_incremental_state
+                    .as_ref()
+                    .expect("one-shot state"),
+                &mut interruption_cleanup_settled,
+            );
 
             // Flush the completed stream before publishing. Retain the abort
             // authority outside the join future in case a late signal bounds
@@ -2806,6 +2872,11 @@ async fn execute_cli_command_impl(
                 );
             }
 
+            if let Some(observation) = cancelled_context_observation
+                && let Err(failure) = &mut turn_result
+            {
+                failure.partial.cancel_context_not_saved = Some(observation);
+            }
             let mut sr = match turn_result {
                 Ok(sr) => sr,
                 Err(e)
@@ -2832,8 +2903,12 @@ async fn execute_cli_command_impl(
                         crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
                     );
                     if args.json {
+                        let mut output = hard_failure_json_output(e);
+                        if let Some(observation) = cancelled_context_observation {
+                            output["context_not_saved"] = serde_json::json!(observation);
+                        }
                         write_headless_stdout_line(
-                            &serde_json::to_string_pretty(&hard_failure_json_output(e))
+                            &serde_json::to_string_pretty(&output)
                                 .map_err(|error| error.to_string())?,
                         )?;
                         return Ok(failure_exit);
@@ -2857,6 +2932,21 @@ async fn execute_cli_command_impl(
                     }));
                     if !had_partial_text {
                         sr.full_text = "Execution interrupted by the user.".to_string();
+                    }
+                }
+                if let Some(observation) = cancelled_context_observation {
+                    if let Some(interruption) = sr
+                        .interruption
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        interruption
+                            .insert("context_not_saved".into(), serde_json::json!(observation));
+                    }
+                    if let Some(notice) =
+                        crate::cli::turn::turn_cancellation::cancelled_context_notice(observation)
+                    {
+                        eprintln!("{notice}");
                     }
                 }
                 retain_interrupted_partial_canonical_messages(&mut sr, &message);
@@ -2892,6 +2982,35 @@ async fn execute_cli_command_impl(
             print_one_shot_completion_warning(&sr, exit_code, args.json);
 
             Ok(exit_code)
+        }
+
+        Some(Command::Workspace(WorkspaceCmd::ConfirmStopped)) => {
+            if !std::io::stdin().is_terminal() {
+                return Err("Confirm workspace recovery from an interactive terminal.".into());
+            }
+            let root = std::env::current_dir().map_err(|error| error.to_string())?;
+            let recovery = astra_tools::workspace_observation::begin_workspace_recovery(&root)
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!("Workspace: {}", root.display());
+            let confirmed = inquire::Confirm::new(
+                "Have all local and connected commands that may still use this workspace stopped?",
+            )
+            .with_default(false)
+            .prompt()
+            .map_err(|error| format!("Could not confirm workspace recovery: {error}"))?;
+            if !confirmed {
+                eprintln!("Workspace recovery cancelled.");
+                return Ok(ExitCode::Success);
+            }
+            recovery
+                .confirm()
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!(
+                "Workspace confirmed. Restart any running Astra sessions from this workspace before retrying the rollback."
+            );
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Judge(args))) => {
@@ -3279,14 +3398,27 @@ async fn execute_cli_command_impl(
                 "context_window": context_window,
                 "is_default": is_default,
             });
+            if let Some(format) = args.api_format {
+                payload["inference_protocol"] = serde_json::json!(match format.as_str() {
+                    "responses" => "openai_responses",
+                    _ => "openai_compatible",
+                });
+            }
             if let Some(connection) = connection {
                 payload["connection_id"] = serde_json::json!(connection);
             }
             let body = api
                 .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
+                .map_err(crate::cli::cli_config::cli_utils::model_creation_error)?;
+            if interactive {
+                stdout_println!(
+                    "{} Personal model '{name}' added; provider check passed.",
+                    theme::icon_ok()
+                );
+            } else {
+                print_json_or_raw(&body);
+            }
             Ok(ExitCode::Success)
         }
 
@@ -3740,6 +3872,9 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         {
             return false;
         }
+        if record.execution_ok.is_some() && !record.ok {
+            return true;
+        }
         match record.exit_semantics.as_deref().and_then(|tag| {
             serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
                 serde_json::Value::String(tag.to_string()),
@@ -3775,6 +3910,18 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     if sr.final_state == "interrupted" {
         return ExitCode::Partial;
     }
+    // The shared loop's completed response follows its tool-result feedback.
+    // An earlier failed call remains audit evidence, not an exit-code veto.
+    if sr.final_state == "completed" && !sr.full_text.trim().is_empty() {
+        return ExitCode::Success;
+    }
+    if !sr.server_terminal_authoritative
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        return ExitCode::ToolFailure;
+    }
     if !sr.server_terminal_authoritative
         && sr.tool_call_records.iter().any(&is_error)
         && sr.tool_call_records.last().is_none_or(|record| {
@@ -3792,8 +3939,8 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
 
 /// Classify the user-visible terminal contract without turning advisory
 /// evidence into another execution/retry authority. A natural-language stop
-/// can still be useful output, but an active exact-argument failure or
-/// rejection means Astra cannot honestly label the result verified.
+/// can still be useful output. Historical tool failures remain diagnostics;
+/// lifecycle and explicit verification own the terminal disposition.
 fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static str {
     if exit_code != ExitCode::Success {
         return if sr.final_state == "interrupted" {
@@ -3808,17 +3955,7 @@ fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static st
     if sr.server_terminal_authoritative {
         return "completed";
     }
-    let unresolved = !astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(
-        &sr.tool_call_records,
-    )
-    .is_empty()
-        || !astra_turn_core::evaluation::active_rejected_operation_keys(&sr.tool_call_records)
-            .is_empty();
-    if unresolved {
-        "responded_unverified"
-    } else {
-        "completed"
-    }
+    "completed"
 }
 
 fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
@@ -3865,6 +4002,11 @@ fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
 /// only from the physical stream's validated root binding.
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let exit_code = hard_failure_exit_code(&failure);
+    let mut diagnostic = failure.error.clone();
+    crate::cli::turn::turn_failure_reporting::append_cancelled_context_notice(
+        &mut diagnostic,
+        failure.partial.cancel_context_not_saved,
+    );
     let partial = failure.partial;
     let authoritative_failed = partial.failed_run_terminal.is_some()
         && !partial.remote_cancel_required
@@ -3919,10 +4061,37 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         output["model_item_id"] = serde_json::json!(model_item_id);
     }
     output["tool_result_class_counts"] = classes;
-    output["error"] = serde_json::json!(failure.error);
+    output["error"] = serde_json::json!(diagnostic);
     output["error_code"] = serde_json::json!(partial.error_code);
     output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    if let Some(observation) = partial.cancel_context_not_saved {
+        output["context_not_saved"] = serde_json::json!(observation);
+    }
     output
+}
+
+fn merge_cancelled_context_observations(first: Option<bool>, second: Option<bool>) -> Option<bool> {
+    match (first, second) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_cancelled_context_for_run(
+    outer: Option<bool>,
+    run_id: &str,
+    failure: &crate::TurnFailure,
+) -> Option<bool> {
+    if failure.partial.run_id.as_deref() != Some(run_id) {
+        return None;
+    }
+    failure
+        .partial
+        .cancel_context_not_saved
+        .map_or(outer, |inner| {
+            merge_cancelled_context_observations(outer, inner)
+        })
 }
 
 fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
@@ -3956,7 +4125,7 @@ fn final_json_output_with_context(
             .expect("fixed tool result-class aggregate must serialize")
     };
     let disposition = completion_disposition(sr, exit_code);
-    serde_json::json!({
+    let mut output = serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
@@ -3996,11 +4165,20 @@ fn final_json_output_with_context(
         "tools_used": sr.tools_used,
         "local_continuation": if sr.local_continuation_omitted { Some("omitted_by_policy") } else { None },
         "persistence_error": sr.session_persistence_error,
+        "warning": one_shot_completion_warning(sr, exit_code),
         "exit_code": i32::from(exit_code),
         "success": exit_code == ExitCode::Success && disposition == "completed",
         "completion_disposition": disposition,
         "error_kind": error_kind_for_exit_code(exit_code),
-    })
+    });
+    if let Some(observation) = sr
+        .interruption
+        .as_ref()
+        .and_then(|value| value.get("context_not_saved"))
+    {
+        output["context_not_saved"] = observation.clone();
+    }
+    output
 }
 
 // All one-shot entrypoints bypass interactive startup but advertise a native
@@ -4149,9 +4327,9 @@ pub(crate) async fn run_print_mode(
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: None,
         stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
@@ -5487,6 +5665,83 @@ mod exit_code_tests {
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
+    #[test]
+    fn exit_code_reports_delivery_failure_after_successful_command() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                execution_ok: Some(true),
+                exit_semantics: Some("success".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn completed_model_response_is_not_overridden_by_an_earlier_delivery_failure() {
+        let mut sr = empty_stream_result();
+        sr.full_text = "I verified the output.".into();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        sr.final_state = "interrupted".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+    }
+
+    #[test]
+    fn read_delivery_failure_does_not_block_an_alternative_observation() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                args_full: Some(r#"{"path":"one.txt"}"#.into()),
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                args_full: Some(r#"{"path":"two.txt"}"#.into()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        // A lost mutation outcome cannot be recovered by an unrelated read.
+        sr.tool_call_records[0].name = "write_file".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+        assert!(
+            super::one_shot_completion_warning(&sr, ExitCode::ToolFailure)
+                .unwrap()
+                .contains("result could not be saved or delivered")
+        );
+
+        // The server's terminal state supersedes stale local tool records.
+        sr.server_terminal_authoritative = true;
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+    }
+
     fn tool_call_record(
         name: &str,
         ok: bool,
@@ -5758,7 +6013,59 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod final_json_output_tests {
-    use super::{ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result};
+    use super::{
+        ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result,
+        hard_failure_json_output,
+    };
+
+    #[test]
+    fn interrupted_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let mut result = StreamResult::default();
+            result.interruption = Some(serde_json::json!({"context_not_saved": observed}));
+            let output = final_json_output_with_context(&result, ExitCode::Partial, None, None);
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn failed_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let output = hard_failure_json_output(crate::TurnFailure {
+                error: "cancelled during cleanup".into(),
+                partial: crate::PartialTurnData {
+                    cancel_context_not_saved: Some(observed),
+                    ..Default::default()
+                },
+            });
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn stronger_cancelled_context_observation_wins_but_conflicts_are_unknown() {
+        use super::merge_cancelled_context_observations as merge;
+        assert_eq!(merge(None, Some(true)), Some(true));
+        assert_eq!(merge(Some(false), None), Some(false));
+        assert_eq!(merge(Some(true), Some(false)), None);
+        assert_eq!(merge(None, None), None);
+        let failure = crate::TurnFailure {
+            error: "cancelled".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("root".into()),
+                cancel_context_not_saved: Some(Some(true)),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "root", &failure),
+            Some(true)
+        );
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "child", &failure),
+            None
+        );
+    }
 
     fn stream_result_for_json() -> StreamResult {
         StreamResult {
@@ -6002,7 +6309,7 @@ mod final_json_output_tests {
     }
 
     #[test]
-    fn final_json_output_marks_active_exact_failure_as_unverified() {
+    fn final_json_output_keeps_historical_failure_separate_from_completion() {
         let mut sr = stream_result_for_json();
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -6015,9 +6322,13 @@ mod final_json_output_tests {
             });
         let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
 
-        assert_eq!(output["completion_disposition"], "responded_unverified");
-        assert_eq!(output["success"], false);
+        assert_eq!(output["completion_disposition"], "completed");
+        assert_eq!(output["success"], true);
         assert_eq!(output["exit_code"], 0);
+        assert!(
+            !sr.tool_call_records[0].ok,
+            "failure remains diagnostic evidence"
+        );
     }
 
     #[test]
@@ -6877,6 +7188,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),
@@ -7012,6 +7324,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),

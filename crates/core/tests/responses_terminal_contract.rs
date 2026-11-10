@@ -14,11 +14,108 @@ fn decode(
     decode_sse(&format!("data: {event}\n\n"))
 }
 fn call(status: Option<&str>) -> Value {
-    let mut item = json!({"type":"function_call","id":"fc-fixture","namespace":"astra","call_id":"call-fixture","name":"read_file","arguments":"{}"});
+    let mut item = json!({"type":"function_call","id":"fc-fixture","call_id":"call-fixture","name":"read_file","arguments":"{}"});
     if let Some(status) = status {
         item["status"] = json!(status);
     }
     item
+}
+
+#[test]
+fn plaintext_and_encrypted_reasoning_survive_a_complete_tool_round() {
+    let connection = "00000000-0000-4000-8000-000000000001";
+    for reasoning in [
+        json!({"type":"reasoning","id":"rs","summary":[],"content":[
+            {"type":"reasoning_text","text":"first"},
+            {"type":"reasoning_text","text":"second"}
+        ]}),
+        json!({"type":"reasoning","id":"rs","summary":[],"encrypted_content":"opaque"}),
+    ] {
+        let items = json!([reasoning, call(Some("completed"))]);
+        for finished_items in [false, true] {
+            let mut stream = String::new();
+            if finished_items {
+                for (index, item) in items.as_array().unwrap().iter().enumerate() {
+                    stream.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({
+                            "type":"response.output_item.done", "output_index":index, "item":item
+                        })
+                    ));
+                }
+            }
+            let output = if finished_items {
+                json!([])
+            } else {
+                items.clone()
+            };
+            stream.push_str(&format!("data: {}\n\n", terminal("completed", output)));
+            let response = decode_sse(&stream).unwrap();
+            let mut assistant = json!({"role":"assistant", "tool_calls":response.tool_calls});
+            assistant[CONTINUATION_KEY] = response.continuation(connection, "model");
+            assistant[CONTINUATION_KEY] = validated_continuation(&assistant).unwrap();
+            let messages = [
+                assistant,
+                json!({"role":"tool", "tool_call_id":"call-fixture", "content":"done"}),
+            ];
+            let wire = request("model", &messages, None, connection, false, None).unwrap();
+            assert_eq!(wire["input"][0], reasoning);
+            assert_eq!(wire["input"][1], items[1]);
+            assert_eq!(wire["input"][2]["type"], "function_call_output");
+            assert!(request("model", &messages, None, "other-scope", false, None).is_err());
+        }
+    }
+}
+
+#[test]
+fn malformed_or_missing_plaintext_reasoning_never_authorizes_a_tool() {
+    for content in [
+        Value::Null,
+        json!([]),
+        json!("not an array"),
+        json!([null]),
+        json!([{"type":"reasoning_text"}]),
+        json!([{"type":"reasoning_text", "text":1}]),
+        json!([{"type":"unknown", "text":"private"}]),
+        json!([{"type":"reasoning_text", "text":"valid"}, {"type":"unknown", "text":"invalid"}]),
+    ] {
+        let reasoning = json!({"type":"reasoning", "summary":[], "content":content});
+        assert!(decode(terminal("completed", json!([reasoning, call(None)]))).is_err());
+    }
+    // An explicitly present empty part is still a valid typed reasoning item.
+    let empty_text =
+        json!({"type":"reasoning", "summary":[], "content":[{"type":"reasoning_text", "text":""}]});
+    assert!(decode(terminal("completed", json!([empty_text, call(None)]))).is_ok());
+}
+
+#[test]
+fn reasoning_budget_covers_all_items_and_done_item_replacements() {
+    let part = json!({"type":"reasoning_text", "text":"x"});
+    let reasoning =
+        |count| json!({"type":"reasoning", "summary":[], "content":vec![part.clone(); count]});
+    let make_output = |second| json!([reasoning(2048), reasoning(second), call(None)]);
+    assert!(decode(terminal("completed", make_output(2048))).is_ok());
+    assert!(decode(terminal("completed", make_output(2049))).is_err());
+
+    // An index can be replaced without accumulating the discarded item's budget.
+    let events = [
+        json!({"type":"response.output_item.done", "output_index":0, "item":reasoning(4096)}),
+        json!({"type":"response.output_item.done", "output_index":0, "item":reasoning(1)}),
+        json!({"type":"response.output_item.done", "output_index":1, "item":call(None)}),
+        terminal("completed", json!([])),
+    ];
+    let stream: String = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    assert!(decode_sse(&stream).is_ok());
+
+    let large = json!({"role":"assistant", CONTINUATION_KEY:{
+        "connection_id":"00000000-0000-4000-8000-000000000001", "model":"model", "items":[
+            {"type":"reasoning", "summary":[], "content":[{"type":"reasoning_text", "text":"x".repeat(16 * 1024 * 1024 + 1)}]}
+        ]
+    }});
+    assert!(validated_continuation(&large).is_none());
 }
 #[test]
 fn truncation_never_authorizes_functions_or_provider_replay() {
@@ -109,11 +206,20 @@ fn completed_functions_require_complete_items_including_saved_replay() {
                     );
                 }
             }
-            let mut saved = json!({"role":"assistant","content":"","tool_calls":[{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]});
+            let is_call = item["type"] == "function_call";
+            let mut saved = json!({"role":"assistant","content":""});
+            if is_call {
+                saved["tool_calls"] =
+                    json!([{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]);
+            }
             saved[CONTINUATION_KEY] =
                 json!({"connection_id":connection,"model":"model","items":[item]});
             assert_eq!(validated_continuation(&saved).is_some(), allowed);
-            let wire = request("model", &[saved], None, connection, false, None);
+            let mut messages = vec![saved];
+            if is_call {
+                messages.push(json!({"role":"tool","tool_call_id":"call-fixture","content":"ok"}));
+            }
+            let wire = request("model", &messages, None, connection, false, None);
             assert_eq!(wire.is_ok(), allowed);
             if let Ok(wire) = wire {
                 assert!(
@@ -132,6 +238,83 @@ fn completed_functions_require_complete_items_including_saved_replay() {
             "required {field}"
         );
     }
+}
+
+#[test]
+fn completed_tool_rounds_validate_the_same_items_before_execution_and_replay() {
+    let connection = "00000000-0000-4000-8000-000000000001";
+    let valid = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]});
+    let invalid_messages = [
+        json!({"type":"message","content":[{"type":"output_text","text":"working"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"unknown","text":"working"}]}),
+    ];
+    assert!(decode(terminal("completed", json!([valid, call(None)]))).is_ok());
+    for invalid in invalid_messages {
+        for finished_items in [false, true] {
+            let items = vec![invalid.clone(), call(None)];
+            let mut stream = String::new();
+            if finished_items {
+                for (index, item) in items.iter().enumerate() {
+                    stream.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.output_item.done","output_index":index,"item":item})
+                    ));
+                }
+            }
+            let output = if finished_items {
+                json!([])
+            } else {
+                json!(items)
+            };
+            stream.push_str(&format!("data: {}\n\n", terminal("completed", output)));
+            assert!(decode_sse(&stream).is_err(), "invalid message: {invalid}");
+        }
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid,call(None)]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    for (field, value) in [
+        ("call_id", "x".repeat(513)),
+        ("call_id", "call\ninvalid".to_owned()),
+        ("name", "x".repeat(129)),
+    ] {
+        let mut invalid = call(None);
+        invalid[field] = json!(value);
+        assert!(decode(terminal("completed", json!([invalid]))).is_err());
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    let mut items: Vec<_> = (0..4095)
+        .map(|index| json!({"type":"message","id":format!("m{index}"),"role":"assistant","content":[{"type":"output_text","text":"x"}]}))
+        .collect();
+    items.push(call(None));
+    let output = decode(terminal("completed", json!(items))).unwrap();
+    assert_eq!(output.tool_calls.len(), 1);
+    items.push(json!({"type":"reasoning","encrypted_content":"ciphertext"}));
+    assert!(decode(terminal("completed", json!(items))).is_err());
+
+    let mut stream = String::new();
+    for index in 0..4097 {
+        let item = if index == 0 {
+            call(None)
+        } else {
+            json!({"type":"reasoning","encrypted_content":"ciphertext"})
+        };
+        stream.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.output_item.done","output_index":index,"item":item
+            })
+        ));
+    }
+    stream.push_str(&format!("data: {}\n\n", terminal("completed", json!([]))));
+    assert!(decode_sse(&stream).is_err());
 }
 
 fn message(id: &str, text: &str, status: &str) -> Value {

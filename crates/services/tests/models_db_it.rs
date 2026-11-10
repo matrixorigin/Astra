@@ -100,6 +100,297 @@ async fn complete_quirks_replacement_corrects_noncanonical_stored_controls() {
 #[tokio::test]
 #[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn responses_continuation_survives_probe_updates_but_fences_route_changes() {
+    use astra_core::model_wire::{
+        LlmProviderProtocol,
+        responses::{CONTINUATION_KEY, CONTINUATION_SCOPE_CHANGED, ResponseOutput, request},
+    };
+    use astra_services::{AdmittedModelExecution, models::QuirksData};
+    use serde_json::json;
+
+    async fn admitted(service: &DatabaseModelService, id: &str) -> AdmittedModelExecution {
+        service
+            .admit_model_offering("responses-scope-test-user".into(), id.to_string())
+            .await
+            .unwrap()
+    }
+
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let name = format!("responses_scope_{}", Uuid::new_v4().simple());
+    let id = seed_model(&pool, &name).await;
+    let encryptor = Arc::new(FernetTokenEncryptor::new("responses-scope-db-it-key").unwrap());
+    let mut quirks = QuirksData {
+        inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+        ..Default::default()
+    };
+    sqlx::query("UPDATE infra_llm_models SET provider = 'openai', api_key_encrypted = ?, quirks = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("first-key").unwrap())
+        .bind(serde_json::to_string(&quirks).unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = DatabaseModelService::new(settings, encryptor.clone()).with_pool(shared_pool);
+    let original = admitted(&service, &id).await;
+    let scope = original.response_scope.as_deref().unwrap();
+    let output = ResponseOutput {
+        items: vec![
+            json!({"type":"function_call", "id":"fc-1",  "name":"lookup", "call_id":"call-1", "arguments":"{}"}),
+        ],
+        ..Default::default()
+    };
+    let mut assistant = json!({"role":"assistant", "content":"", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}]});
+    assistant[CONTINUATION_KEY] = output.continuation(scope, original.upstream_model_name());
+    let messages = [
+        json!({"role":"user", "content":"look up"}),
+        assistant,
+        json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}),
+    ];
+    let bind = |execution: &AdmittedModelExecution| {
+        let mut bound = messages.clone();
+        bound[1][CONTINUATION_KEY] = output.continuation(
+            execution.response_scope.as_deref().unwrap(),
+            execution.upstream_model_name(),
+        );
+        bound
+    };
+    let replay = |execution: &AdmittedModelExecution, messages: &[serde_json::Value]| {
+        request(
+            execution.upstream_model_name(),
+            messages,
+            None,
+            execution.response_scope.as_deref().unwrap(),
+            false,
+            None,
+        )
+    };
+    assert!(replay(&original, &messages).is_ok());
+
+    quirks.probe_endpoint = Some("/health".into());
+    quirks.probe_headers = Some(json!({"User-Agent":"probe"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let refreshed = admitted(&service, &id).await;
+    assert!(original.has_same_execution_identity(&refreshed));
+    assert_eq!(refreshed.response_scope.as_deref(), Some(scope));
+    assert!(replay(&refreshed, &messages).is_ok());
+
+    quirks.supported_reasoning_efforts = Some(vec!["high".into()]);
+    quirks.request_headers = Some(Default::default());
+    quirks.prompt_cache_capability = Some(serde_json::from_value(json!({
+        "schema_version":2, "protocol":"strict_history_match", "volatile_placement":"append_only_user_tail",
+        "volatile_delivery":"all", "reuse_scope":"conversation_turns"
+    })).unwrap());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    update.base_url = Some("http://127.0.0.1:1/".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    assert_eq!(
+        admitted(&service, &id).await.response_scope.as_deref(),
+        Some(scope)
+    );
+
+    quirks.request_headers = Some(json!({"X-Tenant":"tenant-a"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let with_header = admitted(&service, &id).await;
+    let header_scope = with_header.response_scope.as_deref().unwrap();
+    let header_messages = bind(&with_header);
+
+    quirks.request_headers = Some(json!({"x-tenant":"tenant-a"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let same_header = admitted(&service, &id).await;
+    assert_eq!(same_header.response_scope.as_deref(), Some(header_scope));
+    assert_eq!(
+        same_header.header_overrides.get("x-tenant").unwrap(),
+        "tenant-a"
+    );
+    assert!(replay(&same_header, &header_messages).is_ok());
+
+    let mut conflicting = quirks.clone();
+    conflicting.request_headers = Some(
+        json!({"X-Tenant":"tenant-a", "x-tenant":"tenant-b"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut update = model_patch();
+    update.quirks = Some(conflicting.clone());
+    assert!(matches!(
+        service.update_model(name.clone(), update).await,
+        Err((StatusCode::BAD_REQUEST, _))
+    ));
+    assert_eq!(
+        admitted(&service, &id).await.response_scope,
+        same_header.response_scope
+    );
+
+    // A previously stored ambiguous configuration must also fail closed at
+    // execution admission, even when it bypassed current write validation.
+    sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+        .bind(serde_json::to_string(&conflicting).unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy = service.revalidate_model_offering(id.clone()).await.unwrap();
+    assert!(AdmittedModelExecution::from_offering(legacy).is_err());
+    let mut disable = model_patch();
+    disable.is_active = Some(false);
+    service.update_model(name.clone(), disable).await.unwrap();
+    let mut enable = model_patch();
+    enable.is_active = Some(true);
+    assert!(matches!(
+        service.update_model(name.clone(), enable).await,
+        Err((StatusCode::BAD_REQUEST, _))
+    ));
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    update.is_active = Some(true);
+    service.update_model(name.clone(), update).await.unwrap();
+
+    quirks.request_headers = Some(json!({"x-tenant":"other"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks);
+    service.update_model(name.clone(), update).await.unwrap();
+    let changed_route = admitted(&service, &id).await;
+    assert_eq!(changed_route.header_overrides["x-tenant"], "other");
+    assert_ne!(changed_route.response_scope.as_deref(), Some(header_scope));
+    assert_eq!(
+        replay(&changed_route, &header_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+    let changed_messages = bind(&changed_route);
+
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("second-key").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rotated = admitted(&service, &id).await;
+    assert_ne!(rotated.response_scope, changed_route.response_scope);
+    assert_eq!(
+        replay(&rotated, &changed_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+    let rotated_messages = bind(&rotated);
+    let mut update = model_patch();
+    update.base_url = Some("http://127.0.0.1:2".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let moved = admitted(&service, &id).await;
+    assert_ne!(moved.response_scope, rotated.response_scope);
+    assert_eq!(
+        replay(&moved, &rotated_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+
+    let mut update = model_patch();
+    update.base_url = Some("http://LOCALHOST:80/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let upper = admitted(&service, &id).await;
+    let upper_messages = bind(&upper);
+    let mut update = model_patch();
+    update.base_url = Some("http://localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let lower = admitted(&service, &id).await;
+    assert_eq!(upper.response_scope, lower.response_scope);
+    assert!(replay(&lower, &upper_messages).is_ok());
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("second-key").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reencrypted = admitted(&service, &id).await;
+    assert_eq!(lower.response_scope, reencrypted.response_scope);
+    assert!(replay(&reencrypted, &bind(&lower)).is_ok());
+
+    let mut quirks = QuirksData {
+        inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+        request_headers: Some(
+            json!({"Authorization":"Bearer second-key", "x-tenant":"other"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+        ..Default::default()
+    };
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let override_before = admitted(&service, &id).await;
+    assert_eq!(lower.response_scope, override_before.response_scope);
+    assert!(replay(&override_before, &bind(&lower)).is_ok());
+    let override_messages = bind(&override_before);
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("unused-key-rotation").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let override_after = admitted(&service, &id).await;
+    assert_eq!(
+        override_before.response_scope,
+        override_after.response_scope
+    );
+    assert!(replay(&override_after, &override_messages).is_ok());
+
+    quirks.request_headers = Some(
+        json!({"authorization":"Bearer changed", "x-tenant":"other"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut update = model_patch();
+    update.quirks = Some(quirks);
+    service.update_model(name.clone(), update).await.unwrap();
+    let changed_auth = admitted(&service, &id).await;
+    assert_ne!(changed_auth.response_scope, override_after.response_scope);
+    assert_eq!(
+        replay(&changed_auth, &override_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+
+    // URL userinfo becomes an additional Authorization header in reqwest.
+    let mut update = model_patch();
+    update.base_url = Some("http://first:secret@localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let first_userinfo = admitted(&service, &id).await;
+    let first_messages = bind(&first_userinfo);
+    let mut update = model_patch();
+    update.base_url = Some("http://%66irst:%73ecret@localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let same_userinfo = admitted(&service, &id).await;
+    assert_eq!(first_userinfo.response_scope, same_userinfo.response_scope);
+    assert!(replay(&same_userinfo, &first_messages).is_ok());
+    let mut update = model_patch();
+    update.base_url = Some("http://second:secret@localhost/v1".into());
+    service.update_model(name, update).await.unwrap();
+    let second_userinfo = admitted(&service, &id).await;
+    assert_ne!(
+        first_userinfo.response_scope,
+        second_userinfo.response_scope
+    );
+    assert_eq!(
+        replay(&second_userinfo, &first_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn configured_catalog_price_matches_full_and_paginated_reads() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();

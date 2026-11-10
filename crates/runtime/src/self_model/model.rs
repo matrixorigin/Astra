@@ -56,11 +56,6 @@ pub struct SelfModel {
     /// before the session-wide fallback actually fires.
     #[serde(default)]
     pub denial_pressure: Option<DenialPressureView>,
-    /// Gap 2: names of tests that failed in recent tool outcomes (e.g., the
-    /// last few `cargo test` / `pytest` / `npm test` invocations). Empty
-    /// when the session has no recent test failures.
-    #[serde(default)]
-    pub recent_failing_tests: Vec<String>,
     /// Gap 3: recent permission-rejection reasons keyed by tool, bounded to
     /// a small ring so the agent perceives *why* the runtime is refusing
     /// specific calls and can adjust scope instead of retrying blindly.
@@ -393,7 +388,6 @@ impl SelfModel {
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
             denial_pressure: None,
-            recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
@@ -408,13 +402,6 @@ impl SelfModel {
     /// as "unknown ceiling" and will still render the raw count.
     pub fn with_denial_pressure(mut self, view: DenialPressureView) -> Self {
         self.denial_pressure = Some(view);
-        self
-    }
-
-    /// Gap 2: attach names of tests that failed in recent tool outcomes.
-    /// Empty vectors are preserved as empty (renderer skips).
-    pub fn with_recent_failing_tests(mut self, names: Vec<String>) -> Self {
-        self.recent_failing_tests = names;
         self
     }
 
@@ -597,31 +584,6 @@ impl SelfModel {
                     );
                 }
             }
-        }
-
-        // ── Gap 2: recent test failure names ──
-        // Specific failing test names are high-density signal — the agent
-        // can retry just those or inspect their code, rather than reruning
-        // the whole suite.
-        if !self.recent_failing_tests.is_empty() {
-            let sample: Vec<&str> = self
-                .recent_failing_tests
-                .iter()
-                .take(5)
-                .map(String::as_str)
-                .collect();
-            let extra = self.recent_failing_tests.len().saturating_sub(sample.len());
-            let suffix = if extra > 0 {
-                format!(" (+{extra} more)")
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                s,
-                "Recent test failures: {}{} — fix or investigate these specifically before re-running the whole suite",
-                sample.join(", "),
-                suffix
-            );
         }
 
         // ── Gap 3: recent permission-rejection reasons ──
@@ -809,10 +771,7 @@ impl SelfModel {
         {
             return true;
         }
-        if !self.recent_failing_tests.is_empty()
-            || !self.recent_rejections.is_empty()
-            || !self.recent_correction_excerpts.is_empty()
-        {
+        if !self.recent_rejections.is_empty() || !self.recent_correction_excerpts.is_empty() {
             return true;
         }
         if !self.outcome_bias.is_empty() {
@@ -1488,42 +1447,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_failing_tests_renders_compact_list() {
-        let model = minimal_model().with_recent_failing_tests(vec![
-            "tests::parses_json".into(),
-            "tests::handles_empty".into(),
-        ]);
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            rendered.contains("Recent test failures: tests::parses_json, tests::handles_empty"),
-            "got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("more"),
-            "no +N more when list is short: {rendered}"
-        );
-    }
-
-    #[test]
-    fn recent_failing_tests_truncates_and_counts_overflow() {
-        let tests: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
-        let model = minimal_model().with_recent_failing_tests(tests);
-        let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("t0, t1, t2, t3, t4"), "got: {rendered}");
-        assert!(rendered.contains("(+3 more)"), "got: {rendered}");
-    }
-
-    #[test]
-    fn recent_failing_tests_empty_renders_nothing() {
-        let model = minimal_model().with_recent_failing_tests(Vec::new());
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            !rendered.contains("Recent test failures"),
-            "got: {rendered}"
-        );
-    }
-
-    #[test]
     fn recent_rejections_renders_reasons() {
         let model = minimal_model().with_recent_rejections(vec![
             RejectionSummary {
@@ -1746,12 +1669,6 @@ mod tests {
             !model.has_meaningful_self_awareness(),
             "zero denials carries no signal"
         );
-    }
-
-    #[test]
-    fn meaningful_when_recent_failing_tests() {
-        let model = minimal_model().with_recent_failing_tests(vec!["t1".into()]);
-        assert!(model.has_meaningful_self_awareness());
     }
 
     #[test]

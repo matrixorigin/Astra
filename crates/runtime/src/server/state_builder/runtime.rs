@@ -112,6 +112,7 @@ pub(super) async fn build_runtime_wiring(
         state.edge_callback_ledger.clone(),
         run_engine.clone(),
     )
+    .with_runtime_config(&settings.runtime)
     .with_admission_limits(admission_limits)
     .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
     .with_pool(shared_pool.clone())

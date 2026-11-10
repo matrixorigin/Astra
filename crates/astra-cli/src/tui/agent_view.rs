@@ -57,13 +57,7 @@ pub(crate) fn refresh_open_agent_transcript_for_event(
     // run transcript.
     let transcript_updated = match ae {
         TuiAppEvent::AgentLive(event) => bottom_pane.refresh_agent_live_event(event),
-        TuiAppEvent::AgentLiveBatch(events) => {
-            let mut updated = false;
-            for event in events {
-                updated |= bottom_pane.refresh_agent_live_event(event);
-            }
-            updated
-        }
+        TuiAppEvent::AgentLiveBatch(events) => bottom_pane.refresh_agent_live_events(events),
         TuiAppEvent::AgentLiveGap(gap) => bottom_pane.refresh_agent_live_gap(gap),
         _ => false,
     };

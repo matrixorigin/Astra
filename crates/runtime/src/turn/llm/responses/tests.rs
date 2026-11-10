@@ -21,6 +21,1134 @@ mod fixture {
 struct Attempts {
     next: AtomicU32,
     finished: Mutex<Vec<astra_services::InferenceInvocationTerminal>>,
+    measured_inputs: Mutex<Vec<u64>>,
+    snapshots: Mutex<Vec<super::UsageSnapshot>>,
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
+    use futures_util::{StreamExt, stream};
+    use std::collections::HashSet;
+
+    struct Timeouts;
+    impl Drop for Timeouts {
+        fn drop(&mut self) {
+            super::super::TEST_STREAM_IDLE_TIMEOUT.with(|value| *value.borrow_mut() = None);
+            super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+                .with(|value| *value.borrow_mut() = None);
+        }
+    }
+    super::super::TEST_STREAM_IDLE_TIMEOUT
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    let _timeouts = Timeouts;
+    let terminal = json!({"type":"response.completed", "response":{
+        "status":"completed", "output":[{"type":"message", "role":"assistant", "content":[
+            {"type":"output_text", "text":"done"}
+        ]}]
+    }});
+    for (delta, budget, should_succeed) in [
+        (json!("private reasoning"), None, true),
+        (json!("  "), None, false),
+        (json!(12), None, false),
+        (
+            json!("private reasoning"),
+            Some(Duration::from_millis(250)),
+            false,
+        ),
+    ] {
+        let raw = json!({"type":"response.reasoning_text.delta", "delta":delta});
+        let events = vec![raw.clone(), raw.clone(), raw, terminal.clone()];
+        let stream = stream::iter(events).then(|event| async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<_, std::io::Error>(format!("data: {event}\n\n"))
+        });
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body(reqwest::Body::wrap_stream(stream))
+                .unwrap(),
+        );
+        let route = LlmExecutionRoute {
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope: Some("scope"),
+            subscription: None,
+            fixed_temperature: None,
+            supported_reasoning_efforts: None,
+            thinking_protocol: None,
+            model_name: "model",
+            wire_model_name: None,
+            api_key: "key",
+            base_url: "http://localhost",
+            provider: "openai",
+            header_overrides: None,
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect(
+            response,
+            route,
+            &HashSet::new(),
+            LlmCancel::None,
+            Some(&mut callback),
+            tokio::time::Instant::now().into_std(),
+            budget,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.is_ok(), should_succeed);
+        if let Ok(result) = result {
+            assert_eq!(result.full_text, "done");
+            assert!(result.reasoning.is_empty());
+        }
+        assert!(
+            updates.is_empty(),
+            "raw reasoning must not reach user callbacks"
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let wire_requests = Arc::clone(&requests);
+    let app = Router::new().route("/responses", post(
+        |State(requests): State<Arc<Mutex<Vec<Value>>>>, uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| async move {
+            if body["input"].to_string().contains("look up") {
+                assert_eq!(uri.path(), "/responses");
+                assert_eq!(uri.query(), Some("workspace=one"));
+                let authorization = headers.get_all("authorization").iter().collect::<Vec<_>>();
+                assert_eq!(authorization, ["Basic dXNlcjpwYXNz", "Bearer custom"]);
+                assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
+                assert_eq!(headers.get_all("x-tenant").iter().count(), 1);
+            } else {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
+            }
+            if body.get("include").is_some()
+                || body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function"))
+            {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter"}}))).into_response();
+            }
+            if body["input"].to_string().contains("context failure") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"maximum context length secret provider detail"}}))).into_response();
+            }
+            if body["input"].to_string().contains("billing failure") {
+                return (StatusCode::PAYMENT_REQUIRED, Json(json!({"error":{"code":"insufficient_credit"}}))).into_response();
+            }
+            if body["input"].to_string().contains("reject this") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter","param":"temperature","message":"secret provider detail"}}))).into_response();
+            }
+            if body["input"].to_string().contains("reject effort") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_value","param":"reasoning.effort","message":"secret provider detail"}}))).into_response();
+            }
+            if body["input"].to_string().contains("low only") && body["reasoning"]["effort"] != "low" {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_value","param":"reasoning.effort"}}))).into_response();
+            }
+            let malformed = body["input"].to_string().contains("malformed terminal");
+            let oversized = body["input"].to_string().contains("oversized terminal");
+            let plaintext = body["input"].to_string().contains("plaintext case");
+            let fresh_turn = body["input"].to_string().contains("start a new turn");
+            let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
+            requests.lock().unwrap().push(body);
+            let output = if malformed {
+                json!([{"type":"message","content":[{"type":"output_text","text":"working"}]},
+                    {"type":"function_call","name":"lookup","call_id":"call-bad","arguments":"{}"}])
+            } else if oversized {
+                let mut items = vec![json!({"type":"function_call","name":"lookup","call_id":"call-large","arguments":"{}"})];
+                items.extend((0..4096).map(|_| json!({"type":"reasoning","encrypted_content":"ciphertext"})));
+                json!(items)
+            } else if continued || fresh_turn {
+                json!([{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}])
+            } else if plaintext {
+                json!([{"type":"reasoning","id":"rs-plain","summary":[],"content":[{"type":"reasoning_text","text":"check the file"}]},
+                    {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else {
+                json!([{"type":"reasoning","id":"reason-1","encrypted_content":"ciphertext","summary":[]},
+                    {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            };
+            let mut events = String::new();
+            if !malformed && !oversized {
+                for (index, item) in output.as_array().unwrap().iter().enumerate() {
+                    events.push_str(&format!("data: {}\n\n", json!({"type":"response.output_item.done","output_index":index,"item":item})));
+                }
+            }
+            events.push_str(&format!("data: {}\n\n", json!({"type":"response.completed","response":{"id":"response-1","status":"completed","model":"model","output":if malformed || oversized { output } else { json!([]) },"usage":{"input_tokens":20,"output_tokens":5}}})));
+            ([("content-type", "text/event-stream")], events).into_response()
+        }
+    )).route("/chat/completions", post(|| async {
+        (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter","param":"reasoning_effort","message":"secret provider detail"}})))
+    })).with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut offering = astra_services::ResolvedModelOffering {
+        offering_id: "offering".into(),
+        model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope_key: Some(astra_services::models::ResponseScopeKey::for_model(
+                &FernetTokenEncryptor::new("test-scope-secret").unwrap(),
+                "model",
+            )),
+            supported_reasoning_efforts: None,
+            price_snapshot: None,
+            model_name: "model".into(),
+            wire_model_name: None,
+            api_key: "test-key".into(),
+            base_url: format!(
+                "{}?workspace=one#first",
+                base.replacen("http://", "http://user:pass@", 1)
+            ),
+            provider: "openai".into(),
+            tags: Vec::new(),
+            request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: Some(
+                astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,
+            ),
+            prompt_cache_capability: None,
+            thinking_capability: None,
+            context_window: None,
+            max_completion_tokens: None,
+            request_headers: Some(
+                json!({"X-Tenant":"tenant-a", "Authorization":"Bearer custom"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        },
+    };
+    let first_execution =
+        astra_services::AdmittedModelExecution::from_offering(offering.clone()).unwrap();
+    offering.model.request_headers = Some(
+        json!({"x-tenant":"tenant-a", "authorization":"Bearer custom"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    offering.model.api_key = "unused-rotated-key".into();
+    offering.model.base_url = format!(
+        "{}\\?workspace=one",
+        base.replacen("http://", "http://%75ser:%70ass@", 1)
+    );
+    let second_execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
+    assert_eq!(
+        first_execution.response_scope,
+        second_execution.response_scope
+    );
+    let scope = first_execution.response_scope.clone().unwrap();
+    fn cache_capability() -> CacheCapability {
+        CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        }
+    }
+    fn call<'a>(
+        messages: &'a [Value],
+        tools: &'a [Value],
+        scope: &'a str,
+        base: &'a str,
+        thinking: &'a ThinkingConfig,
+    ) -> LlmCall<'a> {
+        LlmCall {
+            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            messages,
+            tools,
+            cache_capability: Some(cache_capability()),
+            route: LlmExecutionRoute {
+                inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                response_scope: Some(scope),
+                subscription: None,
+                fixed_temperature: None,
+                supported_reasoning_efforts: None,
+                thinking_protocol: Some(
+                    astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,
+                ),
+                model_name: "model",
+                wire_model_name: None,
+                api_key: "test-key",
+                base_url: base,
+                provider: "openai",
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: Some(1024),
+            temperature: None,
+            thinking,
+        }
+    }
+    let tools = vec![
+        json!({"type":"function","function":{"name":"lookup","description":"look up","parameters":{"type":"object","properties":{}}}}),
+    ];
+    let snapshot = |content: &str| {
+        crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            content,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let mut first_messages = vec![json!({"role":"system","content":"stable policy"})];
+    crate::turn::wire_assembly::ensure_append_only_runtime_authority_policy(&mut first_messages);
+    first_messages.extend([
+        json!({"role":"user","content":"look up"}),
+        snapshot("first optional observation"),
+    ]);
+    let thinking = ThinkingConfig::Adaptive {
+        effort: astra_turn_core::thinking_config::ThinkingEffort::Max,
+    };
+    let mut first_call = call(&first_messages, &tools, &scope, &base, &thinking);
+    first_call.route = LlmExecutionRoute::from_admitted(&first_execution);
+    let first = call_llm_and_collect_with_stream_callback(
+        first_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    let mut messages = first_messages;
+    let continuation = first.provider_continuation.unwrap();
+    let continuation_text = continuation.to_string();
+    for secret in [
+        "test-key",
+        "Bearer custom",
+        "user:pass",
+        "test-scope-secret",
+    ] {
+        assert!(!continuation_text.contains(secret));
+    }
+    messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:continuation}));
+    let mut interrupted = messages.clone();
+    interrupted.push(snapshot("runtime context is not a new human turn"));
+    let mut interrupted_call = call(&interrupted, &tools, &scope, &base, &thinking);
+    interrupted_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    let failure = call_llm_and_collect_with_stream_callback(
+        interrupted_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_incomplete")
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "incomplete evidence must fail before provider dispatch"
+    );
+    // A result without a matching call in the same group can be the only
+    // surviving evidence of an already executed tool.
+    let mut extra_result = messages.clone();
+    let replay_key = FernetTokenEncryptor::new("responses-replay-fixture").unwrap();
+    let seal_history = |history: &mut [Value]| {
+        let saved = history
+            .iter_mut()
+            .find_map(|message| {
+                message.get_mut(astra_core::model_wire::responses::CONTINUATION_KEY)
+            })
+            .unwrap();
+        crate::turn::llm::private_continuation::seal(saved, &replay_key, "owner", "session")
+            .unwrap();
+    };
+    let open_history = |history: &mut [Value]| {
+        crate::turn::llm::private_continuation::open(
+            history,
+            &replay_key,
+            "owner",
+            &HashSet::from(["session".to_string()]),
+            &scope,
+            "model",
+        )
+        .unwrap();
+    };
+    seal_history(&mut extra_result);
+    extra_result.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    extra_result
+        .push(json!({"role":"tool", "tool_call_id":"missing-call", "content":"effect occurred"}));
+    let mut extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    open_history(&mut extra_result);
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("Check their effects"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "{protocol:?} dispatched an incomplete group"
+        );
+    }
+    extra_result.push(json!({"role":"user", "content":"start a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        assert!(prepare_streaming_call(attempt, RuntimeToolChoice::Auto).is_ok());
+    }
+
+    let mut lost_interrupted = interrupted;
+    lost_interrupted
+        .iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut recovered_histories = Vec::new();
+    for tool_result in [
+        json!({"role":"user", "tool_call_id":"call-1", "content":"tool result"}),
+        json!({"role":"user", "content":[
+            {"type":"text", "text":"tool output"},
+            {"type":"tool_result", "tool_use_id":"call-1", "content":"tool result"}
+        ]}),
+    ] {
+        let mut history = lost_interrupted.clone();
+        history.push(tool_result);
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
+        for protocol in [
+            LlmProviderProtocol::OpenAiResponses,
+            LlmProviderProtocol::OpenAiCompatible,
+        ] {
+            let mut attempt = call(&restored, &tools, &scope, &base, &thinking);
+            attempt.route.inference_protocol = Some(protocol);
+            let error = call_llm_and_collect_with_stream_callback(
+                attempt,
+                LlmCancel::None,
+                None,
+                None,
+                RuntimeToolChoice::Auto,
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains("Check their effects"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+        restored.push(json!({"role":"user", "content":"start a new turn"}));
+        assert!(
+            prepare_streaming_call(
+                call(&restored, &tools, &scope, &base, &thinking),
+                RuntimeToolChoice::Auto,
+            )
+            .is_ok()
+        );
+        recovered_histories.push(restored);
+    }
+    let mut lost_interrupted = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(lost_interrupted).unwrap();
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("Check their effects"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "{protocol:?} dispatched an incomplete turn"
+        );
+    }
+    for (provider, protocol) in [
+        ("anthropic", LlmProviderProtocol::AnthropicMessages),
+        ("bedrock", LlmProviderProtocol::BedrockConverse),
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.provider = provider;
+        attempt.route.inference_protocol = Some(protocol);
+        let error = match prepare_streaming_call(attempt, RuntimeToolChoice::Auto) {
+            Err(error) => error,
+            Ok(_) => panic!("{protocol:?} accepted an incomplete turn"),
+        };
+        assert!(error.message.contains("Check their effects"));
+    }
+    let mut unanchored_call = messages.last().unwrap().clone();
+    unanchored_call
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut unanchored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+        unanchored_call,
+        json!({"role":"system", "content":"compacted", "_compact_boundary":true}),
+        astra_turn_types::runtime_owned_message(
+            "user", "runtime retry", astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+        ),
+    ]).unwrap();
+    let failure = call_llm_and_collect_with_stream_callback(
+        call(&unanchored, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.message.contains("Check their effects"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let mut with_runtime_authority = unanchored.clone();
+    with_runtime_authority.push(snapshot("runtime context is not a user turn"));
+    let with_runtime_authority = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(with_runtime_authority).unwrap();
+    assert!(with_runtime_authority.iter().any(|message| {
+        message["role"] == "user"
+            && astra_turn_types::runtime_message_delivery(message)
+                == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            && !astra_turn_types::is_human_user_message(message)
+    }));
+    let failure = call_llm_and_collect_with_stream_callback(
+        call(&with_runtime_authority, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.message.contains("Check their effects"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    unanchored.push(json!({"role":"user", "content":"start again"}));
+    assert!(
+        prepare_streaming_call(
+            call(&unanchored, &tools, &scope, &base, &thinking),
+            RuntimeToolChoice::Auto,
+        )
+        .is_ok()
+    );
+    lost_interrupted.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(!wire.contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD));
+        assert!(
+            wire.contains("call-1") && wire.contains("not recorded"),
+            "the next turn must receive the call and its unknown result for {protocol:?}"
+        );
+    }
+    for (provider, protocol) in [
+        ("anthropic", LlmProviderProtocol::AnthropicMessages),
+        ("bedrock", LlmProviderProtocol::BedrockConverse),
+    ] {
+        let projected =
+            consolidate_system_messages_for_protocol(&lost_interrupted, provider, None, protocol);
+        let wire = json!(projected).to_string();
+        assert!(!wire.contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD));
+        assert!(wire.contains("call-1") && wire.contains("not recorded"));
+    }
+    let mut ambiguous = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+        json!({"role":"user", "content":"inspect"}),
+        json!({"role":"assistant", "content":[
+            {"type":"text", "text":"checking"},
+            {"type":"tool_use", "id":"hidden-call", "name":"hidden_operation", "input":{}}
+        ], "tool_calls":[
+            {"id":"duplicate-call", "type":"function", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"duplicate-call", "type":"function", "function":{"name":"delete_file", "arguments":"{}"}},
+            {"id":"alias-call-1", "_astra_provider_tool_call_id":"duplicate-provider-id", "type":"function", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"alias-call-2", "_astra_provider_tool_call_id":"duplicate-provider-id", "type":"function", "function":{"name":"delete_file", "arguments":"{}"}},
+            {"id":"safe-call", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}
+        ]}),
+        json!({"role":"tool", "tool_call_id":"duplicate-call", "content":"ambiguous"}),
+        json!({"role":"tool", "tool_call_id":"alias-call-1", "content":"first"}),
+        json!({"role":"tool", "tool_call_id":"alias-call-2", "content":"second"}),
+        json!({"role":"tool", "tool_call_id":"safe-call", "content":"found"}),
+    ]).unwrap();
+    assert_eq!(
+        ambiguous[1][astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD],
+        true
+    );
+    ambiguous.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&ambiguous, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(wire.contains("safe-call"));
+        for discarded in [
+            "duplicate-call",
+            "alias-call-1",
+            "alias-call-2",
+            "duplicate-provider-id",
+            "write_file",
+            "delete_file",
+            "hidden-call",
+            "hidden_operation",
+        ] {
+            assert!(
+                !wire.contains(discarded),
+                "{discarded} reached {protocol:?}"
+            );
+        }
+    }
+    messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
+    messages.push(snapshot("updated optional observation"));
+    let mut inconsistent = messages.clone();
+    inconsistent
+        .iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()[astra_core::model_wire::responses::CONTINUATION_KEY]["items"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"function_call", "call_id":"call-2", "name":"lookup"}));
+    seal_history(&mut inconsistent);
+    let mut inconsistent = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(inconsistent).unwrap();
+    open_history(&mut inconsistent);
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = match prepare_streaming_call(attempt, RuntimeToolChoice::Auto) {
+            Err(error) => error,
+            Ok(_) => panic!("{protocol:?} accepted inconsistent saved calls"),
+        };
+        assert!(error.message.contains("Check their effects"));
+    }
+    inconsistent.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto);
+        if protocol == LlmProviderProtocol::OpenAiResponses {
+            let error = match prepared {
+                Err(error) => error,
+                Ok(_) => panic!("Responses silently discarded inconsistent reasoning"),
+            };
+            assert!(
+                error
+                    .details_json
+                    .unwrap()
+                    .contains("responses_continuation_history_incomplete")
+            );
+            continue;
+        }
+        let prepared = prepared.unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(wire.contains("call-1"));
+        assert!(!wire.contains("call-2"));
+    }
+    let mut lost = messages.clone();
+    lost.iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut lost = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(lost)
+        .unwrap();
+    let changed_scope = format!("sha256:{}", "b".repeat(64));
+    for route_scope in [&scope, &changed_scope] {
+        let failure = call_llm_and_collect_with_stream_callback(
+            call(&lost, &tools, route_scope, &base, &thinking),
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failure
+                .details_json
+                .unwrap()
+                .contains("responses_continuation_incomplete")
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "missing state must stop before dispatch"
+        );
+    }
+    lost.push(json!({"role":"user", "content":"continue in a new turn"}));
+    let mut historical_call = call(&lost, &tools, &changed_scope, &base, &thinking);
+    historical_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    historical_call.route.response_scope = Some(&changed_scope);
+    let historical = call_llm_and_collect_with_stream_callback(
+        historical_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(historical.full_text, "done");
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let mut switched = call(&messages, &tools, &scope, &base, &thinking);
+    switched.route = LlmExecutionRoute::from_admitted(&second_execution);
+    switched.route.inference_protocol = Some(LlmProviderProtocol::OpenAiCompatible);
+    let failure = match prepare_streaming_call(switched, RuntimeToolChoice::Auto) {
+        Err(failure) => failure,
+        Ok(_) => panic!("a different protocol cannot continue the active tool round"),
+    };
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_scope_changed")
+    );
+    let mut second_call = call(&messages, &tools, &scope, &base, &thinking);
+    second_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    let second = call_llm_and_collect_with_stream_callback(
+        second_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.full_text, "done");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["reasoning"]["effort"], "max");
+    assert!(requests[0].get("include").is_none());
+    assert!(
+        requests[2]["input"]
+            .as_array()
+            .unwrap()
+            .starts_with(requests[0]["input"].as_array().unwrap()),
+        "Responses must preserve the complete preceding request, including all runtime context"
+    );
+    assert_eq!(requests[0]["tools"], requests[2]["tools"]);
+    assert!(
+        requests[2]["input"]
+            .to_string()
+            .contains("updated optional observation")
+    );
+    assert!(
+        requests[2]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning")
+    );
+    assert!(
+        requests[2]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
+    drop(requests);
+    messages.push(
+        crate::turn::wire_assembly::runtime_system_context_message("runtime state", true).unwrap(),
+    );
+    messages.push(
+        crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "remaining_seconds=10",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    let other_scope = format!("sha256:{}", "b".repeat(64));
+    let error = match prepare_streaming_call(
+        call(&messages, &tools, &other_scope, &base, &thinking),
+        RuntimeToolChoice::Auto,
+    ) {
+        Ok(_) => panic!("changed continuation scope must fail"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("Start a new turn"));
+    for tool_result in [
+        json!({"role":"user", "tool_call_id":"call-1", "content":"tool result"}),
+        json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call-1", "content":"tool result"}]}),
+    ] {
+        messages.push(tool_result);
+        assert!(matches!(
+            prepare_streaming_call(
+                call(&messages, &tools, &other_scope, &base, &thinking),
+                RuntimeToolChoice::Auto,
+            ),
+            Err(error) if error.message.contains("Start a new turn")
+        ));
+        messages.pop();
+    }
+    // A user-authorized model switch may reuse complete tool evidence in the
+    // same human turn, without forwarding the previous provider's private
+    // continuation. Exercise the actual request and mock provider boundary.
+    let key = astra_services::FernetTokenEncryptor::new("model-switch-fixture").unwrap();
+    let old = crate::turn::llm::model_origin::ReplayScope {
+        encryptor: &key,
+        user_id: "owner",
+        session_id: "session",
+        allowed_session_ids: None,
+        run_id: "run",
+        selection_revision: None,
+        route: "old-route",
+    };
+    let current = crate::turn::llm::model_origin::ReplayScope {
+        selection_revision: Some(1),
+        route: "new-route",
+        ..old
+    };
+    let mut recorded = messages.clone();
+    for message in &mut recorded {
+        crate::turn::llm::model_origin::attest(&old, message);
+    }
+    let projected = crate::turn::llm::model_origin::project(&current, &recorded).unwrap();
+    let mut handoff_call = call(&projected, &tools, &other_scope, &base, &thinking);
+    handoff_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    handoff_call.route.response_scope = Some(&other_scope);
+    let prepared = crate::turn::llm::client::prepare_streaming_call_with_origin(
+        handoff_call,
+        RuntimeToolChoice::Auto,
+        Some(&current),
+    )
+    .unwrap();
+    let handoff_body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+    let input = handoff_body["input"].to_string();
+    assert!(input.contains("call-1") && input.contains("found"));
+    assert!(!input.contains("ciphertext"));
+    let result = crate::turn::llm::client::call_prepared_llm_and_collect_with_stream_callback(
+        prepared,
+        LlmCancel::None,
+        None,
+        None,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "done");
+
+    messages.push(json!({"role":"user", "content":"a new human turn"}));
+    let prepared = prepare_streaming_call(
+        call(&messages, &tools, &other_scope, &base, &thinking),
+        RuntimeToolChoice::Auto,
+    )
+    .unwrap();
+    let resumed_body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+    let resumed_input = resumed_body["input"].as_array().unwrap();
+    assert!(
+        resumed_input
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["call_id"] == "call-1")
+    );
+    assert!(
+        resumed_input
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
+    );
+    assert!(!resumed_body.to_string().contains("ciphertext"));
+    let off = ThinkingConfig::Off;
+    let mut explicit_temperature = call(&messages, &tools, &scope, &base, &thinking);
+    explicit_temperature.temperature = Some(0.0);
+    assert!(prepare_streaming_call(explicit_temperature, RuntimeToolChoice::Auto).is_err());
+    assert!(
+        prepare_streaming_call(
+            call(&messages, &tools, &scope, &base, &off),
+            RuntimeToolChoice::Auto
+        )
+        .is_err()
+    );
+    let efforts = vec!["none".to_owned()];
+    let mut off_call = call(&messages, &tools, &scope, &base, &off);
+    off_call.route.supported_reasoning_efforts = Some(&efforts);
+    let prepared = prepare_streaming_call(off_call, RuntimeToolChoice::Auto).unwrap();
+    let off_body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+    assert_eq!(off_body["reasoning"]["effort"], "none");
+    let rejected = vec![json!({"role":"user","content":"reject this"})];
+    let error = call_llm_and_collect_with_stream_callback(
+        call(&rejected, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    assert!(error.message.contains("temperature"));
+    assert!(!format!("{error:?}").contains("secret provider detail"));
+    let rejected_effort = vec![json!({"role":"user","content":"reject effort"})];
+    let error = call_llm_and_collect_with_stream_callback(
+        call(&rejected_effort, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    assert!(error.message.contains("max reasoning setting"));
+    assert!(error.message.contains("Model default"));
+    assert!(!format!("{error:?}").contains("secret provider detail"));
+    let low_only = vec![json!({"role":"user","content":"low only"})];
+    let low = ThinkingConfig::Adaptive {
+        effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+    };
+    let result = call_llm_and_collect_with_stream_callback(
+        call(&low_only, &tools, &scope, &base, &low),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.tool_calls.len(),
+        1,
+        "the provider accepted the unverified low effort"
+    );
+    for input in ["malformed terminal", "oversized terminal"] {
+        let messages = vec![json!({"role":"user", "content":input})];
+        let before = wire_requests.lock().unwrap().len();
+        let failure = call_llm_and_collect_with_stream_callback(
+            call(&messages, &tools, &scope, &base, &thinking),
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, astra_core::ErrorKind::StreamTransport);
+        assert_eq!(wire_requests.lock().unwrap().len(), before + 1);
+    }
+    for (text, kind) in [
+        ("context failure", astra_core::ErrorKind::ContextWindow),
+        ("billing failure", astra_core::ErrorKind::PaymentRequired),
+    ] {
+        let messages = vec![json!({"role":"user","content":text})];
+        let error = call_llm_and_collect_with_stream_callback(
+            call(&messages, &tools, &scope, &base, &thinking),
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, kind);
+        assert!(!format!("{error:?}").contains("secret provider detail"));
+    }
+    let mut chat_call = call(&rejected, &tools, &scope, &base, &thinking);
+    chat_call.route.inference_protocol = None;
+    let error = call_llm_and_collect_with_stream_callback(
+        chat_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    assert!(error.message.contains("reasoning_effort"));
+    assert!(!format!("{error:?}").contains("secret provider detail"));
+    let before = wire_requests.lock().unwrap().len();
+    let mut resumed = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+    resumed.route = LlmExecutionRoute::from_admitted(&first_execution);
+    call_llm_and_collect_with_stream_callback(
+        resumed,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    let requests = wire_requests.lock().unwrap();
+    assert_eq!(requests.len(), before + 1);
+    let input = requests.last().unwrap()["input"].to_string();
+    assert!(input.contains("call-1") && input.contains("not recorded"));
+    assert!(
+        !requests
+            .last()
+            .unwrap()
+            .to_string()
+            .contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+    );
+    drop(requests);
+    for history in recovered_histories {
+        let mut attempt = call(&history, &tools, &scope, &base, &thinking);
+        attempt.route = LlmExecutionRoute::from_admitted(&first_execution);
+        let result = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert!(result.tool_calls.is_empty());
+        let requests = wire_requests.lock().unwrap();
+        let input = requests.last().unwrap()["input"].to_string();
+        assert!(input.contains("start a new turn"));
+        assert!(input.contains("call-1") && input.contains("not recorded"));
+    }
+    let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+    attempt.route = LlmExecutionRoute::from_admitted(&first_execution);
+    let result = call_llm_and_collect_with_stream_callback(
+        attempt,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "done");
+    assert!(
+        !wire_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("missing-call")
+    );
+    let mut plaintext_history = vec![json!({"role":"user", "content":"plaintext case"})];
+    let default_thinking = ThinkingConfig::ModelDefault;
+    let first = call_llm_and_collect_with_stream_callback(
+        call(&plaintext_history, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+    let mut continuation = first.provider_continuation.unwrap();
+    crate::turn::llm::private_continuation::seal(&mut continuation, &key, "owner", "session")
+        .unwrap();
+    plaintext_history.push(
+        json!({"role":"assistant", "content":"", "tool_calls":first.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+    );
+    plaintext_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    let committed =
+        astra_turn_core::prompt_facing::sanitize_canonical_turn_delta_with_turn_semantics(
+            plaintext_history,
+            false,
+        )
+        .unwrap();
+    assert!(!json!(committed).to_string().contains("check the file"));
+    let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+    crate::turn::llm::private_continuation::open(
+        &mut restored,
+        &key,
+        "owner",
+        &HashSet::from(["session".to_string()]),
+        &scope,
+        "model",
+    )
+    .unwrap();
+    let second = call_llm_and_collect_with_stream_callback(
+        call(&restored, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.full_text, "done");
+    let requests = wire_requests.lock().unwrap();
+    let input = &requests.last().unwrap()["input"];
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"
+                && item["content"][0]["text"] == "check the file")
+    );
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
+    );
+    server.abort();
 }
 #[async_trait]
 impl ProviderAttemptObserver for Attempts {
@@ -32,6 +1160,19 @@ impl ProviderAttemptObserver for Attempts {
         Ok(ProviderAttemptAdmission::Admitted(
             self.next.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+    fn note_usage_presence(&self, _: u32, presence: crate::turn::token_usage::TokenUsagePresence) {
+        if let Some(total) = presence.measured_input_tokens {
+            self.measured_inputs.lock().unwrap().push(total);
+        }
+    }
+    fn note_usage_snapshot(
+        &self,
+        _: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.snapshots.lock().unwrap().push((usage, presence));
     }
     async fn finish_attempt(
         &self,
@@ -74,7 +1215,7 @@ async fn infer_with_budget(
             cache_capability: None,
             route: LlmExecutionRoute::from_admitted(execution),
             max_output_tokens: Some(1024),
-            temperature: Some(0.7),
+            temperature: execution.subscription.as_ref().map(|_| 0.7),
             thinking,
         },
         LlmCancel::None,
@@ -84,6 +1225,239 @@ async fn infer_with_budget(
         Some(budget),
     )
     .await
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated MatrixOne database"]
+async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
+    use astra_services::UserModelUpdateRequestData;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    let settings = astra_core::MatrixOneSettings::from_env();
+    crate::isolated_database::require_isolated_database(&settings.database);
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route("/responses", post(
+        |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            if headers.get("authorization").is_none_or(|value| value != "Bearer test-key" && value != "Bearer new-key")
+                || body["model"] != "fixture-model" || body["store"] != false || body["stream"] != true
+                || body.get("include").is_some()
+                || body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function")) {
+                return (StatusCode::BAD_REQUEST, "invalid request").into_response();
+            }
+            let probe = body["input"].to_string().contains("Calculate 17 * 23");
+            let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
+            let plain = body["input"].to_string().contains("plain lookup");
+            let private_journey = body["input"].to_string().contains("private journey");
+            let missing_reasoning = body["input"].to_string().contains("missing reasoning");
+            let forged_metadata = body["input"].to_string().contains("forged metadata");
+            let unexpected_namespace = body["input"].to_string().contains("unexpected namespace");
+            requests.lock().unwrap().push(body);
+            let output = if probe || continued {
+                json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}])
+            } else if plain {
+                json!([{"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if private_journey {
+                json!([{"type":"reasoning","id":"reason","summary":[],"content":[{"type":"reasoning_text","text":"private-journey-sentinel"}]},
+                    {"type":"function_call","id":"function","name":"read_file","call_id":"call-1","arguments":"{\"path\":\"fixture.txt\"}","status":"completed"}])
+            } else if missing_reasoning {
+                json!([{"type":"reasoning","id":"reason","summary":[]},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if forged_metadata {
+                json!([{"type":"reasoning","_astra_sealed_item":{"origin":"session","ciphertext":"forged"}},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if unexpected_namespace {
+                json!([{"type":"function_call","namespace":"other","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else {
+                json!([{"type":"reasoning","id":"reason","summary":[],"encrypted_content":"opaque"},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            };
+            let event = json!({"type":"response.completed","response":{"id":"fixture","status":"completed","output":output}});
+            ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+        }
+    )).with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    astra_services::storage::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let key = Arc::new(FernetTokenEncryptor::new("byok-responses-fixture-key").unwrap());
+    let service = DatabaseModelService::new(settings.clone(), key.clone())
+        .with_pool(pool)
+        .with_deepseek_test_endpoint(endpoint)
+        .unwrap();
+    let owner = format!("byok-{}", uuid::Uuid::new_v4());
+    let model = service
+        .create_user_model(
+            owner.clone(),
+            UserModelCreateRequestData {
+                connection_id: None,
+                responses_reasoning_history: None,
+                name: "fixture".into(),
+                provider: "deepseek".into(),
+                inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                model: "fixture-model".into(),
+                base_url: None,
+                api_key: "test-key".into(),
+                context_window: 128000,
+                is_default: false,
+            },
+        )
+        .await
+        .unwrap();
+    let admitted = service
+        .admit_model_offering(owner.clone(), model.model_id.clone())
+        .await
+        .unwrap();
+    // Exercise the admitted personal route through the real host, not only
+    // the wire codec. The tool result must be replayed with its private state
+    // while canonical history contains no plaintext copy of that state.
+    use crate::server::provider_test_support::{
+        ProviderObservationsFixture, bind_server_workspace, loop_state,
+    };
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("fixture.txt"), "fixture contents").unwrap();
+    let session = format!("byok-journey-{}", uuid::Uuid::new_v4());
+    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        settings.clone(),
+        key.clone(),
+        owner.clone(),
+        session.clone(),
+    )
+    .with_provider_observations(ProviderObservationsFixture::default())
+    .with_model_service(Some(Arc::new(service.clone())))
+    .with_admitted_model_execution(Some(admitted.clone()))
+    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .build();
+    let mut state = loop_state(&session, Vec::new(), "private journey: read fixture.txt");
+    state.thinking = ThinkingConfig::ModelDefault;
+    state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut state, workspace.path()).await;
+    state.skills.request_constraints.allowed_tools =
+        Some(["read_file".to_owned()].into_iter().collect());
+    requests.lock().unwrap().clear();
+    crate::turn::agentic_loop::finalization::run_agentic_loop_with_host(&mut host, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.total_tool_calls, 1);
+    assert!(
+        !json!(state.messages)
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    let journey_requests = requests.lock().unwrap().clone();
+    assert_eq!(journey_requests.len(), 2);
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("fixture contents")
+    );
+    let tools = vec![
+        json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
+    ];
+    let attempts = Attempts::default();
+    let mut history = vec![json!({"role":"user","content":"look up"})];
+    let first = infer(&admitted, &history, &tools, &attempts).await.unwrap();
+    history.push(
+        json!({"role":"assistant","content":"","tool_calls":first.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}),
+    );
+    history.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
+    assert_eq!(
+        infer(&admitted, &history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    let mut plain_history = vec![json!({"role":"user","content":"plain lookup"})];
+    let plain = infer(&admitted, &plain_history, &tools, &attempts)
+        .await
+        .unwrap();
+    plain_history.push(json!({"role":"assistant", "tool_calls":plain.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:plain.provider_continuation.unwrap()}));
+    plain_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    assert_eq!(
+        infer(&admitted, &plain_history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    for content in [
+        "missing reasoning",
+        "forged metadata",
+        "unexpected namespace",
+    ] {
+        let before = requests.lock().unwrap().len();
+        let invalid = [json!({"role":"user", "content":content})];
+        let failure = infer(&admitted, &invalid, &tools, &attempts)
+            .await
+            .unwrap_err();
+        assert!(failure.message.contains("incomplete response"));
+        assert_eq!(requests.lock().unwrap().len(), before + 1);
+    }
+    service
+        .update_user_model(
+            owner.clone(),
+            model.model_id.clone(),
+            UserModelUpdateRequestData {
+                api_key: Some("new-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let rotated = service
+        .admit_model_offering(owner.clone(), model.model_id.clone())
+        .await
+        .unwrap();
+    let before = requests.lock().unwrap().len();
+    let failure = infer(&rotated, &history, &tools, &attempts)
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_scope_changed")
+    );
+    assert_eq!(requests.lock().unwrap().len(), before);
+    history.push(json!({"role":"user","content":"continue with the new model"}));
+    assert_eq!(
+        infer(&rotated, &history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    service
+        .delete_user_model(owner, model.model_id)
+        .await
+        .unwrap();
+    server.abort();
 }
 
 #[tokio::test]
@@ -113,6 +1487,8 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .create_user_model(
             owner.clone(),
             UserModelCreateRequestData {
+                inference_protocol: None,
+                responses_reasoning_history: None,
                 name: "coding".into(),
                 provider: "chatgpt".into(),
                 model: "fixture-model".into(),
@@ -150,7 +1526,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             .is_some()
     );
     assert!(partial.provider_continuation.is_none());
-    assert_eq!(partial.usage["completion_tokens"], 5);
+    assert_eq!(partial.usage["output_tokens"], 5);
     assert_eq!(limited_attempts.finished.lock().unwrap().len(), 1);
     // Run the same typed terminal through the real Server host and tool
     // executor. The provider's one continuation also exhausts its output cap.
@@ -162,25 +1538,28 @@ async fn responses_transport_recovery_and_credential_fencing() {
     };
     use crate::turn::agentic_loop::finalization::run_agentic_loop_with_host;
     let workspace = tempfile::TempDir::new().unwrap();
+    let build_host = |session: &str, ledger: ProviderObservationsFixture| {
+        crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+            settings.clone(),
+            key.clone(),
+            owner.clone(),
+            session.to_owned(),
+        )
+        .with_provider_observations(ledger)
+        .with_model_service(Some(Arc::new(service.clone())))
+        .with_admitted_model_execution(Some(admitted.clone()))
+        .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+        .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+        .with_static_tool_catalog_admissible(true)
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        ))
+        .build()
+    };
     let session = format!("capped-{}", uuid::Uuid::new_v4());
     let ledger = ProviderObservationsFixture::default();
-    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
-        settings,
-        key,
-        owner.clone(),
-        session.clone(),
-    )
-    .with_provider_observations(ledger.clone())
-    .with_model_service(Some(Arc::new(service.clone())))
-    .with_admitted_model_execution(Some(admitted.clone()))
-    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
-    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
-    .with_static_tool_catalog_admissible(true)
-    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
-        WorkspaceBinding::server_sandbox(workspace.path()),
-        ExecutorBinding::server_local(),
-    ))
-    .build();
+    let mut host = build_host(&session, ledger.clone());
     let mut state = loop_state(&session, Vec::new(), "Write the requested file.");
     state.thinking = ThinkingConfig::ModelDefault;
     state.owner_user_id = Some(owner.clone());
@@ -230,8 +1609,36 @@ async fn responses_transport_recovery_and_credential_fencing() {
     assert!(provider.state.script.lock().unwrap().is_empty());
     assert_eq!(ledger.attempt_count(), 2);
     ledger.assert_quiescent();
-    provider.state.scripted.store(false, Ordering::SeqCst);
+
     provider.state.output_limit.store(false, Ordering::SeqCst);
+    provider.state.requests.lock().unwrap().clear();
+    *provider.state.terminal_output.lock().unwrap() = Some(json!([
+        {"type":"message", "content":[{"type":"output_text", "text":"working"}]},
+        {"type":"function_call", "name":"write_file", "call_id":"bad-call",
+         "arguments":json!({"path":"malformed-effect.txt", "content":"executed"}).to_string()}
+    ]));
+    let invalid_session = format!("invalid-{}", uuid::Uuid::new_v4());
+    let invalid_ledger = ProviderObservationsFixture::default();
+    let mut invalid_host = build_host(&invalid_session, invalid_ledger.clone());
+    let mut invalid_state = loop_state(&invalid_session, Vec::new(), "Write the requested file.");
+    invalid_state.thinking = ThinkingConfig::ModelDefault;
+    invalid_state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut invalid_state, workspace.path()).await;
+    invalid_state.skills.request_constraints.allowed_tools =
+        Some(["write_file".to_owned()].into_iter().collect());
+    let outcome = run_agentic_loop_with_host(&mut invalid_host, &mut invalid_state).await;
+    assert!(outcome.is_err() || invalid_state.interruption.is_some());
+    assert_eq!(invalid_state.total_tool_calls, 0);
+    assert!(!workspace.path().join("malformed-effect.txt").exists());
+    assert_eq!(
+        provider.state.requests.lock().unwrap().len(),
+        1,
+        "outcome: {outcome:?}, interruption: {:?}",
+        invalid_state.interruption
+    );
+    invalid_ledger.assert_quiescent();
+
+    provider.state.scripted.store(false, Ordering::SeqCst);
     provider.state.requests.lock().unwrap().clear();
     provider.state.unterminated.store(true, Ordering::SeqCst);
     let attempts = Attempts::default();
@@ -239,7 +1646,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .await
         .unwrap();
     assert_eq!(first.tool_calls[0]["id"], "call-1");
-    assert_eq!(first.usage["prompt_tokens"], 20);
+    assert_eq!(first.usage_presence.measured_input_tokens, Some(20));
     let mut calls = first.tool_calls;
     calls[0]["id"] = json!("internal-call");
     calls[0][astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] = json!("call-1");
@@ -382,7 +1789,10 @@ async fn responses_transport_recovery_and_credential_fencing() {
         if has_usage {
             let terminals = attempts.finished.lock().unwrap();
             let terminal = terminals.last().unwrap();
-            assert_eq!(terminal.usage.input.total_input_tokens(), 17);
+            assert_eq!(
+                attempts.measured_inputs.lock().unwrap().last().copied(),
+                Some(17)
+            );
             assert_eq!(terminal.usage.output_tokens, 23);
             assert_eq!(
                 terminal.provider_response_id.as_deref(),
@@ -548,7 +1958,7 @@ fn responses_and_openai_share_runtime_role_projection() {
         items: vec![
             json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
             json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Working"}]}),
-            json!({"type":"function_call","name":"read_file","namespace":"astra","call_id":"provider-call"}),
+            json!({"type":"function_call","name":"read_file","call_id":"provider-call"}),
         ],
         ..Default::default()
     }.continuation(connection, "fixture-model");
@@ -667,11 +2077,18 @@ fn responses_finish_reason_comes_from_provider_truncation_evidence() {
         "conn",
         "model",
         "display-model",
+        None,
     );
     assert_eq!(truncated.finish_reason.as_deref(), Some("length"));
     assert_eq!(truncated.full_text, "partial");
     // Without truncation evidence the stop/tool_calls distinction is kept.
-    let stopped = super::result(ResponseOutput::default(), "conn", "model", "display-model");
+    let stopped = super::result(
+        ResponseOutput::default(),
+        "conn",
+        "model",
+        "display-model",
+        None,
+    );
     assert_eq!(stopped.finish_reason.as_deref(), Some("stop"));
     let calls = super::result(
         ResponseOutput {
@@ -683,6 +2100,7 @@ fn responses_finish_reason_comes_from_provider_truncation_evidence() {
         "conn",
         "model",
         "display-model",
+        None,
     );
     assert_eq!(calls.finish_reason.as_deref(), Some("tool_calls"));
 }
@@ -702,10 +2120,151 @@ fn truncated_multi_item_text_reaches_runtime_without_provider_replay() {
         "connection",
         "wire",
         "display",
+        None,
     );
     assert_eq!(value.full_text, "prefix partial tail");
     assert_eq!(value.finish_reason.as_deref(), Some("length"));
-    assert_eq!(value.usage["completion_tokens"], 34);
+    assert_eq!(value.usage["output_tokens"], 34);
     assert!(value.tool_calls.is_empty());
     assert!(value.provider_continuation.is_none());
+}
+
+#[test]
+fn response_result_couples_normalized_values_and_presence() {
+    let output = ResponseOutput {
+        usage: json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}}).as_object().unwrap().clone(),
+        ..Default::default()
+    };
+    let actual = result(output, "connection", "wire-model", "display-model", None);
+    assert_eq!(actual.usage["input_tokens"], 30);
+    assert_eq!(actual.usage["cached_input_tokens"], 40);
+    assert_eq!(actual.usage["cache_creation_tokens"], 30);
+    assert!(
+        actual.usage_presence.fresh_input_tokens && actual.usage_presence.cache_creation_tokens
+    );
+}
+#[test]
+fn responses_usage_tracks_only_codec_accepted_bounded_fields() {
+    let mut accumulator = ResponseAccumulator::default();
+    let mut reported = serde_json::Map::new();
+    let mut latest = None;
+    let event = json!({"type":"response.created","response":{"usage":{"input_tokens":17,"extension":{"private":999}}}});
+    super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None).unwrap();
+    let (_, presence) = latest.unwrap();
+    assert_eq!(presence.measured_input_tokens, Some(17));
+    assert!(!presence.output_tokens);
+    let malformed = json!({"response":{"usage":{"input_tokens":999}}});
+    assert!(
+        super::observe_with_usage(
+            &mut accumulator,
+            &malformed,
+            &mut reported,
+            &mut latest,
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(latest.unwrap().1.measured_input_tokens, Some(17));
+    let event = json!({"type":"response.failed","response":{"usage":{"input_tokens":-1,"output_tokens":5},"error":{"code":"failure"}}});
+    assert!(
+        super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None)
+            .is_err()
+    );
+    let (usage, presence) = latest.unwrap();
+    assert!(presence.input_invalid);
+    assert!(!presence.output_invalid);
+    assert_eq!(usage.output_tokens, 5);
+    assert!(presence.output_tokens);
+    assert!(!reported.contains_key("extension"));
+    assert!(reported.len() <= 2);
+}
+
+#[test]
+fn responses_usage_stays_bounded_and_invalid_output_does_not_erase_input() {
+    let mut accumulator = ResponseAccumulator::default();
+    let mut reported = serde_json::Map::new();
+    let mut latest = None;
+    for index in 0..1000 {
+        let event = json!({"type":"response.in_progress","response":{"usage":{
+            "input_tokens":17, (format!("extra_{index}")): index,
+            "input_tokens_details":{"cached_tokens":3,"ignored":index}
+        }}});
+        super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None)
+            .unwrap();
+    }
+    assert_eq!(reported.len(), 2);
+    assert_eq!(
+        reported["prompt_tokens_details"].as_object().unwrap().len(),
+        1
+    );
+    let event = json!({"type":"response.in_progress","response":{"usage":{"output_tokens":-1}}});
+    super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None).unwrap();
+    let (usage, presence) = latest.unwrap();
+    assert_eq!(presence.measured_input_tokens, Some(17));
+    assert!(presence.output_invalid);
+    assert_eq!(usage.cached_input_tokens, 3);
+}
+
+#[test]
+fn responses_usage_aliases_cannot_hide_invalid_or_conflicting_evidence() {
+    for (raw, input_valid, output_valid) in [
+        (
+            json!({"input_tokens":17,"prompt_tokens":-1,"output_tokens":3}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"prompt_tokens":18,"output_tokens":3}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"completion_tokens":-1}),
+            true,
+            false,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"completion_tokens":4}),
+            true,
+            false,
+        ),
+        (
+            json!({"input_tokens":17,"prompt_tokens":null,"output_tokens":3,"completion_tokens":3}),
+            true,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"input_tokens_details":{"cached_tokens":1},"prompt_tokens_details":{"cached_tokens":-1}}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"input_tokens_details":null,"prompt_tokens_details":{"cached_tokens":1}}),
+            true,
+            true,
+        ),
+    ] {
+        let mut accumulator = ResponseAccumulator::default();
+        let mut reported = serde_json::Map::new();
+        let mut latest = None;
+        let observer = Attempts::default();
+        let event = json!({"type":"response.in_progress","response":{"usage":raw}});
+        super::observe_with_usage(
+            &mut accumulator,
+            &event,
+            &mut reported,
+            &mut latest,
+            Some((&observer, 0)),
+        )
+        .unwrap();
+        let (_, presence) = observer.snapshots.lock().unwrap()[0];
+        assert_eq!(!presence.input_invalid, input_valid, "{event}");
+        assert_eq!(!presence.output_invalid, output_valid, "{event}");
+        assert_eq!(
+            presence.measured_input_tokens,
+            input_valid.then_some(17),
+            "{event}"
+        );
+        assert_eq!(presence.output_tokens, output_valid, "{event}");
+    }
 }

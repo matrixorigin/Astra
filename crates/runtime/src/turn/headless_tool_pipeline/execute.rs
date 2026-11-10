@@ -213,6 +213,32 @@ mod runtime_tool_result_tests {
     }
 
     #[test]
+    fn unknown_outcome_cannot_be_hidden_by_a_successful_exit_code() {
+        let fields = Map::from_iter([
+            ("execution_fact".into(), json!("unknown")),
+            ("exit_semantics".into(), json!("success")),
+            ("result_class".into(), json!("success")),
+        ]);
+        assert!(execution_result_is_error(Some(&fields), Some(false)));
+        assert_eq!(
+            execution_error_kind(Some(&fields)),
+            Some(astra_core::ErrorKind::ToolOutcomeUnknown)
+        );
+        for source_kind in [
+            astra_core::ErrorKind::ToolTimeout,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let mut fields = fields.clone();
+            fields.insert("error_kind".into(), json!(source_kind.as_str()));
+            assert_eq!(execution_error_kind(Some(&fields)), Some(source_kind));
+            let evidence = execution_recovery_evidence(Some(&fields)).unwrap();
+            assert_eq!(evidence.kind, source_kind);
+            assert_eq!(evidence.cause, astra_core::ToolFailureCause::OutcomeUnknown);
+            assert!(!evidence.retryable);
+        }
+    }
+
+    #[test]
     fn runtime_tool_success_metadata_is_preserved() {
         let mut execution = execution();
         let mut metadata = Map::new();
@@ -268,6 +294,11 @@ pub(super) fn execution_result_is_error(
     authoritative_is_error: Option<bool>,
 ) -> bool {
     let fields = tool_result_fields;
+
+    // Unknown delivery or execution state outranks an earlier process exit.
+    if astra_tools::execution_outcome::outcome_is_unknown(fields) {
+        return true;
+    }
 
     // Producer-owned executor failures outrank generic status fields. Result
     // prose is never execution authority: it is arbitrary tool/user content.
@@ -328,35 +359,39 @@ pub(super) fn execution_error_kind(
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(parse_execution_error_kind_tag)
+        .or_else(|| {
+            astra_tools::execution_outcome::outcome_is_unknown(tool_result_fields)
+                .then_some(astra_core::ErrorKind::ToolOutcomeUnknown)
+        })
 }
 
-fn execution_recovery_evidence(
+pub(super) fn execution_recovery_evidence(
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> Option<astra_core::ToolFailureEvidence> {
     let fields = tool_result_fields?;
-    if let Some(evidence) = fields
+    let mut evidence = fields
         .get("recovery_evidence")
+        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
         .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-    {
-        return Some(evidence);
+        .and_then(|value| serde_json::from_value::<astra_core::ToolFailureEvidence>(value).ok())
+        .or_else(|| {
+            // Compact transport facts use the same evidence type as local
+            // tools, without classifying rendered banners.
+            let kind = execution_error_kind(Some(fields))?;
+            let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
+            evidence.retryable = fields
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| kind.is_retryable());
+            Some(evidence)
+        })?;
+    if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) {
+        // Keep the source timeout/cancellation kind; uncertainty describes the
+        // outcome, not its transport cause. Both survive result compaction.
+        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
+        evidence.retryable = false;
+        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
     }
-
-    // Edge/runtime transports may only have the compact error contract. Turn
-    // that typed boundary into the same evidence object used by local tools;
-    // do not make the recovery layer classify a human-readable banner and
-    // accidentally invent a retryable network error.
-    let raw_kind = fields.get("error_kind").and_then(Value::as_str)?;
-    let kind = parse_execution_error_kind_tag(raw_kind)?;
-    let retryable = fields
-        .get("retryable")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| kind.is_retryable());
-    let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
-    // A transport can be known to be terminal at this boundary (for example
-    // an approval timeout or a side-effect-ambiguous disconnect). Preserve
-    // that producer-owned fact instead of deriving retryability from kind.
-    evidence.retryable = retryable;
     Some(evidence)
 }
 
@@ -453,9 +488,13 @@ mod tests {
             ("result_class".into(), serde_json::json!("success")),
             ("exit_code".into(), serde_json::json!(0)),
             ("error_kind".into(), serde_json::json!("tool_unavailable")),
-            ("recovery_evidence".into(), serde_json::to_value(
-                astra_tools::workspace_observation::explicit_workspace_verification_unavailable_evidence(),
-            ).unwrap()),
+            (
+                "recovery_evidence".into(),
+                serde_json::to_value(astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolUnavailable,
+                ))
+                .unwrap(),
+            ),
         ]);
         assert!(execution_result_is_error(Some(&fields), Some(true)));
     }
@@ -593,12 +632,15 @@ mod tests {
             .as_str()
             .expect("model tool content");
         assert!(
-            content.contains("First reconcile the provider's state"),
+            content.contains("reconcile the provider state or invocation receipt"),
             "{content}"
         );
-        assert!(content.contains("Do NOT retry this operation"), "{content}");
         assert!(
-            content.contains("switch tools to repeat its effect"),
+            content.contains("Before repeating any state-changing effect"),
+            "{content}"
+        );
+        assert!(
+            content.contains("A fresh read or a different observation"),
             "{content}"
         );
         assert!(

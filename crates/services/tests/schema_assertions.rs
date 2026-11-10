@@ -407,6 +407,21 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_json JSON NOT NULL",
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_json LONGTEXT NOT NULL",
+            "payload_json",
+        ),
+        (
+            "ALTER TABLE user_llm_models DROP COLUMN inference_protocol",
+            "ALTER TABLE user_llm_models ADD inference_protocol VARCHAR(32) NULL",
+            "inference_protocol",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY inference_protocol VARCHAR(16) NULL",
+            "ALTER TABLE user_llm_models MODIFY inference_protocol VARCHAR(32) NULL",
+            "inference_protocol",
+        ),
+        (
             "ALTER TABLE user_llm_models DROP COLUMN api_key_encrypted",
             "ALTER TABLE user_llm_models ADD api_key_encrypted TEXT NULL",
             "api_key_encrypted",
@@ -484,11 +499,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             ).bind(&schema).fetch_all(pool.get()).await.unwrap()
         };
         let drifted = shape().await;
-        for completed in if change.contains("user_llm_models") {
-            &[true, false][..]
-        } else {
-            &[true][..]
-        } {
+        for completed in
+            if change.contains("user_llm_models") || change.contains("edge_pending_dispatch") {
+                &[true, false][..]
+            } else {
+                &[true][..]
+            }
+        {
             if !completed {
                 sqlx::query("DELETE FROM astra_schema_contracts WHERE component='astra-core'")
                     .execute(pool.get())

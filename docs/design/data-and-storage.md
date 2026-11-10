@@ -83,7 +83,7 @@ upload protocols keep their existing transactions and retention deadlines.
 
 This is a fresh empty database and same-version deployment contract. There is
 no additional marker mechanism, migration, compatibility API or old-data cleanup.
-The combined schema contract version advances to v119 and rejects earlier versions. Strict
+The combined schema contract version advances to v120 and rejects earlier versions. Strict
 request-context JSON decoding is not promised for historical payloads. Existing
 engine snapshots and in-flight old Git operations are not reconciled by the new
 build; stop old workers before handing their workspaces to a new deployment.
@@ -734,9 +734,20 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
-Fresh schema contract `2026-11-02-v119` combines personal model connection and
-authorization storage with v118 invocation archival. It rejects a main-only v118
-database under the existing fresh-database contract; no implicit migration runs.
+Fresh schema contract `2026-11-09-v123` stores Edge dispatch requests as
+lossless text, preserving the serialized payload used for admission and relay
+delivery. Existing databases must make an explicit data and deployment decision;
+the fresh-schema contract does not migrate them automatically.
+
+Fresh schema contract `2026-11-08-v122` replaces the Edge dispatch index with
+a status-leading index that can observe pending work without reading retained
+completed history. It follows the fresh-database contract below; it does not
+automatically migrate the previous index shape.
+
+Fresh schema contract `2026-11-05-v121` adds the declared Responses reasoning
+history policy to the existing personal model row. It rejects earlier databases under the existing
+fresh-database contract; no implicit migration runs. Operators must make an
+explicit data and deployment decision before moving an existing database.
 
 Personal API-key and connection model fields are declared together in the canonical
 `user_llm_models` CREATE. Startup checks their types, nullability and declaration

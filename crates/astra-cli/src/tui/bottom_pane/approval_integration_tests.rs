@@ -380,9 +380,7 @@ fn plan_review_receives_ctrl_enter_before_hidden_approval() {
     ));
     assert_eq!(
         plan_rx.blocking_recv().unwrap(),
-        PlanReviewDecision::Approve {
-            mode: PermissionMode::Auto
-        }
+        PlanReviewDecision::Approve { mode: None }
     );
     assert!(matches!(
         approval_rx.try_recv(),

@@ -114,8 +114,9 @@ impl ToolExecutor {
     // ─── File state helpers ──────────────────────────────────────────────────
 
     fn project_root_aliases(&self) -> Vec<PathBuf> {
-        let mut aliases = vec![self.project_root.clone()];
-        if let Ok(canonical) = self.project_root.canonicalize()
+        let root = self.effective_project_root();
+        let mut aliases = vec![root.clone()];
+        if let Ok(canonical) = root.canonicalize()
             && !aliases.iter().any(|existing| existing == &canonical)
         {
             aliases.push(canonical);
@@ -127,8 +128,9 @@ impl ToolExecutor {
         if let Ok(canonical) = path.canonicalize() {
             return canonical;
         }
-        if let Ok(canonical_root) = self.project_root.canonicalize() {
-            if let Ok(rel) = path.strip_prefix(&self.project_root) {
+        let root = self.effective_project_root();
+        if let Ok(canonical_root) = root.canonicalize() {
+            if let Ok(rel) = path.strip_prefix(&root) {
                 return canonical_root.join(rel);
             }
             if let Ok(rel) = path.strip_prefix(&canonical_root) {
@@ -139,20 +141,21 @@ impl ToolExecutor {
     }
 
     pub(super) fn prefer_project_root_alias(&self, path: &Path) -> PathBuf {
-        if let Ok(rel) = path.strip_prefix(&self.project_root) {
+        let root = self.effective_project_root();
+        if let Ok(rel) = path.strip_prefix(&root) {
             return if rel.as_os_str().is_empty() {
-                self.project_root.clone()
+                root.clone()
             } else {
-                self.project_root.join(rel)
+                root.join(rel)
             };
         }
-        if let Ok(canonical_root) = self.project_root.canonicalize()
+        if let Ok(canonical_root) = root.canonicalize()
             && let Ok(rel) = path.strip_prefix(&canonical_root)
         {
             return if rel.as_os_str().is_empty() {
-                self.project_root.clone()
+                root.clone()
             } else {
-                self.project_root.join(rel)
+                root.join(rel)
             };
         }
         path.to_path_buf()
@@ -160,7 +163,7 @@ impl ToolExecutor {
 
     pub(super) fn project_relative_display(&self, path: &Path) -> String {
         self.prefer_project_root_alias(path)
-            .strip_prefix(&self.project_root)
+            .strip_prefix(self.effective_project_root())
             .unwrap_or(path)
             .display()
             .to_string()
@@ -178,7 +181,11 @@ impl ToolExecutor {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
-            Some(policy) => policy.is_path_allowed(path),
+            Some(policy) => {
+                let mut policy = policy.clone();
+                policy.project_root = self.effective_project_root();
+                policy.is_path_allowed(path)
+            }
             None => true,
         }
     }
@@ -236,7 +243,6 @@ impl ToolExecutor {
             .as_ref()
             .map(|content| content_sha256(content.as_bytes()))
             .or_else(|| file_content_sha256(path).ok());
-        let content_line_count = content.as_deref().map(|value| value.lines().count() as u64);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
         let mut overlapped = false;
@@ -250,16 +256,9 @@ impl ToolExecutor {
             } else {
                 Vec::new()
             };
-            let delivered_range = delivered_range.or_else(|| {
-                if is_partial {
-                    return None;
-                }
-                let line_count = content_line_count?;
-                (line_count > 0).then_some(DeliveredLineRange {
-                    start: 1,
-                    end: line_count,
-                })
-            });
+            // Capturing the full preimage establishes edit freshness, not
+            // numbered-line delivery. Only the renderer knows which complete
+            // source lines survived its outline, redaction and output budget.
             if let Some(delivered_range) =
                 delivered_range.filter(|range| range.start > 0 && range.end >= range.start)
             {
@@ -295,12 +294,13 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
+        let workspace_root = self.effective_project_root();
         match content {
             Some(text) => {
                 self.passive_lsp
-                    .sync_after_write_with_content(&self.project_root, path, text)
+                    .sync_after_write_with_content(&workspace_root, path, text)
             }
-            None => self.passive_lsp.sync_after_write(&self.project_root, path),
+            None => self.passive_lsp.sync_after_write(&workspace_root, path),
         }
         let ts = Self::file_mtime_ms(path);
         let content_sha256 = content
@@ -386,7 +386,7 @@ impl ToolExecutor {
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.project_root.join(path)
+            self.effective_project_root().join(path)
         };
         self.record_read(&abs, false);
     }
@@ -647,6 +647,37 @@ mod tests {
             exe.get_cached_content(&file).as_deref(),
             Some("fn cached() {}\n")
         );
+    }
+
+    #[test]
+    fn captured_preimage_does_not_imply_numbered_line_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        let content = "first\nsecond\n";
+        std::fs::write(&path, content).unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(dir.path());
+        executor.record_read_cached(&path, false, content.into());
+        let key = executor.file_state_key(&path);
+        {
+            let state = executor.file_state.lock().unwrap();
+            assert!(
+                state[&key].full_content_known,
+                "freshness authority is preserved"
+            );
+            assert!(state[&key].delivered_line_ranges.is_empty());
+        }
+        assert!(!executor.record_read_with_delivery_range_cached(
+            &path,
+            true,
+            content.into(),
+            Some(DeliveredLineRange { start: 1, end: 1 })
+        ));
+        assert!(executor.record_read_with_delivery_range_cached(
+            &path,
+            true,
+            content.into(),
+            Some(DeliveredLineRange { start: 1, end: 1 })
+        ));
     }
 
     #[test]

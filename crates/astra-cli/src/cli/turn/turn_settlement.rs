@@ -19,6 +19,7 @@ pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) input_runtime_required_texts: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
     pub(crate) token: &'a str,
+    pub(crate) auth_owner: Option<&'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) session_id: &'a str,
     pub(crate) admitted_server_turn: Option<&'a super::turn_entry::AdmittedServerTurn>,
     pub(crate) semantic_query_override: Option<&'a str>,
@@ -141,6 +142,7 @@ mod tests {
             turn_start: Instant::now(),
             ui: &mut ui,
             turn_usage_sink: None,
+            auth_owner: None,
         };
 
         settle_successful_turn(
@@ -184,6 +186,7 @@ mod tests {
             turn_start: Instant::now(),
             ui: &mut ui,
             turn_usage_sink: None,
+            auth_owner: None,
         };
         let mut failure = crate::TurnFailure {
             error: "boom".into(),
@@ -237,6 +240,7 @@ mod tests {
                 turn_start: Instant::now(),
                 ui: &mut ui,
                 turn_usage_sink: None,
+                auth_owner: None,
             };
             let error_code = Some(rejected_code.to_string());
             let error_metadata = Some(serde_json::json!({"admission_state": "rejected"}));

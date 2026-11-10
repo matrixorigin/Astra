@@ -10,7 +10,7 @@
 //! ```text
 //! ASTRA_MAX_TURNS=300             # optional positive execution-round cap; unset = uncapped
 //! ASTRA_PLAN_SUBTASK_MAX_TURNS=100 # optional positive subtask cap; unset = inherit ASTRA_MAX_TURNS
-//! ASTRA_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
+//! ASTRA_TURN_TIMEOUT_S=300        # optional positive run deadline; unset = no total time limit
 //! ASTRA_GLOBAL_OUTPUT_LIMIT=200000 # combined tool output bytes
 //! ASTRA_TOOL_OUTPUT_LIMIT=80000   # per-tool output bytes
 //! ASTRA_MAX_TOOL_RETRIES=2        # transient-error retries per tool
@@ -19,12 +19,21 @@
 //! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0 = use model ceiling only)
 //! ```
 
-pub(crate) const DEFAULT_TURN_TIMEOUT_S: u64 = 300;
 pub(crate) const DEFAULT_GLOBAL_OUTPUT_LIMIT: usize = 200_000;
 pub(crate) const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 80_000;
 /// Shared default inline presentation budget at the model tool-result boundary.
 /// Tools may retain complete results outside the inline view.
 pub const DEFAULT_TOOL_RESULT_INLINE_CHARS: usize = 8_000;
+/// Maximum serialized size of one canonical conversation segment.
+pub const MAX_CANONICAL_CONTEXT_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum encoded content in one canonical commit.
+pub const MAX_CANONICAL_CONTEXT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+/// Space left for a truthful terminal outcome after the last tool group.
+pub const CANONICAL_TERMINAL_RESERVE_BYTES: u64 = 64 * 1024;
+/// Result envelopes reserved before executing a tool batch.
+pub const MIN_CANONICAL_TOOL_RESULT_BYTES: u64 = 8 * 1024;
+pub const MAX_CANONICAL_TOOL_RESULT_BYTES: u64 = 1024 * 1024;
+pub const CANONICAL_TOOL_RESULT_PROVENANCE_BYTES: u64 = 2048;
 pub(crate) const DEFAULT_MAX_TOOL_RETRIES: usize = 2;
 pub(crate) const DEFAULT_RETRY_BASE_MS: u64 = 500;
 pub(crate) const DEFAULT_MAX_RETRIEVED: usize = 6;
@@ -53,8 +62,8 @@ pub struct RoundLimits {
 pub struct RuntimeLimits {
     /// One authoritative parsing result for optional round constraints.
     pub round_limits: Result<RoundLimits, String>,
-    /// Per-turn hard timeout in seconds.
-    pub turn_timeout_s: f64,
+    /// Explicit agent-run wall-clock limit; absence does not impose a deadline.
+    pub turn_timeout_s: Result<Option<u64>, String>,
     /// Combined tool output truncation limit (bytes).
     pub global_output_limit: usize,
     /// Per-tool output truncation limit (bytes).
@@ -75,7 +84,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             round_limits: Ok(RoundLimits::default()),
-            turn_timeout_s: DEFAULT_TURN_TIMEOUT_S as f64,
+            turn_timeout_s: Ok(None),
             global_output_limit: DEFAULT_GLOBAL_OUTPUT_LIMIT,
             tool_output_limit: DEFAULT_TOOL_OUTPUT_LIMIT,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
@@ -106,7 +115,10 @@ impl RuntimeLimits {
                     )?,
                 })
             })(),
-            turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", cfg.turn_timeout_s() as f64),
+            turn_timeout_s: parse_turn_timeout(
+                std::env::var("ASTRA_TURN_TIMEOUT_S"),
+                cfg.turn_timeout_s,
+            ),
             global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", cfg.global_output_limit()),
             tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", cfg.tool_output_limit()),
             max_tool_retries: env_parse("ASTRA_MAX_TOOL_RETRIES", cfg.max_tool_retries()),
@@ -231,6 +243,27 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn parse_turn_timeout(
+    environment: Result<String, std::env::VarError>,
+    configured: Option<u64>,
+) -> Result<Option<u64>, String> {
+    let value = match environment {
+        Ok(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| "ASTRA_TURN_TIMEOUT_S must be positive integer seconds".to_owned())?,
+        ),
+        Err(std::env::VarError::NotPresent) => configured,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("ASTRA_TURN_TIMEOUT_S must be valid UTF-8".into());
+        }
+    };
+    if value.is_some_and(|value| value == 0 || value > u64::MAX / 1000) {
+        return Err("ASTRA_TURN_TIMEOUT_S exceeds the supported positive deadline range".into());
+    }
+    Ok(value)
+}
+
 fn optional_round_limit(
     key: &str,
     configured: Option<usize>,
@@ -286,6 +319,36 @@ pub fn warn_default_credentials_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_run_deadline_is_opt_in_and_invalid_overrides_fail_admission() {
+        use std::env::VarError::NotPresent;
+        assert_eq!(parse_turn_timeout(Err(NotPresent), None), Ok(None));
+        assert_eq!(
+            parse_turn_timeout(Err(NotPresent), Some(300)),
+            Ok(Some(300))
+        );
+        assert_eq!(
+            parse_turn_timeout(Ok("900".into()), Some(300)),
+            Ok(Some(900))
+        );
+        for value in [
+            "",
+            "0",
+            "-1",
+            "NaN",
+            "inf",
+            "0.5",
+            "bad",
+            "18446744073709551615",
+        ] {
+            assert!(
+                parse_turn_timeout(Ok(value.into()), Some(300)).is_err(),
+                "{value}"
+            );
+        }
+        assert!(parse_turn_timeout(Err(NotPresent), Some(0)).is_err());
+    }
 
     #[test]
     fn explicit_round_limit_parsing_preserves_absence_and_rejects_invalid_values() {

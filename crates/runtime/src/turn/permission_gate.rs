@@ -276,14 +276,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         }
     };
 
-    let plan_mode_blocked = provider_policy.map_or_else(
-        || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args),
-        // A native collaborator is admitted as a control-plane stage. Its
-        // adapter clamps the actual workspace effect to the plan-mode ceiling
-        // before starting the provider, so do not reject it merely because
-        // its descriptor cannot claim that every invocation is read-only.
-        |policy| !policy.is_read_only() && !policy.is_collaborator_stage(),
-    );
+    let plan_mode_blocked = plan_mode_blocks(tool_name, &normalized_args, provider_policy);
     if plan_mode_active && plan_mode_blocked {
         return PermissionCheckResult::Denied {
             reason: format!(
@@ -322,6 +315,21 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         source_discovery_tool,
     )
     .await
+}
+
+pub(crate) fn plan_mode_blocks(
+    tool_name: &str,
+    normalized_args: &serde_json::Value,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+) -> bool {
+    provider_policy.map_or_else(
+        || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, normalized_args),
+        // A native collaborator is admitted as a control-plane stage. Its
+        // adapter clamps the actual workspace effect to the plan-mode ceiling
+        // before starting the provider, so do not reject it merely because
+        // its descriptor cannot claim that every invocation is read-only.
+        |policy| !policy.is_read_only() && !policy.is_collaborator_stage(),
+    )
 }
 
 #[cfg(test)]

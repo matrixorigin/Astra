@@ -87,6 +87,18 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
         }),
     },
     ProviderCase {
+        label: "prefix-after-user-all-context",
+        provider: "openai",
+        model: "prefix-after-user-fixture",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailAfterUser,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    },
+    ProviderCase {
         label: "minimax",
         provider: "openai",
         model: "MiniMax-M2.7",
@@ -149,7 +161,7 @@ fn response(case: ProviderCase, text: &str, call: Option<(&str, &str)>) -> Provi
                 message["tool_calls"] = calls;
             }
             ProviderResponse::OpenAi(
-                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
+                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
             )
         }
         other => panic!("unsupported explicit native provider {other}"),
@@ -162,7 +174,7 @@ fn distinct_native_usage(mut response: ProviderResponse, index: usize) -> Provid
     match &mut response {
         ProviderResponse::OpenAi(body) => {
             body["usage"] = json!({
-                "prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
+                "prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
             })
         }
         ProviderResponse::Anthropic(body) => {
@@ -593,10 +605,13 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
 }
 
 async fn completed_read_prefix() -> Vec<Value> {
-    completed_read_state().await.messages
+    completed_read_state().await.0.messages
 }
 
-async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::AgenticLoopState {
+async fn completed_read_state() -> (
+    astra_runtime::turn::agentic_loop::host::AgenticLoopState,
+    ProviderGateway,
+) {
     let case = *PROVIDER_MATRIX
         .iter()
         .find(|case| case.label == "openai-gpt")
@@ -643,7 +658,7 @@ async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::Agen
     assert_eq!(ledger.attempt_count(), 2);
     ledger.assert_quiescent();
     gateway.assert_complete();
-    state
+    (state, gateway)
 }
 
 #[tokio::test]
@@ -740,9 +755,9 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         model: "append-alias",
         is_marker_isolated: false,
         cache_capability: Some(CacheCapability {
-            protocol: CacheProtocol::OpenAiAutoPrefix,
+            protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::AppendOnlyUserTail,
-            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            volatile_delivery: VolatileDeliveryPolicy::All,
             reuse_scope: Some(CacheReuseScope::ConversationTurns),
         }),
     };
@@ -978,8 +993,19 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             .iter()
             .find(|case| case.label == label)
             .unwrap();
-        let mut state = completed_read_state().await;
+        let (mut state, source_gateway) = completed_read_state().await;
         let canonical = state.messages.clone();
+        // This host uses a different admitted endpoint. Its public history
+        // must use the canonical ID, not the previous provider's ID.
+        let canonical_call_id = canonical
+            .iter()
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flatten()
+            .find(|call| call["function"]["name"] == "read_file")
+            .and_then(|call| call["id"].as_str())
+            .expect("completed read has a canonical call ID")
+            .to_string();
+        assert_ne!(canonical_call_id, "prefix-read");
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
             "current-user-only revisions",
             move |request| {
@@ -992,6 +1018,7 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             ],
         )])
         .await;
+        assert_ne!(source_gateway.base_url, gateway.base_url);
         let ledger = ProviderObservationsFixture::default();
         let session = state.current_session_id.clone().unwrap();
         let mut host = server_host_builder(
@@ -1077,15 +1104,29 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
         assert_native_pair(
             case,
             &requests[0].body,
-            "prefix-read",
+            &canonical_call_id,
             "actual prefix evidence",
         );
         assert_native_pair(
             case,
             &requests[2].body,
-            "prefix-read",
+            &canonical_call_id,
             "actual prefix evidence",
         );
+        for request in [&requests[0], &requests[2]] {
+            assert!(!request.body.to_string().contains("prefix-read"));
+            let call = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["tool_calls"].as_array())
+                .flatten()
+                .find(|call| call["id"] == canonical_call_id)
+                .unwrap();
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args["path"], "evidence.txt");
+        }
         assert_eq!(&a[..index], &b[..index]);
         assert_eq!(
             &a[index + 1..],

@@ -282,12 +282,26 @@ pub(crate) fn validate_reasoning_control(
     );
     thinking.validate_output_budget(crate::prompts::capped_output_tokens(&budget) as u64)?;
     let protocol = execution.thinking_protocol.unwrap_or_default();
-    let supported = thinking.is_supported_by(
-        &execution.provider,
-        capability.map(|capability| capability.as_str()),
-        protocol,
-    ) && thinking
-        .is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
+    // A personal Responses endpoint is explicitly selected by its owner, but
+    // its provider may not publish an exhaustive reasoning-effort inventory.
+    // Permit trying a protocol-valid effort without treating it as verified.
+    let unverified_personal_effort = execution.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && execution.subscription.is_none()
+        && execution.response_scope.is_some()
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+        && execution.supported_reasoning_efforts.is_none()
+        && matches!(
+            thinking,
+            astra_turn_core::thinking_config::ThinkingConfig::Adaptive { .. }
+        );
+    let supported = (unverified_personal_effort
+        || thinking.is_supported_by(
+            &execution.provider,
+            capability.map(|capability| capability.as_str()),
+            protocol,
+        ))
+        && thinking.is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
     if supported {
         Ok(())
     } else {
@@ -475,6 +489,65 @@ mod tests {
     }
 
     #[test]
+    fn personal_responses_can_try_unverified_efforts_without_weakening_declared_routes() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::{ModelAccessKind, ThinkingCapability};
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "personal".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1".into(),
+            "fixture".into(),
+            None,
+            128_000,
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = Some("scope".into());
+        execution.thinking_protocol = Some(ThinkingProtocol::ResponsesReasoning);
+        execution.thinking_capability = None;
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::Max,
+        ] {
+            assert!(
+                validate_reasoning_control(&execution, &ThinkingConfig::Adaptive { effort })
+                    .is_ok()
+            );
+        }
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
+
+        let max = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        };
+        execution.access_kind = ModelAccessKind::SelfHosted;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "unknown gateway capability stays closed"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = None;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a gateway without a personal API-key route stays closed"
+        );
+        execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+        execution.supported_reasoning_efforts = Some(vec!["high".into()]);
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "declared inventories remain binding"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a declared list remains binding for personal routes"
+        );
+    }
+
+    #[test]
     fn published_reasoning_controls_preserve_protocol_admission() {
         use astra_core::model_wire::thinking::ThinkingProtocol;
         use astra_services::models::ThinkingCapability;
@@ -612,6 +685,10 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    responses_reasoning_history: None,
+                    inference_protocol: None,
+                    response_scope_key: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "server-model".into(),
                     wire_model_name: Some("wire-model".into()),
@@ -1062,6 +1139,11 @@ pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) 
         "endpoint": execution.completions_url_override.as_deref().unwrap_or(&execution.base_url),
         "headers": execution.header_overrides.iter().filter(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-api-key" | "api-key")).collect::<std::collections::BTreeMap<_, _>>(),
     });
+    if let Some(protocol) = execution.inference_protocol.filter(|protocol| {
+        *protocol != astra_core::model_wire::llm_provider_protocol(&execution.provider)
+    }) {
+        contract["inference_protocol"] = serde_json::json!(protocol);
+    }
     if let Some(efforts) = &execution.supported_reasoning_efforts {
         contract["supported_reasoning_efforts"] = serde_json::json!(efforts);
     }
@@ -1080,26 +1162,43 @@ pub(crate) async fn inherit_routed_execution<F, Fut>(
     parent_run_id: &str,
     inherited: Option<&AdmittedModelExecution>,
     resolve: F,
-) -> Result<Option<AdmittedModelExecution>, String>
+) -> Result<
+    (
+        Option<AdmittedModelExecution>,
+        Option<astra_turn_core::thinking_config::ThinkingConfig>,
+    ),
+    String,
+>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<AdmittedModelExecution, String>>,
 {
-    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
-    let Some(event) = engine
-        .load_run_event_by_idempotency_key(user_id, parent_run_id, EVENT_TYPE, DECISION_KEY)
+    use astra_services::runs::InheritedRunModel;
+    match engine
+        .inherited_run_model(user_id, session_id, parent_run_id)
         .await?
-    else {
-        return Ok(inherited.cloned());
-    };
-    let decision: ModelRoutingDecision = serde_json::from_value(event["data"].clone())
-        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
-    decision.validate_identity(parent_run_id, session_id)?;
-    let execution = resolve(decision.selected_offering_id).await?;
-    if model_execution_contract_root(&execution) != decision.selected_contract_root {
-        return Err("The inherited Auto model contract changed; start a new turn".into());
+    {
+        InheritedRunModel::Original => Ok((inherited.cloned(), None)),
+        InheritedRunModel::Auto(decision) => {
+            let execution = resolve(decision.selected_offering_id).await?;
+            if model_execution_contract_root(&execution) != decision.selected_contract_root {
+                return Err("The inherited Auto model contract changed; start a new turn".into());
+            }
+            Ok((Some(execution), None))
+        }
+        InheritedRunModel::Explicit(choice) => {
+            let execution = resolve(choice.resolved.offering_id.clone()).await?;
+            if choice.selection.model.offering_id != execution.offering_id
+                || choice.resolved.model_name != execution.model_name
+                || choice.resolved.source_identity != execution.source_identity
+            {
+                return Err("The inherited model identity changed; select it again".into());
+            }
+            let thinking = (&choice.reasoning).into();
+            validate_reasoning_control(&execution, &thinking)?;
+            Ok((Some(execution), Some(thinking)))
+        }
     }
-    Ok(Some(execution))
 }
 
 #[cfg(test)]

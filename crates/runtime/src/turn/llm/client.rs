@@ -30,8 +30,12 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 #[path = "responses.rs"]
 mod responses;
+
+const INCOMPLETE_TOOL_CONTINUATION_MESSAGE: &str =
+    "Some previous tool results could not be verified. Check their effects, then start a new turn.";
 
 #[cfg(test)]
 use crate::prompts;
@@ -116,12 +120,51 @@ fn moi_model_gateway_error(
     }
     Some(ProviderHttpRejection {
         classified: astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::Unknown,
+            match code {
+                "provider_quota_exhausted" => astra_core::ErrorKind::ProviderQuotaExhausted,
+                "provider_forbidden" => astra_core::ErrorKind::ProviderForbidden,
+                "provider_authentication_failed" => astra_core::ErrorKind::Auth,
+                _ => astra_core::ErrorKind::Unknown,
+            },
             format!("MOI model gateway rejected inference: {code}"),
         )
         .with_details_json(details.to_string()),
         retryable,
     })
+}
+
+/// Only explicit machine fields identify provider quota or credentials. A
+/// generic 403 (including upstream_forbidden) proves neither cause. Never
+/// forward provider text: even an auth error body may echo arbitrary secrets.
+fn provider_access_error(status: u16, body: &str) -> Option<astra_core::ClassifiedError> {
+    use astra_core::ErrorKind;
+    let value = serde_json::from_str::<Value>(body).ok();
+    let code = value.as_ref().and_then(|value| {
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
+    });
+    let kind = match (status, code) {
+        (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
+            ErrorKind::ProviderQuotaExhausted
+        }
+        (401 | 403, Some("invalid_api_key" | "invalid_token" | "authentication_error"))
+        | (401, _) => ErrorKind::Auth,
+        (403, _) => ErrorKind::ProviderForbidden,
+        _ => return None,
+    };
+    let message = match kind {
+        ErrorKind::Auth => "LLM provider authentication failed",
+        ErrorKind::ProviderQuotaExhausted => "LLM provider account balance or quota exhausted",
+        ErrorKind::ProviderForbidden => "LLM provider denied inference; the reason is not known",
+        _ => unreachable!(),
+    };
+    Some(
+        astra_core::ClassifiedError::new(kind, message).with_details_json(
+            json!({"source":"llm_provider", "http_status":status, "retryable":false}).to_string(),
+        ),
+    )
 }
 
 /// Keep the billing owner's machine-readable reason without forwarding an
@@ -196,45 +239,7 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmProviderProtocol {
-    OpenAiResponses,
-    OpenAiCompatible,
-    AnthropicMessages,
-    BedrockConverse,
-    TypeSafeSystemOne,
-}
-
-impl LlmProviderProtocol {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAiResponses => "openai_responses",
-            Self::OpenAiCompatible => "openai_compatible",
-            Self::AnthropicMessages => "anthropic_messages",
-            Self::BedrockConverse => "bedrock_converse",
-            Self::TypeSafeSystemOne => "typesafe_systemone",
-        }
-    }
-
-    /// Whether the concrete request builder preserves each appended provider
-    /// message as a distinct wire item. Append-only caching is invalid for
-    /// transports that merge adjacent roles and thereby rewrite the old tail.
-    #[must_use]
-    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
-        matches!(self, Self::OpenAiCompatible)
-    }
-}
-
-pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
-    match provider {
-        "chatgpt" => LlmProviderProtocol::OpenAiResponses,
-        "anthropic" => LlmProviderProtocol::AnthropicMessages,
-        "bedrock" => LlmProviderProtocol::BedrockConverse,
-        "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
-        _ => LlmProviderProtocol::OpenAiCompatible,
-    }
-}
+pub(crate) use astra_core::model_wire::{LlmProviderProtocol, llm_provider_protocol};
 
 /// Immutable identity of the exact serialized provider payload.
 ///
@@ -1079,6 +1084,25 @@ pub(crate) struct ProviderAttemptObservation {
     pub terminal: Option<astra_services::InferenceInvocationTerminal>,
     /// None means not dispatched; an empty sample means dispatched, unknown.
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Inclusive physical input, independent of disjoint billing qualification.
+    pub measured_input_tokens: Option<u64>,
+}
+
+impl ProviderAttemptObservation {
+    /// Inclusive observed input, falling back to the proven lane subtotal.
+    pub(crate) fn observed_input_tokens(&self) -> u64 {
+        if !self.dispatch_started {
+            return 0;
+        }
+        let known = self.qualified_usage.map_or(0, |usage| {
+            usage
+                .input_tokens()
+                .unwrap_or(0)
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0))
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0))
+        });
+        self.measured_input_tokens.unwrap_or(known)
+    }
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
@@ -1089,6 +1113,8 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<&'a str>,
     pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
     pub fixed_temperature: Option<f64>,
     pub supported_reasoning_efforts: Option<&'a [String]>,
@@ -1111,6 +1137,8 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            inference_protocol: execution.inference_protocol,
+            response_scope: execution.response_scope.as_deref(),
             subscription: execution.subscription.as_ref(),
             fixed_temperature: execution.fixed_temperature,
             supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
@@ -1136,6 +1164,8 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<String>,
     pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     pub model_name: String,
     pub wire_model_name: Option<String>,
@@ -1159,6 +1189,8 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.as_deref(),
             subscription: self.subscription.as_ref(),
             fixed_temperature: self.fixed_temperature,
             supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
@@ -1273,6 +1305,15 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         attempt_index: u32,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
+
+    /// Replace the validated cumulative snapshot for this physical attempt.
+    fn note_usage_snapshot(
+        &self,
+        _attempt_index: u32,
+        _usage: crate::turn::token_usage::TokenUsage,
+        _presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+    }
 
     /// Preserve provider lane presence for Explain Analyze without changing
     /// the inference ledger's normalized accounting contract.
@@ -1432,6 +1473,16 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
                 Err(self.ledger_deadline_error("terminalization", Some(terminal)))
             },
         }
+    }
+
+    fn note_usage_snapshot(
+        &self,
+        attempt_index: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner
+            .note_usage_snapshot(attempt_index, usage, presence);
     }
 
     fn note_usage_presence(
@@ -1616,6 +1667,7 @@ pub(crate) async fn finish_observed_provider_error(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1630,6 +1682,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1645,6 +1698,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1659,6 +1713,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1801,6 +1856,28 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
                     }
                 } => {}
             }
+        }
+    }
+}
+
+async fn prepare_compatible_endpoint(
+    url: &str,
+    remaining: std::time::Duration,
+    cancel: LlmCancel<'_>,
+) -> Result<astra_services::byok_endpoint::EndpointClient, astra_core::ClassifiedError> {
+    if remaining.is_zero() {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider deadline reached while preparing the connection",
+        ));
+    }
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled, "LLM call cancelled")),
+        result = tokio::time::timeout(remaining, astra_services::byok_endpoint::endpoint_client(url)) => {
+            result.map_err(|_| astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline, "LLM provider deadline reached while preparing the connection"))?
         }
     }
 }
@@ -2326,7 +2403,9 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiResponses => format!("{base}/responses"),
+        LlmProviderProtocol::OpenAiResponses => {
+            astra_core::model_wire::responses::endpoint_url(base_url)
+        }
         LlmProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
@@ -2336,7 +2415,7 @@ pub(crate) fn llm_request_url_for_provider(
         }
         LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
-            format!("{base}/chat/completions")
+            astra_core::model_wire::endpoint_url(base_url, "chat/completions")
         }
     }
 }
@@ -2732,7 +2811,7 @@ fn append_only_history_contract_error(message: &'static str) -> astra_core::Clas
 /// assistant or synthetic tool message to be replaced. Malformed/incomplete
 /// groups therefore fail before provider I/O and remain recoverable through
 /// the canonical lifecycle instead of silently changing the cache prefix.
-fn validate_append_only_openai_history(
+pub(crate) fn validate_append_only_openai_history(
     messages: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     let mut pending_tool_ids = HashSet::<&str>::new();
@@ -3514,6 +3593,13 @@ fn build_provider_request_body_with_cache_capability(
         message
             .get(astra_core::model_wire::responses::CONTINUATION_KEY)
             .is_some()
+            || message
+                .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+                .is_some()
+            || message.get(super::model_origin::FOREIGN_GROUP).is_some()
+            || message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
             || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
@@ -3545,6 +3631,7 @@ fn build_provider_request_body_with_cache_capability(
                 messages,
             );
             let mut cloned = messages.to_vec();
+            cloned.retain(|message| !is_incomplete_marker_only(message));
             strip_internal_runtime_markers(&mut cloned);
             cloned
         };
@@ -3804,8 +3891,7 @@ fn apply_required_tool_choice(
 
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiResponses => {
-            body["tool_choice"] =
-                json!({"type":"function","namespace":"astra","name":required_tool_name});
+            body["tool_choice"] = json!({"type":"function","name":required_tool_name});
         }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
@@ -4084,7 +4170,20 @@ pub(crate) fn consolidate_system_messages_for_provider(
     provider: &str,
     explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
-    let protocol = llm_provider_protocol(provider);
+    consolidate_system_messages_for_protocol(
+        messages,
+        provider,
+        explicit_cache_capability,
+        llm_provider_protocol(provider),
+    )
+}
+
+pub(crate) fn consolidate_system_messages_for_protocol(
+    messages: &[Value],
+    provider: &str,
+    explicit_cache_capability: Option<CacheCapability>,
+    protocol: LlmProviderProtocol,
+) -> Vec<Value> {
     let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
     let allow_suffix_dependent_history_repair = !matches!(
@@ -4135,6 +4234,17 @@ fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     let provider_ids = provider_history_ids(messages);
     strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
+}
+
+fn is_incomplete_marker_only(message: &Value) -> bool {
+    message["role"] == "assistant"
+        && message
+            .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+            .is_some()
+        && message
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.as_str() == Some(""))
+        && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
 }
 
 fn strip_internal_runtime_markers_with_ids(
@@ -4192,6 +4302,8 @@ fn strip_internal_runtime_markers_with_ids(
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
+            object.remove(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD);
+            object.remove(super::model_origin::FOREIGN_GROUP);
             object.remove("_compact_boundary");
             object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
@@ -4200,6 +4312,7 @@ fn strip_internal_runtime_markers_with_ids(
             // prompt cache suffix.
             for key in [
                 astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -4301,6 +4414,20 @@ fn consolidate_system_messages_inner(
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
+    if !preserve_responses {
+        // A Responses-only reasoning item has no content on another wire.
+        // Keep it in canonical history for same-scope replay, but do not send
+        // an empty assistant turn to providers that cannot consume it.
+        out.retain(|message| {
+            !is_incomplete_marker_only(message)
+                && !(message["role"] == "assistant"
+                    && message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                    && message["content"].as_str().is_some_and(str::is_empty)
+                    && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
+        });
+    }
     if !allow_suffix_dependent_history_repair {
         let provider_ids = provider_history_ids(&out);
         strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
@@ -5084,9 +5211,77 @@ pub(crate) fn prepare_streaming_call(
     call: LlmCall<'_>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
+    prepare_streaming_call_with_origin(call, tool_choice, None)
+}
+
+pub(crate) fn prepare_streaming_call_with_origin<'a>(
+    call: LlmCall<'a>,
+    tool_choice: RuntimeToolChoice,
+    scope: Option<&super::model_origin::ReplayScope<'_>>,
+) -> Result<PreparedStreamingCall<'a>, astra_core::ClassifiedError> {
     let preparation_started = Instant::now();
-    if call.route.provider == astra_services::chatgpt::PROVIDER {
-        return responses::prepare(call, tool_choice, preparation_started);
+    if let Some(scope) = scope {
+        super::model_origin::verify_projected(scope, call.messages)?;
+    } else if call
+        .messages
+        .iter()
+        .any(|message| message.get(super::model_origin::FOREIGN_GROUP).is_some())
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "Unverified model history",
+        ));
+    }
+    let default_protocol = llm_provider_protocol(call.route.provider);
+    if call.route.inference_protocol.is_some_and(|protocol| {
+        protocol != default_protocol
+            && !(protocol == LlmProviderProtocol::OpenAiResponses
+                && default_protocol == LlmProviderProtocol::OpenAiCompatible)
+    }) {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "The selected inference protocol is incompatible with this provider",
+        ));
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(|message| {
+            message["role"] == "assistant"
+                && message
+                    .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                    .is_some()
+        })
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            INCOMPLETE_TOOL_CONTINUATION_MESSAGE,
+        )
+        .with_details_json(
+            json!({"source":"runtime","code":"tool_continuation_incomplete"}).to_string(),
+        ));
+    }
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
+        return responses::prepare(call, tool_choice, preparation_started, scope.is_some());
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(astra_core::model_wire::responses::has_tool_continuation)
+    {
+        return Err(responses::error(
+            astra_core::ErrorKind::InvalidRequest,
+            "responses_continuation_scope_changed",
+        ));
     }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
@@ -5278,6 +5473,36 @@ async fn read_provider_error_body(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+struct LlmAttemptSpan {
+    span: tracing::Span,
+    failed: bool,
+}
+
+impl LlmAttemptSpan {
+    fn start() -> Self {
+        crate::server::run_trace::clear_attempt_code();
+        let span = tracing::info_span!(target: "astra.llm", "llm.call");
+        crate::server::run_trace::parent_to_active_run(&span);
+        let entered = span.clone();
+        let _entered = entered.enter();
+        Self { span, failed: true }
+    }
+
+    fn succeed(&mut self) {
+        self.failed = false;
+        crate::server::run_trace::clear_attempt_code();
+    }
+}
+
+impl Drop for LlmAttemptSpan {
+    fn drop(&mut self) {
+        if self.failed {
+            let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            astra_logging::trace_context::mark_error(&self.span, code);
+        }
+    }
+}
+
 async fn call_prepared_llm_with_total_budget(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5297,6 +5522,7 @@ async fn call_prepared_llm_with_total_budget(
         ..
     } = prepared;
     let LlmExecutionRoute {
+        inference_protocol: _,
         model_name,
         api_key,
         base_url: _,
@@ -5434,16 +5660,23 @@ async fn call_prepared_llm_with_total_budget(
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-            Some(
-                astra_services::byok_endpoint::endpoint_client(&url)
-                    .await
-                    .map_err(|error| {
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::InvalidRequest,
-                            error,
-                        )
-                    })?,
+            match prepare_compatible_endpoint(
+                &url,
+                total_budget.saturating_sub(started.elapsed()),
+                cancel,
             )
+            .await
+            {
+                Ok(client) => Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network && attempt < max_retries =>
+                {
+                    last_err = error.message;
+                    last_kind = error.kind;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -5514,8 +5747,12 @@ async fn call_prepared_llm_with_total_budget(
                     .expect("observed attempt requires observer")
                     .note_dispatch_started(attempt_index);
             }
-            req.body(prepared_request.body()).send().await
+            let mut request = req.body(prepared_request.body()).build()?;
+            crate::server::outbound_trace::rewrite(&mut request);
+            client.execute(request).await
         };
+        let mut llm_attempt = LlmAttemptSpan::start();
+        let send_request = send_request.instrument(llm_attempt.span.clone());
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5640,6 +5877,7 @@ async fn call_prepared_llm_with_total_budget(
                     idle_pre,
                     &authorized_tool_names,
                     stream_callback.as_deref_mut(),
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
                 {
@@ -5660,6 +5898,7 @@ async fn call_prepared_llm_with_total_budget(
                         {
                             return Err(attach_llm_result_details(error, &result));
                         }
+                        llm_attempt.succeed();
                         return Ok(result);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
@@ -5860,7 +6099,11 @@ async fn call_prepared_llm_with_total_budget(
                     }
                 }
             }
-            let stream_result = if let Some(lease) = &lease {
+            let stream_result = if route
+                .inference_protocol
+                .unwrap_or_else(|| llm_provider_protocol(provider))
+                == LlmProviderProtocol::OpenAiResponses
+            {
                 responses::collect(
                     response,
                     route,
@@ -5869,7 +6112,8 @@ async fn call_prepared_llm_with_total_budget(
                     stream_callback.as_deref_mut(),
                     started,
                     stream_budget,
-                    lease,
+                    lease.as_ref(),
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
             } else {
@@ -5885,6 +6129,7 @@ async fn call_prepared_llm_with_total_budget(
                         idle_post,
                         &authorized_tool_names,
                         stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
                     )
                     .await
                 } else {
@@ -5898,6 +6143,7 @@ async fn call_prepared_llm_with_total_budget(
                         idle_post,
                         &authorized_tool_names,
                         stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
                     )
                     .await
                 }
@@ -5945,6 +6191,7 @@ async fn call_prepared_llm_with_total_budget(
                     {
                         return Err(attach_llm_result_details(error, &result));
                     }
+                    llm_attempt.succeed();
                     return Ok(result);
                 }
                 Err(StreamCollectError::Cancelled { partial }) => {
@@ -6086,6 +6333,16 @@ async fn call_prepared_llm_with_total_budget(
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value.strip_prefix("req_").is_some_and(|suffix| {
+                    (8..=96).contains(&suffix.len())
+                        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+            .map(str::to_owned);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -6096,7 +6353,18 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = read_provider_error_body(response, subscription.map(|_| 1024 * 1024));
+        let is_responses = route
+            .inference_protocol
+            .unwrap_or_else(|| llm_provider_protocol(provider))
+            == LlmProviderProtocol::OpenAiResponses;
+        let compatible_bad_request = status == 400
+            && llm_provider_protocol(provider) == LlmProviderProtocol::OpenAiCompatible
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none();
+        let body = read_provider_error_body(
+            response,
+            (is_responses || compatible_bad_request).then_some(1024 * 1024),
+        );
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -6159,7 +6427,26 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
-        let structured_error = if let Some(lease) = &lease {
+        let direct_access_error = (subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none())
+        .then(|| provider_access_error(status, &text))
+        .flatten();
+        let structured_error = if let Some(classified) = direct_access_error {
+            Some(ProviderHttpRejection {
+                classified,
+                retryable: false,
+            })
+        } else if status == 402
+            && subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none()
+        {
+            Some(ProviderHttpRejection {
+                classified: payment_required_error(&text),
+                retryable: false,
+            })
+        } else if let Some(lease) = &lease {
             let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let code = astra_services::chatgpt::provider_error_code(status, &body);
             let refresh = status == 401 && !auth_retried;
@@ -6174,6 +6461,81 @@ async fn call_prepared_llm_with_total_budget(
                         json!({"source":"chatgpt","code":code,"http_status":status}).to_string(),
                     ),
                 retryable: refresh || status >= 500,
+            })
+        } else if (is_responses && !is_rate_limit_status(status) && !is_overload_status(status))
+            || compatible_bad_request
+        {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .and_then(astra_core::model_wire::responses::provider_error)
+                .map(|(code, _)| code)
+                .unwrap_or("invalid_request");
+            let parameter = body
+                .pointer("/error/param")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    matches!(
+                        *value,
+                        "model"
+                            | "input"
+                            | "tools"
+                            | "tool_choice"
+                            | "reasoning"
+                            | "reasoning.effort"
+                            | "reasoning_effort"
+                            | "temperature"
+                            | "top_p"
+                            | "max_tokens"
+                            | "max_completion_tokens"
+                            | "max_output_tokens"
+                    )
+                });
+            let rejected_effort = (is_responses
+                && matches!(status, 400 | 422)
+                && matches!(
+                    parameter,
+                    Some("reasoning" | "reasoning.effort" | "reasoning_effort")
+                ))
+            .then(|| serde_json::from_slice::<Value>(&prepared_request.body).ok())
+            .flatten()
+            .and_then(|body| {
+                body.pointer("/reasoning/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|effort| {
+                astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
+                    effort,
+                )
+            });
+            let message = if let Some(effort) = rejected_effort {
+                format!(
+                    "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
+                )
+            } else {
+                parameter.map_or_else(
+                    || format!("Model provider rejected the request (HTTP {status})"),
+                    |parameter| {
+                        format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                    },
+                )
+            };
+            Some(ProviderHttpRejection {
+                classified: astra_core::ClassifiedError::new(
+                    if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                        astra_core::ErrorKind::ContextWindow
+                    } else {
+                        provider_http_error_kind(status, code)
+                    },
+                    message,
+                )
+                .with_details_json(
+                    json!({"source": if is_responses {"responses"} else {"openai_compatible"},"http_status":status,"code":code,"parameter":parameter,"request_id":request_id})
+                        .to_string(),
+                ),
+                retryable: status >= 500,
             })
         } else {
             moi_model_gateway_error(
@@ -6198,25 +6560,9 @@ async fn call_prepared_llm_with_total_budget(
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
-        if status == 402
-            && !uses_moi_model_gateway_error_contract(header_overrides)
-            && model_gateway_error_contract.is_none()
-        {
-            let error = payment_required_error(&text);
-            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-            return Err(error);
-        }
-
-        // Auth responses can echo arbitrary credentials; do not log the body.
-        if status == 401 || status == 403 {
-            tracing::warn!(
-                target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}",
-            );
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                "LLM provider authentication failed".to_string(),
-            );
+        // Missing/mismatched gateway contracts retain only HTTP facts, never
+        // a provider-body interpretation of gateway-owned billing or identity.
+        if let Some(error) = provider_access_error(status, "") {
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
@@ -6225,7 +6571,7 @@ async fn call_prepared_llm_with_total_budget(
         // leaking secrets that providers may echo back. Retain body for 5xx
         // (helpful for diagnosing transient backend failures) and the 400
         // context-window check below (which still needs to inspect text).
-        last_err = if (400..500).contains(&status) {
+        last_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
             format!("LLM error {status}: {text}")
@@ -6403,8 +6749,9 @@ async fn collect_llm_stream_for_wire(
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -6415,6 +6762,7 @@ async fn collect_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -6445,6 +6793,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -6455,7 +6804,36 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -6667,12 +7045,18 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 current_usage_presence(&usage_presence),
             ) {
                 replace_usage_presence(&usage_presence, observed);
+                if let Some((observer, attempt)) = usage_observer {
+                    observer.note_usage_snapshot(attempt, extracted, observed);
+                }
                 usage = extracted.to_qualified_json_map(observed);
                 made_progress = true;
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
+
+        // The terminal frame owns its delta; subsequent frames may only
+        // refine usage until DONE/EOF or the fixed terminal deadline.
+        if yield_state.is_terminal() {
+            continue;
         }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -6695,9 +7079,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .and_then(|c| c.get("delta"))
             .and_then(Value::as_object)
         else {
-            if yield_state.is_terminal() && !usage.is_empty() {
-                break;
-            }
             continue;
         };
 
@@ -6877,9 +7258,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 }
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
-        }
     }
 
     // A provider may close the stream immediately after a delimiter prefix
@@ -7049,8 +7427,9 @@ async fn collect_anthropic_llm_stream_for_wire(
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_anthropic_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -7061,6 +7440,7 @@ async fn collect_anthropic_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -7091,6 +7471,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -7101,7 +7482,36 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_anthropic_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -7334,6 +7744,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -7556,6 +7971,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -7693,7 +8113,12 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    if call.route.provider == astra_services::chatgpt::PROVIDER {
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
         let prepared = prepare_streaming_call(call, tool_choice)?;
         return call_prepared_llm_and_collect_with_stream_callback(
             prepared,
@@ -7731,7 +8156,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         temperature
     };
     let LlmExecutionRoute {
+        inference_protocol: _,
         subscription: _,
+        response_scope: _,
         fixed_temperature: _,
         supported_reasoning_efforts: _,
         thinking_protocol,
@@ -7853,13 +8280,29 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-        Some(
-            astra_services::byok_endpoint::endpoint_client(&url)
-                .await
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
-                })?,
-        )
+        let mut attempt = 0;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None).await {
+                Ok(client) => break Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network
+                        && attempt < LLM_MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(retry_backoff_ms(attempt));
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if delay >= remaining {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ProviderDeadline,
+                            "LLM non-stream total budget exhausted while preparing the connection",
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     } else {
         None
     };
@@ -7898,11 +8341,15 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 .expect("observed attempt requires observer")
                 .note_dispatch_started(attempt_index);
         }
-        req.timeout(effective_timeout)
+        let mut request = req
+            .timeout(effective_timeout)
             .body(prepared_request.body())
-            .send()
-            .await
+            .build()?;
+        crate::server::outbound_trace::rewrite(&mut request);
+        client.execute(request).await
     };
+    let mut llm_attempt = LlmAttemptSpan::start();
+    let send_request = send_request.instrument(llm_attempt.span.clone());
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
@@ -7955,6 +8402,11 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let response_contract_version = resp
+            .headers()
+            .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = match resp.text().await {
             Ok(text) => text,
             Err(body_error) => {
@@ -7982,13 +8434,33 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
-        if status == 402 {
+        if let Some(rejection) = moi_model_gateway_error(
+            status,
+            &text,
+            header_overrides,
+            response_contract_version.as_deref(),
+        ) {
+            let error = rejection.classified;
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        let ordinary_provider = !uses_moi_model_gateway_error_contract(header_overrides)
+            && response_contract_version.is_none();
+        if let Some(error) =
+            provider_access_error(status, if ordinary_provider { &text } else { "" })
+        {
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        if status == 402 && ordinary_provider {
             let error = payment_required_error(&text);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = provider_http_error_kind(status, &text);
-        let message = if kind == astra_core::ErrorKind::Auth {
+        let kind = provider_http_error_kind(status, if ordinary_provider { &text } else { "" });
+        let message = if !ordinary_provider {
+            format!("LLM request rejected: {status}")
+        } else if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
         } else {
             let detail = redact_provider_secrets(&text);
@@ -8121,6 +8593,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     {
         return Err(attach_llm_result_details(error, &result));
     }
+    llm_attempt.succeed();
     Ok(result)
 }
 
@@ -8397,8 +8870,10 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
 /// Canonical HTTP recovery classification shared by inference protocols.
 fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
     use astra_core::ErrorKind;
-    if status == 401 || status == 403 {
+    if status == 401 {
         ErrorKind::Auth
+    } else if status == 403 {
+        ErrorKind::ProviderForbidden
     } else if is_rate_limit_status(status) {
         ErrorKind::RateLimit
     } else if status >= 500 {
@@ -8547,6 +9022,38 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn compatible_endpoint_preparation_respects_policy_deadline_and_cancellation() {
+        let budget = std::time::Duration::from_secs(1);
+        for url in ["http://provider.example/v1", "https://127.0.0.1/v1"] {
+            let error = prepare_compatible_endpoint(url, budget, LlmCancel::None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            budget,
+            LlmCancel::Token(&cancel),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            std::time::Duration::ZERO,
+            LlmCancel::None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+    }
+
+    #[tokio::test]
     async fn primary_streaming_and_nonstreaming_preserve_admitted_protocol_and_sampling() {
         use astra_core::model_wire::thinking::ThinkingProtocol;
         use axum::{Json, response::IntoResponse};
@@ -8612,6 +9119,8 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     model_name: "local-alias".into(),
                     wire_model_name: Some("upstream-fixture".into()),
@@ -8693,6 +9202,8 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     model_name: "fixture".into(),
                     wire_model_name: None,
@@ -8791,6 +9302,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
@@ -8872,6 +9385,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9048,6 +9563,8 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             fixed_temperature: None,
             supported_reasoning_efforts: None,
@@ -9297,6 +9814,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9344,6 +9863,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9412,6 +9933,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9512,6 +10035,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -9706,6 +10231,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9768,6 +10295,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9847,6 +10376,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9917,6 +10448,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9984,6 +10517,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10058,6 +10593,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10124,6 +10661,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10169,6 +10708,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10220,6 +10761,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10288,6 +10831,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10381,6 +10926,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10455,6 +11002,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10700,13 +11249,12 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let r = parse_nonstream_response_for_provider(&v, "openai", "test-model");
+        assert_eq!(r.usage_presence.measured_input_tokens, Some(10));
+        assert!(!r.usage_presence.fresh_input_tokens);
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(
-            r.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(10)
-        );
+        assert_eq!(r.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             r.usage.get("output_tokens").and_then(Value::as_u64),
             Some(5)
@@ -12046,6 +12594,8 @@ mod tests {
             yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
             tokio::time::sleep(Duration::from_millis(300)).await;
             yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            yield Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":{"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":3}}}))));
             std::future::pending::<()>().await;
         });
         let started = TokioInstant::now();
@@ -12061,9 +12611,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.full_text, "done");
-        assert_eq!(result.usage["input_tokens"], 10);
+        assert_eq!(result.usage["input_tokens"], 3);
+        assert_eq!(result.usage["cached_input_tokens"], 4);
+        assert_eq!(result.usage["cache_creation_tokens"], 3);
         assert_eq!(result.usage["output_tokens"], 3);
-        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -12127,12 +12679,11 @@ mod tests {
         )
         .await
         .expect("collect");
+        assert_eq!(res.usage_presence.measured_input_tokens, Some(3));
+        assert!(!res.usage_presence.fresh_input_tokens);
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
-        assert_eq!(
-            res.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(3)
-        );
+        assert_eq!(res.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             res.usage.get("output_tokens").and_then(Value::as_u64),
             Some(4)
@@ -12147,37 +12698,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_null_markers_cannot_hide_raw_usage_conflicts() {
+        let mut frames = Vec::new();
+        for usage in [
+            json!({
+                "prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7,
+                "cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                "opencode":{"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+            }),
+            json!({"opencode":{"tokens":{"input":4,"output":7}}}),
+        ] {
+            frames.push(Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"usage":usage})
+            ))));
+        }
+        frames.push(Ok(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )));
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "opencode-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("invalid accounting evidence must not discard the answer");
+        assert_eq!(result.full_text, "done");
+        assert!(result.usage_presence.input_invalid && result.usage_presence.output_invalid);
+        assert!(result.usage.is_empty());
+        let terminal = provider_attempt_terminal_from_result(&result);
+        assert_ne!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_partial_write_conflict_respects_frame_boundary() {
+        let partial_tokens = json!({"input":4,"cache_read":6,"cache_write_5m":6});
+        for (updates, expected_usage, expected_status) in [
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7,"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"output_tokens":7}),
+                astra_services::InferenceUsageStatus::ProviderPartial,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7}),
+                    json!({"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"input_tokens":4,"cached_input_tokens":6,"cache_creation_tokens":6,"output_tokens":7,"total_tokens":23}),
+                astra_services::InferenceUsageStatus::ProviderExact,
+            ),
+        ] {
+            let mut frames: Vec<_> = updates
+                .into_iter()
+                .map(|usage| Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":usage})))))
+                .collect();
+            frames.push(Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("usage qualification must not discard the answer");
+            assert_eq!(result.full_text, "done");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage_status, expected_status);
+            assert_eq!(Value::Object(result.usage), expected_usage);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
+        for (usage, expected_input, expected_output) in [
+            (
+                json!({
+                    "prompt_tokens":17774, "completion_tokens":1051,
+                    "prompt_tokens_details":{"cached_tokens":9600},
+                    "opencode":{"tokens":{
+                        "input":8174,"output":1051,"reasoning":537,
+                        "cache_read":9600,"cache_write_5m":0,"cache_write_1h":0
+                    }}
+                }),
+                Some((8174, 9600, 0)),
+                1051,
+            ),
+            (
+                json!({
+                    "prompt_tokens":4,"completion_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":5,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                None,
+                7,
+            ),
+        ] {
+            let frame = json!({
+                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                "usage":usage
+            });
+            let result = collect_llm_stream(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {frame}\n\ndata: [DONE]\n\n"
+                )))]),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("OpenCode stream completes");
+            assert_eq!(result.full_text, "done");
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage.output_tokens, expected_output);
+            if let Some((input, read, write)) = expected_input {
+                assert_eq!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+                assert_eq!(terminal.usage.input.fresh_input_tokens, input);
+                assert_eq!(terminal.usage.input.cache_read_tokens, read);
+                assert_eq!(result.usage["cache_creation_tokens"], write);
+            } else {
+                assert_ne!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
-        for (updates, expected_fresh, expected_cached) in [
+        for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
-                100,
                 0,
+                0,
+                false,
             ),
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"completion_tokens": 5, "prompt_tokens": null}),
                 ],
                 70,
                 30,
+                true,
             ),
             (
                 vec![
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
                 70,
                 30,
+                true,
             ),
         ] {
             let mut frames = vec![Ok(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
             ))];
             for usage in updates {
                 frames.push(Ok(Bytes::from(format!(
@@ -12185,6 +12906,7 @@ mod tests {
                     json!({"usage": usage})
                 ))));
             }
+            frames.push(Ok(Bytes::from(format!("data: {}\n\n", json!({"choices":[{"delta":{"content":"late text","tool_calls":[{"index":0,"id":"late-call","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"length"}]})))));
             frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
             let result = collect_llm_stream(
                 stream::iter(frames),
@@ -12197,18 +12919,28 @@ mod tests {
             )
             .await
             .expect("partial usage chunks must converge");
+            assert_eq!(result.full_text, "Hello");
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
             let terminal = provider_attempt_terminal_from_result(&result);
             assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
             assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
             assert_eq!(terminal.usage.output_tokens, 5);
             assert_eq!(
                 terminal.usage_status,
-                astra_services::InferenceUsageStatus::ProviderPartial
+                if expected_creation_known {
+                    astra_services::InferenceUsageStatus::ProviderExact
+                } else {
+                    astra_services::InferenceUsageStatus::ProviderPartial
+                }
             );
-            assert!(result.usage_presence.fresh_input_tokens);
+            assert_eq!(result.usage_presence.fresh_input_tokens, expected_fresh > 0);
             assert!(result.usage_presence.output_tokens);
             assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
-            assert!(!result.usage_presence.cache_creation_tokens);
+            assert_eq!(
+                result.usage_presence.cache_creation_tokens,
+                expected_creation_known
+            );
         }
     }
 
@@ -12284,7 +13016,7 @@ mod tests {
         for repaired in [false, true] {
             let mut frames = vec![Ok(Bytes::from(format!(
                 "data: {}\n\n",
-                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80}}})
+                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}})
             )))];
             if repaired {
                 frames.push(Ok(Bytes::from(format!(
@@ -12417,6 +13149,1240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_orphan_closers_preserve_answer() {
+        let answer = "Mailbox permission is required.";
+        let content =
+            format!("{answer}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>");
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect orphan protocol suffix");
+        assert_eq!(result.full_text, answer);
+        assert!(
+            result.tool_calls.is_empty(),
+            "closing tags do not identify a call"
+        );
+        let visible = updates
+            .into_iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, answer);
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, answer);
+        assert!(nonstream.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_calls_use_the_existing_wire_authority() {
+        let markup = concat!(
+            " Starting.\n<｜DSML｜ calls><｜DSML｜ invoke name=\"search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">123</｜DSML｜ parameter>",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">5</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke><｜DSML｜ invoke name=\"undeclared\">{}",
+            "</｜DSML｜ invoke></｜DSML｜ calls>Ready. ",
+        );
+        let allowed = HashSet::from(["search".to_owned()]);
+        for native in [false, true] {
+            let mut delta = json!({"content":markup});
+            if native {
+                delta["tool_calls"] = json!([{
+                    "index":0,"id":"native-search","type":"function",
+                    "function":{"name":"search","arguments":"{\"query\":\"native\",\"count\":1}"},
+                }]);
+            }
+            let event = json!({"choices":[{"delta":delta,"finish_reason":"stop"}]});
+            let mut updates = Vec::new();
+            let mut callback = |update| updates.push(update);
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .expect("collect native or recovered DSML call");
+            assert_eq!(result.full_text, " Starting.\nReady. ");
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":delta,"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("search")]
+            );
+            let arguments: Value = serde_json::from_str(
+                result.tool_calls[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arguments,
+                if native {
+                    json!({"query":"native","count":1})
+                } else {
+                    json!({"query":"123","count":5})
+                }
+            );
+            if native {
+                assert_eq!(result.tool_calls[0]["id"], "native-search");
+            }
+            let visible = updates
+                .into_iter()
+                .filter_map(|update| match update {
+                    LlmStreamUpdate::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, result.full_text);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_invalid_input_reaches_strict_admission() {
+        let markup = "<｜DSML｜ calls><｜DSML｜ invoke name=\"search\"><｜DSML｜ parameter name=\"count\" string=\"false\">invalid</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let event = json!({"choices":[{"delta":{"content":markup},"finish_reason":"stop"}]});
+        let allowed = HashSet::from(["search".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {event}\n\ndata: [DONE]\n\n"
+            )))]),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+            None,
+        )
+        .await
+        .expect("retain failed named tool input");
+        assert_eq!(result.full_text, "");
+        let call = &result.tool_calls[0];
+        assert_eq!(call["function"]["name"], "search");
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+            Err("arguments contain incomplete or invalid JSON")
+        );
+        let edge =
+            astra_turn_core::stream_events::build_edge_tool_call_event(call.as_object().unwrap());
+        assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_malformed_outer_owns_nested_calls() {
+        for (content, outer_name) in [
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke name=""><||DSML||invoke name="bash"><||DSML||parameter name="command">pwd</||DSML||parameter></||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke><||DSML||invoke name="bash">{"command":"pwd"}</||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<｜DSML｜ calls><｜DSML｜ invoke name="write_file"><｜DSML｜ calls></｜DSML｜ calls><｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke></｜DSML｜ invoke></｜DSML｜ calls>"#,
+                Some("write_file"),
+            ),
+        ] {
+            let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+            let event = json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                None,
+                None,
+            )
+            .await
+            .expect("collect malformed outer invocation");
+            assert_eq!(result.full_text, "");
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+            for call in &result.tool_calls {
+                assert_eq!(
+                    astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                    Err("arguments contain incomplete or invalid JSON")
+                );
+                let edge = astra_turn_core::stream_events::build_edge_tool_call_event(
+                    call.as_object().unwrap(),
+                );
+                assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+            }
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                nonstream
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_json_owns_markup_before_wire_admission() {
+        let args = json!({
+            "path": "example.txt",
+            "content": r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'>{"command":"pwd"}</|DSML|invoke>"#
+        });
+        let content = format!(
+            "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{args}</|DSML|invoke></|DSML|calls> after"
+        );
+        let frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .chain([Ok(Bytes::from("data: [DONE]\n\n"))])
+            .collect::<Vec<_>>();
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .unwrap();
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(published, "Before  after");
+        for result in [result, nonstream] {
+            assert_eq!(result.full_text, published);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| (
+                        call["function"]["name"].as_str(),
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                            .unwrap(),
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(Some("write_file"), args.clone())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_json_bodies_cannot_release_nested_calls() {
+        let embedded = r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#;
+        let nested = json!([{"examples":[embedded]}]);
+        let genuine = r#"<|DSML|invoke name="bash">{"command":"echo sibling"}</|DSML|invoke>"#;
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        let invalid = "arguments contain incomplete or invalid JSON";
+        let mut cases = [
+            nested.to_string(),
+            json!(embedded).to_string(),
+            format!("[,{nested}]"),
+            "true".to_owned(),
+            "-3.25e2".to_owned(),
+            "null".to_owned(),
+        ]
+        .into_iter()
+        .map(|body| (body, Err(invalid)))
+        .collect::<Vec<_>>();
+        let parameter_embedded = r#"quoted "data" \ </|DSML|parameter></|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#;
+        let parameter_value = json!(parameter_embedded);
+        for (encoded, value) in [
+            (parameter_value.to_string(), Ok(parameter_value.clone())),
+            (
+                parameter_value.to_string().replace('<', r"\u003c"),
+                Ok(parameter_value.clone()),
+            ),
+            (
+                json!({"nested":parameter_value}).to_string(),
+                Ok(json!({"nested":parameter_value})),
+            ),
+            (
+                json!([parameter_value]).to_string(),
+                Ok(json!([parameter_value])),
+            ),
+            (format!("[,{parameter_value}]"), Err(invalid)),
+        ] {
+            cases.push((
+                format!(r#"<|DSML|parameter name="path">example.txt</|DSML|parameter><|DSML|parameter name="content" string="false">{encoded}</|DSML|parameter>"#),
+                value.map(|value| json!({"path":"example.txt","content":value})),
+            ));
+        }
+        cases.push((
+            r#"<|DSML|parameter name="path">example.txt</|DSML|parameter><|DSML|parameter name="content">{"unfinished text</|DSML|parameter>"#.to_owned(),
+            Ok(json!({"path":"example.txt","content":"{\"unfinished text"})),
+        ));
+        for (body, expected) in cases {
+            let content = format!(
+                "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{body}</|DSML|invoke>{genuine}</|DSML|calls> after"
+            );
+            for fragmented in [false, true] {
+                let pieces = if fragmented {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let frames = pieces
+                    .into_iter()
+                    .map(|piece| {
+                        let event = json!({"choices":[{"delta":{"content":piece}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .chain([Ok(Bytes::from("data: [DONE]\n\n"))]);
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let streamed = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &allowed,
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(published, "Before  after");
+                for result in [streamed, nonstream] {
+                    assert_eq!(result.full_text, published);
+                    let calls = result
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            (
+                                call["function"]["name"].as_str(),
+                                astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        calls,
+                        vec![
+                            (Some("write_file"), expected.clone()),
+                            (Some("bash"), Ok(json!({"command":"echo sibling"}))),
+                        ],
+                        "{body}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
+        let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
+        for content in [
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("1. ~~~xml\n\n   {call}\n   ~~~\n"),
+            format!("> ~~~text\n> {call}\n> ~~~"),
+            format!("    {call}\n"),
+            format!("- ~~~text\n  {call}\n  ~~~"),
+            format!("1. ~~~text\n   {call}\n   ~~~"),
+            format!("> - ~~~text\n>   {call}\n>   ~~~"),
+            format!("100. ~~~text\n     {call}\n     ~~~"),
+            format!("```text\n> ```\n{call}\n```"),
+            format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
+            format!(">\t~~~xml\n> {call}\n> ~~~\n"),
+            format!("\t{call}\n"),
+        ]
+        .into_iter()
+        .flat_map(|text| [text.clone(), text.replace("~~~", "```")])
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .expect("collect Markdown example");
+                assert!(
+                    result.tool_calls.is_empty(),
+                    "Markdown is data: {content:?}"
+                );
+                assert_eq!(result.full_text, content);
+                assert_eq!(published, content);
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, content);
+                assert!(nonstream.tool_calls.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_non_protocol_names_remain_literal() {
+        let content =
+            r#"<|DSML|invoke-example name="bash">{"command":"pwd"}</|DSML|invoke-example>"#;
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.full_text, content);
+            assert_eq!(published, content);
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, content);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_inline_code_continuation_resumes_call_recovery() {
+        let content = "Before `foo\n    bar`\n<|DSML|invoke name=\"bash\">{\"command\":\"pwd\"}</|DSML|invoke>";
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "Before `foo\n    bar`\n");
+            assert_eq!(published, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            assert_eq!(
+                astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    &result.tool_calls[0]
+                )
+                .unwrap(),
+                json!({"command":"pwd"})
+            );
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(nonstream.tool_calls[0]["function"]["name"], "bash");
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_fragmented_long_prefixes_are_preserved_or_hidden() {
+        let fence_info = format!(
+            "~~~{}\n<|DSML|invoke name=\"bash\">{{\"command\":\"pwd\"}}</|DSML|invoke>\n~~~\n",
+            "x`".repeat(32_000)
+        );
+        let lazy_quotes = format!("{}first\n{}", "> ".repeat(3_200), "!x\n".repeat(3_200));
+        for (content, expected) in [
+            (fence_info.clone(), fence_info),
+            (lazy_quotes.clone(), lazy_quotes),
+            (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
+            (
+                format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
+                String::new(),
+            ),
+        ] {
+            let mut frames=content.as_bytes().chunks(16).map(|chunk| {
+                let event=json!({"choices":[{"delta":{"content":std::str::from_utf8(chunk).unwrap()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            }).collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, expected);
+            assert_eq!(published, expected);
+            assert!(result.tool_calls.is_empty());
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, expected);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_blocks_and_physical_lines() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let wrapped = format!("<|DSML|calls>{call}</|DSML|calls>");
+        let first = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"a.txt"}</||DSML||invoke></||DSML||
+ tool_calls>"#;
+        let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
+        for (content, expected, paths) in [
+            (
+                "<|DSML|invoke name=\"read_file\"><|DSML|parameter name=\"path\" string=\"true\">line1\rline2\nline3</|DSML|parameter></|DSML|invoke>".to_owned(),
+                String::new(),
+                vec!["line1\rline2\nline3"],
+            ),
+            (
+                format!("```example```\n{call}"),
+                "```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("``example``\n{call}"),
+                "``example``\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text ```example```\n{call}"),
+                "Text ```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("x ` y\n```{call}`"),
+                format!("x ` y\n```{call}`"),
+                vec![],
+            ),
+            (
+                format!("x `` y\n```text ` {call}``"),
+                format!("x `` y\n```text ` {call}``"),
+                vec![],
+            ),
+            (
+                format!("x ` y\n```text\n{call}\n```\n{call}"),
+                format!("x ` y\n```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("```text\n{call}\n```\n{call}"),
+                format!("```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<pre>\n{call}\n</pre>\n{call}"),
+                format!("<pre>\n{call}\n</pre>\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<!--\n{call}\n-->\n{call}"),
+                format!("<!--\n{call}\n-->\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n\n{call}"),
+                format!("<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n{call}"),
+                format!("<div>\n{call}\n</div>\n{call}"),
+                vec![],
+            ),
+            (
+                format!("Answer <code>{call}</code>. {call}"),
+                format!("Answer <code>{call}</code>. "),
+                vec!["README.md"],
+            ),
+            (
+                format!("Answer <br>{call}"),
+                "Answer <br>".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <pre>\n> example\n{call}"),
+                "> <pre>\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <!--\n> example\n{call}"),
+                "> <!--\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Use a ` character\n===\n`{call}`"),
+                format!("Use a ` character\n===\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character\n===\n{call}"),
+                "Use a ` character\n===\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text\n    `example\n{call}`"),
+                format!("Text\n    `example\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Text\n\n    `example\n    {call}`\n"),
+                format!("Text\n\n    `example\n    {call}`\n"),
+                vec![],
+            ),
+            (
+                format!("Example opener: \\<|DSML|calls>\n\n<|DSML|calls>{call}</|DSML|calls>"),
+                "Example opener: \\<|DSML|calls>\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!(
+                    "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n<|DSML|calls>{call}</|DSML|calls>"
+                ),
+                "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("# Example opener: \\<|DSML|calls>\n<|DSML|calls>{call}</|DSML|calls>"),
+                "# Example opener: \\<|DSML|calls>\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("The literal is: \\{call}"),
+                format!("The literal is: \\{call}"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n`{call}`"),
+                format!("Use a ` character.\n\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n{call}"),
+                "Use a ` character.\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n{call}"),
+                "- Example\n  ~~~text\n  example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "one</|DSML|\ncalls>    two</|DSML|calls>three".to_owned(),
+                "one    twothree".to_owned(),
+                vec![],
+            ),
+            (
+                format!("> ~~~\n# `\n`{call}`"),
+                format!("> ~~~\n# `\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Start `\n<!-- -->\n`{call}`"),
+                format!("Start `\n<!-- -->\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("- item\n<div>\n{call}\n</div>\n\n{call}"),
+                format!("- item\n<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("</div>\n{call}\n\n{call}"),
+                format!("</div>\n{call}\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("Need to inspect ` README.\n{call}"),
+                "Need to inspect ` README.\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("`example\n1.\n{call}`"),
+                format!("`example\n1.\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("`example\n+ \n{call}`"),
+                format!("`example\n+ \n{call}`"),
+                vec![],
+            ),
+            (
+                format!("`example\n*\n{}`", call.replace('|', "｜")),
+                format!("`example\n*\n{}`", call.replace('|', "｜")),
+                vec![],
+            ),
+            (
+                format!("Need `inspect\n1.\n    {wrapped}"),
+                "Need `inspect\n1.\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Example `heading\n-\n{call}"),
+                "Example `heading\n-\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n    `{call}`\n    {call}"),
+                format!("- item\n-\n    `{call}`\n    "),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n    {call}"),
+                "- item\n-\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n\n    {call}"),
+                format!("- item\n-\n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>\n>     {call}"),
+                format!("> - item\n> - \n>\n>     {call}"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2. \n\n    {call}"),
+                format!("1. item\n2. \n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n  started\n\n  {call}"),
+                "- item\n-\n  started\n\n  ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "before `unmatched\n    ".to_owned(),
+                "before `unmatched\n    ".to_owned(),
+                vec![],
+            ),
+            (
+                format!("Need `inspect\n{wrapped}\n    "),
+                "Need `inspect\n\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- > > before `open\n<br>\n{call}`"),
+                format!("- > > before `open\n<br>\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Start `{wrapped}\n-     `\n"),
+                "Start `\n-     `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Start `{wrapped}\n    `\n"),
+                format!("Start `{wrapped}\n    `\n"),
+                vec![],
+            ),
+            (
+                format!("Start `{wrapped}\n- next `\n"),
+                "Start `\n- next `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("{first}    {second}"),
+                "    ".to_owned(),
+                vec!["a.txt", "b.txt"],
+            ),
+        ].into_iter().flat_map(|(content, expected, paths)| ["\n", "\r\n"].map(|ending| (
+            content.replace('\n', ending), expected.replace('\n', ending),
+            paths.iter().map(|path| path.replace('\n', ending)).collect::<Vec<_>>()
+        ))) {
+            let chars = content.chars().collect::<Vec<_>>();
+            for width in [chars.len(), 1, 4, 16, 64] {
+                let chunks = chars.chunks(width).map(|chunk| chunk.iter().collect::<String>());
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["read_file".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.full_text, expected, "{content:?}");
+                assert_eq!(published, expected, "callback differs at chunk width {width}: {content:?}");
+                let arguments = result
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        assert_eq!(call["function"]["name"], "read_file");
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arguments,
+                    paths
+                        .iter()
+                        .map(|path| json!({"path":path}))
+                        .collect::<Vec<_>>()
+                );
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, expected);
+                assert_eq!(
+                    nonstream
+                        .tool_calls
+                        .iter()
+                        .map(
+                            |call| astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                                call
+                            )
+                            .unwrap()
+                        )
+                        .collect::<Vec<_>>(),
+                    arguments
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_respects_literal_and_outer_ownership() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let nested =
+            r#"<|DSML|invoke name="bash"><parameter name="command">pwd</parameter></|DSML|invoke>"#;
+        let legacy = "<tool_call>bash)(pwd)</tool_call>";
+        for (content, literal, expected) in [
+            (format!("<Invoke>{nested}</Invoke>"), false),
+            (format!("< invoke>{nested}</invoke>"), false),
+            (format!("<invoke>{nested}</invoke>"), false),
+            (format!("<Invoke name=\"\">{nested}</Invoke>"), false),
+            (
+                format!("<invoke label='name=\"bash\"'>{nested}</invoke>"),
+                false,
+            ),
+            (
+                format!("<invoke tool_name=\"bash\">{nested}</invoke>"),
+                false,
+            ),
+            ("<!--\n<invoke name=\"bash\">\n-->".to_owned(), true),
+            (
+                "Text <code><parameter=example> pwd</code>.".to_owned(),
+                true,
+            ),
+            (format!("<section>\n{call}\n</section>\n"), true),
+            (format!("<style>\n{call}\n</style>\n"), true),
+            (format!("<textarea>\n{call}\n</textarea>\n"), true),
+            (format!("<my-widget>\n{call}\n</my-widget>\n"), true),
+            (format!("<pre>\n{call}\n</pre>\n"), true),
+            (format!("<!--\n{call}\n-->\n"), true),
+            (format!("<pre>\nexample\n</pre>\n    {call}"), true),
+            (format!("<!--\nexample\n-->\n    {call}"), true),
+            (format!("Answer <code>{call}</code>."), true),
+            (format!("> <pre>\n> {call}\n> </pre>\n"), true),
+            (format!("<div class=\"example\">\n{call}\n</div>\n"), true),
+            (format!("<invoke name=\"\">{call}</invoke>"), false),
+            (
+                format!("<parameter name=\"example\">{call}</parameter>"),
+                false,
+            ),
+            (
+                format!("<|DSML|parameter name=\"example\">{legacy}</|DSML|parameter>"),
+                false,
+            ),
+            (format!("<|DSML|calls>{legacy}</|DSML|calls>"), false),
+        ]
+        .into_iter()
+        .map(|(content, literal)| (content, literal, None))
+        .chain(
+            [
+                r#"<Invoke name="bash"><parameter name="command">pwd</parameter></Invoke>"#,
+                r#"< invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name='bash'><parameter name='command'>pwd</parameter></invoke>"#,
+            ]
+            .map(|content| (content.to_owned(), false, Some(json!({"command":"pwd"})))),
+        ) {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|c| c.to_string()).collect()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                for calls in [&result.tool_calls, &nonstream.tool_calls] {
+                    let actual = calls
+                        .iter()
+                        .map(|call| {
+                            assert_eq!(call["function"]["name"], "bash");
+                            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        expected.iter().cloned().collect::<Vec<_>>(),
+                        "{content:?}"
+                    );
+                }
+                if literal {
+                    assert_eq!(result.full_text, content);
+                    assert_eq!(published, content);
+                    assert_eq!(nonstream.full_text, content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_delivers_prose_before_line_or_stream_end() {
+        for pieces in [
+            &["1. This is an ordinary answer arriving incrementally."][..],
+            &["- An ordinary bullet."],
+            &["# An ordinary heading"],
+            &["(An ordinary opening parenthesis)"],
+            &[
+                "Press the `",
+                " key to continue. ",
+                "Then check the result.",
+                " No tool markup is present.",
+            ],
+        ] {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let input = stream::unfold(receiver, |mut receiver| async {
+                    receiver.recv().await.map(|bytes| (Ok(bytes), receiver))
+                });
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        let _ = updates.send(text);
+                    }
+                };
+                collect_llm_stream_for_wire(
+                    Box::pin(input),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::new(),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+            });
+            let mut expected = String::new();
+            let mut published = String::new();
+            for piece in pieces {
+                let event = json!({"choices":[{"delta":{"content":piece}}]});
+                sender
+                    .send(Bytes::from(format!("data: {event}\n\n")))
+                    .await
+                    .unwrap();
+                expected.push_str(piece);
+                // A run at the end of a chunk still needs its delimiter width.
+                let ready = expected.trim_end_matches('`');
+                let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while published.len() < ready.len() {
+                        published.push_str(
+                            &received
+                                .recv()
+                                .await
+                                .expect("text callback while stream stays open"),
+                        );
+                    }
+                })
+                .await;
+                if delivered.is_err() {
+                    task.abort();
+                }
+                delivered.expect("ordinary prose must be delivered before newline or EOF");
+                assert_eq!(published, ready);
+            }
+            sender.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.full_text, expected);
+            assert!(result.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_parameter_markup_preserves_answer_suffix() {
+        let content = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &HashSet::from(["write_file".to_owned()]),
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .expect("collect markup inside a string parameter");
+        assert_eq!(published, "Before.After.");
+        assert_eq!(result.full_text, published);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(&result.tool_calls[0])
+                .unwrap(),
+            json!({"path":"example.txt","content":"<parameter=x>hello"})
+        );
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, published);
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
         let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
@@ -12476,6 +14442,7 @@ mod tests {
             stream_idle_timeout_after_progress(),
             &allowed,
             None,
+            None,
         )
         .await
         .expect("collect with a partial exact surface");
@@ -12492,6 +14459,7 @@ mod tests {
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
             &no_tools,
+            None,
             None,
         )
         .await
@@ -12995,6 +14963,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -13057,6 +15027,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -13408,6 +15380,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
@@ -14006,6 +15980,8 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -15065,6 +17041,97 @@ mod tests {
     }
 
     #[test]
+    fn canonical_responses_retry_switches_to_anthropic_without_empty_assistant() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut assistant = json!({"role":"assistant", "content":""});
+        assistant[CONTINUATION_KEY] = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning", "id":"rs", "summary":[], "encrypted_content":"opaque"}),
+            ],
+            ..Default::default()
+        }
+        .continuation(&connection, "model");
+        let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+        crate::turn::llm::private_continuation::seal(
+            &mut assistant[CONTINUATION_KEY],
+            &key,
+            "owner",
+            "session",
+        )
+        .unwrap();
+        let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "retry required Work",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        for new_user in [false, true] {
+            let mut history = vec![
+                json!({"role":"user", "content":"goal"}),
+                assistant.clone(),
+                control.clone(),
+            ];
+            if new_user {
+                history.push(json!({"role":"user", "content":"new question"}));
+            }
+            let canonical = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
+            let mut opened = canonical.clone();
+            crate::turn::llm::private_continuation::open(
+                &mut opened,
+                &key,
+                "owner",
+                &HashSet::from(["session".to_string()]),
+                &connection,
+                "model",
+            )
+            .unwrap();
+            let replay = request("model", &opened, None, &connection, false, None).unwrap();
+            assert!(
+                replay["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["encrypted_content"] == "opaque")
+            );
+            let mut switched = canonical.clone();
+            let mut required =
+                crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut switched)
+                    .unwrap();
+            required.extend(switched);
+            let projected = consolidate_system_messages_for_protocol(
+                &required,
+                "anthropic",
+                None,
+                LlmProviderProtocol::AnthropicMessages,
+            );
+            let body = build_provider_request_body(
+                &projected,
+                &[],
+                "claude-test",
+                "anthropic",
+                None,
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            assert!(body["messages"].as_array().unwrap().iter().all(|message| {
+                message["role"] != "assistant"
+                    || message["content"]
+                        .as_array()
+                        .is_some_and(|blocks| !blocks.is_empty())
+            }));
+            assert_eq!(body.to_string().contains("retry required Work"), !new_user);
+            assert!(
+                canonical
+                    .iter()
+                    .any(|message| message.get(CONTINUATION_KEY).is_some())
+            );
+        }
+    }
+
+    #[test]
     fn canonical_continuation_tool_result_is_valid_across_provider_protocols() {
         let canonical =
             astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
@@ -15759,6 +17826,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -15824,6 +17893,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -15877,6 +17948,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -15923,6 +17996,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -15966,6 +18041,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16014,6 +18091,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -16090,6 +18169,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16123,6 +18204,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16177,6 +18260,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16245,6 +18330,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16295,6 +18382,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16349,6 +18438,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16397,6 +18488,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16420,7 +18513,12 @@ mod tests {
         .await
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-        assert!(err.message.contains("context_length_exceeded"));
+        assert_eq!(
+            err.message,
+            "Model provider rejected the request (HTTP 400)"
+        );
+        let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["code"], "context_length_exceeded");
     }
 
     #[tokio::test]
@@ -16445,6 +18543,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16567,6 +18667,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16613,6 +18715,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16758,6 +18862,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -16785,8 +18891,15 @@ mod tests {
                         .await
                         .unwrap_err()
                 };
-                assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-                assert_eq!(err.message, "LLM provider authentication failed");
+                assert_eq!(
+                    err.kind,
+                    if status == 401 {
+                        astra_core::ErrorKind::Auth
+                    } else {
+                        astra_core::ErrorKind::ProviderForbidden
+                    }
+                );
+                assert!(!format!("{err:?}").contains("private-credential"));
             }
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -16809,6 +18922,14 @@ mod tests {
         assert_eq!(
             llm_completions_url("https://api.openai.com/v1/", None, "openai"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_keeps_route_query_after_the_endpoint_path() {
+        assert_eq!(
+            llm_completions_url("https://gateway.example/v1?tenant=one", None, "openai"),
+            "https://gateway.example/v1/chat/completions?tenant=one"
         );
     }
 

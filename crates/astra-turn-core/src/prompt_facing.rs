@@ -18,6 +18,10 @@ use serde_json::{Value, json};
 const MAX_PROMPT_FACING_MESSAGES: usize = 40;
 const RUNTIME_RECAP_HEADING: &str = "[Session runtime recap]";
 
+/// Canonical evidence that a tool group's calls or results cannot be verified.
+/// This is not a provider message field and grants no tool execution authority.
+pub const INCOMPLETE_TOOL_GROUP_FIELD: &str = "_astra_incomplete_tool_group";
+
 pub fn extract_text_content(msg: &Value) -> Option<String> {
     if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
         return Some(s.to_string());
@@ -175,7 +179,7 @@ pub fn sanitize_prompt_facing_messages_with_state(
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, false, false)
+    sanitize_canonical_continuation_messages_impl(messages, CanonicalProjection::Restore, false)
 }
 
 /// Project a current-turn delta for canonical commit, independent of outcome.
@@ -190,12 +194,31 @@ pub fn sanitize_canonical_turn_delta_with_turn_semantics(
     messages: Vec<Value>,
     has_prior_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, true, has_prior_user_context)
+    sanitize_canonical_continuation_messages_impl(
+        messages,
+        CanonicalProjection::TurnDelta,
+        has_prior_user_context,
+    )
+}
+
+/// Project an authorized compaction replacement while retaining unresolved
+/// recovery evidence whose original user anchor may have been lost.
+pub fn sanitize_canonical_replacement_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, CanonicalProjection::Replacement, false)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalProjection {
+    Restore,
+    TurnDelta,
+    Replacement,
 }
 
 fn sanitize_canonical_continuation_messages_impl(
     messages: Vec<Value>,
-    preserve_compacted_head: bool,
+    projection: CanonicalProjection,
     mut has_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
     for message in &messages {
@@ -211,11 +234,43 @@ fn sanitize_canonical_continuation_messages_impl(
     // Otherwise two different owners could become indistinguishable and an
     // invalid reference could gain authority when this history is restored.
     let duplicate_targets = duplicate_output_targets(&messages);
-    let start = if preserve_compacted_head {
+    let mut start = if projection != CanonicalProjection::Restore {
         compacted_canonical_turn_start(&messages)?
     } else {
         latest_compaction_boundary_start(&messages).unwrap_or(0)
     };
+    if projection == CanonicalProjection::Restore && start > 0 {
+        let human = messages
+            .iter()
+            .rposition(astra_turn_types::is_human_user_message);
+        let active_start = human.map_or(0, |index| index + 1);
+        if human.is_some_and(|index| index < start)
+            && messages[active_start..]
+                .iter()
+                .any(|message| message["role"] == "assistant" && contains_tool_call_frame(message))
+        {
+            // A compaction boundary can follow retained current-turn evidence.
+            // Keep its human anchor so restoring the history cannot erase it.
+            start = human.unwrap_or(0);
+        } else if human.is_none()
+            && messages[..start]
+                .iter()
+                .any(|message| message["role"] == "assistant" && contains_tool_call_frame(message))
+        {
+            start = 0;
+        }
+    }
+    // A compaction boundary does not supersede a retained provider's state.
+    // Keep its human anchor so canonical projection can retain the group.
+    if let Some(index) = messages[..start]
+        .iter()
+        .position(astra_core::model_wire::responses::has_reasoning_continuation)
+    {
+        start = messages[..index]
+            .iter()
+            .rposition(astra_turn_types::is_human_user_message)
+            .unwrap_or(0);
+    }
     let messages = messages
         .into_iter()
         .enumerate()
@@ -238,6 +293,9 @@ fn sanitize_canonical_continuation_messages_impl(
         })
         .collect::<Vec<_>>();
 
+    let last_human = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message);
     let mut out = Vec::new();
     let mut index = 0;
     while index < messages.len() {
@@ -251,6 +309,11 @@ fn sanitize_canonical_continuation_messages_impl(
         }
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
+            // Provider tool-result envelopes may use the user role, but they
+            // do not establish a new human turn or authorize its tool history.
+            "user" if !astra_turn_types::is_human_user_message(message) => {
+                index += 1;
+            }
             "user" | "system" => {
                 if let Some(projected) = canonical_text_message(message, role, role == "user") {
                     out.push(projected);
@@ -261,7 +324,24 @@ fn sanitize_canonical_continuation_messages_impl(
             "assistant" if contains_tool_call_frame(message) => {
                 let block_end = consecutive_tool_block_end(&messages, index + 1);
                 if has_user_context {
-                    append_complete_tool_group(&mut out, message, &messages[index + 1..block_end]);
+                    append_complete_tool_group(
+                        &mut out,
+                        message,
+                        &messages[index + 1..block_end],
+                        false,
+                    );
+                } else if projection != CanonicalProjection::TurnDelta
+                    && last_human.is_none_or(|human| index > human)
+                {
+                    // A damaged restored history may have lost its user anchor.
+                    // Keep unresolved evidence, but do not admit a complete
+                    // tool round as a new conversation without that anchor.
+                    append_complete_tool_group(
+                        &mut out,
+                        message,
+                        &messages[index + 1..block_end],
+                        true,
+                    );
                 }
                 index = block_end;
             }
@@ -320,15 +400,51 @@ pub fn sanitize_canonical_continuation_messages_with_state(
     Ok(out)
 }
 
+fn continuation_loss_marker(message: &Value) -> Value {
+    let saved = &message[astra_core::model_wire::responses::CONTINUATION_KEY];
+    if saved["model"]
+        .as_str()
+        .is_some_and(astra_core::model_wire::responses::is_model_binding)
+    {
+        let candidate = json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:{
+            "connection_id":saved["connection_id"], "model":saved["model"],
+            astra_core::model_wire::responses::HISTORY_INCOMPLETE:true
+        }});
+        if let Some(marker) = astra_core::model_wire::responses::validated_continuation(&candidate)
+        {
+            return marker;
+        }
+    }
+    json!({"invalid":true})
+}
+
 fn canonical_provider_continuation(message: &Value) -> Option<Value> {
-    let mut saved = astra_core::model_wire::responses::validated_continuation(message)?;
+    message.get(astra_core::model_wire::responses::CONTINUATION_KEY)?;
+    let Some(mut saved) = astra_core::model_wire::responses::validated_continuation(message) else {
+        // Preserve only the fact that replay evidence was invalid, never its
+        // untrusted content. The active turn must not silently resume without it.
+        return Some(continuation_loss_marker(message));
+    };
+    if !saved["model"]
+        .as_str()
+        .is_some_and(astra_core::model_wire::responses::is_model_binding)
+    {
+        return Some(continuation_loss_marker(message));
+    }
+    if saved[astra_core::model_wire::responses::HISTORY_INCOMPLETE] == true {
+        return Some(saved);
+    }
+    if saved["items"].as_array()?.iter().any(|item| {
+        item.get(astra_core::model_wire::responses::SEALED_ITEM)
+            .is_none()
+    }) {
+        return Some(continuation_loss_marker(message));
+    }
     // Provider-encrypted state and IDs are opaque protocol fields. Free text
     // follows the existing credential-redaction boundary before persistence.
     for item in saved["items"].as_array_mut()? {
-        for field in ["content", "summary"] {
-            if let Some(text) = item.get_mut(field) {
-                astra_text_utils::credential_redaction::redact_credentials_in_json(text);
-            }
+        if let Some(text) = item.get_mut("content") {
+            astra_text_utils::credential_redaction::redact_credentials_in_json(text);
         }
     }
     Some(saved)
@@ -339,14 +455,29 @@ fn canonical_text_message(
     role: &str,
     preserve_turn_semantics: bool,
 ) -> Option<Value> {
-    let raw_content = extract_text_content(message)?;
-    let content = prompt_facing_content_for_role(role, &raw_content)?;
+    let saved = canonical_provider_continuation(message).filter(|saved| {
+        // Calls require the complete assistant/tool group handled separately.
+        !saved["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call"))
+    });
+    let content =
+        extract_text_content(message).and_then(|raw| prompt_facing_content_for_role(role, &raw));
+    // A completed Responses item can carry replayable reasoning without
+    // visible text. Preserve only validated provider state at this canonical
+    // boundary; display projections still omit reasoning-only messages.
+    if content.is_none() && saved.is_none() {
+        return None;
+    }
     let mut projected = json!({
         "role": role,
-        "content": content,
+        "content": content.unwrap_or_default(),
     });
-    if let Some(saved) = canonical_provider_continuation(message) {
+    if let Some(saved) = saved {
         projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
+    }
+    if role == "assistant" {
+        preserve_model_replay_identity(message, &mut projected);
     }
     if message
         .get(crate::cloud::history_summary::HISTORY_SUMMARY_FIELD)
@@ -364,6 +495,15 @@ fn canonical_text_message(
     Some(projected)
 }
 
+fn preserve_model_replay_identity(source: &Value, projected: &mut Value) {
+    if let Some(origin) = astra_turn_types::model_replay_origin(source)
+        && astra_turn_types::model_item_id(source) == Some(origin.item_id.as_str())
+    {
+        astra_turn_types::mark_model_message(projected, Some(&origin.item_id));
+        astra_turn_types::mark_model_replay_origin(projected, &origin);
+    }
+}
+
 fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
     while messages
         .get(index)
@@ -376,48 +516,106 @@ fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
     index
 }
 
-fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[Value]) {
-    let Some(calls) = assistant.get("tool_calls").and_then(Value::as_array) else {
-        if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
-            out.push(projected);
-        }
-        return;
-    };
+fn append_complete_tool_group(
+    out: &mut Vec<Value>,
+    assistant: &Value,
+    tools: &[Value],
+    only_incomplete: bool,
+) {
+    let calls = assistant
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
-    let mut results_by_id = std::collections::HashMap::<&str, &Value>::new();
+    let mut results_by_id = std::collections::HashMap::<&str, Option<&Value>>::new();
     for tool in tools {
         if let Some(id) = tool.get("tool_call_id").and_then(Value::as_str)
             && !id.is_empty()
         {
-            results_by_id.entry(id).or_insert(tool);
+            results_by_id
+                .entry(id)
+                .and_modify(|result| *result = None)
+                .or_insert(Some(tool));
         }
     }
 
     let mut matched_calls = Vec::new();
     let mut matched_results = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    let mut call_counts = std::collections::HashMap::<&str, usize>::new();
+    let mut provider_counts = std::collections::HashMap::<&str, usize>::new();
+    let mut missing_result = false;
+    for call in calls {
+        if let Some(id) = call.get("id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            *call_counts.entry(id).or_default() += 1;
+            let provider_id = crate::tool::args::shape::provider_tool_call_id(call).unwrap_or(id);
+            *provider_counts.entry(provider_id).or_default() += 1;
+        }
+    }
     for call in calls {
         let Some(id) = call.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if id.is_empty() || !seen_ids.insert(id) {
+        let provider_id = crate::tool::args::shape::provider_tool_call_id(call).unwrap_or(id);
+        if call_counts.get(id) != Some(&1) || provider_counts.get(provider_id) != Some(&1) {
             continue;
         }
-        let Some(result) = results_by_id.get(id) else {
-            continue;
-        };
-        matched_calls.push(call.clone());
-        matched_results.push(project_tool_result(result, id));
+        match results_by_id.get(id) {
+            Some(Some(result)) => {
+                matched_calls.push(call.clone());
+                matched_results.push(project_tool_result(result, id));
+            }
+            None => {
+                // Keep the provider conversation valid without inventing an
+                // execution fact when cancellation or disconnection lost the result.
+                if let Ok(call) =
+                    crate::tool::args::shape::canonicalize_tool_call_for_execution(call)
+                {
+                    matched_calls.push(call);
+                    matched_results.push(json!({
+                        "role": "tool", "tool_call_id": id,
+                        "content": "The tool result was not recorded. The call may not have started, may have changed state, or may still be running. Inspect the current state before retrying."
+                    }));
+                    missing_result = true;
+                }
+            }
+            Some(None) => {} // Duplicate results are ambiguous, not evidence.
+        }
     }
 
+    let saved = canonical_provider_continuation(assistant);
+    let incomplete = missing_result
+        || assistant.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
+        || calls.is_empty()
+        || matched_calls.len() != calls.len()
+        || matched_results.len() != tools.len()
+        || saved.as_ref().is_some_and(|value| {
+            value["invalid"] == true
+                || !astra_core::model_wire::responses::continuation_group_matches(
+                    assistant,
+                    &matched_results,
+                    crate::tool::args::shape::provider_tool_call_id,
+                )
+        })
+        || assistant["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"));
+    if only_incomplete && !incomplete {
+        return;
+    }
     if matched_calls.is_empty() {
-        if let Some(mut projected) = canonical_text_message(assistant, "assistant", false) {
-            projected
-                .as_object_mut()
-                .expect("canonical text message is an object")
-                .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
-            out.push(projected);
+        let content = extract_text_content(assistant)
+            .and_then(|text| prompt_facing_content_for_role("assistant", &text))
+            .unwrap_or_default();
+        let mut projected = json!({"role":"assistant", "content":content, "tool_calls":[]});
+        preserve_model_replay_identity(assistant, &mut projected);
+        projected[INCOMPLETE_TOOL_GROUP_FIELD] = Value::Bool(true);
+        if let Some(saved) = saved {
+            projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
         }
+        out.push(projected);
         return;
     }
 
@@ -426,23 +624,43 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
         ("tool_calls".to_string(), Value::Array(matched_calls)),
     ]);
     if let Some(content) = assistant.get("content") {
-        projected.insert("content".to_string(), content.clone());
+        let content = if let Some(parts) = content.as_array()
+            && parts.iter().any(|part| part["type"] == "tool_use")
+        {
+            let retained: Vec<_> = parts
+                .iter()
+                .filter(|part| part["type"] != "tool_use")
+                .cloned()
+                .collect();
+            if retained.is_empty() {
+                Value::Null
+            } else {
+                Value::Array(retained)
+            }
+        } else {
+            content.clone()
+        };
+        projected.insert("content".to_string(), content);
     }
-    if let Some(reasoning) = assistant.get("reasoning_content") {
-        projected.insert("reasoning_content".to_string(), reasoning.clone());
+    for field in ["reasoning_content", "reasoning_signature"] {
+        if let Some(reasoning) = assistant.get(field).filter(|value| value.is_string()) {
+            projected.insert(field.to_string(), reasoning.clone());
+        }
     }
-    // A pruned/incomplete call group cannot replay the complete provider turn.
-    if projected["tool_calls"]
-        .as_array()
-        .is_some_and(|matched| matched.len() == calls.len())
-        && let Some(saved) = canonical_provider_continuation(assistant)
-    {
+    // Keep protocol evidence even for an interrupted group. The codec checks
+    // it against canonical pairs before replaying any part of that group.
+    if let Some(saved) = saved {
         projected.insert(
             astra_core::model_wire::responses::CONTINUATION_KEY.into(),
             saved,
         );
     }
-    out.push(Value::Object(projected));
+    if incomplete {
+        projected.insert(INCOMPLETE_TOOL_GROUP_FIELD.into(), Value::Bool(true));
+    }
+    let mut projected = Value::Object(projected);
+    preserve_model_replay_identity(assistant, &mut projected);
+    out.push(projected);
     out.extend(matched_results);
 }
 
@@ -463,6 +681,23 @@ fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
         && !name.is_empty()
     {
         projected.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    // Keep only the existing identity-bound recovery metadata. A descriptor
+    // from another call or run must not become a recovery authority.
+    if let Some(run_id) = crate::tool_result_storage::tool_result_run_id(tool) {
+        projected.insert(
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD.into(),
+            Value::String(run_id.to_string()),
+        );
+        if let Some(descriptor) = crate::tool_result_storage::tool_result_artifact_descriptor(tool)
+            && descriptor.call_id == tool_call_id
+            && let Ok(value) = serde_json::to_value(descriptor)
+        {
+            projected.insert(
+                crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD.into(),
+                value,
+            );
+        }
     }
     if let Some(target) = duplicate_output_reference(tool) {
         projected.insert("_synthetic".to_string(), Value::Bool(true));
@@ -638,8 +873,17 @@ fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
 }
 
 fn contains_tool_call_frame(msg: &Value) -> bool {
-    if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        return !tool_calls.is_empty();
+    if msg.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
+        || astra_core::model_wire::responses::has_tool_continuation(msg)
+    {
+        return true;
+    }
+    if msg.get("tool_calls").is_some_and(|calls| match calls {
+        Value::Null => false,
+        Value::Array(calls) => !calls.is_empty(),
+        _ => true,
+    }) {
+        return true;
     }
     if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
         return content
@@ -720,29 +964,73 @@ mod tests {
     };
     use serde_json::{Value, json};
 
+    // The runtime owns encryption and replay; these fixtures exercise only
+    // canonical grouping and preservation of already-sealed metadata.
+    fn sealed_continuation(connection: &str, mut items: Vec<Value>) -> Value {
+        for item in &mut items {
+            item[astra_core::model_wire::responses::SEALED_ITEM] =
+                json!({"origin":"session", "ciphertext":"opaque"});
+        }
+        json!({"connection_id":connection,
+            "model":astra_core::model_wire::responses::model_binding("model"), "items":items})
+    }
+
     #[test]
-    fn canonical_history_preserves_scoped_provider_state_and_phase() {
-        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
-        let connection = uuid::Uuid::new_v4().to_string();
-        let encrypted = "sk-fixtureciphertextciphertextciphertext";
-        let output = ResponseOutput {
-            items: vec![
-                json!({"type":"reasoning","summary":[],"encrypted_content":encrypted}),
-                json!({"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}),
-            ],
-            ..Default::default()
+    fn canonical_tool_results_keep_only_identity_bound_recovery_metadata() {
+        use crate::tool_result_storage::{
+            mark_tool_result_artifact_descriptor, mark_tool_result_run_id,
+            persist_tool_result_with_descriptor, tool_result_artifact_descriptor,
+            tool_result_run_id,
         };
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-1",
+            "call-1",
+            "read_file",
+            "large result",
+        )
+        .unwrap();
+        let mut result =
+            json!({"role":"tool", "tool_call_id":"call-1", "content":"result retained"});
+        mark_tool_result_run_id(&mut result, Some("run-1")).unwrap();
+        mark_tool_result_artifact_descriptor(&mut result, Some(&artifact.descriptor)).unwrap();
+        let messages = vec![
+            json!({"role":"user", "content":"inspect"}),
+            json!({"role":"assistant", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+            result.clone(),
+        ];
+        let committed = sanitize_canonical_turn_delta_with_turn_semantics(messages, false).unwrap();
+        assert_eq!(tool_result_run_id(&committed[2]), Some("run-1"));
+        assert_eq!(
+            tool_result_artifact_descriptor(&committed[2]),
+            Some(artifact.descriptor)
+        );
+        result["tool_call_id"] = json!("different-call");
+        let projected = super::project_tool_result(&result, "different-call");
+        assert!(tool_result_artifact_descriptor(&projected).is_none());
+    }
+
+    #[test]
+    fn canonical_history_preserves_scoped_sealed_provider_state() {
+        use astra_core::model_wire::responses::CONTINUATION_KEY;
+        let connection = uuid::Uuid::new_v4().to_string();
         let mut assistant = json!({"role":"assistant","content":"Done"});
-        assistant[CONTINUATION_KEY] = output.continuation(&connection, "model");
+        assistant[CONTINUATION_KEY] = sealed_continuation(
+            &connection,
+            vec![
+                json!({"type":"reasoning"}),
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}),
+            ],
+        );
         let messages = vec![json!({"role":"user","content":"explain"}), assistant];
         let canonical =
             super::sanitize_canonical_continuation_messages_with_turn_semantics(messages.clone())
                 .unwrap();
-        let replay = request("model", &canonical, None, &connection, false, None).unwrap();
-        assert_eq!(replay["input"][1]["encrypted_content"], encrypted);
-        assert_eq!(replay["input"][2]["phase"], "final_answer");
-        let switched = request("model", &canonical, None, "other-connection", false, None).unwrap();
-        assert!(!switched.to_string().contains(encrypted));
+        assert_eq!(
+            canonical[1][CONTINUATION_KEY],
+            messages[1][CONTINUATION_KEY]
+        );
         assert!(
             sanitize_prompt_facing_messages(messages)[1]
                 .get(CONTINUATION_KEY)
@@ -751,19 +1039,114 @@ mod tests {
     }
 
     #[test]
-    fn canonical_history_drops_provider_state_from_incomplete_tool_groups() {
-        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput};
+    fn unsealed_plaintext_reasoning_is_not_committed() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
         let output = ResponseOutput {
-            items: vec![json!({"type":"function_call","call_id":"c1","name":"read_file"})],
+            items: vec![
+                json!({"type":"reasoning", "id":"rs", "summary":[], "content":[
+                    {"type":"reasoning_text", "text":format!("inspect {secret}")}
+                ]}),
+                json!({"type":"function_call", "id":"fc", "call_id":"c1", "name":"read_file"}),
+            ],
             ..Default::default()
+        };
+        let mut assistant = json!({"role":"assistant", "content":"", "tool_calls":[
+            {"id":"c1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}
+        ]});
+        assistant[CONTINUATION_KEY] = output.continuation(&connection, "model");
+        let messages = vec![
+            json!({"role":"user", "content":"inspect"}),
+            assistant,
+            json!({"role":"tool", "tool_call_id":"c1", "content":"done"}),
+        ];
+        let committed = sanitize_canonical_turn_delta_with_turn_semantics(messages, false).unwrap();
+        assert!(!json!(committed).to_string().contains(secret));
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+        assert_eq!(restored[1][CONTINUATION_KEY], json!({"invalid":true}));
+        assert!(request("model", &restored, None, &connection, false, None).is_err());
+        assert!(
+            !json!(sanitize_user_visible_messages(restored))
+                .to_string()
+                .contains("reasoning_text")
+        );
+    }
+
+    #[test]
+    fn canonical_history_preserves_reasoning_only_responses_after_restore() {
+        use astra_core::model_wire::responses::CONTINUATION_KEY;
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut assistant = json!({"role":"assistant", "content":""});
+        assistant[CONTINUATION_KEY] =
+            sealed_continuation(&connection, vec![json!({"type":"reasoning"})]);
+        let expected = assistant[CONTINUATION_KEY].clone();
+        let retry_content = astra_turn_types::render_append_only_runtime_authority_frame(
+            "canonical_work_establishment_retry",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+            "retry",
+        )
+        .unwrap();
+        let mut retry = json!({"role":"user", "content":retry_content});
+        mark_append_only_required_context(
+            &mut retry,
+            "canonical_work_establishment_retry",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let original = vec![json!({"role":"user", "content":"goal"}), assistant, retry];
+        let committed = super::sanitize_canonical_turn_delta_with_turn_semantics(original, false)
+            .expect("canonical commit");
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(committed)
+                .expect("canonical restore");
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[1]["role"], "assistant");
+        assert_eq!(restored[1]["content"], "");
+        assert_eq!(restored[1][CONTINUATION_KEY], expected);
+        assert_eq!(sanitize_prompt_facing_messages(restored.clone()).len(), 1);
+
+        let mut invalid = restored;
+        invalid[1][CONTINUATION_KEY]["connection_id"] = json!("invalid");
+        let sanitized =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(invalid)
+                .expect("invalid provider state is safely marked");
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[1][CONTINUATION_KEY], json!({"invalid":true}));
+
+        let mut orphan = json!({"role":"assistant", "content":""});
+        orphan[CONTINUATION_KEY] = sealed_continuation(
+            &connection,
+            vec![json!({"type":"function_call", "call_id":"c", "name":"read_file"})],
+        );
+        let sanitized = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+            json!({"role":"user", "content":"goal"}),
+            orphan,
+        ])
+        .unwrap();
+        assert_eq!(sanitized.len(), 2);
+        assert!(sanitized[1].get(CONTINUATION_KEY).is_some());
+        assert_eq!(sanitized[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+    }
+
+    #[test]
+    fn canonical_history_preserves_provider_state_from_interrupted_tool_groups() {
+        use astra_core::model_wire::responses::CONTINUATION_KEY;
+        let continuation = || {
+            sealed_continuation(
+                &uuid::Uuid::new_v4().to_string(),
+                vec![
+                    json!({"type":"function_call","call_id":"c1","name":"read_file"}),
+                    json!({"type":"function_call","call_id":"c2","name":"read_file"}),
+                ],
+            )
         };
         for matched in [0, 1, 2] {
             let mut assistant = json!({"role":"assistant","content":"Checking","tool_calls":[
                 {"id":"c1","function":{"name":"read_file","arguments":"{}"}},
                 {"id":"c2","function":{"name":"read_file","arguments":"{}"}}
             ]});
-            assistant[CONTINUATION_KEY] =
-                output.continuation(&uuid::Uuid::new_v4().to_string(), "model");
+            assistant[CONTINUATION_KEY] = continuation();
             let mut messages = vec![json!({"role":"user","content":"inspect"}), assistant];
             for id in ["c1", "c2"].into_iter().take(matched) {
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":"file"}));
@@ -771,8 +1154,306 @@ mod tests {
             let canonical =
                 super::sanitize_canonical_continuation_messages_with_turn_semantics(messages)
                     .unwrap();
-            assert_eq!(canonical[1].get(CONTINUATION_KEY).is_some(), matched == 2);
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(canonical)
+                    .unwrap();
+            assert!(restored[1].get(CONTINUATION_KEY).is_some());
+            assert_eq!(
+                restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD] == true,
+                matched != 2,
+                "{matched} recorded results"
+            );
         }
+        // An older projection may already have lost one call while retaining
+        // its provider state. Count and identity must still match the group.
+        let mut partial = json!({"role":"assistant", "tool_calls":[
+            {"id":"c1", "function":{"name":"read_file", "arguments":"{}"}}
+        ]});
+        partial[CONTINUATION_KEY] = continuation();
+        let restored = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+            json!({"role":"user", "content":"inspect"}),
+            partial,
+            json!({"role":"tool", "tool_call_id":"c1", "content":"file"}),
+        ])
+        .unwrap();
+        assert_eq!(restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        assert_eq!(restored[2]["tool_call_id"], "c1");
+        for (id, name) in [("c2", "read_file"), ("c1", "write_file")] {
+            let mut mismatch = restored[1].clone();
+            mismatch
+                .as_object_mut()
+                .unwrap()
+                .remove(super::INCOMPLETE_TOOL_GROUP_FIELD);
+            mismatch[CONTINUATION_KEY] = sealed_continuation(
+                &uuid::Uuid::new_v4().to_string(),
+                vec![json!({"type":"function_call", "call_id":id, "name":name})],
+            );
+            let projected =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+                    json!({"role":"user", "content":"inspect"}),
+                    mismatch,
+                    restored[2].clone(),
+                ])
+                .unwrap();
+            assert_eq!(projected[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        }
+        let mut complete = restored[1].clone();
+        complete
+            .as_object_mut()
+            .unwrap()
+            .remove(super::INCOMPLETE_TOOL_GROUP_FIELD);
+        complete[CONTINUATION_KEY] = sealed_continuation(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![json!({"type":"function_call", "call_id":"c1", "name":"read_file"})],
+        );
+        for extra in [
+            json!({"role":"tool", "tool_call_id":"orphan", "content":"unrelated"}),
+            json!({"role":"tool", "tool_call_id":"c1", "content":"duplicate"}),
+            json!({"role":"tool", "content":"missing identity"}),
+        ] {
+            let projected =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+                    json!({"role":"user", "content":"inspect"}),
+                    complete.clone(),
+                    restored[2].clone(),
+                    extra,
+                ])
+                .unwrap();
+            assert_eq!(projected[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(projected)
+                    .unwrap();
+            assert_eq!(restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        }
+    }
+
+    #[test]
+    fn canonical_history_preserves_incomplete_tool_evidence_without_unmatched_calls() {
+        let calls = json!([
+            {"id":"c1", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"c2", "function":{"name":"read_file", "arguments":"{}"}}
+        ]);
+        for (tool_calls, results, expected_pairs) in [
+            (calls.clone(), vec![], 2),
+            (
+                calls.clone(),
+                vec![json!({"role":"tool", "tool_call_id":"c1", "content":"done"})],
+                2,
+            ),
+            (
+                json!([
+                    {"id":"c1", "function":{"name":"write_file"}},
+                    {"id":"c1", "function":{"name":"delete_file"}}
+                ]),
+                vec![json!({"role":"tool", "tool_call_id":"c1", "content":"done"})],
+                0,
+            ),
+            (
+                json!([{"id":"c1"}, {"id":"c1"}, {"id":"c2"}]),
+                vec![
+                    json!({"role":"tool", "tool_call_id":"c1", "content":"ambiguous"}),
+                    json!({"role":"tool", "tool_call_id":"c2", "content":"unique"}),
+                ],
+                1,
+            ),
+            (
+                json!([
+                    {"id":"c1", "_astra_provider_tool_call_id":"same"},
+                    {"id":"c2", "_astra_provider_tool_call_id":"same"},
+                    {"id":"c3"}
+                ]),
+                vec![
+                    json!({"role":"tool", "tool_call_id":"c1", "content":"first"}),
+                    json!({"role":"tool", "tool_call_id":"c2", "content":"second"}),
+                    json!({"role":"tool", "tool_call_id":"c3", "content":"unique"}),
+                ],
+                1,
+            ),
+            (
+                json!([{"id":"c1"}]),
+                vec![
+                    json!({"role":"tool", "tool_call_id":"c1", "content":"first"}),
+                    json!({"role":"tool", "tool_call_id":"c1", "content":"conflicting"}),
+                ],
+                0,
+            ),
+            (json!([{"id":"broken"}]), vec![], 0),
+            (
+                json!([{"id":"broken", "function":{"name":"bash", "arguments":"{"}}]),
+                vec![],
+                0,
+            ),
+            (json!([{"function":{"name":"write_file"}}]), vec![], 0),
+            (json!({"invalid":true}), vec![], 0),
+        ] {
+            let mut suffix =
+                vec![json!({"role":"assistant", "content":"", "tool_calls":tool_calls})];
+            suffix.extend(results);
+            let committed =
+                sanitize_canonical_turn_delta_with_turn_semantics(suffix, true).unwrap();
+            assert_eq!(committed[0][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+            assert_eq!(
+                committed[0]["tool_calls"].as_array().unwrap().len(),
+                expected_pairs
+            );
+            assert_eq!(committed.len(), 1 + expected_pairs);
+
+            let mut full = vec![json!({"role":"user", "content":"work"})];
+            full.extend(committed);
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(full).unwrap();
+            assert_eq!(restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+            assert_eq!(
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(
+                    restored.clone()
+                )
+                .unwrap(),
+                restored,
+            );
+        }
+
+        let complete = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "tool_calls":calls}),
+            json!({"role":"tool", "tool_call_id":"c1", "content":"done"}),
+            json!({"role":"tool", "tool_call_id":"c2", "content":"done"}),
+        ];
+        let complete =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(complete).unwrap();
+        assert!(
+            complete[1]
+                .get(super::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn incomplete_tool_group_preserves_recorded_results_and_reports_missing_outcomes() {
+        let input = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "tool_calls":[
+                {"id":"first", "function":{"name":"write_file", "arguments":"{}"}},
+                {"id":"second", "function":{"name":"bash", "arguments":"{}"}}
+            ]}),
+            json!({"role":"tool", "tool_call_id":"first", "content":"written"}),
+        ];
+        let history =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(input).unwrap();
+        assert_eq!(history[2]["content"], "written");
+        assert_eq!(history[3]["tool_call_id"], "second");
+        assert!(
+            history[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("may not have started")
+        );
+        assert!(
+            history[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("before retrying")
+        );
+    }
+
+    #[test]
+    fn canonical_restore_keeps_active_tool_evidence_across_compaction_boundaries() {
+        let user = json!({"role":"user", "content":"work"});
+        let pending = json!({"role":"assistant", "tool_calls":[
+            {"id":"c1", "function":{"name":"write_file", "arguments":"{}"}}
+        ]});
+        let boundary = json!({"role":"system", "content":"compacted", "_compact_boundary":true});
+        for messages in [
+            vec![user.clone(), pending.clone(), boundary.clone()],
+            vec![user.clone(), boundary.clone(), pending.clone()],
+        ] {
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(messages)
+                    .unwrap();
+            assert_eq!(restored[0], user);
+            assert_eq!(restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        }
+
+        let mut marker = json!({"role":"assistant", "content":"", "tool_calls":[]});
+        marker[super::INCOMPLETE_TOOL_GROUP_FIELD] = Value::Bool(true);
+        let runtime_context = runtime_owned_message(
+            "user",
+            "runtime retry",
+            RuntimeMessageDelivery::EphemeralControl,
+        );
+        let unanchored_call =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+                pending,
+                boundary.clone(),
+                runtime_context,
+            ])
+            .unwrap();
+        assert_eq!(unanchored_call[0][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        let unanchored = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+            marker.clone(),
+            boundary.clone(),
+        ])
+        .unwrap();
+        assert_eq!(unanchored[0][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        let new_turn = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+            user,
+            marker,
+            boundary,
+            json!({"role":"user", "content":"new turn"}),
+        ])
+        .unwrap();
+        assert_eq!(new_turn, vec![json!({"role":"user", "content":"new turn"})]);
+    }
+
+    #[test]
+    fn unanchored_restore_keeps_only_unresolved_tool_evidence() {
+        let calls = json!([
+            {"id":"c1", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"c2", "function":{"name":"write_file", "arguments":"{}"}}
+        ]);
+        let assistant = json!({"role":"assistant", "tool_calls":calls});
+        let first = json!({"role":"tool", "tool_call_id":"c1", "content":"done"});
+        let second = json!({"role":"tool", "tool_call_id":"c2", "content":"done"});
+        let user = json!({"role":"user", "content":"new turn"});
+
+        let complete = vec![assistant.clone(), first.clone(), second];
+        assert!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(complete.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::sanitize_canonical_replacement_with_turn_semantics(complete.clone())
+                .unwrap()
+                .is_empty()
+        );
+        let mut followed = complete;
+        followed.push(user.clone());
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(followed).unwrap(),
+            vec![user.clone()]
+        );
+
+        let incomplete = vec![assistant, first];
+        assert!(
+            super::sanitize_canonical_turn_delta_with_turn_semantics(incomplete.clone(), false)
+                .unwrap()
+                .is_empty()
+        );
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(incomplete)
+                .unwrap();
+        assert_eq!(restored[0][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(restored.clone())
+                .unwrap(),
+            restored
+        );
+        let mut followed = restored;
+        followed.push(user.clone());
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(followed).unwrap(),
+            vec![user]
+        );
     }
 
     #[test]
@@ -1147,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_continuation_drops_orphaned_tool_frames_without_splitting_valid_pairs() {
+    fn canonical_continuation_drops_orphans_and_closes_missing_tool_results() {
         let messages = vec![
             json!({"role": "tool", "tool_call_id": "orphan-result", "content": "ignore me"}),
             json!({"role": "user", "content": "inspect"}),
@@ -1168,19 +1849,17 @@ mod tests {
         )
         .expect("valid canonical history");
 
-        assert_eq!(got.len(), 4);
-        assert_eq!(got[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[1]["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(got[1]["tool_calls"][0]["id"], "paired");
         assert_eq!(got[2]["tool_call_id"], "paired");
+        assert_eq!(got[2]["content"], "durable evidence");
+        assert_eq!(got[3]["tool_call_id"], "missing");
+        assert!(got[3]["content"].as_str().unwrap().contains("not recorded"));
         assert!(
-            got.iter().all(|message| {
-                message["tool_call_id"] != "orphan-result"
-                    && message
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_none_or(|calls| calls.iter().all(|call| call["id"] != "missing"))
-            }),
-            "projection must retain only provider-valid complete tool groups"
+            got.iter()
+                .all(|message| message["tool_call_id"] != "orphan-result"),
+            "an orphan result must not be attached to a different call"
         );
     }
 

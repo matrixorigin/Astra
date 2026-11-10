@@ -21,8 +21,9 @@ allowed_tools:
 # Review Changes
 
 Review like a maintainer. Report only material issues: correctness, security,
-data loss, API/contract breakage, concurrency/resource bugs, and meaningful test gaps.
-Do not comment on style unless it hides a bug.
+data loss, user experience, API/contract breakage, performance and resource
+cost, unjustified complexity, and meaningful test gaps. Ground design concerns
+in concrete consequences; do not report cosmetic preferences.
 
 Hard rule: treat production control flow driven by natural-language text
 matching as a correctness issue. Safety, admission, routing, blocking, retry,
@@ -37,11 +38,19 @@ legacy fallback decision paths.
 - Evaluate the requested product behavior and canonical owner, not just whether
   the patch compiles. A systemic repair may require replacement or deletion;
   unnecessary new layers and old/new mixed implementations are not progress.
+- Collect related findings across the whole affected journey and current review
+  threads before concluding. Check that the model receives actionable failure
+  context and can use its tools to recover; avoid endorsing brittle blanket
+  terminal rules or adding another control path without a concrete need.
+- Examine implementation, tests, and documentation separately. Test volume or a
+  net deletion does not prove quality; challenge real boundaries and unhappy
+  paths, and require workload evidence for concurrency or performance claims.
 - Astra is treated as a fresh system: do not request backward compatibility,
   data migration, dual paths, or legacy shims unless the user explicitly changes
   that requirement. Distinguish this from required current crash/retry recovery.
-- A review authorizes inspection, not fixes, commits, pushes, or PR mutations.
-  Broader cleanup recommendations must stay separate from verified defects.
+- A review alone authorizes inspection, not fixes, commits, or pushes. Submit an
+  approval or request changes when explicitly requested. Broader cleanup
+  recommendations must stay separate from verified defects.
 - Perform ordinary review with the current agent. Independent review and model
   or effort overrides apply only when required by the user or an applicable
   configured workflow; this skill supplies no reviewer or model default.
@@ -66,8 +75,9 @@ git status --short
 git diff --stat
 ```
 
-These are inspections: omit Bash `mode`. `mode=verify` requests a separate
-unchanged-workspace proof after edits, not a check that a diagnostic command ran.
+Use ordinary Bash commands for both inspection and checks. A command result
+records its output and exit status; it does not certify an unchanged workspace
+or global task correctness. Explicit declared checks retain their own contract.
 
 Target resolution:
 

@@ -4,8 +4,8 @@ use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMeta
 /// Feed a fixture input through the same active dispatcher used by production.
 #[allow(clippy::too_many_arguments)]
 async fn submit_stage_input(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
@@ -123,7 +123,7 @@ for line in sys.stdin: pass
         turn: Some("turn".into()),
         ..Evidence::default()
     };
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut input_rx = None;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let result = submit_stage_input(
@@ -284,7 +284,7 @@ for line in sys.stdin:
             );
             let token = CancellationToken::new();
             let mut process = transport::process(&script, token.clone()).await;
-            let input = process.input();
+            let input = process.input().expect("framed process input");
             let mut evidence = Evidence {
                 thread: Some("thread".into()),
                 turn: Some("turn".into()),
@@ -456,7 +456,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -585,7 +585,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -628,7 +628,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -668,7 +668,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -703,7 +703,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -1852,7 +1852,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     timeout: Some(Duration::from_secs(15)),
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
@@ -1861,7 +1861,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 cancel.clone(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2005,7 +2005,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 )
             })
             .unwrap();
-        assert!(matches!(outcome.end, FramedProcessEnd::Exited));
+        assert!(matches!(outcome.end, ProcessEnd::Exited));
         assert!(outcome.status.unwrap().success());
         assert!(
             !outcome.stderr_capped,
@@ -2120,7 +2120,7 @@ for line in sys.stdin:
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 4096,
@@ -2129,7 +2129,7 @@ for line in sys.stdin:
                 cancel.child_token(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2319,7 +2319,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
     let mut process = owner
         .spawn_framed(
             command,
-            FramedProcessLimits {
+            ProcessIoLimits {
                 max_frame_bytes: FRAME_BYTES,
                 max_queued_frames: 1,
                 max_stderr_bytes: 4096,
@@ -2328,7 +2328,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
             cancel.child_token(),
         )
         .unwrap();
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let probes = async {
         initialize_protocol(&mut process, &input, &mut evidence, OUTPUT_BYTES, None, &cancel).await?;
@@ -3005,7 +3005,7 @@ mod transport {
         }
     }
 
-    pub(super) async fn process(script: &str, token: CancellationToken) -> FramedProcess {
+    pub(super) async fn process(script: &str, token: CancellationToken) -> OwnedProcess {
         let (command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
             std::env::current_exe().unwrap(),
             [
@@ -3021,7 +3021,7 @@ mod transport {
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 128,
@@ -3740,7 +3740,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut input_rx = None;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let ack = submit_stage_input(
@@ -4107,7 +4107,7 @@ for line in sys.stdin: assert json.loads(line).get('method') != 'turn/steer'
             );
             let token = CancellationToken::new();
             let mut process = process(&script, token.clone()).await;
-            let input = process.input();
+            let input = process.input().expect("framed process input");
             let mut evidence = Evidence {
                 thread: Some("thread".into()),
                 turn: Some("turn".into()),
@@ -4279,7 +4279,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let (input_tx, input_receiver) = tokio::sync::mpsc::channel(1);
         let (queued_ack_tx, mut queued_ack_rx) = tokio::sync::oneshot::channel();
         input_tx

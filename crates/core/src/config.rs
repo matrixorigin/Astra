@@ -60,7 +60,6 @@ pub(crate) const DEFAULT_DB_POOL_MAX_LIFETIME_SECS: u64 = 1800;
 use crate::runtime_limits::{
     DEFAULT_GLOBAL_OUTPUT_LIMIT, DEFAULT_MAX_RETRIEVED, DEFAULT_MAX_TOOL_RETRIES,
     DEFAULT_MAX_TURN_INPUT_TOKENS, DEFAULT_RETRY_BASE_MS, DEFAULT_TOOL_OUTPUT_LIMIT,
-    DEFAULT_TURN_TIMEOUT_S,
 };
 
 /// Read an env var and apply it to an `Option<T>` field if the value parses.
@@ -696,11 +695,11 @@ impl ApiConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ServerRuntimeConfig {
-    /// Maximum conversation turns per session.
+    /// Optional execution-round ceiling per Run.
     pub max_turns: Option<usize>,
     /// Per-subtask turn budget for plan execution (0 = use max_turns).
     pub plan_subtask_max_turns: Option<usize>,
-    /// Per-turn hard timeout in seconds.
+    /// Optional run wall-clock limit in seconds. Omission imposes no total deadline.
     pub turn_timeout_s: Option<u64>,
     /// Combined tool output truncation limit (bytes).
     pub global_output_limit: Option<usize>,
@@ -717,9 +716,6 @@ pub struct ServerRuntimeConfig {
 }
 
 impl ServerRuntimeConfig {
-    pub(crate) fn turn_timeout_s(&self) -> u64 {
-        self.turn_timeout_s.unwrap_or(DEFAULT_TURN_TIMEOUT_S)
-    }
     pub(crate) fn global_output_limit(&self) -> usize {
         self.global_output_limit
             .unwrap_or(DEFAULT_GLOBAL_OUTPUT_LIMIT)
@@ -750,7 +746,9 @@ impl ServerRuntimeConfig {
             return Err("runtime.plan_subtask_max_turns must be > 0 (or omit for default)".into());
         }
         if self.turn_timeout_s == Some(0) {
-            return Err("runtime.turn_timeout_s must be > 0 (or omit for default)".into());
+            return Err(
+                "runtime.turn_timeout_s must be > 0 (or omit for no total deadline)".into(),
+            );
         }
         if self.global_output_limit == Some(0) {
             return Err("runtime.global_output_limit must be > 0 (or omit for default)".into());
@@ -969,6 +967,7 @@ impl Default for SkillSearchSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
+    pub runtime: ServerRuntimeConfig,
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
@@ -1056,6 +1055,7 @@ impl AppSettings {
             }
         };
         let mut settings = Self::from_lookup(lookup)?;
+        settings.runtime = sc.runtime.clone();
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
         settings.provider_capabilities = sc.deployment.provider_capabilities.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
@@ -1153,6 +1153,7 @@ impl AppSettings {
                 "dev-runtime-root-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
+            runtime: ServerRuntimeConfig::default(),
             provider_request_auth: Vec::new(),
             edge_token_auth: EdgeTokenAuthConfig::default(),
             external_providers: Vec::new(),

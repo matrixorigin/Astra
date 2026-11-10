@@ -102,8 +102,7 @@ pub use delegation_model_admission::{
     DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
     DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
     DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
-    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
-    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationModelSlotConstraint, DelegationRequirementPropagation, DelegationRequirementStrength,
     DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
 };
 pub use explain_analyze::{
@@ -127,8 +126,8 @@ pub use explain_analyze_projection::{
 };
 pub use inference::{
     AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
-    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
-    client_direct_execution_field, resolve_requested_model_selection,
+    ModelSelection, ModelSelector, ReasoningEffort, ReasoningRequirement, RequestedModelPolicy,
+    RequestedModelPolicyError, client_direct_execution_field, resolve_requested_model_selection,
     resolve_requested_model_selector,
 };
 pub use memory_ranking::{
@@ -167,7 +166,7 @@ pub use provider_contract::{
     ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
     ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
     STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
-    project_native_collaborator_observation,
+    executable_schema, project_native_collaborator_observation,
 };
 pub use recovery_point::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
@@ -189,7 +188,7 @@ pub use resume::{
 pub use runtime_scaffolding::{
     APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
     ParsedRuntimeAuthorityFrame, RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeAuthorityFrameError,
-    RuntimeAuthorityLifetime, RuntimeMessageDelivery,
+    RuntimeAuthorityLifetime, RuntimeMessageDelivery, active_append_only_authority_mask,
     active_append_only_authority_protected_suffix_start, append_only_runtime_authority_is_active,
     has_append_only_runtime_authority_policy, is_human_user_message, is_runtime_owned_message,
     is_runtime_owned_provenance, mark_append_only_required_context,
@@ -259,9 +258,11 @@ pub use tool_invocation::{
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
 pub use turn_provenance::{
-    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, MODEL_REPLAY_ORIGIN_FIELD, ModelReplayOrigin,
+    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
+    mark_model_message, mark_model_replay_origin, mark_turn_message, model_item_id,
+    model_replay_origin, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
@@ -271,13 +272,12 @@ pub use user_intent::{
     mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
-    BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
-    VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
-    WorkspaceObservationProof,
+    BoundVerificationFrontier, VerificationEvidence, VerificationHandoff, VerificationUnavailable,
 };
 
-pub mod permission_control;
-pub use permission_control::{
+pub mod run_settings;
+pub use run_settings::{
+    RunModelOutcome, RunModelOutcomeKind, RunModelRequest, RunModelSelection, RunModelSnapshot,
     RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
     RunPermissionModeSnapshot,
 };

@@ -519,6 +519,10 @@ impl ModelService for TestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
+                inference_protocol: None,
+                response_scope_key: None,
+                supported_reasoning_efforts: None,
                 model_name,
                 wire_model_name: None,
                 api_key: "test-provider-secret".to_string(),
@@ -1588,6 +1592,7 @@ async fn post_unmatched_tool_result(
         output,
         status,
         unmatched_tool_result_identity(),
+        None,
     )
     .await
 }
@@ -1600,7 +1605,7 @@ async fn post_tool_result_from_event(
 ) -> StatusCode {
     let (request_id, identity) =
         tool_request_identity_from_event(event).expect("tool_request event must carry identity");
-    post_tool_result_with_identity(app, &request_id, output, status, identity).await
+    post_tool_result_with_identity(app, &request_id, output, status, identity, None).await
 }
 
 async fn post_tool_result_with_identity(
@@ -1609,6 +1614,7 @@ async fn post_tool_result_with_identity(
     output: &str,
     status: &str,
     identity: ToolResultIdentity,
+    tool_result_fields: Option<Map<String, Value>>,
 ) -> StatusCode {
     let body = astra_thin_client::ToolResultRequest::new_with_hash(
         astra_thin_client::ToolResultRequestParts {
@@ -1620,7 +1626,7 @@ async fn post_tool_result_with_identity(
             status: status.to_string(),
             output: output.to_string(),
             duration_ms: 10,
-            tool_result_fields: None,
+            tool_result_fields,
         },
     );
     let body: Value = serde_json::to_value(body).unwrap();
@@ -3098,6 +3104,111 @@ async fn run_tool_scenario(case: EdgeCallbackScenario) {
             1
         );
     }
+}
+
+#[tokio::test]
+async fn unknown_edge_outcome_reaches_model_before_it_inspects_the_result() {
+    const MESSAGE: &str = "Write notes and inspect the result.";
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new(
+        "unknown edge outcome",
+        |request| primary_request_for(request, MESSAGE),
+        vec![
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "write-unknown", "write_file", json!({"path":"notes.txt", "content":"hello"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "inspect-notes", "read_file", json!({"path":"notes.txt"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"The write could not be confirmed."
+            }, "finish_reason":"stop"}]})),
+        ],
+    )])
+    .await;
+    let response = chat_stream_start(
+        &app,
+        json!({
+            "message": MESSAGE,
+            "interactive_client": true,
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "context": {"edge_tools": [tool_schema("write_file"), tool_schema("read_file")]}
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let approval_id = approval["request_id"].as_str().unwrap();
+    assert_eq!(
+        post_approval_respond(&app, &approval_identity, approval_id, "allow").await,
+        StatusCode::OK
+    );
+    let write = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(write["tool"], "write_file");
+    assert_eq!(
+        write["args"],
+        json!({"path":"notes.txt", "content":"hello"})
+    );
+    let (request_id, identity) = tool_request_identity_from_event(&write).unwrap();
+    assert_eq!(request_id, approval_id);
+    assert_eq!(
+        post_tool_result_with_identity(
+            &app,
+            &request_id,
+            "The write acknowledgement was lost.",
+            "failed",
+            identity,
+            Some(Map::from_iter([
+                ("error_kind".into(), json!("tool_outcome_unknown")),
+                ("execution_fact".into(), json!("unknown")),
+                ("side_effects_maybe".into(), json!(true)),
+                ("retryable".into(), json!(false)),
+            ])),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let read = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(read["tool"], "read_file");
+    assert_eq!(read["args"], json!({"path":"notes.txt"}));
+    assert_eq!(
+        post_tool_result_from_event(&app, &read, "hello", "completed").await,
+        StatusCode::OK
+    );
+    wait_for_sse(&mut rx, "turn_complete", E2E_WAIT_TIMEOUT_SECS).await;
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(find_events(&events, "tool_request").len(), 2);
+    let answer: String = find_events(&events, "text_delta")
+        .iter()
+        .filter_map(|event| event["content"].as_str())
+        .collect();
+    assert_eq!(answer, "The write could not be confirmed.");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    assert!(find_events(&events, "error").is_empty());
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    let tool_message = |request: &ProviderRequest, call_id: &str| {
+        request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+            .and_then(|message| message["content"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let unknown = tool_message(&requests[1], "write-unknown");
+    assert!(unknown.contains("tool_outcome_unknown"));
+    assert!(unknown.contains("Inspect the outcome before repeating it"));
+    assert!(tool_message(&requests[2], "inspect-notes").contains("hello"));
+    drop(requests);
+    gateway.assert_complete();
+    inference.assert_quiescent();
 }
 
 /// Poll run status until it reaches the expected value (with timeout).
@@ -5686,8 +5797,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 #[tokio::test]
 async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_hard_limit_stops_web_agent_run_even_with_progress", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
     let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
@@ -5768,13 +5878,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (status, durable) = get_run_status(&app, root).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(durable["status"], "failed");
-    assert!(
-        accum
-            .full_text
-            .contains("Final answer after the hard limit."),
-        "failure must preserve the text-only settlement output: {}",
-        accum.full_text
-    );
+    assert!(accum.full_text.contains("Turn budget exhausted"));
     let tool_requests = find_events(&events, "tool_request");
     assert_eq!(
         tool_requests.len(),
@@ -5793,7 +5897,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     assert_eq!(terminal["error_kind"], "budget_exhausted");
     assert_ne!(terminal.get("resumable"), Some(&json!(true)));
     let evaluation = &terminal["turn_evaluation"]["metadata"];
-    assert_eq!(evaluation["llm_rounds"], 3);
+    assert_eq!(evaluation["llm_rounds"], 2);
     assert_eq!(evaluation["tool_call_count"], 2);
     assert_eq!(evaluation["tool_execution_count"], 1);
     assert_eq!(evaluation["tool_rejected_count"], 1);
@@ -5804,8 +5908,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(inference.attempt_count(), 3);
-    assert_eq!(gateway.requests.lock().await.len(), 3);
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
@@ -6118,6 +6222,39 @@ mod subscription_isolated_database;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn api_key_responses_agent_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(true, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_public_journey_preserves_private_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_current_turn_prunes_completed_reasoning() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_fork_replays_authorized_parent_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, true).await;
+}
+
+async fn responses_agent_uses_catalog_and_continues_persisted_session(
+    api_key: bool,
+    personal_byok: bool,
+    current_turn_only: bool,
+    forked: bool,
+) {
     use astra_services::chatgpt::ChatgptConfig;
     use astra_services::{DatabaseModelService, DatabaseSessionService};
     init_env();
@@ -6139,13 +6276,29 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     let config = ChatgptConfig::for_test(&provider.base);
     let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
     let make_app = || {
+        let context = Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
+            pool.clone(),
+        ));
+        let forks = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
+            pool.clone(),
+            context.clone(),
+        ));
         let models = Arc::new(
             DatabaseModelService::new(settings.clone(), key.clone())
                 .with_pool(pool.clone())
-                .with_chatgpt_config(config.clone()),
+                .with_chatgpt_config(config.clone())
+                .with_deepseek_test_endpoint(
+                    provider.base.trim_start_matches("http://").parse().unwrap(),
+                )
+                .unwrap(),
         );
         let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
             .with_shared_pool(pool.clone())
+            .with_session_context_authority(
+                context,
+                Arc::new(astra_services::ExecutionGrantSigner::new([7_u8; 32]).unwrap()),
+            )
+            .with_session_fork_coordinator(forks)
             .with_auth_service(Arc::new(StubAuth))
             .with_session_service(Arc::new(
                 DatabaseSessionService::new(settings.clone()).with_pool(pool.clone()),
@@ -6194,27 +6347,124 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     }
     let (base, lifecycle) = make_app();
     let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
-    let authorization = post(
-        &app,
-        "/me/model-connections/chatgpt/authorizations",
-        json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
-    )
-    .await;
-    let code = provider.issue_code(
-        &authorization,
-        &format!("public-{}", uuid::Uuid::new_v4()),
-        true,
-    );
-    let linked = post(
-        &app,
-        &format!(
-            "/me/model-connections/chatgpt/authorizations/{}/complete",
-            authorization["authorization_id"].as_str().unwrap()
-        ),
-        json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
-    )
-    .await;
-    let model=post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await;
+    let model = if personal_byok {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        provider
+            .state
+            .plaintext_reasoning
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let model = post(
+            &app,
+            "/me/models",
+            json!({
+                "name":format!("public-byok-{}",uuid::Uuid::new_v4()),
+                "provider":"deepseek", "model":"fixture-model", "api_key":"fixture-api-key",
+                "inference_protocol":"openai_responses", "context_window":128000, "is_default":false,
+                "responses_reasoning_history":"all_turns"
+            }),
+        )
+        .await;
+        assert_eq!(model["responses_reasoning_history"], "all_turns");
+        if current_turn_only {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/me/models/{}",
+                            model["model_id"].as_str().unwrap()
+                        ))
+                        .header("authorization", TOKEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"responses_reasoning_history":"current_turn"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let updated: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(updated["responses_reasoning_history"], "current_turn");
+        }
+        post(
+            &app,
+            &format!("/me/models/{}/check", model["model_id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+        model
+    } else if api_key {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let service =
+            DatabaseModelService::new(settings.clone(), key.clone()).with_pool(pool.clone());
+        let model = service
+            .create_model(
+                USER_ID.to_string(),
+                ModelCreateRequestData {
+                    name: format!("api-responses-{}", uuid::Uuid::new_v4()),
+                    provider: "openai".into(),
+                    api_key: "fixture-api-key".into(),
+                    base_url: Some(format!("{}/v1", provider.base)),
+                    description: None,
+                    context_window: Some(128000),
+                    max_completion_tokens: None,
+                    input_modalities: vec!["text".into()],
+                    output_modalities: vec!["text".into()],
+                    supported_parameters: vec![],
+                    pricing: None,
+                    architecture: None,
+                    tags: vec![],
+                    quirks: Some(astra_services::models::QuirksData {
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        supported_reasoning_efforts: Some(vec!["high".into(), "max".into()]),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        json!({"model_id":model.model_id})
+    } else {
+        let authorization = post(
+            &app,
+            "/me/model-connections/chatgpt/authorizations",
+            json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
+        )
+        .await;
+        let code = provider.issue_code(
+            &authorization,
+            &format!("public-{}", uuid::Uuid::new_v4()),
+            true,
+        );
+        let linked = post(
+            &app,
+            &format!(
+                "/me/model-connections/chatgpt/authorizations/{}/complete",
+                authorization["authorization_id"].as_str().unwrap()
+            ),
+            json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
+        )
+        .await;
+        post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await
+    };
     let session = post(
         &app,
         "/sessions",
@@ -6222,6 +6472,49 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     )
     .await;
     let session_id = session["session_id"].as_str().unwrap();
+    if api_key {
+        let completion = json!({"operation":"memory_extraction","session_id":session_id,"turn":1,"round":0,"logical_attempt":0,
+            "model_selection":{"offering_id":model["model_id"]},"messages":[{"role":"user","content":"Reply OK"}]});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(completion.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "omitted temperature: {status}: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let mut explicit = completion;
+        explicit["logical_attempt"] = json!(1);
+        explicit["temperature"] = json!(0.0);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(explicit.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     drop(app);
     let (base, lifecycle) = make_app();
     *provider.state.script.lock().unwrap() = vec![
@@ -6240,10 +6533,19 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let lifecycle = Arc::new(lifecycle);
     let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
-    let payload = |message: &str| json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+    let payload = |session_id: &str, message: &str| {
+        let mut value = json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+        if api_key {
+            value["context"] = json!({"thinking":{"mode":"adaptive","effort":"max"}});
+        }
+        value
+    };
     let first = chat_stream_collect(
         &app,
-        payload("subscription-public-first: List the models I can use."),
+        payload(
+            session_id,
+            "subscription-public-first: List the models I can use.",
+        ),
     )
     .await;
     assert!(
@@ -6255,6 +6557,17 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         "the agent did not execute its scripted tool rounds"
     );
     let requests = provider.state.requests.lock().unwrap().clone();
+    if api_key {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["reasoning"]["effort"] == "max"
+                    && request["tools"]
+                        .as_array()
+                        .is_some_and(|tools| !tools.is_empty())),
+            "max reasoning with tools was not dispatched"
+        );
+    }
     assert!(
         requests.iter().any(
             |request| request["input"].as_array().unwrap().iter().any(|item| {
@@ -6294,6 +6607,55 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         persisted > 0,
         "provider continuation was not written to canonical database history"
     );
+    let mut continuation_session = session_id.to_owned();
+    if personal_byok || api_key {
+        let private = if personal_byok {
+            "private-journey-sentinel AKIAIOSFODNN7EXAMPLE"
+        } else {
+            "sk-fixtureciphertextciphertextciphertext"
+        };
+        let encoded = data_encoding::BASE32_NOPAD
+            .encode(private.as_bytes())
+            .to_ascii_lowercase();
+        let resumed = post(
+            &app,
+            &format!("/sessions/{session_id}/resume?continuation_only=true"),
+            json!({}),
+        )
+        .await;
+        assert!(!resumed.to_string().contains(private));
+        assert!(!resumed.to_string().contains(&encoded));
+        let bundle: astra_turn_types::ResumeBundleV1 =
+            serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+        assert!(bundle.validates_root());
+        let segments = post(
+            &app,
+            &format!("/sessions/{session_id}/context/segments:batchGet"),
+            json!({"manifest_root":bundle.cursor.canonical_root_hash.clone()}),
+        )
+        .await;
+        assert!(!segments.to_string().contains(private));
+        assert!(!segments.to_string().contains(&encoded));
+        if forked {
+            let manifest = post(
+                &app,
+                &format!("/sessions/{session_id}/forks"),
+                json!({"idempotency_key":"byok-fork", "expected_parent_cursor":bundle.cursor, "reason":"continue in a fork"}),
+            )
+            .await;
+            let fork_id = manifest["fork_id"].as_str().unwrap();
+            post(
+                &app,
+                &format!("/sessions/{session_id}/forks/{fork_id}/activate-for-continuation"),
+                json!({}),
+            )
+            .await;
+            continuation_session = manifest["child_key"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    }
     drop(app);
     drop(lifecycle);
     // A new local journal root also rules out recovering the first turn from
@@ -6308,7 +6670,10 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     let before = provider.state.requests.lock().unwrap().len();
     let second = chat_stream_collect(
         &app,
-        payload("subscription-public-second: Continue using the former session."),
+        payload(
+            &continuation_session,
+            "subscription-public-second: Continue using the former session.",
+        ),
     )
     .await;
     assert!(
@@ -6324,13 +6689,20 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     .unwrap();
     let requests = provider.state.requests.lock().unwrap();
     let continued = &requests[before..];
-    assert!(
-        continued.iter().any(|request| request["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext")),
-        "provider reasoning was lost after rebuilding Server services"
+    let prior_reasoning_replayed = continued.iter().any(|request| {
+        request["input"].as_array().unwrap().iter().any(|item| {
+            if personal_byok {
+                item["content"]
+                    .to_string()
+                    .contains("private-journey-sentinel AKIAIOSFODNN7EXAMPLE")
+            } else {
+                item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext"
+            }
+        })
+    });
+    assert_eq!(
+        prior_reasoning_replayed, !current_turn_only,
+        "completed-turn reasoning must follow the declared route policy"
     );
     assert!(
         continued.iter().any(|request| request["input"]

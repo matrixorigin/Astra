@@ -32,8 +32,10 @@ fn fmt_file_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
     match name {
         "read_file" => {
             let path = obj.get("path").and_then(|v| v.as_str())?;
-            let start = obj.get("start_line").and_then(|v| v.as_u64());
-            let end = obj.get("end_line").and_then(|v| v.as_u64());
+            let (start, end) = astra_text_utils::line_range::ordered_bounds(
+                obj.get("start_line").and_then(|v| v.as_u64()),
+                obj.get("end_line").and_then(|v| v.as_u64()),
+            );
             let outline = obj
                 .get("outline")
                 .and_then(|v| v.as_bool())

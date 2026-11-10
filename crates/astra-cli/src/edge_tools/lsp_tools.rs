@@ -30,7 +30,7 @@ impl ToolExecutor {
             root.insert("newName".to_string(), Value::String(new_name.to_string()));
         }
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/rename",
             params,
@@ -42,12 +42,15 @@ impl ToolExecutor {
             .map_err(|e| format!("Invalid file URI in WorkspaceEdit: {uri}: {e}"))?
             .to_file_path()
             .map_err(|_| format!("WorkspaceEdit URI is not a local file path: {uri}"))?;
-        let project_root = self.project_root.canonicalize().map_err(|error| {
-            format!(
-                "WorkspaceEdit cannot resolve project root {}: {error}",
-                self.project_root.display()
-            )
-        })?;
+        let project_root = self
+            .effective_project_root()
+            .canonicalize()
+            .map_err(|error| {
+                format!(
+                    "WorkspaceEdit cannot resolve project root {}: {error}",
+                    self.effective_project_root().display()
+                )
+            })?;
         let bound_path = self
             .bind_file_mutation_target(&path)
             .map_err(|error| error.into_string_output())?;
@@ -346,7 +349,7 @@ impl ToolExecutor {
                 committed_paths.push(bound_path.display().to_string());
                 files_changed += 1;
                 updated_files.push(
-                    path.strip_prefix(&self.project_root)
+                    path.strip_prefix(self.effective_project_root())
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .to_string(),
@@ -416,7 +419,7 @@ impl ToolExecutor {
         if file.starts_with('/') {
             PathBuf::from(file)
         } else {
-            self.project_root.join(file)
+            self.effective_project_root().join(file)
         }
     }
 
@@ -529,7 +532,7 @@ impl ToolExecutor {
     ) -> Result<Option<String>, String> {
         let (file_path, _) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp
-            .request_for_file(&self.project_root, &file_path, method, params)
+            .request_for_file(&self.effective_project_root(), &file_path, method, params)
             .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
     }
 
@@ -552,14 +555,14 @@ impl ToolExecutor {
             }
         }
         self.passive_lsp
-            .request_for_file(&self.project_root, &file_path, method, params)
+            .request_for_file(&self.effective_project_root(), &file_path, method, params)
             .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
     }
 
     fn try_active_workspace_symbols(&self, query: &str) -> Result<Option<String>, String> {
         self.passive_lsp
             .request_workspace(
-                &self.project_root,
+                &self.effective_project_root(),
                 "workspace/symbol",
                 json!({ "query": query }),
             )
@@ -573,7 +576,7 @@ impl ToolExecutor {
     fn try_active_file_diagnostics(&self, file: &str) -> Result<Option<String>, String> {
         let (file_path, _) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp
-            .diagnostics_for_file(&self.project_root, &file_path)
+            .diagnostics_for_file(&self.effective_project_root(), &file_path)
             .map(|result| {
                 result.map(|value| {
                     let method = value
@@ -605,7 +608,7 @@ impl ToolExecutor {
             .ok_or_else(|| "failed to build LSP position for code_actions".to_string())?;
         let diagnostics = match self
             .passive_lsp
-            .diagnostics_for_file(&self.project_root, &file_path)?
+            .diagnostics_for_file(&self.effective_project_root(), &file_path)?
         {
             Some(snapshot) => snapshot
                 .get("diagnostics")
@@ -615,7 +618,7 @@ impl ToolExecutor {
         };
         self.passive_lsp
             .request_for_file(
-                &self.project_root,
+                &self.effective_project_root(),
                 &file_path,
                 "textDocument/codeAction",
                 json!({
@@ -671,7 +674,7 @@ impl ToolExecutor {
         let result = self
             .passive_lsp
             .request_workspace(
-                &self.project_root,
+                &self.effective_project_root(),
                 "workspace/executeCommand",
                 json!({
                     "command": command_name,
@@ -811,7 +814,7 @@ impl ToolExecutor {
         let (file_path, _) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp
             .request_for_file(
-                &self.project_root,
+                &self.effective_project_root(),
                 &file_path,
                 "codeAction/resolve",
                 action.clone(),
@@ -822,7 +825,7 @@ impl ToolExecutor {
     fn try_active_document_formatting(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/formatting",
             json!({
@@ -855,7 +858,7 @@ impl ToolExecutor {
             );
         }
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/rangeFormatting",
             params,
@@ -887,7 +890,7 @@ impl ToolExecutor {
             );
         }
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/onTypeFormatting",
             params,
@@ -907,7 +910,7 @@ impl ToolExecutor {
             self.lsp_full_document_range_params(file)?
         };
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/inlayHint",
             params,
@@ -917,7 +920,7 @@ impl ToolExecutor {
     fn try_active_folding_ranges(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/foldingRange",
             json!({
@@ -929,7 +932,7 @@ impl ToolExecutor {
     fn try_active_document_colors(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/documentColor",
             json!({
@@ -941,7 +944,7 @@ impl ToolExecutor {
     fn try_active_semantic_tokens(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/semanticTokens/full",
             json!({
@@ -958,7 +961,7 @@ impl ToolExecutor {
     ) -> Result<Option<Value>, String> {
         let (file_path, params) = self.lsp_position_params(file, line, column)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/completion",
             params,
@@ -968,7 +971,7 @@ impl ToolExecutor {
     fn try_active_code_lenses(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/codeLens",
             json!({
@@ -983,7 +986,7 @@ impl ToolExecutor {
             return Ok(None);
         }
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "experimental/runnables",
             json!({
@@ -1167,7 +1170,7 @@ impl ToolExecutor {
     ) -> Result<Option<Value>, String> {
         let file_path = self.resolve_lsp_file_path(file);
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "completionItem/resolve",
             item.clone(),
@@ -1336,7 +1339,7 @@ impl ToolExecutor {
     fn try_resolve_code_lens(&self, file: &str, lens: &Value) -> Result<Option<Value>, String> {
         let file_path = self.resolve_lsp_file_path(file);
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "codeLens/resolve",
             lens.clone(),
@@ -1401,7 +1404,7 @@ impl ToolExecutor {
             .ok_or_else(|| "documentColor entry missing range".to_string())?;
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/colorPresentation",
             json!({
@@ -1430,7 +1433,7 @@ impl ToolExecutor {
             .cloned()
             .ok_or_else(|| "failed to build LSP position for selection_ranges".to_string())?;
         self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/selectionRange",
             json!({
@@ -1449,7 +1452,7 @@ impl ToolExecutor {
     ) -> Result<Option<String>, String> {
         let (file_path, prepare_params) = self.lsp_position_params(file, line, column)?;
         let prepared = self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/prepareCallHierarchy",
             prepare_params,
@@ -1475,7 +1478,7 @@ impl ToolExecutor {
         };
         self.passive_lsp
             .request_for_file(
-                &self.project_root,
+                &self.effective_project_root(),
                 &file_path,
                 method,
                 json!({ "item": item }),
@@ -1492,7 +1495,7 @@ impl ToolExecutor {
     ) -> Result<Option<String>, String> {
         let (file_path, prepare_params) = self.lsp_position_params(file, line, column)?;
         let prepared = self.passive_lsp.request_for_file(
-            &self.project_root,
+            &self.effective_project_root(),
             &file_path,
             "textDocument/prepareTypeHierarchy",
             prepare_params,
@@ -1518,7 +1521,7 @@ impl ToolExecutor {
         };
         self.passive_lsp
             .request_for_file(
-                &self.project_root,
+                &self.effective_project_root(),
                 &file_path,
                 method,
                 json!({ "item": item }),
@@ -2512,7 +2515,7 @@ impl ToolExecutor {
                         Ok(Some(result)) => result,
                         Ok(None) => json!({
                             "error": "diagnostics for a specific file require an active LSP backend for that workspace",
-                            "active_backends": self.passive_lsp.active_status(&self.project_root),
+                            "active_backends": self.passive_lsp.active_status(&self.effective_project_root()),
                         }).to_string(),
                         Err(error) => json!({ "error": error }).to_string(),
                     }
@@ -2561,7 +2564,7 @@ impl ToolExecutor {
                             "document_colors", "color_presentations", "semantic_tokens", "selection_ranges",
                             "linked_editing_range"
                         ],
-                        "active_backends": self.passive_lsp.active_status(&self.project_root),
+                        "active_backends": self.passive_lsp.active_status(&self.effective_project_root()),
                         "supported_languages": {
                             "active_lsp": ["rust", "typescript", "typescriptreact"],
                             "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
@@ -2593,7 +2596,7 @@ impl ToolExecutor {
         let file_path = if file.starts_with('/') {
             PathBuf::from(file)
         } else {
-            self.project_root.join(file)
+            self.effective_project_root().join(file)
         };
 
         // Check file size to prevent OOM

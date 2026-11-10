@@ -363,100 +363,25 @@ behind; CI disposes of the entire isolated dependency stack. The dedicated
 feature keeps this test out of generic offline/online lanes, avoiding duplicate
 full-stack execution.
 
-## Released CLI and Edge compatibility
+## Candidate CLI and Edge integration
 
-Matrixflow [#19966](https://github.com/matrixorigin/matrixflow/issues/19966)
-tracks the independent client/server rollout contract. The frozen MOI test
-above remains unchanged: it is not a historical Astra CLI or Edge test.
+The shared CLI CI job exercises the current CLI and standalone Edge against a
+fresh production Server backed by disposable MatrixOne and Memoria. The driver
+uses an isolated HOME, a synthetic account and a controlled model provider. It
+checks model discovery, ordinary chat, approval and denial, write readback,
+cancellation with and without committed history, same-session resume, and an
+Edge WebSocket tool invocation. Missing clients or failed scenarios fail the job.
+The separate MOI consumer compatibility gate is unchanged.
 
-`scripts/ci/historical-clients.json` is the reviewed, immutable linux/amd64
-artifact inventory. It pins component version, source commit, original bundle,
-archive URL, size, and SHA256. `historical_clients.py` checks the downloaded or
-cached bytes on every use and safely extracts the exact binary; it does not
-execute an installer or follow a moving channel. A missing artifact, wrong
-digest, unsupported architecture, or failed dependency is a failure, not a
-skipped test or an opportunity to substitute a different version.
-
-The executable support baseline is CLI/Edge **0.2.12**. The fixed samples have
-the following distinct roles; passing negative cases does not confer support:
-
-| Consumer | Required behavior against the candidate Server |
-| --- | --- |
-| Published CLI 0.2.12, source `70a5ee3e` | Complete unversioned v2 catalog, ordinary chat and authoritative final output, tool result return, approval allow/deny, cancellation and same-session reuse |
-| Published Edge 0.2.12, source `70a5ee3e` | Schema v2 registration, connection, task execution and result return |
-| Published CLI 0.2.10, source `5aacae0d` | Negative catalog sample: the installed strict decoder rejects v2; upgrade required, no positive execution claim |
-| Published Edge 0.2.10, source `5aacae0d` | Explicit schema v1 rejection and upgrade guidance; it is not a positive execution baseline |
-| Candidate CLI | Explicit v2 discovery and ordinary chat through the real candidate Server; rollback checks identify the exact historical Server source rather than calling it current Prod |
-
-Cold resume after cancellation starts with a real completed turn and verifies
-its committed cursor before interrupting the following turn. Cancellation must
-preserve that cursor; a new CLI process must resume the same Session with a
-different completed Run while the cancelled Run remains cancelled. A separate
-first-turn cancellation verifies the existing boundary: cancellation revokes
-that turn's Context, so a Session with no committed history returns 404 from
-the hydration API and the historical CLI explicitly rejects cold resume. Raw
-transcript evidence is not promoted into invented canonical history.
-
-CLI/Edge 0.2.10 must be upgraded to 0.2.12 or later. The CLI negative case
-records its actual unknown-field failure; it does not pretend the installed
-binary can display a new Server upgrade message. The standalone Edge negative
-case checks its existing schema-v1 rejection and upgrade hint. These samples
-do not identify the original screenshot's exact client/server pair, and the
-original 0.2.10 conversation failure is not claimed as fixed.
-
-`user_models_http` exercises both real catalog routes with independent frozen
-0.2.10/0.2.12 decoders. Unversioned and explicit-v2 responses retain the complete
-0.2.12 shape, including null and non-null metadata; the 0.2.10 reader must reject
-it. Four reasoning protocols and non-null prices are checked without a version
-header. This protects the wire inputs used by the historical picker, not an
-actual TUI interaction. The real 0.2.12 `model list` journey also verifies
-that its decoded output retains the configured protocol value and non-null
-pricing, rather than accepting a successful exit alone. Invalid versions, authentication denial, unknown
-execution enums, and nested authority metadata remain covered. Current
-readers accept additive page/item metadata, while the strict 0.2.12 fixture
-rejects it: future additions require a new negotiated format, not changes to
-unversioned/v2 responses. CLI tests distinguish malformed JSON from unsupported
-schema using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
-reason metadata without echoing received bodies.
-
-The shared CLI CI execution runs `client_compatibility` with the dedicated
-`moi-compat-tests` feature and isolated MatrixOne/Memoria. It starts the real
-production router with fresh storage, then invokes
-`scripts/ci/client_compatibility.py` using downloaded historical executables
-and the already-built candidate CLI. The provider is a finite, controlled
-OpenAI wire fixture. Client state is isolated in temporary HOME/XDG/workspace
-directories, and authorization, tool admission, approvals, and persistence
-still cross their production owners. Each CLI logs the synthetic fixture account
-into its isolated profile through `admin login`; a bearer environment variable
-alone is not a bound stdio profile. Captured one-shot chats explicitly select
-the published read-only `plan` permission mode because they have no terminal
-or approval channel; stdio approval journeys retain `prompt` mode and its real
-approval channel. The special performance/capture-SHA
-baseline is not loosened to accept historical clients.
-
-Tool journeys pair their own case-specific call IDs with a unique preceding
-assistant declaration and tool result in the complete provider request. A
-runtime context suffix may legitimately appear as `role=user` after a tool
-result, so the fixture never treats the last user-role message as a turn boundary.
-After an approved write, the controlled model performs a full `read_file` of
-the same target and checks its real content before returning its single final
-answer. This satisfies the existing post-mutation observation boundary. The
-denied-write branch performs no readback and must leave the target absent.
-
-Both IDC and public candidate-image smoke jobs invoke the same driver after
-the existing candidate digest/revision and stack health checks. They reuse
-that image rather than rebuilding a Server for each consumer. The existing
-required job results include these failures; no skip, retry, or larger timeout
-is used to turn a failure into success.
-
-Reports record exact artifact/source identities, scenario outcomes, failure
-categories, and elapsed time. PR jobs retain the JSON report in the job summary
-without changing the existing CLI JUnit timing artifact. Candidate-image jobs
-also upload the report as a standalone artifact. Reports do not contain tokens,
-raw client output, provider responses, or user data. Passing a catalog parser test is not a full
-conversation result. Support is advertised only for the exact successful
-combinations and feature scopes recorded by CI; testing two versions does not
-prove every intervening version or all-platform installation behavior.
+The PR integration report records binary hashes, Server source, scenario results,
+and bounded, redacted error categories, without credentials or raw transcripts.
+It uses debug clients and a Server with test features, while release images use
+release builds with default features disabled.
+Public and IDC candidate-image smoke jobs separately verify image identity,
+health, and a Memoria round trip; they do not run the CLI or Edge journeys above.
+In particular, the PR integration does not prove the behavior of an independently
+selected IDC source or of the final release binaries. Deployment uses a fresh
+database and local state and does not promise compatibility with older clients.
 
 ## Where Tests Live
 
@@ -620,7 +545,6 @@ as a passing test. No production credentials are needed in fork CI.
 The key-free BYOK network smoke is also explicit:
 
 ```bash
-ASTRA_BYOK_DNS_SERVERS=tcp://223.5.5.5 \
 ASTRA_TEST_BYOK_MODELS_URL=https://api.moonshot.cn/v1/models \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test byok_live_network -- --ignored
@@ -631,14 +555,12 @@ not successful model inference.
 
 The provider-wire regression uses a strict loopback HTTP fixture and a disposable
 MatrixOne database, without real provider keys. Create the designated database
-first and supply its `MATRIXONE_*` connection settings. Choose an unused loopback
-port for the fixture:
+first and supply its `MATRIXONE_*` connection settings. The fixture binds an
+available loopback port:
 
 ```bash
 ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX= \
 ASTRA_DATABASE=astra_test_probe_local ASTRA_TEST_DATABASE=astra_test_probe_local \
-ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
-ASTRA_BYOK_DEEPSEEK_BASE_URL=http://127.0.0.1:18994 \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test user_model_probe_db_it -- --ignored
 ```
@@ -920,9 +842,9 @@ Repeat for `kimi-k3`. The first check verifies observable enabled/disabled
 behavior; the second uses the actual streaming summary transport and Work
 decision parser with a test persistence implementation, without starting an
 Astra Server. Its elapsed time is invocation duration, not user-visible TTFT.
-Neither replaces the MatrixOne-backed persistence fixture above. Configure
-`ASTRA_BYOK_DNS_SERVERS` only when required by the local network; do not disable
-the BYOK public-endpoint policy to run these checks.
+Neither replaces the MatrixOne-backed persistence fixture above. Configure the
+Server's system DNS if needed; do not disable the BYOK public-endpoint policy
+to run these checks.
 
 ```bash
 # 1. Smallest relevant target while iterating

@@ -201,6 +201,12 @@ def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, An
     thinking_protocol = _optional_string(entry, "thinking_protocol", model_name)
     if thinking_protocol is not None:
         quirks["thinking_protocol"] = thinking_protocol
+    inference_protocol = _optional_string(entry, "inference_protocol", model_name)
+    if inference_protocol is not None:
+        quirks["inference_protocol"] = inference_protocol
+    efforts = _optional_string_list(entry, "supported_reasoning_efforts", model_name)
+    if efforts is not None:
+        quirks["supported_reasoning_efforts"] = efforts
     probe_endpoint = _optional_string(entry, "probe_endpoint", model_name)
     if probe_endpoint is not None:
         quirks["probe_endpoint"] = probe_endpoint

@@ -56,6 +56,26 @@ pub(crate) fn create_controlled_per_turn_bridge(
     crate::cli::chat_stream::StreamEventTx,
     PerTurnStreamBridgeControl,
 ) {
+    create_controlled_per_turn_bridge_with_scope(tui_tx, None)
+}
+
+pub(crate) fn create_scoped_per_turn_bridge(
+    tui_tx: TuiAppEventTx,
+    scope: Arc<crate::tui::bottom_pane::RootIntentScope>,
+) -> (
+    crate::cli::chat_stream::StreamEventTx,
+    PerTurnStreamBridgeControl,
+) {
+    create_controlled_per_turn_bridge_with_scope(tui_tx, Some(scope))
+}
+
+fn create_controlled_per_turn_bridge_with_scope(
+    tui_tx: TuiAppEventTx,
+    scope: Option<Arc<crate::tui::bottom_pane::RootIntentScope>>,
+) -> (
+    crate::cli::chat_stream::StreamEventTx,
+    PerTurnStreamBridgeControl,
+) {
     let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
     let close = CancellationToken::new();
     let bridge_close = close.clone();
@@ -92,10 +112,19 @@ pub(crate) fn create_controlled_per_turn_bridge(
             // adjacent text deltas; the first non-text event is retained for
             // the next iteration so no typed boundary is reordered or lost.
             let event = coalesce_text_stream_event(event, &mut stream_rx, &mut pending_event);
-            if let Some(tui_event) = map_stream_event(event)
-                && tui_tx.send(tui_event).await.is_err()
-            {
-                return;
+            if let Some(mut tui_event) = map_stream_event(event) {
+                if matches!(
+                    &tui_event,
+                    TuiAppEvent::AgentLive(_)
+                        | TuiAppEvent::AgentLiveBatch(_)
+                        | TuiAppEvent::AgentLiveGap(_)
+                        | TuiAppEvent::AgentCommunication(_)
+                ) {
+                    tui_event = scope_agent_event(tui_event, &scope);
+                }
+                if tui_tx.send(tui_event).await.is_err() {
+                    return;
+                }
             }
         }
         let _ = tui_tx.send(TuiAppEvent::TurnStreamClosed).await;
@@ -250,7 +279,22 @@ impl BoundedAgentLiveSink {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEventSink {
+    create_agent_live_sink_with_scope(tui_tx, None)
+}
+
+pub(crate) fn create_scoped_agent_live_sink(
+    tui_tx: TuiAppEventTx,
+    scope: Arc<crate::tui::bottom_pane::RootIntentScope>,
+) -> SharedAgentLiveEventSink {
+    create_agent_live_sink_with_scope(tui_tx, Some(scope))
+}
+
+fn create_agent_live_sink_with_scope(
+    tui_tx: TuiAppEventTx,
+    scope: Option<Arc<crate::tui::bottom_pane::RootIntentScope>>,
+) -> SharedAgentLiveEventSink {
     let (tx, mut rx) = mpsc::channel::<QueuedAgentLiveEvent>(LIVE_AGENT_QUEUE_CAPACITY * 2);
     let (gap_tx, mut gap_rx) = mpsc::channel::<AgentLiveGap>(LIVE_AGENT_GAP_QUEUE_CAPACITY);
 
@@ -261,7 +305,8 @@ pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEv
                 biased;
                 gap = gap_rx.recv() => match gap {
                     Some(gap) => {
-                        if tui_tx.send(TuiAppEvent::AgentLiveGap(gap)).await.is_err() {
+                        let event = scope_agent_event(TuiAppEvent::AgentLiveGap(gap), &scope);
+                        if tui_tx.send(event).await.is_err() {
                             break;
                         }
                         // Incompleteness notices must not starve already
@@ -292,7 +337,7 @@ pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEv
             } else {
                 TuiAppEvent::AgentLiveBatch(std::mem::take(&mut batch))
             };
-            if tui_tx.send(out).await.is_err() {
+            if tui_tx.send(scope_agent_event(out, &scope)).await.is_err() {
                 break;
             }
         }
@@ -305,6 +350,19 @@ pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEv
     })
 }
 
+fn scope_agent_event(
+    event: TuiAppEvent,
+    scope: &Option<Arc<crate::tui::bottom_pane::RootIntentScope>>,
+) -> TuiAppEvent {
+    match scope {
+        Some(scope) => TuiAppEvent::ScopedAgentLive {
+            scope: scope.clone(),
+            event: Box::new(event),
+        },
+        None => event,
+    }
+}
+
 /// Convert typed stream evidence to the shared TUI event model. Plan execution
 /// and the foreground turn both use this mapping so transcript/tool semantics
 /// stay identical across execution modes.
@@ -312,6 +370,15 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
     Some(match event {
         StreamEvent::SessionBound(session_id) => TuiAppEvent::SessionBound(session_id),
         StreamEvent::RunBound(run_id) => TuiAppEvent::RunBound(run_id),
+        StreamEvent::RunModelOutcome {
+            run_id,
+            session_id,
+            outcome,
+        } => TuiAppEvent::RunModelOutcome {
+            run_id,
+            session_id,
+            outcome,
+        },
         StreamEvent::ContextWindowPolicy {
             raw_window_tokens,
             usable_input_tokens,

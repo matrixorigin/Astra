@@ -37,6 +37,12 @@ impl IntrospectReport {
                 .unwrap()
                 .push(json!("judgment_usage"));
         }
+        if self.thinking.is_some() {
+            projected["projection_budget"]["omitted_fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("thinking"));
+        }
         self.update_projection_counts(&mut projected);
         assert!(
             fits(&projected, max_chars),
@@ -66,6 +72,9 @@ impl IntrospectReport {
             json!(self.budget_result),
             max_chars,
         );
+        if let Some(thinking) = &self.thinking {
+            self.fit_field(&mut projected, "thinking", json!(thinking), max_chars);
+        }
 
         let mut observations = self.observations.iter().collect::<Vec<_>>();
         observations

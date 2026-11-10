@@ -74,8 +74,6 @@ pub struct RuntimeSnapshot {
     pub last_tool_result_class: Option<String>,
     #[serde(default)]
     pub read_only_round_streak: u32,
-    #[serde(default)]
-    pub redundant_read_count: u32,
 
     // ── Delegation depth ──
     #[serde(default)]
@@ -132,7 +130,6 @@ impl RuntimeSnapshot {
             has_final_text: false,
             last_tool_result_class: None,
             read_only_round_streak: 0,
-            redundant_read_count: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 0,
@@ -371,7 +368,6 @@ mod tests {
             has_final_text: true,
             last_tool_result_class: Some("success".into()),
             read_only_round_streak: 0,
-            redundant_read_count: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 1_700_000_000_000,

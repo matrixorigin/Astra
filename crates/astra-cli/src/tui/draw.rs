@@ -1482,6 +1482,8 @@ mod task_board_draw_tests {
                 output: Some(
                     serde_json::json!({
                         "agent_id": "reviewer@abc",
+                        "run_id": "reviewer-run",
+                        "result_family": "child_result",
                         "status": "completed",
                         "result": "done"
                     })
@@ -1492,6 +1494,13 @@ mod task_board_draw_tests {
             },
         ));
 
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id.as_deref(), Some("reviewer-run"));
+        assert_eq!(
+            rows[0].state.status,
+            crate::tui::agent_run_projection::AgentRunStatus::Completed
+        );
         let frame = active_viewport(&widget, &status, None, false, None, 80, 24);
 
         assert!(
@@ -1514,6 +1523,8 @@ mod task_board_draw_tests {
                 output: Some(
                     serde_json::json!({
                         "agent_id": "reviewer@settled",
+                        "run_id": "settled-run",
+                        "result_family": "child_result",
                         "status": "completed",
                         "result": "done"
                     })
@@ -1538,7 +1549,13 @@ mod task_board_draw_tests {
             frame.multi_agent.is_none(),
             "terminal agent history remains in Ctrl+G and must not pin the idle viewport"
         );
-        assert_eq!(widget.agent_monitor_snapshot(5).len(), 1);
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id.as_deref(), Some("settled-run"));
+        assert_eq!(
+            rows[0].state.status,
+            crate::tui::agent_run_projection::AgentRunStatus::Completed
+        );
     }
 
     #[test]

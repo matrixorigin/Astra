@@ -179,6 +179,11 @@ pub(crate) struct TurnUsage {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) usage_attribution: UsageAttribution,
+    /// Normalized disjoint lanes accounted for this logical turn. The
+    /// attribution above is the preferred source for the user-facing summary;
+    /// these lanes are the fallback that keeps the turn's own measurement
+    /// visible when no provider-attempt Explain facts were delivered.
+    pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     /// A provider usage attempt or unavailable capture was observed even if
     /// no numeric lane survived into the attribution projection.
     pub(crate) usage_observed: bool,
@@ -192,6 +197,7 @@ impl TurnUsage {
             cache_read_tokens: result.cache_read_tokens,
             cache_creation_tokens: result.cache_creation_tokens,
             usage_attribution: result.usage_attribution.clone(),
+            qualified_usage: result.qualified_usage,
             usage_observed: false,
         };
         let usage_observed = result.token_usage_coverage.attempts > 0
@@ -211,6 +217,7 @@ impl TurnUsage {
             cache_read_tokens: partial.cache_read_tokens,
             cache_creation_tokens: partial.cache_creation_tokens,
             usage_attribution: partial.usage_attribution.clone(),
+            qualified_usage: partial.qualified_usage,
             usage_observed: false,
         };
         let usage_observed = partial.token_usage_coverage.attempts > 0
@@ -391,6 +398,27 @@ pub(crate) enum ChatInput {
     Conversation(String),
 }
 
+async fn capture_turn_auth_owner(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>, &'static str> {
+    let capture = session_runtime::capture_admitted_auth_owner(api, profile, token);
+    let cancelled = async {
+        match cancel {
+            Some(cancel) => cancel.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => Err("Turn cancelled before it was sent."),
+        result = tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, capture) =>
+            result.map_err(|_| "Authentication did not become available; the turn was not sent."),
+    }
+}
+
 pub(crate) async fn handle_chat_input(
     input: ChatInput,
     current_token: Option<&str>,
@@ -470,6 +498,23 @@ pub(crate) async fn handle_chat_input_with_ui(
         }
     };
 
+    // Bind refresh authority before session creation or any other asynchronous
+    // preflight can race a refresh from a concurrent request.
+    let initial_auth_owner = match capture_turn_auth_owner(
+        ctx.api,
+        ctx.profile,
+        token,
+        state.tui_cancel_token.as_deref(),
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(message) => {
+            ui.show_warning(message);
+            let _ = ui.restore_input(&line, state.session_id.as_deref());
+            return Ok(InteractiveTurnOutcome::NotStarted);
+        }
+    };
     let session_id =
         match ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await {
             Ok(session_id) => session_id,
@@ -535,11 +580,24 @@ pub(crate) async fn handle_chat_input_with_ui(
     let turn_start = Instant::now();
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
+    let auth_owner = match admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+    {
+        Some(turn) => turn.auth_owner.clone(),
+        None => initial_auth_owner,
+    };
+    if auth_owner.as_ref().is_some_and(|owner| !owner.is_current()) || !ctx.permits_admission(state)
+    {
+        ui.show_warning("The account or conversation changed. This instruction was not sent.");
+        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        return Ok(InteractiveTurnOutcome::NotStarted);
+    }
     let attempt = run_chat_turn(TurnExecutionRequest {
         state,
         input: TurnExecutionInput {
             api: ctx.api,
-            profile: ctx.profile,
+
             token,
             message: &finalized_input.user_message,
             user_intent: &finalized_input.user_intent,
@@ -551,6 +609,7 @@ pub(crate) async fn handle_chat_input_with_ui(
                 .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: None,
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
+            auth_owner: auth_owner.as_ref(),
         },
     })
     .await;
@@ -578,6 +637,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         turn_start,
         ui,
         turn_usage_sink: Some(&turn_usage_sink),
+        auth_owner: auth_owner.as_ref(),
     };
 
     let settlement =
@@ -625,6 +685,20 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         }
     };
 
+    let initial_auth_owner = match capture_turn_auth_owner(
+        ctx.api,
+        ctx.profile,
+        token,
+        state.tui_cancel_token.as_deref(),
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(message) => {
+            ui.show_warning(message);
+            return Ok(InteractiveTurnOutcome::NotStarted);
+        }
+    };
     let session_id =
         ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
 
@@ -674,11 +748,23 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     ui.blank_line();
 
+    let auth_owner = match admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+    {
+        Some(turn) => turn.auth_owner.clone(),
+        None => initial_auth_owner,
+    };
+    if auth_owner.as_ref().is_some_and(|owner| !owner.is_current()) || !ctx.permits_admission(state)
+    {
+        ui.show_warning("The account or conversation changed. The background update was not sent.");
+        return Ok(InteractiveTurnOutcome::NotStarted);
+    }
     let attempt = run_chat_turn(TurnExecutionRequest {
         state,
         input: TurnExecutionInput {
             api: ctx.api,
-            profile: ctx.profile,
+
             token,
             message: &runtime_envelope,
             user_intent: &user_intent,
@@ -690,6 +776,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
                 .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: Some(user_intent.as_str()),
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
+            auth_owner: auth_owner.as_ref(),
         },
     })
     .await;
@@ -714,6 +801,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         turn_start,
         ui,
         turn_usage_sink: Some(&turn_usage_sink),
+        auth_owner: auth_owner.as_ref(),
     };
     let settlement =
         settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
@@ -901,6 +989,7 @@ mod tests {
         ensure_agent_projection_for_turn, ensure_interactive_session_identity,
         handle_chat_input_with_ui, interactive_outcome, model_selection_preflight_failure,
     };
+    use crate::cli::session::session_runtime;
     use crate::cli::session::session_state::SessionState;
     use crate::cli::stream::streaming_types::UsageAttribution;
 
@@ -953,7 +1042,7 @@ mod tests {
         ];
         let input = super::TurnExecutionInput {
             api: &api,
-            profile: None,
+
             token: "synthetic-token",
             message: "continue",
             user_intent: "continue",
@@ -963,6 +1052,7 @@ mod tests {
             admitted_server_turn: None,
             semantic_query_override: None,
             explain_analyze_terminal_degraded: None,
+            auth_owner: None,
         };
         let attempt = WORKSPACE_HOST_VALIDATION_FOR_TEST
             .scope(
@@ -1004,6 +1094,7 @@ mod tests {
             turn_start: std::time::Instant::now(),
             ui: &mut ui,
             turn_usage_sink: Some(&usage),
+            auth_owner: None,
         };
         let settled = super::settle_turn_attempt(&mut state, &mut dispatch, attempt, |_| {
             Box::pin(async { panic!("unsupported host must not retry") })
@@ -1040,6 +1131,210 @@ mod tests {
                 .all(|request| request.method.as_str() == "GET" && request.url.path() == "/models"),
             "no execution or refresh request is allowed"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancellation_during_auth_capture_restores_input_before_network() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("old-access".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let held = owner.legacy_binding.as_ref().unwrap().pair.lock().await;
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut state = SessionState {
+            tui_cancel_token: Some(cancel.clone()),
+            ..SessionState::default()
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        {
+            let turn = handle_chat_input_with_ui(
+                ChatInput::Interactive("hello".into()),
+                Some("old-access"),
+                session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                ctx,
+                &mut ui,
+            );
+            tokio::pin!(turn);
+            tokio::select! {
+                _ = &mut turn => panic!("auth owner lock must be held"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+            cancel.cancel();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        }
+        assert_eq!(ui.restored_inputs, ["hello"]);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_creation_race_retries_preflight_with_the_same_refreshed_owner() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::{get, post},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Clone, Default)]
+        struct Gate {
+            session_entered: Arc<tokio::sync::Notify>,
+            session_release: Arc<tokio::sync::Notify>,
+            refreshes: Arc<AtomicUsize>,
+            old_preflights: Arc<AtomicUsize>,
+            new_preflights: Arc<AtomicUsize>,
+        }
+        async fn session(State(g): State<Gate>) -> (StatusCode, Json<serde_json::Value>) {
+            g.session_entered.notify_one();
+            g.session_release.notified().await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"session_id":"concurrent-auth-session"})),
+            )
+        }
+        async fn preflight(State(g): State<Gate>, headers: HeaderMap) -> StatusCode {
+            match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some("Bearer old-access") => {
+                    g.old_preflights.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::UNAUTHORIZED
+                }
+                Some("Bearer new-access") => {
+                    g.new_preflights.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::FORBIDDEN
+                }
+                other => panic!("unexpected preflight bearer: {other:?}"),
+            }
+        }
+        async fn models(headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
+            if headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some("Bearer old-access")
+            {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+            }
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer new-access")
+            );
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"items":[],"next_cursor":null,"limit":50,"total":0,"catalog_revision":"sha256:empty"}),
+                ),
+            )
+        }
+        async fn refresh(State(g): State<Gate>) -> Json<serde_json::Value> {
+            g.refreshes.fetch_add(1, Ordering::SeqCst);
+            Json(
+                serde_json::json!({"user_id":"owner","access_token":"new-access","refresh_token":"new-refresh"}),
+            )
+        }
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("old-access".into()),
+                refresh_token: Some("old-refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let gate = Gate::default();
+        let app = Router::new()
+            .route("/sessions", post(session))
+            .route("/model-access", get(preflight))
+            .route("/models", get(models))
+            .route("/auth/refresh", post(refresh))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        {
+            let turn = handle_chat_input_with_ui(
+                ChatInput::Interactive("hello".into()),
+                Some("old-access"),
+                session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                ctx,
+                &mut ui,
+            );
+            tokio::pin!(turn);
+            tokio::select! { _ = &mut turn => panic!("session creation must be held"), _ = gate.session_entered.notified() => {} }
+            let auth = session_runtime::AdmittedAuth::Owner(owner);
+            assert!(
+                session_runtime::fetch_admitted_model_catalog(&api, &auth)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            gate.session_release.notify_one();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), &mut turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        }
+        assert_eq!(gate.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.old_preflights.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.new_preflights.load(Ordering::SeqCst), 1);
+        assert_eq!(ui.restored_inputs, ["hello"]);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1724,7 +2019,7 @@ mod tests {
                 state: &mut state,
                 input: super::TurnExecutionInput {
                     api: &api,
-                    profile: None,
+
                     token: "test-token",
                     message: "hello",
                     user_intent: "hello",
@@ -1734,6 +2029,7 @@ mod tests {
                     admitted_server_turn: None,
                     semantic_query_override: None,
                     explain_analyze_terminal_degraded: None,
+                    auth_owner: None,
                 },
             });
             let result = if expected == "timed out" {

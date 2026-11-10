@@ -344,7 +344,11 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 .unwrap_or_else(|_| "?".to_string());
             eprintln!("  {} {}", "Running for:".bold(), elapsed);
 
-            eprintln!("\n  {}", "📊 Metrics".magenta().bold());
+            eprintln!(
+                "\n  {} ({})",
+                "📊 Metrics".magenta().bold(),
+                state.metrics.coverage()
+            );
             eprintln!("  {}", "─".repeat(30).dim());
             eprintln!("  {} {}", "Turns:".bold(), state.metrics.turns_completed);
             eprintln!("  {} {}", "Tool calls:".bold(), state.metrics.tool_calls);
@@ -979,7 +983,9 @@ fn format_status(status: &AgentStatus) -> String {
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
         AgentStatus::Waiting { reason } => format!("waiting: {reason}"),
         AgentStatus::Paused { reason } => format!("paused: {reason}"),
-        AgentStatus::Cancelled { by_user, reason } => {
+        AgentStatus::Cancelled {
+            by_user, reason, ..
+        } => {
             if reason.is_empty() {
                 if *by_user {
                     "cancelled by user".to_string()

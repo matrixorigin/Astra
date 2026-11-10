@@ -18,11 +18,16 @@ pub(crate) struct ConversationFailure {
     pub error_code: Option<String>,
 }
 
-struct RunFailure {
+enum RunTerminalDetail {
+    Failure(ConversationFailure),
+    Cancelled(Option<bool>),
+}
+
+struct RunTerminal {
     run_id: String,
     created_at: String,
     terminal_assistant_source: Option<String>,
-    failure: ConversationFailure,
+    detail: RunTerminalDetail,
     detail_truncated: bool,
 }
 
@@ -53,6 +58,8 @@ pub(crate) enum ConversationItem {
         item: Box<TranscriptItemResponse>,
         #[serde(skip_serializing_if = "Option::is_none")]
         failure: Option<ConversationFailure>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_not_saved: Option<Option<bool>>,
     },
     Opening {
         id: String,
@@ -67,19 +74,27 @@ pub(crate) enum ConversationItem {
         created_at: String,
         failure: ConversationFailure,
     },
+    Cancellation {
+        id: String,
+        run_id: String,
+        created_at: String,
+        context_not_saved: Option<bool>,
+    },
 }
 
 impl ConversationItem {
     fn run_id(&self) -> Option<&str> {
         match self {
             Self::Raw { item, .. } => item.run_id.as_deref(),
-            Self::Opening { run_id, .. } | Self::Failure { run_id, .. } => Some(run_id),
+            Self::Opening { run_id, .. }
+            | Self::Failure { run_id, .. }
+            | Self::Cancellation { run_id, .. } => Some(run_id),
         }
     }
     fn source(&self) -> Option<&str> {
         match self {
             Self::Raw { item, .. } => item.source_event_id.as_deref(),
-            Self::Failure { .. } => None,
+            Self::Failure { .. } | Self::Cancellation { .. } => None,
             Self::Opening {
                 source_event_id, ..
             } => Some(source_event_id),
@@ -88,7 +103,9 @@ impl ConversationItem {
     fn created_at(&self) -> &str {
         match self {
             Self::Raw { item, .. } => &item.created_at,
-            Self::Opening { created_at, .. } | Self::Failure { created_at, .. } => created_at,
+            Self::Opening { created_at, .. }
+            | Self::Failure { created_at, .. }
+            | Self::Cancellation { created_at, .. } => created_at,
         }
     }
 }
@@ -132,7 +149,10 @@ WITH roots AS (
            s.history_loaded,
            CASE WHEN r.status = 'failed' THEN LEFT(b.error_message, 256) ELSE NULL END AS failure_message,
            CASE WHEN r.status = 'failed' THEN b.error_code ELSE NULL END AS failure_code,
-           CASE WHEN r.status = 'failed' THEN
+           CASE WHEN r.status = 'cancelled' THEN
+               JSON_UNQUOTE(JSON_EXTRACT(b.terminal_receipt_json, '$.receipt.context.disposition'))
+               ELSE NULL END AS cancellation_context,
+           CASE WHEN r.status IN ('failed', 'cancelled') THEN
                NULLIF(JSON_UNQUOTE(JSON_EXTRACT(b.terminal_receipt_json, '$.receipt.transcript.assistant_source_event_id')), 'null')
                ELSE NULL END AS terminal_assistant_source,
            CASE WHEN r.status = 'failed' AND CHAR_LENGTH(b.error_message) > 256 THEN 1 ELSE 0 END AS failure_detail_truncated
@@ -144,7 +164,7 @@ WITH roots AS (
 ), budgeted AS (
     SELECT c.*, SUM(CASE WHEN selected_rank = 1 THEN 0 ELSE
         stored_bytes + 512 + 12 * OCTET_LENGTH(run_id) +
-        CASE WHEN status = 'failed' THEN 1024 + 6 *
+        CASE WHEN status IN ('failed', 'cancelled') THEN 1024 + 6 *
             (COALESCE(OCTET_LENGTH(failure_message), 0) +
              COALESCE(OCTET_LENGTH(failure_code), 0) +
              COALESCE(OCTET_LENGTH(terminal_assistant_source), 0)) ELSE 0 END END)
@@ -172,7 +192,7 @@ SELECT 'root' AS record_kind, r.session_id, r.run_id, r.status, r.waiting_for,
        CASE WHEN body_loaded = 1 THEN b.opening_context_json ELSE CAST(NULL AS CHAR) END AS opening_context_json,
        CASE WHEN b.run_id IS NULL THEN -1 ELSE body_loaded END AS opening_body_loaded, stored_bytes, history_loaded,
        CASE WHEN body_loaded = 1 THEN failure_message ELSE NULL END AS failure_message,
-       failure_code, terminal_assistant_source,
+       failure_code, cancellation_context, terminal_assistant_source,
        CASE WHEN failure_detail_truncated = 1 OR (body_loaded = 0 AND failure_message IS NOT NULL)
             THEN 1 ELSE 0 END AS failure_detail_truncated,
        CAST(NULL AS SIGNED) AS item_seq, CAST(NULL AS CHAR) AS role,
@@ -185,7 +205,9 @@ SELECT 'raw', t.session_id, t.run_id, r.status, CAST(NULL AS CHAR),
        CAST(0 AS SIGNED), CAST(0 AS SIGNED),
        CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(0 AS SIGNED), CAST(0 AS SIGNED), CAST(1 AS SIGNED),
        CAST(NULL AS CHAR), CASE WHEN r.status = 'failed' THEN r.error_code ELSE NULL END,
-       CASE WHEN r.status = 'failed' THEN
+       CASE WHEN r.status = 'cancelled' THEN
+           JSON_UNQUOTE(JSON_EXTRACT(r.terminal_receipt_json, '$.receipt.context.disposition')) ELSE NULL END,
+       CASE WHEN r.status IN ('failed', 'cancelled') THEN
            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(r.terminal_receipt_json, '$.receipt.transcript.assistant_source_event_id')), 'null')
            ELSE NULL END,
        CASE WHEN r.status = 'failed' AND r.error_message IS NOT NULL THEN 1 ELSE 0 END,
@@ -248,16 +270,14 @@ pub(crate) async fn read_conversation(
     let mut selected = None;
     let mut openings = Vec::new();
     let mut raw = Vec::new();
-    let mut failures = std::collections::HashMap::new();
+    let mut terminals = std::collections::HashMap::new();
     let mut truncated = false;
     let mut history_loaded = true;
     for row in rows {
-        if row
+        let status = row
             .try_get::<Option<String>, _>("status")
-            .map_err(|e| e.to_string())?
-            .as_deref()
-            == Some("failed")
-        {
+            .map_err(|e| e.to_string())?;
+        if matches!(status.as_deref(), Some("failed" | "cancelled")) {
             let run_id: String = row.try_get("run_id").map_err(|e| e.to_string())?;
             let message: Option<String> =
                 row.try_get("failure_message").map_err(|e| e.to_string())?;
@@ -267,21 +287,34 @@ pub(crate) async fn read_conversation(
                 == 1;
             // A raw page can reach a Run outside the bounded opening window.
             // Its compact outcome still comes from this statement snapshot.
-            if message.is_some() || !failures.contains_key(&run_id) {
-                failures.insert(
+            if message.is_some() || !terminals.contains_key(&run_id) {
+                terminals.insert(
                     run_id.clone(),
-                    RunFailure {
+                    RunTerminal {
                         run_id,
                         created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
                         terminal_assistant_source: row
                             .try_get("terminal_assistant_source")
                             .map_err(|e| e.to_string())?,
                         detail_truncated,
-                        failure: ConversationFailure {
-                            message: message
-                                .filter(|text| !text.trim().is_empty())
-                                .unwrap_or_else(|| "Astra run failed.".into()),
-                            error_code: row.try_get("failure_code").map_err(|e| e.to_string())?,
+                        detail: if status.as_deref() == Some("cancelled") {
+                            let disposition: Option<String> = row
+                                .try_get("cancellation_context")
+                                .map_err(|e| e.to_string())?;
+                            RunTerminalDetail::Cancelled(match disposition.as_deref() {
+                                Some("revoked") => Some(true),
+                                Some("advanced" | "unchanged") => Some(false),
+                                _ => None,
+                            })
+                        } else {
+                            RunTerminalDetail::Failure(ConversationFailure {
+                                message: message
+                                    .filter(|text| !text.trim().is_empty())
+                                    .unwrap_or_else(|| "Astra run failed.".into()),
+                                error_code: row
+                                    .try_get("failure_code")
+                                    .map_err(|e| e.to_string())?,
+                            })
                         },
                     },
                 );
@@ -369,7 +402,7 @@ pub(crate) async fn read_conversation(
             selected = Some(root);
         }
     }
-    truncated |= failures.values().any(|failure| failure.detail_truncated);
+    truncated |= terminals.values().any(|failure| failure.detail_truncated);
     raw.sort_by_key(|item| item.item_seq);
     let has_more = raw.len() > limit;
     if has_more {
@@ -384,7 +417,7 @@ pub(crate) async fn read_conversation(
         raw,
         openings,
         if history_loaded {
-            failures.into_values().collect()
+            terminals.into_values().collect()
         } else {
             Vec::new()
         },
@@ -403,7 +436,7 @@ pub(crate) async fn read_conversation(
 fn compose_conversation(
     raw: Vec<TranscriptItemResponse>,
     mut openings: Vec<ConversationItem>,
-    mut failures: Vec<RunFailure>,
+    mut terminals: Vec<RunTerminal>,
     selected: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<ConversationItem>, bool), String> {
@@ -429,6 +462,7 @@ fn compose_conversation(
         .map(|item| ConversationItem::Raw {
             item: Box::new(item),
             failure: None,
+            context_not_saved: None,
         })
         .collect();
     let mut omitted = false;
@@ -475,7 +509,9 @@ fn compose_conversation(
     }
     // Invisible tool scaffolding must not consume the Web's display window.
     entries.retain(|entry| match entry {
-        ConversationItem::Opening { .. } | ConversationItem::Failure { .. } => true,
+        ConversationItem::Opening { .. }
+        | ConversationItem::Failure { .. }
+        | ConversationItem::Cancellation { .. } => true,
         ConversationItem::Raw { item, .. } => {
             matches!(item.role.as_str(), "user" | "system")
                 || item.role == "assistant"
@@ -487,26 +523,43 @@ fn compose_conversation(
                         || !item.artifacts.is_empty())
         }
     });
-    failures.sort_by(|a, b| (&a.created_at, &a.run_id).cmp(&(&b.created_at, &b.run_id)));
-    for outcome in failures {
-        if let Some(ConversationItem::Raw { failure, .. }) = entries.iter_mut().find(|entry| {
+    terminals.sort_by(|a, b| (&a.created_at, &a.run_id).cmp(&(&b.created_at, &b.run_id)));
+    for outcome in terminals {
+        if let Some(ConversationItem::Raw {
+            failure,
+            context_not_saved,
+            ..
+        }) = entries.iter_mut().find(|entry| {
             matches!(entry, ConversationItem::Raw { item, .. } if item.role == "assistant"
                 && item.run_id.as_deref() == Some(&outcome.run_id)
                 && outcome.terminal_assistant_source.is_some()
                 && item.source_event_id == outcome.terminal_assistant_source)
         }) {
-            *failure = Some(outcome.failure);
+            match outcome.detail {
+                RunTerminalDetail::Failure(detail) => *failure = Some(detail),
+                RunTerminalDetail::Cancelled(observation) => *context_not_saved = Some(observation),
+            }
         } else if let Some(index) = entries
             .iter()
             .rposition(|entry| entry.run_id() == Some(&outcome.run_id))
         {
             entries.insert(
                 index + 1,
-                ConversationItem::Failure {
-                    id: format!("failure:{}", outcome.run_id),
-                    run_id: outcome.run_id,
-                    created_at: outcome.created_at,
-                    failure: outcome.failure,
+                match outcome.detail {
+                    RunTerminalDetail::Failure(failure) => ConversationItem::Failure {
+                        id: format!("failure:{}", outcome.run_id),
+                        run_id: outcome.run_id,
+                        created_at: outcome.created_at,
+                        failure,
+                    },
+                    RunTerminalDetail::Cancelled(context_not_saved) => {
+                        ConversationItem::Cancellation {
+                            id: format!("cancellation:{}", outcome.run_id),
+                            run_id: outcome.run_id,
+                            created_at: outcome.created_at,
+                            context_not_saved,
+                        }
+                    }
                 },
             );
         }
@@ -533,6 +586,68 @@ fn compose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_context_is_bound_to_its_terminal_and_survives_successors() {
+        for observation in [Some(true), Some(false), None] {
+            for partial in [false, true] {
+                let mut rows = vec![raw(
+                    3,
+                    Some("next"),
+                    Some("next-answer"),
+                    "assistant",
+                    "new answer",
+                    "third",
+                )];
+                if partial {
+                    rows.insert(
+                        0,
+                        raw(
+                            2,
+                            Some("old"),
+                            Some("terminal"),
+                            "assistant",
+                            "partial answer",
+                            "second",
+                        ),
+                    );
+                }
+                let (items, _) = compose_conversation(
+                    rows,
+                    vec![
+                        opening("old", "first", "old input"),
+                        opening("next", "third", "new input"),
+                    ],
+                    vec![RunTerminal {
+                        run_id: "old".into(),
+                        created_at: "first".into(),
+                        terminal_assistant_source: Some("terminal".into()),
+                        detail: RunTerminalDetail::Cancelled(observation),
+                        detail_truncated: false,
+                    }],
+                    Some("next"),
+                    200,
+                )
+                .unwrap();
+                let wire = serde_json::to_value(items).unwrap();
+                let old = wire
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["run_id"] == "old" && item.get("context_not_saved").is_some())
+                    .unwrap();
+                assert_eq!(old["context_not_saved"], serde_json::json!(observation));
+                assert_eq!(old["kind"], if partial { "raw" } else { "cancellation" });
+                assert!(
+                    wire.as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["run_id"] == "next")
+                        .all(|item| item.get("context_not_saved").is_none())
+                );
+            }
+        }
+    }
     fn opening(run: &str, time: &str, content: &str) -> ConversationItem {
         ConversationItem::Opening {
             id: format!("input:{run}"),
@@ -574,6 +689,7 @@ mod tests {
                 ConversationItem::Opening { content, .. } => content.as_str(),
                 ConversationItem::Raw { item, .. } => item.content.as_str(),
                 ConversationItem::Failure { failure, .. } => &failure.message,
+                ConversationItem::Cancellation { .. } => "Stopped.",
             })
             .collect()
     }
@@ -766,15 +882,15 @@ mod tests {
                     opening("old", "first", "old input"),
                     opening("next", "third", "next input"),
                 ],
-                vec![RunFailure {
+                vec![RunTerminal {
                     run_id: "old".into(),
                     created_at: "first".into(),
                     terminal_assistant_source: terminal.map(str::to_owned),
                     detail_truncated: false,
-                    failure: ConversationFailure {
+                    detail: RunTerminalDetail::Failure(ConversationFailure {
                         message: "provider disconnected".into(),
                         error_code: Some("stream_transport".into()),
-                    },
+                    }),
                 }],
                 Some("next"),
                 200,
@@ -821,15 +937,15 @@ mod tests {
                 opening("old", "first", "old input"),
                 opening("current", "second", "exact input"),
             ],
-            vec![RunFailure {
+            vec![RunTerminal {
                 run_id: "current".into(),
                 created_at: "second".into(),
                 terminal_assistant_source: None,
                 detail_truncated: false,
-                failure: ConversationFailure {
+                detail: RunTerminalDetail::Failure(ConversationFailure {
                     message: "failure".into(),
                     error_code: None,
-                },
+                }),
             }],
             Some("current"),
             2,

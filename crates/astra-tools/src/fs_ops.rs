@@ -38,12 +38,6 @@ const READ_FILE_ALLOWED_FIELDS: &[&str] = &[
     "start_line",
     "end_line",
     "outline",
-    // System-level transaction/rollback fields injected by the rollback engine.
-    "transaction_id",
-    "rollback_on_failure",
-    "rollback_boundary",
-    "rollback_state",
-    "rollback",
     // System-level field injected by headless tool pipeline for idempotency
     // and work-surface deduplication.
     "_tool_call_id",
@@ -94,16 +88,6 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     }?;
     validate_read_file_line_arg(object, "start_line")?;
     validate_read_file_line_arg(object, "end_line")?;
-    if let (Some(start), Some(end)) = (
-        object.get("start_line").and_then(Value::as_u64),
-        object.get("end_line").and_then(Value::as_u64),
-    ) && start > end
-    {
-        return Err(
-            "Error: `start_line` must not exceed `end_line` for read_file. Use an inclusive 1-based range, or omit `end_line` to read through the end of the file."
-                .to_string(),
-        );
-    }
     if let Some(value) = object.get("outline")
         && !value.is_boolean()
     {
@@ -151,6 +135,7 @@ pub fn normalize_read_file_line_range(
     end_line: Option<usize>,
     total_lines: usize,
 ) -> ReadLineRange {
+    let (start_line, end_line) = astra_text_utils::line_range::ordered_bounds(start_line, end_line);
     let start = start_line.unwrap_or(1);
     let end = end_line.unwrap_or(total_lines);
     ReadLineRange {
@@ -711,11 +696,17 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 
     let lines: Vec<&str> = raw_content.lines().collect();
+    let range = normalize_read_file_line_range(start_line, end_line, lines.len());
     if lines.is_empty() {
+        if has_range {
+            return ToolResult::error(format!(
+                "Error: start_line {} exceeds file length 0",
+                range.start_line
+            ));
+        }
         return ToolResult::text("(empty file)".to_string());
     }
 
-    let range = normalize_read_file_line_range(start_line, end_line, lines.len());
     let start = range.start_line.saturating_sub(1).min(lines.len());
     let end = range.end_line.min(lines.len());
 
@@ -806,6 +797,8 @@ pub struct PreparedWriteFile {
     /// journal entry, cache invalidation, or workspace generation change.
     already_desired: bool,
     requested_content_state: crate::workspace_observation::WorkspaceFileStateIdentity,
+    #[cfg(unix)]
+    parent_binding: std::sync::OnceLock<Result<FileParentBinding, String>>,
 }
 
 impl PreparedWriteFile {
@@ -826,6 +819,8 @@ impl PreparedWriteFile {
             original_content: original_bytes,
             content,
             requested_content_state,
+            #[cfg(unix)]
+            parent_binding: std::sync::OnceLock::new(),
         }
     }
 
@@ -887,6 +882,25 @@ impl PreparedWriteFile {
         self.original_content.as_deref()
     }
 
+    #[cfg(unix)]
+    pub fn parent_binding(&self) -> Option<&FileParentBinding> {
+        self.parent_binding
+            .get()
+            .and_then(|result| result.as_ref().ok())
+    }
+
+    #[cfg(unix)]
+    fn capture_parent_binding(&self) -> Result<(), String> {
+        self.parent_binding
+            .get_or_init(|| {
+                capture_file_parent(&self.path)
+                    .map_err(|error| format!("Error: Cannot bind file directory: {error}"))
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
+    }
+
     /// Owner-derived outcome from the prepared full-state comparison. This is
     /// available before apply so journal owners can avoid recording an undo
     /// entry for an exact no-op; apply still revalidates the preimage hash.
@@ -918,6 +932,11 @@ impl PreparedWriteFile {
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
+        }
+
+        #[cfg(unix)]
+        if let Err(error) = self.capture_parent_binding() {
+            return ToolResult::error(error);
         }
 
         match write_file_atomic(
@@ -1087,7 +1106,10 @@ fn resolve_replacement_match<'a>(
 ) -> Result<(&'a str, Cow<'a, str>, Option<&'static str>), ToolResult> {
     let count = content.matches(old_str).count();
     if count > 0 {
-        if count > 1 && !replace_all {
+        let overlapping = (count == 1 && !replace_all)
+            .then(|| astra_text_utils::first_two_match_positions(content, old_str))
+            .flatten();
+        if !replace_all && (count > 1 || overlapping.is_some()) {
             let label = edit_index.map_or_else(
                 || "old_str".to_owned(),
                 |index| format!("edit[{index}] old_str"),
@@ -1097,15 +1119,30 @@ fn resolve_replacement_match<'a>(
             } else {
                 "Add surrounding context to match exactly once, or use replace_all=true to replace every occurrence."
             };
+            let detail = if overlapping.is_some() {
+                "old_str matched at least 2 overlapping locations; anchors must be unique."
+                    .to_string()
+            } else {
+                format!("old_str matched {count} times; anchors must be unique.")
+            };
             let mut message = str_replace_fail(
                 &format!("{label} is ambiguous in {path_str}."),
-                &format!("old_str matched {count} times; anchors must be unique."),
+                &detail,
                 next,
             );
-            let locations: Vec<_> = content
-                .match_indices(old_str)
-                .take(10)
-                .map(|(offset, _)| {
+            let positions: Vec<_> = overlapping.map_or_else(
+                || {
+                    content
+                        .match_indices(old_str)
+                        .take(10)
+                        .map(|(offset, _)| offset)
+                        .collect()
+                },
+                |(first, second)| vec![first, second],
+            );
+            let locations: Vec<_> = positions
+                .into_iter()
+                .map(|offset| {
                     content[..offset]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
@@ -1709,10 +1746,8 @@ pub struct PreparedDeleteFile {
     path: PathBuf,
     path_str: String,
     before_content: Vec<u8>,
-    /// SHA-256 hex digest of the file content captured at prepare time.
-    /// Verified before commit to detect concurrent modifications: a delete
-    /// that silently destroys newer content than the model read is unsafe.
-    before_content_hash: Option<String>,
+    #[cfg(unix)]
+    parent_binding: std::sync::OnceLock<Option<FileParentBinding>>,
 }
 
 impl PreparedDeleteFile {
@@ -1724,17 +1759,31 @@ impl PreparedDeleteFile {
         &self.before_content
     }
 
+    #[cfg(unix)]
+    pub fn parent_binding(&self) -> Option<&FileParentBinding> {
+        self.parent_binding.get().and_then(Option::as_ref)
+    }
+
     pub fn apply(&self) -> ToolResult {
-        // First principles: deleting a file that changed since it was read is
-        // a silent data-loss hazard. Re-verify the hash before removing, so a
-        // concurrent write between prepare→apply aborts instead of destroying
-        // new content. This mirrors write_file / str_replace pre-commit checks.
-        if let Err(e) =
-            verify_expected_original_hash(&self.path, self.before_content_hash.as_deref())
+        #[cfg(unix)]
+        let result = match self
+            .parent_binding
+            .get_or_init(|| capture_file_parent(&self.path).ok())
         {
-            return ToolResult::error(e);
-        }
-        match std::fs::remove_file(&self.path) {
+            Some(parent) => {
+                restore_file_in_bound_parent(parent, &self.path, Some(&self.before_content), None)
+            }
+            None => Err(std::io::Error::other("cannot bind file directory")),
+        };
+        #[cfg(not(unix))]
+        let result = {
+            let hash = format!("{:x}", Sha256::digest(&self.before_content));
+            if let Err(error) = verify_expected_original_hash(&self.path, Some(&hash)) {
+                return ToolResult::error(error);
+            }
+            std::fs::remove_file(&self.path)
+        };
+        match result {
             Ok(()) => ToolResult::text(format!("Successfully deleted {}", self.path_str))
                 .with_workspace_mutation_applied(),
             Err(e) => ToolResult::error(format!("Error: Cannot delete file: {e}")),
@@ -1771,13 +1820,12 @@ pub fn prepare_delete_file(
         }
     };
 
-    let before_content_hash = Some(format!("{:x}", Sha256::digest(&before_content)));
-
     Ok(PreparedDeleteFile {
         path,
         path_str: path_str.to_string(),
         before_content,
-        before_content_hash,
+        #[cfg(unix)]
+        parent_binding: std::sync::OnceLock::new(),
     })
 }
 
@@ -1957,6 +2005,10 @@ impl PreparedMultiPathEdit {
             if prepared.dry_run {
                 // Dry-run batches are handled before reaching this point.
                 continue;
+            }
+            #[cfg(unix)]
+            if let Err(error) = prepared.publication.capture_parent_binding() {
+                return ToolResult::error(error);
             }
             let staging = match stage_file(prepared.path(), prepared.new_content_bytes()) {
                 Ok(staging) => staging,
@@ -2433,13 +2485,222 @@ fn publish_staged_file(
         .map_err(|error| format!("Error: Cannot commit write for {}: {error}", path.display()))
 }
 
-fn write_file_atomic(
+/// Publish bytes only if the current file still matches the expected digest.
+/// `None` requires the target to be absent and uses no-clobber publication.
+pub fn write_file_atomic(
     path: &Path,
     content: &[u8],
     expected_original_hash: Option<&str>,
 ) -> Result<(), String> {
     verify_expected_original_hash(path, expected_original_hash)?;
     publish_staged_file(stage_file(path, content)?, path, expected_original_hash)
+}
+
+/// The directory in which a committed edit was made. The path is only a
+/// lookup label; the identity must still match when a journal is restored.
+#[cfg(unix)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileParentBinding {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(unix)]
+pub fn capture_file_parent(path: &Path) -> std::io::Result<FileParentBinding> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("file has no parent directory"))?
+        .canonicalize()?;
+    let filesystem = astra_sandbox::open_filesystem_root()?;
+    let relative = parent
+        .strip_prefix("/")
+        .map_err(|_| std::io::Error::other("file parent is not absolute"))?;
+    let metadata = astra_sandbox::open_directory_beneath(&filesystem, relative)?.metadata()?;
+    Ok(FileParentBinding {
+        path: parent,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        created: metadata.created().ok(),
+    })
+}
+
+/// Restore relative to the originally recorded directory, without following a
+/// substituted parent or final symlink. The byte comparison detects existing
+/// conflicts; as with ordinary file writes, it is not a CAS against unrelated
+/// processes that write concurrently with publication.
+#[cfg(unix)]
+pub fn restore_file_in_bound_parent(
+    binding: &FileParentBinding,
+    path: &Path,
+    expected: Option<&[u8]>,
+    replacement: Option<&[u8]>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let filesystem = astra_sandbox::open_filesystem_root()?;
+    let relative = binding
+        .path
+        .strip_prefix("/")
+        .map_err(|_| std::io::Error::other("recorded parent is not absolute"))?;
+    let parent = astra_sandbox::open_directory_beneath(&filesystem, relative)?;
+    let metadata = parent.metadata()?;
+    if metadata.dev() != binding.device
+        || metadata.ino() != binding.inode
+        || binding
+            .created
+            .is_some_and(|created| metadata.created().ok() != Some(created))
+    {
+        return Err(std::io::Error::other(
+            "file parent changed since the recorded edit",
+        ));
+    }
+    restore_file_in_open_parent(&parent, path, expected, replacement)
+}
+
+/// Restore through an already bound directory; compare before publication so
+/// a later edit is not knowingly replaced. This is not an OS-level CAS.
+#[cfg(unix)]
+pub fn restore_file_in_open_parent(
+    parent: &std::fs::File,
+    path: &Path,
+    expected: Option<&[u8]>,
+    replacement: Option<&[u8]>,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("file has no name"))?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::other("file name contains NUL"))?;
+
+    let check = || -> std::io::Result<Option<std::fs::Permissions>> {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "file changed since the recorded edit",
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::other(
+                "file has multiple links; rollback was not applied",
+            ));
+        }
+        let Some(expected) = expected else {
+            return Err(std::io::Error::other(
+                "file changed since the recorded edit",
+            ));
+        };
+        if metadata.len() != expected.len() as u64 {
+            return Err(std::io::Error::other(
+                "file changed since the recorded edit",
+            ));
+        }
+        let mut buffer = [0u8; 8192];
+        for expected_chunk in expected.chunks(buffer.len()) {
+            file.read_exact(&mut buffer[..expected_chunk.len()])?;
+            if &buffer[..expected_chunk.len()] != expected_chunk {
+                return Err(std::io::Error::other(
+                    "file changed since the recorded edit",
+                ));
+            }
+        }
+        if file.read(&mut buffer[..1])? != 0 {
+            return Err(std::io::Error::other(
+                "file changed since the recorded edit",
+            ));
+        }
+        Ok(Some(metadata.permissions()))
+    };
+
+    let permissions = check()?;
+    let Some(content) = replacement else {
+        if expected.is_some()
+            && unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    };
+
+    let temp_name = CString::new(format!(".astra-rollback-{}", uuid::Uuid::new_v4().simple()))
+        .expect("generated file name contains no NUL");
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            // A deleted source has no remaining mode to copy. Keep its
+            // restored contents private instead of widening permissions.
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    struct RemoveTemp<'a> {
+        parent: &'a std::fs::File,
+        name: &'a CString,
+    }
+    impl Drop for RemoveTemp<'_> {
+        fn drop(&mut self) {
+            unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+    let _remove_temp = RemoveTemp {
+        parent,
+        name: &temp_name,
+    };
+    let mut staged = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Some(permissions) = permissions {
+        staged.set_permissions(permissions)?;
+    }
+    staged.write_all(content)?;
+    check()?;
+    let result = unsafe {
+        if expected.is_some() {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                parent.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } else {
+            libc::linkat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        }
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn validate_structural_edit(
@@ -2679,6 +2940,23 @@ pub fn unified_diff_raw(old_content: &str, new_content: &str, path: &Path) -> St
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_a_large_replacement_without_changing_it() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, b"edited").unwrap();
+        let binding = capture_file_parent(&path).unwrap();
+        // A sparse file exercises a large size mismatch without writing it.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(256 * 1024 * 1024).unwrap();
+        drop(file);
+        let result =
+            restore_file_in_bound_parent(&binding, &path, Some(b"edited"), Some(b"before"));
+        assert!(result.is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256 * 1024 * 1024);
+    }
 
     #[test]
     fn pure_single_edit_rejections_report_no_execution_before_target_access() {
@@ -3438,6 +3716,36 @@ mod tests {
     }
 
     #[test]
+    fn read_file_reorders_reversed_range() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("lines.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let read = |start, end| {
+            read_file(
+                dir.path(),
+                &serde_json::json!({
+                    "path": "lines.txt", "start_line": start, "end_line": end
+                }),
+            )
+        };
+        let reversed = read(4, 2);
+        let ordered = read(2, 4);
+        assert!(!reversed.is_error, "{:?}", reversed);
+        assert_eq!(reversed.output, ordered.output);
+        assert!(reversed.output.contains("2\tb"));
+        assert!(read(0, 2).is_error);
+        assert!(read(9, 7).is_error);
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let empty = read_file(
+            dir.path(),
+            &serde_json::json!({"path":"empty.txt", "start_line":4, "end_line":2}),
+        );
+        assert!(
+            empty.is_error && empty.output.contains("start_line 2"),
+            "{empty:?}"
+        );
+    }
+
+    #[test]
     fn read_file_argument_failures_preserve_recovery_evidence() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3454,7 +3762,6 @@ mod tests {
             serde_json::json!({"path": "missing.txt", "start_line": -1}),
             serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
             serde_json::json!({"path": "missing.txt", "end_line": "2"}),
-            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
             serde_json::json!({"path": "missing.txt", "outline": 1}),
         ] {
             let result = read_file(dir.path(), &args);
@@ -3778,6 +4085,175 @@ mod tests {
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "foo qux baz\n");
+    }
+
+    #[test]
+    fn str_replace_rejects_overlapping_literal_occurrences() {
+        for (raw, anchor) in [("aaa", "aa"), ("界界界", "界界")] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("f.data");
+            std::fs::write(&path, raw).unwrap();
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":anchor,"new_str":"z"}),
+            );
+            assert!(
+                result.is_error,
+                "overlapping exact anchors must be ambiguous"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            let all = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":anchor,"new_str":"z","replace_all":true}),
+            );
+            assert!(!all.is_error, "{}", all.output);
+            assert!(std::fs::read_to_string(path).unwrap().starts_with('z'));
+        }
+    }
+
+    #[test]
+    fn str_replace_rejects_overlapping_quote_normalized_occurrences() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.data");
+        for raw in ["“““", "“””"] {
+            std::fs::write(&path, raw).unwrap();
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":"\"\"","new_str":"x"}),
+            );
+            assert!(
+                result.is_error,
+                "overlapping normalized matches must be ambiguous"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+        let all = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"\"\"","new_str":"x","replace_all":true}),
+        );
+        assert!(!all.is_error, "{}", all.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "x”");
+    }
+
+    #[test]
+    fn str_replace_handles_unicode_and_empty_fuzzy_anchors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.data");
+        std::fs::write(&path, "你好").unwrap();
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"1. 你","new_str":"再"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "再好");
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"1.","new_str":"x"}),
+        );
+        assert!(result.is_error, "an empty stripped anchor must be rejected");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "再好");
+        std::fs::write(&path, "你\n好吗").unwrap();
+        let escaped = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"你\\n好","new_str":"再"}),
+        );
+        assert!(!escaped.is_error, "{}", escaped.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "再吗");
+    }
+
+    #[test]
+    fn str_replace_checks_overlapping_pem_anchor_locations() {
+        for duplicate in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let blocks = (0..3)
+                .map(|i| {
+                    format!(
+                        "-----BEGIN PRIVATE KEY-----\nkey{}\n-----END PRIVATE KEY-----",
+                        if duplicate { 0 } else { i }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let raw = blocks.join("\n");
+            let path = tmp.path().join("keys.data");
+            std::fs::write(&path, &raw).unwrap();
+            let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw).0;
+            let markers = safe.lines().collect::<Vec<_>>();
+            let anchor = markers[1..].join("\n");
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"keys.data","old_str":anchor,"new_str":"replaced"}),
+            );
+            let actual = std::fs::read_to_string(path).unwrap();
+            if duplicate {
+                assert!(result.is_error, "ambiguous anchor must not write");
+                assert_eq!(actual, raw);
+            } else {
+                assert!(!result.is_error, "{}", result.output);
+                assert_eq!(actual, format!("{}\nreplaced", blocks[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn str_replace_rejects_noncanonical_overlapping_pem_occurrence() {
+        let tmp = TempDir::new().unwrap();
+        let first = "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----";
+        let second = "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----";
+        let raw = format!("{first}{}{second}-", &second[5..]);
+        let path = tmp.path().join("keys.data");
+        std::fs::write(&path, &raw).unwrap();
+        let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw).0;
+        let anchor = &safe[safe.rfind("[REDACTED:").unwrap()..];
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"keys.data","old_str":anchor,"new_str":"replaced"}),
+        );
+        assert!(
+            result.is_error,
+            "a raw overlapping duplicate must not be written"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn str_replace_accepts_reference_from_overlapping_redaction_rules() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.data");
+        let raw =
+            "--token abcdefghijklmnopqrstAKIAABCDEFGHIJKLMNOP\n--token abcdefghijklmnopqrst\n";
+        std::fs::write(&path, raw).unwrap();
+        let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(raw).0;
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","old_str":safe,"new_str":"replaced"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "replaced");
+    }
+
+    #[test]
+    fn source_read_and_edit_share_overlapping_credential_groups() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.data");
+        let raw = "--token AKIAABCDEFGHIJKLMNOPsuffixsuffixsuffix";
+        std::fs::write(&path, raw).unwrap();
+        let read = read_file(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","start_line":1,"end_line":1}),
+        );
+        assert!(
+            !read.is_error && !read.output.contains("suffixsuffixsuffix"),
+            "{}",
+            read.output
+        );
+        let start = read.output.find("[REDACTED:").unwrap();
+        let end = start + read.output[start..].find(']').unwrap() + 1;
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","old_str":&read.output[start..end],"new_str":"replaced"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "--token replaced");
     }
 
     #[test]
@@ -4108,6 +4584,54 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha beta");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "external change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_do_not_publish_when_the_parent_cannot_be_bound_for_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let restricted = tmp.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let first = tmp.path().join("first.txt");
+        let second = restricted.join("second.txt");
+        let single_path = restricted.join("single.txt");
+        std::fs::write(&first, "alpha").unwrap();
+        std::fs::write(&second, "beta").unwrap();
+        std::fs::write(&single_path, "old").unwrap();
+        let single = PreparedWriteFile::from_authorized_preimage(
+            single_path,
+            "single.txt",
+            "new",
+            Some(b"old".to_vec()),
+        );
+        let multi = prepare_multi_path_edit(
+            tmp.path(),
+            &serde_json::json!({"edits":[
+                {"path":"first.txt", "old_str":"alpha", "new_str":"ALPHA"},
+                {"path":"restricted/second.txt", "old_str":"beta", "new_str":"BETA"}
+            ]}),
+        )
+        .unwrap();
+        // The directory can disappear after preparation. Unlike read permission,
+        // this prevents binding on both Linux (which can use O_PATH) and macOS.
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&restricted, &moved).unwrap();
+        let single_result = single.apply();
+        let multi_result = multi.apply();
+
+        assert!(single_result.is_error, "{single_result:?}");
+        assert!(multi_result.is_error, "{multi_result:?}");
+        assert!(single_result.output.contains("Cannot bind file directory"));
+        assert!(multi_result.output.contains("Cannot bind file directory"));
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "alpha");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("second.txt")).unwrap(),
+            "beta"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join("single.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]

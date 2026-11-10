@@ -283,7 +283,7 @@ pub(super) async fn run(
             output.display()
         )
     })?;
-    let manifest = json!({"schema_version":1,"astra_version":env!("CARGO_PKG_VERSION"),"binary_hash":binary_hash()?,"fixture_hash":hash(&serde_json::to_vec(&cases).map_err(|e| e.to_string())?),"cases":cases,"offerings":offerings,"repeat":args.repeat,"deadline_ms":DEADLINE_MS,"output_format":"typed-judgment-v1; chat true/uncertain IDs; native probabilities","backend_order":"alternates_per_repetition","cost":"Usage only; completion catalog does not expose pricing. No invoice estimate is inferred."});
+    let manifest = json!({"schema_version":1,"astra_version":env!("CARGO_PKG_VERSION"),"binary_hash":binary_hash()?,"fixture_hash":hash(&serde_json::to_vec(&cases).map_err(|e| e.to_string())?),"cases":cases,"offerings":offerings,"repeat":args.repeat,"deadline_ms":DEADLINE_MS,"output_format":"typed-judgment-v1; chat true/uncertain IDs; native probabilities","backend_order":"alternates_per_repetition","sampling":"server default or configured model override; effective sampling is not exposed by the catalog","cost":"Usage only; completion catalog does not expose pricing. No invoice estimate is inferred."});
     save(&output.join("manifest.json"), &manifest)?;
     let session = api
         .create_session(
@@ -334,7 +334,6 @@ pub(super) async fn run(
                     .map_err(|_| {
                         "Judgment output budget exceeds the completion protocol".to_string()
                     })?;
-                request.temperature = 0.0;
                 let started = Instant::now();
                 let mut row = json!({"repeat":repetition+1,"case_id":case.id,"backend":if backend==0 {"baseline"} else {"candidate"},"offering_id":id,"input_hash":input_hash,"operation":case.operation,"session_id":session_id,"logical_attempt":sequence,"threshold":case.threshold});
                 match api.post_completions(token, &request).await {

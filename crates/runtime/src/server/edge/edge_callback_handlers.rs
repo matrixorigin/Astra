@@ -1997,8 +1997,7 @@ mod edge_callback_insert_tests {
         EdgeDispatchService,
     };
     use astra_turn_core::edge_ledger::{
-        LEDGER_MAX_ENTRIES, discard_ledger_entry_for_cancelled_callback_ack, expect_ledger_entry,
-        tool_callback_key,
+        LEDGER_MAX_ENTRIES, expect_ledger_entry, take_ledger_entry, tool_callback_key,
     };
     use async_trait::async_trait;
     use axum::{
@@ -2539,15 +2538,6 @@ mod edge_callback_insert_tests {
 
     #[async_trait]
     impl EdgeDispatchService for RecordingEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,
@@ -3877,7 +3867,11 @@ mod edge_callback_insert_tests {
         let key = tool_callback_key(&identity);
         expect_ledger_entry(&state.edge_callback_ledger, &key, "edge-a")
             .expect("the emitted request owns callback custody");
-        discard_ledger_entry_for_cancelled_callback_ack(&state.edge_callback_ledger, &key).await;
+        assert!(
+            take_ledger_entry(&state.edge_callback_ledger, &key, Duration::ZERO)
+                .await
+                .is_none()
+        );
 
         let response = post_tool_result_handler(
             Extension(RequestTrace {
@@ -3924,7 +3918,11 @@ mod edge_callback_insert_tests {
         );
         let key = tool_callback_key(&identity);
         expect_ledger_entry(&state.edge_callback_ledger, &key, "edge-a").unwrap();
-        discard_ledger_entry_for_cancelled_callback_ack(&state.edge_callback_ledger, &key).await;
+        assert!(
+            take_ledger_entry(&state.edge_callback_ledger, &key, Duration::ZERO)
+                .await
+                .is_none()
+        );
 
         let error = post_tool_result_handler(
             Extension(RequestTrace {

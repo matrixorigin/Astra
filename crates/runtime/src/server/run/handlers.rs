@@ -312,6 +312,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "provider_interaction_resolved"
             | "user_intent"
             | "permission_mode_applied"
+            | "run_model_outcome"
             | "user_intent_applied"
             | "user_intent_returned"
             | "run_finished"
@@ -556,6 +557,36 @@ pub(crate) async fn stream_run_handler(
     }
 }
 
+pub(crate) async fn get_run_execution_settlement_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/cancel",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let observed = state
+        .execution
+        .run_lifecycle_service
+        .get_run_execution_settlement(run_id, principal.user.user_id)
+        .await
+        .map_err(normalize_cancel_run_error)?;
+    Ok(Json(CancelRunResponse::from(observed)))
+}
+
 pub(crate) async fn cancel_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -697,9 +728,54 @@ pub(crate) async fn submit_run_user_intent_handler(
     }))
 }
 
+pub(crate) async fn run_user_intent_status_handler(
+    State(state): State<AppState>,
+    Path((run_id, intent_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<RunPermissionModeQuery>,
+) -> Result<Json<astra_turn_types::UserIntentStatus>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .run_user_intent_status(user.user_id, query.expected_session_id, run_id, intent_id)
+        .await
+        .map(Json)
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct RunPermissionModeQuery {
     pub expected_session_id: String,
+}
+
+pub(crate) async fn request_run_model_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<astra_turn_types::RunModelRequest>,
+) -> Result<Json<astra_turn_types::RunModelSelection>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .request_run_model(user.user_id, run_id, request)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn run_model_snapshot_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunPermissionModeQuery>,
+) -> Result<Json<astra_turn_types::RunModelSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .run_model_snapshot(user.user_id, query.expected_session_id, run_id)
+        .await
+        .map(Json)
 }
 
 pub(crate) async fn request_permission_mode_handler(
@@ -954,6 +1030,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -989,6 +1066,21 @@ mod tests {
         assert_eq!(
             descriptor.body_digest.as_deref(),
             Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-provider-cancel/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "settlement observation must use request-aware authentication too"
         );
     }
 

@@ -41,10 +41,27 @@ behavior. A small diff is not a systemic fix by itself.
   `plans/`; label target behavior separately from what current code proves.
 - Treat Astra as a fresh system: no old-version compatibility, data migrations,
   dual reads/writes, legacy parsers, or transitional shims unless the user
-  explicitly changes that requirement. This is not permission to delete live data.
+  explicitly changes that requirement. Preserve the current MOI Gate contract
+  and its constraint tests; never weaken them to pass a change. This is not
+  permission to delete live data.
 - Consolidate or remove redundant implementations, tables, projections, and tests
   within the changed ownership boundary. Search callers and relevant recent main
   commits; do not expand into unrelated cleanup or optimize for lines deleted.
+- Optimize for the real user journey: make success and failure clear, keep drafts
+  and recoverable work, and avoid exposing internal mechanisms in product copy.
+  Transient failures must not strand a session or prevent a reasonable next step.
+- Prefer the simplest design that meets correctness, robustness, and scale. Delete
+  unreachable code, unused fields and self-only abstractions; do not suppress dead
+  code or retain a parallel path merely to avoid cleaning up its owner.
+- Use the requested checkout and branch; create or switch worktrees only when the
+  task requires it. Prefer existing OS and deployment facilities over new resolver,
+  proxy, retry, or configuration machinery unless a concrete need justifies it.
+- For agent behavior, distinguish not executed, execution failed, and executed
+  with an unavailable result. Deliver typed, actionable errors and enough context
+  to the model, preserving tool access and budget for a reasonable recovery. Let
+  the model choose the next step; do not add permanent blanket failures, brittle
+  per-tool heuristics, or duplicate control loops. Keep explicit security, policy,
+  and unknown-side-effect boundaries intact.
 - Honor design and independent-review requirements from the user or applicable
   configured workflow, including model and effort. Do not introduce them merely
   by loading this skill. Follow [review-changes](../review_changes/SKILL.md)
@@ -103,7 +120,8 @@ the real configured database whenever the change crosses that boundary.
 - For session hot paths, account for new and existing sessions, cold/warm caches,
   and expected thousands to tens of thousands of concurrent sessions. Examine
   queries, pool wait, transaction/lock duration, fairness, backpressure, and memory
-  bounds. Smaller-scale tests do not prove larger-scale capacity.
+  bounds. Avoid new per-session polling or hot-path SQL without a demonstrated
+  need. Smaller-scale tests do not prove larger-scale capacity.
 - Keep Trace, Explain, Introspect, Reflect, and usage accounting as projections
   of canonical facts, including parent/child runs, routing/judgment/reflection
   calls and paid retries. Explain decisions, applied actions, and observed effects;
@@ -117,11 +135,13 @@ the real configured database whenever the change crosses that boundary.
 
 $ARGUMENTS
 
-## Phase 1: Explore Task (finish in about 3 minutes)
+## Phase 1: Explore Task
 
 1. Run `git status --short`.
 2. If focus files are known, inspect both staged and unstaged diffs for them, then run `git log --oneline -10 -- <FILES>`.
-3. Read only the owning module and the immediate caller/callee needed to explain the change. Use the Ownership Map below.
+3. Trace the affected product journey through its owners, callers, state, and
+   failure/recovery boundaries. Use the Ownership Map below; read more when a
+   cross-component contract or observed failure requires it.
 4. State the task location in one line:
 
 ```text
@@ -140,6 +160,8 @@ Rules:
 - When responding to PR feedback, read the latest comments against the current
   head, validate their claims, and record adopted or rejected findings with reasons.
   If remote evidence is unavailable, label that limit instead of claiming freshness.
+- Gather related, evidence-backed findings across the affected mechanism before
+  implementing a coherent fix; do not repeatedly patch one symptom at a time.
 
 ## Phase 2: Integrate Findings
 
@@ -210,6 +232,9 @@ cargo check -p <crate>
 
 7. Remove superseded paths and duplicate/weak tests; retain each still-valid
    contract in the owning test rather than adding another suite around old behavior.
+   Review implementation, test, and documentation growth separately: every
+   new layer or test should establish a concrete benefit or distinct behavior.
+   Report net change when useful, but do not pursue a line-count target.
 
 ## Phase 4: Failure Triage
 
@@ -229,6 +254,8 @@ A timeout or flake is evidence to investigate, including connection-pool waits,
 lock contention, and fixture lifecycle. Do not call a rerun, a raised timeout, a
 smaller workload, or weaker assertions a fix. Bound diagnostic runs and explain
 why an expensive run is necessary; avoid repeated long full-suite runs.
+For CI, inspect all relevant failed jobs and fix their causes. Do not wait for CI
+unless the user requests it or the delivery contract requires its result.
 
 ## Phase 5: Verification Gates
 
@@ -274,6 +301,13 @@ is not a pass or permission to merge. Follow AGENTS.md delivery safety: before
 every push resolve and report remote URL, source branch, destination ref, and
 remote default branch; never push a MatrixOrigin default branch. Keep credentials,
 private endpoints, and unsanitized session/benchmark evidence out of commits.
+
+Before creating or editing a PR title or body, save the exact proposed body to a
+file and run `python3 scripts/ci/check_pr_metadata.py --title "$pr_title" --body-file "$pr_body_file"`.
+This executes the repository's actual PR metadata workflow locally. Preserve the
+required `Capability assessment: Updated|Unchanged|N/A: explanation` first
+line when rewriting the body, and revise the assessment if the capability impact
+changed. A valid Conventional Commit title alone is not sufficient.
 
 ## Appendix: Ownership Map
 
