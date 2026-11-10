@@ -233,14 +233,12 @@ fn provider_access_error(
                 .and_then(|error| error.error_field("type"))
                 .and_then(classify_token)
         })
-        .or_else(|| match status {
+        .or(match status {
             401 => Some(ErrorKind::Auth),
             403 => Some(ErrorKind::ProviderForbidden),
             _ => None,
         });
-    let Some(kind) = kind else {
-        return None;
-    };
+    let kind = kind?;
     let message = match kind {
         ErrorKind::Auth => "LLM provider authentication failed",
         ErrorKind::ProviderQuotaExhausted => "LLM provider account balance or quota exhausted",
