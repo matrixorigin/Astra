@@ -199,6 +199,11 @@ later failures retain their source-owned facts.
 
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
 
+Execution inspection reports persisted run totals. Those aggregates can lag
+while a run is active and are not a live count of completed tool calls. Error
+guidance describes the failure category; the run's recovery state determines
+whether a retry is actually in progress.
+
 Edge callback HTTP failures are reported independently of tool execution and
 durable run state. A generic HTTP rejection, including a proxy/WAF HTML block
 page, is not evidence of a lifecycle contract violation. HTTP 409 alone, JSON

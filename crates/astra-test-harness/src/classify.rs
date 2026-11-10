@@ -164,7 +164,8 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     let judger_unavailable = criteria_results.iter().any(|r| {
         !r.passed
             && matches!(r.criterion, Criterion::HardJudger { .. })
-            && (r.detail.contains("required judger unavailable")
+            && (crate::judger::assessment_summary(r).0 == "unavailable"
+                || r.detail.contains("required judger unavailable")
                 || r.detail.starts_with("judger call failed:"))
     });
     if judger_unavailable {
@@ -772,6 +773,53 @@ mod tests {
             classify(&make_outcome(), &[result]),
             FailureClass::InfraVerificationUnavailable
         );
+    }
+
+    #[tokio::test]
+    async fn step_judger_unavailable_is_not_a_negative_quality_verdict() {
+        use crate::judger::{Judger, JudgerAssessment, JudgerResult, SemanticJudgerEvidence};
+
+        struct Judge(bool);
+        #[async_trait::async_trait]
+        impl Judger for Judge {
+            async fn judge(
+                &self,
+                _: &Criterion,
+                _: &RunOutcome,
+                _: Option<&SemanticJudgerEvidence>,
+            ) -> Result<JudgerResult, astra_core::ClassifiedError> {
+                if self.0 {
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Unknown,
+                        "uncertain judgment answer",
+                    ))
+                } else {
+                    Ok(JudgerResult {
+                        assessment: JudgerAssessment::Acceptance(false),
+                        rationale: "rejected".into(),
+                        full_rationale: "rejected".into(),
+                        votes: Vec::new(),
+                    })
+                }
+            }
+        }
+        let criterion = Criterion::HardJudger {
+            question: "was the work complete?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let outcome = make_outcome();
+        for (unavailable, expected) in [
+            (true, FailureClass::InfraVerificationUnavailable),
+            (false, FailureClass::ModelQualityLow),
+        ] {
+            let mut result =
+                crate::judger::evaluate_judger(&Judge(unavailable), &criterion, &outcome, None)
+                    .await
+                    .unwrap();
+            result.detail = format!("step 1: {}", result.detail);
+            assert_eq!(classify(&outcome, &[result]), expected);
+        }
     }
 
     #[test]

@@ -3826,7 +3826,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
     }
 
-    fn requires_strict_sse_json(&self) -> bool {
+    fn requires_sse_done(&self) -> bool {
         self.stream_json_exchange.is_some()
     }
 

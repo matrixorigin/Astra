@@ -3005,11 +3005,6 @@ fn destructive_command_warning(command: &str) -> Option<&'static str> {
         ("git branch -D", "⚠️ Warning: may force-delete a branch"),
         // Git — safety bypass
         ("--no-verify", "⚠️ Warning: skipping safety hooks"),
-        // File deletion
-        (
-            "rm -rf /",
-            "⚠️ Warning: recursive force-remove from root — extremely dangerous",
-        ),
         // Database
         ("DROP TABLE", "⚠️ Warning: may drop database table"),
         ("DROP DATABASE", "⚠️ Warning: may drop entire database"),
@@ -4003,7 +3998,7 @@ impl ToolExecutor {
         }
         if !environment_background_authorized() {
             let mut outcome = super::ToolExecutionOutcome::ok(
-                "Managed background services are unavailable in this execution environment. No process was started. Run bounded work and its checks in one foreground call.".to_string(),
+                "Environment-lifetime services are unavailable. No process was started. When task controls are available, run the command in the foreground and use yield_time_ms to retain and inspect it while the executor remains active.".to_string(),
             );
             mark_bash_capture_unavailable(&mut outcome);
             let fields = outcome.tool_result_fields.get_or_insert_default();
@@ -4809,7 +4804,7 @@ impl BashOutputRenderer {
                 );
             } else {
                 outcome.output.push_str(
-                    " Managed background services are unavailable. Keep bounded work and its dependent checks in the same foreground call.",
+                    " Environment-lifetime services are unavailable. For future commands, when task controls are available, run the service in the foreground and use yield_time_ms; inspect or stop the retained task with task_output or task_stop while the executor remains active.",
                 );
             }
         }
@@ -8433,9 +8428,39 @@ mod tests {
             );
         }
         // safe commands
-        for cmd in ["git status", "ls -la", "cargo test"] {
+        for cmd in [
+            "git status",
+            "ls -la",
+            "cargo test",
+            "rm -rf /tmp/test-data",
+        ] {
             assert!(destructive_command_warning(cmd).is_none(), "safe: {cmd}");
         }
+        assert!(check_dangerous_command("rm -rf /").is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reaped_children_hint_distinguishes_retained_tasks_from_services() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let renderer = super::BashOutputRenderer {
+            output_limit: 4096,
+            read_only_execution: false,
+        };
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let (result, _) = renderer.render_bash_outcome("true", output, true);
+        assert!(
+            result
+                .output
+                .contains("Environment-lifetime services are unavailable")
+        );
+        assert!(result.output.contains("yield_time_ms"));
+        assert!(result.output.contains("task_output or task_stop"));
     }
 
     #[test]
