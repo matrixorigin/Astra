@@ -15528,6 +15528,20 @@ mod tests {
                     )
                     .unwrap(),
                 );
+                let canonical_messages = vec![
+                    serde_json::json!({"role":"user","content":"question"}),
+                    serde_json::json!({"role":"assistant","content":"answer"}),
+                ];
+                state.active_conversation = Some(
+                    astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                        original_owner.owner_scope.id(),
+                        "browser-reauth-live-session",
+                        canonical_messages.clone(),
+                        1,
+                        astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+                    )
+                    .unwrap(),
+                );
                 let original_epoch = state.session_attachment_epoch;
                 let mut modules = auth_flow::build_identity_services(&api, None, "account-a")
                     .await
@@ -15657,6 +15671,10 @@ mod tests {
                     assert_eq!(state.model.as_deref(), Some("kept-model"));
                     assert_eq!(state.session_attachment_epoch, original_epoch);
                     assert_eq!(state.history, [("question".into(), "answer".into())]);
+                    assert_eq!(
+                        state.active_conversation.as_ref().unwrap().materialize(),
+                        canonical_messages
+                    );
                     assert!(
                         !astra_services::session_journal::read_journal(
                             "browser-reauth-live-session"
@@ -15843,6 +15861,10 @@ mod tests {
                     &mut permissions,
                 );
                 params.history = &state.history;
+                params.pre_loaded_messages = state
+                    .active_conversation
+                    .as_ref()
+                    .map(|conversation| conversation.materialize());
                 let turn = stream_chat_sse(params).await.unwrap();
                 assert_eq!(turn.full_text, "Account A answer");
                 for request in server.received_requests().await.unwrap() {
