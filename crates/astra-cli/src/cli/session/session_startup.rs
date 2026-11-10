@@ -338,30 +338,51 @@ async fn prune_stale_pending_recovery(
     }
 }
 
-#[derive(Debug)]
 struct CliSessionMemoryMemoriaPort {
     api: astra_thin_client::ThinClient,
-    profile: Option<String>,
+    auth: Option<session_runtime::AdmittedAuth>,
     astra_user_id: String,
     working_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl CliSessionMemoryMemoriaPort {
-    fn new(
+    async fn new(
         api: astra_thin_client::ThinClient,
         profile: Option<&str>,
         astra_user_id: impl Into<String>,
     ) -> Self {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        // Native transport selects its bound identity rather than a legacy
+        // profile alias, just like fresh_access_token. Capture refresh authority
+        // without making a transient token-read failure permanent for this port.
+        let selected_profile = if owner.native_binding.is_some() {
+            None
+        } else {
+            profile
+        };
+        let auth = if let Some(auth) =
+            session_runtime::capture_presented_auth(selected_profile, &owner)
+        {
+            Some(auth)
+        } else if let Some(token) = session_runtime::fresh_access_token(&api, profile).await {
+            let owner = session_runtime::capture_admitted_auth_owner(&api, profile, &token).await;
+            Some(session_runtime::AdmittedAuth::new(&token, owner))
+        } else {
+            None
+        };
         Self {
             api,
-            profile: profile.map(str::to_string),
+            auth,
             astra_user_id: astra_user_id.into(),
             working_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     async fn fresh_token(&self) -> Result<String, String> {
-        session_runtime::fresh_access_token(&self.api, self.profile.as_deref())
+        self.auth
+            .as_ref()
+            .ok_or_else(|| "no CLI access token available".to_string())?
+            .access_token(&self.api, None)
             .await
             .ok_or_else(|| "no CLI access token available".to_string())
     }
@@ -652,11 +673,7 @@ pub(crate) async fn build_cli_session_memory_port(
         let token = session_runtime::fresh_access_token(api, profile).await?;
         let me_body = api.get_auth_me_text(&token).await.ok()?;
         let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
-        Some(session_memory_port_for_authenticated_user(
-            api,
-            profile,
-            &me.user_id,
-        ))
+        Some(session_memory_port_for_authenticated_user(api, profile, &me.user_id).await)
     })
     .await
     .ok()
@@ -665,16 +682,12 @@ pub(crate) async fn build_cli_session_memory_port(
 
 /// Login already established this canonical account ID. Reuse that fact
 /// instead of making an optional identity read part of credential settlement.
-pub(crate) fn session_memory_port_for_authenticated_user(
+pub(crate) async fn session_memory_port_for_authenticated_user(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     user_id: &str,
 ) -> std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort> {
-    std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
-        api.clone(),
-        profile,
-        user_id,
-    ))
+    std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(api.clone(), profile, user_id).await)
 }
 
 pub(crate) async fn complete_session_startup(
@@ -1640,6 +1653,45 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn captured_memory_service_cannot_borrow_a_replacement_accounts_bearer() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let sign_in = |user: &str| {
+            crate::cli::auth_flow::save_profile_auth_tokens(
+                None,
+                user,
+                &crate::cli::auth_flow::AuthTokenPayload {
+                    user_id: user.into(),
+                    access_token: format!("access-{user}"),
+                    refresh_token: format!("refresh-{user}"),
+                },
+            )
+            .unwrap();
+        };
+        sign_in("old");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "old").await;
+        sign_in("new");
+        assert!(
+            astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
+                &Default::default(),
+                "old-session",
+                &port,
+            )
+            .await
+            .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn cli_exit_hands_off_to_server_and_never_falls_back_to_local_purge() {
         use std::sync::Arc;
         let _creds_guard = crate::tests::isolate_credentials();
@@ -1664,11 +1716,9 @@ mod tests {
             let mut state = SessionState {
                 session_id: Some("session-1".into()),
                 turn: 3,
-                session_memory_port: Some(Arc::new(CliSessionMemoryMemoriaPort::new(
-                    api,
-                    None,
-                    "astra-user",
-                ))),
+                session_memory_port: Some(Arc::new(
+                    CliSessionMemoryMemoriaPort::new(api, None, "astra-user").await,
+                )),
                 ..Default::default()
             };
             crate::cli::session::session_cleanup::finalize_session_with_budget(
@@ -1718,7 +1768,7 @@ mod tests {
                     "memories":[{"memory_id":"working-1","user_id":record_owner,"session_id":session,"memory_type":"working","content":snapshot}]
                 }))).expect(1).mount(&server).await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let port = CliSessionMemoryMemoriaPort::new(api, None, "astra-user");
+            let port = CliSessionMemoryMemoriaPort::new(api, None, "astra-user").await;
             let result = port
                 .retrieve_ext("snapshot", Some("session-1"), 5, true)
                 .await;
@@ -1767,7 +1817,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1").await;
         assert_eq!(
             port.store_scene("session-1", "pattern", "recurring evidence")
                 .await
@@ -1801,7 +1851,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1").await;
         port.working_ids
             .lock()
             .unwrap()
@@ -1844,7 +1894,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1").await;
         let error = port
             .retrieve_ext("session memory", Some("session-1"), 5, true)
             .await
@@ -1871,7 +1921,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1").await;
         port.delete("memory-old").await.unwrap();
     }
 
@@ -1888,7 +1938,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1").await;
         port.delete("memory-missing")
             .await
             .expect_err("404 must not be accepted as a completed delete");

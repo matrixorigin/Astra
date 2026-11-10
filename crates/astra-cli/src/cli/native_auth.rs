@@ -42,17 +42,32 @@ pub(crate) fn active() -> Option<Arc<Binding>> {
         .clone()
 }
 
+fn session_profile_name(session: &native::NativeSession) -> String {
+    format!(
+        "moi-{}-{}",
+        session.environment.key(),
+        session.astra_user_id
+    )
+}
+
+/// Read the identity actually published by browser exchange, before ACTIVE is rebound.
+pub(crate) async fn published_owner_identity()
+-> Result<(astra_services::OwnerScope, String), String> {
+    let session = NativeStore::new()?.current_off_runtime().await?;
+    let owner = super::cli_config::cli_utils::cli_profile_owner_scope(
+        &session_profile_name(&session),
+        Some(&session.astra_user_id),
+    )?;
+    Ok((owner, session.astra_user_id))
+}
+
 impl Binding {
     pub(crate) fn endpoint(&self) -> &str {
         &self.session.environment.astra_url
     }
 
     pub(crate) fn profile_name(&self) -> String {
-        format!(
-            "moi-{}-{}",
-            self.session.environment.key(),
-            self.session.astra_user_id
-        )
+        session_profile_name(&self.session)
     }
 
     fn check_identity(
