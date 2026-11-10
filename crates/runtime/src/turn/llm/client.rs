@@ -44,10 +44,7 @@ use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
-use astra_turn_core::sse_data_lines::{
-    json_events_from_sse_event_block, validate_sse_event_block_json,
-    validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
-};
+use astra_turn_core::sse_data_lines::validated_sse_event;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_call_shape::tool_call_name;
@@ -9139,19 +9136,23 @@ pub(crate) fn parse_openai_sse_json_stream(
                     return;
                 }
             };
-            let blocks = match sse_in.push_bytes(&bytes) {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                    return;
-                }
-            };
-            for block in blocks {
-                if let Err(error) = validate_sse_event_block_json(&block) {
-                    yield Err(error);
-                    return;
-                }
-                let d = json_events_from_sse_event_block(&block);
+            let mut input = bytes.as_ref();
+            while !input.is_empty() {
+                let block = match sse_in.next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES)) {
+                    Ok(Some(block)) => block,
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield Err(format!("invalid model SSE response: {error}"));
+                        return;
+                    }
+                };
+                let d = match validated_sse_event(&block) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 for v in d.events {
                     yield Ok(ParsedSseEvent::Data(v));
                 }
@@ -9161,39 +9162,20 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             }
         }
-        let mut buf = match sse_in.into_inner() {
-            Ok(buf) => buf,
-            Err(error) => {
-                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                return;
-            }
-        };
-        let tail = match validated_drain_sse_data_lines(&mut buf, "") {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in tail.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if tail.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
-            return;
-        }
-        let fin = match validated_finish_sse_data_buffer(&mut buf) {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in fin.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if fin.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
+        match sse_in.finish() {
+            Ok(Some(block)) => match validated_sse_event(&block) {
+                Ok(event) => {
+                    for value in event.events {
+                        yield Ok(ParsedSseEvent::Data(value));
+                    }
+                    if event.stream_finished {
+                        yield Ok(ParsedSseEvent::Done);
+                    }
+                }
+                Err(error) => yield Err(error),
+            },
+            Ok(None) => {},
+            Err(error) => yield Err(format!("invalid model SSE response: {error}")),
         }
     }
 }
@@ -13202,7 +13184,7 @@ mod tests {
             .await
             .expect("invalid block item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
@@ -13216,17 +13198,55 @@ mod tests {
             .await
             .expect("invalid tail item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
+    async fn parse_openai_sse_json_stream_decodes_valid_clean_eof_tail() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
         let st = parse_openai_sse_json_stream(stream::iter(parts));
         tokio::pin!(st);
-        let ev = st.next().await.unwrap().unwrap();
-        assert_eq!(ev, ParsedSseEvent::Data(json!({"z": 9})));
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"z":9}))
+        );
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_joins_data_fields_across_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from("data:{\"text\":\"hello\",\r\n")),
+            Ok(Bytes::from("data: \"n\":2}\r\n\r\ndata:[DONE]\r\n\r\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"text": "hello", "n": 2}))
+        );
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_preserves_prefix_and_done_order() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"a\":1}\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"a": 1}))
+        );
+        assert!(st.next().await.unwrap().is_err());
+
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
         assert!(st.next().await.is_none());
     }
 
@@ -13340,6 +13360,25 @@ mod tests {
             }
             other => panic!("expected transport error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_accepts_semantic_terminal_at_clean_eof() {
+        let terminal = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(format!("data: {terminal}\n")))]);
+        let result = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -315,12 +315,10 @@ impl ErrorKind {
                  Do NOT retry or re-authenticate; resolve the provider billing restriction first."
             }
             Self::RateLimit => {
-                "Rate limit hit. The system will retry automatically. \
-                 Reduce parallel tool calls if this persists."
+                "Rate limit hit. Check the run's recovery status; reduce parallel requests if this persists."
             }
             Self::ServerError => {
-                "LLM provider returned a server error (5xx). \
-                 Retrying automatically with backoff."
+                "LLM provider returned a server error (5xx). Check the run's recovery status before retrying."
             }
             Self::Auth => {
                 "Authentication failed. \
@@ -340,15 +338,14 @@ impl ErrorKind {
             }
             Self::StreamIdle => {
                 "Model stopped sending tokens mid-stream (idle timeout). \
-                 Retrying the same request. If this recurs, try a different model or reduce input size."
+                 Check the run's recovery status; if this recurs, reduce the input size or ask the user about selecting another model."
             }
             Self::ProviderDeadline => {
                 "The current provider inference exceeded its deadline. Preserve partial evidence \
                  and use at most one bounded convergence step when it is safe."
             }
             Self::StreamTransport => {
-                "Connection to the LLM provider was lost mid-stream. \
-                 Retrying automatically."
+                "The model response stream was interrupted. Check the run's recovery status before retrying."
             }
             Self::BudgetExhausted => {
                 "Turn/session time budget exhausted. \
@@ -360,7 +357,7 @@ impl ErrorKind {
             }
             Self::Network => {
                 "Network error (DNS, connection refused, unreachable). \
-                 Retrying with backoff. Check network connectivity if this persists."
+                 Check the run's recovery status and network connectivity if this persists."
             }
             Self::ToolNotFound => {
                 "Tool or resource not found. \
@@ -401,7 +398,7 @@ impl ErrorKind {
             Self::ConnectionPoolExhausted => {
                 "HTTP connection pool saturated (reqwest/hyper). \
                  Reduce parallel LLM requests, check for response body leaks, \
-                 or increase pool_max_size. Retrying with backoff."
+                 or increase pool_max_size. Check the run's recovery status before retrying."
             }
             Self::DatabaseError => {
                 "Database query failed (SQL syntax, deadlock, or pool). \
@@ -1260,9 +1257,16 @@ mod tests {
             ErrorKind::ServerError,
             ErrorKind::StreamIdle,
             ErrorKind::StreamTransport,
+            ErrorKind::ConnectionPoolExhausted,
             ErrorKind::Network,
         ] {
             assert!(kind.is_retryable(), "{kind:?} must be retryable");
+            let guidance = kind.guidance().to_ascii_lowercase();
+            assert!(
+                !guidance.contains("retrying automatically"),
+                "{kind:?}: {guidance}"
+            );
+            assert!(!guidance.contains("will retry"), "{kind:?}: {guidance}");
         }
         // Known non-retryable
         for kind in [
