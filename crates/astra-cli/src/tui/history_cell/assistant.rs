@@ -11,8 +11,10 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Settled reply bodies align prose and code at column 0. Code-block rows
-//! stay verbatim so text selected from native scrollback copies as written.
+//! Settled reply bodies indent every rendered row with the same two-column
+//! plain-space gutter the tool and summary cells use, and carry no glyph marker.
+//! Fenced code keeps its source line boundaries and indentation after that
+//! prefix; the native-scrollback rows themselves include the two gutter spaces.
 //! Live cells still use the active-slot wrapper for structure.
 //! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
@@ -410,7 +412,9 @@ impl AssistantCell {
             return (Vec::new(), 0);
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
-        self.markdown_layout_window(source, inner_width, start, maximum)
+        let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
+        let lines = rendered.into_iter().map(prefix_settled_row).collect();
+        (lines, total)
     }
 
     fn scrollback_body_source(&self) -> &str {
@@ -637,22 +641,46 @@ impl AssistantCell {
         (lines, next, next >= total)
     }
 
-    fn render_body(&self, source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
+    fn render_body_with_gutter(&self, source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
         if source.trim().is_empty() {
             return Vec::new();
         }
-        // Live cells receive the width inside the frame. Keep the same
-        // layout width when settled so the final render can reuse the cache.
-        let inner_w = if !live {
+        // Settled cells prepend a 2-col prefix to every line, so wrap text
+        // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
+        // already receive `width - 2` from `active_viewport` (the
+        // `LiveFramedCell` wrapper paints its own gutter column). This means
+        // the final scrollback render uses the same markdown width as the
+        // last active draw and can reuse the cached layout.
+        let prepend_gutter = !live;
+        let inner_w = if prepend_gutter {
             (width as usize).saturating_sub(2).max(20)
         } else {
             (width as usize).max(20)
         };
-        self.markdown_layout(source, inner_w)
+        let rendered = self.markdown_layout(source, inner_w);
+
+        if rendered.is_empty() {
+            return Vec::new();
+        }
+
+        rendered
             .into_iter()
-            .map(|row| row.line)
+            .map(|row| {
+                if prepend_gutter {
+                    prefix_settled_row(row).line
+                } else {
+                    row.line
+                }
+            })
             .collect()
     }
+}
+
+/// Add the plain two-column gutter to every settled row, including fenced code.
+/// Keep `verbatim` attached so code rows retain their source line boundaries.
+fn prefix_settled_row(mut row: MarkdownRow) -> MarkdownRow {
+    row.line.spans.insert(0, Span::raw("  "));
+    row
 }
 
 impl HistoryCell for AssistantCell {
@@ -664,7 +692,7 @@ impl HistoryCell for AssistantCell {
 
         // Branch 1: no <think> block. Original render path.
         let Some(think) = think_inner else {
-            return self.render_body(&self.source, width, self.live);
+            return self.render_body_with_gutter(&self.source, width, self.live);
         };
 
         // Branch 2: <think> still open (streaming). Show a dim
@@ -679,7 +707,7 @@ impl HistoryCell for AssistantCell {
         let think_lines = think.trim().lines().count().max(1);
         let think_tokens = approx_tokens(think.chars().count() as u64);
         let mut out = thought_header_lines(think_lines, think_tokens);
-        out.extend(self.render_body(body.trim_start_matches('\n'), width, self.live));
+        out.extend(self.render_body_with_gutter(body.trim_start_matches('\n'), width, self.live));
         out
     }
 
@@ -1241,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_single_line_command_reply_copies_without_glyphs() {
+    fn settled_single_line_command_reply_uses_spaces_not_glyphs() {
         for source in ["`git status`", "git status"] {
             let c = AssistantCell::from_markdown(source);
             let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
@@ -1250,13 +1278,15 @@ mod tests {
                 c.display_lines(80),
                 scrollback.into_iter().map(|row| row.line).collect(),
             ] {
-                assert_eq!(line_text(&lines), "git status", "{source:?}");
+                assert_eq!(line_text(&lines), "  git status", "{source:?}");
             }
         }
     }
 
     #[test]
-    fn settled_prose_and_code_share_the_same_left_edge() {
+    fn settled_prose_and_fenced_code_share_the_plain_transcript_gutter() {
+        // Every settled row, including code, gets the two plain-space columns.
+        // Source indentation and code-row boundaries remain after that gutter.
         let source = "Result:\n\n```sh\ncat <<'EOF'\n  indented\nEOF\n```\n\nDone.";
         let c = AssistantCell::from_markdown(source);
         let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
@@ -1266,21 +1296,26 @@ mod tests {
             scrollback.into_iter().map(|row| row.line).collect(),
         ] {
             let text = line_text(&lines);
-            assert!(text.starts_with("Result:"), "{text:?}");
+            assert!(text.starts_with("  Result:"), "{text:?}");
             assert!(
-                text.contains("\ncat <<'EOF'\n  indented\nEOF\n"),
+                text.contains("\n  cat <<'EOF'\n    indented\n  EOF\n"),
                 "{text:?}"
             );
-            assert!(text.ends_with("Done."), "{text:?}");
+            assert!(text.ends_with("  Done."), "{text:?}");
         }
     }
 
     #[test]
-    fn settled_code_blocks_copy_verbatim_from_scrollback() {
-        // A heredoc terminator and indentation only survive a copy when the
-        // selected rows match the source exactly, so compare the whole block
-        // rather than trimmed rows.
+    fn settled_code_blocks_keep_source_after_the_plain_gutter() {
+        // Rendered scrollback includes the two-column gutter on each code row.
+        // After that prefix, source text, indentation, and row boundaries remain
+        // unchanged, including the heredoc terminator.
         let block = "cat <<'EOF'\n  indented\nEOF\ngit status";
+        let guttered_block = block
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for source in [
             format!("Run these:\n\n```\n{block}\n```\n\nThen `make lint`."),
             format!("```\n{block}\n```"),
@@ -1294,7 +1329,8 @@ mod tests {
             ] {
                 let text = line_text(&lines);
                 assert!(
-                    text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
+                    text.contains(&format!("\n{guttered_block}\n"))
+                        || text.ends_with(&format!("\n{guttered_block}")),
                     "{source:?} rendered {text:?}"
                 );
                 assert!(!text.contains('●'), "{text}");
@@ -1309,8 +1345,8 @@ mod tests {
         c.push_delta("# Result\n\n- one\n- two\n\n`cargo test`");
 
         // `active_viewport` gives a live assistant the terminal width minus
-        // its frame gutter. Keep that layout width after settlement so the
-        // scrollback can reuse the same cached Markdown layout.
+        // its frame gutter. The committed cell adds that gutter itself, so
+        // its scrollback width resolves to the same cached markdown layout.
         let live = c.display_lines(78);
         assert!(!live.is_empty());
         {
@@ -1323,7 +1359,9 @@ mod tests {
 
         c.finalize();
         let settled = c.display_lines(80);
-        assert!(line_text(&settled).contains("Result"));
+        let text = line_text(&settled);
+        assert!(text.starts_with("  Result"), "{text:?}");
+        assert!(settled.iter().all(|line| !line.spans.is_empty()));
         let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
         assert!(matches!(
             cache.as_ref(),
@@ -1349,14 +1387,12 @@ mod tests {
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
-        let lines = first
-            .into_iter()
-            .chain(second)
-            .map(|row| row.line)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            line_text(&lines).trim_end(),
-            "paragraph 0\n\nparagraph 1\n\nparagraph 2"
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|row| row.line.spans[0].content.as_ref() == "  "),
+            "every chunk indents prose rows with plain spaces"
         );
     }
 

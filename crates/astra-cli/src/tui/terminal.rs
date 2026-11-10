@@ -812,6 +812,14 @@ mod tests {
         terminal
     }
 
+    fn settled_guttered_text(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
     fn queued_assistant(source: &str, width: u16) -> VecDeque<PendingHistory> {
         let cell: Arc<dyn HistoryCell> = Arc::new(AssistantCell::from_markdown(source.to_owned()));
         VecDeque::from([PendingHistory::Assistant(QueuedAssistantHistory {
@@ -968,7 +976,7 @@ mod tests {
                     let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
                     let plain = crate::cli::terminal_region::strip_ansi_codes(&raw);
                     assert!(
-                        plain.contains(&code.replace('\n', "\r\n")),
+                        plain.contains(&settled_guttered_text(&code)),
                         "logical source changed atwidth={width} zellij={zellij} lang={language}: {plain:?}"
                     );
                     assert!(!plain.contains('█'));
@@ -999,8 +1007,8 @@ mod tests {
                 "existing-code",
                 "earlier history overwritten zellij={zellij}"
             );
-            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "first-A");
-            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "first-C");
+            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "  first-A");
+            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "  first-C");
             assert_eq!(terminal.viewport_area.y, 16);
 
             let second = format!("second-batch-{}", "x".repeat(40));
@@ -1014,8 +1022,8 @@ mod tests {
             );
             assert_eq!(
                 parser.screen().rows(0, 40).nth(13).unwrap(),
-                "first-A",
-                "later batch overwrote previous reply zellij={zellij}"
+                "  first-A",
+                "later batch overwrote previous reply zellij={zellij}",
             );
             assert!(
                 parser
@@ -1023,7 +1031,7 @@ mod tests {
                     .rows(0, 40)
                     .nth(17)
                     .unwrap()
-                    .starts_with("second-batch-")
+                    .starts_with("  second-batch-")
             );
             assert!(parser.screen().contents().contains(&second));
             assert_eq!(terminal.viewport_area.y, 19);
@@ -1190,7 +1198,7 @@ mod tests {
         assert_eq!(total_code_rows, source_rows.len());
         let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
         let plain = crate::cli::terminal_region::strip_ansi_codes(&raw);
-        assert!(plain.contains(&code.replace('\n', "\r\n")));
+        assert!(plain.contains(&settled_guttered_text(&code)));
         assert_eq!(plain.matches("oversized:").count(), 1);
         assert!(plain.ends_with("trusted-tail"));
         assert!(raw.contains("\x1b]8;;file:///tmp/copy-test.txt\x1b\\trusted-tail"));
@@ -1248,7 +1256,10 @@ mod tests {
         let (first, _) = take_pending_history_batch(&mut pending);
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
-        assert_eq!(first[0].line.to_string(), "paragraph 0");
+        assert!(
+            first.iter().all(|row| row.line.spans[0].content == "  "),
+            "every prose row indents with plain spaces"
+        );
 
         let mut emitted = first;
         while !pending.is_empty() {
