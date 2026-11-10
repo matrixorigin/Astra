@@ -444,45 +444,46 @@ pub(super) async fn collect(
                 _=tokio::time::sleep_until(idle_deadline)=>return Err(error(astra_core::ErrorKind::ProviderDeadline,"stream_progress_deadline")),
                 value=stream.next()=>value,
             };
-            let Some(chunk) = next else {
-                frames.finish().map_err(|_| {
-                    error(
-                        astra_core::ErrorKind::StreamTransport,
-                        "incomplete_response_event",
-                    )
-                })?;
-                return Err(error(
-                    astra_core::ErrorKind::StreamTransport,
-                    "response_completion_missing",
-                ));
-            };
-            let chunk = chunk.map_err(|_| {
+            let chunk = next.transpose().map_err(|_| {
                 error(
                     astra_core::ErrorKind::StreamTransport,
                     "response_interrupted",
                 )
             })?;
-            let mut input = chunk.as_ref();
-            while !input.is_empty() {
-                let before = input.len();
-                let block = frames
-                    .next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES))
-                    .map_err(|failure| match failure {
-                        astra_core::sse_blocks::SseFrameError::TooLarge { .. } => {
-                            error(astra_core::ErrorKind::ResourceLimit, "stream_size_limit")
-                        }
-                        _ => error(
+            let mut input = chunk.as_deref().unwrap_or_default();
+            loop {
+                let block = if chunk.is_none() {
+                    frames.finish().map_err(|_| {
+                        error(
                             astra_core::ErrorKind::StreamTransport,
                             "invalid_response_encoding",
-                        ),
-                    })?;
-                size = size.saturating_add(before - input.len());
-                if size > MAX_STREAM_ACCUMULATION_BYTES {
-                    return Err(error(
-                        astra_core::ErrorKind::ResourceLimit,
-                        "stream_size_limit",
-                    ));
-                }
+                        )
+                    })?
+                } else {
+                    if input.is_empty() {
+                        break;
+                    }
+                    let before = input.len();
+                    let block = frames
+                        .next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES))
+                        .map_err(|failure| match failure {
+                            astra_core::sse_blocks::SseFrameError::TooLarge { .. } => {
+                                error(astra_core::ErrorKind::ResourceLimit, "stream_size_limit")
+                            }
+                            _ => error(
+                                astra_core::ErrorKind::StreamTransport,
+                                "invalid_response_encoding",
+                            ),
+                        })?;
+                    size = size.saturating_add(before - input.len());
+                    if size > MAX_STREAM_ACCUMULATION_BYTES {
+                        return Err(error(
+                            astra_core::ErrorKind::ResourceLimit,
+                            "stream_size_limit",
+                        ));
+                    }
+                    block
+                };
                 let Some(block) = block else { break };
                 let parsed = validated_sse_event(&block).map_err(|_| {
                     error(
@@ -605,6 +606,12 @@ pub(super) async fn collect(
                         return Ok(result);
                     }
                 }
+            }
+            if chunk.is_none() {
+                return Err(error(
+                    astra_core::ErrorKind::StreamTransport,
+                    "response_completion_missing",
+                ));
             }
         }
     };

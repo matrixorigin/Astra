@@ -6420,9 +6420,14 @@ async fn probe_responses(
                 }
             }
         }
-        frames.finish().map_err(|_| {
-            ModelProbeError::Response("Model check response ended with an incomplete event")
-        })?;
+        if let Some(tail) = frames
+            .finish()
+            .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?
+        {
+            astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
+                |_| ModelProbeError::Response("Model check did not produce a complete response"),
+            )?;
+        }
         finish_response_probe(accumulator)
     })
     .await
@@ -8237,6 +8242,9 @@ mod tests {
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(events)) }).chain(futures_util::stream::pending());
             Response::new(Body::from_stream(stream))
         })).route("/incomplete", post(|| async { "data: {\"type\":\"response.created\"}\n\n" }))
+        .route("/terminal-eof", post(|| async {
+            format!("data: {}\n", serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}))
+        }))
         .route("/refusal", post(|| async {
             let item = serde_json::json!({"type":"message","id":"refusal-1","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"cannot comply"}]});
             let reasoning = serde_json::json!({"type":"reasoning","id":"reason-1","summary":[]});
@@ -8276,6 +8284,18 @@ mod tests {
             )
             .await
             .is_err()
+        );
+        assert!(
+            probe_responses(
+                &client,
+                &format!("{base}/terminal-eof"),
+                "model",
+                "key",
+                None,
+                None
+            )
+            .await
+            .is_ok()
         );
         assert!(
             tokio::time::timeout(

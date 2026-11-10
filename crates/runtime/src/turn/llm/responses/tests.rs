@@ -138,6 +138,64 @@ async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
 }
 
 #[tokio::test]
+async fn clean_eof_responses_requires_a_valid_semantic_terminal() {
+    use std::collections::HashSet;
+
+    let terminal = json!({"type":"response.completed", "response":{
+        "id":"resp-1", "status":"completed", "output":[{"type":"message", "role":"assistant", "content":[
+            {"type":"output_text", "text":"done"}
+        ]}]
+    }});
+    let cases = [
+        (format!("data: {terminal}\n"), true),
+        (format!("data: {terminal}"), true),
+        ("data: {\"type\":\"response.completed\"".to_string(), false),
+        ("data: {\"type\":\"response.created\"}\n".to_string(), false),
+    ];
+    for (body, expected) in cases {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body(reqwest::Body::from(body))
+                .unwrap(),
+        );
+        let route = LlmExecutionRoute {
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope: Some("scope"),
+            subscription: None,
+            fixed_temperature: None,
+            supported_reasoning_efforts: None,
+            thinking_protocol: None,
+            model_name: "model",
+            wire_model_name: None,
+            api_key: "key",
+            base_url: "http://localhost",
+            provider: "openai",
+            header_overrides: None,
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let result = collect(
+            response,
+            route,
+            &HashSet::new(),
+            LlmCancel::None,
+            None,
+            Instant::now(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.is_ok(), expected, "{result:?}");
+        if let Ok(result) = result {
+            assert_eq!(result.full_text, "done");
+        }
+    }
+}
+
+#[tokio::test]
 async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     use axum::{
         Json, Router,

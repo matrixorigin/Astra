@@ -65,7 +65,6 @@ impl std::error::Error for SseUtf8Error {}
 pub enum SseFrameError {
     InvalidUtf8(SseUtf8Error),
     TooLarge { limit: usize },
-    Incomplete,
 }
 
 impl fmt::Display for SseFrameError {
@@ -73,7 +72,6 @@ impl fmt::Display for SseFrameError {
         match self {
             Self::InvalidUtf8(error) => error.fmt(f),
             Self::TooLarge { limit } => write!(f, "SSE event exceeds {limit} bytes"),
-            Self::Incomplete => f.write_str("incomplete SSE event at end of stream"),
         }
     }
 }
@@ -180,12 +178,11 @@ impl SseBlankLineUtf8Buf {
         self.first_frame_seen = true;
     }
 
-    pub fn finish(&self) -> Result<(), SseFrameError> {
-        if self.buf.is_empty() {
-            Ok(())
-        } else {
-            Err(SseFrameError::Incomplete)
-        }
+    /// Return the last block at a clean EOF. Consumers must validate its
+    /// payload and their own semantic terminal before accepting a response.
+    pub fn finish(&mut self) -> Result<Option<String>, SseUtf8Error> {
+        let tail = self.take_buf()?;
+        Ok((!tail.is_empty()).then_some(tail))
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<String>, SseUtf8Error> {

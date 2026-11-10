@@ -1237,9 +1237,12 @@ pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
             return output.finish();
         }
     }
-    frames
+    if let Some(tail) = frames
         .finish()
-        .map_err(|_| ResponsesStreamError::Codec("Incomplete Responses SSE event"))?;
+        .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE framing"))?
+    {
+        observe_sse_block(&mut output, &tail)?;
+    }
     output.finish()
 }
 
