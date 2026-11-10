@@ -58,6 +58,18 @@ pub(crate) fn note_attempt_code(code: &'static str) {
     astra_logging::trace_context::note_attempt_code(code);
 }
 
+pub(crate) fn in_llm_call<F: Future>(future: F) -> impl Future<Output = F::Output> + use<F> {
+    astra_logging::trace_context::in_llm_call(future)
+}
+
+pub(crate) fn note_attempt_settlement_error(code: &'static str) {
+    astra_logging::trace_context::note_attempt_settlement_error(code);
+}
+
+pub(crate) fn attempt_settlement_error() -> Option<&'static str> {
+    astra_logging::trace_context::attempt_settlement_error()
+}
+
 pub(crate) fn clear_attempt_code() {
     astra_logging::trace_context::clear_attempt_code();
 }

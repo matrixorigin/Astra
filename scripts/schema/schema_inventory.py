@@ -91,6 +91,9 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         startup_owner="ensure_llm_provider_admission_schema_if_configured",
         state_class_hint="coordination fact",
         hot_path_hint="LLM admission hot path when enabled",
+        # The test-only MySQL proxy module precedes the production DDL.
+        # Do not treat that helper as the end of the production source.
+        stop_at_cfg_test=False,
     ),
 )
 
