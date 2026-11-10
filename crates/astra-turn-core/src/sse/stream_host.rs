@@ -19,10 +19,11 @@ use crate::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, 
 use crate::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, DurableRunTerminal,
     DurableRunTerminalStatus, EdgeApprovalRequest, SseRenderEffect, StreamRootIdentity,
-    dispatch_chat_turn_sse_event_block, durable_run_terminal_from_event,
+    dispatch_chat_turn_sse_event_block, dispatch_decoded_sse_event,
+    durable_run_terminal_from_event,
 };
-use crate::sse::blocks::{SseBlankLineUtf8Buf, drain_complete_sse_event_blocks};
-use crate::sse::data_lines::{json_events_from_sse_event_block, validate_sse_event_block_json};
+use crate::sse::blocks::SseBlankLineUtf8Buf;
+use crate::sse::data_lines::{json_events_from_sse_event_block, validated_sse_event};
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
@@ -70,21 +71,38 @@ struct EdgeExecutionReadAhead {
     queued_bytes: usize,
     /// A chunk may end in the middle of an SSE block. Keep that fragment until
     /// the next chunk, then hand it back to the normal framer in order.
-    framing: Vec<u8>,
+    framing: Option<SseBlankLineUtf8Buf>,
+    finished: bool,
     live_gaps: BTreeMap<(String, String), u64>,
     live_gap_bytes: usize,
 }
 
 impl EdgeExecutionReadAhead {
-    fn pop_front(&mut self) -> Option<Vec<u8>> {
+    fn pop_front(&mut self, framer: &mut ChatTurnSseFramer) -> Option<Vec<u8>> {
         if let Some(bytes) = self.queued.pop_front() {
             self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
             return Some(bytes);
         }
-        (!self.framing.is_empty()).then(|| std::mem::take(&mut self.framing))
+        if let Some(framing) = self.framing.take() {
+            framer.restore_framing(framing);
+        }
+        None
+    }
+
+    fn begin(&mut self, framer: &mut ChatTurnSseFramer) -> Result<(), String> {
+        if self.framing.is_none() {
+            self.framing = Some(framer.take_framing());
+        }
+        self.ensure_bounded()
     }
 
     fn push_bytes(&mut self, bytes: &[u8], strict_json: bool) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.framing
+            .get_or_insert_with(SseBlankLineUtf8Buf::new)
+            .mark_stream_started();
         for feed in bytes.chunks(EDGE_EXECUTION_READ_AHEAD_FEED_BYTES) {
             self.push_feed(feed, strict_json)?;
         }
@@ -92,23 +110,32 @@ impl EdgeExecutionReadAhead {
     }
 
     fn push_feed(&mut self, bytes: &[u8], strict_json: bool) -> Result<(), String> {
-        if self
-            .queued_bytes
-            .saturating_add(self.framing.len())
-            .saturating_add(self.live_gap_bytes)
-            .saturating_add(bytes.len())
-            > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
-        {
-            return Err(format!(
-                "SSE control read-ahead exceeded {} bytes while Edge work was running",
-                MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
-            ));
-        }
-        self.framing.extend_from_slice(bytes);
-        let blocks = drain_complete_sse_event_blocks(&mut self.framing)
-            .map_err(|error| format!("invalid UTF-8 in SSE read-ahead: {error}"))?;
-        for block in blocks {
+        let mut input = bytes;
+        while !input.is_empty() {
+            let limit = MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+                .saturating_sub(self.queued_bytes)
+                .saturating_sub(self.live_gap_bytes);
+            let Some(block) = self
+                .framing
+                .as_mut()
+                .expect("read-ahead framing is initialized")
+                .next_frame(&mut input, Some(limit))
+                .map_err(|error| match error {
+                    astra_core::sse_blocks::SseFrameError::TooLarge { .. } => format!(
+                        "SSE control read-ahead exceeded {} bytes while Edge work was running",
+                        MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+                    ),
+                    _ => format!("invalid SSE read-ahead: {error}"),
+                })?
+            else {
+                break;
+            };
+            let done = astra_core::sse_blocks::event_data(&block).as_deref() == Some("[DONE]");
             self.push_block(block, strict_json)?;
+            if done {
+                self.finished = true;
+                break;
+            }
         }
         self.ensure_bounded()
     }
@@ -116,7 +143,7 @@ impl EdgeExecutionReadAhead {
     /// Finish one execution window without inventing an SSE boundary. A queued
     /// tool may start another window before the partial tail can be replayed;
     /// keep it here so subsequent network bytes extend the same event. After
-    /// all complete queued blocks drain, `pop_front` hands it to the main framer.
+    /// all complete queued blocks drain, `pop_front` restores the parser to the main reader.
     fn finish_window(&mut self) -> Result<(), String> {
         self.ensure_bounded()
     }
@@ -153,7 +180,11 @@ impl EdgeExecutionReadAhead {
     fn ensure_bounded(&self) -> Result<(), String> {
         if self
             .queued_bytes
-            .saturating_add(self.framing.len())
+            .saturating_add(
+                self.framing
+                    .as_ref()
+                    .map_or(0, |frames| frames.buffered_bytes()),
+            )
             .saturating_add(self.live_gap_bytes)
             > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
         {
@@ -170,10 +201,11 @@ impl EdgeExecutionReadAhead {
     /// stay on the bounded replay lane and therefore retain existing strict
     /// protocol validation and ordering semantics.
     fn record_live_gap_if_only_live(&mut self, block: &str, strict_json: bool) -> bool {
-        if strict_json && validate_sse_event_block_json(block).is_err() {
-            return false;
-        }
-        let parsed = json_events_from_sse_event_block(block);
+        let parsed = match validated_sse_event(block) {
+            Ok(parsed) => parsed,
+            Err(_) if strict_json => return false,
+            Err(_) => Default::default(),
+        };
         if parsed.stream_finished || parsed.events.is_empty() {
             return false;
         }
@@ -244,6 +276,7 @@ fn live_gap_key_bytes(key: &(String, String)) -> usize {
 struct DurableTerminalProbe {
     frames: SseBlankLineUtf8Buf,
     identity: StreamRootIdentity,
+    finished: bool,
 }
 
 impl DurableTerminalProbe {
@@ -252,12 +285,21 @@ impl DurableTerminalProbe {
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) -> Result<Option<DurableRunTerminal>, String> {
-        let blocks = self
-            .frames
-            .push_bytes(bytes)
-            .map_err(|error| error.to_string())?;
-        for block in blocks {
-            for event in json_events_from_sse_event_block(&block).events {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut input = bytes;
+        while !input.is_empty() {
+            let block = match self.frames.next_frame(&mut input, Some(16 * 1024 * 1024)) {
+                Ok(Some(block)) => block,
+                Ok(None) | Err(_) => return Ok(None),
+            };
+            let parsed = json_events_from_sse_event_block(&block);
+            if parsed.stream_finished {
+                self.finished = true;
+                return Ok(None);
+            }
+            for event in parsed.events {
                 let event_type = event.get("type").and_then(Value::as_str);
                 self.identity.observe_event(&event)?;
                 if event_type == Some("run_finished") {
@@ -284,12 +326,12 @@ impl DurableTerminalProbe {
         }
         Ok(None)
     }
-
     fn take_trailing_terminal(&mut self) -> Result<Option<DurableRunTerminal>, String> {
         let mut tail = self.frames.take_buf().map_err(|error| error.to_string())?;
         if tail.trim().is_empty() {
             return Ok(None);
         }
+        validated_sse_event(&tail)?;
         // EOF is the only point where an unterminated final SSE block becomes
         // dispatchable. Reuse the exact normal probe path by supplying the
         // missing framing boundary after ownership of the tail is taken.
@@ -719,7 +761,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // but accumulate elapsed time toward the full idle_timeout.
         let mut chunk_was_probed = false;
         let chunk_result = 'wait: {
-            if let Some(bytes) = read_ahead.pop_front() {
+            if let Some(bytes) = read_ahead.pop_front(&mut framer) {
                 chunk_was_probed = true;
                 break 'wait Some(Some(Ok(bytes)));
             }
@@ -811,18 +853,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 break;
             }
         }
-        let event_blocks = match framer.push_bytes(&bytes) {
-            Ok(blocks) => blocks,
-            Err(error) => {
-                abort = Some(astra_core::ErrorKind::StreamTransport);
-                abort_message = Some(format!(
-                    "Error: invalid UTF-8 in model SSE response: {error}"
-                ));
-                break;
-            }
-        };
+        let mut input = bytes.as_slice();
         let mut terminal_marker_seen = false;
-        for event_str in event_blocks {
+        while !input.is_empty() {
+            let event_str = match framer.next_frame(&mut input) {
+                Ok(Some(block)) => block,
+                Ok(None) => break,
+                Err(error) => {
+                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                    abort_message = Some(format!("Error: invalid SSE response: {error}"));
+                    break;
+                }
+            };
             let processed = process_sse_event_block(
                 &event_str,
                 host,
@@ -887,7 +929,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // Replayed blocks and the trailing partial event precede any new
             // network chunk. Consume that backlog through the same framer
             // before waiting for another sibling request.
-            let (next, reached_eof, chunk_was_probed) = if let Some(bytes) = read_ahead.pop_front()
+            let (next, reached_eof, chunk_was_probed) = if let Some(bytes) =
+                read_ahead.pop_front(&mut framer)
             {
                 (Some(Ok(bytes)), false, true)
             } else if let Some(token) = cancel_token {
@@ -1001,17 +1044,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     }
                     let mut saw_event = false;
                     let mut all_events_extended_batch = true;
-                    let event_blocks = match framer.push_bytes(&bytes) {
-                        Ok(blocks) => blocks,
-                        Err(error) => {
-                            abort = Some(astra_core::ErrorKind::StreamTransport);
-                            abort_message = Some(format!(
-                                "Error: invalid UTF-8 in model SSE response: {error}"
-                            ));
-                            break;
-                        }
-                    };
-                    for event_str in event_blocks {
+                    let mut input = bytes.as_slice();
+                    while !input.is_empty() {
+                        let event_str = match framer.next_frame(&mut input) {
+                            Ok(Some(block)) => block,
+                            Ok(None) => break,
+                            Err(error) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort_message =
+                                    Some(format!("Error: invalid SSE response: {error}"));
+                                break;
+                            }
+                        };
                         saw_event = true;
                         match process_sse_event_block(
                             &event_str,
@@ -1082,10 +1126,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // The main framer may already hold the beginning of the next SSE
             // event, including an incomplete UTF-8 character. The read-ahead
             // lane must inherit those bytes before it consumes another chunk.
-            if let Err(error) = read_ahead.push_bytes(
-                &framer.take_pending_bytes(),
-                host.requires_strict_sse_json(),
-            ) {
+            if let Err(error) = read_ahead.begin(&mut framer) {
                 abort = Some(astra_core::ErrorKind::StreamTransport);
                 abort_message = Some(format!("Error: {error}"));
                 if let Some(token) = cancel_token {
@@ -1222,18 +1263,19 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 // The original Edge flush has settled. Observe only the
                 // received prefix through the failed root terminal; no new
                 // pending tool or approval may execute on this abort path.
-                'observe_terminal: while let Some(bytes) = read_ahead.pop_front() {
-                    let blocks = match framer.push_bytes(&bytes) {
-                        Ok(blocks) => blocks,
-                        Err(error) => {
-                            abort = Some(astra_core::ErrorKind::StreamTransport);
-                            abort_message = Some(format!(
-                                "Error: invalid UTF-8 in model SSE response: {error}"
-                            ));
-                            break;
-                        }
-                    };
-                    for block in blocks {
+                'observe_terminal: while let Some(bytes) = read_ahead.pop_front(&mut framer) {
+                    let mut input = bytes.as_slice();
+                    while !input.is_empty() {
+                        let block = match framer.next_frame(&mut input) {
+                            Ok(Some(block)) => block,
+                            Ok(None) => break,
+                            Err(error) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort_message =
+                                    Some(format!("Error: invalid SSE response: {error}"));
+                                break 'observe_terminal;
+                            }
+                        };
                         if let Err(error) = process_sse_event_block(
                             &block,
                             host,
@@ -1538,10 +1580,11 @@ async fn process_sse_event_block<H: SseStreamHost>(
     if accum.stream_complete {
         return Ok(false);
     }
-    if host.requires_strict_sse_json() {
-        validate_sse_event_block_json(event_str)?;
-    }
-    let parsed = json_events_from_sse_event_block(event_str);
+    let (parsed, invalid) = match validated_sse_event(event_str) {
+        Ok(parsed) => (parsed, false),
+        Err(error) if host.requires_strict_sse_json() => return Err(error),
+        Err(_) => (Default::default(), true),
+    };
     if !*first_sse_frame_seen {
         *first_sse_frame_seen = true;
         host.on_first_sse_frame();
@@ -1580,7 +1623,11 @@ async fn process_sse_event_block<H: SseStreamHost>(
             _ => {}
         }
     }
-    let effects = dispatch_chat_turn_sse_event_block(event_str, accum, pending);
+    let effects = if invalid {
+        dispatch_chat_turn_sse_event_block(event_str, accum, pending)
+    } else {
+        dispatch_decoded_sse_event(&parsed, accum, pending)
+    };
     let extends_coalescible_batch = {
         let appended = pending.get(pending_len_before..).unwrap_or_default();
         !appended.is_empty()
@@ -2268,6 +2315,28 @@ mod tests {
         assert_eq!(result.accum.full_text, "hello world");
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multiline_event_reaches_host_and_done_precedes_later_bad_bytes() {
+        let bytes = b"data:{\"type\":\"text_delta\",\rdata: \"content\":\"hello\"}\n\r\ndata:[DONE]\r\rdata: \xff\n\n";
+        for chunks in [
+            vec![bytes.to_vec()],
+            bytes.chunks(7).map(<[u8]>::to_vec).collect(),
+        ] {
+            let chunks = chunks.into_iter().map(Ok::<_, String>);
+            let mut stream = stream::iter(chunks);
+            let mut host = NoopSseStreamHost;
+            let (result, abort) = consume_sse_stream(
+                &mut stream,
+                &mut host,
+                std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+            )
+            .await;
+            assert!(abort.is_none(), "{abort:?}");
+            assert_eq!(result.accum.full_text, "hello");
+            assert!(result.accum.stream_complete);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4899,6 +4968,81 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
     }
 
+    #[test]
+    fn edge_handoff_preserves_crlf_boundary_without_empty_events() {
+        let mut main = ChatTurnSseFramer::new();
+        let mut initial = b"data: {\"type\":\"tool_request\"}\r\n\r".as_slice();
+        assert!(main.next_frame(&mut initial).unwrap().is_some());
+
+        let mut ahead = EdgeExecutionReadAhead::default();
+        ahead.begin(&mut main).unwrap();
+        ahead
+            .push_bytes(b"\ndata: {\"type\":\"ping\"}\r\n\r", true)
+            .unwrap();
+        let replay = ahead.pop_front(&mut main).unwrap();
+        assert_eq!(replay, b"data: {\"type\":\"ping\"}\n\n");
+        let mut replay = replay.as_slice();
+        assert!(main.next_frame(&mut replay).unwrap().is_some());
+        assert!(ahead.pop_front(&mut main).is_none());
+
+        let mut rest = b"\ndata: {\"type\":\"done\"}\n\n".as_slice();
+        assert_eq!(
+            main.next_frame(&mut rest).unwrap().as_deref(),
+            Some("data: {\"type\":\"done\"}")
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_eof_tail_cancels_running_edge_tool() {
+        for strict in [false, true] {
+            let (tx, mut source) = test_channel();
+            let started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut host = RecordingSseStreamHost::new();
+            host.tool_gate = Some((started.clone(), cancel.clone()));
+            host.strict_sse_json = strict;
+            let bridge = tokio::spawn(async move {
+                tx.send(Ok(format!(
+                    "{}{}",
+                    sse_event("session_info", ",\"session_id\":\"s\",\"run_id\":\"r\""),
+                    sse_event(
+                        "tool_request",
+                        ",\"request_id\":\"t\",\"tool\":\"bash\",\"args\":{}"
+                    )
+                )
+                .into_bytes()))
+                    .await
+                    .unwrap();
+                started.notified().await;
+                tx.send(Ok(b"data: not-json".to_vec())).await.unwrap();
+            });
+            let (result, abort) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                consume_sse_stream_cancellable(
+                    &mut source,
+                    &mut host,
+                    stream_idle_timeout(),
+                    Some(&cancel),
+                    None,
+                ),
+            )
+            .await
+            .expect("invalid EOF must cancel and settle the tool");
+            assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+            assert!(cancel.is_cancelled());
+            assert!(
+                result
+                    .accum
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("invalid JSON")
+            );
+            bridge.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn edge_read_ahead_preserves_partial_event_across_two_tool_windows() {
         let (tx, mut stream) = test_channel();
@@ -5004,10 +5148,8 @@ mod tests {
         assert!(read_ahead.live_gaps.is_empty());
         assert_eq!(read_ahead.queued.len(), 1);
         assert!(
-            validate_sse_event_block_json(
-                std::str::from_utf8(read_ahead.queued.front().unwrap()).unwrap()
-            )
-            .is_err()
+            validated_sse_event(std::str::from_utf8(read_ahead.queued.front().unwrap()).unwrap())
+                .is_err()
         );
     }
 
@@ -5044,8 +5186,9 @@ mod tests {
         read_ahead.push_bytes(block.as_bytes(), true).unwrap();
         assert!(read_ahead.live_gaps.is_empty());
         assert_eq!(read_ahead.live_gap_bytes, 0);
-        assert_eq!(read_ahead.pop_front().unwrap(), block.as_bytes());
-        assert!(read_ahead.pop_front().is_none());
+        let mut framer = ChatTurnSseFramer::new();
+        assert_eq!(read_ahead.pop_front(&mut framer).unwrap(), block.as_bytes());
+        assert!(read_ahead.pop_front(&mut framer).is_none());
     }
 
     /// Adjacent concurrency-safe tool requests may arrive as separate SSE
@@ -5162,12 +5305,10 @@ mod tests {
     /// Skill and non-skill tool_request in the same SSE block during
     /// streaming: skill must execute first.
     #[tokio::test]
-    async fn skill_prioritized_over_regular_tool_in_same_block() {
-        // Both tool requests in a SINGLE SSE block (no \n\n between them,
-        // only one \n\n at the end). This simulates them arriving in the
-        // same TCP chunk as a single framed event.
+    async fn skill_prioritized_over_regular_tool_in_same_chunk() {
+        // Both independently framed requests arrive in one transport chunk.
         let block = format!(
-            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"admitted_skill_names\":[\"test-skill\"],\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
+            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\n\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"admitted_skill_names\":[\"test-skill\"],\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
             "skill"
         );
         let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(block.into_bytes())];

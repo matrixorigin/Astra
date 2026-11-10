@@ -48,21 +48,40 @@ async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
             {"type":"output_text", "text":"done"}
         ]}]
     }});
-    for (delta, budget, should_succeed) in [
-        (json!("private reasoning"), None, true),
-        (json!("  "), None, false),
-        (json!(12), None, false),
+    for (delta, budget, should_succeed, done_first) in [
+        (json!("private reasoning"), None, true, false),
+        (json!("  "), None, false, false),
+        (json!(12), None, false, false),
         (
             json!("private reasoning"),
             Some(Duration::from_millis(250)),
             false,
+            false,
         ),
+        (json!("private reasoning"), None, false, true),
     ] {
         let raw = json!({"type":"response.reasoning_text.delta", "delta":delta});
-        let events = vec![raw.clone(), raw.clone(), raw, terminal.clone()];
-        let stream = stream::iter(events).then(|event| async move {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            Ok::<_, std::io::Error>(format!("data: {event}\n\n"))
+        let events = if done_first {
+            vec![json!("[DONE]"), terminal.clone()]
+        } else {
+            vec![raw.clone(), raw.clone(), raw, terminal.clone()]
+        };
+        let terminal_frame = terminal.to_string();
+        let stream = stream::iter(events).then(move |event| {
+            let terminal_frame = terminal_frame.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let event = event.to_string();
+                let frame = if event == "\"[DONE]\"" {
+                    format!("data: [DONE]\n\ndata: {terminal_frame}\n\n")
+                } else if event.contains("response.completed") {
+                    let (first, rest) = event.split_once(',').unwrap();
+                    format!("data:{first},\r\ndata: {rest}\r\n\r\n")
+                } else {
+                    format!("data: {event}\n\n")
+                };
+                Ok::<_, std::io::Error>(frame)
+            }
         });
         let response = reqwest::Response::from(
             axum::http::Response::builder()
@@ -102,6 +121,11 @@ async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
         )
         .await;
         assert_eq!(result.is_ok(), should_succeed);
+        if done_first {
+            assert!(
+                matches!(&result, Err(StreamCollectError::Provider { error, .. }) if error.message.contains("response_completion_missing"))
+            );
+        }
         if let Ok(result) = result {
             assert_eq!(result.full_text, "done");
             assert!(result.reasoning.is_empty());

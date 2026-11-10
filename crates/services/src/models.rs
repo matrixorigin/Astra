@@ -6391,16 +6391,26 @@ async fn probe_responses(
         let mut size = 0usize;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(ModelProbeError::transport)?;
-            size = size.saturating_add(chunk.len());
-            if size > 1024 * 1024 {
-                return Err(ModelProbeError::Response(
-                    "Model check response exceeded its size limit",
-                ));
-            }
-            let blocks = frames.push_bytes(&chunk).map_err(|_| {
-                ModelProbeError::Response("Model check response has invalid encoding")
-            })?;
-            for block in blocks {
+            let mut input = chunk.as_ref();
+            while !input.is_empty() {
+                let before = input.len();
+                let block = frames
+                    .next_frame(&mut input, Some(1024 * 1024))
+                    .map_err(|error| match error {
+                        astra_core::sse_blocks::SseFrameError::TooLarge { .. } => {
+                            ModelProbeError::Response(
+                                "Model check response exceeded its size limit",
+                            )
+                        }
+                        _ => ModelProbeError::Response("Model check response has invalid encoding"),
+                    })?;
+                size = size.saturating_add(before - input.len());
+                if size > 1024 * 1024 {
+                    return Err(ModelProbeError::Response(
+                        "Model check response exceeded its size limit",
+                    ));
+                }
+                let Some(block) = block else { break };
                 astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &block)
                     .map_err(|_| {
                         ModelProbeError::Response("Model check did not produce a complete response")
@@ -6410,12 +6420,9 @@ async fn probe_responses(
                 }
             }
         }
-        let tail = frames
-            .take_buf()
-            .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?;
-        astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
-            |_| ModelProbeError::Response("Model check did not produce a complete response"),
-        )?;
+        frames.finish().map_err(|_| {
+            ModelProbeError::Response("Model check response ended with an incomplete event")
+        })?;
         finish_response_probe(accumulator)
     })
     .await
@@ -8219,11 +8226,13 @@ mod tests {
             assert_eq!(headers["x-probe"], "fixture");
             let item = serde_json::json!({"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"391","annotations":[]}]});
             let reasoning = serde_json::json!({"type":"reasoning","id":"reason-1","summary":[]});
-            let events = if matches!(body["model"].as_str(), Some("truncated" | "empty")) {
+            let events = if body["model"] == "done-first" {
+                format!("data: [DONE]\n\ndata: {}\n\n", serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[item]}}))
+            } else if matches!(body["model"].as_str(), Some("truncated" | "empty")) {
                 let output_tokens = if body["model"] == "truncated" { 32 } else { 0 };
                 format!("data: {}\n\n", serde_json::json!({"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"output_tokens":output_tokens}}}))
             } else {
-                format!("data: {}\n\ndata: {}\n\ndata: {}\n\n", serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}), serde_json::json!({"type":"response.output_item.done","output_index":1,"item":item}), serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}))
+                format!("data:\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n", serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}), serde_json::json!({"type":"response.output_item.done","output_index":1,"item":item}), serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}))
             };
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(events)) }).chain(futures_util::stream::pending());
             Response::new(Body::from_stream(stream))
@@ -8266,6 +8275,22 @@ mod tests {
                 None
             )
             .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                probe_responses(
+                    &client,
+                    &format!("{base}/responses"),
+                    "done-first",
+                    "key",
+                    Some(&headers),
+                    Some("high")
+                )
+            )
+            .await
+            .unwrap()
             .is_err()
         );
         let truncated = probe_responses(

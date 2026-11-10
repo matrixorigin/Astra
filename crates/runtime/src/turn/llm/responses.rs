@@ -434,7 +434,7 @@ pub(super) async fn collect(
     let exchange = async {
         let mut stream = response.bytes_stream();
         let mut frames = SseBlankLineUtf8Buf::new();
-        let mut size = 0;
+        let mut size = 0usize;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout();
         let mut admitted_items = HashSet::new();
         loop {
@@ -444,39 +444,58 @@ pub(super) async fn collect(
                 _=tokio::time::sleep_until(idle_deadline)=>return Err(error(astra_core::ErrorKind::ProviderDeadline,"stream_progress_deadline")),
                 value=stream.next()=>value,
             };
-            let eof = next.is_none();
-            let blocks = if let Some(chunk) = next {
-                let chunk = chunk.map_err(|_| {
+            let Some(chunk) = next else {
+                frames.finish().map_err(|_| {
                     error(
                         astra_core::ErrorKind::StreamTransport,
-                        "response_interrupted",
+                        "incomplete_response_event",
                     )
                 })?;
-                size += chunk.len();
+                return Err(error(
+                    astra_core::ErrorKind::StreamTransport,
+                    "response_completion_missing",
+                ));
+            };
+            let chunk = chunk.map_err(|_| {
+                error(
+                    astra_core::ErrorKind::StreamTransport,
+                    "response_interrupted",
+                )
+            })?;
+            let mut input = chunk.as_ref();
+            while !input.is_empty() {
+                let before = input.len();
+                let block = frames
+                    .next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES))
+                    .map_err(|failure| match failure {
+                        astra_core::sse_blocks::SseFrameError::TooLarge { .. } => {
+                            error(astra_core::ErrorKind::ResourceLimit, "stream_size_limit")
+                        }
+                        _ => error(
+                            astra_core::ErrorKind::StreamTransport,
+                            "invalid_response_encoding",
+                        ),
+                    })?;
+                size = size.saturating_add(before - input.len());
                 if size > MAX_STREAM_ACCUMULATION_BYTES {
                     return Err(error(
                         astra_core::ErrorKind::ResourceLimit,
                         "stream_size_limit",
                     ));
                 }
-                frames.push_bytes(&chunk)
-            } else {
-                frames.take_buf().map(|tail| vec![tail])
-            }
-            .map_err(|_| {
-                error(
-                    astra_core::ErrorKind::StreamTransport,
-                    "invalid_response_encoding",
-                )
-            })?;
-            for block in blocks {
-                validate_sse_event_block_json(&block).map_err(|_| {
+                let Some(block) = block else { break };
+                let parsed = validated_sse_event(&block).map_err(|_| {
                     error(
                         astra_core::ErrorKind::StreamTransport,
                         "invalid_response_event",
                     )
                 })?;
-                let parsed = json_events_from_sse_event_block(&block);
+                if parsed.stream_finished {
+                    return Err(error(
+                        astra_core::ErrorKind::StreamTransport,
+                        "response_completion_missing",
+                    ));
+                }
                 for event in parsed.events {
                     if event["type"] == "response.output_item.added"
                         && event["item"]["type"] == "function_call"
@@ -586,12 +605,6 @@ pub(super) async fn collect(
                         return Ok(result);
                     }
                 }
-            }
-            if eof {
-                return Err(error(
-                    astra_core::ErrorKind::StreamTransport,
-                    "response_completion_missing",
-                ));
             }
         }
     };
