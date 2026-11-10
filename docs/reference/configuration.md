@@ -430,6 +430,19 @@ Tool execution spans appear as `tool.exec <tool name>` in Jaeger. They carry
 call can be matched to runtime logs. Tool arguments, shell commands and result
 bodies are not included. This metadata does not change execution timeouts.
 
+LLM spans retain the `llm.call` operation name and existing `error.code`.
+Failures also carry `error.phase` (`request`, `response_body`,
+`response_status`, `response_decode`, or `settlement`) and a fixed
+`error.reason`. Typed transport causes can identify `connection_refused`,
+`connection_reset`, `connection_aborted`, `broken_pipe`, `unexpected_eof`, or
+`timeout`; otherwise the reason remains a safe category such as `connect_error`
+or the existing error code. DNS/TLS details are not guessed from error text.
+Collectors that have already erased the transport type retain their existing
+category. `http.response.status_code` is recorded only after a response arrives.
+`retry.attempt` is the zero-based client retry-loop index; non-streaming calls
+use zero. These fields do not export raw error messages, provider URLs, prompts
+or response bodies, and do not change retry, timeout or request-result behavior.
+
 ### CLI overrides (optional)
 
 - `ASTRA_CLI_SESSION_ID`, `ASTRA_CLI_SESSION_NAME`

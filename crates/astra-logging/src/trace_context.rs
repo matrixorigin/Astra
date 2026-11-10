@@ -310,6 +310,19 @@ pub fn tool_span(tool_name: &str, call_id: Option<&str>, route: &str) -> tracing
     span
 }
 
+/// Construct an LLM attempt span with the zero-based client retry-loop index.
+/// Failure details are recorded later using fixed codes, never cause text.
+pub fn llm_span(retry_attempt: u32) -> tracing::Span {
+    tracing::info_span!(
+        target: "astra.llm",
+        "llm.call",
+        retry.attempt = retry_attempt,
+        http.response.status_code = tracing::field::Empty,
+        error.phase = tracing::field::Empty,
+        error.reason = tracing::field::Empty,
+    )
+}
+
 /// Stable exported status. The description is `code`, not the cause text.
 pub fn mark_error(span: &tracing::Span, code: &'static str) {
     #[cfg(feature = "otel")]
@@ -678,6 +691,80 @@ mod tests {
             .with_simple_exporter(capture.clone())
             .build();
         (capture, provider)
+    }
+
+    #[test]
+    fn llm_spans_export_fixed_diagnostics_without_private_causes() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        mark_export_ready();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryLayer::new(provider.tracer("astra-test"))
+                .with_filter(EnvFilter::new("astra.llm=info")),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+        for (attempt, status, phase, reason) in [
+            (0, None, "request", "connection_refused"),
+            (1, Some(429), "response_status", "http_status"),
+        ] {
+            let span = llm_span(attempt);
+            if let Some(status) = status {
+                span.record("http.response.status_code", status);
+            }
+            span.record("error.phase", phase);
+            span.record("error.reason", reason);
+            mark_error(&span, "network");
+            {
+                let _entered = span.enter();
+                tracing::warn!(target: "astra_runtime::llm_client", url = "https://private.invalid", error = "secret cause", "private body");
+            }
+        }
+        drop(llm_span(0)); // Successful calls have no failure or invented status.
+        let captured = exporter.0.lock().unwrap();
+        // Other carrier tests may create manual run spans through the global
+        // provider on another thread. Only this test's LLM spans are relevant.
+        let finished: Vec<_> = captured
+            .iter()
+            .filter(|span| span.name == "llm.call")
+            .collect();
+        assert_eq!(finished.len(), 3);
+        for (span, attempt, status, phase, reason) in [
+            (
+                &finished[0],
+                "0",
+                None,
+                Some("request"),
+                Some("connection_refused"),
+            ),
+            (
+                &finished[1],
+                "1",
+                Some("429"),
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (&finished[2], "0", None, None, None),
+        ] {
+            assert_eq!(span.name, "llm.call");
+            for (key, expected) in [
+                ("retry.attempt", Some(attempt)),
+                ("http.response.status_code", status),
+                ("error.phase", phase),
+                ("error.reason", reason),
+            ] {
+                let actual = span
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key.as_str() == key)
+                    .map(|attr| attr.value.as_str().into_owned());
+                assert_eq!(actual.as_deref(), expected, "{key}");
+            }
+            let rendered = format!("{span:?}");
+            for private in ["private.invalid", "secret cause", "private body"] {
+                assert!(!rendered.contains(private));
+            }
+        }
     }
 
     #[test]
