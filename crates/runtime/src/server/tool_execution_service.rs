@@ -685,7 +685,11 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let route = self.routing_decision(&request);
-        let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+        let span = astra_logging::trace_context::tool_span(
+            &request.tool_name,
+            Some(&request.tool_call_id),
+            route.as_str(),
+        );
         crate::server::run_trace::parent_to_active_run(&span);
         let result = self
             .execute_with_route_and_cancel(request, route, local_transport, cancel_token)
@@ -710,7 +714,11 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport<R> + ?Sized,
         R: ToolTransportResult,
     {
-        let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+        let span = astra_logging::trace_context::tool_span(
+            boundary.tool_name(),
+            boundary.tool_call_id(),
+            boundary.route_kind().as_str(),
+        );
         crate::server::run_trace::parent_to_active_run(&span);
         let mut result = self
             .execute_with_route_and_cancel(
