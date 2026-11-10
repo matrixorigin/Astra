@@ -359,6 +359,7 @@ struct ServerState {
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    live_events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Value>>>,
     fail_model_catalog: Arc<AtomicBool>,
 }
 
@@ -676,7 +677,16 @@ fn server_orchestration_response(state: ServerState) -> Response<axum::body::Bod
             }));
         } else {
             match &state.held_response_release {
-                Some(release) => release.notified().await,
+                Some(release) => {
+                    tokio::select! {
+                        _ = release.notified() => {},
+                        event = async { state.live_events.lock().await.recv().await } => {
+                            if let Some(event) = event {
+                                return Some((Ok::<_, std::io::Error>(sse_line(&event)), (state, phase)));
+                            }
+                        }
+                    }
+                }
                 None => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
             }
             state
@@ -1327,6 +1337,7 @@ pub struct MockLlmServer {
     cancellation_requests: Arc<Mutex<Vec<String>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     held_binding_release: Option<Arc<tokio::sync::Notify>>,
+    live_events: tokio::sync::mpsc::UnboundedSender<Value>,
     fail_model_catalog: Arc<AtomicBool>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -1392,6 +1403,7 @@ impl MockLlmServer {
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let held_binding_release = hold_binding.then(|| Arc::new(tokio::sync::Notify::new()));
         let fail_model_catalog = Arc::new(AtomicBool::new(false));
+        let (live_events_tx, live_events_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
@@ -1405,6 +1417,7 @@ impl MockLlmServer {
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
             held_binding_release: held_binding_release.clone(),
+            live_events: Arc::new(tokio::sync::Mutex::new(live_events_rx)),
             fail_model_catalog: fail_model_catalog.clone(),
         };
 
@@ -1450,6 +1463,7 @@ impl MockLlmServer {
             cancellation_requests,
             held_response_release,
             held_binding_release,
+            live_events: live_events_tx,
             fail_model_catalog,
             _shutdown: tx,
         })
@@ -1484,6 +1498,13 @@ impl MockLlmServer {
             .lock()
             .expect("fixture cancellation records")
             .clone()
+    }
+
+    /// Inject a live control event without releasing the held response.
+    pub fn send_held_stream_event(&self, event: Value) {
+        self.live_events
+            .send(event)
+            .expect("mock stream remains active");
     }
 
     pub fn release_held_response(&self) {

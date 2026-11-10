@@ -39,9 +39,33 @@ const DEFAULT_TOOL_OUTPUT_EVENT_LIMIT: usize = 5_000;
 const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 /// Keep room in the per-turn observer queue for terminal lifecycle facts.
 /// High-volume observations are sampled before this reserve is consumed so a
-/// publication and the final deferred answer tail never have to wait behind a
-/// stalled interactive renderer.
+/// publication never has to wait behind a stalled interactive renderer.
 const RELIABLE_STREAM_EVENT_RESERVE: usize = 2;
+const STREAM_OBSERVER_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum StreamObserverFailure {
+    Backpressure = 1,
+    Closed = 2,
+}
+
+impl StreamObserverFailure {
+    fn from_raw(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Backpressure),
+            2 => Some(Self::Closed),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Backpressure => "stream_observer_backpressure",
+            Self::Closed => "stream_observer_closed",
+        }
+    }
+}
 
 fn approval_unavailable_tool_output(reason: &str) -> String {
     let (redacted, _) =
@@ -1248,7 +1272,10 @@ pub(crate) struct EdgeSseContext<'a> {
 // local tool execution, and permission prompts into the generic SSE consumer.
 
 #[derive(Debug, PartialEq, Eq)]
-struct PermissionModePending;
+enum ApprovalWaitError {
+    PermissionModePending,
+    ObserverUnavailable,
+}
 
 /// CLI host for SSE stream consumption.
 ///
@@ -1295,6 +1322,7 @@ struct CliSseStreamHost<'a> {
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     stream_event_tx: Option<chat_stream::StreamEventTx>,
+    observer_failure: std::sync::atomic::AtomicU8,
     /// Whether this turn is collecting Explain Analyze facts. Generic stream
     /// gaps should not create an Explain warning when observation is disabled.
     explain_analyze_enabled: bool,
@@ -1332,11 +1360,6 @@ struct CliSseStreamHost<'a> {
     /// authoritative, but this marker forces a repair snapshot even when the
     /// live observer saw no fact at all.
     explain_analyze_observer_gap: bool,
-    /// Once token observation starts falling behind, retain the remaining
-    /// answer suffix in order. It is sent immediately before
-    /// `AssistantOutputSettled`, allowing the TUI to reconcile a complete
-    /// answer without duplicating the prefix that was already delivered.
-    deferred_token_projection: Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -1830,6 +1853,7 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_sequence: 0,
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
+            observer_failure: std::sync::atomic::AtomicU8::new(0),
             explain_analyze_enabled: false,
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
@@ -1843,7 +1867,6 @@ impl<'a> CliSseStreamHost<'a> {
             pending_reliable_stream_event: None,
             pending_explain_analyze_snapshot: None,
             explain_analyze_observer_gap: false,
-            deferred_token_projection: None,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
@@ -2219,6 +2242,18 @@ impl<'a> CliSseStreamHost<'a> {
             || self.cancel_token.is_some_and(|token| token.is_cancelled())
     }
 
+    fn edge_dispatch_stop_reason(&self) -> &'static str {
+        if self
+            .observer_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            "Stream observer unavailable before tool dispatch; the tool was not executed"
+        } else {
+            "Execution cancelled before tool dispatch"
+        }
+    }
+
     fn register_tool_result_identity(&mut self, request: &ToolBatchRequest) -> Result<(), String> {
         if self.auth_failure || self.callback_failure.is_some() {
             return Err("Edge callback admission is closed".into());
@@ -2555,8 +2590,13 @@ impl<'a> CliSseStreamHost<'a> {
                 }
                 let response = self
                     .wait_for_approval_response(resp_rx, self.cancel_token)
-                    .await
-                    .unwrap_or(ApprovalResponse::Deny);
+                    .await;
+                if matches!(response, Err(ApprovalWaitError::ObserverUnavailable)) {
+                    return Err(format!(
+                        "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
+                    ));
+                }
+                let response = response.unwrap_or(ApprovalResponse::Deny);
 
                 if response.is_approved() {
                     let save_warning_tx = self.stream_event_tx.clone();
@@ -2740,7 +2780,26 @@ impl CliSseStreamHost<'_> {
             .or_else(|| self.cancel_token.cloned())
     }
 
+    fn fail_stream_observer(&self, failure: StreamObserverFailure) {
+        if self.cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return;
+        }
+        let _ = self.observer_failure.compare_exchange(
+            0,
+            failure as u8,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
     async fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
+        if self
+            .observer_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return;
+        }
         if let Some(tx) = &self.stream_event_tx {
             let cancelled = async {
                 match self.cancel_token {
@@ -2748,13 +2807,25 @@ impl CliSseStreamHost<'_> {
                     None => std::future::pending::<()>().await,
                 }
             };
-            let sent = tokio::select! {
-                biased;
-                result = tx.send(event.clone()) => Some(result),
-                _ = cancelled => None,
-            };
-            if matches!(sent, Some(Err(_))) {
-                tracing::debug!("stream event receiver closed");
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.fail_stream_observer(StreamObserverFailure::Closed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    let sent = tokio::select! {
+                        biased;
+                        result = tx.send(event) => Some(result),
+                        _ = cancelled => None,
+                        _ = tokio::time::sleep(STREAM_OBSERVER_SEND_TIMEOUT), if self.stream_json_exchange.is_none() => {
+                            self.fail_stream_observer(StreamObserverFailure::Backpressure);
+                            None
+                        }
+                    };
+                    if matches!(sent, Some(Err(_))) {
+                        self.fail_stream_observer(StreamObserverFailure::Closed);
+                    }
+                }
             }
         }
         if let Some(sink) = &self.stream_event_sink {
@@ -2768,7 +2839,9 @@ impl CliSseStreamHost<'_> {
     /// delivery contract is unchanged; the regular TUI path already treats
     /// the durable server stream and final accumulator as authoritative.
     async fn emit_stream_observation(&mut self, event: chat_stream::StreamEvent) {
-        if self.stream_json_exchange.is_some() {
+        if self.stream_json_exchange.is_some()
+            || matches!(event, chat_stream::StreamEvent::Token { .. })
+        {
             self.emit_stream_event(event).await;
         } else {
             self.try_emit_stream_observation(event);
@@ -2848,51 +2921,6 @@ impl CliSseStreamHost<'_> {
     }
 
     fn try_emit_stream_observation(&mut self, event: chat_stream::StreamEvent) {
-        if let chat_stream::StreamEvent::Token {
-            model_item_id,
-            text,
-        } = &event
-        {
-            if let Some(pending) = self.deferred_token_projection.as_mut() {
-                match pending.back_mut() {
-                    Some(chat_stream::StreamEvent::Token {
-                        model_item_id: pending_id,
-                        text: pending_text,
-                    }) if pending_id == model_item_id => pending_text.push_str(text),
-                    _ => pending.push_back(event.clone()),
-                }
-                if let Some(sink) = &self.stream_event_sink {
-                    sink.send(event);
-                }
-                return;
-            }
-            let Some(tx) = self.stream_event_tx.as_ref() else {
-                if let Some(sink) = &self.stream_event_sink {
-                    sink.send(event);
-                }
-                return;
-            };
-            if tx.capacity() <= RELIABLE_STREAM_EVENT_RESERVE {
-                self.deferred_token_projection =
-                    Some(std::collections::VecDeque::from([event.clone()]));
-                if let Some(sink) = &self.stream_event_sink {
-                    sink.send(event);
-                }
-                return;
-            }
-            match tx.try_send(event.clone()) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.deferred_token_projection =
-                        Some(std::collections::VecDeque::from([event.clone()]));
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-            }
-            if let Some(sink) = &self.stream_event_sink {
-                sink.send(event);
-            }
-            return;
-        }
         // Explain Analyze facts are live observations, but dropping one must
         // leave an integrity marker outside the same lossy queue. The
         // terminal accumulator can repair the projection; if that repair
@@ -3380,12 +3408,18 @@ impl CliSseStreamHost<'_> {
         &self,
         response: tokio::sync::oneshot::Receiver<chat_stream::ApprovalResponse>,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<chat_stream::ApprovalResponse, PermissionModePending> {
+    ) -> Result<chat_stream::ApprovalResponse, ApprovalWaitError> {
         tokio::select! {
             biased;
-            _ = self.wait_for_permission_selection() => Err(PermissionModePending),
+            _ = self.wait_for_permission_selection() => Err(ApprovalWaitError::PermissionModePending),
             _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Ok(chat_stream::ApprovalResponse::Deny),
             result = response => Ok(result.unwrap_or(chat_stream::ApprovalResponse::Deny)),
+            _ = async {
+                if let Some(tx) = &self.stream_event_tx { tx.closed().await } else { std::future::pending::<()>().await }
+            } => {
+                self.fail_stream_observer(StreamObserverFailure::Closed);
+                Err(ApprovalWaitError::ObserverUnavailable)
+            },
         }
     }
 
@@ -3395,12 +3429,15 @@ impl CliSseStreamHost<'_> {
         detail: Option<&str>,
         display_label: Option<&str>,
         approval_kind: astra_thin_client::ApprovalKind,
-    ) -> Result<astra_thin_client::ApprovalDecision, PermissionModePending> {
+    ) -> Result<astra_thin_client::ApprovalDecision, ApprovalWaitError> {
         use crate::cli::chat_stream::ApprovalResponse;
         use astra_thin_client::ApprovalDecision;
 
         if self.pending_permission_selection() {
-            return Err(PermissionModePending);
+            return Err(ApprovalWaitError::PermissionModePending);
+        }
+        if self.stream_observer_error().is_some() {
+            return Err(ApprovalWaitError::ObserverUnavailable);
         }
 
         // Plan review is a typed lifecycle interaction with four deliberate
@@ -3408,11 +3445,19 @@ impl CliSseStreamHost<'_> {
         // exact tool identity through the dedicated review surface and keep
         // semantic intent classification in the model/tool protocol.
         if tool == "exit_plan_mode" {
+            let cancel = self.effective_tool_cancel_token();
             return Ok(
                 match tokio::select! {
                     biased;
-                    _ = self.wait_for_permission_selection() => return Err(PermissionModePending),
+                    _ = self.wait_for_permission_selection() => return Err(ApprovalWaitError::PermissionModePending),
+                    _ = async { if let Some(cancel) = &cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => return Ok(ApprovalDecision::Deny),
                     outcome = self.executor.resolve_remote_plan_review(detail) => outcome,
+                    _ = async {
+                        if let Some(tx) = &self.stream_event_tx { tx.closed().await } else { std::future::pending::<()>().await }
+                    } => {
+                        self.fail_stream_observer(StreamObserverFailure::Closed);
+                        return Err(ApprovalWaitError::ObserverUnavailable);
+                    },
                 } {
                     Ok(true) => ApprovalDecision::Allow,
                     Ok(false) => ApprovalDecision::Deny,
@@ -3568,14 +3613,19 @@ impl CliSseStreamHost<'_> {
         })
         .await;
 
-        let response = if let Some(token) = self.effective_tool_cancel_token() {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => AskUserResponse::Cancelled,
-                r = response_rx => r.unwrap_or(AskUserResponse::Cancelled),
-            }
-        } else {
-            response_rx.await.unwrap_or(AskUserResponse::Cancelled)
+        if self.stream_observer_error().is_some() {
+            return "Error: ask_user could not complete because the stream observer is unavailable"
+                .into();
+        }
+        let cancel = self.effective_tool_cancel_token();
+        let response = tokio::select! {
+            biased;
+            _ = async { if let Some(token) = &cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => AskUserResponse::Cancelled,
+            r = response_rx => r.unwrap_or(AskUserResponse::Cancelled),
+            _ = async { if let Some(tx) = &self.stream_event_tx { tx.closed().await } else { std::future::pending::<()>().await } } => {
+                self.fail_stream_observer(StreamObserverFailure::Closed);
+                return "Error: ask_user could not complete because the stream observer is unavailable".into();
+            },
         };
 
         match response {
@@ -3692,8 +3742,7 @@ async fn execute_server_budgeted(
     args: &Value,
 ) -> EdgeToolExecResult {
     if host.should_abort_edge_work() {
-        let mut result =
-            request.rejected_result(args, "Execution cancelled before tool dispatch".into());
+        let mut result = request.rejected_result(args, host.edge_dispatch_stop_reason().into());
         settle_unexecuted_server_tool_result(host, &mut result).await;
         return result;
     }
@@ -3782,10 +3831,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn should_abort_edge_work(&self) -> bool {
-        self.callback_delivery_closed()
+        self.stream_observer_error().is_some()
+            || self.callback_delivery_closed()
             || self
                 .effective_tool_cancel_token()
                 .is_some_and(|token| token.is_cancelled())
+    }
+
+    fn stream_observer_error(&self) -> Option<&'static str> {
+        if self
+            .stream_event_tx
+            .as_ref()
+            .is_some_and(|tx| tx.is_closed())
+        {
+            self.fail_stream_observer(StreamObserverFailure::Closed);
+        }
+        StreamObserverFailure::from_raw(
+            self.observer_failure
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+        .map(StreamObserverFailure::code)
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
@@ -4242,6 +4307,33 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     SseRenderEffect::SystemWarning(message) => {
                         Some(StreamEvent::SystemWarning(message.clone()))
                     }
+                    SseRenderEffect::GuidanceDisposition { intent, status } => {
+                        let intent_id = intent.intent_id.clone();
+                        let delivery = intent.delivery;
+                        let event_index = intent.event_index;
+                        let content = intent.content.clone();
+                        match status {
+                            astra_turn_types::UserIntentStatus::Applied => {
+                                Some(StreamEvent::UserIntentApplied {
+                                    intent_id,
+                                    delivery,
+                                    status: *status,
+                                    event_index,
+                                    content,
+                                })
+                            }
+                            astra_turn_types::UserIntentStatus::Returned => {
+                                Some(StreamEvent::UserIntentReturned {
+                                    intent_id,
+                                    delivery,
+                                    status: *status,
+                                    event_index,
+                                    content,
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
                     SseRenderEffect::StreamText {
                         model_item_id,
                         text: s,
@@ -4261,9 +4353,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    if matches!(ev, StreamEvent::SystemWarning(_)) {
-                        // Configuration diagnostics are rare control messages;
-                        // preserve each one when the interactive queue is full.
+                    if matches!(
+                        ev,
+                        StreamEvent::SystemWarning(_)
+                            | StreamEvent::UserIntentApplied { .. }
+                            | StreamEvent::UserIntentReturned { .. }
+                    ) {
+                        // Preserve control updates when the interactive queue is full.
                         self.emit_stream_event(ev).await;
                     } else {
                         self.emit_stream_observation(ev).await;
@@ -4292,7 +4388,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText { .. } | SseRenderEffect::SystemWarning(_) => {} // suppressed or already rendered
+                        SseRenderEffect::StreamText { .. }
+                        | SseRenderEffect::SystemWarning(_)
+                        | SseRenderEffect::GuidanceDisposition { .. } => {} // suppressed or already rendered
                     }
                 }
                 return;
@@ -4303,7 +4401,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
-                SseRenderEffect::SystemWarning(_) => {
+                SseRenderEffect::SystemWarning(_) | SseRenderEffect::GuidanceDisposition { .. } => {
                     i += 1;
                 }
                 SseRenderEffect::StopThinkingSpinner => {
@@ -4390,6 +4488,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 parent_tool_use_id: None,
             })
             .await;
+        }
+
+        if self.should_abort_edge_work() {
+            let mut result = request.rejected_result(args, self.edge_dispatch_stop_reason().into());
+            settle_unexecuted_server_tool_result(self, &mut result).await;
+            return result;
         }
 
         // Install a bash progress sink + 200ms ticker for the TUI's
@@ -4715,19 +4819,27 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             metadata: Some(Box::new(metadata)),
                         },
                     ) {
-                        Ok(()) => self
-                            .wait_for_approval_response(
+                        Ok(()) => {
+                            self.wait_for_approval_response(
                                 resp_rx,
                                 self.effective_tool_cancel_token().as_ref(),
                             )
                             .await
-                            .unwrap_or(ApprovalResponse::Deny),
+                        }
                         Err(error) => {
                             denied_output =
                                 Some(format!("Error: {t} requires approval, but {error}"));
-                            ApprovalResponse::Deny
+                            Ok(ApprovalResponse::Deny)
                         }
                     };
+                    let observer_unavailable =
+                        matches!(response, Err(ApprovalWaitError::ObserverUnavailable));
+                    let response = response.unwrap_or(ApprovalResponse::Deny);
+                    if observer_unavailable {
+                        denied_output = Some(
+                            "Error: approval unavailable because the stream observer closed".into(),
+                        );
+                    }
                     let mut stale_revalidation_passed = true;
                     if response.is_approved() {
                         if let Some((path, previous)) = stale_revalidation.as_ref() {
@@ -4740,7 +4852,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         }
                     }
                     let save_warning_tx = self.stream_event_tx.clone();
-                    if let Some(pm) = self.perm_manager.as_mut() {
+                    if !observer_unavailable && let Some(pm) = self.perm_manager.as_mut() {
                         apply_approval_memory_action(
                             pm,
                             approval_memory_action(
@@ -4761,7 +4873,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // that produced the prompt (the engine
                     // wiring populates that side; today we use
                     // a tool+timestamp scheme).
-                    {
+                    if !observer_unavailable {
                         let timestamp_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
@@ -4810,7 +4922,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             },
                         );
                     }
-                    response.is_approved() && stale_revalidation_passed
+                    response.is_approved() && stale_revalidation_passed && !observer_unavailable
                 } else {
                     // Sub-runs cannot prompt, and a non-silent host without
                     // an approval sink is misconfigured. Both fail closed with
@@ -4837,8 +4949,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             allowed = false;
         }
         if self.should_abort_edge_work() {
-            let mut result =
-                request.rejected_result(args, "Execution cancelled before tool dispatch".into());
+            let mut result = request.rejected_result(args, self.edge_dispatch_stop_reason().into());
             settle_unexecuted_server_tool_result(self, &mut result).await;
             return result;
         }
@@ -4954,7 +5065,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     "Error: skill resolver not available".to_string()
                 }
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
-                self.ask_user_via_tui(args).await
+                let output = self.ask_user_via_tui(args).await;
+                tool_execution_marked_error = output.starts_with("Error:");
+                output
             } else {
                 let _pending_tool_request_guard =
                     crate::cli::edge_lifecycle::PendingToolRequestGuard::acquire();
@@ -5154,7 +5267,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     }
                                 }
                             };
-                            if approved {
+                            if approved && self.stream_observer_error().is_none() {
                                 if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
                                     astra_core::agent_warn!(
                                         "sandbox",
@@ -5398,12 +5511,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             Ok(astra_thin_client::ApprovalDecision::Deny)
         };
-        let Ok(decision) = decision else {
-            return EdgeApprovalResult {
-                request_id: request_id.to_owned(),
-                decision: "deny".into(),
-                reason: Some("Permission mode change superseded the unstarted approval".into()),
-            };
+        let (decision, observer_reason) = match decision {
+            Ok(decision) => (decision, None),
+            Err(ApprovalWaitError::PermissionModePending) => {
+                return EdgeApprovalResult {
+                    request_id: request_id.to_owned(),
+                    decision: "deny".into(),
+                    reason: Some("Permission mode change superseded the unstarted approval".into()),
+                };
+            }
+            Err(ApprovalWaitError::ObserverUnavailable) => (
+                astra_thin_client::ApprovalDecision::Deny,
+                Some("Approval unavailable: stream observer closed".to_string()),
+            ),
         };
         let allowed = matches!(
             &decision,
@@ -5413,7 +5533,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let body = astra_thin_client::ApprovalRespondRequest {
             request_id: request_id.to_string(),
             decision,
-            reason: None,
+            reason: observer_reason.clone(),
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             tool_name: Some(tool.to_string()),
@@ -5435,7 +5555,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 "deny"
             }
             .to_string(),
-            reason: post_result.err().map(|error| error.to_string()),
+            reason: post_result
+                .err()
+                .map(|error| error.to_string())
+                .or(observer_reason),
         }
     }
 
@@ -5496,13 +5619,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut results = Vec::with_capacity(requests.len());
         let mut callback_delivery_open = self.callback_failure.is_none() && !self.auth_failure;
         for (request, decision) in requests.iter().zip(decisions) {
-            let Ok(decision) = decision else {
-                results.push(EdgeApprovalResult {
-                    request_id: request.request_id.clone(),
-                    decision: "deny".into(),
-                    reason: Some("Permission mode change superseded the unstarted approval".into()),
-                });
-                continue;
+            let (decision, observer_reason) = match decision {
+                Ok(decision) => (decision, None),
+                Err(ApprovalWaitError::PermissionModePending) => {
+                    results.push(EdgeApprovalResult {
+                        request_id: request.request_id.clone(),
+                        decision: "deny".into(),
+                        reason: Some(
+                            "Permission mode change superseded the unstarted approval".into(),
+                        ),
+                    });
+                    continue;
+                }
+                Err(ApprovalWaitError::ObserverUnavailable) => (
+                    astra_thin_client::ApprovalDecision::Deny,
+                    Some("Approval unavailable: stream observer closed".to_string()),
+                ),
             };
             let allowed = matches!(
                 &decision,
@@ -5512,7 +5644,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let body = astra_thin_client::ApprovalRespondRequest {
                 request_id: request.request_id.clone(),
                 decision,
-                reason: None,
+                reason: observer_reason.clone(),
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
                 tool_name: Some(request.tool.clone()),
@@ -5544,7 +5676,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     "deny"
                 }
                 .to_string(),
-                reason: post_result.err().map(|error| error.to_string()),
+                reason: post_result
+                    .err()
+                    .map(|error| error.to_string())
+                    .or(observer_reason),
             });
         }
         results
@@ -5757,6 +5892,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 None
             };
             ui_indices.push(tool_idx);
+        }
+
+        if self.should_abort_edge_work() {
+            for (index, request) in conc_reqs {
+                results[index] = Some(execute_server_budgeted(self, request, &request.args).await);
+            }
+            self.render.tool_batch_progress = None;
+            return results
+                .into_iter()
+                .map(|result| result.expect("all tool result slots filled"))
+                .collect();
         }
 
         // ── Phase 2: Concurrent execution (semaphore-capped + panic isolation) ──
@@ -5990,19 +6136,27 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 resp_tx,
                             ),
                         ) {
-                            Ok(()) => self
-                                .wait_for_approval_response(resp_rx, Some(&retry_cancel))
-                                .await
-                                .unwrap_or(ApprovalResponse::Deny),
+                            Ok(()) => {
+                                self.wait_for_approval_response(resp_rx, Some(&retry_cancel))
+                                    .await
+                            }
                             Err(error) => {
                                 outputs[pos].0.output = format!(
                                     "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
                                 );
                                 outputs[pos].0.is_error = true;
-                                ApprovalResponse::Deny
+                                Ok(ApprovalResponse::Deny)
                             }
                         };
-                        if let Some(pm) = self.perm_manager.as_mut() {
+                        let observer_unavailable =
+                            matches!(response, Err(ApprovalWaitError::ObserverUnavailable));
+                        let response = response.unwrap_or(ApprovalResponse::Deny);
+                        if observer_unavailable {
+                            outputs[pos].0.output = format!(
+                                "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
+                            );
+                            outputs[pos].0.is_error = true;
+                        } else if let Some(pm) = self.perm_manager.as_mut() {
                             if response.is_approved() {
                                 let workspace_untrusted = !pm.project_allow_rules_active();
                                 let always_scope = approval_default_always_scope(
@@ -6026,7 +6180,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 pm.record_approval(&approval_tool, Some(&guard_args), false);
                             }
                         }
-                        response.is_approved()
+                        response.is_approved() && self.stream_observer_error().is_none()
                     } else {
                         // No approval sink (headless / sub-run): fail
                         // closed. The contract is enforced upstream by
@@ -6044,6 +6198,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
             };
             if !approved {
+                continue;
+            }
+            if self.stream_observer_error().is_some() {
+                outputs[pos].0.output = "Error: stream observer closed before sandbox retry".into();
+                outputs[pos].0.is_error = true;
                 continue;
             }
             if retry_cancel.is_cancelled() {
@@ -6239,10 +6398,6 @@ pub(crate) struct TurnResult {
     /// Complete canonical Explain Analyze facts retained outside the lossy
     /// observer lane. The outer turn owner reconciles this before settlement.
     pub(crate) pending_explain_analyze_snapshot: Option<chat_stream::StreamEvent>,
-    /// Answer suffix held after token observation backpressure. It is emitted
-    /// before `AssistantOutputSettled` by the Server-admission host.
-    pub(crate) deferred_token_projection:
-        Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
 }
 
 impl Deref for TurnResult {
@@ -6272,7 +6427,6 @@ impl TurnResult {
             output_transport_failure: None,
             pending_reliable_stream_event: None,
             pending_explain_analyze_snapshot: None,
-            deferred_token_projection: None,
         }
     }
 }
@@ -7801,6 +7955,7 @@ fn apply_sse_render_effects(
     for effect in effects {
         match effect {
             SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
+            SseRenderEffect::GuidanceDisposition { .. } => {}
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -7869,7 +8024,7 @@ pub(crate) async fn consume_turn_sse(
         output_transport_failure,
         pending_reliable_stream_event,
         pending_explain_analyze_snapshot,
-        deferred_token_projection,
+        observer_failure,
     ) = if let Some(mut ctx) = edge {
         // The stream owns a child scope even when the caller supplies a
         // reusable turn/session token. A durable terminal may cancel this
@@ -7959,7 +8114,10 @@ pub(crate) async fn consume_turn_sse(
         let output_transport_failure = host.output_transport_failure;
         let pending_reliable_stream_event = host.pending_reliable_stream_event.take();
         let pending_explain_analyze_snapshot = host.pending_explain_analyze_snapshot.take();
-        let deferred_token_projection = host.deferred_token_projection.take();
+        let observer_failure = StreamObserverFailure::from_raw(
+            host.observer_failure
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         (
             result,
             edge_tool_round,
@@ -7973,7 +8131,7 @@ pub(crate) async fn consume_turn_sse(
             output_transport_failure,
             pending_reliable_stream_event,
             pending_explain_analyze_snapshot,
-            deferred_token_projection,
+            observer_failure,
         )
     } else {
         debug_assert!(
@@ -8020,6 +8178,28 @@ pub(crate) async fn consume_turn_sse(
         &mut sse_result.accum,
         request_session_lease_failure,
     );
+    if let Some(failure) = observer_failure
+        && !callback_delivery_failed
+        && output_transport_failure.is_none()
+        && !cancel_token.is_some_and(|token| token.is_cancelled())
+        && !sse_result
+            .accum
+            .run_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.status.is_unsuccessful())
+        && sse_result.accum.error_kind.is_none_or(|kind| {
+            matches!(
+                kind,
+                astra_core::ErrorKind::StreamTransport | astra_core::ErrorKind::Cancelled
+            )
+        })
+    {
+        sse_result.accum.error_kind = Some(astra_core::ErrorKind::StreamTransport);
+        sse_result.accum.error_code = Some(failure.code().into());
+        sse_result.accum.error_message = Some(
+            "The stream observer stopped accepting events. The server run may still be active; inspect the session before retrying.".into(),
+        );
+    }
     let callback_failure_run_id = callback_failure_run_id.or_else(|| {
         request_session_lease_failed
             .then(|| sse_result.accum.run_id.clone())
@@ -8036,7 +8216,6 @@ pub(crate) async fn consume_turn_sse(
         output_transport_failure,
         pending_reliable_stream_event,
         pending_explain_analyze_snapshot,
-        deferred_token_projection,
     };
     sanitize_final_stream_text(&mut result);
 
@@ -8339,6 +8518,217 @@ mod tests {
             });
             host.on_render_effects(vec![]).await;
             assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_observer_stops_edge_admission_with_a_precise_error() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        for closed in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let _keep_open = if closed {
+                drop(rx);
+                None
+            } else {
+                tx.send(chat_stream::StreamEvent::StatusLine("occupied".into()))
+                    .await
+                    .unwrap();
+                Some(rx)
+            };
+            let mut cache = EdgeToolCache::new(8);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "unused",
+                    executor_id: "unused",
+                    executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(
+                        root.path(),
+                    )),
+                    render_policy: RenderPolicy::Silent,
+                    perm_manager: None,
+                    cancel_token: Some(&cancellation),
+                    stream_event_tx: Some(tx),
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    compensate_non_file_on_failure: false,
+                    tool_cache: &mut cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                },
+                80,
+                false,
+            );
+            host.on_render_effects(vec![SseRenderEffect::StreamText {
+                model_item_id: Some("prior".into()),
+                text: "partial".into(),
+            }])
+            .await;
+            assert!(host.should_abort_edge_work());
+            assert!(
+                !cancellation.is_cancelled(),
+                "observer failure is not user cancellation"
+            );
+            host.on_accepted_sse_event(&serde_json::json!({"type":"tool_request"}))
+                .await
+                .expect("an observer failure must not masquerade as invalid SSE");
+            assert_eq!(
+                host.stream_observer_error(),
+                Some(if closed {
+                    "stream_observer_closed"
+                } else {
+                    "stream_observer_backpressure"
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_guidance_cannot_overtake_prior_token_at_channel_reserve() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(chat_stream::StreamEvent::StatusLine("one".into()))
+            .await
+            .unwrap();
+        tx.send(chat_stream::StreamEvent::StatusLine("two".into()))
+            .await
+            .unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.on_render_effects(vec![SseRenderEffect::StreamText {
+            model_item_id: Some("before".into()),
+            text: "old answer".into(),
+        }])
+        .await;
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"run_started\",\"run_id\":\"root\"}\n\n",
+            &mut accum,
+            &mut pending,
+        );
+        let event = serde_json::json!({"type":"user_intent_applied", "run_id":"root", "intent_id":"intent",
+            "delivery":"guide_current_run", "status":"applied", "event_index":1, "content":"new direction"});
+        let effects = astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {event}\n\n"),
+            &mut accum,
+            &mut pending,
+        );
+        host.on_render_effects(effects).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::StatusLine(_))
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::StatusLine(_))
+        ));
+        assert!(
+            matches!(rx.recv().await, Some(chat_stream::StreamEvent::Token { text, .. }) if text == "old answer")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(chat_stream::StreamEvent::UserIntentApplied { intent_id, .. }) if intent_id == "intent")
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_dispositions_reach_silent_tui_under_backpressure() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx.clone()),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let bootstrap = "data: {\"type\":\"run_started\",\"run_id\":\"root\"}\n\n";
+        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            bootstrap,
+            &mut accum,
+            &mut pending,
+        );
+        for (kind, status) in [
+            ("user_intent_applied", "applied"),
+            ("user_intent_returned", "returned"),
+        ] {
+            let event = serde_json::json!({"type":kind, "run_id":"root", "intent_id":kind,
+                "delivery":"guide_current_run", "status":status, "event_index":7, "content":"guide"});
+            let effects =
+                astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut pending,
+                );
+            tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+                .await
+                .unwrap();
+            let delivery = host.on_render_effects(effects);
+            tokio::pin!(delivery);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(chat_stream::StreamEvent::StatusLine(_))
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                .await
+                .unwrap();
+            let observed = rx.recv().await.unwrap();
+            assert!(match observed {
+                chat_stream::StreamEvent::UserIntentApplied { intent_id, .. } =>
+                    status == "applied" && intent_id == kind,
+                chat_stream::StreamEvent::UserIntentReturned { intent_id, .. } =>
+                    status == "returned" && intent_id == kind,
+                _ => false,
+            });
         }
     }
 
@@ -12119,6 +12509,135 @@ mod tests {
             tool: tool.to_owned(),
             args,
         }
+    }
+
+    #[tokio::test]
+    async fn observer_closure_before_parallel_dispatch_settles_unexecuted_requests() {
+        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        host.stream_event_tx = Some(tx);
+        host.last_bound_run_id = Some("root-observer-failure".into());
+        let mut requests = vec![
+            parallel_batch_request("owner", "one", "list_dir", serde_json::json!({"path":"."})),
+            parallel_batch_request("owner", "two", "list_dir", serde_json::json!({"path":"."})),
+        ];
+        for request in &mut requests {
+            request.run_id = "root-observer-failure".into();
+        }
+        let results = host.execute_tools_batch(requests.clone()).await;
+        assert!(results.iter().all(|result| result.status != "completed"));
+        assert!(results.iter().all(|result| {
+            result
+                .tool_result_fields
+                .as_ref()
+                .is_some_and(|fields| fields.get("execution_started") == Some(&Value::Bool(false)))
+        }));
+        fixture.assert_settlements(&requests, &results).await;
+    }
+
+    #[tokio::test]
+    async fn observer_closure_after_tool_execution_preserves_the_result_callback() {
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.stream_event_tx = Some(tx);
+        let mut request = parallel_batch_request(
+            "owner",
+            "memory-one",
+            "memory",
+            serde_json::json!({"action":"recall","query":"needle"}),
+        );
+        request.run_id = "root-observer-failure".into();
+        host.last_bound_run_id = Some(request.run_id.clone());
+        let requests = vec![request];
+        let observe = async {
+            assert!(matches!(
+                rx.recv().await,
+                Some(chat_stream::StreamEvent::ToolStarted { .. })
+            ));
+            let (query, release) = arrivals.recv().await.expect("real tool reached provider");
+            assert_eq!(query, "needle");
+            drop(rx);
+            release.send(()).unwrap();
+        };
+        let (results, ()) = tokio::join!(host.execute_tools_batch(requests.clone()), observe);
+        assert_eq!(results[0].status, "completed");
+        assert_eq!(host.stream_observer_error(), Some("stream_observer_closed"));
+        fixture.assert_settlements(&requests, &results).await;
+    }
+
+    #[tokio::test]
+    async fn observer_closure_settles_waiting_ask_user_without_cancelling_run() {
+        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        host.executor
+            .accept_server_tool_surface_admission("ask_user")
+            .unwrap();
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(4);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        host.stream_event_tx = Some(stream_tx);
+        host.ask_user_request_tx = Some(ask_tx);
+        let mut request = parallel_batch_request(
+            "owner",
+            "ask-one",
+            "ask_user",
+            serde_json::json!({
+                "questions": [{"id":"choice","header":"Choice","question":"Proceed?","options":[{"label":"Yes"},{"label":"No"}]}]
+            }),
+        );
+        request.run_id = "root-observer-failure".into();
+        host.last_bound_run_id = Some(request.run_id.clone());
+        let requests = vec![request];
+        let observe = async {
+            while !matches!(
+                stream_rx.recv().await,
+                Some(chat_stream::StreamEvent::AskUserPrompted { .. })
+            ) {}
+            let prompt = ask_rx.recv().await.expect("question was displayed");
+            drop(stream_rx);
+            prompt
+        };
+        let (results, prompt) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(host.execute_tools_batch(requests.clone()), observe)
+        })
+        .await
+        .expect("closed observer must unblock ask_user");
+        assert!(prompt.response_tx.is_closed());
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].output.contains("observer is unavailable"));
+        assert!(!cancel.is_cancelled());
+        fixture.assert_settlements(&requests, &results).await;
+    }
+
+    #[tokio::test]
+    async fn approval_response_wins_when_observer_closes_at_the_same_time() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        host.stream_event_tx = Some(stream_tx);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        response_tx
+            .send(chat_stream::ApprovalResponse::AllowOnce)
+            .unwrap();
+        drop(stream_rx);
+        assert_eq!(
+            host.wait_for_approval_response(response_rx, Some(&cancel))
+                .await,
+            Ok(chat_stream::ApprovalResponse::AllowOnce)
+        );
+        assert!(!cancel.is_cancelled());
     }
 
     #[tokio::test]

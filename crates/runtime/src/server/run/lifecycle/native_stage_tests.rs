@@ -4,7 +4,8 @@ use astra_messaging::{AgentAddress, AgentMessage, MessagePayload, MessageTarget}
 use astra_server_types::edge_connection_pool::{EdgeConnectionPool, EdgeToolResult};
 use astra_server_types::edge_ws_protocol::EdgeServerMessage;
 use astra_services::multi_agent::{
-    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeRegistryService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchService,
+    EdgeRegistryService,
 };
 use astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger;
 use astra_turn_types::{
@@ -44,6 +45,9 @@ enum Scenario {
     MailboxUnknown,
     MailboxUnknownRace,
     MailboxUnknownReplay,
+    UserIntentAckTimeout,
+    UserIntentLateAck,
+    UserIntentAckAfterResult,
 }
 
 async fn native_stage_receipt_journey(scenario: Scenario) {
@@ -207,6 +211,15 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         scenario,
         Scenario::MailboxUnknown | Scenario::MailboxUnknownRace | Scenario::MailboxUnknownReplay
     );
+    let user_intent_delivery = matches!(
+        scenario,
+        Scenario::UserIntentAckTimeout
+            | Scenario::UserIntentLateAck
+            | Scenario::UserIntentAckAfterResult
+    );
+    let late_user_intent_ack = matches!(scenario, Scenario::UserIntentLateAck);
+    let ack_after_result = matches!(scenario, Scenario::UserIntentAckAfterResult);
+    let intent_service = user_intent_delivery.then(|| db_backed_test_service(&pool, &owner));
     if !mailbox_unknown || replay {
         store.fail_next_native_binding_insert_for_test();
     }
@@ -233,12 +246,29 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         Arc::new(tempfile::tempdir().unwrap()),
         "test-server-scratch",
     ));
+    if late_user_intent_ack {
+        let mut mismatched = make_config();
+        mismatched
+            .execution_contract
+            .as_mut()
+            .unwrap()
+            .0
+            .execution_binding_generation = Some(binding.generation + 1);
+        assert!(
+            executor
+                .ensure_durable_subrun_started(&mismatched, None)
+                .await
+                .is_err()
+        );
+        assert!(engine.load_run(&user, &child).await.unwrap().is_none());
+    }
     let child_authority = executor
         .ensure_durable_subrun_started(&config, None)
         .await
         .unwrap()
         .unwrap();
     config.execution_owner_generation = Some(child_authority.owner_generation);
+    let child_generation = child_authority.owner_generation;
     let identity =
         ToolInvocationIdentity::new(&user, &session, &child, &child, "native-stage").unwrap();
     let unknown_observed = Arc::new(tokio::sync::Notify::new());
@@ -263,7 +293,86 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         };
         assert_eq!(*actual, identity);
         let mut completion_race_ack = None;
-        if mailbox_unknown {
+        let mut first_guidance_index = None;
+        if user_intent_delivery {
+            let service = intent_service.as_ref().unwrap();
+            for (intent_id, content) in [
+                ("first-guidance", "First guidance"),
+                ("second-guidance", "Second guidance"),
+            ] {
+                let accepted = service
+                    .submit_run_user_intent(
+                        child.clone(),
+                        user.clone(),
+                        RunUserIntentData {
+                            intent_id: intent_id.into(),
+                            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                            input: json!({"content": content}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    accepted.status,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote
+                );
+                first_guidance_index.get_or_insert(accepted.event_index);
+            }
+            let EdgeServerMessage::ToolInput { input, .. } =
+                tokio::time::timeout(Duration::from_secs(5), edge_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_attempted_message()
+            else {
+                panic!("expected first user intent")
+            };
+            assert_eq!(input.input_id(), "first-guidance");
+            if ack_after_result {
+                completion_race_ack = Some(ProviderStageInputAck::accepted(&input, None));
+            } else {
+                tokio::time::sleep(
+                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT + Duration::from_millis(250),
+                )
+                .await;
+                if late_user_intent_ack {
+                    assert!(edge_pool.deliver_provider_stage_input_ack(
+                        &user,
+                        "selected-runner",
+                        &request_id,
+                        delivery_generation,
+                        ProviderStageInputAck::accepted(&input, None),
+                    ));
+                    let EdgeServerMessage::ToolInput {
+                        input: second_input,
+                        ..
+                    } = tokio::time::timeout(
+                        astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
+                        edge_rx.recv(),
+                    )
+                    .await
+                    .expect("late ACK must release the next durable guidance")
+                    .unwrap()
+                    .into_attempted_message()
+                    else {
+                        panic!("expected second user intent")
+                    };
+                    assert_eq!(second_input.input_id(), "second-guidance");
+                    assert!(edge_pool.deliver_provider_stage_input_ack(
+                        &user,
+                        "selected-runner",
+                        &request_id,
+                        delivery_generation,
+                        ProviderStageInputAck::accepted(&second_input, None),
+                    ));
+                } else {
+                    assert!(
+                        edge_rx.try_recv().is_err(),
+                        "an unresolved source must not be duplicated or overtaken"
+                    );
+                }
+            }
+        } else if mailbox_unknown {
             for content in ["First guidance", "Second guidance"] {
                 router
                     .send(AgentMessage::new(
@@ -308,6 +417,63 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         let fields = json!({"workspace_effect_settled":true,
             "collaborator_native_session":{"anchor_run_id":child,"provider":"codex","native_session_id":"acknowledged-thread"}
         }).as_object().unwrap().clone();
+        if ack_after_result {
+            // Match the WS owner: persist the authenticated result before
+            // waking the invocation, while its input ACK is still in flight.
+            let result = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: session.clone(),
+                    run_id: child.clone(),
+                    turn_chain_id: child.clone(),
+                    request_id: request_id.clone(),
+                    edge_agent_id: "selected-runner".into(),
+                    status: "completed".into(),
+                    output: "Original delivered result.".into(),
+                    duration_ms: 1,
+                    tool_result_fields: Some(fields.clone()),
+                },
+            );
+            assert!(
+                DatabaseEdgeDispatchService::from_shared(&pool)
+                    .deliver_result(
+                        &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                            &user,
+                            &session,
+                            &child,
+                            &child,
+                            &request_id,
+                        ),
+                        "selected-runner",
+                        &serde_json::to_string(&result).unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            for purpose in [
+                astra_services::runs::UserIntentApplyPurpose::ModelBoundary,
+                astra_services::runs::UserIntentApplyPurpose::ProviderAcknowledgement {
+                    dispatch_owner: "another-executor",
+                },
+            ] {
+                assert!(
+                    store
+                        .apply_run_user_intents(
+                            astra_services::runs::AtomicRunUserIntentApplyRequest {
+                                purpose,
+                                invocation_identity: Some(&identity),
+                                user_id: &user,
+                                run_id: &child,
+                                expected_session_id: &session,
+                                expected_owner_generation: child_generation,
+                                source_event_indices: &[first_guidance_index.unwrap()],
+                            },
+                        )
+                        .await
+                        .is_err(),
+                    "completed dispatch may settle only under its captured owner"
+                );
+            }
+        }
         assert!(edge_pool.deliver_tool_result(
             &user,
             "selected-runner",
@@ -323,13 +489,19 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         if let Some(ack) = completion_race_ack {
             // Completion is delivered while the input ACK remains outstanding.
             // The result path may already have closed the ACK waiter.
-            let _ = edge_pool.deliver_provider_stage_input_ack(
+            if ack_after_result {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let observed = edge_pool.deliver_provider_stage_input_ack(
                 &user,
                 "selected-runner",
                 &request_id,
                 delivery_generation,
                 ack,
             );
+            if ack_after_result {
+                assert!(observed, "completion must retain the original input waiter");
+            }
         }
         if let Some(barrier) = &binding_barrier {
             // Confirmation starts only after the physical receipt. Gate the
@@ -448,13 +620,27 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
             "replay must not rewrite the settled receipt"
         );
     }
-    if mailbox_unknown {
+    if mailbox_unknown || (user_intent_delivery && !late_user_intent_ack && !ack_after_result) {
         let outcome = serde_json::to_value(&recorded.outcome).unwrap();
         assert_eq!(
             outcome.pointer("/result/metadata/guidance_disposition"),
             Some(&json!("unconfirmed"))
         );
     } else {
+        if late_user_intent_ack || ack_after_result {
+            let outcome = serde_json::to_value(&recorded.outcome).unwrap();
+            assert_ne!(
+                outcome.pointer("/result/metadata/guidance_disposition"),
+                Some(&json!("unconfirmed")),
+                "a late, accepted ACK must clear the uncertainty"
+            );
+            let applied = durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "user_intent_applied")
+                .count();
+            assert_eq!(applied, if ack_after_result { 1 } else { 2 });
+        }
         let recreated = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(&owner);
         assert!(
             recreated
@@ -520,4 +706,22 @@ async fn native_mailbox_unknown_survives_receipt_terminal_and_completion_race() 
     native_stage_receipt_journey(Scenario::MailboxUnknown).await;
     native_stage_receipt_journey(Scenario::MailboxUnknownRace).await;
     native_stage_receipt_journey(Scenario::MailboxUnknownReplay).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne; no model calls"]
+async fn native_user_intent_without_ack_does_not_duplicate_or_overtake() {
+    native_stage_receipt_journey(Scenario::UserIntentAckTimeout).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne; no model calls"]
+async fn native_user_intent_late_ack_releases_ordered_guidance() {
+    native_stage_receipt_journey(Scenario::UserIntentLateAck).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne; no model calls"]
+async fn native_user_intent_ack_after_result_preserves_application() {
+    native_stage_receipt_journey(Scenario::UserIntentAckAfterResult).await;
 }

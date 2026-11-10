@@ -1420,6 +1420,18 @@ async fn handle_edge_connection(
                                         );
                                     }
                                 }
+                                Ok(EdgeClientMessage::ToolInputUnconfirmed {
+                                    request_id,
+                                    delivery_generation,
+                                    input_id,
+                                }) => {
+                                    if !input_id.is_empty() && input_id == input_id.trim() {
+                                        state.edge_connection_pool.mark_provider_stage_input_unconfirmed(
+                                            &user_id, &edge_agent_id, &request_id,
+                                            delivery_generation, &input_id,
+                                        );
+                                    }
+                                }
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
                                         break;

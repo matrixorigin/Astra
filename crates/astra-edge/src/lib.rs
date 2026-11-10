@@ -380,12 +380,6 @@ struct CompletedEdgeInvocation {
     duration_ms: u64,
 }
 
-struct CompletedProviderStageInput {
-    request_id: String,
-    generation: u64,
-    ack: ProviderStageInputAck,
-}
-
 fn rejected_tool_message(
     request_id: String,
     identity: astra_turn_types::ToolInvocationIdentity,
@@ -507,8 +501,8 @@ pub struct EdgeInvocationOwner {
     tasks: JoinSet<()>,
     completed_tx: mpsc::Sender<CompletedEdgeInvocation>,
     completed_rx: mpsc::Receiver<CompletedEdgeInvocation>,
-    input_ack_tx: mpsc::Sender<CompletedProviderStageInput>,
-    input_ack_rx: mpsc::Receiver<CompletedProviderStageInput>,
+    input_ack_tx: mpsc::Sender<EdgeClientMessage>,
+    input_ack_rx: mpsc::Receiver<EdgeClientMessage>,
     journal: EdgeInvocationJournal,
     journal_writable: bool,
 }
@@ -520,7 +514,7 @@ impl EdgeInvocationOwner {
     ) -> Result<Self, EdgeConnectionError> {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
-            mpsc::channel::<CompletedProviderStageInput>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
+            mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
         let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
         let journal_status = journal.status();
         tracing::info!(
@@ -1016,6 +1010,7 @@ async fn serve_connection_on_owner(
                                 }
                                 let execution_generation = journal
                                     .running_execution_generation(&request_id, delivery_generation);
+                                let input_id = input.input_id().to_owned();
                                 let input = EdgeInvocationInput { input, ack: ack_tx };
                                 let sent = match execution_generation {
                                     Some(generation) => invocations.send_input(&request_id, generation, input),
@@ -1038,20 +1033,15 @@ async fn serve_connection_on_owner(
                                 }
                                 let input_ack_tx = input_ack_tx.clone();
                                 tokio::spawn(async move {
-                                    // A dropped adapter acknowledgement is a
-                                    // transport failure. Do not invent a
-                                    // third business disposition; the pool's
-                                    // bounded wait will retry the same input
-                                    // identity on the next opportunity.
-                                    if let Ok(ack) = ack_rx.await {
-                                        let _ = input_ack_tx
-                                            .send(CompletedProviderStageInput {
-                                                request_id,
-                                                generation: delivery_generation,
-                                                ack,
-                                            })
-                                            .await;
-                                    }
+                                    let message = match ack_rx.await {
+                                        Ok(ack) => EdgeClientMessage::ToolInputAck {
+                                            request_id, delivery_generation, ack,
+                                        },
+                                        Err(_) => EdgeClientMessage::ToolInputUnconfirmed {
+                                            request_id, delivery_generation, input_id,
+                                        },
+                                    };
+                                    let _ = input_ack_tx.send(message).await;
                                 });
                             }
                             Ok(EdgeServerMessage::CapacityRequest {
@@ -1159,12 +1149,7 @@ async fn serve_connection_on_owner(
                 );
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&result_msg)?.into()), &shutdown).await?;
             }
-            Some(completed) = input_ack_rx.recv() => {
-                let message = EdgeClientMessage::ToolInputAck {
-                    request_id: completed.request_id,
-                    delivery_generation: completed.generation,
-                    ack: completed.ack,
-                };
+            Some(message) = input_ack_rx.recv() => {
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
             _ = heartbeat.tick() => {

@@ -23,6 +23,7 @@ pub enum RunControlStatus {
 pub struct RunControlObservation {
     pub status: Option<RunControlStatus>,
     pub last_event_idx: Option<i64>,
+    pub last_guidance_event_idx: Option<i64>,
     pub session_id: Option<String>,
     pub run_generation: Option<u64>,
 }

@@ -2188,6 +2188,8 @@ pub struct DurableRunRecord {
     pub owner_lease_expires_at: Option<String>,
     pub run_generation: u64,
     pub last_event_idx: i64,
+    /// Highest committed user-intent event; maintained with the event append.
+    pub last_guidance_event_idx: i64,
     pub current_checkpoint: Option<CurrentCheckpointRef>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -3545,6 +3547,8 @@ pub struct DurableRunControlRecord {
     /// read so active executors can notice accepted input without another
     /// periodic database query. This is a wake hint, not an applied cursor.
     pub last_event_idx: i64,
+    /// Latest committed user-intent event, read with the existing control row.
+    pub last_guidance_event_idx: i64,
     /// True only when the store can prove an execution owner with an
     /// unexpired lease using its authoritative clock.
     pub owner_lease_live: bool,
@@ -4027,6 +4031,7 @@ impl From<&DurableRunRecord> for DurableRunControlRecord {
             cancellation_requested: false,
             run_generation: run.run_generation,
             last_event_idx: run.last_event_idx,
+            last_guidance_event_idx: run.last_guidance_event_idx,
             owner_lease_live: run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(true),
         }
@@ -4135,7 +4140,7 @@ impl From<&DurableRunCheckpointRecord> for RunCheckpointReceipt {
 
 const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
-     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, last_guidance_event_idx, checkpoint_version, \
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
@@ -4146,7 +4151,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
 // not the potentially large checkpoint body. Executable recovery loads it separately.
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
-     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, last_guidance_event_idx, checkpoint_version, \
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
@@ -7357,8 +7362,7 @@ impl InMemoryRunStateStore {
                         terminal_error_code.as_deref(),
                     )?;
                     if !new_events.is_empty() {
-                        run.events.extend(new_events);
-                        run.last_event_idx = run.events.len() as i64 - 1;
+                        append_in_memory_events(run, new_events);
                     }
                     if release_recovery_owner {
                         run.owner_pod_id = None;
@@ -7457,6 +7461,28 @@ impl InMemoryRunStateStore {
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
         normalize_run_opening(&mut record)?;
+        // New runs use the same contiguous event identities as database rows.
+        // Reject imported sparse fixtures instead of accepting cursors that
+        // vector-based action fences cannot interpret correctly.
+        let frontier = record.events.len() as i64 - 1;
+        if record.last_event_idx > frontier
+            || record.events.iter().enumerate().any(|(position, event)| {
+                event
+                    .get("index")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|index| index != position as i64)
+            })
+        {
+            return Err("Run creation requires contiguous event indices".into());
+        }
+        if record.events.first().is_some_and(is_user_intent_event) {
+            return Err("Run creation cannot place user guidance at event index zero".into());
+        }
+        record.last_guidance_event_idx = record
+            .events
+            .iter()
+            .rposition(is_user_intent_event)
+            .map_or(-1, |index| index as i64);
         if let Some(opening) = record.opening.loaded()? {
             record.opening_hash = Some(opening.encode()?.hash);
             record.context_admission_hash = opening.context_fingerprint();
@@ -8672,17 +8698,13 @@ impl RunStateStore for InMemoryRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunControlRecord>, String> {
-        let run = self
-            .runs
-            .read()
-            .await
-            .get(run_id)
-            .filter(|run| run.user_id == user_id)
-            .cloned();
-        let Some(run) = run else {
-            return Ok(None);
+        let mut control = {
+            let runs = self.runs.read().await;
+            let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
+                return Ok(None);
+            };
+            DurableRunControlRecord::from(run)
         };
-        let mut control = DurableRunControlRecord::from(&run);
         control.cancellation_requested = self
             .cancellation_requests
             .read()
@@ -8820,15 +8842,8 @@ impl RunStateStore for InMemoryRunStateStore {
             });
         }
 
-        let event_count = i64::try_from(run.events.len())
-            .map_err(|_| format!("run {} event count exceeds i64", request.run_id))?;
-        let event_index = run
-            .last_event_idx
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?
-            .max(event_count);
-        run.events.push(request.event.clone());
-        run.last_event_idx = event_index;
+        append_in_memory_events(run, vec![request.event.clone()]);
+        let event_index = run.last_event_idx;
         run.updated_at = chrono::Utc::now().to_rfc3339();
 
         Ok(AtomicRunGuidanceAdmission::Committed { event_index })
@@ -8864,13 +8879,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 .events
                 .iter()
                 .enumerate()
-                .find(|(position, event)| {
-                    event
-                        .get("index")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(*position as i64)
-                        == *source_index
-                })
+                .find(|(position, _)| *position as i64 == *source_index)
                 .map(|(_, event)| event)
                 .ok_or(AtomicRunUserIntentApply::SourceMissing {
                     event_index: *source_index,
@@ -9106,10 +9115,7 @@ impl RunStateStore for InMemoryRunStateStore {
             .iter()
             .enumerate()
             .filter_map(|(position, event)| {
-                let index = event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64);
+                let index = position as i64;
                 if index <= after_event_idx {
                     return None;
                 }
@@ -9145,39 +9151,22 @@ impl RunStateStore for InMemoryRunStateStore {
         let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
             return Ok(None);
         };
-        // The in-memory test store permits fixtures with explicit durable gaps;
-        // mirror the database row-key authority instead of trusting vector
-        // position metadata in those fixtures.
-        let authoritative_last_event_idx = run
-            .events
-            .iter()
-            .enumerate()
-            .map(|(position, event)| {
-                event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64)
-            })
-            .max()
-            .unwrap_or(run.last_event_idx)
-            .max(run.last_event_idx);
+        // Like the database row key, vector position owns event identity;
+        // arbitrary event payloads cannot advance the control cursor.
+        let authoritative_last_event_idx = run.last_event_idx;
         let mut indexed_control_events = run
             .events
             .iter()
             .enumerate()
             .filter_map(|(position, event)| {
-                let index = event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64);
+                let index = position as i64;
                 (index > after_event_idx
                     && index <= authoritative_last_event_idx
                     && is_user_intent_control_event(event))
                 .then_some((index, event))
             })
+            .take(limit_plus_one)
             .collect::<Vec<_>>();
-        indexed_control_events.sort_by_key(|(index, _)| *index);
-        indexed_control_events.truncate(limit_plus_one);
         let has_more = indexed_control_events.len() > limit;
         indexed_control_events.truncate(limit);
         let events = indexed_control_events
@@ -9206,10 +9195,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 .iter()
                 .enumerate()
                 .filter_map(|(position, event)| {
-                    let index = event
-                        .get("index")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(position as i64);
+                    let index = position as i64;
                     let key = extract_optional_string(event, "idempotency_key")?;
                     (index <= authoritative_last_event_idx && disposition_keys.contains(&key))
                         .then_some(event.clone())
@@ -9727,8 +9713,7 @@ impl RunStateStore for InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
-                    run.events.push(event);
-                    run.last_event_idx = run.events.len() as i64 - 1;
+                    append_in_memory_events(run, vec![event]);
                     true
                 }
             } else {
@@ -9865,8 +9850,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.resolved_model_name = Some(selection.selected_model);
             }
             if !new_events.is_empty() {
-                run.events.extend(new_events);
-                run.last_event_idx = run.events.len() as i64 - 1;
+                append_in_memory_events(run, new_events);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
             }
         };
@@ -10156,10 +10140,7 @@ impl RunStateStore for InMemoryRunStateStore {
             if events.is_empty() {
                 return Ok(());
             }
-            let start_idx = run.events.len() as i64;
-            let event_count = events.len() as i64;
-            run.events.extend(events);
-            run.last_event_idx = start_idx + event_count - 1;
+            append_in_memory_events(run, events);
             run.updated_at = chrono::Utc::now().to_rfc3339();
         }
         Ok(())
@@ -11520,7 +11501,7 @@ const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
 
 const RUN_CONTROL_COLUMNS: &str =
     "run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-     run_generation, last_event_idx,
+     run_generation, last_event_idx, last_guidance_event_idx,
      CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
      CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
           AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live";
@@ -11964,6 +11945,9 @@ impl DatabaseRunStateStore {
         }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&event_rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
         update.push(", updated_at = NOW(6) WHERE user_id = ");
         update.push_bind(user_id);
         update.push(" AND session_id = ");
@@ -13444,18 +13428,25 @@ impl DatabaseRunStateStore {
         #[cfg(test)]
         let mut rows = rows;
         let last_event_idx = rows.last().expect("non-empty staged batch").event_idx;
-        let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
-        )
-        .bind(last_event_idx)
-        .bind(user_id)
-        .bind(&run.session_id)
-        .bind(run_id)
-        .bind(run.last_event_idx)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error("update_run_event_batch_counter", run_id, source))?;
+        let mut update = QueryBuilder::<MySql>::new("UPDATE agent_runs SET last_event_idx = ");
+        update.push_bind(last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
+        update
+            .push(", updated_at = NOW(6) WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(&run.session_id)
+            .push(" AND run_id = ")
+            .push_bind(run_id)
+            .push(" AND last_event_idx = ")
+            .push_bind(run.last_event_idx);
+        let updated = update
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| db_error("update_run_event_batch_counter", run_id, source))?;
         if updated.rows_affected() != 1 {
             return Err(db_error(
                 "update_run_event_batch_counter",
@@ -13788,7 +13779,7 @@ impl DatabaseRunStateStore {
             "INSERT INTO agent_runs
              (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
               delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, last_guidance_event_idx,
               checkpoint_version, current_checkpoint_id, current_checkpoint_hash, error_code, error_message,
               total_prompt_tokens, total_completion_tokens, total_tool_calls,
               agent_binding_id, agent_binding_name, agent_binding_schema_version,
@@ -13797,7 +13788,7 @@ impl DatabaseRunStateStore {
               work_id, work_branch_id, work_graph_revision,
               work_item_id, work_item_revision, work_item_attempt_id,
               created_at, updated_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), CASE WHEN CAST(? AS SIGNED) = 1 THEN NOW(6) ELSE NULL END)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), CASE WHEN CAST(? AS SIGNED) = 1 THEN NOW(6) ELSE NULL END)",
             null_shape.iter().copied(),
         );
         sqlx::query(insert_sql)
@@ -13818,6 +13809,7 @@ impl DatabaseRunStateStore {
             .bind(self.lease_ttl_micros())
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
+            .bind(record.last_guidance_event_idx)
             .bind(record.current_checkpoint_version())
             .bind(
                 record
@@ -13998,6 +13990,13 @@ impl DatabaseRunStateStore {
                 &record.session_id,
             ));
         }
+        if events.first().is_some_and(is_user_intent_event) {
+            return Err("Run creation cannot place user guidance at event index zero".into());
+        }
+        record.last_guidance_event_idx = events
+            .iter()
+            .rposition(is_user_intent_event)
+            .map_or(-1, |index| index as i64);
         let opening_count = record
             .opening
             .loaded()?
@@ -14493,14 +14492,19 @@ impl DatabaseRunStateStore {
         let dispatched: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM edge_pending_dispatch
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
-               AND request_id = ?
-               AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
+               AND request_id = ? AND edge_agent_id = ?
+               AND ((status = 'dispatched' AND result_json IS NULL)
+                 OR (? IS NOT NULL AND status = 'completed' AND result_json IS NOT NULL)) FOR UPDATE",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(identity.storage_key())
+        .bind(edge_agent_id)
+        // Only the exact unresolved ledger's captured dispatch owner may
+        // settle an ACK after its result frame. This cannot admit more work.
+        .bind(settlement_dispatch_owner)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|source| {
@@ -18131,11 +18135,12 @@ impl RunStateStore for DatabaseRunStateStore {
         .fetch_optional(connection.connection_mut())
         .await
         .map_err(|source| db_error("load_user_intent_watermark", run_id, source).to_string())?;
-        connection.release();
         let Some(authoritative_last_event_idx) = watermark else {
+            connection.release();
             return Ok(None);
         };
         if after_event_idx >= authoritative_last_event_idx {
+            connection.release();
             return Ok(Some(DurableRunUserIntentControlDelta {
                 authoritative_last_event_idx,
                 page_cursor: after_event_idx,
@@ -18163,7 +18168,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(authoritative_last_event_idx)
             .bind(sql_limit)
             .bind(sql_limit)
-            .fetch_all(self.pool.get())
+            .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| {
                 db_error("load_user_intent_control_delta", run_id, source).to_string()
@@ -18201,7 +18206,7 @@ impl RunStateStore for DatabaseRunStateStore {
             builder.push(" ORDER BY event_idx ASC");
             builder
                 .build()
-                .fetch_all(self.pool.get())
+                .fetch_all(connection.connection_mut())
                 .await
                 .map_err(|source| {
                     db_error("load_user_intent_control_dispositions", run_id, source).to_string()
@@ -18211,6 +18216,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?
         };
+        connection.release();
         Ok(Some(DurableRunUserIntentControlDelta {
             authoritative_last_event_idx,
             page_cursor,
@@ -18410,11 +18416,12 @@ impl RunStateStore for DatabaseRunStateStore {
         // expire while this transaction owns the row even though no other
         // transaction can mutate it.
         let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
+            "UPDATE agent_runs SET last_event_idx = ?, last_guidance_event_idx = ?, updated_at = NOW(6)
              WHERE user_id = ? AND run_id = ? AND last_event_idx = ?
                AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
                AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)",
         )
+        .bind(event_index)
         .bind(event_index)
         .bind(request.user_id)
         .bind(request.run_id)
@@ -19240,7 +19247,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_control_batch", "batch", source).to_string())?;
-        connection.release();
         let mut results = vec![None; keys.len()];
         for row in rows {
             let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
@@ -19262,10 +19268,12 @@ impl RunStateStore for DatabaseRunStateStore {
                     .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose()),
             );
         }
-        results
+        let results = results
             .into_iter()
             .map(|result| result.ok_or_else(|| "missing run control request ordinal".into()))
-            .collect()
+            .collect::<Result<_, String>>()?;
+        connection.release();
+        Ok(results)
     }
 
     async fn load_run_controls(
@@ -19453,6 +19461,11 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         update.push(", last_event_idx = ");
         update.push_bind(event_idx);
+        if event_row.event_type == "user_intent" {
+            update
+                .push(", last_guidance_event_idx = ")
+                .push_bind(event_idx);
+        }
         update.push(", updated_at = NOW(6) WHERE user_id = ");
         update.push_bind(user_id);
         update.push(" AND session_id = ");
@@ -19745,6 +19758,9 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut update =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET last_event_idx = ");
         update.push_bind(next_last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&event_rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
         if let Some(selection) = &selection {
             update.push(", model_offering_id = ");
             update.push_bind(&selection.selected_offering_id);
@@ -24366,6 +24382,19 @@ fn decode_run_control_row(
     row: &sqlx::mysql::MySqlRow,
     entity: &str,
 ) -> Result<DurableRunControlRecord, String> {
+    let last_event_idx: i64 = row
+        .try_get("last_event_idx")
+        .map_err(|source| db_error("decode_run_control_event_index", entity, source).to_string())?;
+    let last_guidance_event_idx: i64 =
+        row.try_get("last_guidance_event_idx").map_err(|source| {
+            db_error("decode_run_control_guidance_index", entity, source).to_string()
+        })?;
+    if last_guidance_event_idx < -1
+        || last_guidance_event_idx == 0
+        || last_guidance_event_idx > last_event_idx
+    {
+        return Err(format!("invalid guidance watermark for run {entity}"));
+    }
     Ok(DurableRunControlRecord {
         run_id: row
             .try_get("run_id")
@@ -24392,9 +24421,8 @@ fn decode_run_control_row(
             |source| db_error("decode_run_control_generation", entity, source).to_string(),
         )?)
         .map_err(|_| format!("negative run generation in control row for {entity}"))?,
-        last_event_idx: row.try_get("last_event_idx").map_err(|source| {
-            db_error("decode_run_control_event_index", entity, source).to_string()
-        })?,
+        last_event_idx,
+        last_guidance_event_idx,
         owner_lease_live: row
             .try_get::<i64, _>("owner_lease_live")
             .map_err(|source| {
@@ -24541,6 +24569,17 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
     let context_admission_hash =
         run_row_optional_string(row, operation, table, "context_admission_hash")?;
     let opening = decode_run_opening_from_row(row)?;
+    let last_event_idx = run_row_at_least_i64(row, operation, table, "last_event_idx", -1)?;
+    let last_guidance_event_idx =
+        run_row_at_least_i64(row, operation, table, "last_guidance_event_idx", -1)?;
+    if last_guidance_event_idx == 0 || last_guidance_event_idx > last_event_idx {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "last_guidance_event_idx",
+            "guidance watermark exceeds the event frontier",
+        ));
+    }
     Ok(DurableRunRecord {
         opening,
         opening_hash,
@@ -24572,7 +24611,8 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             "owner_lease_expires_at",
         )?,
         run_generation: run_row_u64(row, operation, table, "run_generation")?,
-        last_event_idx: run_row_at_least_i64(row, operation, table, "last_event_idx", -1)?,
+        last_event_idx,
+        last_guidance_event_idx,
         current_checkpoint: decode_current_checkpoint_ref(row)?,
         error_code: run_row_optional_string(row, operation, table, "error_code")?,
         error_message: run_row_optional_string(row, operation, table, "error_message")?,
@@ -24761,6 +24801,48 @@ pub fn extract_event_type(event: &serde_json::Value) -> String {
     extract_optional_string(event, "event_type")
         .or_else(|| extract_optional_string(event, "type"))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_user_intent_event(event: &serde_json::Value) -> bool {
+    event
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| event.get("type").and_then(serde_json::Value::as_str))
+        == Some("user_intent")
+}
+
+// Store-assigned positions, not caller-provided payload metadata, identify new
+// events. Index zero is reserved for the initial run receipt.
+fn append_in_memory_events(run: &mut DurableRunRecord, mut events: Vec<serde_json::Value>) {
+    if events.is_empty() {
+        return;
+    }
+    if run.events.is_empty() && is_user_intent_event(&events[0]) {
+        run.events
+            .push(run_created_receipt_event(&run.run_id, &run.session_id));
+    }
+    let first_index = run.events.len() as i64;
+    for (offset, event) in events.iter_mut().enumerate() {
+        let index = first_index.saturating_add(offset as i64);
+        if event.get("index").is_some()
+            && let Some(object) = event.as_object_mut()
+        {
+            object.insert("index".to_string(), serde_json::json!(index));
+        }
+        if is_user_intent_event(event) {
+            run.last_guidance_event_idx = index;
+        }
+        run.last_event_idx = index;
+    }
+    run.events.extend(events);
+}
+
+fn latest_guidance_in_rows(rows: &[RunEventInsertRow]) -> Option<i64> {
+    rows.iter()
+        .rev()
+        .find(|row| row.event_type == "user_intent")
+        .map(|row| row.event_idx)
 }
 
 fn extract_optional_string(event: &serde_json::Value, key: &str) -> Option<String> {
@@ -25716,6 +25798,13 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
+    if event_type == "user_intent" && event_idx == 0 {
+        return Err(db_error(
+            "build_run_event",
+            run_id,
+            sqlx::Error::Protocol("user guidance cannot occupy the initial event index".into()),
+        ));
+    }
     let invocation_supersession_scope_key =
         projected_invocation_supersession_scope_key(user_id, session_id, run_id, event_idx, event);
     let subject_run_id = match event_type.as_str() {
@@ -28405,6 +28494,7 @@ mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -29699,6 +29789,7 @@ mod tests {
                 "depth" => 2,
                 "run_generation" => 3,
                 "last_event_idx" => 4,
+                "last_guidance_event_idx" => -1,
                 "total_prompt_tokens" => 100,
                 "total_completion_tokens" => 25,
                 "total_tool_calls" => 6,
@@ -43212,6 +43303,7 @@ mod tests {
                     owner_lease_expires_at: None,
                     run_generation: 0,
                     last_event_idx: -1,
+                    last_guidance_event_idx: -1,
                     current_checkpoint: None,
                     error_code: None,
                     error_message: None,
@@ -43312,14 +43404,14 @@ mod tests {
             if live {
                 assert_eq!(
                     result,
-                    AtomicRunGuidanceAdmission::Committed { event_index: 0 }
+                    AtomicRunGuidanceAdmission::Committed { event_index: 1 }
                 );
                 assert_eq!(
                     store
                         .admit_run_guidance(guidance_admission_request(id, id, &event, live))
                         .await
                         .unwrap(),
-                    AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+                    AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
                 );
             } else {
                 assert!(matches!(
@@ -43330,12 +43422,11 @@ mod tests {
             let run = store.load_run("u1", id).await.unwrap().unwrap();
             assert_eq!(run.status, STATUS_PAUSED);
             assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
-            assert_eq!(run.events.len(), usize::from(live));
-            assert!(
-                run.events
-                    .iter()
-                    .all(|event| extract_event_type(event) == "user_intent")
-            );
+            assert_eq!(run.events.len(), 2 * usize::from(live));
+            assert!(run.events.iter().all(|event| matches!(
+                extract_event_type(event).as_str(),
+                "run_created" | "user_intent"
+            )));
         }
     }
 
@@ -43357,7 +43448,7 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AtomicRunGuidanceAdmission::Committed { event_index: 0 }
+            AtomicRunGuidanceAdmission::Committed { event_index: 1 }
         );
         store
             .runs
@@ -43376,7 +43467,7 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+            AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         );
         let mut conflicting = event.clone();
         conflicting["data"]["input"] = json!({"content": "different immutable guidance"});
@@ -43841,7 +43932,7 @@ mod tests {
         assert_eq!(
             outcome,
             AtomicRunActionAdmission::Superseded {
-                user_intent_event_index: 0
+                user_intent_event_index: 1
             }
         );
         let run = store
@@ -43849,8 +43940,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.events.len(), 1);
-        assert_eq!(extract_event_type(&run.events[0]), "user_intent");
+        assert_eq!(run.events.len(), 2);
+        assert_eq!(extract_event_type(&run.events[1]), "user_intent");
     }
 
     #[tokio::test]
@@ -43964,19 +44055,19 @@ mod tests {
             .await
             .unwrap();
         let mut request = action_admission_request("action-observed-intent");
-        request.expected_control_epoch = 0;
+        request.expected_control_epoch = 1;
 
         let started = store.begin_action(request).await.unwrap();
         assert_eq!(
             started,
-            AtomicRunActionAdmission::Started { event_index: 1 }
+            AtomicRunActionAdmission::Started { event_index: 2 }
         );
         assert!(started.is_fresh_grant());
-        assert!(AtomicRunActionAdmission::AckRecoveredStarted { event_index: 1 }.is_fresh_grant());
+        assert!(AtomicRunActionAdmission::AckRecoveredStarted { event_index: 2 }.is_fresh_grant());
         let replay = store.begin_action(request).await.unwrap();
         assert_eq!(
             replay,
-            AtomicRunActionAdmission::AlreadyStarted { event_index: 1 }
+            AtomicRunActionAdmission::AlreadyStarted { event_index: 2 }
         );
         assert!(
             !replay.is_fresh_grant(),
@@ -45829,7 +45920,7 @@ mod tests {
                 .await
                 .unwrap(),
             AtomicRunInteractionBatchRegistration::Superseded {
-                user_intent_event_index: 0
+                user_intent_event_index: 1
             }
         );
         let run = store
@@ -45851,7 +45942,7 @@ mod tests {
             projection.events.last().map(extract_event_type).as_deref(),
             Some("user_intent")
         );
-        assert_eq!(projection.last_event_idx, 0);
+        assert_eq!(projection.last_event_idx, 1);
     }
 
     fn recovered_interaction_event(expected: &RunEventInsertRow) -> RecoveredInteractionEvent {
@@ -46363,17 +46454,18 @@ mod tests {
             let mut run = durable_run_record(&run_id);
             run.status = status.to_string();
             run.waiting_for = waiting_for.map(ToString::to_string);
+            run.events.push(make_event("run_created", json!({})));
             run.events.push(json!({
                 "event_type": "user_intent",
                 "idempotency_key": format!("user_intent:{run_id}"),
-                "index": 0,
+                "index": 1,
                 "data": {
                     "intent_id": format!("intent-{run_id}"),
                     "delivery": "guide_current_run",
                     "input": {"content": "preserve this guidance"}
                 }
             }));
-            run.last_event_idx = 0;
+            run.last_event_idx = 1;
             store.insert_run(run).await.unwrap();
             assert!(store.request_run_cancellation("u1", &run_id).await.unwrap());
 
@@ -46394,18 +46486,18 @@ mod tests {
             assert!(cancelled.waiting_for.is_none(), "{suffix}");
             assert!(cancelled.owner_pod_id.is_none(), "{suffix}");
             assert!(cancelled.owner_lease_expires_at.is_none(), "{suffix}");
-            assert_eq!(cancelled.events.len(), 3, "{suffix}");
+            assert_eq!(cancelled.events.len(), 4, "{suffix}");
             assert_eq!(
-                cancelled.events[1]["event_type"], "user_intent_returned",
+                cancelled.events[2]["event_type"], "user_intent_returned",
                 "{suffix}"
             );
             assert_eq!(
-                cancelled.events[2]["event_type"], "run_finished",
+                cancelled.events[3]["event_type"], "run_finished",
                 "{suffix}"
             );
-            assert_eq!(cancelled.events[2]["data"]["cancelled"], true, "{suffix}");
+            assert_eq!(cancelled.events[3]["data"]["cancelled"], true, "{suffix}");
             assert_eq!(
-                cancelled.events[2]["data"]["cancellation_origin"], "user",
+                cancelled.events[3]["data"]["cancellation_origin"], "user",
                 "{suffix}"
             );
             assert!(
@@ -47790,6 +47882,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_control_batch_reports_only_committed_guidance_watermark() {
+        let store = InMemoryRunStateStore::new();
+        let run = durable_run_record("guidance-batch");
+        store.insert_run(run).await.unwrap();
+        let guidance = json!({"event_type":"user_intent", "idempotency_key":"guide-1"});
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "guidance-batch",
+                &[
+                    make_event("progress", json!({})),
+                    guidance.clone(),
+                    make_event("progress", json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+        // Replaying the same event and appending unrelated work cannot move it.
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "guidance-batch",
+                &[guidance, make_event("progress", json!({}))],
+            )
+            .await
+            .unwrap();
+        let key = |user: &str| RunControlReadKey {
+            user_id: user.into(),
+            run_id: "guidance-batch".into(),
+        };
+        let results = store
+            .load_run_control_batch(&[key("u1"), key("u1"), key("u2")])
+            .await
+            .unwrap();
+        for result in &results[..2] {
+            let control = result.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(control.last_guidance_event_idx, 1);
+            assert_eq!(control.last_event_idx, 3);
+        }
+        assert!(results[2].as_ref().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn guidance_uses_store_assigned_indices_and_rejects_sparse_creation() {
+        let store = InMemoryRunStateStore::new();
+        let mut sparse = durable_run_record("sparse-guidance");
+        sparse.events = vec![json!({"index": 8, "event_type": "user_intent"})];
+        sparse.last_event_idx = 8;
+        assert!(
+            store
+                .insert_run(sparse)
+                .await
+                .unwrap_err()
+                .contains("contiguous")
+        );
+
+        store
+            .insert_run(durable_run_record("canonical-guidance"))
+            .await
+            .unwrap();
+        // A tool payload may also contain an untrusted index. It must not
+        // advance the guidance reader past a later committed user intent.
+        let mut tool = edge_tool_request_event("fake-index", "write_file");
+        tool["index"] = json!(99);
+        assert!(matches!(
+            store
+                .commit_guarded_tool_request(guarded_tool_request(
+                    "canonical-guidance",
+                    "fake-index",
+                    &tool
+                ))
+                .await
+                .unwrap(),
+            AtomicRunToolRequestCommitOutcome::Committed(_)
+        ));
+        let before = store
+            .load_user_intent_control_delta("u1", "canonical-guidance", -1, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.authoritative_last_event_idx, 1);
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "canonical-guidance",
+                &[json!({"index": 99, "event_type": "user_intent", "idempotency_key": "new"})],
+            )
+            .await
+            .unwrap();
+        let control = store
+            .load_run_control("u1", "canonical-guidance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (control.last_event_idx, control.last_guidance_event_idx),
+            (2, 2)
+        );
+        let delta = store
+            .load_user_intent_control_delta("u1", "canonical-guidance", 1, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.events[0]["index"], 2);
+        assert_eq!(
+            store
+                .begin_action(action_admission_request("canonical-guidance"))
+                .await
+                .unwrap(),
+            AtomicRunActionAdmission::Superseded {
+                user_intent_event_index: 2
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn unsettled_user_intent_control_read_ignores_large_unrelated_history() {
         let store = InMemoryRunStateStore::new();
         let mut run = durable_run_record("intent-control-tail");
@@ -47921,26 +48132,29 @@ mod tests {
     async fn user_intent_control_delta_keyset_pages_do_not_skip_or_starve_control_events() {
         let store = InMemoryRunStateStore::new();
         let mut run = durable_run_record("intent-control-delta-pages");
-        run.events = (0..5)
-            .map(|index| {
-                json!({
-                    "index": index,
-                    "event_type": "user_intent",
-                    "idempotency_key": format!("user_intent:intent-page-{index}"),
-                    "data": {
-                        "intent_id": format!("intent-page-{index}"),
-                        "delivery": "guide_current_run",
-                        "input": {"content": format!("page {index}")}
-                    }
+        run.events = vec![make_event("run_created", json!({}))];
+        run.events.extend(
+            (1..=5)
+                .map(|index| {
+                    json!({
+                        "index": index,
+                        "event_type": "user_intent",
+                        "idempotency_key": format!("user_intent:intent-page-{index}"),
+                        "data": {
+                            "intent_id": format!("intent-page-{index}"),
+                            "delivery": "guide_current_run",
+                            "input": {"content": format!("page {index}")}
+                        }
+                    })
                 })
-            })
-            .collect();
-        run.last_event_idx = 8;
+                .collect::<Vec<_>>(),
+        );
+        run.last_event_idx = 9;
         run.events.extend([
-            make_event("reasoning_delta", json!({"index": 5})),
             make_event("reasoning_delta", json!({"index": 6})),
             make_event("reasoning_delta", json!({"index": 7})),
             make_event("reasoning_delta", json!({"index": 8})),
+            make_event("reasoning_delta", json!({"index": 9})),
         ]);
         store.insert_run(run).await.unwrap();
 
@@ -47949,7 +48163,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.page_cursor, 1);
+        assert_eq!(first.page_cursor, 2);
         assert!(first.has_more);
         let second = store
             .load_user_intent_control_delta(
@@ -47961,7 +48175,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.page_cursor, 3);
+        assert_eq!(second.page_cursor, 4);
         assert!(second.has_more);
         let third = store
             .load_user_intent_control_delta(
@@ -47973,8 +48187,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(third.page_cursor, 4);
-        assert_eq!(third.authoritative_last_event_idx, 8);
+        assert_eq!(third.page_cursor, 5);
+        assert_eq!(third.authoritative_last_event_idx, 9);
         assert!(!third.has_more);
         assert_eq!(
             first
@@ -47984,7 +48198,7 @@ mod tests {
                 .chain(&third.events)
                 .filter_map(|event| event["index"].as_i64())
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![1, 2, 3, 4, 5]
         );
     }
 
@@ -48080,6 +48294,7 @@ mod tests {
         let store = InMemoryRunStateStore::new();
         let mut fenced_run = durable_run_record("intent-apply-ack-lost-fence");
         fenced_run.run_generation = 17;
+        fenced_run.events.push(make_event("run_created", json!({})));
         fenced_run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-ack-lost-fence",
@@ -48089,7 +48304,7 @@ mod tests {
                 "input": {"content": "apply before fence"}
             }
         }));
-        fenced_run.last_event_idx = 0;
+        fenced_run.last_event_idx = 1;
         store.insert_run(fenced_run).await.unwrap();
 
         let fenced_request = AtomicRunUserIntentApplyRequest {
@@ -48100,7 +48315,7 @@ mod tests {
             run_id: "intent-apply-ack-lost-fence",
             expected_session_id: "s1",
             expected_owner_generation: 17,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             store.apply_run_user_intents(fenced_request).await.unwrap(),
@@ -48132,6 +48347,9 @@ mod tests {
         let mut terminal_run = durable_run_record("intent-apply-ack-lost-terminal");
         terminal_run.session_id = "s2".to_string();
         terminal_run.run_generation = 23;
+        terminal_run
+            .events
+            .push(make_event("run_created", json!({})));
         terminal_run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-ack-lost-terminal",
@@ -48150,7 +48368,7 @@ mod tests {
                 "input": {"content": "must remain unclaimed"}
             }
         }));
-        terminal_run.last_event_idx = 1;
+        terminal_run.last_event_idx = 2;
         store.insert_run(terminal_run).await.unwrap();
         let terminal_request = AtomicRunUserIntentApplyRequest {
             purpose: UserIntentApplyPurpose::ModelBoundary,
@@ -48160,7 +48378,7 @@ mod tests {
             run_id: "intent-apply-ack-lost-terminal",
             expected_session_id: "s2",
             expected_owner_generation: 23,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             store
@@ -48225,7 +48443,7 @@ mod tests {
                     run_id: "intent-apply-ack-lost-terminal",
                     expected_session_id: "s2",
                     expected_owner_generation: 23,
-                    source_event_indices: &[1],
+                    source_event_indices: &[2],
                 })
                 .await
                 .unwrap(),
@@ -48255,7 +48473,7 @@ mod tests {
             returned[0]
                 .pointer("/data/event_index")
                 .and_then(serde_json::Value::as_u64),
-            Some(1)
+            Some(2)
         );
         assert_eq!(terminal.status, STATUS_CANCELLED);
     }
@@ -48265,6 +48483,7 @@ mod tests {
         let store = std::sync::Arc::new(InMemoryRunStateStore::new());
         let mut run = durable_run_record("intent-apply-guidance-race");
         run.run_generation = 5;
+        run.events.push(make_event("run_created", json!({})));
         run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-old",
@@ -48274,7 +48493,7 @@ mod tests {
                 "input": {"content": "old"}
             }
         }));
-        run.last_event_idx = 0;
+        run.last_event_idx = 1;
         store.insert_run(run).await.unwrap();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
 
@@ -48291,7 +48510,7 @@ mod tests {
                     run_id: "intent-apply-guidance-race",
                     expected_session_id: "s1",
                     expected_owner_generation: 5,
-                    source_event_indices: &[0],
+                    source_event_indices: &[1],
                 })
                 .await
                 .unwrap()
@@ -48609,6 +48828,8 @@ mod tests {
         run.user_id = user_id.clone();
         run.session_id = session_id.clone();
         run.run_generation = 9;
+        run.events
+            .push(run_created_receipt_event(&run_id, &session_id));
         run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-matrix-apply",
@@ -48647,7 +48868,7 @@ mod tests {
             run_id: &run_id,
             expected_session_id: &session_id,
             expected_owner_generation: 9,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             ack_loss_store.apply_run_user_intents(request).await.unwrap(),
@@ -48660,13 +48881,13 @@ mod tests {
                         .apply_run_user_intents(AtomicRunUserIntentApplyRequest { purpose: UserIntentApplyPurpose::ModelBoundary,
         invocation_identity: None,
 
-                            source_event_indices: &[1],
+                            source_event_indices: &[2],
                             ..request
                         })
                         .await
                         .unwrap(),
                     AtomicRunUserIntentApply::Applied { ref event_indices }
-                        if event_indices == &[4]
+                        if event_indices == &[5]
                 ));
         assert!(matches!(
             store.apply_run_user_intents(request).await.unwrap(),
@@ -48714,7 +48935,7 @@ mod tests {
                     purpose: UserIntentApplyPurpose::ModelBoundary,
                     invocation_identity: None,
 
-                    source_event_indices: &[2],
+                    source_event_indices: &[3],
                     ..request
                 })
                 .await
@@ -48735,7 +48956,7 @@ mod tests {
         assert_eq!(
             store.apply_run_user_intents(request).await.unwrap(),
             AtomicRunUserIntentApply::AlreadyApplied {
-                event_indices: vec![3]
+                event_indices: vec![4]
             }
         );
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
@@ -49149,7 +49370,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.events.len(), 2);
     }
 }
 

@@ -1652,7 +1652,6 @@ struct PendingStageInputAck {
     request_id: Value,
     input: ProviderStageInput,
     sender: Option<tokio::sync::oneshot::Sender<ProviderStageInputAck>>,
-    deadline: tokio::time::Instant,
 }
 
 impl PendingStageInputAck {
@@ -1717,7 +1716,6 @@ async fn start_stage_input(
         request_id: request["id"].clone(),
         input: message.input,
         sender: Some(message.ack),
-        deadline: tokio::time::Instant::now() + astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
     };
     if let Err(error) = send(input, request).await {
         mark_transport_failure(evidence, None);
@@ -1747,15 +1745,6 @@ async fn drive_active_turn(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("native invocation cancelled"),
-            _ = async {
-                match &pending_ack {
-                    Some(ack) => tokio::time::sleep_until(ack.deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if pending_ack.as_ref().is_some_and(|ack| ack.sender.is_some()) => {
-                // Timeout is uncertainty, never permission to replay or reject.
-                pending_ack.as_mut().expect("pending ACK").sender.take();
-            }
             decision = async {
                 match interaction.as_mut() {
                     Some((_, decision)) => decision.as_mut().await,

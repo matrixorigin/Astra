@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-09-v123";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-10-v124";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -175,6 +175,7 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     cancellation_requested_at DATETIME(6) NULL,
     run_generation BIGINT NOT NULL DEFAULT 0,
     last_event_idx BIGINT NOT NULL DEFAULT -1,
+    last_guidance_event_idx BIGINT NOT NULL DEFAULT -1,
     checkpoint_version VARCHAR(32) NULL,
     current_checkpoint_id VARCHAR(64) NULL,
     current_checkpoint_hash CHAR(64) NULL,
@@ -273,6 +274,7 @@ const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "cancellation_requested_at",
     "run_generation",
     "last_event_idx",
+    "last_guidance_event_idx",
     "checkpoint_version",
     "current_checkpoint_id",
     "current_checkpoint_hash",

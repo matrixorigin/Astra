@@ -115,6 +115,46 @@ async fn native_guidance_wait_is_idle_but_preserves_retry_and_closed_subscriptio
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn finished_native_invocation_only_drains_started_guidance() {
+    let started = AtomicBool::new(false);
+    let pending = std::future::pending::<()>();
+    tokio::pin!(pending);
+    let now = tokio::time::Instant::now();
+    assert!(
+        drain_started_native_guidance(pending.as_mut(), &started)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        now,
+        "an idle control read cannot delay a completed result"
+    );
+
+    started.store(true, Ordering::Release);
+    let ack = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        42
+    };
+    tokio::pin!(ack);
+    assert_eq!(
+        drain_started_native_guidance(ack.as_mut(), &started).await,
+        Some(42)
+    );
+    let pending = std::future::pending::<()>();
+    tokio::pin!(pending);
+    assert!(
+        drain_started_native_guidance(pending.as_mut(), &started)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - now,
+        Duration::from_millis(100) + astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT
+    );
+}
+
 #[path = "cancellation_db_tests.rs"]
 mod cancellation_db_tests;
 
@@ -2835,6 +2875,7 @@ async fn attached_stream_closes_a_stalled_interaction_lane_for_durable_replay() 
 struct StaticRunControlProvider {
     status: Option<RunControlStatus>,
     calls: AtomicUsize,
+    guidance: StdMutex<std::collections::VecDeque<Result<Option<i64>, String>>>,
 }
 
 struct HangingRunControlProvider {
@@ -2889,6 +2930,7 @@ impl StaticRunControlProvider {
         Self {
             status,
             calls: AtomicUsize::new(0),
+            guidance: StdMutex::new(Default::default()),
         }
     }
 
@@ -2899,6 +2941,26 @@ impl StaticRunControlProvider {
 
 #[async_trait::async_trait]
 impl crate::turn::run_control::RunStatusProvider for StaticRunControlProvider {
+    async fn control_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<crate::turn::run_control::RunControlObservation, String> {
+        let guidance = self
+            .guidance
+            .lock()
+            .unwrap()
+            .pop_front()
+            .transpose()?
+            .flatten();
+        Ok(crate::turn::run_control::RunControlObservation {
+            status: self.control_status(user_id, run_id).await?,
+            last_event_idx: guidance.map(|_| 7),
+            last_guidance_event_idx: guidance,
+            ..Default::default()
+        })
+    }
+
     async fn control_status(
         &self,
         _user_id: &str,
@@ -12407,7 +12469,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
                 .await
                 .get(&run_id)
                 .unwrap()
-                .input_wake
+                .guidance_wake
                 .subscribe();
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -12422,6 +12484,15 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
             })
             .await
             .expect("the owning Server observes remotely committed guidance");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while llm.requests.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "new guidance must reach a second provider request before the first is released",
+            );
         }
         drop(permit);
         llm.release_blocked.notify_one();
@@ -21190,6 +21261,7 @@ fn active_run_live_event_projection_excludes_transient_agent_activity() {
         pause_flag: Arc::new(AtomicBool::new(false)),
         llm_cancel_token: Arc::new(CancellationToken::new()),
         input_wake: tokio::sync::watch::channel(-1).0,
+        guidance_wake: tokio::sync::watch::channel(-1).0,
         live_tx: None,
         attached_event_tx: None,
         waiting_for: None,
@@ -21609,6 +21681,7 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
         pause_flag: Arc::new(AtomicBool::new(false)),
         llm_cancel_token: cancel_token,
         input_wake: tokio::sync::watch::channel(-1).0,
+        guidance_wake: tokio::sync::watch::channel(-1).0,
         live_tx: None,
         attached_event_tx: None,
         waiting_for: None,
@@ -27844,6 +27917,7 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         cancel.clone(),
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
+        tokio::sync::watch::channel(-1).0,
     )
     .unwrap();
     // Let the task install its lifetime guard before simulating a task failure.
@@ -27857,6 +27931,78 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         "observer failure is runtime-owned"
     );
     assert!(watcher.alive.has_changed().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_control_watcher_observes_committed_guidance() {
+    let provider = Arc::new(StaticRunControlProvider::new(None));
+    provider.guidance.lock().unwrap().push_back(Ok(Some(6)));
+    let (guidance, observed) = tokio::sync::watch::channel(-1);
+    let _watcher = start_active_run_control_watcher(
+        Some(provider.clone()),
+        "user-1".into(),
+        "session-1".into(),
+        "run-1".into(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(CancellationToken::new()),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
+        guidance,
+    )
+    .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        *observed.borrow(),
+        6,
+        "guidance committed after the opening ACK is still seen"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_run_control_watcher_retries_control_failure_without_losing_pause() {
+    let provider = Arc::new(StaticRunControlProvider::new(Some(
+        RunControlStatus::Paused,
+    )));
+    provider.guidance.lock().unwrap().extend([
+        Ok(None),
+        Err("control query unavailable".into()),
+        Ok(Some(6)),
+    ]);
+    let pause = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(CancellationToken::new());
+    let (guidance, observed) = tokio::sync::watch::channel(-1);
+    let _watcher = start_active_run_control_watcher(
+        Some(provider.clone()),
+        "user-1".into(),
+        "session-1".into(),
+        "run-1".into(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        pause.clone(),
+        cancel.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
+        guidance,
+    )
+    .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert!(pause.load(Ordering::Acquire));
+    assert_eq!(*observed.borrow(), -1);
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert!(pause.load(Ordering::Acquire));
+    assert_eq!(*observed.borrow(), -1);
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert_eq!(*observed.borrow(), 6);
+    assert!(!cancel.is_cancelled());
 }
 
 #[tokio::test(start_paused = true)]
@@ -27879,6 +28025,7 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
         pause_flag.clone(),
         cancel_token.clone(),
         Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
@@ -27960,6 +28107,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             cancel.clone(),
             lost.clone(),
             sender,
+            tokio::sync::watch::channel(-1).0,
         )
         .unwrap();
         watchers.push((guard, cancel, pause, lost, receiver));
@@ -28080,6 +28228,7 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
         cancel_token.clone(),
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
+        tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
 
@@ -28116,6 +28265,7 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
         pause_flag,
         cancel_token,
         Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
@@ -28776,6 +28926,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: 449,
+        last_guidance_event_idx: -1,
         current_checkpoint: None,
         error_code: None,
         error_message: None,
@@ -35012,7 +35163,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
     let pool = setup_lifecycle_run_db_it().await;
     // ACK decoding/order is exercised by the real framed-process tests. This
     // composed test begins at that validated contract and calls public owners.
-    for accepted in [Some(true), Some(false), None] {
+    for accepted in [Some(true), Some(false)] {
         let user = Uuid::new_v4().to_string();
         let session = Uuid::new_v4().to_string();
         let owner = Uuid::new_v4().to_string();
@@ -35218,6 +35369,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
         state.current_run_owner_generation = Some(1);
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
         let mut cursor = 0;
+        let delivery_unconfirmed = AtomicBool::new(false);
         let pump = pump_native_guidance(
             &edge_pool,
             &mut host,
@@ -35226,6 +35378,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             binding,
             "selected-runner",
             &mut cursor,
+            &delivery_unconfirmed,
         );
         let acknowledge = async {
             let EdgeServerMessage::ToolInput {
@@ -35267,8 +35420,9 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             ) | (
                 Some(false),
                 NativeGuidanceProgress::Continue { retry_at: Some(_) }
-            ) | (None, NativeGuidanceProgress::StoppedUnconfirmed)
+            )
         ));
+        assert!(!delivery_unconfirmed.load(Ordering::Acquire));
         if accepted == Some(false) {
             let stored = service
                 .run_engine
@@ -35307,6 +35461,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                 binding,
                 "selected-runner",
                 &mut cursor,
+                &delivery_unconfirmed,
             );
             let ack = async {
                 let EdgeServerMessage::ToolInput {
@@ -35368,7 +35523,8 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                     &identity,
                     binding,
                     "selected-runner",
-                    &mut cursor
+                    &mut cursor,
+                    &delivery_unconfirmed,
                 )
                 .await
                 .unwrap(),
