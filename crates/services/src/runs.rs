@@ -18135,11 +18135,12 @@ impl RunStateStore for DatabaseRunStateStore {
         .fetch_optional(connection.connection_mut())
         .await
         .map_err(|source| db_error("load_user_intent_watermark", run_id, source).to_string())?;
-        connection.release();
         let Some(authoritative_last_event_idx) = watermark else {
+            connection.release();
             return Ok(None);
         };
         if after_event_idx >= authoritative_last_event_idx {
+            connection.release();
             return Ok(Some(DurableRunUserIntentControlDelta {
                 authoritative_last_event_idx,
                 page_cursor: after_event_idx,
@@ -18167,7 +18168,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(authoritative_last_event_idx)
             .bind(sql_limit)
             .bind(sql_limit)
-            .fetch_all(self.pool.get())
+            .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| {
                 db_error("load_user_intent_control_delta", run_id, source).to_string()
@@ -18205,7 +18206,7 @@ impl RunStateStore for DatabaseRunStateStore {
             builder.push(" ORDER BY event_idx ASC");
             builder
                 .build()
-                .fetch_all(self.pool.get())
+                .fetch_all(connection.connection_mut())
                 .await
                 .map_err(|source| {
                     db_error("load_user_intent_control_dispositions", run_id, source).to_string()
@@ -18215,6 +18216,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?
         };
+        connection.release();
         Ok(Some(DurableRunUserIntentControlDelta {
             authoritative_last_event_idx,
             page_cursor,

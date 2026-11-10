@@ -232,7 +232,14 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
     }
 }
 
-const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+fn is_control_observation_sql(sql: &str) -> bool {
+    sql.starts_with("SELECT requested.ordinal, ")
+        && sql.contains(" FROM (VALUES ROW(")
+        && sql.contains(
+            " LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id",
+        )
+        && sql.contains(" AS cancellation_requested")
+}
 
 // The account/session snapshot is cached for 30 seconds. A slow fixture can
 // cross that boundary independently of readonly tool rounds. Attribute only
@@ -603,7 +610,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                         let observed = capture.0.lock().unwrap().as_ref().is_some_and(|samples| {
                             samples
                                 .iter()
-                                .any(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+                                .any(|sample| is_control_observation_sql(&sample.sql))
                         });
                         if observed {
                             break;
@@ -718,7 +725,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
 
         let control_observation_sql = samples
             .iter()
-            .filter(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+            .filter(|sample| is_control_observation_sql(&sample.sql))
             .count();
         if held_for_control {
             assert!(control_observation_sql > 0);
@@ -1433,7 +1440,7 @@ async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
         .collect::<Vec<_>>();
     let control_polls = sql
         .iter()
-        .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
+        .filter(|statement| is_control_observation_sql(statement))
         .count();
     let authentication_reads = authentication_snapshot_count(&sql);
     // The measured cold Auto path is 29 statements including transactions and

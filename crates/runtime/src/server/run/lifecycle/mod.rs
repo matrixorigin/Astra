@@ -18052,6 +18052,20 @@ async fn wait_native_guidance(
     tokio::time::sleep_until(deadline).await;
 }
 
+// A completed invocation only needs to wait for guidance that already owns
+// a transport or durable disposition. A stalled read has nothing to settle.
+async fn drain_started_native_guidance<F: std::future::Future>(
+    guidance: std::pin::Pin<&mut F>,
+    delivery_unconfirmed: &AtomicBool,
+) -> Option<F::Output> {
+    if !delivery_unconfirmed.load(Ordering::Acquire) {
+        return None;
+    }
+    tokio::time::timeout(astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT, guidance)
+        .await
+        .ok()
+}
+
 async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHost>(
     pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
     host: &mut H,
@@ -18060,7 +18074,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
     binding: astra_server_types::edge_connection_pool::ProviderStageDispatchBinding,
     edge_agent_id: &str,
     cursor: &mut usize,
-    delivery_unconfirmed: &mut bool,
+    delivery_unconfirmed: &AtomicBool,
 ) -> Result<NativeGuidanceProgress, astra_core::ClassifiedError> {
     use crate::turn::agentic_loop::execution_phase::{
         ProviderBoundaryGate, apply_acknowledged_user_intents, apply_pending_user_intents_once,
@@ -18072,6 +18086,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
     let now = tokio::time::Instant::now();
     let pending = state.user_intents.pending_apply_event_indices();
     if state.user_intents.should_retry_apply_ack(now) {
+        delivery_unconfirmed.store(true, Ordering::Release);
         apply_pending_user_intents_once(
             host,
             state,
@@ -18088,6 +18103,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
             }),
         )
         .await?;
+        delivery_unconfirmed.store(false, Ordering::Release);
     }
     // Do not let a later steer overtake an accepted input whose durable
     // disposition still needs acknowledgement, including after owner loss.
@@ -18155,7 +18171,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 ),
             });
         }
-        *delivery_unconfirmed = true;
+        delivery_unconfirmed.store(true, Ordering::Release);
         match pool
             .deliver_provider_stage_input(
                 identity,
@@ -18180,7 +18196,6 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                             error,
                         )
                     })?;
-                *delivery_unconfirmed = false;
                 *cursor = event.event_index;
                 apply_pending_user_intents_once(
                     host,
@@ -18198,6 +18213,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                     }),
                 )
                 .await?;
+                delivery_unconfirmed.store(false, Ordering::Release);
                 // Yield to result/cancellation settlement after one physical
                 // input. A full page must not monopolize the native waiter.
                 return Ok(NativeGuidanceProgress::Continue {
@@ -18224,7 +18240,6 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                             error,
                         )
                     })?;
-                *delivery_unconfirmed = false;
                 *cursor = event.event_index;
                 tracing::warn!(run_id = %identity.run_id, intent_id = %event.intent_id,
                         reason = ?ack.reason, "native guidance was rejected");
@@ -18244,6 +18259,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                     }),
                 )
                 .await?;
+                delivery_unconfirmed.store(false, Ordering::Release);
                 return Ok(NativeGuidanceProgress::Continue {
                     retry_at: Some(
                         state
@@ -18254,7 +18270,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 });
             }
             Err(error) if !error.may_have_reached_provider => {
-                *delivery_unconfirmed = false;
+                delivery_unconfirmed.store(false, Ordering::Release);
                 return Ok(NativeGuidanceProgress::Continue {
                     retry_at: Some(
                         tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
@@ -22287,10 +22303,10 @@ impl ServerSubRunExecutor {
                         // Poll physical completion while control I/O is in
                         // progress. A slow poll or persistence call must not
                         // keep the invocation future from observing cancel.
-                        let mut delivery_unconfirmed = false;
+                        let delivery_unconfirmed = AtomicBool::new(false);
                         let guidance = pump_native_guidance(pool, host, state,
                             &identity, dispatch_binding.expect("this dispatch enabled guidance"),
-                            &edge_agent_id, &mut guidance_cursor, &mut delivery_unconfirmed);
+                            &edge_agent_id, &mut guidance_cursor, &delivery_unconfirmed);
                         let mut guidance = Box::pin(guidance);
                         let mut completed_invocation = None;
                         let progress = tokio::select! {
@@ -22302,15 +22318,14 @@ impl ServerSubRunExecutor {
                                 // frames. Give the original waiter a bounded
                                 // drain so frame order cannot discard an ACK;
                                 // this never sends another input.
-                                tokio::time::timeout(
-                                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
-                                    &mut guidance,
-                                ).await.ok()
+                                drain_started_native_guidance(
+                                    guidance.as_mut(), &delivery_unconfirmed,
+                                ).await
                             },
                         };
                         drop(guidance);
                         if let Some(result) = completed_invocation {
-                            guidance_disposition_unconfirmed |= delivery_unconfirmed;
+                            guidance_disposition_unconfirmed |= delivery_unconfirmed.load(Ordering::Acquire);
                             break result;
                         }
                         guidance_enabled = match progress.expect("one branch completed")? {

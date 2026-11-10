@@ -21966,6 +21966,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "error",
                         llm_capture_error_response(&e),
                     );
+                    if e.kind == astra_core::ErrorKind::Cancelled {
+                        // Only bytes actually projected to the user belong in
+                        // the next model context. Work-gated text and tool
+                        // fragments are still provisional.
+                        if let Some(message) =
+                            astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+                                &state.messages,
+                                &streamed_text,
+                                state.current_model_item_id.as_deref(),
+                            )
+                        {
+                            state.push_prompt_history_message(message);
+                        }
+                        let mut error = e;
+                        if let Some(Value::Object(mut details)) = error
+                            .details_json
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok())
+                        {
+                            details.insert("partial_full_text".into(), json!(streamed_text));
+                            error.details_json = Some(Value::Object(details).to_string());
+                        }
+                        // Cancellation is an ordinary control transition, not
+                        // a provider failure requiring a synchronous full-request
+                        // artifact on the hot path.
+                        return Err(error);
+                    }
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -52003,9 +52030,13 @@ mod tests {
                 inference.cancel();
             }
             let result = execution.await;
+            let error = result.err().expect("cancelled");
+            assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
             assert_eq!(
-                result.err().expect("cancelled").kind,
-                astra_core::ErrorKind::Cancelled
+                details["partial_full_text"], "",
+                "unpublished Work text stays private"
             );
             release.notify_one();
             let mut text = Vec::new();
@@ -52016,6 +52047,152 @@ mod tests {
             }
             assert!(text.is_empty(), "provisional Work answer leaked: {text:?}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn superseded_stream_preserves_visible_context_without_database_dumps() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let mut settings = MatrixOneSettings::from_env();
+        settings.db_pool_min_connections = 0;
+        settings.db_pool_max_connections = 1;
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let user = format!("steer-no-dump-user-{nonce}");
+        let session = format!("steer-no-dump-session-{nonce}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let chunks = [
+            json!({"choices":[{"delta":{"content":"Visible partial."}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n").into_bytes())
+        .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+        .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "cancel a visible provider response",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )])
+        .await;
+        let mut host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        host.terminal_handoff_window.close();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(events_tx);
+        let mut state = create_durable_execution_test_state(&session);
+        state.message = "continue".into();
+        state.user_intent = state.message.clone();
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let inference = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent);
+        state.cancellation.inference_token = Some(inference.clone());
+        let error = {
+            let execution = host.execute_turn(&mut state);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    _ = &mut execution => panic!("provider ended before cancellation"),
+                    event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv()) => {
+                        let event = event.unwrap().unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                            assert_eq!(event["content"], "Visible partial.");
+                            break;
+                        }
+                    }
+                }
+            }
+            // The only connection is unavailable. A diagnostic dump would
+            // block here, even though the interrupted inference has settled.
+            let held = pool.get().acquire().await.unwrap();
+            inference.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut execution)
+                .await
+                .expect("cancelled inference must not wait for the database");
+            drop(held);
+            result.err().expect("inference was superseded")
+        };
+        release.notify_one();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(
+            state.messages.iter().any(|message| {
+                message["role"] == "assistant" && message["content"] == "Visible partial."
+            }),
+            "the next request must see the text the user already saw"
+        );
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 0);
+        provider.assert_complete();
+
+        // Real provider failures retain their existing diagnostics.
+        let failing_provider = ProviderGateway::start(vec![ProviderScript::new(
+            "reject a provider request",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::Json {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error": {"message": "invalid request"}}),
+            }],
+        )])
+        .await;
+        let mut failed_host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", failing_provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        let mut failed_state = create_durable_execution_test_state(&session);
+        let error = failed_host
+            .execute_turn(&mut failed_state)
+            .await
+            .err()
+            .expect("provider failure");
+        assert_ne!(error.kind, astra_core::ErrorKind::Cancelled);
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 1);
+        failing_provider.assert_complete();
+        sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

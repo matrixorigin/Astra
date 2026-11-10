@@ -115,6 +115,46 @@ async fn native_guidance_wait_is_idle_but_preserves_retry_and_closed_subscriptio
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn finished_native_invocation_only_drains_started_guidance() {
+    let started = AtomicBool::new(false);
+    let pending = std::future::pending::<()>();
+    tokio::pin!(pending);
+    let now = tokio::time::Instant::now();
+    assert!(
+        drain_started_native_guidance(pending.as_mut(), &started)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        now,
+        "an idle control read cannot delay a completed result"
+    );
+
+    started.store(true, Ordering::Release);
+    let ack = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        42
+    };
+    tokio::pin!(ack);
+    assert_eq!(
+        drain_started_native_guidance(ack.as_mut(), &started).await,
+        Some(42)
+    );
+    let pending = std::future::pending::<()>();
+    tokio::pin!(pending);
+    assert!(
+        drain_started_native_guidance(pending.as_mut(), &started)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - now,
+        Duration::from_millis(100) + astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT
+    );
+}
+
 #[path = "cancellation_db_tests.rs"]
 mod cancellation_db_tests;
 
@@ -35329,7 +35369,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
         state.current_run_owner_generation = Some(1);
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
         let mut cursor = 0;
-        let mut delivery_unconfirmed = false;
+        let delivery_unconfirmed = AtomicBool::new(false);
         let pump = pump_native_guidance(
             &edge_pool,
             &mut host,
@@ -35338,7 +35378,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             binding,
             "selected-runner",
             &mut cursor,
-            &mut delivery_unconfirmed,
+            &delivery_unconfirmed,
         );
         let acknowledge = async {
             let EdgeServerMessage::ToolInput {
@@ -35382,7 +35422,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                 NativeGuidanceProgress::Continue { retry_at: Some(_) }
             )
         ));
-        assert!(!delivery_unconfirmed);
+        assert!(!delivery_unconfirmed.load(Ordering::Acquire));
         if accepted == Some(false) {
             let stored = service
                 .run_engine
@@ -35421,7 +35461,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                 binding,
                 "selected-runner",
                 &mut cursor,
-                &mut delivery_unconfirmed,
+                &delivery_unconfirmed,
             );
             let ack = async {
                 let EdgeServerMessage::ToolInput {
@@ -35484,7 +35524,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                     binding,
                     "selected-runner",
                     &mut cursor,
-                    &mut delivery_unconfirmed,
+                    &delivery_unconfirmed,
                 )
                 .await
                 .unwrap(),

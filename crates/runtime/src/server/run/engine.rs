@@ -10701,32 +10701,30 @@ mod tests {
             .start_run("run-gapped", "user-1", "sess-gapped")
             .await
             .unwrap();
+        // The run starts at 0. Ordinary events occupy 1..=6 and 8;
+        // the filtered control page must retain durable gaps.
+        let mut events = vec![serde_json::json!({"event_type":"agent_progress"}); 6];
+        events.extend([
+            serde_json::json!({
+                "event_type": "user_intent",
+                "data": {
+                    "intent_id": "intent-7",
+                    "delivery": "guide_current_run",
+                    "input": {"content": "first"}
+                }
+            }),
+            serde_json::json!({"event_type":"agent_progress"}),
+            serde_json::json!({
+                "event_type": "user_intent",
+                "data": {
+                    "intent_id": "intent-9",
+                    "delivery": "guide_current_run",
+                    "input": {"content": "second"}
+                }
+            }),
+        ]);
         engine
-            .append_events_batch(
-                "user-1",
-                "sess-gapped",
-                "run-gapped",
-                &[
-                    serde_json::json!({
-                        "index": 7,
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": "intent-7",
-                            "delivery": "guide_current_run",
-                            "input": {"content": "first"}
-                        }
-                    }),
-                    serde_json::json!({
-                        "index": 9,
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": "intent-9",
-                            "delivery": "guide_current_run",
-                            "input": {"content": "second"}
-                        }
-                    }),
-                ],
-            )
+            .append_events_batch("user-1", "sess-gapped", "run-gapped", &events)
             .await
             .unwrap();
 
@@ -10811,9 +10809,8 @@ mod tests {
                         .start_run("run-input", "user-1", "sess-input")
                         .await
                         .unwrap();
-                    let events = [7, 9].map(|index| {
+                    let controls = [7, 9].map(|index| {
                         serde_json::json!({
-                            "index": index,
                             "event_type": event_type,
                             "data": {
                                 "event_index": index,
@@ -10823,6 +10820,10 @@ mod tests {
                             }
                         })
                     });
+                    let mut events = vec![serde_json::json!({"event_type":"agent_progress"}); 6];
+                    events.push(controls[0].clone());
+                    events.push(serde_json::json!({"event_type":"agent_progress"}));
+                    events.push(controls[1].clone());
                     engine
                         .append_events_batch("user-1", "sess-input", "run-input", &events)
                         .await
