@@ -125,18 +125,20 @@ impl ToolExecutor {
             Err(e) => {
                 let error = astra_mcp::McpError::Service(e);
                 if error.side_effects_maybe() {
-                    let mut mgr = manager_arc.write().await;
-                    // Another caller may already have replaced this connection.
-                    if mgr
-                        .get(server_name)
-                        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &conn))
-                    {
-                        if let Err(reconnect_error) = mgr.reconnect(server_name).await {
-                            tracing::warn!(
-                                server = %server_name,
-                                error = %reconnect_error,
-                                "MCP connection recovery failed after an uncertain call"
-                            );
+                    if !error.provider_acknowledged() {
+                        let mut mgr = manager_arc.write().await;
+                        // Another caller may already have replaced this connection.
+                        if mgr
+                            .get(server_name)
+                            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &conn))
+                        {
+                            if let Err(reconnect_error) = mgr.reconnect(server_name).await {
+                                tracing::warn!(
+                                    server = %server_name,
+                                    error = %reconnect_error,
+                                    "MCP connection recovery failed after an uncertain call"
+                                );
+                            }
                         }
                     }
                     let mut outcome = ToolExecutionOutcome::error(format!(
@@ -275,7 +277,7 @@ mod tests {
         assert_eq!(metadata["dispatch_certainty"], "unknown");
         assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
         assert_eq!(metadata["mcp_call_dispatched"], true);
-        assert_eq!(metadata["workspace_effect_settled"], false);
+        assert_eq!(metadata["execution_fact"], "unknown");
         assert_eq!(
             std::fs::read_to_string(&counter).expect("durable fixture mutation"),
             "applied\n",

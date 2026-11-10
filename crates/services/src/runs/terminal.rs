@@ -3,7 +3,7 @@
 //! an execution grant or evidence that an external effect has settled.
 
 use super::*;
-use astra_turn_types::interruption::{InterruptionKind, InterruptionRecord};
+use astra_turn_types::interruption::InterruptionRecord;
 use astra_turn_types::{
     CanonicalTokenUsage, SessionCursorV1, tool_ledger_receipt::ToolLedgerReceipt,
 };
@@ -62,8 +62,8 @@ pub enum CanonicalTerminalContext {
     /// Legitimately empty outcome: validate the admitted base without
     /// fabricating an empty conversation turn.
     Unchanged,
-    /// A real control revocation forbids a Context write, even when the Run's
-    /// cancellation and original raw history can still be committed.
+    /// This Run's Context was not saved, while its raw history and terminal
+    /// may still be committed (for example after revocation or a size limit).
     Revoked,
     Unowned,
 }
@@ -200,6 +200,13 @@ impl CanonicalRunTerminalReceipt {
                 data["cancelled"] = true.into();
                 data["cancellation_origin"] = origin.as_str().into();
             }
+            match &self.context {
+                CanonicalTerminalContext::Revoked => data["context_not_saved"] = true.into(),
+                CanonicalTerminalContext::Advanced { .. } | CanonicalTerminalContext::Unchanged => {
+                    data["context_not_saved"] = false.into();
+                }
+                CanonicalTerminalContext::Unowned => {}
+            }
             if let Some(interruption) = &self.interruption {
                 data["interruption"] = interruption.to_json();
             }
@@ -271,7 +278,7 @@ impl CanonicalRunTerminalReceipt {
         }
         if let Some(interruption) = &self.interruption
             && (!matches!(self.outcome, CanonicalTerminalOutcome::Failed)
-                || interruption.kind != InterruptionKind::ExecutionIncomplete
+                || astra_core::ErrorKind::parse_tag(interruption.kind.label()).is_some()
                 || self.error_kind.is_some()
                 || self.error_metadata.is_some()
                 || self.error_code.as_deref() != Some(interruption.kind.label())
@@ -1226,47 +1233,54 @@ mod tests {
 
     #[test]
     fn cold_terminal_interruption_requires_coherent_sanitized_outcome() {
-        use astra_turn_types::interruption::{InterruptionStateSummary, ResumeAction};
-        let mut stored = failed_receipt();
-        let record = InterruptionRecord::new(
+        use astra_turn_types::interruption::{
+            InterruptionKind, InterruptionStateSummary, ResumeAction,
+        };
+        for kind in [
             InterruptionKind::ExecutionIncomplete,
-            ResumeAction::ContinueImmediately,
-            InterruptionStateSummary::default(),
-        );
-        stored.receipt.error_kind = None;
-        stored.receipt.error_metadata = None;
-        stored.receipt.error_code = Some(record.kind.label().into());
-        stored.receipt.error_hash =
-            CanonicalRunTerminalReceipt::error_hash(Some(&record.user_message));
-        stored.receipt.interruption = Some(record);
-        let encoded = serde_json::to_string(&stored).unwrap();
-        assert_eq!(
-            CommittedRunTerminalReceipt::decode(&encoded, 2).unwrap(),
-            stored
-        );
-        for (path, value) in [
-            (
-                "/receipt/interruption/error_detail",
-                serde_json::json!("private"),
-            ),
-            (
-                "/receipt/interruption/user_message",
-                serde_json::json!("changed error"),
-            ),
-            (
-                "/receipt/interruption/kind",
-                serde_json::json!("budget_exhausted"),
-            ),
-            ("/receipt/error_kind", serde_json::json!("network")),
-            ("/receipt/error_code", serde_json::json!("other_error")),
-            ("/receipt/outcome/status", serde_json::json!("completed")),
+            InterruptionKind::TokenBudgetExceeded,
         ] {
-            let mut corrupt: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-            *corrupt.pointer_mut(path).unwrap() = value;
-            assert!(
-                CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err(),
-                "{path}"
+            let mut stored = failed_receipt();
+            let record = InterruptionRecord::new(
+                kind,
+                ResumeAction::ContinueImmediately,
+                InterruptionStateSummary::default(),
             );
+            stored.receipt.error_kind = None;
+            stored.receipt.error_metadata = None;
+            stored.receipt.error_code = Some(record.kind.label().into());
+            stored.receipt.error_hash =
+                CanonicalRunTerminalReceipt::error_hash(Some(&record.user_message));
+            stored.receipt.interruption = Some(record);
+            let encoded = serde_json::to_string(&stored).unwrap();
+            assert_eq!(
+                CommittedRunTerminalReceipt::decode(&encoded, 2).unwrap(),
+                stored
+            );
+            for (path, value) in [
+                (
+                    "/receipt/interruption/error_detail",
+                    serde_json::json!("private"),
+                ),
+                (
+                    "/receipt/interruption/user_message",
+                    serde_json::json!("changed error"),
+                ),
+                (
+                    "/receipt/interruption/kind",
+                    serde_json::json!("budget_exhausted"),
+                ),
+                ("/receipt/error_kind", serde_json::json!("network")),
+                ("/receipt/error_code", serde_json::json!("other_error")),
+                ("/receipt/outcome/status", serde_json::json!("completed")),
+            ] {
+                let mut corrupt: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                *corrupt.pointer_mut(path).unwrap() = value;
+                assert!(
+                    CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err(),
+                    "{path}"
+                );
+            }
         }
     }
 

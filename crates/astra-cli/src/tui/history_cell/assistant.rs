@@ -11,9 +11,8 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Settled reply bodies indent prose rows with plain spaces and carry no
-//! glyph marker; code-block rows stay verbatim at column 0, so text selected
-//! from native scrollback copies as written.
+//! Settled reply bodies align prose and code at column 0. Code-block rows
+//! stay verbatim so text selected from native scrollback copies as written.
 //! Live cells still use the active-slot wrapper for structure.
 //! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
@@ -81,11 +80,82 @@ struct LiveMarkdownLayoutCache {
     lines: Vec<Line<'static>>,
 }
 
+/// Offsets into `source`, maintained as it grows. The cursor overlaps the
+/// possible split closing tag so streaming never rescans an entire thought.
+#[derive(Debug, Clone)]
+enum ThinkEnvelope {
+    Prefix {
+        whitespace_end: usize,
+    },
+    Plain,
+    Tagged {
+        inner_start: usize,
+        close_tag: &'static str,
+        search_from: usize,
+        close_start: Option<usize>,
+    },
+}
+
+impl ThinkEnvelope {
+    fn new(source: &str) -> Self {
+        let mut envelope = Self::Prefix { whitespace_end: 0 };
+        envelope.advance(source);
+        envelope
+    }
+
+    fn advance(&mut self, source: &str) {
+        const TAGS: [(&str, &str); 2] = [("<think>", "</think>"), ("<thinking>", "</thinking>")];
+        if let Self::Prefix { whitespace_end } = self {
+            let remaining = &source[*whitespace_end..];
+            let trimmed = remaining.trim_start();
+            *whitespace_end += remaining.len() - trimmed.len();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some((open, close)) = TAGS.iter().find(|(open, _)| trimmed.starts_with(open)) {
+                let inner_start = *whitespace_end + open.len();
+                *self = Self::Tagged {
+                    inner_start,
+                    close_tag: close,
+                    search_from: inner_start,
+                    close_start: None,
+                };
+            } else if TAGS.iter().all(|(open, _)| !open.starts_with(trimmed)) {
+                *self = Self::Plain;
+            } else {
+                return;
+            }
+        }
+        if let Self::Tagged {
+            inner_start,
+            close_tag,
+            search_from,
+            close_start,
+        } = self
+            && close_start.is_none()
+        {
+            if let Some(relative) = source[*search_from..].find(*close_tag) {
+                *close_start = Some(*search_from + relative);
+            } else {
+                let mut next = source
+                    .len()
+                    .saturating_sub(close_tag.len() - 1)
+                    .max(*inner_start);
+                while !source.is_char_boundary(next) {
+                    next += 1;
+                }
+                *search_from = next;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AssistantCell {
     pub(crate) model_item_id: Option<String>,
     /// Raw markdown. Growing during stream via `push_delta`.
     source: String,
+    think_envelope: ThinkEnvelope,
     /// `true` while tokens can still arrive. Flipped to false by
     /// `finalize()`.
     live: bool,
@@ -109,6 +179,7 @@ impl AssistantCell {
         Self {
             model_item_id: None,
             source: String::new(),
+            think_envelope: ThinkEnvelope::new(""),
             live: true,
             ts: None,
             render_revision: 0,
@@ -120,9 +191,11 @@ impl AssistantCell {
     /// Construct from a complete markdown blob — e.g. replay on
     /// resume, or a non-streaming model reply. Not live.
     pub fn from_markdown(markdown: impl Into<String>) -> Self {
+        let source = markdown.into();
         Self {
             model_item_id: None,
-            source: markdown.into(),
+            think_envelope: ThinkEnvelope::new(&source),
+            source,
             live: false,
             ts: None,
             render_revision: 0,
@@ -136,6 +209,7 @@ impl AssistantCell {
         match ev {
             TurnEvent::Assistant { ts, markdown } => Some(Self {
                 model_item_id: None,
+                think_envelope: ThinkEnvelope::new(&markdown),
                 source: markdown,
                 live: false,
                 ts,
@@ -153,12 +227,35 @@ impl AssistantCell {
     pub fn push_delta(&mut self, delta: &str) {
         debug_assert!(self.live, "push_delta on finalised AssistantCell");
         self.source.push_str(delta);
+        self.think_envelope.advance(&self.source);
         self.render_revision = self.render_revision.wrapping_add(1);
         *astra_core::sync_poison::recover_mutex_lock(&self.render_cache) = None;
     }
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub(crate) fn refresh_live_viewport(&self) {
+        *astra_core::sync_poison::recover_mutex_lock(&self.live_render_cache) = None;
+    }
+
+    /// Plain, complete transcript details, without exposing thinking tags as
+    /// assistant prose. The ordinary live preview remains compact.
+    pub(crate) fn transcript_detail_text(&self) -> std::borrow::Cow<'_, str> {
+        let (thought, closed, body) = self.split_think();
+        let Some(thought) = thought else {
+            return std::borrow::Cow::Borrowed(&self.source);
+        };
+        let mut text = String::from("Thought\n");
+        text.push_str(thought);
+        if closed && !body.is_empty() {
+            if !thought.ends_with('\n') && !body.starts_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(body);
+        }
+        std::borrow::Cow::Owned(text)
     }
 
     /// Split the raw source into the optional thinking prefix and
@@ -200,27 +297,21 @@ impl AssistantCell {
     /// prose that mentions the tag.
     fn split_think(&self) -> (Option<&str>, bool, &str) {
         let source = self.source.as_str();
-        let trimmed = source.trim_start();
-        if trimmed.is_empty() {
-            return (None, false, source);
-        }
-        const THINK_TAGS: [(&str, &str); 2] =
-            [("<think>", "</think>"), ("<thinking>", "</thinking>")];
-
-        // Case 1 / 3: an explicit thinking envelope at the very start.
-        if let Some((open_tag, close_tag, after_open)) = THINK_TAGS
-            .iter()
-            .find_map(|&(open, close)| trimmed.strip_prefix(open).map(|after| (open, close, after)))
+        if let ThinkEnvelope::Tagged {
+            inner_start,
+            close_tag,
+            close_start,
+            ..
+        } = self.think_envelope
         {
-            if let Some(close_rel) = after_open.find(close_tag) {
-                let think_inner = &after_open[..close_rel];
-                let leading_ws = source.len() - trimmed.len();
-                let body_start = leading_ws + open_tag.len() + close_rel + close_tag.len();
-                let body = source[body_start..].trim_start_matches('\n');
-                return (Some(think_inner), true, body);
-            }
-            // Still streaming the think block — no close yet.
-            return (Some(after_open), false, "");
+            return match close_start {
+                Some(end) => (
+                    Some(&source[inner_start..end]),
+                    true,
+                    &source[end + close_tag.len()..],
+                ),
+                None => (Some(&source[inner_start..]), false, ""),
+            };
         }
 
         // Case 2: source ends with `</think>` → all of it is leaked
@@ -230,9 +321,8 @@ impl AssistantCell {
         //
         // The test has to handle trailing whitespace from the
         // streaming wire (partial chunks often end in `\n`).
-        if let Some(close_tag) = THINK_TAGS
-            .iter()
-            .map(|(_, close)| *close)
+        if let Some(close_tag) = ["</think>", "</thinking>"]
+            .into_iter()
             .find(|close| source.trim_end().ends_with(close))
         {
             let trimmed_end = source.trim_end();
@@ -320,15 +410,13 @@ impl AssistantCell {
             return (Vec::new(), 0);
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
-        let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
-        let lines = rendered.into_iter().map(prefix_settled_row).collect();
-        (lines, total)
+        self.markdown_layout_window(source, inner_width, start, maximum)
     }
 
     fn scrollback_body_source(&self) -> &str {
         let (think_inner, think_closed, body) = self.split_think();
         if think_inner.is_some() && think_closed {
-            body
+            body.trim_start_matches('\n')
         } else {
             self.source.as_str()
         }
@@ -387,16 +475,24 @@ impl AssistantCell {
         }
 
         let mut out = if let Some(think) = think_inner {
-            thought_header_lines(
-                think.trim().lines().count().max(1),
-                approx_tokens(think.chars().count() as u64),
-            )
+            if think.len() <= MAX_LIVE_THINK_BYTES {
+                thought_header_lines(
+                    think.trim().lines().count().max(1),
+                    approx_tokens(think.chars().count() as u64),
+                )
+            } else {
+                let theme = crate::tui::theme::current();
+                vec![Line::from(vec![
+                    Span::styled("● ", Style::default().fg(theme.dim)),
+                    thought_gradient("Thought", theme),
+                ])]
+            }
         } else {
             Vec::new()
         };
         let body_budget = maximum.saturating_sub(out.len()).max(1);
         let source = if think_inner.is_some() && think_closed {
-            body
+            body.trim_start_matches('\n')
         } else {
             self.source.as_str()
         };
@@ -519,7 +615,7 @@ impl AssistantCell {
             _ => Vec::new(),
         };
         let body_source = if think_inner.is_some() && think_closed {
-            body
+            body.trim_start_matches('\n')
         } else {
             self.source.as_str()
         };
@@ -541,49 +637,22 @@ impl AssistantCell {
         (lines, next, next >= total)
     }
 
-    fn render_body_with_gutter(&self, source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
+    fn render_body(&self, source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
         if source.trim().is_empty() {
             return Vec::new();
         }
-        // Settled cells prepend a 2-col prefix to every line, so wrap text
-        // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
-        // already receive `width - 2` from `active_viewport` (the
-        // `LiveFramedCell` wrapper paints its own gutter column). This means
-        // the final scrollback render uses the same markdown width as the
-        // last active draw and can reuse the cached layout.
-        let prepend_gutter = !live;
-        let inner_w = if prepend_gutter {
+        // Live cells receive the width inside the frame. Keep the same
+        // layout width when settled so the final render can reuse the cache.
+        let inner_w = if !live {
             (width as usize).saturating_sub(2).max(20)
         } else {
             (width as usize).max(20)
         };
-        let rendered = self.markdown_layout(source, inner_w);
-
-        if rendered.is_empty() {
-            return Vec::new();
-        }
-
-        rendered
+        self.markdown_layout(source, inner_w)
             .into_iter()
-            .map(|row| {
-                if prepend_gutter {
-                    prefix_settled_row(row).line
-                } else {
-                    row.line
-                }
-            })
+            .map(|row| row.line)
             .collect()
     }
-}
-
-/// Decorate prose while retaining code-row semantics for the final writer.
-/// Settled code starts at column zero and uses terminal soft wrapping; live
-/// responses keep their distinct focus gutter supplied by `LiveFramedCell`.
-fn prefix_settled_row(mut row: MarkdownRow) -> MarkdownRow {
-    if !row.verbatim {
-        row.line.spans.insert(0, Span::raw("  "));
-    }
-    row
 }
 
 impl HistoryCell for AssistantCell {
@@ -595,7 +664,7 @@ impl HistoryCell for AssistantCell {
 
         // Branch 1: no <think> block. Original render path.
         let Some(think) = think_inner else {
-            return self.render_body_with_gutter(&self.source, width, self.live);
+            return self.render_body(&self.source, width, self.live);
         };
 
         // Branch 2: <think> still open (streaming). Show a dim
@@ -610,7 +679,7 @@ impl HistoryCell for AssistantCell {
         let think_lines = think.trim().lines().count().max(1);
         let think_tokens = approx_tokens(think.chars().count() as u64);
         let mut out = thought_header_lines(think_lines, think_tokens);
-        out.extend(self.render_body_with_gutter(body, width, self.live));
+        out.extend(self.render_body(body.trim_start_matches('\n'), width, self.live));
         out
     }
 
@@ -691,6 +760,7 @@ pub(super) fn thought_gradient(word: &str, theme: &crate::tui::theme::Theme) -> 
 /// fixed-height instead of pushing the composer off-screen on a
 /// long internal monologue.
 const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 4;
+const MAX_LIVE_THINK_BYTES: usize = 8192;
 
 /// While `<think>` is open and the model is still streaming, show a
 /// calm `Thought · N lines · N tokens` header plus a fixed-height scrolling
@@ -706,29 +776,25 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     // Body preview text: fg dim only — readable but visually subordinate.
     let preview_text = Style::default().fg(theme.dim);
 
-    let line_count = think_partial.trim().lines().count().max(1);
-    let token_count = approx_tokens(think_partial.chars().count() as u64);
-    let line_label = if line_count == 1 {
-        "1 line".to_string()
-    } else {
-        format!("{line_count} lines")
-    };
-    let tok_label = if token_count == 1 {
-        "1 token".to_string()
-    } else {
-        format!("{token_count} tokens")
-    };
+    let (preview, truncated) = utf8_tail_window(think_partial, MAX_LIVE_THINK_BYTES);
 
     // The outer live gutter owns the activity marker. Keeping the inner
     // header marker-free makes its title align with `● Thought` after the
     // thinking segment freezes.
-    let mut out = vec![Line::from(vec![
-        thought_gradient("Thought", theme),
-        Span::styled(" · ", stat),
-        Span::styled(line_label, stat),
-        Span::styled(" · ", stat),
-        Span::styled(tok_label, stat),
-    ])];
+    let mut header = vec![thought_gradient("Thought", theme)];
+    if !truncated {
+        let line_count = preview.trim().lines().count().max(1);
+        let token_count = approx_tokens(preview.chars().count() as u64);
+        header.push(Span::styled(
+            format!(
+                " · {line_count} line{} · {token_count} token{}",
+                if line_count == 1 { "" } else { "s" },
+                if token_count == 1 { "" } else { "s" }
+            ),
+            stat,
+        ));
+    }
+    let mut out = vec![Line::from(header)];
 
     // Soft-wrap the partial thinking content, then render the most
     // recent N rows, with a `⋯ +M more` counter in the first slot
@@ -737,7 +803,7 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     // frame already reserves 2 cols for its border — total 6.
     let inner_w = (width as usize).saturating_sub(6).max(10);
     let mut body_rows: Vec<String> = Vec::new();
-    for logical in think_partial.lines() {
+    for logical in preview.lines() {
         if logical.trim().is_empty() {
             continue;
         }
@@ -747,16 +813,23 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     let total = body_rows.len();
-    let visible_start = if total > LIVE_THINK_PREVIEW_MAX_ROWS {
+    let visible_start = if truncated || total > LIVE_THINK_PREVIEW_MAX_ROWS {
         // Row 0 of the body shows the overflow counter; the window
         // displays the last `LIVE_THINK_PREVIEW_MAX_ROWS - 1` rows.
         let tail = LIVE_THINK_PREVIEW_MAX_ROWS - 1;
-        let hidden = total - tail;
+        let hidden = total.saturating_sub(tail);
         out.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("⋯ +{hidden} more"), stat),
+            Span::styled(
+                if truncated {
+                    "⋯ earlier thinking".to_string()
+                } else {
+                    format!("⋯ +{hidden} more")
+                },
+                stat,
+            ),
         ]));
-        total - tail
+        total.saturating_sub(tail)
     } else {
         0
     };
@@ -843,6 +916,94 @@ mod tests {
         c.push_delta("Hello ");
         c.push_delta("world");
         assert_eq!(c.source(), "Hello world");
+    }
+
+    #[test]
+    fn streamed_thinking_tags_survive_every_utf8_chunk_boundary() {
+        for (source, thought, closed, body) in [
+            (
+                " \u{2003}<think>推理</think>\n答案",
+                Some("推理"),
+                true,
+                "\n答案",
+            ),
+            (
+                "<thinking>thinking</thinking>answer",
+                Some("thinking"),
+                true,
+                "answer",
+            ),
+            ("<think>still thinking", Some("still thinking"), false, ""),
+            (
+                "A reference to </think> inside prose",
+                None,
+                false,
+                "A reference to </think> inside prose",
+            ),
+            (
+                " leaked thought </think>\n",
+                Some("leaked thought"),
+                true,
+                "",
+            ),
+        ] {
+            let expected = (thought, closed, body);
+            assert_eq!(AssistantCell::from_markdown(source).split_think(), expected);
+            for split in source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([source.len()])
+            {
+                let mut cell = AssistantCell::new_streaming();
+                cell.push_delta(&source[..split]);
+                cell.push_delta(&source[split..]);
+                assert_eq!(
+                    cell.split_think(),
+                    expected,
+                    "split at byte {split}: {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_streaming_thought_only_scans_the_new_suffix() {
+        let mut cell = AssistantCell::new_streaming();
+        cell.push_delta("<think>");
+        cell.push_delta(&"中文".repeat(32_768));
+        for _ in 0..64 {
+            cell.push_delta("x");
+            match cell.think_envelope {
+                ThinkEnvelope::Tagged {
+                    search_from,
+                    close_start: None,
+                    ..
+                } => {
+                    assert!(cell.source.len() - search_from <= "</think>".len());
+                }
+                _ => panic!("thought should remain open"),
+            }
+        }
+        cell.push_delta("</th");
+        cell.push_delta("ink>answer");
+        assert_eq!(cell.split_think().2, "answer");
+        let before = cell.think_envelope.clone();
+        cell.push_delta(" continues");
+        match (before, cell.think_envelope) {
+            (
+                ThinkEnvelope::Tagged {
+                    close_start: Some(a),
+                    search_from: x,
+                    ..
+                },
+                ThinkEnvelope::Tagged {
+                    close_start: Some(b),
+                    search_from: y,
+                    ..
+                },
+            ) => assert_eq!((a, x), (b, y)),
+            _ => panic!("the closed thought should retain its offsets"),
+        }
     }
 
     #[test]
@@ -1089,8 +1250,28 @@ mod tests {
                 c.display_lines(80),
                 scrollback.into_iter().map(|row| row.line).collect(),
             ] {
-                assert_eq!(line_text(&lines), "  git status", "{source:?}");
+                assert_eq!(line_text(&lines), "git status", "{source:?}");
             }
+        }
+    }
+
+    #[test]
+    fn settled_prose_and_code_share_the_same_left_edge() {
+        let source = "Result:\n\n```sh\ncat <<'EOF'\n  indented\nEOF\n```\n\nDone.";
+        let c = AssistantCell::from_markdown(source);
+        let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
+        assert!(complete);
+        for lines in [
+            c.display_lines(80),
+            scrollback.into_iter().map(|row| row.line).collect(),
+        ] {
+            let text = line_text(&lines);
+            assert!(text.starts_with("Result:"), "{text:?}");
+            assert!(
+                text.contains("\ncat <<'EOF'\n  indented\nEOF\n"),
+                "{text:?}"
+            );
+            assert!(text.ends_with("Done."), "{text:?}");
         }
     }
 
@@ -1128,8 +1309,8 @@ mod tests {
         c.push_delta("# Result\n\n- one\n- two\n\n`cargo test`");
 
         // `active_viewport` gives a live assistant the terminal width minus
-        // its frame gutter. The committed cell adds that gutter itself, so
-        // its scrollback width resolves to the same cached markdown layout.
+        // its frame gutter. Keep that layout width after settlement so the
+        // scrollback can reuse the same cached Markdown layout.
         let live = c.display_lines(78);
         assert!(!live.is_empty());
         {
@@ -1142,7 +1323,7 @@ mod tests {
 
         c.finalize();
         let settled = c.display_lines(80);
-        assert!(settled.iter().all(|line| !line.spans.is_empty()));
+        assert!(line_text(&settled).contains("Result"));
         let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
         assert!(matches!(
             cache.as_ref(),
@@ -1168,12 +1349,14 @@ mod tests {
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
-        assert!(
-            first
-                .iter()
-                .chain(&second)
-                .all(|row| row.line.spans[0].content.as_ref() == "  "),
-            "every chunk indents prose rows with plain spaces"
+        let lines = first
+            .into_iter()
+            .chain(second)
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            line_text(&lines).trim_end(),
+            "paragraph 0\n\nparagraph 1\n\nparagraph 2"
         );
     }
 

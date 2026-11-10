@@ -240,6 +240,9 @@ pub struct EdgeInvocation {
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
+    /// W3C carrier for this invocation's task. Empty when the server sent none.
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
     /// Bounded semantic inputs addressed to this invocation. Ordinary tool
     /// executors may ignore the receiver; provider-stage adapters consume it.
     pub input_rx: mpsc::Receiver<EdgeInvocationInput>,
@@ -377,12 +380,6 @@ struct CompletedEdgeInvocation {
     duration_ms: u64,
 }
 
-struct CompletedProviderStageInput {
-    request_id: String,
-    generation: u64,
-    ack: ProviderStageInputAck,
-}
-
 fn rejected_tool_message(
     request_id: String,
     identity: astra_turn_types::ToolInvocationIdentity,
@@ -504,8 +501,8 @@ pub struct EdgeInvocationOwner {
     tasks: JoinSet<()>,
     completed_tx: mpsc::Sender<CompletedEdgeInvocation>,
     completed_rx: mpsc::Receiver<CompletedEdgeInvocation>,
-    input_ack_tx: mpsc::Sender<CompletedProviderStageInput>,
-    input_ack_rx: mpsc::Receiver<CompletedProviderStageInput>,
+    input_ack_tx: mpsc::Sender<EdgeClientMessage>,
+    input_ack_rx: mpsc::Receiver<EdgeClientMessage>,
     journal: EdgeInvocationJournal,
     journal_writable: bool,
 }
@@ -517,7 +514,7 @@ impl EdgeInvocationOwner {
     ) -> Result<Self, EdgeConnectionError> {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
-            mpsc::channel::<CompletedProviderStageInput>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
+            mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
         let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
         let journal_status = journal.status();
         tracing::info!(
@@ -818,6 +815,8 @@ async fn serve_connection_on_owner(
                                 execution_timeout_ms,
                                 command_timeout_cap_ms,
                                 execution_ceiling,
+                                traceparent,
+                                tracestate,
                             }) => {
                                 let execution_deadline = if timeout_secs.is_none() && execution_ceiling.is_none() {
                                     Err("An unbudgeted task requires an admitted execution grant")
@@ -961,6 +960,8 @@ async fn serve_connection_on_owner(
                                             execution_ceiling,
                                             runtime_process_authorization,
                                             input_rx,
+                                            traceparent,
+                                            tracestate,
                                         }, cancel.clone()).await
                                     };
                                     // The executor owns asynchronous subprocess cleanup.
@@ -1009,6 +1010,7 @@ async fn serve_connection_on_owner(
                                 }
                                 let execution_generation = journal
                                     .running_execution_generation(&request_id, delivery_generation);
+                                let input_id = input.input_id().to_owned();
                                 let input = EdgeInvocationInput { input, ack: ack_tx };
                                 let sent = match execution_generation {
                                     Some(generation) => invocations.send_input(&request_id, generation, input),
@@ -1031,20 +1033,15 @@ async fn serve_connection_on_owner(
                                 }
                                 let input_ack_tx = input_ack_tx.clone();
                                 tokio::spawn(async move {
-                                    // A dropped adapter acknowledgement is a
-                                    // transport failure. Do not invent a
-                                    // third business disposition; the pool's
-                                    // bounded wait will retry the same input
-                                    // identity on the next opportunity.
-                                    if let Ok(ack) = ack_rx.await {
-                                        let _ = input_ack_tx
-                                            .send(CompletedProviderStageInput {
-                                                request_id,
-                                                generation: delivery_generation,
-                                                ack,
-                                            })
-                                            .await;
-                                    }
+                                    let message = match ack_rx.await {
+                                        Ok(ack) => EdgeClientMessage::ToolInputAck {
+                                            request_id, delivery_generation, ack,
+                                        },
+                                        Err(_) => EdgeClientMessage::ToolInputUnconfirmed {
+                                            request_id, delivery_generation, input_id,
+                                        },
+                                    };
+                                    let _ = input_ack_tx.send(message).await;
                                 });
                             }
                             Ok(EdgeServerMessage::CapacityRequest {
@@ -1152,12 +1149,7 @@ async fn serve_connection_on_owner(
                 );
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&result_msg)?.into()), &shutdown).await?;
             }
-            Some(completed) = input_ack_rx.recv() => {
-                let message = EdgeClientMessage::ToolInputAck {
-                    request_id: completed.request_id,
-                    delivery_generation: completed.generation,
-                    ack: completed.ack,
-                };
+            Some(message) = input_ack_rx.recv() => {
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
             _ = heartbeat.tick() => {
@@ -1454,7 +1446,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
 
         struct ControlledExecutor {
-            started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            started: std::sync::Mutex<Option<oneshot::Sender<u64>>>,
             executions: std::sync::atomic::AtomicUsize,
             inputs: std::sync::atomic::AtomicUsize,
             cancellations: std::sync::atomic::AtomicUsize,
@@ -1469,7 +1461,8 @@ mod tests {
                     self.executions
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if let Some(started) = self.started.lock().unwrap().take() {
-                        let _ = started.send(());
+                        let _ =
+                            started.send(invocation.args["fraction"].as_f64().unwrap().to_bits());
                     }
                     loop {
                         tokio::select! {
@@ -1545,7 +1538,7 @@ mod tests {
             identity: Box::new(identity),
             delivery_generation: 1,
             tool: "native_provider".into(),
-            args: serde_json::json!({}),
+            args: serde_json::json!({"fraction": 51.248178375505404_f64}),
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: Some(60),
@@ -1553,6 +1546,9 @@ mod tests {
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
             execution_ceiling: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         first_socket
             .send(Message::Text(
@@ -1560,10 +1556,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), started_rx)
+        let observed_bits = tokio::time::timeout(Duration::from_secs(3), started_rx)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(observed_bits, 51.248178375505404_f64.to_bits());
         first_socket.close(None).await.unwrap();
         let (mut second_socket, _) = tokio::time::timeout(
             Duration::from_secs(3),
@@ -1682,6 +1679,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(
@@ -1709,6 +1709,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(

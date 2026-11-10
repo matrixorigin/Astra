@@ -582,18 +582,17 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("enter_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_enter_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.session_id,
-                &context.user_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                args,
-            )
-            .await,
+        execute_enter_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.session_id,
+            &context.user_id,
+            &context.plan_mode_cache,
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            args,
+            cancel_token,
         )
+        .await
     }
 }
 
@@ -640,20 +639,27 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("exit_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_exit_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.user_id,
-                &context.session_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                context.approval_gate.as_deref(),
-                &plan_review_request_id(&context.session_id, invocation.tool_call_id),
-                args,
-            )
-            .await,
-        )
+        let request_id = plan_review_request_id(&context.session_id, invocation.tool_call_id);
+        let exit = execute_exit_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.user_id,
+            &context.session_id,
+            context.plan_mode_cache.as_ref(),
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            context.approval_gate.as_deref(),
+            &request_id,
+            args,
+        );
+        match cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                result = exit => result,
+                _ = token.cancelled() => astra_tools::cancelled_tool_result("exit_plan_mode", true)
+                    .with_execution_outcome_unknown(),
+            },
+            None => exit.await,
+        }
     }
 }
 

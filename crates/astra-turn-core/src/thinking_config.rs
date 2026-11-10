@@ -74,23 +74,46 @@ fn default_effort() -> ThinkingEffort {
     ThinkingEffort::High
 }
 
-impl From<&astra_turn_types::DelegationReasoningRequirement> for ThinkingConfig {
-    fn from(requirement: &astra_turn_types::DelegationReasoningRequirement) -> Self {
-        use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
+impl From<&astra_turn_types::ReasoningRequirement> for ThinkingConfig {
+    fn from(requirement: &astra_turn_types::ReasoningRequirement) -> Self {
+        use astra_turn_types::{ReasoningEffort, ReasoningRequirement};
         match requirement {
-            DelegationReasoningRequirement::ModelDefault => Self::ModelDefault,
-            DelegationReasoningRequirement::Off => Self::Off,
-            DelegationReasoningRequirement::On {} => Self::On {},
-            DelegationReasoningRequirement::Budget { tokens } => Self::Enabled {
+            ReasoningRequirement::ModelDefault => Self::ModelDefault,
+            ReasoningRequirement::Off => Self::Off,
+            ReasoningRequirement::On {} => Self::On {},
+            ReasoningRequirement::Budget { tokens } => Self::Enabled {
                 budget_tokens: *tokens,
             },
-            DelegationReasoningRequirement::Effort { effort } => Self::Adaptive {
+            ReasoningRequirement::Effort { effort } => Self::Adaptive {
                 effort: match effort {
-                    DelegationReasoningEffort::Low => ThinkingEffort::Low,
-                    DelegationReasoningEffort::Medium => ThinkingEffort::Medium,
-                    DelegationReasoningEffort::High => ThinkingEffort::High,
-                    DelegationReasoningEffort::XHigh => ThinkingEffort::XHigh,
-                    DelegationReasoningEffort::Max => ThinkingEffort::Max,
+                    ReasoningEffort::Low => ThinkingEffort::Low,
+                    ReasoningEffort::Medium => ThinkingEffort::Medium,
+                    ReasoningEffort::High => ThinkingEffort::High,
+                    ReasoningEffort::XHigh => ThinkingEffort::XHigh,
+                    ReasoningEffort::Max => ThinkingEffort::Max,
+                },
+            },
+        }
+    }
+}
+
+impl From<&ThinkingConfig> for astra_turn_types::ReasoningRequirement {
+    fn from(config: &ThinkingConfig) -> Self {
+        use astra_turn_types::{ReasoningEffort, ReasoningRequirement};
+        match config {
+            ThinkingConfig::ModelDefault => ReasoningRequirement::ModelDefault,
+            ThinkingConfig::Off => ReasoningRequirement::Off,
+            ThinkingConfig::On {} => ReasoningRequirement::On {},
+            ThinkingConfig::Enabled { budget_tokens } => ReasoningRequirement::Budget {
+                tokens: *budget_tokens,
+            },
+            ThinkingConfig::Adaptive { effort } => ReasoningRequirement::Effort {
+                effort: match effort {
+                    ThinkingEffort::Low => ReasoningEffort::Low,
+                    ThinkingEffort::Medium => ReasoningEffort::Medium,
+                    ThinkingEffort::High => ReasoningEffort::High,
+                    ThinkingEffort::XHigh => ReasoningEffort::XHigh,
+                    ThinkingEffort::Max => ReasoningEffort::Max,
                 },
             },
         }
@@ -749,6 +772,42 @@ pub fn strip_think_tags(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shared_reasoning_requirement_preserves_every_model_control() {
+        use super::{ThinkingConfig, ThinkingEffort};
+        use astra_turn_types::ReasoningRequirement;
+
+        let configurations = [
+            ThinkingConfig::ModelDefault,
+            ThinkingConfig::Off,
+            ThinkingConfig::On {},
+            ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Medium,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::XHigh,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+        ];
+        for config in configurations {
+            let request = ReasoningRequirement::from(&config);
+            let wire = serde_json::to_value(&request).unwrap();
+            let decoded: ReasoningRequirement = serde_json::from_value(wire).unwrap();
+            assert_eq!(ThinkingConfig::from(&decoded), config);
+        }
+    }
 
     #[test]
     fn responses_picker_and_selectors_preserve_declared_efforts() {

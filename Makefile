@@ -1729,7 +1729,9 @@ format-check:
 .PHONY: audit
 audit:
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
-	@cargo audit --no-fetch
+	@# Only ignore the rmcp advisory after verifying its vulnerable backends are disabled.
+	@python3 scripts/ci/check_rmcp_audit.py
+	@cargo audit --no-fetch --ignore RUSTSEC-2026-0462
 
 .PHONY: type-check
 type-check: sweep

@@ -37,24 +37,20 @@ impl Evidence {
     }
 }
 
-fn workspace_mutation_risk(record: &ToolCallRecord, root: Option<&str>) -> bool {
+fn record_reports_workspace_change(record: &ToolCallRecord) -> bool {
     record.was_executed()
-        && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-            &record.name,
-            super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-        )
-        && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
-        && !super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record)
-        && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record)
+        && (super::lifecycle::record_has_typed_workspace_tool_receipt(record)
+            || super::execution_phase::record_has_live_workspace_mutation_receipt(record)
+            || record.workspace_writer_applied_bound == Some(true)
+            || super::execution_phase::record_has_trusted_partial_workspace_mutation_receipt(
+                record,
+            ))
 }
 
-fn parallel_mutator_batches<'a>(
-    records: &'a [ToolCallRecord],
-    root: Option<&str>,
-) -> HashMap<&'a str, Vec<usize>> {
+fn parallel_mutator_batches(records: &[ToolCallRecord]) -> HashMap<&str, Vec<usize>> {
     let mut batches: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
-        if workspace_mutation_risk(record, root)
+        if record_reports_workspace_change(record)
             && let Some(batch_id) = record.batch_id.as_deref()
         {
             batches.entry(batch_id).or_default().push(index);
@@ -93,13 +89,26 @@ pub(crate) mod tests {
     }
 
     fn record(name: &str, ok: bool, command: &str) -> ToolCallRecord {
-        ToolCallRecord {
+        let mut record = ToolCallRecord {
             name: name.into(),
             ok,
             disposition: Some(ToolCallDisposition::Executed),
             runtime_args_full: Some(serde_json::json!({"command": command}).to_string()),
+            exit_semantics: (name == "bash" && ok).then(|| "success".into()),
+            result_class: (name == "bash" && ok).then(|| "success".into()),
             ..Default::default()
+        };
+        if name == "write_file" && ok {
+            record.runtime_args_full =
+                Some(serde_json::json!({"path":"/app/value.txt", "content":"updated"}).to_string());
+            record.workspace_mutation_observed = Some(true);
+            record.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            record.workspace_mutation_receipt =
+                astra_tools::workspace_observation::typed_workspace_tool_receipt()
+                    .remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
+        record
     }
 
     fn executed(
@@ -108,7 +117,12 @@ pub(crate) mod tests {
         name: &str,
         command: &str,
     ) -> ToolCallRecord {
-        executed_with_args(ledger, id, name, serde_json::json!({"command": command}))
+        let args = if name == "write_file" {
+            serde_json::json!({"path":"/app/value.txt", "content":command})
+        } else {
+            serde_json::json!({"command":command})
+        };
+        executed_with_args(ledger, id, name, args)
     }
 
     fn executed_with_args(
@@ -135,6 +149,19 @@ pub(crate) mod tests {
                 ToolInvocationDispatchLease::new("owner", u64::MAX).unwrap(),
             )
             .unwrap();
+        let mut record = ToolCallRecord {
+            runtime_args_full: Some(args.to_string()),
+            ..record(name, true, "")
+        };
+        let mut metadata = std::collections::BTreeMap::new();
+        if name == "write_file" {
+            metadata = astra_tools::workspace_observation::typed_workspace_tool_receipt()
+                .into_iter()
+                .collect();
+        }
+        if let Some(class) = &record.result_class {
+            metadata.insert("result_class".into(), serde_json::json!(class));
+        }
         let terminal = ledger
             .compare_and_complete(
                 &identity,
@@ -143,21 +170,18 @@ pub(crate) mod tests {
                 ToolInvocationTerminalOutcome::Succeeded {
                     result: ToolInvocationResultPayload {
                         output: "ok".into(),
-                        metadata: Default::default(),
-                        exit_semantics: None,
+                        metadata,
+                        exit_semantics: record.exit_semantics.clone(),
                     },
                 },
             )
             .unwrap();
-        ToolCallRecord {
-            execution_completion: Some(
-                ToolInvocationCompletionRef::from_record(&terminal)
-                    .unwrap()
-                    .into(),
-            ),
-            runtime_args_full: Some(args.to_string()),
-            ..record(name, true, "")
-        }
+        record.execution_completion = Some(
+            ToolInvocationCompletionRef::from_record(&terminal)
+                .unwrap()
+                .into(),
+        );
+        record
     }
 
     fn restore_from_ledger(
@@ -283,12 +307,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parallel_verify_receipts_require_live_parameters_and_unchanged_owner_facts() {
-        use astra_tools::workspace_observation as observation;
+    fn parallel_checks_require_successful_matching_commands() {
         for invalid in [
             None,
-            Some("mode"),
-            Some("ownership"),
+            Some("unclassified"),
             Some("mutation"),
             Some("failure"),
         ] {
@@ -303,25 +325,15 @@ pub(crate) mod tests {
             let hooks = [hook("./a"), hook("./b")];
             let mut records = vec![writer];
             for (i, command) in ["./a", "./b"].into_iter().enumerate() {
-                let mut args = serde_json::json!({"command": command, "mode": "verify"});
-                if i == 0 && invalid == Some("mode") {
-                    args.as_object_mut().unwrap().remove("mode");
-                }
+                let args = serde_json::json!({"command": command});
                 let mut verifier =
                     executed_with_args(&mut ledger, &format!("verify-{i}"), "bash", args);
-                let fields = observation::explicit_workspace_verification_receipt();
-                verifier.workspace_mutation_scope = Some(observation::BOUND_WORKSPACE_SCOPE.into());
-                verifier.workspace_mutation_receipt =
-                    fields.get(observation::OBSERVATION_RECEIPT_FIELD).cloned();
                 verifier.batch_id = Some("verify-batch".into());
                 verifier.parallel = Some(true);
                 if i == 0 {
                     match invalid {
-                        Some("ownership") => {
-                            verifier.workspace_mutation_receipt.as_mut().unwrap()["ownership"] =
-                                serde_json::json!(observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-                        }
-                        Some("mutation") => verifier.workspace_mutation_observed = Some(true),
+                        Some("unclassified") => verifier.result_class = None,
+                        Some("mutation") => verifier.workspace_mutation_partial = Some(true),
                         Some("failure") => verifier.ok = false,
                         _ => {}
                     }
@@ -351,14 +363,8 @@ pub(crate) mod tests {
             &mut ledger,
             "verifier",
             "bash",
-            serde_json::json!({"command": "./verify", "mode": "verify"}),
+            serde_json::json!({"command": "./verify"}),
         );
-        verifier.workspace_mutation_scope =
-            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-        verifier.workspace_mutation_receipt =
-            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .cloned();
         writer.batch_id = Some("parallel-verify".into());
         verifier.batch_id = writer.batch_id.clone();
         let hooks = [hook("./verify")];
@@ -411,20 +417,6 @@ pub(crate) mod tests {
         };
         VerificationFrontier::restore(None, &snapshot, "user", "session", "run", "chain", &[], &[])
             .unwrap()
-    }
-
-    /// A successfully restored prefix followed by loss of one local suffix
-    /// record. Exercise unavailable history without inventing a missing-state
-    /// variant that strict snapshot decoding no longer permits.
-    pub(crate) fn restored_prefix_with_missing_history(
-        retained: &[ToolCallRecord],
-    ) -> VerificationFrontier {
-        let mut frontier = restored_read_only_prefix();
-        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
-        let mut suffix = retained.to_vec();
-        suffix.push(executed(&mut ledger, "lost-read", "read_file", ""));
-        frontier.advance(None, &[], &suffix).unwrap();
-        frontier
     }
 
     #[test]
@@ -583,40 +575,41 @@ pub(crate) mod tests {
         assert_eq!(restored.missing(), Some(vec!["same label".into(); 3]));
     }
 
-    // Independent full-history oracle: this is the previous production query.
+    // Independent full-history ordering oracle. The producer fact selector
+    // is shared; this intentionally recomputes the query rather than folding
+    // the incremental cursor/retained-prefix representation.
     fn full_scan(hooks: &[StopHook], records: &[ToolCallRecord]) -> Option<Vec<String>> {
         let hooks: Vec<_> = hooks.iter().filter(|hook| hook.authoritative).collect();
         if hooks.is_empty() {
             return None;
         }
-        let barrier = records
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, record)| {
-                record.was_executed()
-                    && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                        &record.name,
-                        super::super::lifecycle::extract_tool_args(
-                            record.authoritative_args_full(),
-                        )
-                        .as_ref(),
-                    )
-                    && !hooks.iter().any(|hook| {
-                        super::super::execution_phase::record_verifies_explicit_hook(record, hook)
-                    })
-            })
-            .map(|(index, _)| index)?;
+        let changed_at = records.iter().rposition(record_reports_workspace_change);
         Some(
             hooks
                 .iter()
                 .filter(|hook| {
-                    !records.iter().enumerate().any(|(index, record)| {
-                        index > barrier
-                            && super::super::execution_phase::record_verifies_explicit_hook(
-                                record, hook,
-                            )
-                    })
+                    !records
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, record)| {
+                            let args = super::super::lifecycle::extract_tool_args(
+                                record.authoritative_args_full(),
+                            );
+                            record.was_executed()
+                                && super::super::execution_phase::tool_call_verifies_explicit_hook(
+                                    &record.name,
+                                    args.as_ref(),
+                                    hook,
+                                    None,
+                                )
+                        })
+                        .is_some_and(|(index, record)| {
+                            changed_at.is_none_or(|change| index >= change)
+                                && super::super::execution_phase::record_verifies_explicit_hook(
+                                    record, hook, None,
+                                )
+                        })
                 })
                 .map(|hook| hook.label.clone())
                 .collect(),
@@ -662,12 +655,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn changed_hook_reclassifies_previous_verifier_as_mutation() {
-        // A successful shell verifier may itself have written build artifacts.
+    fn changed_hook_requires_its_own_execution_outcome() {
         let records = vec![record("bash", true, "./a")];
         let mut frontier = VerificationFrontier::default();
         frontier.advance(None, &[hook("./a")], &records).unwrap();
-        assert_eq!(frontier.missing(), None);
+        assert_eq!(frontier.missing(), Some(vec![]));
         frontier.advance(None, &[hook("./b")], &records).unwrap();
         assert_eq!(frontier.missing(), Some(vec!["same label".into()]));
         assert_eq!(frontier.missing(), full_scan(&[hook("./b")], &records));
@@ -689,15 +681,45 @@ pub(crate) mod tests {
             executed(&mut ledger, "read", "read_file", ""),
             executed(&mut ledger, "verify", "bash", "./a"),
         ];
+        let VerificationHandoff::Bound { snapshot } =
+            frontier.export(None, &hooks, &records, Some("chain"))
+        else {
+            panic!("declared check outcomes must survive without prior changes");
+        };
+        let snapshot = serde_json::from_slice::<astra_turn_types::BoundVerificationFrontier>(
+            &serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.mutation.is_none());
+        let completion = records[1].execution_completion.as_ref().unwrap();
+        assert_eq!(
+            &snapshot.proofs[0].as_ref().unwrap().invocation,
+            completion.as_invocation().unwrap()
+        );
+        let rows = [ledger.get(completion.identity()).unwrap().clone()];
+        let restored = VerificationFrontier::restore(
+            None, &snapshot, "user", "session", "run", "chain", &hooks, &rows,
+        )
+        .unwrap();
+        assert_eq!(restored.missing(), Some(vec![]));
         assert!(
             matches!(
-                frontier.export(None, &hooks, &records, Some("chain")),
-                VerificationHandoff::Bound { .. }
+                VerificationFrontier::restore(
+                    None,
+                    &snapshot,
+                    "user",
+                    "session",
+                    "run",
+                    "chain",
+                    &hooks,
+                    &[]
+                ),
+                Err(VerificationRecoveryError::LedgerMismatch)
             ),
-            "no mutation means no verification debt"
+            "a no-write check still requires its exact execution evidence"
         );
         let mut records = records;
-        records.push(record("write_file", false, ""));
+        records.push(record("write_file", true, ""));
         assert!(matches!(
             frontier.export(None, &hooks, &records, Some("chain")),
             VerificationHandoff::Unavailable {
@@ -745,10 +767,87 @@ pub(crate) mod tests {
                 assert_eq!(frontier.missing(), full_scan(&hooks, &records));
             }
         }
-        records.push(record("write_file", false, ""));
+        records.push(record("write_file", true, ""));
         frontier.advance(None, &hooks, &records).unwrap();
         assert_eq!(frontier.missing(), Some(vec!["same label".into(); 3]));
         assert_eq!(frontier.missing(), full_scan(&hooks, &records));
+    }
+    #[test]
+    fn a_later_failed_declared_check_replaces_its_earlier_success() {
+        let args = serde_json::json!({"command":"./requested-check"});
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let first = executed_with_args(&mut ledger, "first", "bash", args.clone());
+        let mut latest = executed_with_args(&mut ledger, "latest", "bash", args);
+        latest.ok = false;
+        latest.result_class = Some("test_failure".into());
+        latest.exit_semantics = Some("domain_negative".into());
+        let hooks = [hook("./requested-check")];
+        let mut frontier = VerificationFrontier::default();
+        frontier
+            .advance(Some("/app"), &hooks, std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(frontier.missing(), Some(Vec::new()));
+        frontier
+            .advance(Some("/app"), &hooks, &[first, latest])
+            .unwrap();
+        assert_eq!(frontier.missing(), Some(vec!["same label".into()]));
+    }
+
+    #[tokio::test]
+    async fn declared_commands_record_outcomes_without_claiming_global_freshness() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("value.txt"), "before").unwrap();
+        let ctx = astra_tools::ToolContext::test(workspace.path());
+        let command = "printf after > value.txt && printf 'check result\\n'";
+        let args = serde_json::json!({"command":command});
+        let result = astra_tools::shell_ops::execute_bash(&ctx, &args).await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("value.txt")).unwrap(),
+            "after"
+        );
+        let fields = result.metadata.as_ref().unwrap();
+        assert_eq!(fields["exit_code"], 0);
+        assert!(
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+        );
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let mut record = executed_with_args(&mut ledger, "ordinary-check", "bash", args);
+        record.result_class = fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        record.exit_semantics = fields
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hooks = [hook(command)];
+        let mut frontier = VerificationFrontier::default();
+        frontier
+            .advance(workspace.path().to_str(), &hooks, &[])
+            .unwrap();
+        assert_eq!(frontier.missing(), Some(vec!["same label".into()]));
+        frontier
+            .advance(
+                workspace.path().to_str(),
+                &hooks,
+                std::slice::from_ref(&record),
+            )
+            .unwrap();
+        assert_eq!(
+            frontier.missing(),
+            Some(Vec::new()),
+            "only the declared invocation's result is established"
+        );
+        let mut failed = record;
+        failed.ok = false;
+        failed.result_class = Some("test_failure".into());
+        failed.exit_semantics = Some("domain_negative".into());
+        let mut failure = VerificationFrontier::default();
+        failure
+            .advance(workspace.path().to_str(), &hooks, &[failed])
+            .unwrap();
+        assert_eq!(failure.missing(), Some(vec!["same label".into()]));
     }
 }
 
@@ -999,8 +1098,8 @@ impl VerificationFrontier {
                     invocation,
                 })
         };
-        // Without an authoritative obligation or source mutation, old
-        // verifier calls are irrelevant to the current completion predicate.
+        // Only authoritative obligations retain change/check evidence. A check
+        // can satisfy its obligation even when no preceding write was observed.
         let mutation = if view.contract.is_empty() {
             None
         } else if let Some(evidence) = &view.mutation {
@@ -1012,16 +1111,14 @@ impl VerificationFrontier {
             None
         };
         let mut proofs = vec![None; view.contract.len()];
-        if mutation.is_some() {
-            for (index, evidence) in view.proofs.iter().enumerate() {
-                if let Some(evidence) = evidence {
-                    let Some(bound) = bind(evidence) else {
-                        return unavailable(VerificationUnavailable::UnboundProof {
-                            hook_index: index,
-                        });
-                    };
-                    proofs[index] = Some(bound);
-                }
+        for (index, evidence) in view.proofs.iter().enumerate() {
+            if let Some(evidence) = evidence {
+                let Some(bound) = bind(evidence) else {
+                    return unavailable(VerificationUnavailable::UnboundProof {
+                        hook_index: index,
+                    });
+                };
+                proofs[index] = Some(bound);
             }
         }
         // Handoff custody is enforced independently from named verification.
@@ -1114,8 +1211,8 @@ impl VerificationFrontier {
         base.checked_add(additional)
             .ok_or(VerificationRecoveryError::OrdinalExhausted)?;
         if contract_changed {
-            // Changing a hook can turn its former successful verifier into a
-            // mutation. Rebuild with the same reducer, not a guessed reset.
+            // A different declaration needs its own outcomes. Rebuild from
+            // retained execution facts instead of carrying unrelated proof.
             *self = Self {
                 proofs: vec![None; contract.len()],
                 contract,
@@ -1129,7 +1226,7 @@ impl VerificationFrontier {
         // Tool-phase hands off a complete batch with the round snapshot. A
         // retained prefix cannot gain a later member of the same batch.
         let suffix = &records[self.cursor..];
-        let parallel_mutators = parallel_mutator_batches(suffix, workspace_root);
+        let parallel_mutators = parallel_mutator_batches(suffix);
         for (index, record) in suffix.iter().enumerate() {
             self.processed_through += 1;
             if !record.was_executed() {
@@ -1145,23 +1242,26 @@ impl VerificationFrontier {
                     .and_then(|reference| reference.as_invocation())
                     .cloned(),
             };
-            let mut verified = false;
-            for (hook, proof) in self.contract.iter().zip(&mut self.proofs) {
-                if !parallel_mutating_peer
-                    && super::execution_phase::record_verifies_explicit_hook(record, hook)
-                {
-                    *proof = Some(evidence.clone());
-                    verified = true;
-                }
-            }
-            if !verified
-                && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                    &record.name,
-                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-                )
-            {
-                self.mutation = Some(evidence);
+            if record_reports_workspace_change(record) {
+                self.mutation = Some(evidence.clone());
                 self.proofs.fill(None);
+            }
+            let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
+            for (hook, proof) in self.contract.iter().zip(&mut self.proofs) {
+                if super::execution_phase::tool_call_verifies_explicit_hook(
+                    &record.name,
+                    args.as_ref(),
+                    hook,
+                    workspace_root,
+                ) {
+                    *proof = (!parallel_mutating_peer
+                        && super::execution_phase::record_verifies_explicit_hook(
+                            record,
+                            hook,
+                            workspace_root,
+                        ))
+                    .then(|| evidence.clone());
+                }
             }
         }
         self.cursor = records.len();
@@ -1187,7 +1287,7 @@ impl VerificationFrontier {
         if self.contract.is_empty() {
             return None;
         }
-        let mutation = self.mutation.as_ref()?;
+        let changed_through = self.mutation.as_ref().map_or(0, |change| change.ordinal);
         Some(
             self.contract
                 .iter()
@@ -1195,7 +1295,7 @@ impl VerificationFrontier {
                 .filter(|(_, proof)| {
                     !proof
                         .as_ref()
-                        .is_some_and(|proof| proof.ordinal > mutation.ordinal)
+                        .is_some_and(|proof| proof.ordinal >= changed_through)
                 })
                 .map(|(hook, _)| hook.label.clone())
                 .collect(),

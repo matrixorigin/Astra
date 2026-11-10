@@ -181,13 +181,14 @@ pub fn tool_selection_contract(schema: &Value) -> Option<Value> {
 
 /// Stable content address for one compact selection contract.
 ///
-/// The digest covers exactly the contract returned to the model by
-/// `tool_search`: canonical name, compact description, parameter shape, and
-/// truncation fact. Provider binding and capability authority are deliberately
+/// The digest addresses the full executable input schema and canonical name.
+/// Presentation text, truncation and directory refreshes do not revoke a
+/// selected unchanged contract. Provider binding and capability authority are deliberately
 /// excluded and must be revalidated at execution time.
 #[must_use]
 pub fn tool_selection_contract_digest(selection: &Value) -> String {
-    let canonical = astra_core::canonical_json_string(selection);
+    let executable = json!({"name": selection.get("name"), "parameters": selection.get("parameters").map(astra_turn_types::executable_schema)});
+    let canonical = astra_core::canonical_json_string(&executable);
     format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
@@ -1039,14 +1040,16 @@ mod tests {
 
     #[test]
     fn selection_contract_digest_is_stable_for_equivalent_object_key_order() {
-        let left = json!({
+        let left = super::tool_selection_contract(&json!({
             "type": "function",
             "function": {"name": "read_file", "parameters": {"type": "object"}}
-        });
-        let right = json!({
+        }))
+        .unwrap();
+        let right = super::tool_selection_contract(&json!({
             "function": {"parameters": {"type": "object"}, "name": "read_file"},
             "type": "function"
-        });
+        }))
+        .unwrap();
 
         assert_eq!(
             tool_selection_contract_digest(&left),
@@ -1054,10 +1057,10 @@ mod tests {
         );
         assert_ne!(
             tool_selection_contract_digest(&left),
-            tool_selection_contract_digest(&json!({
+            tool_selection_contract_digest(&super::tool_selection_contract(&json!({
                 "type": "function",
                 "function": {"name": "read_file", "parameters": {"type": "object", "additionalProperties": false}}
-            }))
+            })).unwrap())
         );
     }
 
@@ -1182,6 +1185,59 @@ mod tests {
                 .get("x-astra-discovery-summary")
                 .is_none(),
             "internal discovery metadata must not become model-callable schema"
+        );
+    }
+
+    #[test]
+    fn task_output_selection_explains_live_activity_and_paging() {
+        let schemas = crate::schemas::all_tool_schemas();
+        let selected: Value = serde_json::from_str(&tool_search(
+            &schemas,
+            &json!({"query": "select:task_output"}),
+        ))
+        .unwrap();
+        assert_eq!(selected["selection_status"], "ok");
+        let tool = &selected["matches"][0];
+        assert_eq!(tool["description_truncated"], false);
+        let summary = tool["description"].as_str().unwrap();
+        for term in ["block=true", "wake_on_output=true", "snapshot", "timeout"] {
+            assert!(summary.contains(term), "missing {term}: {summary}");
+        }
+        let parameters = &tool["parameters"];
+        assert_eq!(parameters["required"], json!(["task_id"]));
+        let revision = &parameters["properties"]["after_output_revision"];
+        assert_eq!(revision["type"], "integer");
+        let guidance = revision["description"].as_str().unwrap();
+        for term in [
+            "output_revision",
+            "block=true",
+            "wake_on_output=true",
+            "offset/pattern",
+            "not a byte cursor",
+        ] {
+            assert!(guidance.contains(term), "missing {term}: {guidance}");
+        }
+        assert!(
+            parameters["properties"]["offset"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("after terminal status")
+        );
+        let pattern_guidance = parameters["properties"]["pattern"]["description"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            pattern_guidance.contains("live search"),
+            "{pattern_guidance}"
+        );
+        assert!(
+            pattern_guidance.contains("bounded snapshot"),
+            "{pattern_guidance}"
+        );
+        assert!(
+            pattern_guidance.contains("cannot combine with block or offset"),
+            "{pattern_guidance}"
         );
     }
 
@@ -1416,20 +1472,21 @@ mod tests {
     #[test]
     fn explicit_selection_materializes_conditional_required_fields() {
         let schemas = crate::schemas::all_tool_schemas();
-
-        let selected = tool_search(&schemas, &json!({"query": "select:agent"}));
-        let selected: Value = serde_json::from_str(&selected).expect("valid json");
-        let parameters = &selected["matches"][0]["parameters"];
-        let description = parameters["description"]
-            .as_str()
-            .expect("compact parameters must explain action requirements");
-        assert!(
-            description.contains("spawn requires description + prompt"),
-            "conditional spawn fields must survive compact discovery: {selected}"
-        );
-        assert!(
-            parameters.get("x-astra-per-action-required").is_none(),
-            "internal action metadata must remain hidden from the model schema"
-        );
+        for (query, required) in [
+            ("select:agent", "spawn requires description + prompt"),
+            ("select:worktree", "enter requires branch"),
+        ] {
+            let selected = tool_search(&schemas, &json!({"query": query}));
+            let selected: Value = serde_json::from_str(&selected).expect("valid json");
+            let parameters = &selected["matches"][0]["parameters"];
+            let description = parameters["description"]
+                .as_str()
+                .expect("compact parameters must explain action requirements");
+            assert!(description.contains(required), "{selected}");
+            assert!(
+                parameters.get("x-astra-per-action-required").is_none(),
+                "internal action metadata must remain hidden from the model schema"
+            );
+        }
     }
 }

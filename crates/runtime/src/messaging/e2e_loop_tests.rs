@@ -2078,30 +2078,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn plan_mode_blocks_mutating_tools_before_headless_protocol_fallback() {
-        let tool_calls = vec![json!({
-            "id": "call-write-plan",
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
-            }
-        })];
-
+    async fn plan_tool_round(
+        executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+        active: bool,
+        name: &str,
+        args: Value,
+        mode: PermissionMode,
+    ) -> (
+        Vec<Value>,
+        Vec<Value>,
+        Vec<astra_services::session_journal::ToolCallRecord>,
+    ) {
+        let calls = vec![json!({"id":name, "type":"function", "function": {
+            "name":name, "arguments": args.to_string()
+        }})];
         let mut messages = Vec::new();
-        let mut tool_results = Vec::new();
-        let valid_tool_names = HashSet::from(["write_file".to_string()]);
-        let mut restricted_tools = HashSet::new();
-        let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-user", "test-session", "plan-mode-write");
-        let mut idempotency_cache = InMemoryIdempotencyCache::new();
-        let mut semantic_dedup = SemanticDedup::new(0.95);
-        let mut tool_call_records = Vec::new();
-        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
-        let mut term = NoopHeadlessTerminal;
+        let mut results = Vec::new();
+        let mut records = Vec::new();
+        let mut restricted = HashSet::new();
+        let mut guard = TurnGuard::new();
+        let mut recorder = StepRecorder::new("test-user", "test-session", "plan-recovery");
+        let mut idempotency = InMemoryIdempotencyCache::new();
+        let mut dedup = SemanticDedup::new(0.95);
+        let mut counts = std::collections::HashMap::new();
+        let mut terminal = NoopHeadlessTerminal;
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let valid = HashSet::from([name.to_string()]);
+        let deferred = HashSet::new();
+        let hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
-
+        let permissions = PermissionSyncContext::shared_root(mode);
+        let session_id = "test-session".to_string();
+        let has_executor = executor.is_some();
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
@@ -2109,49 +2117,61 @@ mod tests {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
-            api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api: &api,
             token: "",
-            current_user_id: None,
-            current_session_id: None,
-            current_run_id: None,
-            current_turn_chain_id: None,
+            current_user_id: has_executor.then_some("test-user"),
+            current_session_id: has_executor.then_some(&session_id),
+            current_run_id: has_executor.then_some("test-run"),
+            current_turn_chain_id: has_executor.then_some("test-turn"),
             durable_dispatch_admission: None,
             delegation_model_admissions: None,
-            physical_tool_calls: &tool_calls,
-            logical_tool_calls: &tool_calls,
+            physical_tool_calls: &calls,
+            logical_tool_calls: &calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
             runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
             messages: &mut messages,
-            tool_results: &mut tool_results,
-            valid_tool_names: &valid_tool_names,
-            deferred_tool_names: &std::collections::HashSet::new(),
-            restricted_tools: &mut restricted_tools,
-            turn_guard: &mut turn_guard,
-            step_recorder: &mut step_recorder,
-            idempotency_cache: &mut idempotency_cache,
-            semantic_dedup: &mut semantic_dedup,
-            call_counts: &mut std::collections::HashMap::new(),
+            tool_results: &mut results,
+            valid_tool_names: &valid,
+            deferred_tool_names: &deferred,
+            restricted_tools: &mut restricted,
+            turn_guard: &mut guard,
+            step_recorder: &mut recorder,
+            idempotency_cache: &mut idempotency,
+            semantic_dedup: &mut dedup,
+            call_counts: &mut counts,
             max_identical_calls: 2,
             max_tools_per_turn: 15,
             max_consecutive_empty_name: 3,
-            tool_call_records: &mut tool_call_records,
-            tool_event_hooks: &tool_event_hooks,
+            tool_call_records: &mut records,
+            tool_event_hooks: &hooks,
             client_skill_execution: None,
-            term: &mut term,
+            term: &mut terminal,
             mailbox: None,
-            permission_context: None,
+            permission_context: Some(&permissions),
             progress_emitter: None,
             pre_resolved_results: &[],
-            runtime_tool_executor: None,
+            runtime_tool_executor: executor,
             turn_start: None,
             llm_round: 0,
-            plan_mode_active: true,
+            plan_mode_active: active,
         })
         .await;
+        (messages, results, records)
+    }
 
+    #[tokio::test]
+    async fn plan_mode_blocks_mutating_tools_before_headless_protocol_fallback() {
+        let (messages, tool_results, tool_call_records) = plan_tool_round(
+            None,
+            true,
+            "write_file",
+            json!({"path":"result.txt", "content":"ok"}),
+            PermissionMode::Auto,
+        )
+        .await;
         assert_eq!(tool_results.len(), 1);
         assert_eq!(tool_call_records.len(), 1);
         let record_error = tool_call_records[0].error.as_deref().unwrap_or("");
@@ -2160,11 +2180,11 @@ mod tests {
                 .contains("blocked_tool: tool 'write_file' is blocked while plan mode is active"),
             "unexpected journal error: {record_error}"
         );
-        let tool_message = messages
+        let body = messages
             .iter()
             .find(|message| message["role"] == "tool")
-            .expect("expected a tool result message");
-        let body = tool_message["content"].as_str().unwrap_or("");
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or("");
         assert!(
             body.contains("Permission denied for tool 'write_file'"),
             "unexpected tool body: {body}"
@@ -2173,6 +2193,145 @@ mod tests {
             !body.contains("headless edge protocol"),
             "plan mode should short-circuit before protocol fallback: {body}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plan_lookup_outage_recovers_through_headless_policy_and_executor() {
+        use crate::server::runtime_tool_executor::RuntimeToolExecutor;
+        use crate::server::tool_execution_binding::{ExecutorBinding, WorkspaceBinding};
+        use astra_tools::ToolExecutor;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.path().into(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        );
+        executor.set_current_selected_tool_offers(
+            ["write_file", "read_file"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.into(),
+                        crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                            name,
+                            "server-sandbox",
+                            crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
+                        ),
+                    )
+                })
+                .collect(),
+        );
+        executor.enable_durable_invocations();
+        let gate = Arc::new(std::sync::RwLock::new(false));
+        executor.set_plan_authoring_active_handle(gate.clone());
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1:1/astra")
+            .unwrap();
+        pool.close().await;
+        executor.set_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(pool)));
+        let first = executor
+            .execute("write_file", &json!({"path":"result.txt", "content":"ok"}))
+            .await;
+        assert!(first.contains("could not be checked"), "{first}");
+        assert!(*gate.read().unwrap());
+        let write_args = json!({"path":"result.txt", "content":"ok"});
+        let (messages, results, records) = plan_tool_round(
+            Some(&executor),
+            true,
+            "write_file",
+            write_args.clone(),
+            PermissionMode::Auto,
+        )
+        .await;
+        let blocked = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or("");
+        assert!(blocked.contains("could not be checked"), "{blocked}");
+        assert_eq!(results[0]["error_kind"], "tool_unavailable");
+        assert_eq!(results[0]["retryable"], true);
+        assert_eq!(results[0]["retry_after_ms"], 5000);
+        assert_eq!(
+            records[0].error_kind,
+            Some(astra_core::ErrorKind::ToolUnavailable)
+        );
+        assert!(!records[0].was_executed());
+        assert!(!workspace.path().join("result.txt").exists());
+
+        let (_, _, records) = plan_tool_round(
+            Some(&executor),
+            true,
+            "write_file",
+            write_args.clone(),
+            PermissionMode::Plan,
+        )
+        .await;
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("blocked_tool")
+        );
+
+        // A live TCP endpoint that never speaks MySQL makes an accidental
+        // read-side refresh hang; exploration must complete without it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pending_pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy(&format!(
+                "mysql://root@{}/astra",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+        executor.set_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(pending_pool)));
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        std::fs::write(workspace.path().join("source.txt"), "readable").unwrap();
+        let (read_messages, _, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            plan_tool_round(
+                Some(&executor),
+                true,
+                "read_file",
+                json!({"path":"source.txt"}),
+                PermissionMode::Auto,
+            ),
+        )
+        .await
+        .expect("read-only work must not wait for a plan lookup");
+        assert!(read_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("readable"))
+        }));
+
+        executor.set_plan_repository(Arc::new(astra_plan::InMemoryPlanRepository::new()));
+        let (messages, _, _) = plan_tool_round(
+            Some(&executor),
+            true,
+            "write_file",
+            write_args,
+            PermissionMode::Auto,
+        )
+        .await;
+        assert!(!*gate.read().unwrap());
+        let completed = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or("");
+        let written = std::fs::read_to_string(workspace.path().join("result.txt"))
+            .unwrap_or_else(|error| panic!("write failed: {error}; tool result: {completed}"));
+        assert_eq!(written, "ok\n", "{completed}");
     }
 
     /// Provider tool batches are canonical authority input. Missing call ids

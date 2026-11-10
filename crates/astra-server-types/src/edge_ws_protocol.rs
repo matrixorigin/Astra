@@ -86,16 +86,44 @@ use astra_turn_types::{ProviderStageInput, ProviderStageInputAck};
 /// subprocess without receiving file-transfer metadata or bytes.
 pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
 
+/// Edge accepts optional W3C `traceparent` and `tracestate` on a tool request.
+/// Older edges use `deny_unknown_fields` and reject the message when these
+/// fields are present, so the server sends them only after this advertisement.
+pub const W3C_TRACE_CONTEXT_V1_CAPABILITY: &str = "w3c_trace_context_v1";
+
 /// Whether an Edge runtime advertisement supports request-scoped process
 /// authorization. This protocol predicate is shared by registration, run
 /// admission, and dispatch so an incompatible Edge cannot be offered Bash and
 /// rejected only after the model selects it.
 pub fn supports_runtime_process_authorization(capabilities: Option<&Value>) -> bool {
+    protocol_capability(capabilities, RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY)
+}
+
+/// Whether this connected edge can decode a W3C carrier on `ToolRequest`.
+pub fn supports_w3c_trace_context(capabilities: Option<&Value>) -> bool {
+    protocol_capability(capabilities, W3C_TRACE_CONTEXT_V1_CAPABILITY)
+}
+
+fn protocol_capability(capabilities: Option<&Value>, name: &str) -> bool {
     capabilities
         .and_then(|value| value.get("protocol_capabilities"))
-        .and_then(|items| items.get(RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY))
+        .and_then(|items| items.get(name))
         .and_then(Value::as_bool)
         == Some(true)
+}
+
+/// Keep a call's W3C carrier only when the live edge advertised support.
+/// An older edge must receive the previous message shape.
+pub fn trace_carrier_for_connection<'a>(
+    capabilities: Option<&Value>,
+    traceparent: Option<&'a str>,
+    tracestate: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if supports_w3c_trace_context(capabilities) {
+        (traceparent, tracestate)
+    } else {
+        (None, None)
+    }
 }
 
 /// Whether the process-authorization capability applies to this tool.
@@ -200,6 +228,15 @@ pub enum EdgeClientMessage {
         ack: ProviderStageInputAck,
     },
 
+    /// The adapter stopped observing this input without an acceptance or
+    /// rejection. The provider may still have received it.
+    #[serde(rename = "edge_tool_input_unconfirmed")]
+    ToolInputUnconfirmed {
+        request_id: String,
+        delivery_generation: u64,
+        input_id: String,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_capacity_result")]
     CapacityResult {
@@ -282,6 +319,13 @@ pub enum EdgeServerMessage {
         execution_timeout_ms: Option<u64>,
         /// Independent command policy ceiling, not the native job budget.
         command_timeout_cap_ms: Option<u64>,
+        /// W3C context for this tool call. Absent when tracing is off or the
+        /// connected edge did not advertise `w3c_trace_context_v1`. An older
+        /// edge rejects unknown fields, so the server omits both until it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tracestate: Option<String>,
     },
 
     /// Deliver one already-admitted semantic input to the active provider
@@ -471,11 +515,48 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_tool_request");
         assert_eq!(v["tool"], "bash");
         assert_eq!(v["timeout_secs"], 120);
+        assert!(v.get("traceparent").is_none());
+        assert!(v.get("tracestate").is_none());
+    }
+
+    #[test]
+    fn edge_tool_request_accepts_a_missing_trace_carrier() {
+        let msg = EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
+            request_id: "req-old".into(),
+            identity: Box::new(identity()),
+            delivery_generation: 1,
+            tool: "bash".into(),
+            args: json!({"command": "true"}),
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: Some(30),
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
+            traceparent: None,
+            tracestate: None,
+        };
+        let encoded = serde_json::to_value(&msg).unwrap();
+        let parsed: EdgeServerMessage = serde_json::from_value(encoded).unwrap();
+        let EdgeServerMessage::ToolRequest {
+            traceparent,
+            tracestate,
+            ..
+        } = parsed
+        else {
+            panic!("expected tool request");
+        };
+        assert_eq!(traceparent, None);
+        assert_eq!(tracestate, None);
     }
 
     #[test]
@@ -495,6 +576,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
 
         assert!(!format!("{msg:?}").contains("runtime-grant"));
@@ -526,6 +610,32 @@ mod tests {
                 "runtime_process_authorization_v1": true
             }
         }))));
+    }
+
+    #[test]
+    fn trace_carrier_stays_off_the_wire_without_edge_support() {
+        let parent = Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01");
+        let state = Some("vendor=value");
+        assert_eq!(
+            trace_carrier_for_connection(None, parent, state),
+            (None, None)
+        );
+        assert_eq!(
+            trace_carrier_for_connection(
+                Some(&json!({"protocol_capabilities": {"w3c_trace_context_v1": false}})),
+                parent,
+                state,
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            trace_carrier_for_connection(
+                Some(&json!({"protocol_capabilities": {"w3c_trace_context_v1": true}})),
+                parent,
+                state,
+            ),
+            (parent, state)
+        );
     }
 
     #[test]

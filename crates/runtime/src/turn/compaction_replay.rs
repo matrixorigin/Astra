@@ -20,8 +20,8 @@
 //!
 //! Design: tiered escalation (default → aggressive → emergency) gated by
 //! `consecutive_context_window_errors`. After MAX_COMPACT_RETRIES the error
-//! propagates as a structured `InterruptionRecord` with
-//! `ResumeAction::CompactAndRetry` (for cross-session resume).
+//! propagates as a structured `InterruptionRecord` requiring user intervention,
+//! while preserving progress for a future request.
 
 use super::{CompactionEngine, PipelineOutcome, TokenBudget};
 use astra_turn_core::compaction_types::CompactionKind;
@@ -33,19 +33,6 @@ use serde_json::Value;
 /// we stop retrying and let the error propagate with a structured
 /// `InterruptionRecord`.
 pub(crate) const MAX_COMPACT_RETRIES: u32 = 3;
-
-/// Circuit-breaker threshold for consecutive futile compaction attempts.
-///
-/// Scope: **session-lifetime**, NOT per-turn. `MAX_COMPACT_RETRIES` caps
-/// retries inside a single turn; this cap stops a session whose context is
-/// irrecoverably over the limit from re-running the same pipeline on every
-/// 413 across turns.
-///
-/// A "futile" attempt is one where the pipeline executed but freed 0 tokens,
-/// OR the pipeline refused to run (pre-conditions failed). Attempts that
-/// free tokens — even if the next LLM call still 413s — reset the counter,
-/// since the freed work is still progress.
-pub const MAX_CONSECUTIVE_FUTILE_ATTEMPTS: u32 = 3;
 
 /// Fallback context limit when model_context_limit is 0: 128K * 90%.
 const DEFAULT_CONTEXT_LIMIT: u64 = 115_200;
@@ -74,9 +61,8 @@ pub struct CompactionReplayResult {
 /// amount wasn't enough. Tracking this enables escalation to more aggressive
 /// tiers and telemetry for diagnosing chronic context pressure.
 ///
-/// The tracker also carries a session-lifetime circuit breaker
-/// (`consecutive_futile_attempts`) so an unrecoverable session does not
-/// re-run the pipeline on every 413. See [`MAX_CONSECUTIVE_FUTILE_ATTEMPTS`].
+/// The tracker retains diagnostic history only. Retry admission is bounded
+/// by the current turn, so changed context or model capacity can recover later.
 #[derive(Debug, Default)]
 pub struct CompactionEffectivenessTracker {
     /// Tokens freed by the last compaction attempt.
@@ -129,7 +115,7 @@ impl CompactionEffectivenessTracker {
     /// Record a compaction result.
     ///
     /// `tokens_freed == 0` is treated as a futile attempt and increments the
-    /// circuit-breaker counter. Any positive value resets it — freed work is
+    /// diagnostic counter. Any positive value resets it — freed work is
     /// progress, even if the next LLM call still overflows.
     pub fn record_compaction(&mut self, tokens_freed: u64) {
         self.last_tokens_freed = tokens_freed;
@@ -144,8 +130,8 @@ impl CompactionEffectivenessTracker {
     }
 
     /// Record that a compaction attempt could not make progress: either the
-    /// pipeline refused to run (too few messages, not over budget) or it
-    /// executed but freed nothing. Counts toward the circuit breaker.
+    /// pipeline could not rewrite protected content or it
+    /// executed but freed nothing. Counts toward diagnostic history.
     pub fn record_futile(&mut self) {
         self.consecutive_futile_attempts = self.consecutive_futile_attempts.saturating_add(1);
     }
@@ -154,16 +140,9 @@ impl CompactionEffectivenessTracker {
     ///
     /// Orthogonal to the futile counter: a compaction that frees tokens but
     /// fails to clear the budget is "insufficient" (annotation) but not
-    /// "futile" (circuit-breaker input). Both axes matter for telemetry.
+    /// "futile" (diagnostic evidence). Both axes matter for telemetry.
     pub fn mark_insufficient(&mut self) {
         self.last_was_insufficient = true;
-    }
-
-    /// True once `consecutive_futile_attempts` has reached the session cap.
-    /// Callers should skip the pipeline and propagate the overflow as a
-    /// structured interruption instead of burning another doomed attempt.
-    pub fn is_circuit_open(&self) -> bool {
-        self.consecutive_futile_attempts >= MAX_CONSECUTIVE_FUTILE_ATTEMPTS
     }
 
     /// Build a summary for telemetry — emitted into the heavy-checkpoint
@@ -176,7 +155,6 @@ impl CompactionEffectivenessTracker {
             "last_tokens_freed": self.last_tokens_freed,
             "last_was_insufficient": self.last_was_insufficient,
             "consecutive_futile_attempts": self.consecutive_futile_attempts,
-            "circuit_open": self.is_circuit_open(),
         })
     }
 }
@@ -193,7 +171,7 @@ pub(crate) fn try_compact_for_retry(
 
 /// Run the compression pipeline on the message list after a context-window error.
 ///
-/// Returns `None` if there are too few messages to compact or if no tokens were
+/// Returns `None` for an empty history or if no tokens were
 /// freed (compaction is futile). Returns `Some(result)` with details on success.
 ///
 /// The `retry_count` parameter enables tiered escalation:
@@ -206,8 +184,8 @@ pub(crate) fn try_compact_for_retry_tiered(
     model_context_limit: u64,
     retry_count: u32,
 ) -> Option<CompactionReplayResult> {
-    if messages.len() <= 4 {
-        return None; // Too few messages to compact meaningfully
+    if messages.is_empty() {
+        return None;
     }
 
     // Build a budget that reflects the overflow.
@@ -222,7 +200,7 @@ pub(crate) fn try_compact_for_retry_tiered(
     // Using `prompts::estimate_tokens` (which walks content + tool_calls and
     // adds per-message + fixed overhead) keeps this in sync with the
     // pre-request pressure estimate in `agentic_loop::lifecycle` so a
-    // CompactAndRetry triggered precisely by large tool_calls is not
+    // recovery triggered precisely by large tool_calls is not
     // silently skipped.
     let measured = last_measured_tokens
         .unwrap_or_else(|| crate::prompts::estimate_tokens(messages, 0, 0) as u64);
@@ -235,14 +213,10 @@ pub(crate) fn try_compact_for_retry_tiered(
 
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,
-        last_measured_tokens: measured,
+        last_measured_tokens: measured.max(max_tokens.saturating_add(1)),
         current_round_index: None,
         now_secs: 0,
     };
-
-    if !budget.is_over_budget() && budget.pressure() < 0.85 {
-        return None;
-    }
 
     // Tiered escalation: default → aggressive → emergency.
     let (pipeline, tier) = if retry_count <= 1 {
@@ -261,9 +235,10 @@ pub(crate) fn try_compact_for_retry_tiered(
             CompactionKind::RetryEmergency,
         )
     };
-    let outcome = pipeline.compress_if_needed(messages, &budget);
+    let mut candidate = messages.clone();
+    let outcome = pipeline.compress_if_needed(&mut candidate, &budget);
 
-    if outcome.total_tokens_freed == 0 {
+    if outcome.total_tokens_freed == 0 || candidate == *messages {
         return None; // Pipeline did nothing
     }
 
@@ -278,6 +253,7 @@ pub(crate) fn try_compact_for_retry_tiered(
         .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
         .collect();
 
+    *messages = candidate;
     Some(CompactionReplayResult {
         tokens_freed: outcome.total_tokens_freed,
         messages_removed,
@@ -288,22 +264,15 @@ pub(crate) fn try_compact_for_retry_tiered(
     })
 }
 
-/// Three-valued outcome returned by [`try_compact_for_retry_checked`].
-///
-/// Separates "would run but the circuit is open" from "ran and did nothing"
-/// so the caller can emit different telemetry and take different recovery
-/// actions. `Futile` already covers the pipeline-returned-None case;
-/// `CircuitOpen` is the short-circuit path.
+/// A bounded rewrite either reduced history or made no progress. A future
+/// request may recover with different content, authorization or model capacity.
 #[derive(Debug)]
 pub enum CompactionReplayOutcome {
     /// The pipeline ran and freed at least one token.
     Compacted(CompactionReplayResult),
     /// The attempt made no progress (pipeline refused to run OR freed 0
-    /// tokens). Counted toward the circuit breaker.
+    /// tokens). Retained for diagnostics.
     Futile,
-    /// Circuit breaker already tripped — pipeline skipped entirely. Messages
-    /// are untouched and the caller should propagate the overflow.
-    CircuitOpen,
 }
 
 impl PartialEq for CompactionReplayOutcome {
@@ -311,17 +280,15 @@ impl PartialEq for CompactionReplayOutcome {
         use CompactionReplayOutcome::*;
         matches!(
             (self, other),
-            (Futile, Futile) | (CircuitOpen, CircuitOpen) | (Compacted(_), Compacted(_))
+            (Futile, Futile) | (Compacted(_), Compacted(_))
         )
     }
 }
 
-/// Circuit-breaker-aware wrapper around [`try_compact_for_retry_tiered`].
+/// Record the result of [`try_compact_for_retry_tiered`].
 ///
 /// The caller supplies the tracker by mutable reference; this function
-/// updates both the attempt log and the futile counter so downstream
-/// telemetry stays consistent. Short-circuits when [`CompactionEffectivenessTracker::is_circuit_open`]
-/// returns true — no pipeline execution, no message mutation.
+/// updates attempt statistics; historical failure never disables future recovery.
 pub fn try_compact_for_retry_checked(
     messages: &mut Vec<Value>,
     tracker: &mut CompactionEffectivenessTracker,
@@ -329,32 +296,16 @@ pub fn try_compact_for_retry_checked(
     model_context_limit: u64,
     retry_count: u32,
 ) -> CompactionReplayOutcome {
-    if tracker.is_circuit_open() {
-        return CompactionReplayOutcome::CircuitOpen;
-    }
-
-    match try_compact_for_retry_tiered(
-        messages,
-        last_measured_tokens,
-        model_context_limit,
-        retry_count,
-    ) {
-        Some(result) if result.tokens_freed > 0 => {
+    for tier in retry_count.max(1)..=MAX_COMPACT_RETRIES {
+        if let Some(result) =
+            try_compact_for_retry_tiered(messages, last_measured_tokens, model_context_limit, tier)
+        {
             tracker.record_compaction(result.tokens_freed);
-            CompactionReplayOutcome::Compacted(result)
-        }
-        Some(_zero) => {
-            // Defensive: the tiered helper already filters 0-token results to
-            // None today, but an internal change shouldn't silently evade the
-            // circuit breaker.
-            tracker.record_futile();
-            CompactionReplayOutcome::Futile
-        }
-        None => {
-            tracker.record_futile();
-            CompactionReplayOutcome::Futile
+            return CompactionReplayOutcome::Compacted(result);
         }
     }
+    tracker.record_futile();
+    CompactionReplayOutcome::Futile
 }
 
 /// Build a concise summary string for the compaction event (for logs/journal).
@@ -388,11 +339,28 @@ mod tests {
     }
 
     #[test]
-    fn compaction_returns_none_when_not_over_budget() {
+    fn reported_overflow_does_not_trust_stale_cached_usage() {
         let mut msgs = make_messages(3);
-        // Well under budget
+        // The caller has a real overflow; prior usage cannot veto recovery.
         let result = try_compact_for_retry(&mut msgs, Some(10_000), 200_000);
-        assert!(result.is_none());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn short_protected_overflow_retains_controls_and_reports_futility() {
+        let mut messages = vec![
+            json!({"role":"system","content":"Preserve constraints."}),
+            json!({"role":"user","content":"Earlier investigation"}),
+            json!({"role":"assistant","content":"current detail ".repeat(20_000)}),
+            json!({"role":"user","content":"Current goal: preserve my files."}),
+        ];
+        let original = messages.clone();
+        let mut tracker = CompactionEffectivenessTracker::default();
+        let result =
+            try_compact_for_retry_checked(&mut messages, &mut tracker, Some(100_000), 4_000, 1);
+        assert_eq!(result, CompactionReplayOutcome::Futile);
+        assert_eq!(messages, original);
+        assert_eq!(tracker.consecutive_futile_attempts, 1);
     }
 
     #[test]

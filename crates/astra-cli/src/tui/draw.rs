@@ -477,13 +477,20 @@ pub(crate) fn active_viewport(
     // finalized background layout path.
     let live_assistant_rows = usize::from(rows.saturating_sub(10).clamp(4, 48));
     let active = chat_widget.active_cell().and_then(|cell| {
-        let lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
+        let mut lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
             && cell.is_live()
         {
             sanitize_lines_for_buffer(assistant.live_viewport_lines(inner_w, live_assistant_rows))
         } else {
             history_cell_lines_for_buffer(cell, inner_w)
         };
+        if let Some(tool) = chat_widget.latest_parked_tool() {
+            let mut tool_lines = history_cell_lines_for_buffer(tool, inner_w);
+            // Keep the reply visible even in a short viewport; the compact
+            // tool cue remains below it while the invocation is still live.
+            tool_lines.truncate(2);
+            lines.extend(tool_lines);
+        }
         if lines.is_empty() {
             None
         } else {
@@ -1467,6 +1474,46 @@ mod task_board_draw_tests {
     }
 
     #[test]
+    fn live_reply_stays_visible_while_a_tool_is_running() {
+        use crate::tui::chat_widget::WireEvent;
+        let mut widget = chat_widget::ChatWidget::new(String::new());
+        widget.handle_event(chat_widget::AppEvent::wire(WireEvent::ToolStarted {
+            name: "bash".into(),
+            description: "long task".into(),
+            tool_use_id: "running-task".into(),
+            parent_tool_use_id: None,
+        }));
+        widget.handle_event(chat_widget::AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: None,
+            text: "Here is the status".into(),
+        }));
+        let frame = active_viewport(
+            &widget,
+            &status_indicator::StatusIndicator::new(),
+            None,
+            false,
+            None,
+            80,
+            12,
+        );
+        let ActiveView::Active { lines, .. } = frame.active else {
+            panic!("reply must be rendered in the active viewport");
+        };
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let answer = rendered.find("Here is the status").expect("visible reply");
+        let tool = rendered.find("Bash").expect("running tool remains visible");
+        assert!(
+            answer < tool,
+            "the reply takes priority in a short viewport"
+        );
+        assert!(widget.has_live_tool_projection());
+    }
+
+    #[test]
     fn completed_logical_agents_linger_briefly_even_when_duration_exceeds_local_elapsed() {
         use crate::tui::chat_widget::WireEvent;
 
@@ -1482,6 +1529,8 @@ mod task_board_draw_tests {
                 output: Some(
                     serde_json::json!({
                         "agent_id": "reviewer@abc",
+                        "run_id": "reviewer-run",
+                        "result_family": "child_result",
                         "status": "completed",
                         "result": "done"
                     })
@@ -1492,6 +1541,13 @@ mod task_board_draw_tests {
             },
         ));
 
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id.as_deref(), Some("reviewer-run"));
+        assert_eq!(
+            rows[0].state.status,
+            crate::tui::agent_run_projection::AgentRunStatus::Completed
+        );
         let frame = active_viewport(&widget, &status, None, false, None, 80, 24);
 
         assert!(
@@ -1514,6 +1570,8 @@ mod task_board_draw_tests {
                 output: Some(
                     serde_json::json!({
                         "agent_id": "reviewer@settled",
+                        "run_id": "settled-run",
+                        "result_family": "child_result",
                         "status": "completed",
                         "result": "done"
                     })
@@ -1538,7 +1596,13 @@ mod task_board_draw_tests {
             frame.multi_agent.is_none(),
             "terminal agent history remains in Ctrl+G and must not pin the idle viewport"
         );
-        assert_eq!(widget.agent_monitor_snapshot(5).len(), 1);
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id.as_deref(), Some("settled-run"));
+        assert_eq!(
+            rows[0].state.status,
+            crate::tui::agent_run_projection::AgentRunStatus::Completed
+        );
     }
 
     #[test]

@@ -433,6 +433,11 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Bind freshly produced assistant messages to their actual model owner.
+    /// Hosts without durable model authority leave messages unchanged.
+    fn attest_model_messages(&self, _state: &mut AgenticLoopState, _start: usize) {}
+    fn attest_runtime_messages(&self, _state: &mut AgenticLoopState, _start: usize) {}
+
     /// The selected host must expose both a durable session writer and a
     /// model-visible reader before shared execution can spill history.
     fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
@@ -991,9 +996,10 @@ pub trait AgenticLoopHost: Send {
     /// round. On success the implementation must return the typed event that
     /// describes the applied mutation and bump
     /// [`AgenticLoopState::compact_tier_applied`] to at least
-    /// [`CompactionTier::CompactHistory`] so the downstream budget guard
-    /// skips redundant mechanical compression. Lifecycle accounting and
-    /// delivery are owned by the caller, independently of quiet rendering.
+    /// [`CompactionTier::CompactHistory`]. Subsequent pressure is evaluated
+    /// against the current history, not the historical tier. Lifecycle
+    /// accounting and delivery are owned by the caller, independently of
+    /// quiet rendering.
     /// Default is a no-op so non-server hosts preserve legacy behavior.
     async fn maybe_pre_turn_compact(
         &mut self,
@@ -1418,6 +1424,7 @@ fn build_introspect_snapshot_with_tool_admission(
         current_round,
         tool_errors,
         circuit_breaker,
+        thinking: Some(state.thinking.clone()),
     };
 
     // Enrich live-metric fields from provider data when available.
@@ -2109,6 +2116,9 @@ pub struct UserIntentState {
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,
+    /// Advisory wake for committed user input, separate from generic run
+    /// events so ordinary progress cannot interrupt model inference.
+    pub(crate) guidance_wake: Option<tokio::sync::watch::Receiver<i64>>,
     /// Next time a best-effort empty/error intent poll is allowed.
     /// Due release acknowledgements may wake the poll independently.
     next_user_intent_poll_at: Option<tokio::time::Instant>,
@@ -2496,6 +2506,9 @@ pub struct CancellationState {
     pub pause_flag: Option<Arc<AtomicBool>>,
     /// Optional token cancelled with user cancel for immediate LLM/stream wake.
     pub token: Option<Arc<CancellationToken>>,
+    /// Cancels one provider request when newer user guidance arrives. It
+    /// inherits run cancellation but never cancels the run or other work.
+    pub(crate) inference_token: Option<Arc<CancellationToken>>,
     /// Set when this process can no longer prove it owns the durable execution
     /// lease. The shared I/O token is also cancelled, but this typed cause must
     /// never be projected as a user cancellation.
@@ -3665,7 +3678,7 @@ pub struct AgenticLoopState {
     pub current_run_owner_generation: Option<u64>,
     /// In-memory projection of the durable permission revision selected for this round.
     pub applied_permission_mode: Option<astra_turn_types::RunPermissionModeSelection>,
-    pub(crate) permission_mode_observation: super::permission_boundary::PermissionModeObservation,
+    pub(crate) run_settings_observation: super::settings_boundary::RunSettingsObservation,
     /// The sender lives inside the Server watcher task. A closed channel
     /// restores synchronous control observation if that task exits or panics.
     pub(crate) durable_control_watcher: Option<tokio::sync::watch::Receiver<()>>,
@@ -4049,7 +4062,7 @@ impl AgenticLoopState {
             current_run_id: None,
             current_run_owner_generation: None,
             applied_permission_mode: None,
-            permission_mode_observation: Default::default(),
+            run_settings_observation: Default::default(),
             durable_control_watcher: None,
             inference_purpose,
             owner_user_id: None,
@@ -6424,11 +6437,13 @@ pub(crate) mod tests {
         pub(crate) handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
+        direct_context_errors: bool,
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
         pre_execution_rejection: Option<String>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
-        provider_response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        pub(crate) provider_response_gate:
+            Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
@@ -6492,6 +6507,7 @@ pub(crate) mod tests {
                 handoff_snapshots: Vec::new(),
                 turn_results,
                 terminal_provider_error: None,
+                direct_context_errors: false,
                 admitted_results_by_turn,
                 pre_execution_rejection: None,
                 current_turn: 0,
@@ -6755,7 +6771,30 @@ pub(crate) mod tests {
             }
             if let Some((started, release)) = self.provider_response_gate.take() {
                 started.notify_one();
-                release.notified().await;
+                let cancellation = state
+                    .cancellation
+                    .inference_token
+                    .clone()
+                    .or_else(|| state.cancellation.token.clone());
+                tokio::select! {
+                    _ = release.notified() => {}
+                    _ = async {
+                        match cancellation {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.current_turn += 1;
+                        self.turn_results.remove(0);
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "mock inference cancelled",
+                        ).with_details_json(serde_json::json!({
+                            "partial_full_text": "unsettled completion claim",
+                            "tool_calls": [{"id": "unexecuted-tool-fragment"}],
+                        }).to_string()));
+                    }
+                }
             }
             self.executed_messages.push(state.messages.clone());
             self.executed_model_item_ids
@@ -6773,6 +6812,14 @@ pub(crate) mod tests {
             self.current_turn += 1;
             if let Some(counter) = &self.provider_call_counter {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.direct_context_errors
+                && result.error_kind == Some(astra_core::ErrorKind::ContextWindow)
+            {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContextWindow,
+                    result.accum.error_message.unwrap(),
+                ));
             }
             Ok(result)
         }
@@ -8682,6 +8729,43 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_failed_build_reaches_model_before_success_can_end_turn() {
+        let mut failed = make_edge_tool_with_args(
+            "bash",
+            json!({"command": "go build ./..."}),
+            "cannot find module providing package example/fault",
+        );
+        failed.tool_result_fields.as_mut().unwrap().extend([
+            ("exit_code".into(), json!(1)),
+            ("exit_semantics".into(), json!("domain_negative")),
+            ("result_class".into(), json!("inconclusive")),
+        ]);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![failed, make_edge_tool("catalog", "catalog ready")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("The build could not find the module.", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash", "catalog"])
+        .with_stop_after_success_completion("catalog", Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(host.current_turn, 2);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("cannot find module"))
+        }));
+        assert_eq!(state.final_text, "The build could not find the module.");
+    }
+
+    #[tokio::test]
     async fn non_retryable_rejection_allows_a_different_permitted_action() {
         let rejected = json!({
             "id": "denied-command", "type": "function",
@@ -8800,22 +8884,17 @@ pub(crate) mod tests {
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
-        let mut quality = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./quality-gate", "mode": "verify"}),
-            "quality ok",
-        );
+        let mut quality =
+            make_edge_tool_with_args("bash", json!({"command": "./quality-gate"}), "quality ok");
         quality.request_id = "req-quality".into();
-        let mut unit = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./unit-gate", "mode": "verify"}),
-            "unit ok",
-        );
+        let mut unit =
+            make_edge_tool_with_args("bash", json!({"command": "./unit-gate"}), "unit ok");
         unit.request_id = "req-unit".into();
         for receipt in [&mut quality, &mut unit] {
-            receipt.tool_result_fields.as_mut().unwrap().extend(
-                astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-            );
+            receipt.tool_result_fields.as_mut().unwrap().extend([
+                ("result_class".into(), json!("success")),
+                ("exit_semantics".into(), json!("success")),
+            ]);
         }
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![write], 0, 0, Some(50)),
@@ -9476,7 +9555,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_unchanged_work_observations_are_bounded_by_runtime() {
+    async fn context_overflow_preparation_and_streaming_rebuild_the_next_request() {
+        for direct in [false, true] {
+            let mut overflow = text_result("", 0, 0, None);
+            overflow.response.accum.error_message =
+                Some("input exceeds the provider context window".into());
+            overflow.response.error_kind = Some(astra_core::ErrorKind::ContextWindow);
+            let mut host = MockHost::new(vec![
+                overflow,
+                text_result("Recovered after compaction", 100, 10, None),
+            ]);
+            host.direct_context_errors = direct;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages.clear();
+            for index in 0..20 {
+                state
+                    .messages
+                    .push(json!({"role":"user","content":format!("old question {index}")}));
+                state
+                    .messages
+                    .push(json!({"role":"assistant","content":"old answer ".repeat(200)}));
+            }
+            state.messages.push(
+                json!({"role":"user","content":"Fix this; preserve the authentication boundary."}),
+            );
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{direct}: {outcome:?}"
+            );
+            assert_eq!(host.turn_count(), 2);
+            assert_eq!(
+                state.total_tool_calls, 0,
+                "failed preparation cannot execute tools"
+            );
+            assert!(!host.compaction_events.is_empty());
+            assert!(
+                crate::prompts::estimate_wire_input_tokens(&host.executed_messages[1], 0)
+                    < crate::prompts::estimate_wire_input_tokens(&host.executed_messages[0], 0)
+            );
+            assert!(
+                host.executed_messages[1]
+                    .iter()
+                    .any(|message| message["content"]
+                        == "Fix this; preserve the authentication boundary.")
+            );
+            assert_eq!(state.final_text, "Recovered after compaction");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_unchanged_work_observations_leave_next_step_to_model() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -9504,7 +9634,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["bash", "task_output"]);
         let mut state = make_state();
@@ -9517,19 +9652,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged observation must close the loop without another model call"
+            4,
+            "a repeated observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
@@ -9710,7 +9839,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["task_output"]);
         let mut state = make_state();
@@ -9723,19 +9857,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged live observation must close the loop"
+            4,
+            "a repeated live observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("has not materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
@@ -11342,7 +11470,6 @@ pub(crate) mod tests {
     fn original_execution_facts_keep_admitted_evaluation_thresholds() {
         use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
         let mut policy = astra_config::runtime_config::ToolPolicyConfig {
-            redundant_reads_eval_threshold: 7,
             search_fanout_eval_threshold: 19,
             redundant_validation_retries_eval_threshold: 5,
             ..Default::default()
@@ -15266,7 +15393,6 @@ mod parallel_execution_tests {
                             r.snapshot.final_state.as_deref(),
                             Some("completed" | "interrupted")
                         ) && r.snapshot.read_only_round_streak >= 32
-                            && r.snapshot.redundant_read_count >= 6
                     })
                     .count()
                     >= 3,

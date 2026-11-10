@@ -251,6 +251,16 @@ separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
 are independent cursor domains and do not establish a shared chronological order.
 `A` loads older activity; `R` refreshes the conversation and latest activity.
 
+For an open child conversation, the live view renders a bounded tail while
+keeping the full received item available to search and export. Expanding an
+item shows its sanitized Markdown source; inline and separate reasoning can
+be inspected explicitly, while the ordinary preview stays collapsed. When new
+output arrives during expanded reading, the displayed snapshot stays stable
+and indicates that newer output is available; `End` returns to the live tail.
+Search and export use the latest received content. Missing live events remain
+gaps rather than being inferred from the preview, and durable history replaces
+matching live items by their model identity.
+
 Large recorded tool outputs use bounded previews; expanding one activity collapses
 the previously expanded activity. Search and export retain the full available text.
 Live tools keep their logical identity when a deferred carrier resolves. Delegation
@@ -310,6 +320,12 @@ remote run remains protected by Server session-slot admission. An unconfirmed
 local execution or failed owner cleanup is not treated as a clean stream
 failure and retains its local exclusion until its own authority settles.
 
+CLI stream output, live guidance, and tool lifecycle events share their
+delivery order. If an observer remains unable to receive events, the client
+stops the physical stream with an explicit observer error; the error does not
+assert that remote work stopped or that already-started tools had no effects.
+Partial execution and the durable run remain available for reconciliation.
+
 Transcript progress is described by item sequence and committed cursor.
 Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence
@@ -366,6 +382,9 @@ still fail closed. The stdio app-server requires durable local thread
 continuation and rejects this policy before admitting a turn.
 
 ## User-facing diagnostics
+
+The stdio app-server forwards system diagnostics as `warning` notifications
+with a `message`, including uncertain tool outcomes and unsaved turn history.
 
 A user should be able to answer:
 

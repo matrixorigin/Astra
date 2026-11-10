@@ -7275,7 +7275,7 @@ impl DynamicAgentSpawner {
         let repair = self.clone_for_task();
         let id = agent_id.to_string();
         let started_at = state.started_at;
-        let task = async move {
+        let task = crate::server::run_trace::in_active_run(async move {
             let execution = async move {
                 tokio::pin!(execution);
                 if let Some(control) = cancellation {
@@ -7378,7 +7378,7 @@ impl DynamicAgentSpawner {
             };
             let _ = terminal_tx.send(receipt);
             drop(panic_payload);
-        };
+        });
         let admission = self
             .background_task_admission
             .lock()
@@ -12302,6 +12302,7 @@ pub(crate) mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -17096,6 +17097,8 @@ pub(crate) mod tests {
     async fn spawn_preserves_task_intent_without_granting_execution_authority() {
         use astra_config::user_profile::WorkspaceMutationIntent::{MustMutate, ReadOnly};
         for (agent_type, intent, inherited_read_only, expected_read_only) in [
+            ("general-purpose", MustMutate, false, false),
+            ("general-purpose", ReadOnly, true, true),
             ("task", MustMutate, false, false),
             ("task", ReadOnly, false, false),
             ("task", MustMutate, true, true),
@@ -19327,8 +19330,8 @@ pub(crate) mod tests {
     fn frozen_delegation_requirement_applies_omission_and_rejects_conflicts() {
         use astra_turn_types::{
             DelegationModelAdmission, DelegationModelAdmissionOutcome,
-            DelegationModelInstructionSource, DelegationModelSlotConstraint,
-            DelegationReasoningEffort, DelegationReasoningRequirement, ModelSelection,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint, ModelSelection,
+            ReasoningEffort, ReasoningRequirement,
         };
         let admission = DelegationModelAdmission {
             source: DelegationModelInstructionSource {
@@ -19353,8 +19356,8 @@ pub(crate) mod tests {
                     }),
                     requested_model_policy: None,
                     model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
-                    reasoning: Some(DelegationReasoningRequirement::Effort {
-                        effort: DelegationReasoningEffort::High,
+                    reasoning: Some(ReasoningRequirement::Effort {
+                        effort: ReasoningEffort::High,
                     }),
                     reasoning_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
                     task_scope_quote: None,
@@ -25051,6 +25054,90 @@ pub(crate) mod tests {
             inherited.provider,
             astra_turn_core::fork_prefix::ProviderKind::Anthropic
         ));
+    }
+
+    /// Records, from inside `execute`, the run outcome visible on the child task.
+    struct RunScopeProbeExecutor {
+        observed: std::sync::Mutex<Option<Option<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for RunScopeProbeExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            crate::server::run_trace::fail_active_run("child_probe");
+            *self.observed.lock().unwrap() =
+                Some(astra_logging::trace_context::active_run_error_code());
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                turns_completed: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn child_execution_task_observes_the_parent_run() {
+        let exec = Arc::new(RunScopeProbeExecutor {
+            observed: std::sync::Mutex::new(None),
+        });
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+        let carrier = astra_logging::trace_context::Carrier::default();
+        astra_logging::trace_context::bind_run(&carrier, async {
+            let input = SpawnAgentInput {
+                description: "child".into(),
+                prompt: "work".into(),
+                agent_type: "explore".into(),
+                ..Default::default()
+            };
+            let SpawnAgentOutput::Launched { agent_id, .. } = spawner
+                .spawn(input, &parent_context("run-parent-trace"))
+                .await
+                .unwrap();
+            assert!(
+                spawner
+                    .wait_for_agent(&agent_id, Duration::from_secs(2))
+                    .await
+                    .is_some()
+            );
+            assert_eq!(
+                astra_logging::trace_context::active_run_error_code(),
+                None,
+                "a child outcome must not mark the parent run"
+            );
+        })
+        .await;
+        assert_eq!(
+            exec.observed.lock().unwrap().take(),
+            Some(Some("child_probe")),
+            "the JoinSet child task must run inside an observing run scope"
+        );
     }
 
     #[tokio::test]

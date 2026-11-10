@@ -84,53 +84,16 @@ available for audit.
 
 ### Foreground Bash output
 
-The local CLI and Edge foreground Bash executors share the output-capture owner
-without replacing their existing process-settlement or workspace-lease owners.
-They keep stdout and stderr pipes as the command's own stdout and stderr,
-and capture their original bytes in
-separate `0600` files with a shared random 16-lowercase-hex basename and
-`.stdout` / `.stderr` suffixes under the selected workspace's
-`astra-bash-outputs/` directory. This dedicated top-level directory holds
-ordinary user-readable output data, not Astra's private `.astra/` state; it is
-excluded from executor workspace-mutation fingerprints without excluding
-other user paths. Git-backed observation excludes that exact directory before
-its bounded status probe, so retained outputs do not consume the mutation
-observer's byte or entry budget. This is a tap after the top-level Bash
-process, so shell pipelines and explicit redirection keep their normal
-behavior. The file-retention threshold is the lesser of the configured
-per-tool byte limit and the shared 8,000-character model inline budget. The
-formatted, redacted output plus its actual exit note determines retention;
-small results remain inline even with a low configured budget. Stream-preview
-capping also retains the files. Byte counting is conservative for UTF-8.
-Retained results return both
-file paths, byte counts and SHA-256 digests. The redacted preview uses space
-remaining after the receipt and terminal facts in a 4,000-byte presentation
-target; an exceptionally long workspace path can make the mandatory receipt
-itself exceed that target. The configured limit bounds disposable preview,
-not the mandatory file receipt or terminal facts; even a 64-byte budget must
-return complete paths, byte counts, digests and completeness. The owner marks
-this bounded native projection so downstream recording does not truncate its
-recovery receipt a second time. A complete capture's receipt instructs the caller
-to copy its paths exactly and filter or format the saved files locally,
-emitting only the fields or sections needed for the answer instead of
-rerunning the original command merely to change presentation. This guidance
-precedes the preview and consumes the same inline budget; incomplete captures
-do not receive it. File names are ordinary workspace paths, not authority or
-aliases; exclusive creation rejects a collision without overwriting a file.
-The inline view remains bounded and applies
-the existing display redaction; the files deliberately contain raw bytes and
-must be treated as ordinary user workspace data, not redacted or immutable
-session artifacts. The digest describes bytes observed when the receipt was
-created, not a guarantee against subsequent same-user modification.
+The CLI keeps command output in the existing private task capture, bounded by
+the task retention limits. When an inline result cannot represent all output,
+it provides the task ID for `task_output` if those controls are available.
+Timeout, cancellation and capture failures identify output as incomplete while
+preserving the observed execution result. The task's output can be evicted
+under the existing retention budget or become unavailable after session close.
 
-The combined capture hard limit is 50 MiB per invocation. Timeout,
-cancellation, stream failure or the capture limit yields an explicit
-`complete=false` result and never claims that partial files hold the full
-output. A post-execution capture failure preserves the command's exit and
-process-settlement facts. Capture files follow the selected workspace's
-lifetime: an ephemeral workspace disappears with its existing lease; a local
-workspace retains large-output files like any other Bash-created file. There
-is no independent output-file retention service.
+The foreground Edge executor has no task reader. It returns a bounded, redacted
+preview and states when output is truncated or incomplete. Neither executor
+writes command output to the workspace unless the command explicitly does so.
 
 File outlines use the shared AST parser for supported languages, including
 Python stub, JavaScript module and TypeScript module extensions. Unsupported
@@ -179,10 +142,11 @@ Command output can establish a current state, including an already-satisfied
 request or an absent directory, without claiming this invocation changed it.
 Neither a zero exit status nor a generic filesystem delta proves arbitrary task
 correctness. Domain tools and canonical Work retain their own result contracts.
-Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
-after edits. If bounded observation is unavailable, command output is retained
-but the requested verification fails closed; it must not mint a completion or
-no-change receipt. Command text does not select or weaken this contract.
+Inspection, diagnostics and checks use the same command tool. The executor
+reports the actual output and exit status without a whole-workspace fingerprint
+or a separate verification mode. Declared checks are explicit runtime contracts;
+a successful invocation does not prove workspace exclusivity or that no other
+process will write later.
 
 ### Rename authority
 
@@ -394,8 +358,9 @@ check receipt authority independently of the coordination check used to launch.
 Receipt-attribution quarantine is retained per workspace observation root for
 the executor process lifetime, not per conversation. It prevents new attribution
 receipts, while healthy execution coordination remains independent. Explicit
-verification still fails when the required proof is unavailable. Quarantine
-diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
+verification records the observed command result and does not require a
+fingerprint. Quarantine diagnostics log a root digest, not local paths or shell
+input. A new conversation does not clear quarantine; before restarting
 the affected Astra or astra-edge process, verify that earlier background work
 has stopped. Restart alone does not stop escaped descendants or prove safety.
 
@@ -556,14 +521,23 @@ is not a chain or batch guarantee. An explicit file undo checks the recorded
 post-state and reports conflicts or partial results; it is not atomic against
 concurrent writes from external programs.
 
-On Linux, the invocation subreaper settles ownership only after kernel
+When the Linux invocation supervisor is used for Bash, its subreaper settles
+its child ownership only after kernel
 `waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an
 auxiliary means to kill adopted descendants. If that enumeration is unavailable,
 the same bounded loop continues waiting and reaping under its original deadline.
 Neither an unavailable or empty scan nor deadline expiry proves settlement; a
 live child at expiry or an unexpected wait error retains unsettled ownership.
-The helper's non-dumpable boundary and nonce-bound terminal receipt remain
-required, and Server run settlement cannot replace this local scope proof.
+The helper's non-dumpable boundary and nonce-bound terminal receipt apply to
+that path; Server run settlement cannot replace this local scope proof.
+
+Other Bash paths may execute directly in a cgroup or process group without the
+supervisor; `run_script` retains its cgroup prerequisite. Group cleanup cannot
+prove that a descendant which created a new session has stopped, and a same-user
+process may be able to move between delegated cgroups. When a script explicitly
+requests memory or CPU limits, it is rejected before starting if those limits
+cannot be enforced.
+`run_script` does not itself add filesystem or network isolation.
 
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding

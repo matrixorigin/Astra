@@ -57,7 +57,7 @@ pub fn sandbox_command(
 
 /// Build a restricted bash command string.
 ///
-/// Applies shell hardening (extglob disable, IFS reset, stdin redirect)
+/// Applies shell hardening (extglob disable, IFS reset)
 /// for Standard+ isolation.
 ///
 /// Note: ulimit-based resource limits were removed (relies on timeouts
@@ -1355,15 +1355,12 @@ mod tests {
     fn permissive_applies_minimal_hardening() {
         let p = SandboxPolicy::permissive("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        // Permissive now applies shell hardening (stdin redirect, extglob disable).
+        // Permission level does not change shell parsing hardening.
         assert!(
             wrapped.contains("echo hello"),
             "should contain user command"
         );
-        assert!(
-            wrapped.contains("< /dev/null"),
-            "should redirect stdin from /dev/null"
-        );
+        assert!(wrapped.contains("extglob"), "should disable extglob");
     }
 
     #[test]

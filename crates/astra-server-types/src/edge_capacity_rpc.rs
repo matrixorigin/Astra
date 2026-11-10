@@ -206,7 +206,12 @@ mod tests {
         }
     }
 
-    fn connect(pool: &EdgeConnectionPool) -> (u64, mpsc::Receiver<EdgeServerMessage>) {
+    fn connect(
+        pool: &EdgeConnectionPool,
+    ) -> (
+        u64,
+        mpsc::Receiver<crate::edge_connection_pool::EdgeOutbound>,
+    ) {
         let (sender, receiver) = mpsc::channel(8);
         let generation = pool.register_with_capabilities(
             "owner",
@@ -277,7 +282,8 @@ mod tests {
                 .call_capacity_provider(route(&call_pool, generation))
                 .await
         });
-        let EdgeServerMessage::CapacityRequest { request_id, .. } = receiver.recv().await.unwrap()
+        let EdgeServerMessage::CapacityRequest { request_id, .. } =
+            receiver.recv().await.unwrap().into_attempted_message()
         else {
             panic!("capacity frame");
         };

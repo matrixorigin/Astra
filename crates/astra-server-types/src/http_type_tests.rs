@@ -688,11 +688,13 @@ fn cancel_run_response_serializes() {
         run_id: "r1".into(),
         status: "cancelled".into(),
         execution_settled: true,
+        context_not_saved: Some(true),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["run_id"], "r1");
     assert_eq!(v["status"], "cancelled");
     assert_eq!(v["execution_settled"], true);
+    assert_eq!(v["context_not_saved"], true);
 }
 
 #[test]
@@ -1132,6 +1134,7 @@ fn cancel_run_record_to_response() {
         run_id: "r1".into(),
         status: "cancelled".into(),
         execution_settled: true,
+        context_not_saved: Some(false),
     };
     let resp: CancelRunResponse = record.into();
     assert_eq!(resp.run_id, "r1");

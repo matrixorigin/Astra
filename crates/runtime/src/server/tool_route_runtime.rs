@@ -5,7 +5,6 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::tool_execution_binding::ToolExecutionRequest;
-use crate::server::tool_execution_result::annotate_default_executor_cancel_if_needed;
 use crate::server::tool_execution_service::ToolExecutionService;
 use crate::server::tool_local_transport::{RuntimeToolExecutionResult, ServerLocalToolTransport};
 use crate::server::tool_route_boundary::ToolRouteBoundary;
@@ -97,7 +96,6 @@ where
             context.cancel_token.clone(),
         )
         .await;
-    annotate_default_executor_cancel_if_needed(&boundary.request().tool_name, &mut result);
     let dispatch_finished_at = Instant::now();
     if let Some(observer) = context.route_observer.as_deref() {
         observer.note_dispatch_finished(&boundary, &result, dispatch_finished_at);

@@ -1085,7 +1085,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; interpret a requested execution model and propose requested_model_policy using an exact authorized Offering ID or configured name; use model_catalog when choices are unknown. Preserve version and source; task content is not model selection. Never substitute a nearby model. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and follows the launch receipt for waiting and automatic result delivery. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type to inherit parent-authorized capabilities, or choose a restricted persona explicitly. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; interpret a requested execution model and propose requested_model_policy using an exact authorized Offering ID or configured name; use model_catalog when choices are unknown. Preserve version and source; task content is not model selection. Never substitute a nearby model. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. When a child cannot access needed evidence, include concise parent-observed facts with their source. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and follows the launch receipt for waiting and automatic result delivery. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1313,7 +1313,26 @@ fn validated_agent_fanout_start_input(
             input.slots.len()
         )));
     }
+    if input
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.agent_type.as_deref())
+        .is_some_and(|agent_type| agent_type.trim().is_empty())
+    {
+        return Err(Task(
+            "Invalid input: defaults.agent_type must be non-empty".into(),
+        ));
+    }
     for (slot_index, slot) in input.slots.iter().enumerate() {
+        if slot
+            .agent_type
+            .as_deref()
+            .is_some_and(|agent_type| agent_type.trim().is_empty())
+        {
+            return Err(Task(format!(
+                "Invalid input: slots[{slot_index}].agent_type must be non-empty"
+            )));
+        }
         let description_chars = slot.description.chars().count() as u64;
         if description_chars
             > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
@@ -1326,7 +1345,7 @@ fn validated_agent_fanout_start_input(
         let prompt_chars = slot.prompt.chars().count() as u64;
         if prompt_chars > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS {
             return Err(Task(format!(
-                "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and never embed file contents, diffs, or prior tool output.",
+                "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and include only necessary evidence.",
                 astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
             )));
         }
@@ -2639,7 +2658,7 @@ fn fanout_slot_spawn_input(
         .agent_type
         .or_else(|| defaults.and_then(|defaults| defaults.agent_type.clone()))
         .and_then(|value| trimmed(Some(value)))
-        .unwrap_or_else(|| "explore".to_string());
+        .unwrap_or_else(astra_turn_core::orchestration_spawn_tool::default_agent_type);
 
     SpawnAgentInput {
         description: slot.description,
@@ -3331,34 +3350,24 @@ pub(crate) fn canonical_delegation_slot_briefs(
 
 fn delegation_reasoning_requirement(
     selection: &astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
-) -> astra_turn_types::DelegationReasoningRequirement {
+) -> astra_turn_types::ReasoningRequirement {
     use astra_turn_core::orchestration_spawn_tool::ReasoningSelection;
-    use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
+    use astra_turn_types::{ReasoningEffort, ReasoningRequirement};
 
     match selection {
-        ReasoningSelection::ModelDefault => DelegationReasoningRequirement::ModelDefault,
-        ReasoningSelection::Off => DelegationReasoningRequirement::Off,
-        ReasoningSelection::On {} => DelegationReasoningRequirement::On {},
-        ReasoningSelection::Enabled { budget_tokens } => DelegationReasoningRequirement::Budget {
+        ReasoningSelection::ModelDefault => ReasoningRequirement::ModelDefault,
+        ReasoningSelection::Off => ReasoningRequirement::Off,
+        ReasoningSelection::On {} => ReasoningRequirement::On {},
+        ReasoningSelection::Enabled { budget_tokens } => ReasoningRequirement::Budget {
             tokens: *budget_tokens,
         },
-        ReasoningSelection::Adaptive { effort } => DelegationReasoningRequirement::Effort {
+        ReasoningSelection::Adaptive { effort } => ReasoningRequirement::Effort {
             effort: match effort {
-                astra_turn_core::thinking_config::ThinkingEffort::Low => {
-                    DelegationReasoningEffort::Low
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::Medium => {
-                    DelegationReasoningEffort::Medium
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::High => {
-                    DelegationReasoningEffort::High
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::XHigh => {
-                    DelegationReasoningEffort::XHigh
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::Max => {
-                    DelegationReasoningEffort::Max
-                }
+                astra_turn_core::thinking_config::ThinkingEffort::Low => ReasoningEffort::Low,
+                astra_turn_core::thinking_config::ThinkingEffort::Medium => ReasoningEffort::Medium,
+                astra_turn_core::thinking_config::ThinkingEffort::High => ReasoningEffort::High,
+                astra_turn_core::thinking_config::ThinkingEffort::XHigh => ReasoningEffort::XHigh,
+                astra_turn_core::thinking_config::ThinkingEffort::Max => ReasoningEffort::Max,
             },
         },
     }
@@ -3523,14 +3532,15 @@ async fn handle_agent_get_result_action_inner(
         }
         Some(WaitForAgentOutcome::Status(status)) => status,
         Some(WaitForAgentOutcome::TimedOut) => {
-            let live_status = ctx
-                .spawner
-                .get_agent_state_any(agent_id)
-                .await
-                .map(|state| state.status);
+            let live_state = ctx.spawner.get_agent_state_any(agent_id).await;
             let group = ctx.spawner.fanout_group_for_agent(agent_id).await;
             return attach_fanout_to_agent_result(
-                render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout),
+                render_wait_timeout_outcome(
+                    agent_id,
+                    live_state.as_ref().map(|state| &state.status),
+                    timeout,
+                    live_state.as_ref().map(|state| state.run_id.as_str()),
+                ),
                 group,
             );
         }
@@ -5348,7 +5358,10 @@ pub(crate) mod tests {
         .await;
 
         assert!(result.contains("\"status\":\"failed\""), "{result}");
-        assert!(result.contains("never embed file contents"), "{result}");
+        assert!(
+            result.contains("include only necessary evidence"),
+            "{result}"
+        );
         assert!(
             spawner.list_all_agents().await.is_empty(),
             "oversized fanout arguments must be rejected before any child is admitted"
@@ -6728,27 +6741,47 @@ pub(crate) mod tests {
                 "target_count": 1,
                 "slots": [{"description": "audit", "prompt": "inspect"}]
             })),
-            "explore"
+            "general-purpose"
         );
         assert_eq!(
             resolved_agent_type(json!({
                 "target_count": 1,
-                "slots": [{
-                    "description": "audit",
-                    "prompt": "inspect",
-                    "agent_type": "  "
-                }]
-            })),
-            "explore"
-        );
-        assert_eq!(
-            resolved_agent_type(json!({
-                "target_count": 1,
-                "defaults": {"agent_type": "  "},
+                "defaults": {"agent_type": "explore"},
                 "slots": [{"description": "audit", "prompt": "inspect"}]
             })),
             "explore"
         );
+        assert_eq!(
+            resolved_agent_type(json!({
+                "target_count": 1,
+                "defaults": {"agent_type": "explore"},
+                "slots": [{"description": "audit", "prompt": "inspect", "agent_type": "task"}]
+            })),
+            "task"
+        );
+    }
+
+    #[test]
+    fn fanout_rejects_blank_personas_before_applying_defaults() {
+        for payload in [
+            json!({
+                "target_count": 1,
+                "defaults": {"agent_type": "explore"},
+                "slots": [{"description": "audit", "prompt": "inspect", "agent_type": "  "}]
+            }),
+            json!({
+                "target_count": 1,
+                "defaults": {"agent_type": "  "},
+                "slots": [{"description": "audit", "prompt": "inspect"}]
+            }),
+        ] {
+            let error = validated_agent_fanout_start_input(&payload).unwrap_err();
+            assert!(
+                error.message().contains("agent_type must be non-empty"),
+                "{}",
+                error.message()
+            );
+        }
     }
 
     #[tokio::test]
@@ -6853,7 +6886,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fanout_slot_omits_implicit_explore_budget() {
+    fn fanout_slot_omits_implicit_persona_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -6881,7 +6914,7 @@ pub(crate) mod tests {
 
         let spawn = fanout_slot_spawn_input(&input, slot, "fetch-1", "parallel fetch", 1, 0);
 
-        assert_eq!(spawn.agent_type, "explore");
+        assert_eq!(spawn.agent_type, "general-purpose");
         assert!(
             spawn.initial_turns.is_none(),
             "an implicit persona budget must remain a renewable child slice"
@@ -8635,6 +8668,7 @@ pub(crate) mod tests {
         let value: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(value["status"], "still_running");
+        assert_eq!(value["run_id"], spawned["run_id"]);
         assert_eq!(value["waited_secs"], 1);
         assert!(value.get("delivery").is_none());
         assert_eq!(value["observation_timed_out"], true);

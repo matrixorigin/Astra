@@ -942,7 +942,8 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         &skill_result,
     );
 
-    state.push_prompt_history_message(serde_json::json!({
+    let synthetic_start = state.messages.len();
+    state.messages.push(serde_json::json!({
         "role": "assistant",
         "content": null,
         "tool_calls": [{
@@ -957,6 +958,8 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             }
         }]
     }));
+    host.attest_runtime_messages(state, synthetic_start);
+    state.record_appended_prompt_history_from(synthetic_start);
     let (tool_msg, tool_result) =
         astra_turn_core::headless_tool_assembly::openai_tool_roundtrip_values(
             &tool_call_id,
@@ -1473,1241 +1476,6 @@ pub(crate) fn record_has_typed_workspace_tool_receipt(
         )
 }
 
-pub(crate) fn record_has_typed_workspace_observation_receipt(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    let args = extract_tool_args(record.authoritative_args_full()).unwrap_or(Value::Null);
-    let receipt = record
-        .workspace_mutation_receipt
-        .as_ref()
-        .unwrap_or(&Value::Null);
-    record.was_executed()
-        && record.ok
-        // An invocation cannot truthfully be both an unchanged observation
-        // and a workspace mutation. Fail closed on contradictory executor
-        // metadata instead of letting the observation half settle a newer
-        // mutation epoch.
-        && record.workspace_mutation_observed != Some(true)
-        && record.workspace_mutation_partial != Some(true)
-        && ((astra_tools::workspace_observation::is_typed_workspace_observer(&record.name)
-            && astra_tools::workspace_observation::is_typed_workspace_observation_receipt(receipt))
-            || (record.runtime_args_full.is_some()
-                && record.result_class.as_deref().is_none_or(|class| class == "success")
-                && record.exit_semantics.as_deref().is_none_or(|semantics| semantics == "success")
-                && astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                    &record.name,
-                    &args,
-                )
-                && astra_tools::workspace_observation::is_explicit_workspace_verification_receipt(
-                    receipt,
-                )))
-        && record.workspace_mutation_scope.as_deref()
-            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
-}
-
-/// Return the executor-owned no-change fact for a Bash invocation.  Unlike a
-/// typed observer receipt this helper intentionally accepts an unsuccessful
-/// command: the shell may have failed after proving, under the same owner
-/// lease, that the bound workspace fingerprint did not change.  It is used
-/// only to avoid manufacturing a mutation barrier; it is never a positive
-/// validation receipt.
-pub(crate) fn is_authoritative_unchanged_bash_observation_record(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    record.name == "bash"
-        && record.was_executed()
-        && record.workspace_mutation_observed != Some(true)
-        && record.workspace_mutation_scope.as_deref()
-            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
-        && record.workspace_mutation_receipt.as_ref().is_some_and(
-            astra_tools::workspace_observation::is_authoritative_unchanged_bash_observation_receipt,
-        )
-}
-
-/// An executor-owned Bash verification receipt covers the whole bound
-/// workspace for the live invocation that minted it.  Keep this typed lane
-/// distinct from legacy shell-shape observations: the latter may need an
-/// exact delivered-artifact correlation, while a v2 receipt was produced only
-/// after the owner held the workspace observation lease and proved an
-/// unchanged pre/post fingerprint.
-pub(crate) fn record_has_full_scope_explicit_workspace_verification_receipt(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    record_has_typed_workspace_observation_receipt(record)
-        && astra_tools::workspace_observation::is_explicit_workspace_verification_receipt(
-            record
-                .workspace_mutation_receipt
-                .as_ref()
-                .unwrap_or(&Value::Null),
-        )
-}
-
-pub(crate) fn record_explicit_path(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<String> {
-    // A live record has an executor-owned, lossless argument lane.  Prefer it
-    // over `file_path`, which is a display projection and may itself contain
-    // a redaction marker when the filename resembles a credential.  If the
-    // live arguments are present but do not expose a direct path, do not fall
-    // back to the projection and accidentally compare a different target.
-    if let Some(args) = extract_tool_args(record.authoritative_args_full()) {
-        let path = ["path", "file_path", "notebook_path", "destination", "dest"]
-            .into_iter()
-            .find_map(|key| {
-                args.get(key)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .map(ToString::to_string)
-            });
-        if path.is_some() || record.runtime_args_full.is_some() {
-            return path;
-        }
-    }
-    if record.runtime_args_full.is_some() {
-        return None;
-    }
-    // `args_preview` is an audit display field and is intentionally truncated
-    // by the journal.  It is never an execution contract, even when a short
-    // preview happens to be valid JSON.  A durable `file_path` is acceptable
-    // only when it is not visibly redacted; otherwise this helper fails
-    // closed rather than treating a marker as a real filesystem path.
-    record
-        .file_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && !path.contains("[REDACTED:"))
-        .map(ToString::to_string)
-}
-
-/// A shell-expanded path is not a durable scope receipt.  Resolving it as a
-/// literal relative path can accidentally place an external `$TMPDIR`/glob
-/// under the bound workspace and promote unrelated validation to success.
-fn path_contains_unresolved_shell_expansion(path: &str) -> bool {
-    path.chars()
-        .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | ']'))
-}
-
-/// Resolve an evidence path against the bound workspace without consulting
-/// the process cwd.  A relative path is meaningful only when the executor
-/// supplied a workspace binding; otherwise it is intentionally not a
-/// scheduler receipt.
-pub(crate) fn normalize_workspace_path(
-    path: &str,
-    workspace_root: Option<&str>,
-) -> Option<PathBuf> {
-    if path_contains_unresolved_shell_expansion(path) {
-        return None;
-    }
-    let root = workspace_root.and_then(normalize_absolute_path)?;
-    let raw = Path::new(path);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        root.join(raw)
-    };
-    let candidate = normalize_absolute_path(candidate.to_str()?)?;
-    candidate.starts_with(&root).then_some(candidate)
-}
-
-fn normalize_scoped_path(path: &str, cwd: &Path, root: &Path) -> Option<PathBuf> {
-    if path_contains_unresolved_shell_expansion(path) {
-        return None;
-    }
-    let raw = Path::new(path);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        cwd.join(raw)
-    };
-    let candidate = normalize_absolute_path(candidate.to_str()?)?;
-    candidate.starts_with(root).then_some(candidate)
-}
-
-fn scope_token_is_path_like(token: &str) -> bool {
-    token.starts_with('/')
-        || token.starts_with("./")
-        || token.starts_with("../")
-        || token == "."
-        || token == ".."
-        || (token.contains('/') && !token.contains("://"))
-}
-
-fn scoped_command_path_tokens(words: &[String]) -> Vec<(usize, &str)> {
-    let mut indices = Vec::new();
-    for (index, word) in words.iter().enumerate().skip(1) {
-        let candidate = word
-            .split_once('=')
-            .map(|(_, value)| value)
-            .filter(|_| word.starts_with('-'))
-            .unwrap_or(word);
-        if !candidate.starts_with('-') && scope_token_is_path_like(candidate) {
-            indices.push((index, candidate));
-        }
-    }
-    indices
-}
-
-/// A read-only shell command is not automatically a workspace observation:
-/// `echo`, `true`, and `sleep` are safe but carry no state receipt. Keep this
-/// positive capability separate from permission classification.
-pub(crate) fn bash_command_has_workspace_observation_shape(command: &str) -> bool {
-    if !astra_turn_core::evaluation::shell_command_preserves_pipeline_status(command) {
-        return false;
-    }
-    let Some(segments) =
-        astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
-    else {
-        return false;
-    };
-    let mut observed = false;
-    let mut unobserved_opaque_mutation = false;
-    for (segment_index, (raw_segment, op_after)) in segments.iter().enumerate() {
-        let segment = raw_segment.trim();
-        if !segment.is_empty() && !segment.starts_with('#') {
-            let positive = shell_segment_has_positive_observation(segment);
-            if positive {
-                let literal_script = shell_segment_contains_literal_script_artifact(segment);
-                observed = !literal_script || !unobserved_opaque_mutation;
-                if observed {
-                    unobserved_opaque_mutation = false;
-                }
-            } else if !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(segment) {
-                // A successful observer only describes the state at its own
-                // ordered boundary. An opaque writer on the same successful
-                // shell path reopens the mutation epoch even when joined by
-                // `&&` (for example `check.py && touch stamp`).
-                observed = false;
-                unobserved_opaque_mutation = true;
-            }
-        }
-
-        // A reader/validator followed by `||` or by a real sequence RHS does
-        // not prove the overall command: the reader may have failed and the
-        // later branch can still make the shell return success. `&&` keeps
-        // the receipt on the successful path. A later positive segment may
-        // establish a fresh receipt after a barrier.
-        let sequence_has_rhs = segments[segment_index + 1..].iter().any(|(rhs, _)| {
-            let rhs = rhs.trim();
-            !rhs.is_empty() && !rhs.starts_with('#')
-        });
-        if matches!(op_after, astra_turn_core::evaluation::ShellControlOp::Or)
-            || (matches!(
-                op_after,
-                astra_turn_core::evaluation::ShellControlOp::Sequence
-            ) && sequence_has_rhs)
-        {
-            observed = false;
-        }
-    }
-    observed
-}
-
-/// Prove that the command has a surviving positive observation of the bound
-/// workspace. Earlier ordered segments may legitimately use external scratch
-/// paths (for example a test log under `/tmp`); only the segment carrying the
-/// surviving receipt must be workspace-scoped. Cwd transitions remain
-/// authoritative, and unknown/concurrent syntax fails closed.
-fn bash_command_has_scoped_workspace_observation(
-    command: &str,
-    workspace_root: Option<&str>,
-    workdir: Option<&str>,
-) -> bool {
-    if !astra_turn_core::evaluation::shell_command_preserves_pipeline_status(command) {
-        return false;
-    }
-    let Some(root) = workspace_root.and_then(normalize_absolute_path) else {
-        return workdir.is_none() && bash_command_has_workspace_observation_shape(command);
-    };
-    let Some(segments) =
-        astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
-    else {
-        return false;
-    };
-    let mut cwd = match workdir {
-        Some(workdir) => normalize_workspace_path(workdir, workspace_root),
-        None => Some(root.clone()),
-    };
-    let mut observed = false;
-    let mut unobserved_opaque_mutation = false;
-    for (segment_index, (raw_segment, op_after)) in segments.iter().enumerate() {
-        let segment = raw_segment.trim();
-        if !segment.is_empty() && !segment.starts_with('#') {
-            let positive = shell_segment_has_positive_observation(segment);
-            if positive {
-                let literal_script = shell_segment_contains_literal_script_artifact(segment);
-                observed = (!literal_script || !unobserved_opaque_mutation)
-                    && cwd.as_ref().is_some_and(|cwd| {
-                        shell_observation_segment_is_workspace_scoped(segment, cwd, &root)
-                    });
-                if observed {
-                    unobserved_opaque_mutation = false;
-                }
-            } else if !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(segment) {
-                observed = false;
-                unobserved_opaque_mutation = true;
-            }
-            apply_ordered_shell_cwd_transition(segment, &mut cwd);
-        }
-
-        let sequence_has_rhs = segments[segment_index + 1..].iter().any(|(rhs, _)| {
-            let rhs = rhs.trim();
-            !rhs.is_empty() && !rhs.starts_with('#')
-        });
-        if matches!(op_after, astra_turn_core::evaluation::ShellControlOp::Or)
-            || (matches!(
-                op_after,
-                astra_turn_core::evaluation::ShellControlOp::Sequence
-            ) && sequence_has_rhs)
-        {
-            observed = false;
-        }
-    }
-    observed
-}
-
-fn shell_observation_segment_is_workspace_scoped(segment: &str, cwd: &Path, root: &Path) -> bool {
-    if !cwd.starts_with(root) {
-        return false;
-    }
-    let Some(pipeline_segments) =
-        astra_turn_core::evaluation::split_shell_pipeline_segments(segment)
-    else {
-        return false;
-    };
-    for raw_pipeline in pipeline_segments {
-        let pipeline = raw_pipeline
-            .trim()
-            .strip_suffix("2>&1")
-            .or_else(|| raw_pipeline.trim().strip_suffix("1>&2"))
-            .map(str::trim)
-            .unwrap_or_else(|| raw_pipeline.trim());
-        let Some(words) = shell_file_test_words(pipeline) else {
-            return false;
-        };
-        for (_, token) in scoped_command_path_tokens(&words) {
-            if normalize_scoped_path(token, cwd, root).is_none() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn apply_ordered_shell_cwd_transition(segment: &str, cwd: &mut Option<PathBuf>) {
-    let Some(pipeline_segments) =
-        astra_turn_core::evaluation::split_shell_pipeline_segments(segment)
-    else {
-        *cwd = None;
-        return;
-    };
-    // A cwd-changing builtin inside a pipeline does not establish a
-    // deterministic parent-shell cwd for later evidence.
-    if pipeline_segments.len() != 1 {
-        return;
-    }
-    let pipeline = pipeline_segments[0].trim();
-    let Some(words) = shell_file_test_words(pipeline) else {
-        let head = pipeline
-            .split_whitespace()
-            .next()
-            .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase());
-        if matches!(head.as_deref(), Some("cd" | "pushd")) {
-            *cwd = None;
-        }
-        return;
-    };
-    let Some(head) = words.first().map(|word| word.to_ascii_lowercase()) else {
-        return;
-    };
-    if head == "popd" {
-        *cwd = None;
-        return;
-    }
-    if !matches!(head.as_str(), "cd" | "pushd") {
-        return;
-    }
-    let Some(target) = words.iter().skip(1).find(|word| !word.starts_with('-')) else {
-        *cwd = None;
-        return;
-    };
-    if path_contains_unresolved_shell_expansion(target) {
-        *cwd = None;
-        return;
-    }
-    let raw = Path::new(target);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else if let Some(current) = cwd.as_ref() {
-        current.join(raw)
-    } else {
-        *cwd = None;
-        return;
-    };
-    *cwd = candidate.to_str().and_then(normalize_absolute_path);
-}
-
-fn shell_segment_has_positive_observation(segment: &str) -> bool {
-    if let Some(words) = shell_file_test_words(segment) {
-        let head = words
-            .first()
-            .map(|word| word.to_ascii_lowercase())
-            .unwrap_or_default();
-        if matches!(head.as_str(), "test" | "[") {
-            return shell_file_test_has_workspace_operand(&words);
-        }
-    }
-    let Some(pipelines) = astra_turn_core::evaluation::split_shell_pipeline_segments(segment)
-    else {
-        return false;
-    };
-    // A downstream pipeline stage can terminate early (`head`) or otherwise
-    // mask the interpreter's status when `pipefail` is not active. Therefore
-    // a literal script is behavioral evidence only as a single foreground
-    // command; never let a pipeline containing it fall through to the generic
-    // reader/validator provenance rules.
-    if pipelines.len() > 1
-        && pipelines.iter().any(|raw_pipeline| {
-            let pipeline = raw_pipeline
-                .trim()
-                .strip_suffix("2>&1")
-                .or_else(|| raw_pipeline.trim().strip_suffix("1>&2"))
-                .map(str::trim)
-                .unwrap_or_else(|| raw_pipeline.trim());
-            shell_pipeline_executes_literal_script_artifact(pipeline)
-        })
-    {
-        return false;
-    }
-    // A pipeline is concurrent, so an unknown or mutating stage invalidates
-    // the whole receipt group. A later validator cannot prove ordering around
-    // `touch`, an inline writer, or another opaque stage. Known read-only
-    // stages and canonical validators remain eligible for the provenance
-    // rules below.
-    if pipelines.iter().any(|raw_pipeline| {
-        let pipeline = raw_pipeline
-            .trim()
-            .strip_suffix("2>&1")
-            .or_else(|| raw_pipeline.trim().strip_suffix("1>&2"))
-            .map(str::trim)
-            .unwrap_or_else(|| raw_pipeline.trim());
-        shell_segment_has_non_benign_redirect(pipeline)
-            || (!astra_turn_core::cloud_approval_policy::bash_command_is_read_only(pipeline)
-                && !astra_turn_core::evaluation::bash_command_has_post_mutation_validation(
-                    pipeline,
-                )
-                && !shell_pipeline_executes_literal_script_artifact(pipeline))
-    }) {
-        return false;
-    }
-    let mut upstream_workspace_receipt = false;
-    let mut validator_count = 0;
-    for raw_pipeline in &pipelines {
-        let pipeline = raw_pipeline
-            .trim()
-            .strip_suffix("2>&1")
-            .or_else(|| raw_pipeline.trim().strip_suffix("1>&2"))
-            .map(str::trim)
-            .unwrap_or_else(|| raw_pipeline.trim());
-        if shell_segment_has_non_benign_redirect(pipeline) {
-            return false;
-        }
-        if shell_segment_has_reader_meta_option(pipeline) {
-            return false;
-        }
-        let Some(words) = shell_file_test_words(pipeline) else {
-            // The canonical validator may still understand a compound
-            // pipeline, but an unknown reader shape is not a receipt by
-            // itself. Keep the positive classifier fail-closed.
-            continue;
-        };
-        let Some(head) = words.first().map(|word| word.to_ascii_lowercase()) else {
-            continue;
-        };
-        let basic_receipt = shell_segment_has_basic_workspace_observation(pipeline);
-        // The broad core predicate intentionally accepts generic local checks
-        // such as `test` as a receipt for a whole command. It is not safe to
-        // use that broad result as pipeline provenance: `test foo` and
-        // `test foo | cat` inspect only literals/stdin. Pipeline stages may
-        // inherit only from a strict canonical validator, or from the basic
-        // operand-aware receipt calculated above.
-        let literal_test_without_operand =
-            matches!(head.as_str(), "test" | "[") && !shell_file_test_has_workspace_operand(&words);
-        let validator =
-            astra_turn_core::evaluation::bash_command_post_mutation_validation_prefix(pipeline)
-                .is_some();
-        validator_count += usize::from(validator);
-        if validator_count > 1 {
-            return false;
-        }
-        let canonical_receipt = validator
-            || (!literal_test_without_operand
-                && astra_turn_core::evaluation::bash_command_has_post_mutation_validation(
-                    pipeline,
-                ))
-            || shell_pipeline_executes_literal_script_artifact(pipeline);
-        // A reader without an operand may consume a previous pipeline stage
-        // (e.g. `cargo test | tail -20`), but it may only inherit a receipt
-        // from a prior stage that itself has a workspace operand or a
-        // canonical validation shape. Pipeline position alone is not proof:
-        // `printf x | cat` and `[ foo ] | cat` only process literals/stdin.
-        if shell_reader_requires_operand_check(&head)
-            && !basic_receipt
-            && !upstream_workspace_receipt
-        {
-            return false;
-        }
-        if basic_receipt || canonical_receipt {
-            upstream_workspace_receipt = true;
-        }
-    }
-    upstream_workspace_receipt
-        || astra_turn_core::evaluation::bash_command_post_mutation_validation_prefix(segment)
-            .is_some()
-        || (pipelines.len() == 1
-            && astra_turn_core::evaluation::bash_command_has_post_mutation_validation(segment))
-}
-
-/// A successful foreground execution of a literal script in the bound
-/// workspace is a direct behavioral observation of that delivered artifact.
-/// This is intentionally narrower than treating an arbitrary interpreter
-/// invocation or exit code as evidence: inline code, modules, stdin, dynamic
-/// paths, and mismatched extensions remain opaque. The caller separately
-/// proves the ordered cwd/path stays inside the bound workspace.
-fn shell_segment_contains_literal_script_artifact(segment: &str) -> bool {
-    astra_turn_core::evaluation::split_shell_pipeline_segments(segment).is_some_and(|pipelines| {
-        pipelines.iter().any(|pipeline| {
-            shell_pipeline_literal_script_artifact(
-                pipeline
-                    .trim()
-                    .strip_suffix("2>&1")
-                    .or_else(|| pipeline.trim().strip_suffix("1>&2"))
-                    .map(str::trim)
-                    .unwrap_or_else(|| pipeline.trim()),
-            )
-            .is_some()
-        })
-    })
-}
-
-fn shell_pipeline_executes_literal_script_artifact(pipeline: &str) -> bool {
-    shell_pipeline_literal_script_artifact(pipeline).is_some()
-}
-
-fn shell_pipeline_literal_script_artifact(segment: &str) -> Option<String> {
-    if shell_segment_has_non_benign_redirect(segment)
-        || shell_segment_has_reader_meta_option(segment)
-    {
-        return None;
-    }
-    let words = astra_turn_core::evaluation::split_static_shell_words(segment)?;
-    let [interpreter, script, ..] = words.as_slice() else {
-        return None;
-    };
-    if script.starts_with('-') || matches!(script.as_str(), "-" | "." | "..") {
-        return None;
-    }
-    let interpreter = Path::new(interpreter)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_ascii_lowercase)?;
-    let extension = Path::new(script)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase);
-    let extension_matches = match interpreter.as_str() {
-        name if name == "python"
-            || name == "python3"
-            || name.strip_prefix("python3.").is_some_and(|minor| {
-                !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit())
-            }) =>
-        {
-            extension.as_deref() == Some("py")
-        }
-        "node" | "nodejs" => matches!(extension.as_deref(), Some("js" | "mjs" | "cjs")),
-        "ruby" => extension.as_deref() == Some("rb"),
-        "perl" => extension.as_deref() == Some("pl"),
-        "php" => extension.as_deref() == Some("php"),
-        "bash" | "sh" | "zsh" => extension.as_deref() == Some("sh"),
-        _ => false,
-    };
-    extension_matches.then(|| script.clone())
-}
-
-fn shell_reader_requires_operand_check(head: &str) -> bool {
-    matches!(
-        head,
-        "cat"
-            | "head"
-            | "tail"
-            | "grep"
-            | "rg"
-            | "ls"
-            | "find"
-            | "file"
-            | "stat"
-            | "readlink"
-            | "wc"
-            | "sed"
-            | "cmp"
-            | "diff"
-            | "sha256sum"
-            | "sha512sum"
-            | "git"
-    )
-}
-
-fn shell_segment_has_non_benign_redirect(segment: &str) -> bool {
-    let segment = segment
-        .trim()
-        .strip_suffix("2>&1")
-        .or_else(|| segment.trim().strip_suffix("1>&2"))
-        .map(str::trim)
-        .unwrap_or_else(|| segment.trim());
-    // Keep redirect syntax classification on the shared raw shell scanner.
-    // The lifecycle path must agree with core for quoted literals such as
-    // `grep '>' file`; tokenizing first would turn that literal into a false
-    // output redirect and reject valid observation evidence.
-    astra_turn_core::evaluation::shell_segment_has_non_benign_redirect(segment)
-}
-
-fn shell_file_test_words(segment: &str) -> Option<Vec<String>> {
-    let trimmed = segment.trim();
-    if trimmed.starts_with('[') {
-        let body = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
-        return astra_turn_core::evaluation::split_static_shell_words(&format!("test {body}"));
-    }
-    astra_turn_core::evaluation::split_static_shell_words(trimmed)
-}
-
-fn shell_segment_has_reader_meta_option(segment: &str) -> bool {
-    let segment = segment
-        .trim()
-        .strip_suffix("2>&1")
-        .or_else(|| segment.trim().strip_suffix("1>&2"))
-        .map(str::trim)
-        .unwrap_or_else(|| segment.trim());
-    let Some(words) = astra_turn_core::evaluation::split_static_shell_words(segment) else {
-        return false;
-    };
-    let head = words
-        .first()
-        .map(|word| word.to_ascii_lowercase())
-        .unwrap_or_default();
-    let mut options_done = false;
-    words.iter().skip(1).any(|word| {
-        if options_done {
-            return false;
-        }
-        if word == "--" {
-            options_done = true;
-            return false;
-        }
-        matches!(word.as_str(), "-V" | "-?")
-            || (word == "-h"
-                && matches!(
-                    head.as_str(),
-                    "git" | "cat" | "head" | "tail" | "sed" | "cargo" | "python" | "python3"
-                ))
-            || matches!(
-                word.to_ascii_lowercase().as_str(),
-                "--help" | "--version" | "--usage"
-            )
-    })
-}
-
-fn shell_segment_has_basic_workspace_observation(segment: &str) -> bool {
-    let Some(pipelines) = astra_turn_core::evaluation::split_shell_pipeline_segments(segment)
-    else {
-        return false;
-    };
-    pipelines.into_iter().any(|pipeline| {
-        let pipeline = pipeline
-            .trim()
-            .strip_suffix("2>&1")
-            .or_else(|| pipeline.trim().strip_suffix("1>&2"))
-            .map(str::trim)
-            .unwrap_or_else(|| pipeline.trim());
-        if shell_segment_has_non_benign_redirect(pipeline) {
-            return false;
-        }
-        let Some(words) = shell_file_test_words(pipeline) else {
-            return false;
-        };
-        let Some(head) = words.first().map(|word| word.to_ascii_lowercase()) else {
-            return false;
-        };
-        if shell_segment_has_reader_meta_option(pipeline) {
-            return false;
-        }
-        match head.as_str() {
-            "git" => shell_git_has_workspace_subcommand(&words),
-            "ls" | "find" => true,
-            "grep" | "rg" => shell_grep_has_workspace_operand(&words, &head),
-            "sed" => {
-                shell_reader_positional_count(&words, &head) >= 1
-                    && words
-                        .iter()
-                        .skip(1)
-                        .any(|word| word == "-n" || word == "--quiet")
-            }
-            "cat" | "head" | "tail" | "file" | "stat" | "readlink" | "wc" | "cmp" | "diff" => {
-                shell_reader_positional_count(&words, &head) >= 1
-            }
-            "sha256sum" | "sha512sum" => shell_reader_positional_count(&words, &head) >= 1,
-            "test" | "[" => shell_file_test_has_workspace_operand(&words),
-            _ => false,
-        }
-    })
-}
-
-fn shell_git_has_workspace_subcommand(words: &[String]) -> bool {
-    let mut skip_next = false;
-    for word in words.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if word == "--" {
-            return false;
-        }
-        if word.starts_with('-') {
-            if shell_option_takes_value_for_reader("git", word) {
-                skip_next = true;
-            }
-            continue;
-        }
-        return matches!(
-            word.to_ascii_lowercase().as_str(),
-            "status" | "diff" | "show" | "log" | "ls-files" | "branch" | "remote"
-        );
-    }
-    false
-}
-
-fn shell_reader_positional_count(words: &[String], head: &str) -> usize {
-    let mut count = 0;
-    let mut skip_next = false;
-    let mut options_done = false;
-    for word in words.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if options_done {
-            count += 1;
-            continue;
-        }
-        if word == "--" {
-            options_done = true;
-            continue;
-        }
-        if word.starts_with('-') {
-            if shell_option_takes_value_for_reader(head, word) && !word.contains('=') {
-                skip_next = true;
-            }
-            continue;
-        }
-        count += 1;
-    }
-    count
-}
-
-fn shell_grep_has_workspace_operand(words: &[String], head: &str) -> bool {
-    let positional = shell_reader_positional_count(words, head);
-    let pattern_from_option = words.iter().skip(1).any(|word| {
-        matches!(word.as_str(), "-e" | "--regexp" | "-f" | "--file")
-            || word.starts_with("--regexp=")
-            || word.starts_with("--file=")
-    });
-    if pattern_from_option {
-        positional >= 1
-    } else {
-        positional >= 2
-    }
-}
-
-fn shell_file_test_has_workspace_operand(words: &[String]) -> bool {
-    let mut operands = words
-        .iter()
-        .skip(1)
-        .filter(|word| word.as_str() != "]")
-        .filter(|word| !matches!(word.as_str(), "!" | "("))
-        .peekable();
-    while let Some(word) = operands.next() {
-        if matches!(
-            word.as_str(),
-            "-e" | "-f"
-                | "-d"
-                | "-L"
-                | "-h"
-                | "-b"
-                | "-c"
-                | "-p"
-                | "-r"
-                | "-w"
-                | "-x"
-                | "-s"
-                | "-O"
-                | "-G"
-                | "-N"
-                | "-ef"
-                | "-nt"
-                | "-ot"
-        ) {
-            return operands.next().is_some();
-        }
-    }
-    false
-}
-
-fn shell_option_takes_value_for_reader(head: &str, option: &str) -> bool {
-    match head {
-        "wc" => matches!(option, "--files0-from"),
-        "grep" | "rg" => matches!(
-            option,
-            "-e" | "--regexp"
-                | "-f"
-                | "--file"
-                | "-C"
-                | "--context"
-                | "--include"
-                | "--exclude"
-                | "--glob"
-                | "-m"
-                | "--max-count"
-        ),
-        "head" | "tail" => matches!(option, "-n" | "--lines" | "-c" | "--bytes"),
-        "stat" => matches!(option, "-c" | "--format" | "--printf" | "-t"),
-        "find" => matches!(
-            option,
-            "-maxdepth" | "-mindepth" | "-name" | "-path" | "-type" | "-printf"
-        ),
-        _ => shell_option_takes_value(option),
-    }
-}
-
-fn shell_option_takes_value(option: &str) -> bool {
-    matches!(
-        option,
-        "-n" | "--lines"
-            | "-c"
-            | "--bytes"
-            | "-m"
-            | "--max-count"
-            | "-e"
-            | "--regexp"
-            | "-f"
-            | "--file"
-            | "-C"
-            | "--context"
-            | "-d"
-            | "--delimiter"
-            | "-t"
-            | "--time-style"
-            | "--format"
-            | "--max-depth"
-            | "--min-depth"
-            | "--include"
-            | "--exclude"
-            | "--glob"
-            | "--type"
-            | "--color"
-            | "--git-dir"
-            | "--work-tree"
-    )
-}
-
-pub(crate) fn bash_invocation_has_scoped_workspace_observation(
-    root: Option<&str>,
-    args: &Value,
-) -> bool {
-    let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(args) else {
-        return false;
-    };
-    let has_go_validation = astra_turn_core::evaluation::bash_command_has_go_validation(command);
-    if has_go_validation
-        && (root.and_then(normalize_absolute_path).is_none()
-            || astra_turn_core::evaluation::normalize_validation_prefix("bash", &args.to_string())
-                .is_none())
-    {
-        return false;
-    }
-    if has_go_validation {
-        let root = root
-            .and_then(normalize_absolute_path)
-            .expect("checked Go root");
-        let Some(segments) =
-            astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
-        else {
-            return false;
-        };
-        if segments.iter().any(|(segment, _)| {
-            external_scratch_setup(segment, None) && !external_scratch_setup(segment, root.to_str())
-        }) {
-            return false;
-        }
-    }
-    let workdir = match args.get("workdir") {
-        None => None,
-        Some(Value::String(workdir)) if !workdir.trim().is_empty() => Some(workdir.as_str()),
-        _ => return false,
-    };
-    bash_command_has_scoped_workspace_observation(command, root, workdir)
-}
-
-/// Return concrete targets only for a simple, unambiguous shell mutation.
-/// Complex control flow, substitutions, pipelines, and heredocs remain
-/// unknown here; the command is still executable, but cannot serve as a
-/// scheduler renewal receipt without an executor-provided file_path.
-fn simple_bash_mutation_targets(command: &str) -> Option<Vec<String>> {
-    if command.contains([';', '|', '\n', '&'])
-        || command.contains("$(")
-        || command.contains('`')
-        || command.contains("<<")
-    {
-        return None;
-    }
-    let args = astra_turn_core::evaluation::split_static_shell_words(command)?;
-    let head = args.first()?.to_ascii_lowercase();
-    if !crate::bash_intent::bash_command_looks_mutating(command) {
-        return None;
-    }
-    // For redirects, only the destination is a mutation target; source paths
-    // and string literals must not turn a scratch-only write into workspace
-    // progress.  Handle both spaced and attached `>file` forms.
-    let redirect_count = args
-        .iter()
-        .filter(|token| matches!(token.as_str(), ">" | ">>"))
-        .count();
-    if redirect_count > 0 {
-        // A shell command may redirect more than one descriptor.  The static
-        // lexer intentionally does not model descriptor semantics, so a
-        // second redirect is an unknown additional write rather than a reason
-        // to trust only the first target.
-        if redirect_count != 1 {
-            return None;
-        }
-        let index = args.iter().position(|token| token.starts_with('>'))?;
-        if !matches!(head.as_str(), "cat" | "echo" | "printf") {
-            return None;
-        }
-        let token = args[index].trim_start_matches('>');
-        let target = if token.is_empty() {
-            args.get(index + 1)?.to_string()
-        } else {
-            token.to_string()
-        };
-        return static_shell_path_token(&target).map(|target| vec![target]);
-    }
-    let positional = args
-        .iter()
-        .skip(1)
-        .filter(|token| !token.starts_with('-'))
-        .filter(|token| !token.contains('='))
-        .cloned()
-        .collect::<Vec<_>>();
-    match head.as_str() {
-        "cp" | "mv" | "ln" => {
-            // Destination-changing options (notably `-t DIR`) need their own
-            // argv semantics.  Until a typed executor target is available,
-            // fail closed instead of treating the final source operand as the
-            // destination.
-            if args.iter().skip(1).any(|token| token.starts_with('-')) {
-                return None;
-            }
-            positional
-                .into_iter()
-                .map(|target| static_shell_path_token(&target))
-                .collect::<Option<Vec<_>>>()
-                .and_then(|mut targets| targets.pop().map(|target| vec![target]))
-        }
-        "rm" | "rmdir" | "mkdir" | "touch" => {
-            if args.iter().skip(1).any(|token| token.starts_with('-')) {
-                return None;
-            }
-            positional
-                .into_iter()
-                .map(|target| static_shell_path_token(&target))
-                .collect::<Option<Vec<_>>>()
-                .filter(|targets| !targets.is_empty())
-        }
-        "chmod" | "chown" => {
-            if args.iter().skip(1).any(|token| token.starts_with('-')) {
-                return None;
-            }
-            // The first positional is a mode/owner, not a file.  Until the
-            // executor provides typed target operands, retain only the final
-            // literal path; the mode must never be treated as a filesystem
-            // operand when proving a mutation is confined to scratch space.
-            positional
-                .into_iter()
-                .last()
-                .and_then(|target| static_shell_path_token(&target))
-                .map(|target| vec![target])
-        }
-        _ => None,
-    }
-}
-
-/// Keep only literal path operands.  Expansion is deliberately not inferred
-/// from a shell string: a variable, glob, tilde, escape, or substitution can
-/// point outside the bound workspace and therefore needs a typed executor
-/// receipt instead of scheduler heuristics.
-fn static_shell_path_token(token: &str) -> Option<String> {
-    let token = token.trim();
-    if token.is_empty()
-        || token.starts_with('&')
-        || token.chars().any(|ch| {
-            matches!(
-                ch,
-                '$' | '`' | '~' | '*' | '?' | '[' | ']' | '\\' | '>' | '<' | '|' | '&'
-            )
-        })
-    {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-/// Prove a deliberately narrow shell shape: one literal redirect writer whose
-/// sole target is volatile scratch outside the bound workspace. Compound
-/// commands and multi-operand writers are not exhaustively modeled here; an
-/// executor-provided typed receipt is required before those can be ignored by
-/// a post-mutation observation watermark.
-pub(crate) fn bash_mutation_is_proven_external_scratch(
-    command: &str,
-    workspace_root: Option<&str>,
-) -> bool {
-    // A review/exploration command often uses a compound read pipeline and
-    // redirects the inspected bytes to `/tmp` for a second bounded read.  The
-    // old recognizer rejected every compound form, so an external scratch
-    // file was incorrectly promoted to a bound-workspace mutation.  Keep the
-    // proof fail-closed: every segment must be either a canonical read-only
-    // command (or shell-local `cd`) or a canonical read-only producer whose
-    // sole redirect target is external scratch; unknown writers and any
-    // workspace redirect remain mutation barriers.
-    if let Some(segments) = astra_turn_core::evaluation::split_shell_control_segments(command) {
-        let segments = segments
-            .into_iter()
-            .map(|segment| segment.trim().to_string())
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if external_scratch_for_loop(&segments, workspace_root) {
-            return true;
-        }
-        if segments.len() > 1 {
-            let mut saw_external_redirect = false;
-            let mut safe = true;
-            for segment in &segments {
-                if let Some((producer, _target)) =
-                    external_scratch_redirect(segment, workspace_root)
-                {
-                    if !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(&producer)
-                    {
-                        safe = false;
-                        break;
-                    }
-                    saw_external_redirect = true;
-                } else if !shell_local_or_read_only(segment)
-                    && !external_scratch_setup(segment, workspace_root)
-                {
-                    safe = false;
-                    break;
-                }
-            }
-            if safe && saw_external_redirect {
-                return true;
-            }
-        }
-    }
-
-    let Some(segments) = astra_turn_core::evaluation::split_shell_control_segments(command) else {
-        return false;
-    };
-    let mut segments = segments
-        .into_iter()
-        .map(|segment| segment.trim().to_string())
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() != 1 {
-        return false;
-    }
-    let segment = segments.pop().expect("one non-empty segment");
-    if external_scratch_setup(&segment, workspace_root) {
-        return true;
-    }
-    let head = segment
-        .split_whitespace()
-        .next()
-        .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase());
-    if !matches!(head.as_deref(), Some("cat" | "echo" | "printf")) {
-        return false;
-    }
-    let Some(targets) = simple_bash_mutation_targets(&segment) else {
-        return false;
-    };
-    targets.len() == 1
-        && Path::new(&targets[0]).is_absolute()
-        && path_is_external_volatile_scratch(&targets[0], workspace_root)
-}
-
-/// Return the read-only producer and its one literal redirect target.  The
-/// shell splitter has already separated pipelines/control operators; the
-/// static lexer still rejects substitutions/globs so target scope cannot be
-/// guessed from a shell string.
-fn external_scratch_redirect(
-    segment: &str,
-    workspace_root: Option<&str>,
-) -> Option<(String, String)> {
-    // Normalize only AST-confirmed fd forwarding before looking for the one
-    // real output target.  Without this, a safe `> /tmp/snapshot 2>&1` is
-    // mistaken for two writes and cannot be scoped to external scratch.
-    let normalized = astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(segment);
-    let args = astra_turn_core::evaluation::split_static_shell_words(&normalized)?;
-    let redirect_indices = args
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| token.starts_with('>') || token.starts_with("2>"))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if redirect_indices.len() != 1 {
-        return None;
-    }
-    let index = redirect_indices[0];
-    let token = args[index].as_str();
-    let target = if token == ">" || token == ">>" || token == "2>" || token == "2>>" {
-        args.get(index + 1)?.clone()
-    } else if token.starts_with("2>>") {
-        token.trim_start_matches("2>>").to_string()
-    } else {
-        token
-            .trim_start_matches(">>")
-            .trim_start_matches('>')
-            .to_string()
-    };
-    if target.is_empty()
-        || target.contains(['$', '`', '~', '*', '?', '[', ']', '\\', '<', '>', '|', '&'])
-        || !Path::new(&target).is_absolute()
-        || !path_is_external_volatile_scratch(&target, workspace_root)
-    {
-        return None;
-    }
-    let mut producer = args[..index].to_vec();
-    if token == ">" || token == ">>" || token == "2>" || token == "2>>" {
-        // The target is a separate argv token; no producer bytes follow it.
-        producer.truncate(index);
-    }
-    if producer.is_empty() {
-        return None;
-    }
-    Some((producer.join(" "), target))
-}
-
-fn shell_local_or_read_only(segment: &str) -> bool {
-    let head = segment
-        .split_whitespace()
-        .next()
-        .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase());
-    head.as_deref() == Some("cd")
-        || astra_turn_core::cloud_approval_policy::bash_command_is_read_only(segment)
-}
-
-/// Validate the bounded `for ...; do read-only body; done > /tmp/file` shape
-/// used to collect several historical diff slices.  The shell evaluator
-/// intentionally exposes only top-level segments, so validate the loop
-/// header, substitute its literal loop variable in the body, and require
-/// every body pipeline stage to be a canonical observation.  This handles a
-/// real compound shell construct without treating arbitrary loops as safe.
-fn external_scratch_for_loop(segments: &[String], workspace_root: Option<&str>) -> bool {
-    let mut index = 0usize;
-    let mut saw_loop = false;
-    while index < segments.len() {
-        let segment = segments[index].trim();
-        if !segment.starts_with("for ") {
-            if !shell_local_or_read_only(segment)
-                && !external_scratch_setup(segment, workspace_root)
-            {
-                return false;
-            }
-            index += 1;
-            continue;
-        }
-        if saw_loop || !valid_literal_for_header(segment) {
-            return false;
-        }
-        saw_loop = true;
-        let variable = segment
-            .split_whitespace()
-            .nth(1)
-            .expect("validated for header has a loop variable");
-        index += 1;
-        let mut saw_body = false;
-        let mut saw_done = false;
-        while index < segments.len() {
-            let body_segment = segments[index].trim();
-            if let Some(body) = body_segment.strip_prefix("do ") {
-                saw_body = true;
-                if !read_only_loop_body(body, variable) {
-                    return false;
-                }
-            } else if let Some(done_tail) = body_segment.strip_prefix("done") {
-                if !saw_body || !external_scratch_done_redirect(done_tail, workspace_root) {
-                    return false;
-                }
-                saw_done = true;
-                index += 1;
-                break;
-            } else if !read_only_loop_body(body_segment, variable) {
-                return false;
-            }
-            index += 1;
-        }
-        if !saw_done {
-            return false;
-        }
-    }
-    saw_loop
-}
-
-fn valid_literal_for_header(segment: &str) -> bool {
-    let words = segment.split_whitespace().collect::<Vec<_>>();
-    words.len() >= 4
-        && words[0] == "for"
-        && words[2] == "in"
-        && words[1].bytes().enumerate().all(|(index, byte)| {
-            (index == 0 && (byte == b'_' || byte.is_ascii_alphabetic()))
-                || (index > 0 && (byte == b'_' || byte.is_ascii_alphanumeric()))
-        })
-        && words[3..].iter().all(|word| {
-            !word.is_empty()
-                && !word.contains(['$', '`', '*', '?', '[', ']', ';', '|', '&', '>', '<'])
-        })
-}
-
-fn read_only_loop_body(body: &str, variable: &str) -> bool {
-    let body = body
-        .replace(&format!("${{{variable}}}"), "literal")
-        .replace(&format!("${variable}"), "literal");
-    let Some(pipeline_segments) = astra_turn_core::evaluation::split_shell_pipeline_segments(&body)
-    else {
-        return false;
-    };
-    !pipeline_segments.is_empty()
-        && pipeline_segments
-            .into_iter()
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .all(shell_local_or_read_only)
-}
-
-fn external_scratch_done_redirect(done_tail: &str, workspace_root: Option<&str>) -> bool {
-    // Reuse the exact redirect parser with a harmless read-only producer;
-    // `done` itself is a shell keyword, not an argv command.
-    let synthetic = format!("echo{done_tail}");
-    external_scratch_redirect(&synthetic, workspace_root).is_some()
-}
-
 fn begin_budget_settlement(state: &mut AgenticLoopState) -> bool {
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
@@ -2772,10 +1540,7 @@ fn begin_budget_settlement_for_work_state(
     allow_without_tool_calls: bool,
     allow_completion_action: bool,
 ) -> bool {
-    let pending = match super::execution_phase::pending_terminal_completion_action_for_work_state(
-        state,
-        active_work_attempt,
-    ) {
+    let pending = match super::execution_phase::pending_completion_action(state) {
         Ok(action) => action,
         Err(error) => {
             super::execution_phase::finish_unavailable_verification(state, error);
@@ -2837,9 +1602,7 @@ fn begin_budget_settlement_for_work_state(
                 "mode": if active_work_attempt { "completion_then_work_settlement" } else { "one_completion_action" },
                 "allowed_action": action,
                 "attempts_remaining": 1,
-                "action_hint": super::execution_phase::completion_action_hint_for_state(
-                    state, &action,
-                ),
+                "action_hint": super::execution_phase::completion_action_hint(&action),
                 "declarations_may_remain_visible_for_cache": true,
                 "execution_authority": "one_matching_action",
                 "evidence": tool_outcome_evidence,
@@ -2947,9 +1710,8 @@ pub(super) fn prepare_iteration_budget(
 /// Unified diagnosis of all stall conditions evaluated at interruption time.
 ///
 /// Computes the signal string, human-readable summary, and restricted tool
-/// list in a single pass to avoid re-evaluating the same three stall
-/// conditions (exploration family streak, redundant reads, single-tool
-/// streak) across three separate functions.
+/// list in a single pass to avoid re-evaluating the same stall
+/// observations across three separate functions.
 struct StallDiagnosis {
     signal: Option<String>,
     summary: Option<String>,
@@ -2962,42 +1724,16 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
         && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
     {
-        let mut summary_text = match family {
+        let summary_text = match family {
             "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
             "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
             "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
             _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
         };
-        // Enrich with redundant read detail when co-occurring
-        if family == "read" {
-            let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-                &state.stall.tool_call_records,
-            );
-            if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD
-            {
-                summary_text.push_str(&format!(
-                    "; {redundant_reads} redundant overlapping reads on unchanged files"
-                ));
-            }
-        }
         let summary = Some(summary_text);
         return StallDiagnosis {
             signal: Some(format!("exploration_family={family};streak={streak}")),
             summary,
-            restricted_tools: Vec::new(),
-        };
-    }
-
-    // 2. Redundant overlapping reads
-    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-        &state.stall.tool_call_records,
-    );
-    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
-        return StallDiagnosis {
-            signal: Some(format!("redundant_reads={redundant_reads}")),
-            summary: Some(format!(
-                "{redundant_reads} redundant overlapping reads on unchanged files"
-            )),
             restricted_tools: Vec::new(),
         };
     }
@@ -3267,10 +2003,6 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     kind: CompactionKind,
     audit_label: &str,
 ) {
-    if state.compaction_effectiveness.is_circuit_open() {
-        return;
-    }
-
     let max_tokens = state.max_turn_input_tokens;
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,
@@ -3419,9 +2151,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     // Cancellation and pause have priority over round control. Capture the
     // permission selection before any mode-dependent preparation begins.
-    super::permission_boundary::apply_round_permission_mode(host, state)
-        .await
-        .map_err(|error| error.to_string())?;
+    super::settings_boundary::apply_round_settings(host, state).await?;
 
     if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
         super::execution_phase::finish_unavailable_verification(state, error);
@@ -3790,22 +2520,34 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
     maybe_pre_route_skill(host, state).await;
 
-    if turn_index > 0 {
+    if turn_index > 0 || state.messages.len() > 10 {
         // Context pressure estimation + adaptive compaction.
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
+        // The last provider measurement includes protocol-owned input which
+        // the local text estimator cannot see. Use it until a new request is
+        // measured, discounting only the savings from rewrites in this pass.
+        let mut measured_floor = state.last_measured_prompt_tokens.unwrap_or(0);
+        let pressure_with_measurement = |state: &AgenticLoopState, floor: u64| {
+            let (pressure, estimate) = estimate_context_pressure_for_state(state);
+            if state.max_turn_input_tokens == 0 || estimate >= floor {
+                (pressure, estimate)
+            } else {
+                (floor as f64 / state.max_turn_input_tokens as f64, floor)
+            }
+        };
         let (mut pressure, mut pressure_estimate_tokens) =
-            estimate_context_pressure_for_state(state);
+            pressure_with_measurement(state, measured_floor);
 
         // Pre-turn LLM compact: if pressure exceeds the model-adaptive
         // trigger, let the host run an optional cache-friendly inline-summary
         // pass before the next LLM call.
         if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
-            && state.compact_tier_applied < CompactionTier::CompactHistory
             && state.messages.len() > 10
         {
             if let Some(event) = host.maybe_pre_turn_compact(state, pressure).await {
+                measured_floor = measured_floor.saturating_sub(event.tokens_freed);
                 state.context_compression_triggered = true;
                 state
                     .compaction_effectiveness
@@ -3826,7 +2568,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     sess.stats.record_compaction(event.tokens_freed);
                 }
                 host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) = estimate_context_pressure_for_state(state);
+                (pressure, pressure_estimate_tokens) =
+                    pressure_with_measurement(state, measured_floor);
             }
         }
 
@@ -3891,6 +2634,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             )
         };
         if mc.results_compacted > 0 {
+            measured_floor = measured_floor.saturating_sub(mc.tokens_saved as u64);
             state.finish_canonical_rewrite(rewrite_permit);
             state.context_compression_triggered = true;
             let event = CompactionEvent::new(
@@ -3926,7 +2670,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure_for_state(state);
+        let (post_mc_pressure, post_mc_tokens) = pressure_with_measurement(state, measured_floor);
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
@@ -3934,30 +2678,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
             let is_aggressive =
                 post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
-            let (kind, label) = if is_aggressive {
+            let (kind, label) = if turn_index == 0 {
+                (CompactionKind::Resume, "resume")
+            } else if is_aggressive {
                 (CompactionKind::ProactiveAggressive, "aggressive")
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
             run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label);
-        }
-    }
-
-    // ── Compaction-on-resume: if turn 0 has many messages (restored from
-    // checkpoint), estimate context pressure from raw content size and
-    // proactively compress before the first LLM call.  This prevents an
-    // immediate 413 when resuming from a CompactAndRetry interruption.
-    if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let (estimated_pressure, estimated_tokens) = estimate_context_pressure_for_state(state);
-        if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            run_proactive_compaction(
-                estimated_pressure,
-                estimated_tokens,
-                state,
-                host,
-                CompactionKind::Resume,
-                "resume",
-            );
         }
     }
 
@@ -4458,202 +3186,6 @@ mod tests {
         assert_eq!(state.llm_rounds_completed, 28);
     }
 
-    #[test]
-    fn explicit_bash_verification_receipt_requires_the_exact_contract() {
-        let receipt = astra_tools::workspace_observation::explicit_workspace_verification_receipt();
-        let mut record = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(json!({"command": "pytest -q", "mode": "verify"}).to_string()),
-            runtime_args_full: Some(json!({"command": "pytest -q", "mode": "verify"}).to_string()),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: receipt
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .cloned(),
-            ..Default::default()
-        };
-        assert!(record_has_typed_workspace_observation_receipt(&record));
-        assert!(record_has_full_scope_explicit_workspace_verification_receipt(&record));
-
-        record.runtime_args_full = None;
-        assert!(!record_has_typed_workspace_observation_receipt(&record));
-        record.runtime_args_full = record.args_full.clone();
-
-        record.workspace_mutation_observed = Some(true);
-        assert!(!record_has_typed_workspace_observation_receipt(&record));
-        record.workspace_mutation_observed = None;
-
-        let typed_observer_receipt =
-            astra_tools::workspace_observation::typed_workspace_observation_receipt();
-        let typed_observer = ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(json!({"path": "/workspace/result"}).to_string()),
-            runtime_args_full: Some(json!({"path": "/workspace/result"}).to_string()),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: typed_observer_receipt
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .cloned(),
-            ..Default::default()
-        };
-        assert!(record_has_typed_workspace_observation_receipt(
-            &typed_observer
-        ));
-        assert!(
-            !record_has_full_scope_explicit_workspace_verification_receipt(&typed_observer),
-            "a typed read receipt must not be promoted to full-scope Bash verification"
-        );
-
-        let mut wrong_tool_v2 = typed_observer;
-        wrong_tool_v2.workspace_mutation_receipt = record.workspace_mutation_receipt.clone();
-        assert!(!record_has_typed_workspace_observation_receipt(
-            &wrong_tool_v2
-        ));
-        assert!(
-            !record_has_full_scope_explicit_workspace_verification_receipt(&wrong_tool_v2),
-            "the v2 payload alone must not authorize a non-Bash tool"
-        );
-
-        record.args_full = Some(json!({"command": "pytest -q"}).to_string());
-        record.runtime_args_full = record.args_full.clone();
-        assert!(!record_has_typed_workspace_observation_receipt(&record));
-
-        record.args_full = Some(json!({"command": "pytest -q", "mode": "verify"}).to_string());
-        record.runtime_args_full = record.args_full.clone();
-        record.workspace_mutation_receipt = Some(json!({
-            "schema": "workspace_observation_receipt.v2",
-            "source": "model_claim",
-            "scope": astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE,
-            "ownership": "typed_workspace_observer",
-        }));
-        assert!(!record_has_typed_workspace_observation_receipt(&record));
-    }
-
-    #[test]
-    fn unchanged_bash_fingerprint_is_safe_invalidation_evidence() {
-        let fields =
-            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-            );
-        let receipt = fields
-            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-            .cloned();
-        let mut failed = ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(json!({"command": "pnpm exec tsc --noEmit"}).to_string()),
-            runtime_args_full: Some(json!({"command": "pnpm exec tsc --noEmit"}).to_string()),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: receipt.clone(),
-            ..Default::default()
-        };
-
-        assert!(is_authoritative_unchanged_bash_observation_record(&failed));
-        assert!(
-            !record_has_typed_workspace_observation_receipt(&failed),
-            "a failed probe is not a positive observation receipt"
-        );
-
-        failed.ok = true;
-        assert!(is_authoritative_unchanged_bash_observation_record(&failed));
-        assert!(
-            !record_has_typed_workspace_observation_receipt(&failed),
-            "unchanged fingerprints cannot prove an observation occurred"
-        );
-
-        let mut weak = failed;
-        weak.workspace_mutation_receipt = Some(
-            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-            )
-            .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-            .expect("weak receipt"),
-        );
-        assert!(!is_authoritative_unchanged_bash_observation_record(&weak));
-    }
-
-    #[test]
-    fn explicit_verify_receipt_owns_freshness_independent_of_shell_shape() {
-        for (command, accepted) in [
-            ("GOWORK=off go test ./...", true),
-            ("custom-check-command", true),
-            ("python3 - <<'PY'\nassert 1 == 1\nPY", true),
-            ("env GOFLAGS=-n go test ./...", true),
-            ("printf -v GOFLAGS %s -n && GOWORK=off go test ./...", true),
-            (
-                "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
-                true,
-            ),
-            ("GOFLAGS=-n go test ./...", true),
-            ("GOFLAGS=-n go test -run '<<' ./...", true),
-            ("GOFLAGS=-n go test -run '`' ./...", true),
-            ("GOWORK=off go test -n ./... && cargo test", true),
-            (
-                "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
-                true,
-            ),
-            ("GOFLAGS=\"$FLAGS\" go test \"$PKGS\"", true),
-            ("result=$(go test ./...)", true),
-            ("cd /tmp && go test ./...", true),
-        ]
-        .into_iter()
-        .map(|(command, accepted)| (command.to_string(), accepted))
-        .chain(std::iter::once((
-            format!(
-                "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
-                "x".repeat(16 * 1024)
-            ),
-            true,
-        ))) {
-            let args = json!({"command":command,"mode":"verify"});
-            let record = ToolCallRecord {
-                name: "bash".into(),
-                ok: true,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                runtime_args_full: Some(args.to_string()),
-                result_class: Some("success".into()),
-                exit_semantics: Some("success".into()),
-                workspace_mutation_scope: Some(
-                    astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-                ),
-                workspace_mutation_receipt:
-                    astra_tools::workspace_observation::explicit_workspace_verification_receipt()
-                        .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD),
-                ..Default::default()
-            };
-            assert_eq!(
-                record_has_full_scope_explicit_workspace_verification_receipt(&record),
-                accepted,
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn record_path_uses_live_arguments_before_redacted_projection() {
-        let raw_path = "/workspace/password=super_secret_value_123456";
-        let mut record = ToolCallRecord {
-            name: "read_file".into(),
-            file_path: Some("[REDACTED:SECRET_ASSIGNMENT]".into()),
-            args_full: Some(json!({"path": "[REDACTED:SECRET_ASSIGNMENT]"}).to_string()),
-            runtime_args_full: Some(json!({"path": raw_path}).to_string()),
-            ..Default::default()
-        };
-        assert_eq!(record_explicit_path(&record).as_deref(), Some(raw_path));
-
-        record.runtime_args_full = None;
-        assert_eq!(record_explicit_path(&record), None);
-    }
-
     fn explicit_verification_hook(
         label: &str,
         command: &str,
@@ -4670,92 +3202,6 @@ mod tests {
     }
 
     #[test]
-    fn external_scratch_shell_proof_is_narrow_and_fail_closed() {
-        let workspace = Some("/workspace");
-
-        assert!(bash_mutation_is_proven_external_scratch(
-            "printf x >/tmp/scratch.txt",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "echo x > '/var/tmp/scratch file'",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel 2>/dev/null || echo .)\" && git show HEAD:src/lib.rs > /tmp/inspected.rs && sed -n '1,20p' /tmp/inspected.rs",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel 2>/dev/null || echo .)\" && git diff 449b13b95f56f57619094fbb8afbc496d31dd7a8^ 449b13b95f56f57619094fbb8afbc496d31dd7a8 > /tmp/review.diff && wc -l /tmp/review.diff",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel)\"; git show HEAD:src/lib.rs > /tmp/inspected.rs 2>&1; wc -l /tmp/inspected.rs",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "mkdir -p /tmp/review && git show HEAD:src/lib.rs > /tmp/review/inspected.rs 2>&1 && wc -l /tmp/review/inspected.rs",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel 2>/dev/null || echo .)\" && for f in crates/runtime/src/turn/agentic_loop/host.rs crates/runtime/src/turn/agentic_loop/lifecycle.rs; do echo \"######## $f ########\"; git show HEAD -- \"$f\" | tail -n +120; done > /tmp/loopdiff.txt 2>&1; wc -l /tmp/loopdiff.txt",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel)\"; git show HEAD:src/lib.rs > /tmp/inspected.rs; grep -n foo /tmp/inspected.rs",
-            workspace,
-        ));
-        assert!(bash_mutation_is_proven_external_scratch(
-            "cd \"$(git rev-parse --show-toplevel 2>/dev/null)\"; git --no-pager diff 449b13b95^ 449b13b95 -- crates/services/src/storage.rs > /tmp/sd.diff 2>&1; wc -l /tmp/sd.diff",
-            workspace,
-        ));
-
-        // Source operands, mode operands, multiple targets, and control flow
-        // are not proven by the small shell recognizer.  They must remain
-        // mutation barriers until the executor supplies a typed receipt.
-        for command in [
-            "mv /workspace/a /tmp/out",
-            "mkdir -p /workspace/review",
-            "chmod 644 /workspace/a /tmp/out",
-            "sed -i s/a/b/ /workspace/a /tmp/out",
-            "sed -i s/a/b/ /tmp/out /tmp/other",
-            "sed -i 's/a/b/w /workspace/leak' /tmp/out",
-            "sed -i 's/a/b/e touch /workspace/leak' /tmp/out",
-            "printf x >/tmp/scratch.txt >/workspace/out.txt",
-            "printf x >/tmp/scratch.txt 2>/workspace/error.txt",
-            "printf x >/workspace/out.txt >/tmp/scratch.txt",
-            "printf x >/tmp/scratch.txt && unknown-writer",
-            "unknown-writer >/tmp/scratch.txt",
-            "git show HEAD:src/lib.rs >/workspace/out.txt",
-            "printf x >\"$TMPDIR/out\"",
-        ] {
-            assert!(
-                !bash_mutation_is_proven_external_scratch(command, workspace),
-                "unexpected scratch proof for {command:?}"
-            );
-        }
-
-        // A sequence is safe when every stage is independently proven and
-        // every writer target is external; it is not safe merely because the
-        // first writer targets /tmp.
-        assert!(bash_mutation_is_proven_external_scratch(
-            "printf x >/tmp/scratch.txt; true",
-            workspace,
-        ));
-        assert!(!bash_mutation_is_proven_external_scratch(
-            "for f in /workspace/a; do rm -f /workspace/a; done >/tmp/scratch.txt",
-            workspace,
-        ));
-
-        // A bound workspace nested below /tmp is still a real workspace, not
-        // disposable scratch merely because of its filesystem prefix.
-        assert!(!bash_mutation_is_proven_external_scratch(
-            "printf x >/tmp/workspace/out.txt",
-            Some("/tmp/workspace"),
-        ));
-    }
-
-    #[test]
     fn bash_preview_never_counts_as_historical_mutation_evidence() {
         let record = ToolCallRecord {
             name: "bash".into(),
@@ -4764,166 +3210,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!tool_record_is_workspace_mutation(&record));
-    }
-
-    #[test]
-    fn workspace_observation_shape_preserves_shell_status_boundaries() {
-        assert!(!bash_command_has_workspace_observation_shape("echo ok"));
-        for command in [
-            "git --version status",
-            "cat --version",
-            "head -n 0",
-            "sed -n",
-            "stat --version",
-            "test foo",
-            "[ foo ]",
-            "cargo test --help",
-            "pytest --help",
-            "touch /workspace/out | cargo test",
-            "cargo test | touch /workspace/out",
-            "cat /workspace/source > /workspace/output",
-        ] {
-            assert!(
-                !bash_command_has_workspace_observation_shape(command),
-                "metadata/option-only reader must not be a workspace receipt: {command}"
-            );
-        }
-        assert!(bash_command_has_workspace_observation_shape("git status"));
-        assert!(bash_command_has_workspace_observation_shape(
-            "cargo test -v"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "cat /workspace/result"
-        ));
-        assert!(bash_command_has_workspace_observation_shape("ls"));
-        assert!(bash_command_has_workspace_observation_shape(
-            "test -e /workspace/result"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "[ -f /workspace/result ]"
-        ));
-        for command in [
-            "grep -n pattern /workspace/result",
-            "grep -e pattern /workspace/result",
-            "grep -h pattern /workspace/result",
-            "grep -- -h /workspace/result",
-            "grep '>' /workspace/result",
-            "wc -c /workspace/result",
-            "ls -h",
-        ] {
-            assert!(
-                bash_command_has_workspace_observation_shape(command),
-                "valid reader must retain its workspace operand: {command}"
-            );
-        }
-        assert!(!bash_command_has_workspace_observation_shape(
-            "cat /workspace/missing || true"
-        ));
-        assert!(!bash_command_has_workspace_observation_shape(
-            "cat /workspace/missing; echo ok"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "cat /workspace/result && true"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "cat /workspace/missing || cat /workspace/result"
-        ));
-        assert!(!bash_command_has_workspace_observation_shape(
-            "cargo test || true"
-        ));
-        assert!(!bash_command_has_workspace_observation_shape(
-            "cargo test; true"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "cargo test && true"
-        ));
-        for command in [
-            "printf x | cat",
-            "[ foo ] | cat",
-            "printf x | sha256sum",
-            "test foo | cat",
-            "test foo | true",
-        ] {
-            assert!(
-                !bash_command_has_workspace_observation_shape(command),
-                "a stdin-only downstream reader cannot manufacture workspace evidence: {command}"
-            );
-        }
-        for command in ["cargo test | tail -20", "cat /workspace/result | head"] {
-            assert!(
-                bash_command_has_workspace_observation_shape(command),
-                "a downstream reader may inherit evidence from a workspace-producing stage: {command}"
-            );
-        }
-        assert!(bash_command_has_workspace_observation_shape(
-            "cat /workspace/source > /workspace/output && cat /workspace/output"
-        ));
-        assert!(bash_command_has_workspace_observation_shape(
-            "[ -f /workspace/result ] | cat"
-        ));
-    }
-
-    #[test]
-    fn scoped_workspace_observation_uses_the_ordered_receipt_segment() {
-        let root = Some("/tmp/project");
-        for command in [
-            "cargo test > /tmp/test.log 2>&1; rm /tmp/test.log; git status --short",
-            "cat /tmp/external-input; git status --short",
-            "rm /tmp/scratch && cd /tmp/project && cargo test -q",
-        ] {
-            assert!(
-                bash_command_has_scoped_workspace_observation(command, root, None),
-                "a final bound-workspace receipt must survive earlier external scratch work: {command}"
-            );
-        }
-
-        for command in [
-            "git status --short; touch /tmp/later",
-            "git status --short || touch /tmp/later",
-            "cd /tmp && git status --short",
-            "cat /tmp/unrelated",
-        ] {
-            assert!(
-                !bash_command_has_scoped_workspace_observation(command, root, None),
-                "external/stale evidence must not satisfy the bound-workspace contract: {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn successful_bound_script_execution_is_a_workspace_observation() {
-        let root = Some("/app");
-
-        for command in [
-            "cd /app && python3 solution.py",
-            "cd /app && node verify.mjs",
-            "cd /app && bash acceptance.sh",
-        ] {
-            assert!(
-                bash_command_has_scoped_workspace_observation(command, root, None),
-                "executing a literal script from the bound workspace observes the delivered artifact: {command}"
-            );
-        }
-        for command in [
-            "cd /app && python3 -c 'print(1)'",
-            "cd /app && python3 $SCRIPT",
-            "cd /app && python3 /tmp/attack.py",
-            "cd /app && python3 verify.js",
-            "cd /app && node verify.py",
-            "cd /app && python3 solution.py | cat",
-            "cd /app && python3 solution.py | head -1",
-            "cd /app && touch earlier.txt && python3 solution.py",
-            "cd /app && python3 solution.py && touch later.txt",
-            "cd /app && python3 solution.py && rm -f obsolete.txt",
-            "cd /app && python3 solution.py || true",
-            "cd /app && python3 solution.py; true",
-            "cd /app && python3 solution.py > result.txt",
-        ] {
-            assert!(
-                !bash_command_has_scoped_workspace_observation(command, root, None),
-                "inline, dynamic, or external interpreter input is not bound-workspace evidence: {command}"
-            );
-        }
     }
 
     #[test]
@@ -5288,61 +3574,6 @@ mod tests {
     }
 
     #[test]
-    fn active_work_boundary_reserves_one_canonical_revalidation_then_settlement() {
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state.max_turns = 32;
-        state.remaining_turns = 2;
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                args_full: Some(r#"{"command":"cargo test"}"#.into()),
-                runtime_args_full: Some(r#"{"command":"cargo test"}"#.into()),
-                ..Default::default()
-            },
-            committed_write_record(31, "/workspace/src/lib.rs"),
-        ];
-
-        assert!(begin_budget_settlement_for_work_state(
-            &mut state, true, false, true
-        ));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("stale Work validation must receive one bounded revalidation action");
-        assert_eq!(
-            window.action,
-            super::super::host::CompletionAction::CanonicalWorkValidation
-        );
-        assert_eq!(state.max_turns, 32);
-        assert_eq!(state.remaining_turns, 2);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
     fn active_work_dependency_chain_cannot_skip_to_work_settlement() {
         let mut state = make_state();
         state.task_profile =
@@ -5472,8 +3703,8 @@ mod tests {
             "expected read-family diagnosis, got {diagnosis}"
         );
         assert!(
-            diagnosis.contains("redundant overlapping reads"),
-            "expected redundant-read detail, got {diagnosis}"
+            !diagnosis.contains("redundant"),
+            "requested ranges are not delivery evidence"
         );
     }
 
@@ -8097,6 +6328,33 @@ mod tests {
             "resume compaction must reduce message count from 100; got {}",
             state.messages.len()
         );
+    }
+
+    #[tokio::test]
+    async fn provider_measurement_triggers_compaction_when_text_estimate_is_low() {
+        for turn_index in [0, 1] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            state.max_turn_input_tokens = 200_000;
+            state.messages = vec![json!({"role":"user", "content":"Complete the task"})];
+            state.messages.extend((0..30).map(|index| {
+                json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
+            }));
+            assert!(estimate_context_pressure_for_state(&state).0 < 0.5);
+            state.last_measured_prompt_tokens = Some(195_000);
+
+            prepare_turn_iteration(&mut host, &mut state, turn_index)
+                .await
+                .unwrap();
+
+            assert!(
+                host.compaction_events.iter().any(|event| matches!(
+                    event.kind,
+                    CompactionKind::Resume | CompactionKind::ProactiveAggressive
+                )),
+                "provider pressure must reach the compaction owner before the next request"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1580,6 +1580,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -2789,9 +2790,7 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
                 None,
             )
             .await,
-        Err(astra_services::SessionContextCoordinatorError::ExecutionOccupied(
-            astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool
-        ))
+        Err(astra_services::SessionContextCoordinatorError::Fenced)
     ));
     assert!(
         recovered["control_basis"]["writer_epoch"].as_u64().unwrap() > source_lease.writer_epoch

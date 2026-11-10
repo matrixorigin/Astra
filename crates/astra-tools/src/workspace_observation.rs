@@ -44,7 +44,7 @@ const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 
 fn is_executor_owned_fingerprint_path(path: &Path) -> bool {
     matches!(path.components().next(), Some(Component::Normal(name))
-        if name == ".astra" || name == crate::shell_output_capture::CAPTURE_DIRECTORY_NAME)
+        if name == ".astra")
 }
 
 /// Metadata keys carried in a `ToolResult` and projected into the lossless
@@ -83,58 +83,6 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
-/// Minimal path for the only external helper allowed in a detached command
-/// (`sleep`). Builtins do not consult PATH, and clearing the inherited
-/// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
-/// PATH shadowing from the detached process.
-pub const DETACHABLE_PATH: &str = "/usr/bin:/bin";
-
-/// Detached execution is intentionally narrower than ordinary execution.
-/// Without a terminal-owned post receipt, only shell builtins (plus the
-/// harmless `sleep` helper used by interactive flows) are eligible; all
-/// filesystem/network/tool commands stay foreground where the observer can
-/// attribute their final state.
-pub fn bash_command_is_detachable_safe(command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty()
-        || ["&&", "||", ";", "|", ">", "<", "$(", "`", "\n", "&"]
-            .iter()
-            .any(|marker| command.contains(marker))
-    {
-        return false;
-    }
-    let mut words = command.split_whitespace();
-    let Some(first) = words.next() else {
-        return false;
-    };
-    if is_env_assignment(first) || first == "env" {
-        return false;
-    }
-    matches!(
-        first,
-        "echo" | "printf" | "pwd" | "true" | "false" | ":" | "test" | "[" | "sleep"
-    )
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
-        _ => return false,
-    }
-    let mut saw_equal = false;
-    for ch in chars {
-        if ch == '=' {
-            saw_equal = true;
-            break;
-        }
-        if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            return false;
-        }
-    }
-    saw_equal
-}
-
 static WRITER_EPOCHS: OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<std::path::PathBuf, std::sync::Weak<WriterEpochState>>,
@@ -3233,17 +3181,6 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     let Some(mut status_command) = hardened_git_command(root) else {
         return GitFingerprint::UseManifest;
     };
-    let capture_path = relative_root.join(crate::shell_output_capture::CAPTURE_DIRECTORY_NAME);
-    let Some(capture_path) = capture_path.to_str() else {
-        return GitFingerprint::Unknown;
-    };
-    // Exclude the workspace's exact top-level output directory in Git, before
-    // the bounded status probe counts bytes or entries. A nested directory
-    // with the same name remains within the observed workspace.
-    let capture_exclusion = format!(
-        ":(top,exclude,literal){}/",
-        capture_path.replace(std::path::MAIN_SEPARATOR, "/")
-    );
     status_command.args([
         "status",
         "--porcelain=v1",
@@ -3256,7 +3193,6 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         "--ignored=matching",
         "--",
         ".",
-        &capture_exclusion,
     ]);
     let Some(output) = run_bounded_probe(
         status_command,
@@ -3733,51 +3669,6 @@ pub fn changed_receipt_with_ownership(
             }),
         ),
     ])
-}
-
-/// Build an executor-owned observation receipt for a Bash invocation whose
-/// bounded pre/post fingerprints were equal.  This is deliberately a
-/// different source from a typed read observer and from a mutation receipt:
-/// it proves only that the bound workspace was unchanged while the owner held
-/// the observation lease.  The runtime may use it to avoid inventing a
-/// mutation barrier for a failed diagnostic command; it never proves that a
-/// requested validation or task completed.
-pub fn unchanged_bash_observation_receipt_with_ownership(
-    ownership: &str,
-) -> serde_json::Map<String, serde_json::Value> {
-    serde_json::Map::from_iter([
-        (
-            OBSERVATION_SCOPE_FIELD.to_string(),
-            serde_json::Value::String(BOUND_WORKSPACE_SCOPE.to_string()),
-        ),
-        (
-            OBSERVATION_RECEIPT_FIELD.to_string(),
-            serde_json::json!({
-                "schema": "workspace_observation_receipt.v1",
-                "source": "executor_bash_fingerprint",
-                "scope": BOUND_WORKSPACE_SCOPE,
-                "changed": false,
-                "ownership": ownership,
-            }),
-        ),
-    ])
-}
-
-/// Validate an unchanged Bash fingerprint receipt.  Only invocation-owned
-/// process boundaries are durable proof: a foreground process group can leave
-/// a descendant behind after the leader exits, so that result remains a weak
-/// quarantine and cannot clear a workspace freshness barrier.
-pub fn is_authoritative_unchanged_bash_observation_receipt(receipt: &serde_json::Value) -> bool {
-    receipt.get("schema").and_then(serde_json::Value::as_str)
-        == Some("workspace_observation_receipt.v1")
-        && receipt.get("source").and_then(serde_json::Value::as_str)
-            == Some("executor_bash_fingerprint")
-        && receipt.get("scope").and_then(serde_json::Value::as_str) == Some(BOUND_WORKSPACE_SCOPE)
-        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(false)
-        && matches!(
-            receipt.get("ownership").and_then(serde_json::Value::as_str),
-            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
-        )
 }
 
 /// Build a compact receipt for a successful, structured workspace writer.
@@ -4517,34 +4408,6 @@ pub fn is_typed_workspace_observer(name: &str) -> bool {
     )
 }
 
-/// `bash` is never inferred to be an observer from its command text.  A
-/// caller must opt into this narrow contract and the owner executor must
-/// subsequently prove a settled, unchanged workspace before it emits the
-/// corresponding receipt.
-pub fn is_explicit_workspace_verification_request(name: &str, args: &serde_json::Value) -> bool {
-    name == "bash"
-        && args.get("mode").and_then(serde_json::Value::as_str) == Some("verify")
-        && args
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty())
-}
-
-/// Source-authored recovery evidence for an explicit Bash verification whose
-/// bounded workspace fingerprint is unavailable.  A successful shell exit is
-/// deliberately not enough to replace this evidence: only an Edge-owned
-/// receipt can authorize post-mutation completion.
-pub fn explicit_workspace_verification_unavailable_evidence() -> astra_core::ToolFailureEvidence {
-    astra_core::ToolFailureEvidence::new(
-        astra_core::ErrorKind::ToolUnavailable,
-        astra_core::ToolFailureCause::ScopeTooBroad,
-        false,
-        vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
-    )
-}
-
-pub const EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE: &str = "Error: verify-mode could not capture a bounded workspace observation. This verification cannot produce a completion receipt for the current workspace generation; use a typed observer such as read_file or list_dir for the changed artifact instead.";
-
 pub fn typed_workspace_observation_receipt() -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
         (
@@ -4769,37 +4632,6 @@ pub fn full_read_file_normalized_target(
     }
     normalized_bound_target_identity(name, args, workspace_root)
         .and_then(|target| target.get("path")?.as_str().map(ToString::to_string))
-}
-
-/// A workspace observation produced by the executor's explicit verification
-/// path.  This is intentionally a separate schema from typed read tools: it
-/// is valid only with `bash { mode: "verify" }` and is never inferred from
-/// shell text or stdout.
-pub fn explicit_workspace_verification_receipt() -> serde_json::Map<String, serde_json::Value> {
-    serde_json::Map::from_iter([
-        (
-            OBSERVATION_SCOPE_FIELD.to_string(),
-            serde_json::Value::String(BOUND_WORKSPACE_SCOPE.to_string()),
-        ),
-        (
-            OBSERVATION_RECEIPT_FIELD.to_string(),
-            serde_json::json!({
-                "schema": "workspace_observation_receipt.v2",
-                "source": "executor_bash_verify",
-                "scope": BOUND_WORKSPACE_SCOPE,
-                "ownership": TYPED_WORKSPACE_OBSERVER_OWNERSHIP,
-            }),
-        ),
-    ])
-}
-
-pub fn is_explicit_workspace_verification_receipt(value: &serde_json::Value) -> bool {
-    value.get("schema").and_then(serde_json::Value::as_str)
-        == Some("workspace_observation_receipt.v2")
-        && value.get("source").and_then(serde_json::Value::as_str) == Some("executor_bash_verify")
-        && value.get("scope").and_then(serde_json::Value::as_str) == Some(BOUND_WORKSPACE_SCOPE)
-        && value.get("ownership").and_then(serde_json::Value::as_str)
-            == Some(TYPED_WORKSPACE_OBSERVER_OWNERSHIP)
 }
 
 /// Validate the owner-authored fact that a typed multi-path writer committed
@@ -5049,18 +4881,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_explicit_verification_has_non_retryable_typed_evidence() {
-        let evidence = explicit_workspace_verification_unavailable_evidence();
-        assert_eq!(evidence.kind, astra_core::ErrorKind::ToolUnavailable);
-        assert_eq!(evidence.cause, astra_core::ToolFailureCause::ScopeTooBroad);
-        assert!(!evidence.retryable);
-        assert_eq!(
-            evidence.recovery_actions,
-            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability]
-        );
-    }
-
-    #[test]
     fn changed_receipt_is_scoped_and_typed() {
         let receipt = changed_receipt();
         assert_eq!(receipt[OBSERVED_FIELD], serde_json::Value::Bool(true));
@@ -5113,35 +4933,6 @@ mod tests {
         ));
         assert!(is_typed_workspace_observer("read_file"));
         assert!(!is_typed_workspace_observer("bash"));
-    }
-
-    #[test]
-    fn unchanged_bash_receipt_requires_authoritative_owner() {
-        let receipt =
-            unchanged_bash_observation_receipt_with_ownership(INVOCATION_CGROUP_OWNERSHIP);
-        assert_eq!(receipt[OBSERVATION_SCOPE_FIELD], BOUND_WORKSPACE_SCOPE);
-        assert_eq!(
-            receipt[OBSERVATION_RECEIPT_FIELD]["source"],
-            "executor_bash_fingerprint"
-        );
-        assert!(is_authoritative_unchanged_bash_observation_receipt(
-            &receipt[OBSERVATION_RECEIPT_FIELD]
-        ));
-
-        let weak =
-            unchanged_bash_observation_receipt_with_ownership(FOREGROUND_PROCESS_GROUP_OWNERSHIP);
-        assert!(!is_authoritative_unchanged_bash_observation_receipt(
-            &weak[OBSERVATION_RECEIPT_FIELD]
-        ));
-        assert!(!is_authoritative_unchanged_bash_observation_receipt(
-            &serde_json::json!({
-                "schema": "workspace_observation_receipt.v1",
-                "source": "executor_bash_fingerprint",
-                "scope": BOUND_WORKSPACE_SCOPE,
-                "changed": true,
-                "ownership": INVOCATION_CGROUP_OWNERSHIP
-            })
-        ));
     }
 
     #[test]
@@ -5683,21 +5474,6 @@ mod tests {
                 )
                 .is_none()
             );
-        }
-    }
-
-    #[test]
-    fn detached_gate_allows_only_non_mutating_builtin_shape() {
-        for command in ["echo done", "printf done", "pwd", "sleep 1"] {
-            assert!(bash_command_is_detachable_safe(command), "{command}");
-        }
-        for command in [
-            "env echo done",
-            "python3 -c 'open(\"out\", \"w\").write(\"x\")'",
-            "git status",
-            "find . -name '*.rs'",
-        ] {
-            assert!(!bash_command_is_detachable_safe(command), "{command}");
         }
     }
 
@@ -6829,7 +6605,7 @@ mod tests {
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
         let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let nested = temp.path().join("user-data/astra-bash-outputs");
         fs::create_dir_all(&nested).expect("user directory");
@@ -6839,14 +6615,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_output_does_not_mask_other_workspace_changes_in_manifest() {
+    fn similarly_named_user_directory_is_observed_in_manifest() {
         let temp = tempfile::tempdir().expect("tempdir");
         let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
         let capture_directory = temp.path().join("astra-bash-outputs");
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
         let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let nested = temp.path().join("user-data/astra-bash-outputs");
         fs::create_dir_all(&nested).expect("user directory");
@@ -6883,7 +6659,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_excludes_capture_files_before_status_limits() {
+    fn git_fingerprint_observes_similarly_named_user_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(
             Command::new("git")
@@ -6895,20 +6671,16 @@ mod tests {
         let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
         let capture_directory = temp.path().join("astra-bash-outputs");
         fs::create_dir(&capture_directory).expect("capture directory");
-        for index in 0..=MAX_STATUS_ENTRIES {
-            fs::File::create(capture_directory.join(format!("{index:05}.stdout")))
-                .expect("capture file");
-        }
-        let after = WorkspaceFingerprint::capture(temp.path())
-            .expect("capture files must not consume Git status limits");
-        assert!(!before.changed_from(Some(after.clone())));
+        fs::write(capture_directory.join("user.txt"), "user data").expect("user file");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("user directory");
+        assert!(before.changed_from(Some(after.clone())));
         fs::write(temp.path().join("user.txt"), "user content").expect("user file");
         let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
         assert!(after.changed_from(Some(after_user)));
     }
 
     #[test]
-    fn git_fingerprint_excludes_only_capture_directory_of_nested_workspace() {
+    fn git_fingerprint_observes_similarly_named_directory_in_nested_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(
             Command::new("git")
@@ -6924,7 +6696,7 @@ mod tests {
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("generated.stdout"), "generated").expect("capture file");
         let after_capture = WorkspaceFingerprint::capture(&workspace).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let user_directory = workspace.join("user/astra-bash-outputs");
         fs::create_dir_all(&user_directory).expect("user directory");

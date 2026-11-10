@@ -40,6 +40,34 @@ pub struct ModelSelection {
     pub offering_id: String,
 }
 
+/// Provider-independent reasoning requested together with a model choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningRequirement {
+    ModelDefault,
+    Off,
+    On {},
+    /// `adaptive` is the public tool spelling for effort selection.
+    #[serde(rename = "effort", alias = "adaptive")]
+    Effort {
+        effort: ReasoningEffort,
+    },
+    Budget {
+        tokens: u32,
+    },
+}
+
 /// A caller's fixed-model request, before Server resolves it to an exact
 /// Offering. Names are lookup keys only; execution and authorization always
 /// use the returned [`ModelSelection`].

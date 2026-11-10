@@ -292,8 +292,12 @@ mod tests {
         let status = AgentStatus::Running {
             activity: "review".into(),
         };
-        let out =
-            render_wait_timeout_outcome("reviewer-tests", Some(&status), Duration::from_secs(120));
+        let out = render_wait_timeout_outcome(
+            "reviewer-tests",
+            Some(&status),
+            Duration::from_secs(120),
+            None,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["status"],
@@ -324,7 +328,8 @@ mod tests {
             AgentStatus::cancelled_anonymous(),
         ];
         for terminal in terminals {
-            let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
+            let out =
+                render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30), None);
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert_eq!(v["status"], AgentToolResultStatusKind::TimedOut.as_str());
         }

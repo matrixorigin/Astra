@@ -1,6 +1,7 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
+use astra_core::sync_poison::recover_mutex_lock;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -15,7 +16,9 @@ use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ConversationTabId,
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
-use crate::tui::history_cell::{HistoryCell, reasoning::ReasoningCell, tool::ToolCell};
+use crate::tui::history_cell::{
+    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, tool::ToolCell,
+};
 use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
 /// Lines reserved for chrome (title + scroll indicator + hint blank + hint).
@@ -69,6 +72,8 @@ enum TranscriptContent {
     },
     RenderedTrusted(Vec<Line<'static>>),
     Reasoning(ReasoningCell),
+    LiveAssistant(Arc<Mutex<AssistantCell>>),
+    LiveReasoning(Arc<Mutex<ReasoningCell>>),
     Tool(Arc<ToolCell>),
 }
 
@@ -258,6 +263,40 @@ impl TranscriptItem {
         }
     }
 
+    /// Share the live source with the agent view. Rendering stays bounded,
+    /// while explicit search and export can read the complete current item.
+    pub(crate) fn live_assistant(
+        id: TranscriptItemId,
+        cell: Arc<Mutex<AssistantCell>>,
+        separator_rows: usize,
+    ) -> Self {
+        let model_item_id = recover_mutex_lock(&cell).model_item_id().map(str::to_owned);
+        Self {
+            model_item_id,
+            tool_identity: None,
+            id,
+            kind: TranscriptItemKind::Assistant,
+            content: TranscriptContent::LiveAssistant(cell),
+            separator_rows,
+        }
+    }
+
+    pub(crate) fn live_reasoning(
+        id: TranscriptItemId,
+        cell: Arc<Mutex<ReasoningCell>>,
+        separator_rows: usize,
+    ) -> Self {
+        let model_item_id = recover_mutex_lock(&cell).model_item_id().map(str::to_owned);
+        Self {
+            model_item_id,
+            tool_identity: None,
+            id,
+            kind: TranscriptItemKind::Reasoning,
+            content: TranscriptContent::LiveReasoning(cell),
+            separator_rows,
+        }
+    }
+
     pub(crate) fn tool(
         id: TranscriptItemId,
         cell: impl Into<Arc<ToolCell>>,
@@ -328,6 +367,31 @@ impl TranscriptItem {
         }
     }
 
+    /// Materialize text only for an explicit full-detail operation.
+    fn full_detail_text(&self) -> Option<String> {
+        match &self.content {
+            TranscriptContent::Committed(cell) => {
+                if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>() {
+                    Some(assistant.transcript_detail_text().into_owned())
+                } else {
+                    cell.as_any_ref()
+                        .downcast_ref::<ReasoningCell>()
+                        .map(|reasoning| format!("▼ Thought\n{}", reasoning.text()))
+                }
+            }
+            TranscriptContent::Reasoning(cell) => Some(format!("▼ Thought\n{}", cell.text())),
+            TranscriptContent::LiveAssistant(cell) => Some(
+                recover_mutex_lock(cell)
+                    .transcript_detail_text()
+                    .into_owned(),
+            ),
+            TranscriptContent::LiveReasoning(cell) => {
+                Some(format!("▼ Thought\n{}", recover_mutex_lock(cell).text()))
+            }
+            _ => None,
+        }
+    }
+
     fn same_detail_source(&self, other: &TranscriptContent) -> bool {
         match (&self.content, other) {
             (TranscriptContent::Activity(a), TranscriptContent::Activity(b)) => {
@@ -341,13 +405,15 @@ impl TranscriptItem {
         }
     }
 
-    fn is_expandable(&self, width: u16) -> bool {
+    fn is_expandable(&self) -> bool {
         match &self.content {
-            TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
+            TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref()),
             TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
             TranscriptContent::Activity(text) => !text.is_empty(),
             TranscriptContent::ToolRequest { cell, .. } => !cell.description.is_empty(),
-            TranscriptContent::Reasoning(cell) => cell.has_transcript_details(width),
+            TranscriptContent::Reasoning(cell) => !cell.text().is_empty(),
+            TranscriptContent::LiveAssistant(cell) => !recover_mutex_lock(cell).source().is_empty(),
+            TranscriptContent::LiveReasoning(cell) => !recover_mutex_lock(cell).text().is_empty(),
             TranscriptContent::Tool(cell) => cell.has_transcript_details(),
         }
     }
@@ -359,6 +425,8 @@ impl TranscriptItem {
             TranscriptContent::Activity(_) => "activity details",
             TranscriptContent::ToolRequest { .. } => "tool request",
             TranscriptContent::Reasoning(_) => "reasoning",
+            TranscriptContent::LiveAssistant(_) => "assistant output",
+            TranscriptContent::LiveReasoning(_) => "reasoning",
             TranscriptContent::Tool(_) => "tool details",
         }
     }
@@ -372,7 +440,28 @@ impl TranscriptItem {
                 render_detail(text, heading, width, expanded)
             }
             TranscriptContent::RenderedTrusted(lines) => lines.clone(),
-            TranscriptContent::Reasoning(cell) => cell.transcript_lines(width, expanded),
+            TranscriptContent::Reasoning(cell) if expanded => {
+                render_detail(&format!("▼ Thought\n{}", cell.text()), None, width, true)
+            }
+            TranscriptContent::Reasoning(cell) => cell.transcript_lines(width, false),
+            TranscriptContent::LiveAssistant(cell) => {
+                let cell = recover_mutex_lock(cell);
+                if expanded {
+                    render_detail(&cell.transcript_detail_text(), None, width, true)
+                } else if !cell.is_live() {
+                    history_cell_lines_for_buffer(&*cell, width)
+                } else {
+                    cell.live_viewport_lines(width, 48)
+                }
+            }
+            TranscriptContent::LiveReasoning(cell) => {
+                let cell = recover_mutex_lock(cell);
+                if expanded {
+                    render_detail(&format!("▼ Thought\n{}", cell.text()), None, width, true)
+                } else {
+                    cell.transcript_lines(width, false)
+                }
+            }
             TranscriptContent::Tool(cell) => cell.transcript_lines(width, expanded),
         };
         if matches!(
@@ -466,9 +555,11 @@ fn committed_cell_kind(cell: &dyn HistoryCell) -> TranscriptItemKind {
     }
 }
 
-fn cell_expandable(cell: &dyn HistoryCell, width: u16) -> bool {
+fn cell_expandable(cell: &dyn HistoryCell) -> bool {
     if let Some(reasoning) = cell.as_any_ref().downcast_ref::<ReasoningCell>() {
-        reasoning.has_transcript_details(width)
+        !reasoning.text().is_empty()
+    } else if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>() {
+        !assistant.source().is_empty()
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.has_transcript_details()
     } else {
@@ -488,7 +579,20 @@ fn cell_label(cell: &dyn HistoryCell) -> &'static str {
 
 fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'static>> {
     if let Some(reasoning) = cell.as_any_ref().downcast_ref::<ReasoningCell>() {
-        reasoning.transcript_lines(width, expanded)
+        if expanded {
+            render_detail(
+                &format!("▼ Thought\n{}", reasoning.text()),
+                None,
+                width,
+                true,
+            )
+        } else {
+            reasoning.transcript_lines(width, false)
+        }
+    } else if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
+        && expanded
+    {
+        render_detail(&assistant.transcript_detail_text(), None, width, true)
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
     } else {
@@ -509,6 +613,32 @@ impl TranscriptSnapshot {
     pub(crate) fn item_count(&self) -> usize {
         self.items.len()
     }
+
+    fn map_item_id(&self, previous: &Self, id: &TranscriptItemId) -> Option<TranscriptItemId> {
+        if self.items.iter().any(|item| &item.id == id) {
+            return Some(id.clone());
+        }
+        let identity = previous
+            .items
+            .iter()
+            .find(|item| &item.id == id)?
+            .model_identity()?;
+        if previous
+            .items
+            .iter()
+            .filter(|item| item.model_identity() == Some(identity))
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let mut matches = self
+            .items
+            .iter()
+            .filter(|item| item.model_identity() == Some(identity));
+        let mapped = matches.next()?.id.clone();
+        matches.next().is_none().then_some(mapped)
+    }
 }
 
 type ExpandedActivityCache = (
@@ -526,6 +656,9 @@ pub(crate) struct TranscriptView {
     row_items: Vec<Option<TranscriptItemId>>,
     expanded: HashSet<TranscriptItemId>,
     activity_cache: Option<ExpandedActivityCache>,
+    /// Expanded live content is a stable reading snapshot until navigation
+    /// refreshes it or the user explicitly returns to the live tail.
+    live_tail_dirty: bool,
     width: u16,
     scroll: usize,
     cursor: usize,
@@ -566,6 +699,7 @@ impl TranscriptView {
             row_items: Vec::new(),
             expanded: HashSet::new(),
             activity_cache: None,
+            live_tail_dirty: false,
             width,
             scroll: 0,
             cursor: 0,
@@ -596,6 +730,18 @@ impl TranscriptView {
                 .max(MIN_VISIBLE_LINES)
         };
         if self.max_visible == max_visible && self.width == width {
+            return;
+        }
+
+        if self.selection_holds_live_projection() {
+            // Keep the visible rows being selected stable, even when a
+            // resize or a canonical refresh changes the latest projection.
+            self.max_visible = max_visible;
+            self.width = width;
+            self.live_tail_dirty = true;
+            self.status = Some("View updated · finish selecting to refresh".into());
+            self.scroll = self.scroll.min(self.max_scroll());
+            self.ensure_cursor_visible();
             return;
         }
 
@@ -640,6 +786,135 @@ impl TranscriptView {
         self.replace_snapshot(snapshot, width);
     }
 
+    /// Replace a live suffix without rendering the unchanged conversation.
+    /// Interactive or filtered views use the full identity-aware projection.
+    pub(crate) fn replace_live_suffix(
+        &mut self,
+        prefix_len: usize,
+        suffix: Vec<TranscriptItem>,
+        width: u16,
+    ) -> bool {
+        if self.width != width
+            || self.filter != TranscriptFilter::All
+            || self.selection_anchor.is_some()
+            || self.live_tail_dirty
+            || !self.expanded.is_empty()
+            || suffix.is_empty()
+        {
+            return false;
+        }
+        let Some(first) = self.snapshot.items.get(prefix_len) else {
+            return false;
+        };
+        let Some(mut start) = self
+            .row_items
+            .iter()
+            .rposition(|id| id.as_ref() == Some(&first.id))
+        else {
+            return false;
+        };
+        while start > 0 && self.row_items[start - 1].as_ref() == Some(&first.id) {
+            start -= 1;
+        }
+        let follow_tail = self.is_following_tail();
+        if !follow_tail && self.cursor >= start {
+            return false;
+        }
+        self.lines.truncate(start);
+        self.row_items.truncate(start);
+        self.snapshot.items.truncate(prefix_len);
+        for item in suffix {
+            let lines = item.render(width, false);
+            self.row_items
+                .extend(std::iter::repeat_n(Some(item.id.clone()), lines.len()));
+            self.lines.extend(lines.into_iter().map(Arc::new));
+            for _ in 0..item.separator_rows {
+                self.lines.push(Arc::new(Line::default()));
+                self.row_items.push(None);
+            }
+            self.snapshot.items.push(item);
+        }
+        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
+            self.lines.pop();
+            self.row_items.pop();
+        }
+        self.activity_cache = None;
+        if follow_tail {
+            self.cursor = self.lines.len().saturating_sub(1);
+            self.scroll = self.max_scroll();
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
+            self.ensure_cursor_visible();
+        }
+        true
+    }
+
+    /// Update an existing live tail without rendering the unchanged history.
+    /// A different layout or identity falls back to the normal full projection.
+    pub(crate) fn replace_live_tail(&mut self, item: TranscriptItem, width: u16) -> bool {
+        let Some(old) = self.snapshot.items.last() else {
+            return false;
+        };
+        if self.width != width || old.id != item.id || old.kind != item.kind {
+            return false;
+        }
+        if !old.matches_filter(self.filter) {
+            *self.snapshot.items.last_mut().expect("checked tail") = item;
+            return true;
+        }
+        if (self.expanded.contains(&item.id) || self.selection_anchor.is_some())
+            && matches!(
+                &item.content,
+                TranscriptContent::LiveAssistant(_) | TranscriptContent::LiveReasoning(_)
+            )
+        {
+            *self.snapshot.items.last_mut().expect("checked tail") = item;
+            self.live_tail_dirty = true;
+            self.status = Some("New live output · End follows the latest".into());
+            return true;
+        }
+        let Some(last_row) = self
+            .row_items
+            .iter()
+            .rposition(|id| id.as_ref() == Some(&item.id))
+        else {
+            return false;
+        };
+        if self.row_items[last_row + 1..].iter().any(Option::is_some) {
+            return false;
+        }
+        let mut start = last_row;
+        while start > 0 && self.row_items[start - 1].as_ref() == Some(&item.id) {
+            start -= 1;
+        }
+        let mut lines = item.render(width, self.expanded.contains(&item.id));
+        while lines.last().is_some_and(|line| line.spans.is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return false;
+        }
+        let follow_tail = self.is_following_tail();
+        let cursor = self.cursor;
+        let anchor = self.selection_anchor;
+        self.lines.truncate(start);
+        self.row_items.truncate(start);
+        self.row_items
+            .extend(std::iter::repeat_n(Some(item.id.clone()), lines.len()));
+        self.lines.extend(lines.into_iter().map(Arc::new));
+        *self.snapshot.items.last_mut().expect("checked tail") = item;
+        if follow_tail {
+            self.cursor = self.lines.len() - 1;
+            self.scroll = self.max_scroll();
+        } else {
+            self.cursor = cursor.min(self.lines.len() - 1);
+            self.selection_anchor = anchor.map(|row| row.min(self.lines.len() - 1));
+            self.scroll = self.scroll.min(self.max_scroll());
+            self.ensure_cursor_visible();
+        }
+        true
+    }
+
     /// Set a view-local status for an asynchronous transcript operation.
     ///
     /// This is deliberately outside [`TranscriptSnapshot`]: loading and
@@ -655,8 +930,16 @@ impl TranscriptView {
     /// off-screen rows are not lost.
     pub(crate) fn export_plain_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        for item in &self.snapshot.items {
-            if let Some((text, heading)) = item.detail_text() {
+        for (index, item) in self.snapshot.items.iter().enumerate() {
+            if let Some(text) = item.full_detail_text() {
+                let content = if item.kind == TranscriptItemKind::Reasoning {
+                    text.strip_prefix("▼ ").unwrap_or(&text)
+                } else {
+                    &text
+                };
+                let clean = crate::tui::render::line_utils::sanitize_terminal_text(content);
+                lines.extend(clean.split('\n').map(str::to_owned));
+            } else if let Some((text, heading)) = item.detail_text() {
                 if let Some((heading, name)) = heading {
                     let heading = format!("{name} · {heading}");
                     lines.push(
@@ -665,14 +948,13 @@ impl TranscriptView {
                     );
                 }
                 let clean = crate::tui::render::line_utils::sanitize_terminal_text(text);
-                lines.extend(clean.lines().map(str::to_owned));
+                lines.extend(clean.split('\n').map(str::to_owned));
             } else {
                 lines.extend(item.render(self.width, true).iter().map(line_plain_text));
             }
-            lines.extend(std::iter::repeat_n(String::new(), item.separator_rows));
-        }
-        while lines.last().is_some_and(String::is_empty) {
-            lines.pop();
+            if index + 1 < self.snapshot.items.len() {
+                lines.extend(std::iter::repeat_n(String::new(), item.separator_rows));
+            }
         }
         lines
     }
@@ -688,21 +970,61 @@ impl TranscriptView {
                     && self.scroll == self.max_scroll()))
     }
 
+    fn selection_holds_live_projection(&self) -> bool {
+        self.selection_anchor.is_some()
+            && (self.live_tail_dirty
+                || self.snapshot.items.iter().any(|item| {
+                    matches!(
+                        &item.content,
+                        TranscriptContent::LiveAssistant(_) | TranscriptContent::LiveReasoning(_)
+                    )
+                }))
+    }
+
     fn replace_snapshot(&mut self, snapshot: TranscriptSnapshot, width: u16) {
+        let freeze_selection = self.selection_holds_live_projection();
         let follow_tail = self.is_following_tail();
-        let cursor_locator = self.row_locator(self.cursor);
+        let map_locator = |(id, offset): (TranscriptItemId, usize)| {
+            snapshot
+                .map_item_id(&self.snapshot, &id)
+                .map(|id| (id, offset))
+        };
+        let cursor_locator = self.row_locator(self.cursor).and_then(map_locator);
         let anchor_locator = self
             .selection_anchor
-            .and_then(|anchor| self.row_locator(anchor));
+            .and_then(|anchor| self.row_locator(anchor))
+            .and_then(map_locator);
+        let expanded = self
+            .expanded
+            .iter()
+            .filter_map(|id| snapshot.map_item_id(&self.snapshot, id))
+            .collect();
+        if freeze_selection {
+            let mut mapped = HashMap::new();
+            for id in self.row_items.iter_mut().flatten() {
+                let replacement = mapped
+                    .entry(id.clone())
+                    .or_insert_with(|| snapshot.map_item_id(&self.snapshot, id));
+                if let Some(replacement) = replacement {
+                    *id = replacement.clone();
+                }
+            }
+        }
         self.snapshot = snapshot;
+        self.expanded = expanded;
         self.width = width;
         self.expanded.retain(|id| {
             self.snapshot
                 .items
                 .iter()
                 .find(|item| &item.id == id)
-                .is_some_and(|item| item.is_expandable(width))
+                .is_some_and(TranscriptItem::is_expandable)
         });
+        if freeze_selection {
+            self.live_tail_dirty = true;
+            self.status = Some("View updated · finish selecting to refresh".into());
+            return;
+        }
         self.rebuild_lines();
 
         if self.lines.is_empty() {
@@ -727,6 +1049,7 @@ impl TranscriptView {
     }
 
     fn rebuild_lines(&mut self) {
+        self.live_tail_dirty = false;
         self.lines.clear();
         self.row_items.clear();
         if !self
@@ -782,6 +1105,21 @@ impl TranscriptView {
             self.lines.pop();
             self.row_items.pop();
         }
+    }
+
+    fn refresh_live_snapshot(&mut self) {
+        if !self.live_tail_dirty {
+            return;
+        }
+        let cursor = self.row_locator(self.cursor);
+        let anchor = self.selection_anchor.and_then(|row| self.row_locator(row));
+        self.rebuild_lines();
+        self.cursor = cursor
+            .and_then(|at| self.row_for_locator(at))
+            .unwrap_or_else(|| self.cursor.min(self.lines.len().saturating_sub(1)));
+        self.selection_anchor = anchor.and_then(|at| self.row_for_locator(at));
+        self.scroll = self.scroll.min(self.max_scroll());
+        self.ensure_cursor_visible();
     }
 
     fn row_locator(&self, row: usize) -> Option<(TranscriptItemId, usize)> {
@@ -857,14 +1195,20 @@ impl TranscriptView {
             return;
         };
         let Some(item) = self.snapshot.items.iter().find(|item| item.id == id) else {
+            if self.live_tail_dirty && self.selection_anchor.take().is_some() {
+                self.refresh_live_snapshot();
+                self.status = Some("Selection ended · view updated".into());
+                return;
+            }
             self.status = Some("Selected item is no longer available".to_string());
             return;
         };
-        if !item.is_expandable(self.width) {
+        if !item.is_expandable() {
             self.status = Some("This item has no hidden details".to_string());
             return;
         }
         let label = item.label();
+        let ended_selection = self.selection_anchor.take().is_some();
         let expanded = if self.expanded.remove(&id) {
             false
         } else {
@@ -877,21 +1221,40 @@ impl TranscriptView {
         }
         self.ensure_cursor_visible();
         self.status = Some(format!(
-            "{} {label}",
-            if expanded { "Expanded" } else { "Collapsed" }
+            "{} {label}{}",
+            if expanded { "Expanded" } else { "Collapsed" },
+            if ended_selection {
+                " · selection ended"
+            } else {
+                ""
+            }
         ));
     }
 
     /// Expand the selected content object without turning Right into a toggle.
     /// Returns `true` only when a collapsed expandable object changed state.
     pub(crate) fn expand_current_item(&mut self) -> bool {
+        let ended_selection = self.selection_anchor.take().is_some();
+        let unavailable_frozen = ended_selection
+            && self.live_tail_dirty
+            && self
+                .item_at_or_near(self.cursor)
+                .is_none_or(|id| !self.snapshot.items.iter().any(|item| item.id == id));
+        if ended_selection {
+            self.status = Some("Selection ended".into());
+        }
+        self.refresh_live_snapshot();
+        if unavailable_frozen {
+            self.status = Some("Selection ended · view updated".into());
+            return false;
+        }
         let Some(id) = self.item_at_or_near(self.cursor) else {
             return false;
         };
         let Some(item) = self.snapshot.items.iter().find(|item| item.id == id) else {
             return false;
         };
-        if !item.is_expandable(self.width) || self.expanded.contains(&id) {
+        if !item.is_expandable() || self.expanded.contains(&id) {
             return false;
         }
         let label = item.label();
@@ -901,7 +1264,14 @@ impl TranscriptView {
             self.move_cursor_to(row);
         }
         self.ensure_cursor_visible();
-        self.status = Some(format!("Expanded {label}"));
+        self.status = Some(format!(
+            "Expanded {label}{}",
+            if ended_selection {
+                " · selection ended"
+            } else {
+                ""
+            }
+        ));
         true
     }
 
@@ -913,6 +1283,15 @@ impl TranscriptView {
             return false;
         };
         if !self.expanded.remove(&id) {
+            if self.selection_anchor.is_some()
+                && self.live_tail_dirty
+                && !self.snapshot.items.iter().any(|item| item.id == id)
+            {
+                self.selection_anchor = None;
+                self.refresh_live_snapshot();
+                self.status = Some("Selection ended · view updated".into());
+                return true;
+            }
             return false;
         }
         let label = self
@@ -922,12 +1301,20 @@ impl TranscriptView {
             .find(|item| item.id == id)
             .map(TranscriptItem::label)
             .unwrap_or("item");
+        let ended_selection = self.selection_anchor.take().is_some();
         self.rebuild_lines();
         if let Some(row) = self.row_for_locator((id, 0)) {
             self.move_cursor_to(row);
         }
         self.ensure_cursor_visible();
-        self.status = Some(format!("Collapsed {label}"));
+        self.status = Some(format!(
+            "Collapsed {label}{}",
+            if ended_selection {
+                " · selection ended"
+            } else {
+                ""
+            }
+        ));
         true
     }
 
@@ -1032,7 +1419,12 @@ impl TranscriptView {
             if !item.matches_filter(self.filter) {
                 continue;
             }
-            if let Some((text, heading)) = item.detail_text() {
+            let full_text = item.full_detail_text();
+            let detail = full_text
+                .as_deref()
+                .map(|text| (text, None))
+                .or_else(|| item.detail_text());
+            if let Some((text, heading)) = detail {
                 let text = crate::tui::render::line_utils::sanitize_terminal_text(text);
                 let lower = text.to_lowercase();
                 let mut offset = usize::from(heading.is_some());
@@ -1102,7 +1494,7 @@ impl TranscriptView {
             return;
         };
         let id = self.snapshot.items[index].id.clone();
-        if self.snapshot.items[index].is_expandable(self.width) {
+        if self.snapshot.items[index].is_expandable() {
             self.expand_item(&id);
             self.rebuild_lines();
         }
@@ -1147,7 +1539,10 @@ impl TranscriptView {
         let (start, end) = self
             .selection_bounds()
             .unwrap_or((self.cursor, self.cursor));
-        self.lines[start..=end]
+        let Some(selected) = self.lines.get(start..=end) else {
+            return String::new();
+        };
+        selected
             .iter()
             .map(|line| line_plain_text(line))
             .collect::<Vec<_>>()
@@ -1367,6 +1762,40 @@ impl BottomPaneView for TranscriptView {
                 _ => {}
             }
             return;
+        }
+
+        if self.live_tail_dirty && key.code == KeyCode::End && self.selection_anchor.is_none() {
+            if let Some(item) = self.snapshot.items.last()
+                && matches!(
+                    &item.content,
+                    TranscriptContent::LiveAssistant(_) | TranscriptContent::LiveReasoning(_)
+                )
+            {
+                self.expanded.remove(&item.id);
+                if let TranscriptContent::LiveAssistant(cell) = &item.content {
+                    recover_mutex_lock(cell).refresh_live_viewport();
+                }
+            }
+            self.rebuild_lines();
+            self.cursor = self.lines.len().saturating_sub(1);
+            self.scroll = self.max_scroll();
+            self.status = None;
+            return;
+        }
+        if self.live_tail_dirty
+            && self.selection_anchor.is_none()
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('j' | 'k')
+            )
+        {
+            self.refresh_live_snapshot();
         }
 
         let max_visible = self.max_visible as usize;
@@ -2383,5 +2812,147 @@ mod tests {
         pane.render(area, &mut buffer);
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(text.contains("Search cancelled"), "{text}");
+    }
+
+    #[test]
+    fn replacing_live_tail_reuses_history_rows() {
+        let history = TranscriptItem::rendered(
+            TranscriptItemId::from_widget_id(1),
+            vec![Line::from("history")],
+            1,
+        );
+        let tail = |text: &str| {
+            TranscriptItem::rendered_kind(
+                TranscriptItemId::from_widget_id(2),
+                TranscriptItemKind::Assistant,
+                vec![Line::from(text.to_string())],
+                1,
+            )
+        };
+        let mut view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(vec![history, tail("first")]),
+            24,
+            80,
+        );
+        let cached = view.lines[0].clone();
+        assert!(view.replace_live_tail(tail("second"), 80));
+        assert!(std::sync::Arc::ptr_eq(&cached, &view.lines[0]));
+        assert!(rendered(&view).contains("second"));
+        assert!(!view.replace_live_tail(tail("wrong width"), 40));
+    }
+
+    #[test]
+    fn copying_selection_uses_the_frozen_live_snapshot() {
+        use crate::tui::history_cell::assistant::AssistantCell;
+        use std::sync::{Arc, Mutex};
+
+        let cell = Arc::new(Mutex::new(AssistantCell::new_streaming()));
+        cell.lock().unwrap().push_delta("first line\nsecond line\n");
+        let id = TranscriptItemId::from_widget_id(5);
+        let item = || TranscriptItem::live_assistant(id.clone(), cell.clone(), 0);
+        let mut view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item()]), 24, 80);
+        assert!(view.expand_current_item());
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let selected = view.selected_text();
+        assert!(selected.contains("first line"));
+
+        cell.lock().unwrap().push_delta("new output\n");
+        assert!(view.replace_live_tail(item(), 80));
+        assert!(view.live_tail_dirty);
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            matches!(view.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::CopyToClipboard { text, .. }, ..
+        }) if text == selected && !text.contains("new output"))
+        );
+        assert!(view.export_plain_lines().join("\n").contains("new output"));
+    }
+
+    #[test]
+    fn changing_an_unmapped_frozen_item_keeps_the_transcript_open() {
+        use crate::tui::history_cell::assistant::AssistantCell;
+        use std::sync::{Arc, Mutex};
+
+        for action in [KeyCode::Left, KeyCode::Enter, KeyCode::Right] {
+            let cell = Arc::new(Mutex::new(AssistantCell::new_streaming()));
+            cell.lock().unwrap().push_delta("selected content");
+            let live = TranscriptItem::live_assistant(TranscriptItemId::from_widget_id(1), cell, 0);
+            let mut view =
+                TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![live]), 24, 80);
+            assert!(view.expand_current_item());
+            view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            view.replace_snapshot(
+                TranscriptSnapshot::new(vec![TranscriptItem::rendered(
+                    TranscriptItemId::from_widget_id(2),
+                    vec![Line::from("unrelated replacement")],
+                    0,
+                )]),
+                80,
+            );
+            view.handle_key(KeyEvent::new(action, KeyModifiers::NONE));
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Selection ended · view updated"),
+                "{action:?}"
+            );
+            assert!(view.selection_anchor.is_none());
+            assert!(view.take_action_request().is_none());
+        }
+    }
+
+    #[test]
+    fn export_uses_logical_lines_at_every_terminal_width() {
+        use crate::tui::history_cell::assistant::AssistantCell;
+        use std::sync::{Arc, Mutex};
+
+        let source = "0123456789012345678needle  \t界\u{1b}[31m红\u{1b}[0m\n\nlast\n";
+        let clean = "0123456789012345678needle  \t界红\n\nlast\n";
+        let cell = Arc::new(Mutex::new(AssistantCell::new_streaming()));
+        cell.lock().unwrap().push_delta(source);
+        for width in [12, 22, 80] {
+            let view = TranscriptView::from_snapshot(
+                TranscriptSnapshot::new(vec![TranscriptItem::live_assistant(
+                    TranscriptItemId::from_widget_id(1),
+                    cell.clone(),
+                    0,
+                )]),
+                24,
+                width,
+            );
+            assert_eq!(view.export_plain_lines().join("\n"), clean);
+        }
+        let view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(vec![TranscriptItem::committed(
+                TranscriptItemId::from_widget_id(1),
+                Arc::new(AssistantCell::from_markdown(source)),
+                0,
+            )]),
+            24,
+            12,
+        );
+        assert_eq!(view.export_plain_lines().join("\n"), clean);
+
+        // Root conversation history stores the same reasoning as a committed
+        // HistoryCell; its search/export contract must match child history.
+        let mut view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(vec![TranscriptItem::committed(
+                TranscriptItemId::from_widget_id(2),
+                Arc::new(ReasoningCell::from_text(source, None)),
+                0,
+            )]),
+            24,
+            22,
+        );
+        view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for key in "needle".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+        }
+        assert_eq!(view.status.as_deref(), Some("Match 1/1 · /needle"));
+        assert_eq!(
+            view.export_plain_lines().join("\n"),
+            format!("Thought\n{clean}")
+        );
     }
 }

@@ -48,6 +48,7 @@ pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> D
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
+        last_guidance_event_idx: -1,
         current_checkpoint: None,
         error_code: None,
         error_message: None,
@@ -221,6 +222,6 @@ pub(crate) async fn seed_live_edge_invocation(
     );
     assert!(matches!(dispatch.admit_and_claim_direct_dispatch(&dispatch_identity, "selected-runner", &json!({
             "identity":identity, "request_id":identity.storage_key(), "tool":"native_codex", "args":{"task":"native interaction"}
-        }).to_string()).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
+        })).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
     (ledger, identity)
 }

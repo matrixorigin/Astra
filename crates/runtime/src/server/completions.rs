@@ -228,6 +228,7 @@ pub(super) async fn completions_handler(
         &admitted.provider,
         &admitted.model_name,
         admission_estimated_tokens,
+        crate::turn::llm::client::LlmCancel::None,
     )
     .await
     .map_err(provider_admission_http_error)?;

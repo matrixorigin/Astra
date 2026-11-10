@@ -417,7 +417,7 @@ mod tests {
 
         assert!(rendered.contains("Ask"), "current mode must remain visible");
         assert!(
-            rendered.contains("next: Auto"),
+            rendered.contains("requested: Auto"),
             "staged mode must be visible while the turn runs; got {rendered:?}"
         );
     }
@@ -442,7 +442,7 @@ mod tests {
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect();
         assert!(rendered.contains("Ask"));
-        assert!(rendered.contains("next: Auto"));
+        assert!(rendered.contains("requested: Auto"));
 
         state
             .perm_manager
@@ -453,7 +453,7 @@ mod tests {
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect();
         assert!(rendered.contains("Read-only"));
-        assert!(rendered.contains("next: Auto"));
+        assert!(rendered.contains("requested: Auto"));
         assert!(
             !rendered.contains("Ask"),
             "pending intent must not replace the live mirror; got {rendered:?}"

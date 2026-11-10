@@ -1006,6 +1006,52 @@ impl AgentRunRegistry {
         }
     }
 
+    /// A spawn receipt can arrive after the server has already projected the
+    /// same run. Keep its existing row and bind the agent identity to it.
+    fn reconcile_agent_identity(&mut self, agent_id: &str, run_id: &str) -> String {
+        if self
+            .runs
+            .get(agent_id)
+            .is_some_and(|projection| projection.run_id.as_deref() == Some(run_id))
+        {
+            return agent_id.to_owned();
+        }
+        let key = self.key_for_live_event(agent_id, run_id);
+        if key == agent_id {
+            return key;
+        }
+        if !self.can_bind_run(agent_id, run_id) {
+            return key;
+        }
+        // Merge an identity-only row into the canonical run first, so the
+        // latter's live transcript and pending controls survive the rename.
+        self.rename(agent_id, key.clone());
+        self.rename(&key, agent_id.to_owned());
+        agent_id.to_owned()
+    }
+
+    fn can_bind_run(&self, key: &str, run_id: &str) -> bool {
+        self.runs
+            .get(key)
+            .and_then(|projection| projection.run_id.as_deref())
+            .is_none_or(|existing| existing == run_id)
+    }
+
+    fn key_for_control_target<'a>(
+        &'a self,
+        key: &'a str,
+        target: &crate::tui::agent_run_projection::AgentControlTarget,
+    ) -> Option<&'a str> {
+        match target {
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id } => {
+                self.key_for_run_id(run_id)
+            }
+            crate::tui::agent_run_projection::AgentControlTarget::LocalAgent { .. } => {
+                self.runs.contains_key(key).then_some(key)
+            }
+        }
+    }
+
     fn action_for_tool_use(&self, tool_use_id: &str) -> Option<AgentControlAction> {
         self.control_bindings
             .get(tool_use_id)
@@ -1466,7 +1512,7 @@ fn local_agent_runtime_metadata(
                 parent_run_id = parent.parent_run_id.as_str();
             }
             (
-                agent.agent_id.clone(),
+                agent.run_id.clone(),
                 (
                     depth,
                     child_counts
@@ -1773,29 +1819,6 @@ struct ParkedToolCell {
     cell_id: u64,
 }
 
-/// `live_tasks` is the multi-slot register for **parallel TaskCells**
-/// (sub-agents spawned via the agent spawn action in a single turn). Each
-/// entry is keyed by its `tool_use_id`. Nested lifecycle events are owned by
-/// the corresponding child run and stay out of these parent rows, so
-/// spawning agent B no longer commits agent A to scrollback — both stay live.
-/// On terminal completion (`ToolCompleted` for the parent), the cell finalises
-/// and moves to `history` with no disruption to its siblings.
-///
-/// **Insertion order matters**: `LiveTaskOrder` records the order
-/// agents were spawned so the renderer can show them deterministically
-/// (oldest-first) regardless of HashMap iteration order.
-enum DeferredStreamEvent {
-    AnswerDelta {
-        model_item_id: Option<String>,
-        text: String,
-    },
-    ReasoningDelta {
-        model_item_id: Option<String>,
-        text: String,
-    },
-    ReasoningDone,
-}
-
 /// A reconnect can replay lifecycle boundaries from an earlier turn. Keep a
 /// bounded identity tombstone so a late end (or a replayed start) cannot
 /// manufacture a second transcript row after the original call was settled.
@@ -1871,11 +1894,6 @@ pub(crate) struct ChatWidget {
     /// uncertain rows remain reconcilable when their authoritative terminal
     /// receipt arrives late; successful/failed terminals stay idempotent.
     settled_tool_cell_ids: std::collections::HashMap<String, u64>,
-    /// Providers may emit answer/reasoning tokens before the preceding tool's
-    /// terminal event. Keep those events ordered until the tool receipt lands
-    /// so the transcript does not manufacture a failed tool and later append
-    /// a duplicate successful one.
-    deferred_stream_events: Vec<DeferredStreamEvent>,
     next_cell_id: u64,
     /// Live parallel TaskCells, keyed by their `tool_use_id`.
     /// Mutating directly (no `Arc`) so each parent can finalize independently.
@@ -1948,7 +1966,6 @@ impl ChatWidget {
             settled_tool_use_ids: std::collections::HashSet::new(),
             settled_tool_use_order: VecDeque::new(),
             settled_tool_cell_ids: std::collections::HashMap::new(),
-            deferred_stream_events: Vec::new(),
             next_cell_id: 1,
             live_tasks: std::collections::HashMap::new(),
             live_task_order: Vec::new(),
@@ -2040,17 +2057,22 @@ impl ChatWidget {
 
         if snapshot.available {
             for agent in &snapshot.agents {
+                let run_key = self
+                    .agent_runs
+                    .reconcile_agent_identity(&agent.agent_id, &agent.run_id);
                 if let Some(tool_use_id) = agent.spawn_tool_call_id.as_deref()
                     && let Some(provisional_key) = self
                         .agent_runs
                         .key_for_tool_use(tool_use_id)
                         .map(str::to_string)
-                    && provisional_key != agent.agent_id
+                    && provisional_key != run_key
+                    && self
+                        .agent_runs
+                        .can_bind_run(&provisional_key, &agent.run_id)
                 {
-                    self.agent_runs
-                        .rename(&provisional_key, agent.agent_id.clone());
+                    self.agent_runs.rename(&provisional_key, run_key.clone());
                 }
-                present.insert(agent.agent_id.clone());
+                present.insert(run_key.clone());
                 let status = local_agent_run_status(&agent.status);
                 let state = AgentRunState::confirmed_local(status);
                 let (label, label_kind) = if agent.description.trim().is_empty() {
@@ -2061,12 +2083,12 @@ impl ChatWidget {
                         AgentRunLabelKind::TaskDescription,
                     )
                 };
-                let accepted =
-                    self.agent_runs
-                        .ensure(agent.agent_id.clone(), label, label_kind, state);
-                if let Some(projection) = self.agent_runs.get_mut(&agent.agent_id) {
+                let accepted = self
+                    .agent_runs
+                    .ensure(run_key.clone(), label, label_kind, state);
+                if let Some(projection) = self.agent_runs.get_mut(&run_key) {
                     let (depth, child_agents) = local_runtime_metadata
-                        .get(agent.agent_id.as_str())
+                        .get(agent.run_id.as_str())
                         .copied()
                         .unwrap_or((1, 0));
                     projection.set_runtime_metadata(
@@ -2117,7 +2139,7 @@ impl ChatWidget {
                         agent_fanout_membership(slot, title, &agent.description)
                     });
                     self.agent_runs
-                        .reconcile_fanout_membership(&agent.agent_id, fanout);
+                        .reconcile_fanout_membership(&run_key, fanout);
                 }
             }
 
@@ -2131,19 +2153,35 @@ impl ChatWidget {
         }
 
         for restored_agent in restored {
-            if self.agent_runs.contains_key(&restored_agent.id) {
+            if self
+                .agent_runs
+                .get(&restored_agent.id)
+                .is_some_and(|projection| {
+                    projection.run_id.as_deref() == Some(restored_agent.run_id.as_str())
+                })
+                || self
+                    .agent_runs
+                    .key_for_run_id(&restored_agent.run_id)
+                    .is_some()
+            {
+                continue;
+            }
+            let run_key = self
+                .agent_runs
+                .key_for_live_event(&restored_agent.id, &restored_agent.run_id);
+            if self.agent_runs.contains_key(&run_key) {
                 continue;
             }
             let Some(status) = restored_agent_run_status(&restored_agent.status) else {
                 continue;
             };
             self.agent_runs.ensure(
-                restored_agent.id.clone(),
+                run_key.clone(),
                 restored_agent.title.clone(),
                 AgentRunLabelKind::TaskDescription,
                 AgentRunState::stale_workspace(status),
             );
-            if let Some(projection) = self.agent_runs.get_mut(&restored_agent.id) {
+            if let Some(projection) = self.agent_runs.get_mut(&run_key) {
                 projection.set_runtime_metadata(
                     AgentProjectionSource::WorkspaceSnapshot,
                     AgentRunKind::Agent,
@@ -2163,7 +2201,7 @@ impl ChatWidget {
                 }
             }
             self.agent_runs.set_fanout_membership(
-                &restored_agent.id,
+                &run_key,
                 restored_agent.fanout.as_ref().map(|fanout| {
                     crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
                         group_id: fanout.group_id.clone(),
@@ -2625,6 +2663,9 @@ impl ChatWidget {
             if let Some(tc) = self.live_tasks.get_mut(id) {
                 append_agent_live_output(tc, "\nCancelling…\n");
             }
+            if self.agent_runs.action_for_tool_use(id) != Some(AgentControlAction::Spawn) {
+                continue;
+            }
             let Some(agent_key) = self.agent_runs.key_for_tool_use(id).map(str::to_owned) else {
                 continue;
             };
@@ -2648,7 +2689,11 @@ impl ChatWidget {
         target: &crate::tui::agent_run_projection::AgentControlTarget,
         action: astra_thin_client::SessionRunAction,
     ) -> Option<uuid::Uuid> {
-        let projection = self.agent_runs.get_mut(agent_id)?;
+        let key = self
+            .agent_runs
+            .key_for_control_target(agent_id, target)?
+            .to_owned();
+        let projection = self.agent_runs.get_mut(&key)?;
         if projection.control_target.as_ref() != Some(target) {
             return None;
         }
@@ -2662,12 +2707,15 @@ impl ChatWidget {
         action: astra_thin_client::SessionRunAction,
         request_id: uuid::Uuid,
     ) -> bool {
-        self.agent_runs.get(agent_id).is_some_and(|projection| {
-            projection.control_target.as_ref() == Some(target)
-                && projection.pending_control.is_some_and(|pending| {
-                    pending.request_id == request_id && pending.action == action
-                })
-        })
+        self.agent_runs
+            .key_for_control_target(agent_id, target)
+            .and_then(|key| self.agent_runs.get(key))
+            .is_some_and(|projection| {
+                projection.control_target.as_ref() == Some(target)
+                    && projection.pending_control.is_some_and(|pending| {
+                        pending.request_id == request_id && pending.action == action
+                    })
+            })
     }
 
     pub fn reject_agent_control(
@@ -2680,8 +2728,15 @@ impl ChatWidget {
         if !self.agent_control_request_matches(agent_id, target, action, request_id) {
             return false;
         }
+        let Some(key) = self
+            .agent_runs
+            .key_for_control_target(agent_id, target)
+            .map(str::to_owned)
+        else {
+            return false;
+        };
         self.agent_runs
-            .get_mut(agent_id)
+            .get_mut(&key)
             .is_some_and(AgentRunProjection::reject_control)
     }
 
@@ -2873,6 +2928,11 @@ impl ChatWidget {
         self.active_cell.as_deref()
     }
 
+    pub(crate) fn latest_parked_tool(&self) -> Option<&dyn HistoryCell> {
+        let id = self.parked_tool_order.last()?;
+        self.parked_tools.get(id).map(|parked| parked.cell.as_ref())
+    }
+
     pub(crate) fn active_cell_id(&self) -> Option<u64> {
         debug_assert_eq!(self.active_cell.is_some(), self.active_cell_id.is_some());
         self.active_cell_id
@@ -3059,12 +3119,8 @@ impl ChatWidget {
         self.history_cell_ids.push(id);
     }
 
-    /// Commit a user message directly into history without opening a new turn
-    /// or draining the current live tool/assistant state.
-    ///
-    /// Used for user intents that become active mid-turn: the transcript
-    /// should show the newest user message as a first-class user row, but the
-    /// current streaming turn should remain live until the runtime yields.
+    /// Preserve the conversational ordering of a mid-turn user message
+    /// without treating any still-running tool as complete.
     pub fn commit_applied_user_intent(
         &mut self,
         _intent_id: impl Into<String>,
@@ -3072,6 +3128,12 @@ impl ChatWidget {
         _status: astra_turn_types::UserIntentStatus,
         text: impl Into<String>,
     ) {
+        if matches!(
+            self.active_cell.as_deref().map(cell_kind),
+            Some(CellKind::Assistant | CellKind::Reasoning)
+        ) {
+            self.commit_active();
+        }
         self.commit_cell(Box::new(UserCell::new(text.into())));
     }
 
@@ -3263,17 +3325,9 @@ impl ChatWidget {
     }
 
     fn on_answer_delta(&mut self, delta: &str, model_item_id: Option<&str>) {
-        if matches!(
-            self.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Tool)
-        ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::AnswerDelta {
-                    model_item_id: model_item_id.map(str::to_owned),
-                    text: delta.to_string(),
-                });
-            return;
-        }
+        // A tool can remain live while the model speaks. Keep its existing
+        // keyed projection rather than hiding the answer or finalizing it.
+        self.park_active_tool();
         // Tokens can begin flowing while another stream-owned cell is still
         // live. The single active-cell slot is type-stable: append to an
         // AssistantCell, or commit the old lane before opening the answer.
@@ -3308,17 +3362,7 @@ impl ChatWidget {
     }
 
     fn on_reasoning_delta(&mut self, delta: &str, model_item_id: Option<&str>) {
-        if matches!(
-            self.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Tool)
-        ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::ReasoningDelta {
-                    model_item_id: model_item_id.map(str::to_owned),
-                    text: delta.to_string(),
-                });
-            return;
-        }
+        self.park_active_tool();
         // Reasoning can resume or arrive after visible answer/tool output from
         // providers that interleave lanes. Keep the active-cell slot type-stable
         // instead of asserting on a legitimate ordering variant.
@@ -3356,8 +3400,6 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Tool)
         ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::ReasoningDone);
             return;
         }
         // Only flips the reasoning cell's live flag; the cell
@@ -3372,6 +3414,7 @@ impl ChatWidget {
             // as its own cell. Keeps the scrollback readable as
             // discrete turns rather than one blob.
             self.commit_active();
+            self.restore_latest_parked_tool();
         }
     }
 
@@ -3457,7 +3500,7 @@ impl ChatWidget {
             // close it only after the tool-specific parking path had a chance
             // to preserve a still-running call.
             if !parked_tool {
-                self.commit_active_and_replay_deferred();
+                self.commit_active();
             }
             let mut cell = ToolCell::new_running(name, description);
             if cell.name == "bash" && self.bash_background_hint_enabled {
@@ -3498,6 +3541,10 @@ impl ChatWidget {
         let Some(action) = AgentControlAction::from_wire(&action) else {
             return;
         };
+        if action == AgentControlAction::GetResult {
+            // Waiting for a result observes a run; it does not create one.
+            return;
+        }
         let fanout_membership =
             fanout_slot.map(|slot| agent_fanout_membership(slot, fanout_title.as_deref(), &label));
         let provisional = provisional_agent_key(&tool_use_id);
@@ -3516,13 +3563,7 @@ impl ChatWidget {
         {
             self.agent_runs.rename(&existing, key.clone());
         }
-        let (label, label_kind) = match action {
-            AgentControlAction::Spawn => (label, AgentRunLabelKind::TaskDescription),
-            AgentControlAction::GetResult => (
-                agent_display_name(&key, None),
-                AgentRunLabelKind::RoutingFallback,
-            ),
-        };
+        let label_kind = AgentRunLabelKind::TaskDescription;
         if self.agent_runs.contains_key(&key) {
             if let Some(projection) = self.agent_runs.get_mut(&key) {
                 projection.set_label(label, label_kind);
@@ -3530,17 +3571,11 @@ impl ChatWidget {
             self.agent_runs
                 .bind_tool_use(&tool_use_id, key.clone(), action);
         } else {
-            let state = match action {
-                AgentControlAction::Spawn => AgentRunState::observed(AgentRunStatus::Starting),
-                AgentControlAction::GetResult => {
-                    AgentRunState::unconfirmed(AgentRunStatus::Running)
-                }
-            };
             self.agent_runs.ensure_for_tool_use(
                 key.clone(),
                 label,
                 label_kind,
-                state,
+                AgentRunState::observed(AgentRunStatus::Starting),
                 &tool_use_id,
                 action,
             );
@@ -3578,14 +3613,32 @@ impl ChatWidget {
         let surface = AgentControlSurface::from_wire(&action, &status, parsed.as_ref());
         let agent_id = event_agent_id.or_else(|| surface.agent_id().map(str::to_string));
         let provisional = provisional_agent_key(&tool_use_id);
-        let key = agent_id
-            .clone()
-            .or_else(|| {
-                self.agent_runs
-                    .key_for_tool_use(&tool_use_id)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| provisional.clone());
+        if control_action == AgentControlAction::GetResult && canonical_run_id.is_none() {
+            self.agent_runs.control_bindings.remove(&tool_use_id);
+            // Without execution identity, do not assign the result to a run.
+            return;
+        }
+        let key = match (agent_id.as_deref(), canonical_run_id.as_deref()) {
+            (agent_id, Some(run_id)) if control_action == AgentControlAction::GetResult => self
+                .agent_runs
+                .key_for_run_id(run_id)
+                .map(str::to_owned)
+                .unwrap_or_else(|| match agent_id {
+                    Some(id) if !self.agent_runs.contains_key(id) => id.to_owned(),
+                    _ => run_id.to_owned(),
+                }),
+            (Some(agent_id), Some(run_id)) => {
+                self.agent_runs.reconcile_agent_identity(agent_id, run_id)
+            }
+            _ => agent_id
+                .clone()
+                .or_else(|| {
+                    self.agent_runs
+                        .key_for_tool_use(&tool_use_id)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| provisional.clone()),
+        };
         if control_action == AgentControlAction::Spawn
             && agent_id.is_none()
             && matches!(
@@ -3598,7 +3651,13 @@ impl ChatWidget {
             self.agent_runs.remove(&provisional);
             return;
         }
-        if key != provisional && self.agent_runs.contains_key(&provisional) {
+        if control_action == AgentControlAction::Spawn
+            && key != provisional
+            && self.agent_runs.contains_key(&provisional)
+            && canonical_run_id
+                .as_deref()
+                .is_none_or(|run_id| self.agent_runs.can_bind_run(&provisional, run_id))
+        {
             self.agent_runs.rename(&provisional, key.clone());
         }
         let (label, label_kind) = if let Some(description) = parsed
@@ -3627,8 +3686,19 @@ impl ChatWidget {
                 AgentRunState::unconfirmed(AgentRunStatus::Running),
             );
         }
-        self.agent_runs
-            .bind_tool_use(&tool_use_id, key.clone(), control_action);
+        if control_action == AgentControlAction::GetResult {
+            // Bind the observation to the exact run named by the receipt.
+            self.agent_runs.control_bindings.insert(
+                tool_use_id.clone(),
+                AgentControlBinding {
+                    run_key: key.clone(),
+                    action: control_action,
+                },
+            );
+        } else {
+            self.agent_runs
+                .bind_tool_use(&tool_use_id, key.clone(), control_action);
+        }
         let Some(projection) = self.agent_runs.get_mut(&key) else {
             return;
         };
@@ -3937,19 +4007,23 @@ impl ChatWidget {
             },
         ) = &event.kind
         {
+            let run_key = self
+                .agent_runs
+                .reconcile_agent_identity(&event.agent_id, &event.run_id);
             if let Some(provisional_key) = self
                 .agent_runs
                 .key_for_tool_use(tool_call_id)
                 .map(str::to_owned)
             {
-                self.agent_runs
-                    .rename(&provisional_key, event.agent_id.clone());
+                if self
+                    .agent_runs
+                    .can_bind_run(&provisional_key, &event.run_id)
+                {
+                    self.agent_runs.rename(&provisional_key, run_key);
+                }
             } else {
-                self.agent_runs.bind_tool_use(
-                    tool_call_id,
-                    event.agent_id.clone(),
-                    AgentControlAction::Spawn,
-                );
+                self.agent_runs
+                    .bind_tool_use(tool_call_id, run_key, AgentControlAction::Spawn);
             }
         }
 
@@ -4368,9 +4442,6 @@ impl ChatWidget {
             tc.complete(&status, duration_ms, description, output_summary, output);
             self.commit_active();
             self.restore_latest_parked_tool();
-            if !self.has_live_tool_projection() {
-                self.replay_deferred_stream_events();
-            }
             return;
         }
 
@@ -4381,9 +4452,6 @@ impl ChatWidget {
             }
             self.commit_cell_with_id(parked.cell, parked.cell_id);
             self.remember_settled_tool_use_id(tool_use_id, Some(parked.cell_id));
-            if !self.has_live_tool_projection() {
-                self.replay_deferred_stream_events();
-            }
             return;
         }
 
@@ -4444,10 +4512,11 @@ impl ChatWidget {
     /// its typed completion/cancellation or the terminal turn boundary owns
     /// that lifecycle transition.
     pub(crate) fn finish_stream_projection(&mut self) {
-        if self.has_live_tool_projection() {
+        if self.active_tool_use_id.is_some() {
             return;
         }
-        self.commit_active_and_replay_deferred();
+        self.commit_active();
+        self.restore_latest_parked_tool();
     }
 
     pub(crate) fn has_live_tool_projection(&self) -> bool {
@@ -4639,37 +4708,9 @@ impl ChatWidget {
         }
     }
 
-    fn replay_deferred_stream_events(&mut self) {
-        let deferred = std::mem::take(&mut self.deferred_stream_events);
-        for event in deferred {
-            match event {
-                DeferredStreamEvent::AnswerDelta {
-                    model_item_id,
-                    text,
-                } => self.on_answer_delta(&text, model_item_id.as_deref()),
-                DeferredStreamEvent::ReasoningDelta {
-                    model_item_id,
-                    text,
-                } => self.on_reasoning_delta(&text, model_item_id.as_deref()),
-                DeferredStreamEvent::ReasoningDone => self.on_reasoning_done(),
-            }
-        }
-    }
-
-    /// Close the current lane at a transcript boundary, then materialize any
-    /// answer/reasoning events held behind a running tool and close that lane
-    /// too. The two commits preserve wire order: tool first, deferred text
-    /// second, boundary cell last.
-    fn commit_active_and_replay_deferred(&mut self) {
-        self.commit_active();
-        self.replay_deferred_stream_events();
-        self.commit_active();
-    }
-
     /// Close every top-level live lane at a real transcript boundary. Parallel
     /// tools are first normalized into their start-ordered keyed register, so
-    /// missing terminals cannot reorder siblings or let deferred answer text
-    /// overtake an earlier call.
+    /// missing terminals cannot reorder siblings.
     fn commit_transcript_boundary(&mut self) {
         let active_is_tool = self.active_cell.as_ref().is_some_and(|cell| {
             matches!(cell_kind(cell.as_ref()), CellKind::Tool) && self.active_tool_use_id.is_some()
@@ -4678,7 +4719,7 @@ impl ChatWidget {
             self.park_active_tool();
         }
         self.drain_all_parked_tools();
-        self.commit_active_and_replay_deferred();
+        self.commit_active();
     }
 
     /// Take the currently-live cell, finalise it, append to
@@ -5687,6 +5728,12 @@ mod tests {
         .to_string()
     }
 
+    fn result_for_run(result: String, run_id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        value["run_id"] = serde_json::json!(run_id);
+        value.to_string()
+    }
+
     // ── UserSubmit ───────────────────────────────────────────────
 
     #[test]
@@ -5708,9 +5755,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_applied_user_intent_keeps_live_active_cell() {
+    fn applied_user_intent_follows_prior_answer_and_preserves_live_tool() {
         let mut w = fresh();
-        w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("before".into()),
+            text: "old answer".into(),
+        }));
 
         w.commit_applied_user_intent(
             "intent-1",
@@ -5719,17 +5769,40 @@ mod tests {
             "stop after this tool",
         );
 
-        assert_eq!(w.history.len(), 1, "user intent is committed as history");
-        let persisted = w.history[0].to_persist().expect("user cell persists");
+        assert_eq!(w.history.len(), 2);
+        assert!(matches!(
+            w.history[0].to_persist(),
+            Some(TurnEvent::Assistant { .. })
+        ));
+        let persisted = w.history[1].to_persist().expect("user cell persists");
         assert!(matches!(
             &persisted,
             TurnEvent::User { text, .. } if text == "stop after this tool"
         ));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("after".into()),
+            text: "new answer".into(),
+        }));
         assert_eq!(
             w.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Assistant),
-            "user intent must not finalize the live assistant/tool cell"
+            Some(CellKind::Assistant)
         );
+
+        let mut tool = fresh();
+        tool.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "bash".into(),
+            description: "running".into(),
+            tool_use_id: "live".into(),
+            parent_tool_use_id: None,
+        }));
+        tool.commit_applied_user_intent(
+            "intent-2",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "new direction",
+        );
+        assert!(tool.has_live_tool_projection());
+        assert_eq!(tool.active_tool_use_id.as_deref(), Some("live"));
     }
 
     #[test]
@@ -5748,13 +5821,14 @@ mod tests {
             "new guidance",
         );
 
-        assert_eq!(w.active_cell_id(), Some(live_id));
-        assert_ne!(w.history_cell_id(0), live_id);
+        assert!(w.active_cell_id().is_none());
+        assert_eq!(w.history_cell_id(0), live_id);
+        assert_ne!(w.history_cell_id(1), live_id);
 
         w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
         assert!(w.active_cell().is_none());
-        assert_eq!(w.history_cell_id(1), live_id);
+        assert_eq!(w.history_cell_id(0), live_id);
         assert_eq!(w.history.len(), w.history_cell_ids.len());
     }
 
@@ -5979,7 +6053,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_drains_parallel_tools_before_deferred_answer_in_start_order() {
+    fn boundary_drains_parallel_tools_before_live_answer_in_start_order() {
         let mut w = fresh();
         for (id, name) in [("call-a", "bash"), ("call-b", "read_file")] {
             w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
@@ -6141,7 +6215,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_delta_waits_for_live_tool_completion_without_false_failure() {
+    fn answer_is_visible_while_tool_remains_live() {
         let mut w = fresh();
 
         w.handle_event(AppEvent::wire(tool_started("read_file", "Cargo.toml")));
@@ -6152,10 +6226,13 @@ mod tests {
 
         assert!(w.history.is_empty(), "running tool must remain live");
         assert!(matches!(
-            w.active_cell
-                .as_deref()
+            w.latest_parked_tool()
                 .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>()),
             Some(tool) if tool.status == ToolStatus::Running
+        ));
+        assert!(matches!(
+            w.active_cell.as_deref().and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>()),
+            Some(answer) if answer.source() == "answer"
         ));
         w.handle_event(AppEvent::wire(tool_completed(
             "read_file",
@@ -6183,7 +6260,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_reasoning_events_replay_in_order_after_tool_completion() {
+    fn interleaved_reasoning_and_answer_remain_visible_while_tool_runs() {
         let mut w = fresh();
 
         w.handle_event(AppEvent::wire(tool_started("bash", "cargo metadata")));
@@ -6196,6 +6273,11 @@ mod tests {
             model_item_id: None,
             text: "metadata is valid".into(),
         }));
+        assert!(w.has_live_tool_projection());
+        assert!(matches!(
+            w.active_cell.as_deref().and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>()),
+            Some(answer) if answer.source() == "metadata is valid"
+        ));
         w.handle_event(AppEvent::wire(tool_completed(
             "bash",
             "",
@@ -6204,13 +6286,13 @@ mod tests {
             Some("ok"),
         )));
 
-        assert_eq!(w.history.len(), 2, "tool then reasoning should be settled");
+        assert_eq!(w.history.len(), 2, "reasoning and tool should be settled");
         assert!(matches!(
-            w.history[0].as_any_ref().downcast_ref::<ToolCell>(),
+            w.history[1].as_any_ref().downcast_ref::<ToolCell>(),
             Some(tool) if tool.status == ToolStatus::Success
         ));
         assert!(
-            w.history[1]
+            w.history[0]
                 .as_any_ref()
                 .downcast_ref::<ReasoningCell>()
                 .is_some()
@@ -6735,7 +6817,10 @@ mod tests {
             label: "reviewer-A".into(),
             status: "completed".into(),
             duration_ms: 10,
-            output: Some(child_result_wire("reviewer-A@abc", "cancelled", None, None)),
+            output: Some(result_for_run(
+                child_result_wire("reviewer-A@abc", "cancelled", None, None),
+                "run-reviewer-A",
+            )),
             tool_use_id: "spawn-tu-lifecycle".into(),
             agent_id: Some("reviewer-A@abc".into()),
         }));
@@ -6749,11 +6834,9 @@ mod tests {
             label: "reviewer-A".into(),
             status: "completed".into(),
             duration_ms: 42,
-            output: Some(child_result_wire(
-                "reviewer-A@abc",
-                "completed",
-                Some("done"),
-                Some("normal"),
+            output: Some(result_for_run(
+                child_result_wire("reviewer-A@abc", "completed", Some("done"), Some("normal")),
+                "run-reviewer-A",
             )),
             tool_use_id: "result-tu-lifecycle".into(),
             agent_id: Some("reviewer-A@abc".into()),
@@ -8007,11 +8090,14 @@ mod tests {
             "Wait for review",
             "completed",
             42,
-            Some(&child_result_wire(
-                "arch-reviewer@abc12345",
-                "completed",
-                Some("review evidence"),
-                None,
+            Some(&result_for_run(
+                child_result_wire(
+                    "arch-reviewer@abc12345",
+                    "completed",
+                    Some("review evidence"),
+                    None,
+                ),
+                "run-arch-reviewer",
             )),
             "wait-arch",
             Some("arch-reviewer@abc12345"),
@@ -8058,11 +8144,14 @@ mod tests {
             "ux-reviewer",
             "completed",
             123,
-            Some(&child_result_wire(
-                "ux-reviewer@def67890",
-                "completed",
-                Some("finding one\nfinding two"),
-                Some("normal"),
+            Some(&result_for_run(
+                child_result_wire(
+                    "ux-reviewer@def67890",
+                    "completed",
+                    Some("finding one\nfinding two"),
+                    Some("normal"),
+                ),
+                "run-ux-reviewer",
             )),
             "result-ux",
             Some("ux-reviewer@def67890"),
@@ -8092,9 +8181,7 @@ mod tests {
         )));
 
         let rows = w.agent_monitor_snapshot(5);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent_id, "reviewer@abc12345");
-        assert_eq!(rows[0].state.status, AgentRunStatus::Failed);
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -8105,10 +8192,9 @@ mod tests {
             "reviewer",
             "completed",
             120_000,
-            Some(&still_running_result_wire(
-                "reviewer@abc12345",
-                120,
-                "call again",
+            Some(&result_for_run(
+                still_running_result_wire("reviewer@abc12345", 120, "call again"),
+                "test-run",
             )),
             "result-reviewer",
             Some("reviewer@abc12345"),
@@ -8143,10 +8229,9 @@ mod tests {
             "reviewer",
             "completed",
             120_000,
-            Some(&still_running_result_wire(
-                "reviewer@abc12345",
-                120,
-                "call again",
+            Some(&result_for_run(
+                still_running_result_wire("reviewer@abc12345", 120, "call again"),
+                "test-run",
             )),
             "result-reviewer",
             Some("reviewer@abc12345"),
@@ -9135,6 +9220,8 @@ mod tests {
                 "capacity unavailable",
             );
         assert!(fanout_completion_is_authoritative(None, Some(&rejection)));
+        let unknown = r#"{"status":"unknown","executed":null,"group_id":"review-42","error":"acknowledgement lost"}"#;
+        assert!(fanout_completion_is_authoritative(None, Some(unknown)));
     }
 
     #[test]
@@ -9316,6 +9403,7 @@ mod tests {
                     "result_family": "child_result",
                     "status": "timeout",
                     "agent_id": "reviewer@abc12345",
+                    "run_id": "test-run",
                     "waited_secs": 120
                 })
                 .to_string(),
@@ -9348,11 +9436,14 @@ mod tests {
             "reviewer",
             "completed",
             77,
-            Some(&child_result_wire(
-                "reviewer@abc12345",
-                "interrupted",
-                None,
-                Some("budget_exhausted"),
+            Some(&result_for_run(
+                child_result_wire(
+                    "reviewer@abc12345",
+                    "interrupted",
+                    None,
+                    Some("budget_exhausted"),
+                ),
+                "test-run",
             )),
             "result-reviewer",
             Some("reviewer@abc12345"),
@@ -9382,11 +9473,14 @@ mod tests {
             "reviewer",
             "completed",
             77,
-            Some(&child_result_wire(
-                "reviewer@abc12345",
-                "interrupted",
-                Some("partial draft"),
-                Some("budget_exhausted"),
+            Some(&result_for_run(
+                child_result_wire(
+                    "reviewer@abc12345",
+                    "interrupted",
+                    Some("partial draft"),
+                    Some("budget_exhausted"),
+                ),
+                "test-run",
             )),
             "result-reviewer",
             Some("reviewer@abc12345"),
@@ -10461,6 +10555,585 @@ mod tests {
     }
 
     #[test]
+    fn spawn_receipt_merges_a_prior_server_snapshot_and_keeps_terminal_truth() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        for terminal_before_receipt in [false, true] {
+            let mut widget = fresh();
+            widget.handle_event(AppEvent::wire(agent_control_started(
+                "spawn",
+                "Review",
+                "spawn-call",
+                None,
+            )));
+            let mut child = server_run_node("child-run", SessionRunLifecycleStatus::Running, 1);
+            child.agent_id = Some("child-agent".into());
+            let mut sibling = server_run_node("sibling-run", SessionRunLifecycleStatus::Running, 1);
+            sibling.agent_id = Some("sibling-agent".into());
+            widget.reconcile_server_agent_projection(&server_agent_projection(
+                crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                vec![child.clone(), sibling.clone()],
+                false,
+            ));
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+                run_id: "child-run".into(),
+                agent_id: "child-agent".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "child evidence".into(),
+                },
+            })));
+            child.status = SessionRunLifecycleStatus::Completed;
+            child.run_event_high_watermark = 2;
+            if terminal_before_receipt {
+                widget.reconcile_server_agent_projection(&server_agent_projection(
+                    crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                    vec![child.clone(), sibling.clone()],
+                    false,
+                ));
+            }
+            widget.handle_event(AppEvent::wire(agent_control_completed(
+                "spawn", "Review", "completed", 1,
+                Some(r#"{"action":"spawn","result_family":"control_receipt","status":"launched","agent_id":"child-agent","run_id":"child-run","transcript_location":"durable_server"}"#),
+                "spawn-call", Some("child-agent"),
+            )));
+            widget.reconcile_server_agent_projection(&server_agent_projection(
+                crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                vec![child, sibling],
+                false,
+            ));
+
+            let rows = widget.agent_monitor_snapshot(5);
+            assert_eq!(rows.len(), 2, "one row per run");
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.run_id.as_deref() == Some("child-run"))
+                    .unwrap()
+                    .state
+                    .status,
+                AgentRunStatus::Completed,
+            );
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.run_id.as_deref() == Some("sibling-run"))
+                    .unwrap()
+                    .state
+                    .status,
+                AgentRunStatus::Running,
+            );
+            assert_eq!(widget.agent_status_strip_ids().len(), 1);
+            let (events, _) = widget.agent_live_transcript_replay("child-agent", "child-run");
+            assert!(events.iter().any(|event| matches!(
+                &event.kind, AgentLiveEventKind::OutputDelta { text, .. } if text == "child evidence"
+            )), "merging identities must preserve the live transcript");
+        }
+    }
+
+    #[test]
+    fn recovered_result_wait_uses_exact_run_identity() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        for snapshot_first in [false, true] {
+            let mut widget = fresh();
+            let mut child = server_run_node("child-run", SessionRunLifecycleStatus::Running, 1);
+            child.agent_id = Some("reviewer".into());
+            let mut sibling = server_run_node("sibling-run", SessionRunLifecycleStatus::Running, 1);
+            sibling.agent_id = Some("reviewer".into());
+            let snapshot = |child, sibling| {
+                server_agent_projection(
+                    crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                    vec![child, sibling],
+                    false,
+                )
+            };
+            if snapshot_first {
+                widget.reconcile_server_agent_projection(&snapshot(child.clone(), sibling.clone()));
+            }
+            widget.handle_event(AppEvent::wire(agent_control_started(
+                "get_result",
+                "Review",
+                "get-call",
+                Some("reviewer"),
+            )));
+            let payload =
+                astra_turn_core::orchestration::agent_result_wire::render_wait_timeout_outcome(
+                    "reviewer",
+                    Some(&AgentStatus::Running {
+                        activity: "working".into(),
+                    }),
+                    std::time::Duration::from_millis(1),
+                    Some("child-run"),
+                );
+            widget.handle_event(AppEvent::wire(agent_control_completed(
+                "get_result",
+                "Review",
+                "completed",
+                1,
+                Some(&payload),
+                "get-call",
+                Some("reviewer"),
+            )));
+            child.status = SessionRunLifecycleStatus::Completed;
+            child.run_event_high_watermark = 2;
+            widget.reconcile_server_agent_projection(&snapshot(child, sibling));
+            let rows = widget.agent_monitor_snapshot(5);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows.iter()
+                    .find(|r| r.run_id.as_deref() == Some("child-run"))
+                    .unwrap()
+                    .state
+                    .status,
+                AgentRunStatus::Completed
+            );
+            assert_eq!(
+                rows.iter()
+                    .find(|r| r.run_id.as_deref() == Some("sibling-run"))
+                    .unwrap()
+                    .state
+                    .status,
+                AgentRunStatus::Running
+            );
+        }
+    }
+
+    #[test]
+    fn result_receipt_binds_only_the_exact_run_without_cancelling_others() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "first-run".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer".into()),
+                text: "first run".into(),
+            },
+        })));
+        let mut second = server_run_node("second-run", SessionRunLifecycleStatus::Running, 1);
+        second.agent_id = Some("reviewer".into());
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![second],
+            false,
+        ));
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Review",
+            "get-call",
+            Some("reviewer"),
+        )));
+        assert!(widget.agent_runs.key_for_tool_use("get-call").is_none());
+        widget.mark_agents_cancelling(&["get-call".into()]);
+
+        let payload =
+            astra_turn_core::orchestration::agent_result_wire::render_wait_timeout_outcome(
+                "reviewer",
+                Some(&AgentStatus::Running {
+                    activity: "working".into(),
+                }),
+                std::time::Duration::from_millis(1),
+                Some("second-run"),
+            );
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Review",
+            "completed",
+            1,
+            Some(&payload),
+            "get-call",
+            Some("reviewer"),
+        )));
+        let after = widget.agent_runs.key_for_tool_use("get-call").unwrap();
+        assert_eq!(
+            widget.agent_runs.get(after).unwrap().run_id.as_deref(),
+            Some("second-run")
+        );
+        widget.mark_agents_cancelling(&["get-call".into()]);
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.state.status == AgentRunStatus::Running)
+        );
+    }
+
+    #[test]
+    fn unknown_result_wait_does_not_create_a_running_child() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        for payload in [
+            astra_turn_core::orchestration::agent_result_wire::render_wait_timeout_outcome(
+                "reviewer",
+                None,
+                std::time::Duration::from_secs(1),
+                None,
+            ),
+            still_running_result_wire("reviewer", 1, "working"),
+            child_result_wire("reviewer", "completed", Some("done"), None),
+        ] {
+            let mut widget = fresh();
+            let mut child = server_run_node("child-run", SessionRunLifecycleStatus::Running, 1);
+            child.agent_id = Some("reviewer".into());
+            let mut sibling = server_run_node("sibling-run", SessionRunLifecycleStatus::Running, 1);
+            sibling.agent_id = Some("reviewer".into());
+            let snapshot = |child, sibling| {
+                server_agent_projection(
+                    crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                    vec![child, sibling],
+                    false,
+                )
+            };
+            widget.reconcile_server_agent_projection(&snapshot(child.clone(), sibling.clone()));
+            widget.handle_event(AppEvent::wire(agent_control_started(
+                "get_result",
+                "Review",
+                "get-call",
+                Some("reviewer"),
+            )));
+            widget.handle_event(AppEvent::wire(agent_control_completed(
+                "get_result",
+                "Review",
+                "completed",
+                1,
+                Some(&payload),
+                "get-call",
+                Some("reviewer"),
+            )));
+            child.status = SessionRunLifecycleStatus::Completed;
+            child.run_event_high_watermark = 2;
+            widget.reconcile_server_agent_projection(&snapshot(child, sibling));
+            let rows = widget.agent_monitor_snapshot(5);
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .any(|row| row.run_id.as_deref() == Some("child-run")
+                        && row.state.status == AgentRunStatus::Completed)
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.run_id.as_deref() == Some("sibling-run")
+                        && row.state.status == AgentRunStatus::Running)
+            );
+        }
+    }
+
+    #[test]
+    fn result_without_run_identity_does_not_complete_a_same_name_run() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "first-run".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "working".into(),
+            },
+        })));
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Review",
+            "get-call",
+            Some("reviewer"),
+        )));
+        let payload = child_result_wire("reviewer", "completed", Some("other result"), None);
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Review",
+            "completed",
+            1,
+            Some(&payload),
+            "get-call",
+            Some("reviewer"),
+        )));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id.as_deref(), Some("first-run"));
+        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
+    }
+
+    #[test]
+    fn unknown_result_preserves_an_existing_spawn_and_cleans_its_own_placeholder() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "Review",
+            "spawn-call",
+            Some("reviewer"),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Review",
+            "get-call",
+            Some("reviewer"),
+        )));
+        let payload = still_running_result_wire("reviewer", 1, "working");
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Review",
+            "completed",
+            1,
+            Some(&payload),
+            "get-call",
+            Some("reviewer"),
+        )));
+        assert!(widget.agent_runs.key_for_tool_use("spawn-call").is_some());
+        assert!(widget.agent_runs.key_for_tool_use("get-call").is_none());
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "Review",
+            "completed",
+            1,
+            Some(&spawn_receipt_wire("reviewer", "child-run")),
+            "spawn-call",
+            Some("reviewer"),
+        )));
+        assert_eq!(
+            widget.agent_monitor_snapshot(5)[0].run_id.as_deref(),
+            Some("child-run")
+        );
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Review",
+            "get-call",
+            None,
+        )));
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Review",
+            "completed",
+            1,
+            Some(&payload),
+            "get-call",
+            Some("reviewer"),
+        )));
+        assert!(widget.agent_monitor_snapshot(5).is_empty());
+    }
+
+    #[test]
+    fn result_for_another_run_does_not_claim_a_pending_spawn() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "Pending review",
+            "spawn-call",
+            Some("reviewer"),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+        let mut other = server_run_node("other-run", SessionRunLifecycleStatus::Running, 1);
+        other.agent_id = Some("reviewer".into());
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![other],
+            false,
+        ));
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Review",
+            "get-call",
+            Some("reviewer"),
+        )));
+        let payload =
+            astra_turn_core::orchestration::agent_result_wire::render_wait_timeout_outcome(
+                "reviewer",
+                Some(&AgentStatus::Running {
+                    activity: "working".into(),
+                }),
+                std::time::Duration::from_millis(1),
+                Some("other-run"),
+            );
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Review",
+            "completed",
+            1,
+            Some(&payload),
+            "get-call",
+            Some("reviewer"),
+        )));
+        let spawn = widget.agent_runs.key_for_tool_use("spawn-call").unwrap();
+        assert_eq!(widget.agent_runs.get(spawn).unwrap().run_id, None);
+        let result = widget.agent_runs.key_for_tool_use("get-call").unwrap();
+        assert_eq!(
+            widget.agent_runs.get(result).unwrap().run_id.as_deref(),
+            Some("other-run")
+        );
+
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "Pending review",
+            "completed",
+            1,
+            Some(&spawn_receipt_wire("reviewer", "spawn-run")),
+            "spawn-call",
+            Some("reviewer"),
+        )));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.run_id.as_deref() == Some("spawn-run"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.run_id.as_deref() == Some("other-run"))
+        );
+    }
+
+    #[test]
+    fn correlated_live_start_merges_a_prior_snapshot_without_waiting_for_receipt() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "Review",
+            "spawn-call",
+            None,
+        )));
+        let mut child = server_run_node("child-run", SessionRunLifecycleStatus::Running, 1);
+        child.agent_id = Some("child-agent".into());
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![child],
+            false,
+        ));
+        let target = crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+            run_id: "child-run".into(),
+        };
+        let action = astra_thin_client::SessionRunAction::Cancel;
+        let request_id = widget
+            .begin_agent_control("child-run", &target, action)
+            .unwrap();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "child-run".into(),
+            agent_id: "child-agent".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                parent_run_id: Some("root-run".into()),
+                depth: 1,
+                spawn_tool_call_id: Some("spawn-call".into()),
+                transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
+            }),
+        })));
+        assert_eq!(widget.agent_monitor_snapshot(5).len(), 1);
+        assert!(widget.agent_control_request_matches("child-run", &target, action, request_id));
+        assert!(!widget.reject_agent_control("child-run", &target, action, uuid::Uuid::new_v4()));
+        assert!(widget.reject_agent_control("child-run", &target, action, request_id));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "child-run".into(),
+            agent_id: "child-agent".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                duration_ms: 1,
+                reason: None,
+            },
+        })));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn local_and_restored_snapshots_keep_one_row_per_run_even_for_reused_agent_ids() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        let mut first = local_agent_info(
+            "reviewer",
+            AgentStatus::Running {
+                activity: "first".into(),
+            },
+        );
+        first.run_id = "run-first".into();
+        first.spawn_tool_call_id = Some("first-call".into());
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "First",
+            "first-call",
+            None,
+        )));
+        let mut server = server_run_node("run-first", SessionRunLifecycleStatus::Running, 1);
+        server.agent_id = Some("reviewer".into());
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server],
+            false,
+        ));
+        let mut second = local_agent_info(
+            "reviewer",
+            AgentStatus::Running {
+                activity: "second".into(),
+            },
+        );
+        second.run_id = "run-second".into();
+        second.parent_run_id = "run-first".into();
+        let mut restored = restored_local_agent("reviewer", "running");
+        restored.run_id = "run-first".into();
+        let snapshot = local_agent_snapshot(vec![first, second]);
+        widget.reconcile_local_agent_snapshot(&snapshot, &[restored]);
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| row.run_id.as_deref())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["run-first", "run-second"])
+        );
+        let mut local_only = fresh();
+        local_only.reconcile_local_agent_snapshot(&snapshot, &[]);
+        let rows = local_only.agent_monitor_snapshot(5);
+        let first = rows
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("run-first"))
+            .unwrap();
+        let second = rows
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("run-second"))
+            .unwrap();
+        assert_eq!((first.depth, first.activity.child_agents), (1, 1));
+        assert_eq!((second.depth, second.activity.child_agents), (2, 0));
+
+        let mut finished = snapshot.clone();
+        finished.agents[0].status = AgentStatus::Completed {
+            result: "first result".into(),
+            finish_reason: None,
+        };
+        local_only.reconcile_local_agent_snapshot(&finished, &[]);
+        let rows = local_only.agent_monitor_snapshot(5);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.run_id.as_deref() == Some("run-first"))
+                .unwrap()
+                .state
+                .status,
+            AgentRunStatus::Completed
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.run_id.as_deref() == Some("run-second"))
+                .unwrap()
+                .state
+                .status,
+            AgentRunStatus::Running
+        );
+    }
+
+    #[test]
     fn durable_agent_membership_does_not_infer_from_parentage() {
         use astra_thin_client::SessionRunLifecycleStatus;
 
@@ -11026,6 +11699,7 @@ mod tests {
                 finish_reason: Some("normal".into()),
             },
         );
+        agent.run_id = "test-run".into();
         agent.metrics.tool_calls = 4;
         agent.metrics.permission_requests = 3;
         agent.metrics.permission_requests_approved = 2;

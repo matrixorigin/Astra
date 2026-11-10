@@ -734,6 +734,22 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-10-v124` adds a guidance event watermark to the
+existing Run row. User-intent commits update it in the same transaction as the
+event; existing batched control reads carry it without another query. Deploy
+all writers against a fresh schema together; the previous schema and mixed
+old/new writers are not supported.
+
+Fresh schema contract `2026-11-09-v123` stores Edge dispatch requests as
+lossless text, preserving the serialized payload used for admission and relay
+delivery. Existing databases must make an explicit data and deployment decision;
+the fresh-schema contract does not migrate them automatically.
+
+Fresh schema contract `2026-11-08-v122` replaces the Edge dispatch index with
+a status-leading index that can observe pending work without reading retained
+completed history. It follows the fresh-database contract below; it does not
+automatically migrate the previous index shape.
+
 Fresh schema contract `2026-11-05-v121` adds the declared Responses reasoning
 history policy to the existing personal model row. It rejects earlier databases under the existing
 fresh-database contract; no implicit migration runs. Operators must make an

@@ -338,9 +338,10 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set as
-the frozen format version 2, including `thinking_protocol` and `pricing`. A
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
 same frozen format; current thin-client and TypeScript SDK requests negotiate
 the current format `3` on every page.
@@ -348,14 +349,9 @@ Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
 
-Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
-The Server must not infer a version from identity or strip protocol metadata
-needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
-its embedded schema-v1 executor are outside the support baseline, as is
-standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
-The installed CLI can still report an unknown-field/invalid-JSON error before
-execution; a new Server error code cannot repair that old diagnostic. This
-policy does not claim to repair the original 0.2.10 conversation failure.
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
 
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
@@ -397,10 +393,8 @@ verify that the selected format can represent the required semantics.
 Authentication, execution requests, approvals, and Edge advertisements are not
 made permissive.
 
-Historical fixtures and binary identities do not move with the producer.
-Support changes must be reviewed separately and document affected features
-and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the fixed artifact inventory and required behavior.
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before
@@ -1040,6 +1034,91 @@ handoff checkpoints carry their complete checked continuation without loading a
 provider-attempt WAL. Run/Context commits and tool side-effect admission and
 deduplication keep their independent contracts.
 
+### DSML tool-call decoding
+
+The OpenAI-compatible response boundary uses the existing turn-core tool-call
+decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
+and streaming/final visible-text projection share one markup lexer. It recognizes
+`tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
+single-delimiter format and the observed doubled-delimiter spelling. Markdown
+code spans, quote/list-contained fences, and indented code remain literal data.
+HTML elements, comments, CDATA, declarations and processing instructions also
+own literal content. CommonMark determines block ownership at the start of a
+line, including block names recognized before the tag closes. A terminator ends
+its block after the closing line; other HTML blocks end at a blank line.
+Matching inline elements and quote/list exits release their literal context.
+Container prefixes and reserved tags use resumable cursors, with completed
+prefix bytes checkpointed across chunks. One exact incremental grammar owns
+both complete and partial tag recognition; suffixed DSML names such as
+`invoke-example` are ordinary text. A fence consumes only its opening containers;
+blank lines may omit list indentation without ending that fence.
+CommonMark also validates the fence opening line and info string. Block
+interruption and fence entry share the same checkpointed backtick lookahead:
+a later backtick in the info string can invalidate the candidate fence.
+Backticks in a tilde fence's info string do not affect ownership.
+Tabs retain physical columns and virtual padding. Indentation within established
+containers can be streamed once its meaning is settled. Indentation after a new
+marker remains provisional until the new block is known. Indented paragraph
+continuations retain inline delimiter state; actual code blocks remain literal.
+DSML, bare `invoke`/`parameter`, and legacy `tool_call` tags share one indexed
+scope stack. Parameter bodies are not independent tool-call sources. Every
+invocation owns its full subtree before name/argument validation, including
+malformed unnamed openers and nested wrappers from another syntax family;
+nested content cannot escape as another call. Only DSML invocations can be
+recovered independently inside a DSML calls wrapper.
+When an invocation body or a typed DSML parameter starts with a JSON object,
+array or string, matching delimiters, quotes and escapes determine where the
+value ends. Protocol spellings inside JSON strings remain argument data even
+when they match an enclosing close tag. An invocation still requires an
+argument object; a typed parameter is decoded as a JSON value.
+Invocation and parameter attributes come only from their own lexical opening
+tags; descendants and quoted values of other attributes cannot supply a name.
+Both invocation families use the shared bounded argument decoder, retaining
+invalid named bodies for existing pre-execution feedback.
+Complete-input scans use a cursor and compact once per batch; long indentation,
+delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
+accumulated prefix on each delta. Candidate decoding walks the ordered tokens
+instead of rescanning earlier families' owned ranges for each candidate.
+DSML projection precedes legacy bare-XML cleanup, and carries literal ranges
+through that cleanup so argument markup cannot consume answer text and examples
+remain unchanged. Escaped tag openers and their
+matching markup are literal scopes within their CommonMark block, never
+executable invocations. An unmatched escaped opener cannot absorb a real call in
+a later block. Per-kind scope
+indexes make unmatched closers constant-time and matching pops amortized linear.
+Physical line-prefix state follows every byte consumed, including newlines inside
+tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
+deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
+remain unchanged. A new empty item can take its first block on the next line;
+a blank separator before that block ends the empty item. The block probe
+retains the first unmatched container's shape so CommonMark can distinguish a
+sibling item from a setext underline without reparsing the deeper nesting for
+each lazy continuation. After a possible
+inline code opener, the stream publishes prose before potential markup and
+releases the prefix when there is no competing delimiter to reconsider.
+Matching runs make any remaining tail literal; at a block boundary or EOF the
+lexer replays an unmatched tail once with indexed delimiter runs, including
+when indentation consumes the last bytes of the response. This allows
+real calls outside matched spans to be recovered. The existing CommonMark parser
+determines paragraph continuation, heading boundaries and new container facts.
+When it rejects a provisional container, that marker is scanned as content,
+so a marker-only paragraph line cannot be mistaken for a blank line.
+Structural prefixes are classified through their
+first inline payload character: ordinary list, heading and punctuation-led
+prose streams before newline or EOF. Ambiguous marker-only prefixes remain
+pending until their structure can be determined. This does not change tool
+dispatch or admission.
+
+Native structured calls take precedence. Recovered calls remain subject to the
+exact request tool surface and the ordinary argument, capability, policy and
+approval boundaries; decoding grants no execution authority. String parameters
+retain their bytes and `string="false"` values require valid JSON. Incomplete or
+undecodable named invocations retain invalid argument evidence for the existing
+pre-execution rejection/model-feedback path, rather than becoming empty calls.
+Orphan protocol closers are removed from visible text without inventing a tool
+call or triggering a model retry. The normalized completion feeds the existing
+canonical history and transcript paths; raw provider diagnostics are unchanged.
+
 ### Provider timeout ownership
 
 Ordinary agent streaming calls use rolling transport-idle and semantic-progress
@@ -1123,6 +1202,27 @@ enum InferenceStreamEvent {
 ```
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
+
+The OpenAI-compatible usage normalizer also accepts the documented
+[OpenCode usage extension](https://dev.opencode.ai/v2/docs/console/api/inference#cost).
+`opencode.tokens.input`, `cache_read`, and `output` are disjoint fresh input,
+cached input, and output evidence. Output already includes reasoning. The checked
+sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
+both counts are reported; a missing lifetime is unknown, not zero. Mirrored
+generic and OpenCode fields must agree, and a complete input partition must
+match an inclusive prompt total. A reported write lifetime contributes to the
+input lower bound even when the full write count is unknown. If that bound
+exceeds the inclusive prompt total in one raw sample, later stream updates
+cannot qualify that attempt's input usage. The generic fields retain their
+existing inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible
+responses reconcile the extension through the same OpenAI usage normalizer.
+Aliases are decoded independently: null fields carry no evidence, and reported
+`input_tokens`/`output_tokens` remain subject to reconciliation even when
+`prompt_tokens`/`completion_tokens` are also present.
+The existing streaming collector retains
+partial cumulative samples and rejects invalid or contradictory raw evidence.
+This extends usage normalization, not the model invocation protocol or billing
+authority; it does not introduce another run lifecycle.
 
 OpenAI-compatible response decoding accepts string `reasoning_content` and
 `reasoning` fields in both streamed deltas and non-streaming assistant messages.

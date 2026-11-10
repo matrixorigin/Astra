@@ -939,6 +939,10 @@ pub struct ToolCallRecord {
     /// Runtime-authored presentation guidance, never appended to result_full.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_advisories: Vec<String>,
+    /// Source-authored cause and recovery facts, retained when result bodies
+    /// are compacted. This is diagnostic evidence, never retry authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_evidence: Option<astra_core::ToolFailureEvidence>,
     /// Full guidance authority when runtime_advisories carries its bounded preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_advisory_artifact: Option<ToolResultArtifactDescriptor>,
@@ -1266,6 +1270,15 @@ impl ToolCallRecord {
 
     pub fn was_executed(&self) -> bool {
         self.effective_disposition() == ToolCallDisposition::Executed
+    }
+
+    /// Explicit outcome uncertainty outranks process exit/result facts. It
+    /// remains evidence, not permission to retry or a separate run lifecycle.
+    pub fn outcome_is_unknown(&self) -> bool {
+        self.error_kind == Some(astra_core::ErrorKind::ToolOutcomeUnknown)
+            || self.recovery_evidence.as_ref().is_some_and(|evidence| {
+                evidence.cause == astra_core::ToolFailureCause::OutcomeUnknown
+            })
     }
 
     /// A result can fail delivery after the underlying operation succeeded.

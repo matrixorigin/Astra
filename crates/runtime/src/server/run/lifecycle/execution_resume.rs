@@ -3,6 +3,8 @@
 use super::*;
 use astra_services::SessionContextCoordinator;
 
+const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
+
 fn invalid_resume(detail: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     invalid_resume_with_message(
         detail,
@@ -179,22 +181,71 @@ impl AgenticRunLifecycleService {
         let admission = admitted_run
             .original_admission_data()
             .map_err(|_| invalid_resume("invalid original admission"))?;
-        let selection: ModelSelection = admission_field(admission, "model_selection")?;
-        let resolved: ResolvedModelSelection =
+        let original_selection: ModelSelection = admission_field(admission, "model_selection")?;
+        let original_resolved: ResolvedModelSelection =
             admission_field(admission, "resolved_model_selection")?;
+        // The immutable opening describes the first model, while these two
+        // existing run facts describe the current model. A recovery must not
+        // silently revert a user choice or an Auto decision.
+        let effective_model = self
+            .run_engine
+            .inherited_run_model(&durable.user_id, &durable.session_id, &durable.run_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("load effective model", error))?;
+        let (applied, routing) = match effective_model {
+            astra_services::runs::InheritedRunModel::Explicit(choice) => (Some(choice), None),
+            astra_services::runs::InheritedRunModel::Auto(decision) => (None, Some(decision)),
+            astra_services::runs::InheritedRunModel::Original => (None, None),
+        };
+        let offering_id = applied
+            .as_ref()
+            .map(|choice| &choice.resolved.offering_id)
+            .or_else(|| {
+                routing
+                    .as_ref()
+                    .map(|decision| &decision.selected_offering_id)
+            })
+            .unwrap_or(&original_selection.offering_id);
         let execution = self
             .model_service
-            .admit_model_offering(admitted_run.user_id.clone(), selection.offering_id.clone())
+            .admit_model_offering(admitted_run.user_id.clone(), offering_id.clone())
             .await?;
-        if admitted_run.model_offering_id.as_deref() != Some(selection.offering_id.as_str())
+        astra_services::models::validate_model_execution_purpose(
+            &execution,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        )?;
+        if admitted_run.model_offering_id.as_deref() != Some(execution.offering_id.as_str())
             || admitted_run.resolved_model_name.as_deref() != Some(execution.model_name.as_str())
-            || resolved.offering_id != execution.offering_id
-            || resolved.model_name != execution.model_name
-            || resolved.source_identity != execution.source_identity
         {
-            return Err(invalid_resume(
-                "the original model identity is no longer available",
-            ));
+            return Err(invalid_resume("the effective model identity changed"));
+        }
+        if let Some(choice) = &applied {
+            if choice.selection.model.offering_id != execution.offering_id
+                || choice.resolved.model_name != execution.model_name
+                || choice.resolved.source_identity != execution.source_identity
+            {
+                return Err(invalid_resume("the selected model identity changed"));
+            }
+            let thinking =
+                astra_turn_core::thinking_config::ThinkingConfig::from(&choice.reasoning);
+            crate::server::model_execution_admission::validate_reasoning_control(
+                &execution, &thinking,
+            )
+            .map_err(invalid_resume)?;
+        } else if let Some(decision) = &routing {
+            if decision.selected_model != execution.model_name
+                || decision.selected_contract_root
+                    != crate::server::model_execution_admission::model_execution_contract_root(
+                        &execution,
+                    )
+            {
+                return Err(invalid_resume("the Auto model contract changed"));
+            }
+        } else if original_resolved.offering_id != execution.offering_id
+            || original_resolved.model_name != execution.model_name
+            || original_resolved.source_identity != execution.source_identity
+        {
+            return Err(invalid_resume("the original model identity changed"));
         }
         let bytes = checkpoint.checkpoint_json.len() as u64;
         let work = astra_services::AdmissionWork {
@@ -323,6 +374,7 @@ impl AgenticRunLifecycleService {
                 &canonical,
                 principal,
                 execution,
+                applied.as_ref(),
                 &cancel,
                 &pause,
                 &token,
@@ -377,6 +429,7 @@ impl AgenticRunLifecycleService {
         canonical: &CanonicalTurnAdmission,
         principal: astra_services::auth::AuthPrincipal,
         execution: astra_services::models::AdmittedModelExecution,
+        applied: Option<&astra_services::runs::RunModelApplied>,
         cancel: &Arc<AtomicBool>,
         pause: &Arc<AtomicBool>,
         token: &Arc<CancellationToken>,
@@ -387,7 +440,9 @@ impl AgenticRunLifecycleService {
         let admission = run
             .original_admission_data()
             .map_err(|_| invalid_resume("invalid original admission"))?;
-        let selection: ModelSelection = admission_field(admission, "model_selection")?;
+        let selection = ModelSelection {
+            offering_id: execution.offering_id.clone(),
+        };
         let catalog = Some(
             astra_services::models::AuthorizedModelCatalogReader::with_cache(
                 self.model_service.clone(),
@@ -403,8 +458,13 @@ impl AgenticRunLifecycleService {
             crate::server::run::engine::durable_run_effective_interaction_mode(run)
                 .map_err(invalid_resume)?;
         let interactive: bool = admission_field(admission, "interactive_client")?;
-        let controls = crate::server::run::engine::durable_run_generation_controls(run)
+        let mut controls = crate::server::run::engine::durable_run_generation_controls(run)
             .map_err(invalid_resume)?;
+        if let Some(choice) = applied {
+            controls.thinking = (&choice.reasoning).into();
+            controls.preserve_thinking =
+                controls.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+        }
         let handoff = server_loop_host::RuntimeExecutionHandoff::from_adopted(proof)
             .map_err(|error| invalid_resume(error.message))?;
         let constraints = RequestConstraints::from_durable_run(
@@ -551,6 +611,18 @@ impl AgenticRunLifecycleService {
             false,
             None,
         );
+        if let Some(policy) = admission.get("model_routing_policy") {
+            let policy = serde_json::from_value(policy.clone())
+                .map_err(|_| invalid_resume("invalid original model routing policy"))?;
+            // If no decision was saved, recovery conservatively retains the
+            // strong model instead of guessing the original input features.
+            host.configure_model_routing(
+                policy,
+                self.model_service.clone(),
+                self.run_engine.clone(),
+                false,
+            );
+        }
         host.restore_handoff_contracts(&handoff);
         let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
             Arc::new(DurableHostInteractionSink {
@@ -598,10 +670,22 @@ impl AgenticRunLifecycleService {
                 &cursor.canonical_root_hash,
                 cursor.compaction_generation,
             );
+        } else if canonical.prior_messages.is_empty() {
+            state.initialize_canonical_rewrite_proof(
+                &canonical.prior_messages,
+                &astra_turn_types::canonical_conversation_root(&canonical.prior_messages),
+                0,
+            );
         }
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
+        if proof.prior_unresolved_tool_calls() {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                PREVIOUS_TOOL_ADVISORY.to_owned(),
+            );
+        }
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
@@ -759,6 +843,7 @@ impl AgenticRunLifecycleService {
             state.session_turn,
             token.clone(),
             interactive,
+            interaction_mode,
             None,
         )
         .await;

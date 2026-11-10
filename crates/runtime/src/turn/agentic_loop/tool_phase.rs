@@ -261,7 +261,8 @@ fn provider_tool_call_facts(tool_calls: &[Value]) -> (u32, Vec<String>) {
 
 /// A failed or deferred call in the same provider batch must be visible before
 /// an optional wait or automatic completion. Reused and suppressed calls can
-/// still represent successful observations; their `ok` status is authoritative.
+/// still represent successful observations. A delivered command result can
+/// also report a failed or inconclusive execution independently of delivery.
 fn settled_round_has_failed_call(settled_tool_calls: &[ToolCallRecord]) -> bool {
     settled_tool_calls.iter().any(|record| {
         matches!(
@@ -269,6 +270,10 @@ fn settled_round_has_failed_call(settled_tool_calls: &[ToolCallRecord]) -> bool 
             astra_services::session_journal::ToolCallDisposition::Rejected
                 | astra_services::session_journal::ToolCallDisposition::Deferred
         ) || !record.ok
+            || matches!(
+                record.result_class.as_deref(),
+                Some("test_failure" | "env_failure" | "execution_error" | "inconclusive")
+            )
     })
 }
 
@@ -1980,6 +1985,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 );
             }
         }
+        host.attest_model_messages(state, transcript_append_start);
         state.record_appended_prompt_history_from(transcript_append_start);
         // Freeze schema-addressed selection evidence before post-tool policy or
         // any compaction/checkpoint can rewrite the just-appended pair.  The
@@ -2271,22 +2277,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         );
         }
 
-        // A required mutation is admitted before execution, but its dependent
-        // observation can only be projected after the journal contains the actual
-        // tool outcome. Keep this bounded chain on the same shared runtime path for
-        // server, edge, and local tool rounds.
-        // Admission rejection can precede the later budget-settlement boundary
-        // that grants repair authority. The recovery transition is Work-attempt
-        // scoped; ordinary completion-window reconciliation below intentionally
-        // continues to consume only executor-produced outcomes.
-        super::execution_phase::advance_rejected_work_settlement_recovery(
-            state,
-            round_records_start,
-        );
-        super::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
-            state,
-            evo_records_before,
-        );
+        super::execution_phase::advance_completion_action_window_after_tool_round(state);
 
         // Rejection is scoped to the requested operation. Its retryability
         // does not decide whether a different permitted action can run.
@@ -2324,36 +2315,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 .completion_settlement
                 .deferred_success_completion = None;
         }
-        let unchanged_work_ids = state
-            .stall
-            .work_unit_observations
-            .repeatedly_unchanged_ids(2);
-        if !settled_round_has_failure && !unchanged_work_ids.is_empty() {
-            let work_ids = unchanged_work_ids.join(", ");
-            let caller_owned_ids = state
-                .stall
-                .work_unit_observations
-                .repeatedly_unchanged_without_wake(2);
-            state.final_text_model_item_id = None;
-            state.final_text = if caller_owned_ids.is_empty() {
-                format!(
-                    "Work {work_ids} has not materially changed. No further live-status reads will run in this turn; the runtime owns its next meaningful update."
-                )
-            } else {
-                format!(
-                    "Work {work_ids} has not materially changed. No further live-status reads will run in this turn. No automatic update is promised for {}; inspect it or request a fresh observation later.",
-                    caller_owned_ids.join(", ")
-                )
-            };
-            tracing::info!(
-                target: "astra::loop_guard",
-                work_ids,
-                "closing repeated unchanged work-unit observations with a runtime acknowledgement"
-            );
-            state.step_recorder.end_turn(false);
-            return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
-        }
-
         if super::execution_phase::reject_unsettled_execution_completion(state) {
             state.step_recorder.end_turn(false);
             try_write_heavy_checkpoint(state);
@@ -4225,6 +4186,30 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(settled_round_has_failed_call(&[record]), needs_followup);
+        }
+    }
+
+    #[test]
+    fn delivered_command_failure_requires_followup_but_domain_answers_do_not() {
+        for (class, needs_followup) in [
+            ("test_failure", true),
+            ("inconclusive", true),
+            ("env_failure", true),
+            ("execution_error", true),
+            ("success", false),
+            ("domain_negative", false),
+            ("empty_result", false),
+        ] {
+            let record = ToolCallRecord {
+                ok: true,
+                result_class: Some(class.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                settled_round_has_failed_call(&[record]),
+                needs_followup,
+                "{class}"
+            );
         }
     }
 

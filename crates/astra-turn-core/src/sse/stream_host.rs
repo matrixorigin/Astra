@@ -567,6 +567,12 @@ pub trait SseStreamHost: Send {
         false
     }
 
+    /// A local stream observer can fail independently of tool callbacks.
+    /// The caller checks this only after already-owned work has settled.
+    fn stream_observer_error(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
     async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult;
@@ -629,7 +635,11 @@ pub trait SseStreamHost: Send {
     ) -> Vec<EdgeToolExecResult> {
         let mut results = Vec::with_capacity(requests.len());
         for req in requests {
-            let r = self.execute_tool(&req).await;
+            let r = if self.should_abort_edge_work() {
+                req.rejected_result(&req.args, "Execution stopped before tool dispatch".into())
+            } else {
+                self.execute_tool(&req).await
+            };
             results.push(r);
         }
         results
@@ -750,6 +760,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     Err(_) => {
                         elapsed += wait;
                         host.on_idle_tick();
+                        if let Some(error) = host.stream_observer_error() {
+                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort_message = Some(error.to_string());
+                            break 'wait None;
+                        }
                     }
                 }
             }
@@ -840,6 +855,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }) {
                 break;
             }
+            if host.stream_observer_error().is_some() && stop_at_terminal.is_none() {
+                // Finish any work already in this accepted event before
+                // reporting observer failure at the normal flush boundary.
+                break;
+            }
             if accum.stream_complete {
                 terminal_marker_seen = true;
                 break;
@@ -856,7 +876,10 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // requests that are already classified as concurrency-safe, and only
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
-        while !terminal_marker_seen && pending_is_coalescible_tool_batch(&pending) {
+        while !terminal_marker_seen
+            && host.stream_observer_error().is_none()
+            && pending_is_coalescible_tool_batch(&pending)
+        {
             if cancel_token.is_some_and(|token| token.is_cancelled()) {
                 abort = Some(astra_core::ErrorKind::Cancelled);
                 break;
@@ -1017,12 +1040,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         }) {
                             break;
                         }
+                        if host.stream_observer_error().is_some() && stop_at_terminal.is_none() {
+                            break;
+                        }
                         if accum.stream_complete {
                             terminal_marker_seen = true;
                             break;
                         }
                     }
-                    if terminal_marker_seen || (saw_event && !all_events_extended_batch) {
+                    if terminal_marker_seen
+                        || host.stream_observer_error().is_some()
+                        || (saw_event && !all_events_extended_batch)
+                    {
                         break;
                     }
                 }
@@ -1254,6 +1283,12 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 }
             }
         }
+        if abort.is_none()
+            && let Some(error) = host.stream_observer_error()
+        {
+            abort = Some(astra_core::ErrorKind::StreamTransport);
+            abort_message = Some(error.to_string());
+        }
         if abort.is_some() {
             break;
         }
@@ -1433,6 +1468,16 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     &mut approval_results,
                 )
                 .await;
+                if let Some(error) = host.stream_observer_error() {
+                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                    accum.stream_complete = false;
+                    accum.error_kind = abort;
+                    accum.full_text.clear();
+                    accum.reasoning_content.clear();
+                    accum.tool_calls.clear();
+                    pending.clear();
+                    accum.error_message = Some(error.to_string());
+                }
             }
             Err(error) => {
                 abort = Some(astra_core::ErrorKind::StreamTransport);
@@ -1839,7 +1884,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         }
     }
 
-    if host.should_abort_edge_work() {
+    if host.should_abort_edge_work() && host.stream_observer_error().is_none() {
         return;
     }
 
@@ -1966,6 +2011,10 @@ struct RecordingSseStreamHost {
     rejected_sse_event_type: Option<&'static str>,
     done_count: usize,
     stream_completed: bool,
+    fail_observer_on_tick: bool,
+    fail_observer_on_render: bool,
+    fail_observer_on_tool: bool,
+    observer_failed: bool,
 }
 
 #[cfg(test)]
@@ -1991,6 +2040,10 @@ impl RecordingSseStreamHost {
             rejected_sse_event_type: None,
             done_count: 0,
             stream_completed: false,
+            fail_observer_on_tick: false,
+            fail_observer_on_render: false,
+            fail_observer_on_tool: false,
+            observer_failed: false,
         }
     }
 
@@ -2028,7 +2081,15 @@ impl SseStreamHost for RecordingSseStreamHost {
     }
 
     fn should_abort_edge_work(&self) -> bool {
-        self.edge_work_aborted
+        self.edge_work_aborted || self.observer_failed
+    }
+
+    fn stream_observer_error(&self) -> Option<&'static str> {
+        self.observer_failed.then_some("stream_observer_closed")
+    }
+
+    fn on_idle_tick(&mut self) {
+        self.observer_failed |= self.fail_observer_on_tick;
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
@@ -2051,6 +2112,7 @@ impl SseStreamHost for RecordingSseStreamHost {
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+        self.observer_failed |= self.fail_observer_on_render;
         self.render_effects.extend(effects);
     }
 
@@ -2081,6 +2143,7 @@ impl SseStreamHost for RecordingSseStreamHost {
         if let Some(delay) = self.tool_delay {
             tokio::time::sleep(delay).await;
         }
+        self.observer_failed |= self.fail_observer_on_tool;
         let output = self
             .tool_outputs
             .get(tool)
@@ -2205,6 +2268,65 @@ mod tests {
         assert_eq!(result.accum.full_text, "hello world");
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_observer_detaches_while_server_stream_is_idle() {
+        let bytes = sse_event("text_delta", ",\"content\":\"partial\"").into_bytes();
+        let mut stream = stream::iter(vec![Ok(bytes)]).chain(stream::pending());
+        let mut host = RecordingSseStreamHost::new();
+        host.fail_observer_on_tick = true;
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_secs(60)).await;
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert_eq!(
+            result.accum.error_message.as_deref(),
+            Some("stream_observer_closed")
+        );
+        assert!(result.accum.full_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_observer_settles_accepted_tool_before_detaching() {
+        let event = sse_event(
+            "tool_request",
+            ",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}",
+        );
+        let mut stream = stream::iter(chunks_from_sse(&event));
+        let mut host = RecordingSseStreamHost::new();
+        host.fail_observer_on_render = true;
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_secs(5)).await;
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert_eq!(
+            result.accum.error_message.as_deref(),
+            Some("stream_observer_closed")
+        );
+        assert_eq!(result.tool_results.len(), 1);
+        assert_ne!(result.tool_results[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn observer_failure_after_tail_tool_settles_and_clears_partial_output() {
+        let text = sse_event("text_delta", ",\"content\":\"partial\"");
+        let tool = sse_event(
+            "tool_request",
+            ",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}",
+        );
+        let bytes = format!("{}{}", text, tool.trim_end()).into_bytes();
+        let mut stream = stream::iter(vec![Ok(bytes)]);
+        let mut host = RecordingSseStreamHost::new();
+        host.fail_observer_on_tool = true;
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_secs(5)).await;
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert_eq!(
+            result.accum.error_message.as_deref(),
+            Some("stream_observer_closed")
+        );
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].status, "completed");
+        assert!(result.accum.full_text.is_empty());
     }
 
     #[tokio::test]

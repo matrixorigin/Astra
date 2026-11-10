@@ -4,8 +4,8 @@ use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMeta
 /// Feed a fixture input through the same active dispatcher used by production.
 #[allow(clippy::too_many_arguments)]
 async fn submit_stage_input(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
@@ -123,7 +123,7 @@ for line in sys.stdin: pass
         turn: Some("turn".into()),
         ..Evidence::default()
     };
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut input_rx = None;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let result = submit_stage_input(
@@ -234,6 +234,34 @@ for line in sys.stdin: pass
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn late_steer_ack_uses_original_correlation_after_deadline() {
+    let input = ProviderStageInput::Text {
+        input_id: "late-ack".into(),
+        content: "extra guidance".into(),
+        correlation_id: None,
+        expected_turn_id: Some("turn".into()),
+    };
+    let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+    let mut pending = PendingStageInputAck {
+        request_id: json!(7),
+        input,
+        sender: Some(ack_tx),
+    };
+    tokio::time::advance(astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT * 2).await;
+    assert!(pending.sender.is_some());
+    let mut evidence = Evidence {
+        turn: Some("turn".into()),
+        ..Evidence::default()
+    };
+    pending
+        .resolve(&json!({"id":7,"result":{"turnId":"turn"}}), &mut evidence)
+        .unwrap();
+    let ack = ack_rx.try_recv().expect("late ACK must retain its sender");
+    assert!(ack.accepted);
+    assert_eq!(ack.input_id, "late-ack");
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn uncertain_guidance_never_becomes_a_negative_receipt_or_replay() {
@@ -284,7 +312,7 @@ for line in sys.stdin:
             );
             let token = CancellationToken::new();
             let mut process = transport::process(&script, token.clone()).await;
-            let input = process.input();
+            let input = process.input().expect("framed process input");
             let mut evidence = Evidence {
                 thread: Some("thread".into()),
                 turn: Some("turn".into()),
@@ -456,7 +484,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -585,7 +613,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -628,7 +656,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -668,7 +696,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -703,7 +731,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -1852,7 +1880,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     timeout: Some(Duration::from_secs(15)),
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
@@ -1861,7 +1889,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 cancel.clone(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2005,7 +2033,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 )
             })
             .unwrap();
-        assert!(matches!(outcome.end, FramedProcessEnd::Exited));
+        assert!(matches!(outcome.end, ProcessEnd::Exited));
         assert!(outcome.status.unwrap().success());
         assert!(
             !outcome.stderr_capped,
@@ -2120,7 +2148,7 @@ for line in sys.stdin:
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 4096,
@@ -2129,7 +2157,7 @@ for line in sys.stdin:
                 cancel.child_token(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2319,7 +2347,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
     let mut process = owner
         .spawn_framed(
             command,
-            FramedProcessLimits {
+            ProcessIoLimits {
                 max_frame_bytes: FRAME_BYTES,
                 max_queued_frames: 1,
                 max_stderr_bytes: 4096,
@@ -2328,7 +2356,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
             cancel.child_token(),
         )
         .unwrap();
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let probes = async {
         initialize_protocol(&mut process, &input, &mut evidence, OUTPUT_BYTES, None, &cancel).await?;
@@ -3005,7 +3033,7 @@ mod transport {
         }
     }
 
-    pub(super) async fn process(script: &str, token: CancellationToken) -> FramedProcess {
+    pub(super) async fn process(script: &str, token: CancellationToken) -> OwnedProcess {
         let (command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
             std::env::current_exe().unwrap(),
             [
@@ -3021,7 +3049,7 @@ mod transport {
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 128,
@@ -3740,7 +3768,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut input_rx = None;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let ack = submit_stage_input(
@@ -4085,111 +4113,101 @@ for line in sys.stdin: pass
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn unknown_or_timed_out_ack_ignores_late_acceptance_and_disables_queued_input() {
-        for expired in [false, true] {
-            let script = format!(
-                r#"
+    async fn unknown_ack_ignores_late_acceptance_and_disables_queued_input() {
+        let script = r#"
 import json,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 steer=recv()
 assert steer['method']=='turn/steer'
-if {internal}:
-    emit({{'id':steer['id'],'error':{{'code':-32603,'message':'unknown adoption'}}}})
-emit({{'id':'native-question','method':'item/tool/requestUserInput','params':{{'threadId':'thread','turnId':'turn','itemId':'item','questions':[{{'id':'q','header':'Choice','question':'Proceed?'}}]}}}})
+emit({'id':steer['id'],'error':{'code':-32603,'message':'unknown adoption'}})
+emit({'id':'native-question','method':'item/tool/requestUserInput','params':{'threadId':'thread','turnId':'turn','itemId':'item','questions':[{'id':'q','header':'Choice','question':'Proceed?'}]}})
 answer=recv()
 assert answer['id']=='native-question', 'a second steer must not be sent'
-emit({{'id':steer['id'],'result':{{'turnId':'turn'}}}})
-emit({{'method':'turn/completed','params':{{'threadId':'thread','turn':{{'id':'turn','status':'completed'}}}}}})
+emit({'id':steer['id'],'result':{'turnId':'turn'}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
 for line in sys.stdin: assert json.loads(line).get('method') != 'turn/steer'
-"#,
-                internal = if expired { "False" } else { "True" }
-            );
-            let token = CancellationToken::new();
-            let mut process = process(&script, token.clone()).await;
-            let input = process.input();
-            let mut evidence = Evidence {
-                thread: Some("thread".into()),
-                turn: Some("turn".into()),
-                ..Evidence::default()
-            };
-            let entered = std::sync::Arc::new(tokio::sync::Notify::new());
-            let release = std::sync::Arc::new(tokio::sync::Notify::new());
-            let gate = BlockingAnswerGate {
-                entered: entered.clone(),
-                release: release.clone(),
-            };
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let text = |id: &str| ProviderStageInput::Text {
-                input_id: id.into(),
-                content: "guidance".into(),
-                correlation_id: None,
-                expected_turn_id: Some("turn".into()),
-            };
-            let mut pending = start_stage_input(
-                &input,
-                &mut evidence,
-                EdgeInvocationInput {
-                    input: text("first"),
-                    ack: ack_tx,
-                },
-            )
+"#.to_owned();
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let input = process.input().expect("framed process input");
+        let mut evidence = Evidence {
+            thread: Some("thread".into()),
+            turn: Some("turn".into()),
+            ..Evidence::default()
+        };
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = BlockingAnswerGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let text = |id: &str| ProviderStageInput::Text {
+            input_id: id.into(),
+            content: "guidance".into(),
+            correlation_id: None,
+            expected_turn_id: Some("turn".into()),
+        };
+        let pending = start_stage_input(
+            &input,
+            &mut evidence,
+            EdgeInvocationInput {
+                input: text("first"),
+                ack: ack_tx,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut driving = Box::pin(drive_active_turn(
+            &mut process,
+            &input,
+            &mut evidence,
+            Some(&gate),
+            &token,
+            OUTPUT_BYTES,
+            Some(rx),
+            Some(pending),
+        ));
+        tokio::select! {
+            _ = entered.notified() => {}
+            result = &mut driving => panic!("question must remain live: {result:?}"),
+        }
+        tokio::select! {
+            result = ack_rx => assert!(result.is_err()),
+            result = &mut driving => panic!("unknown adoption must preserve the live question: {result:?}"),
+        }
+        let (second_ack_tx, second_ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(EdgeInvocationInput {
+            input: text("second"),
+            ack: second_ack_tx,
+        })
+        .await
+        .unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), driving)
             .await
             .unwrap()
             .unwrap();
-            if expired {
-                pending.deadline = tokio::time::Instant::now();
-            }
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            let mut driving = Box::pin(drive_active_turn(
-                &mut process,
-                &input,
-                &mut evidence,
-                Some(&gate),
-                &token,
-                OUTPUT_BYTES,
-                Some(rx),
-                Some(pending),
-            ));
-            tokio::select! {
-                _ = entered.notified() => {}
-                result = &mut driving => panic!("question must remain live: {result:?}"),
-            }
-            tokio::select! {
-                result = ack_rx => assert!(result.is_err()),
-                result = &mut driving => panic!("unknown adoption must preserve the live question: {result:?}"),
-            }
-            let (second_ack_tx, second_ack_rx) = tokio::sync::oneshot::channel();
-            tx.send(EdgeInvocationInput {
-                input: text("second"),
-                ack: second_ack_tx,
-            })
-            .await
-            .unwrap();
-            release.notify_one();
-            tokio::time::timeout(Duration::from_secs(2), driving)
+        assert!(second_ack_rx.await.is_err());
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        // The fixture drains stdin after publishing its terminal frame.
+        // Release our input clone instead of relying on a task cutoff
+        // to kill an otherwise healthy protocol process.
+        drop(input);
+        assert!(
+            process
+                .wait()
                 .await
                 .unwrap()
-                .unwrap();
-            assert!(second_ack_rx.await.is_err());
-            assert_eq!(evidence.terminal.as_deref(), Some("completed"));
-            // The fixture drains stdin after publishing its terminal frame.
-            // Release our input clone instead of relying on a task cutoff
-            // to kill an otherwise healthy protocol process.
-            drop(input);
-            assert!(
-                process
-                    .wait()
-                    .await
-                    .unwrap()
-                    .settlement
-                    .unwrap()
-                    .ownership
-                    .is_authoritative()
-            );
-        }
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
     }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn conclusive_guidance_refusal_does_not_abort_the_native_task() {
@@ -4279,7 +4297,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let (input_tx, input_receiver) = tokio::sync::mpsc::channel(1);
         let (queued_ack_tx, mut queued_ack_rx) = tokio::sync::oneshot::channel();
         input_tx

@@ -58,6 +58,7 @@ pub(super) fn prepare(
     call: LlmCall<'_>,
     tool_choice: RuntimeToolChoice,
     started: Instant,
+    verified_origin: bool,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
     if call.cache_capability.is_some_and(|capability| {
         matches!(
@@ -146,11 +147,12 @@ pub(super) fn prepare(
         .iter()
         .rposition(astra_turn_types::is_human_user_message)
         .map_or(0, |index| index + 1);
-    astra_core::model_wire::responses::validate_active_continuations(
+    astra_core::model_wire::responses::validate_active_continuations_with_foreign(
         &call.messages[active_start..],
         model,
         scope,
         astra_turn_core::tool::args::shape::provider_tool_call_id,
+        |message| verified_origin && message[crate::turn::llm::model_origin::FOREIGN_GROUP] == true,
     )
     .map_err(|cause| {
         error(

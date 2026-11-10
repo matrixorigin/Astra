@@ -15,9 +15,8 @@
 //! # Invariants enforced here
 //!
 //! * `plans.user_id` NOT NULL — every plan is owned.
-//! * For each owner, at most one session has `active_plan_id = P` at any time —
-//!   enforced by [`PlanRepository::set_active_plan`] clearing that owner's other
-//!   sessions pointing at the same plan in one transaction.
+//! * For each owner, at most one session has `active_plan_id = P` at any time.
+//!   A plan held by another session cannot be silently taken over.
 //! * `plans.session_id` is a routing hint for plan authoring. Durable execution
 //!   and attempt evidence belong to Work and Run, not a parallel plan audit.
 
@@ -41,6 +40,12 @@ pub enum PlanLoadError {
     Corrupt(String),
     /// Optimistic-concurrency conflict.
     Conflict { expected: u64, actual: u64 },
+    /// Another operation changed the session's plan binding.
+    BindingConflict,
+    /// The plan is still active in a session.
+    PlanInUse(String),
+    /// The requested session is absent or being deleted.
+    SessionUnavailable,
     /// I/O or other unexpected error.
     Internal(String),
 }
@@ -54,6 +59,12 @@ impl std::fmt::Display for PlanLoadError {
             Self::Conflict { expected, actual } => {
                 write!(f, "version conflict: expected {expected}, stored {actual}")
             }
+            Self::BindingConflict => write!(f, "the session's plan binding changed concurrently"),
+            Self::PlanInUse(plan) => write!(
+                f,
+                "plan {plan} is active in a session; finish or release it there first"
+            ),
+            Self::SessionUnavailable => write!(f, "session is unavailable or being deleted"),
             Self::Internal(msg) => write!(f, "plan error: {msg}"),
         }
     }
@@ -103,15 +114,12 @@ pub trait PlanRepository: Send + Sync {
         filter: PlanListFilter<'_>,
     ) -> Result<Vec<SavedPlanInfo>, PlanLoadError>;
 
-    /// Delete a plan and clear its active session bindings.
+    /// Delete an inactive plan. Active authoring must be released first.
     async fn delete(&self, user_id: &str, plan_id: &str) -> Result<(), PlanLoadError>;
 
-    /// Mark `plan_id` as the active plan for an owned session, atomically
-    /// clearing any other session currently pointing at the same plan. Passing
-    /// `plan_id = None` clears the owned session's active plan.
-    ///
-    /// No-op (and returns Ok) if the session does not exist yet, so CLI can
-    /// invoke it before a session row is created.
+    /// Mark `plan_id` as the active plan for an owned session. A plan held by
+    /// another session is rejected; `None` releases this session's binding.
+    /// The session must exist and must not be deleting.
     async fn set_active_plan(
         &self,
         user_id: &str,
@@ -119,12 +127,31 @@ pub trait PlanRepository: Send + Sync {
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError>;
 
+    /// Finish only the exact submitted revision still bound to this session.
+    /// A concurrent edit/rebind returns false and must retain authoring.
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError>;
+
     /// Return the currently active `plan_id` for an owned session, if any.
     async fn active_plan_for_session(
         &self,
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, PlanLoadError>;
+
+    /// Resolve the current binding after a possibly unacknowledged transition.
+    async fn settled_active_plan_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, PlanLoadError> {
+        self.active_plan_for_session(user_id, session_id).await
+    }
 }
 
 /// Filter for [`PlanRepository::list_for_user`].
@@ -190,6 +217,23 @@ fn ensure_state_owner(user_id: &str, state: &PlanModeState) -> Result<(), PlanLo
 
 #[async_trait]
 impl PlanRepository for CloudPlanRepository {
+    async fn settled_active_plan_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, PlanLoadError> {
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let mut tx = connection.begin().await.map_err(map_sqlx)?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+        ).bind(user_id).bind(session_id).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        connection.release();
+        Ok(row.and_then(|(active,)| active))
+    }
+
     async fn save(
         &self,
         user_id: &str,
@@ -220,18 +264,23 @@ impl PlanRepository for CloudPlanRepository {
 
         // First, read the current row (without FOR UPDATE — we rely on the
         // conditional UPDATE below for the real guard).
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
         let current: Option<(i64,)> =
             sqlx::query_as("SELECT version FROM plans WHERE user_id = ? AND plan_id = ?")
                 .bind(user_id)
                 .bind(plan_id)
-                .fetch_optional(&self.pool)
+                .fetch_all(connection.connection_mut())
                 .await
-                .map_err(map_sqlx)?;
+                .map_err(map_sqlx)?
+                .pop();
 
         match (current, expected_version) {
             // Caller thinks row exists but doesn't → reject, even if expected=0
             // is passed (we reserve `None` for "first write only").
             (None, Some(expected)) if expected != 0 => {
+                connection.release();
                 return Err(PlanLoadError::conflict(expected, 0));
             }
             // A None expected_version means "I am creating this row". If a row
@@ -240,6 +289,7 @@ impl PlanRepository for CloudPlanRepository {
             // The supported re-link path is: load() → save(version). Reject
             // any save(..., None) that lands on an existing plan_id.
             (Some((stored,)), None) => {
+                connection.release();
                 return Err(PlanLoadError::conflict(0, stored as u64));
             }
             // New row: try INSERT; if another writer inserted the same id
@@ -257,6 +307,7 @@ impl PlanRepository for CloudPlanRepository {
                      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                     [state.session_hint.is_some(), state.plan_md.is_some()],
                 );
+                let mut tx = connection.begin().await.map_err(map_sqlx)?;
                 let res = sqlx::query(insert_sql)
                     .bind(plan_id)
                     .bind(user_id)
@@ -268,16 +319,33 @@ impl PlanRepository for CloudPlanRepository {
                     .bind(progress)
                     .bind(subtask_count)
                     .bind(user_id)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await;
                 match res {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        if let Some(session) = state.session_hint.as_deref() {
+                            // Session deletion marks its row first. Lock the
+                            // newly inserted plan before checking that fence,
+                            // matching the normal plan-before-session order.
+                            let status: Option<(String,)> = sqlx::query_as(
+                                "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+                            ).bind(user_id).bind(session).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+                            if !matches!(status, Some((ref status,)) if status != "deleting") {
+                                return Err(PlanLoadError::SessionUnavailable);
+                            }
+                        }
+                        tx.commit().await.map_err(map_sqlx)?;
+                        connection.release();
+                        Ok(())
+                    }
                     Err(sqlx::Error::Database(db_err))
                         if db_err
                             .code()
                             .map(|c| c == "23000" || c.starts_with("1062"))
                             .unwrap_or(false) =>
                     {
+                        tx.rollback().await.map_err(map_sqlx)?;
+                        connection.release();
                         Err(PlanLoadError::conflict(expected_version.unwrap_or(0), 1))
                     }
                     Err(e) => Err(map_sqlx(e)),
@@ -293,6 +361,7 @@ impl PlanRepository for CloudPlanRepository {
                 if let Some(expected) = expected_version
                     && (stored as u64) != expected
                 {
+                    connection.release();
                     return Err(PlanLoadError::conflict(expected, stored as u64));
                 }
                 let next_version = (stored as u64) + 1;
@@ -322,7 +391,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(user_id)
                 .bind(plan_id)
                 .bind(stored)
-                .execute(&self.pool)
+                .execute(connection.connection_mut())
                 .await
                 .map_err(map_sqlx)?;
 
@@ -335,15 +404,18 @@ impl PlanRepository for CloudPlanRepository {
                     )
                     .bind(user_id)
                     .bind(plan_id)
-                    .fetch_optional(&self.pool)
+                    .fetch_all(connection.connection_mut())
                     .await
-                    .map_err(map_sqlx)?;
+                    .map_err(map_sqlx)?
+                    .pop();
                     let actual = latest.map(|(v,)| v as u64).unwrap_or(0);
+                    connection.release();
                     return Err(PlanLoadError::conflict(
                         expected_version.unwrap_or(stored as u64),
                         actual,
                     ));
                 }
+                connection.release();
                 Ok(())
             }
         }
@@ -351,15 +423,21 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn load(&self, user_id: &str, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
         validate_plan_id(plan_id)?;
-        let row = sqlx::query(
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        // This is a unique-key lookup. Drain its result terminator before
+        // returning the checkout to the shared pool.
+        let mut rows = sqlx::query(
             "SELECT plan_json, plan_md, session_id, version FROM plans WHERE user_id = ? AND plan_id = ?",
         )
         .bind(user_id)
         .bind(plan_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(connection.connection_mut())
         .await
         .map_err(map_sqlx)?;
-        let Some(row) = row else {
+        connection.release();
+        let Some(row) = rows.pop() else {
             return Err(PlanLoadError::NotFound(plan_id.to_string()));
         };
         let plan_json: String = row
@@ -422,7 +500,14 @@ impl PlanRepository for CloudPlanRepository {
         }
         q = q.bind(limit);
 
-        let rows = q.fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let rows = q
+            .fetch_all(connection.connection_mut())
+            .await
+            .map_err(map_sqlx)?;
+        connection.release();
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -447,33 +532,35 @@ impl PlanRepository for CloudPlanRepository {
     }
 
     async fn delete(&self, user_id: &str, plan_id: &str) -> Result<(), PlanLoadError> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-
-        let result = sqlx::query("DELETE FROM plans WHERE user_id = ? AND plan_id = ?")
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let mut tx = connection.begin().await.map_err(map_sqlx)?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM plans WHERE user_id = ? AND plan_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(plan_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if row.is_none() {
+            return Err(PlanLoadError::NotFound(plan_id.to_string()));
+        }
+        let holder: Option<(String,)> = sqlx::query_as(
+            "SELECT session_id FROM agent_sessions FORCE INDEX (idx_agent_sessions_active_plan_id) WHERE user_id = ? AND active_plan_id = ? LIMIT 1 FOR UPDATE",
+        ).bind(user_id).bind(plan_id).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+        if holder.is_some() {
+            return Err(PlanLoadError::PlanInUse(plan_id.to_string()));
+        }
+        sqlx::query("DELETE FROM plans WHERE user_id = ? AND plan_id = ?")
             .bind(user_id)
             .bind(plan_id)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await.map_err(map_sqlx)?;
-            return Err(PlanLoadError::NotFound(plan_id.to_string()));
-        }
-
-        // Any session still pointing at this plan must be cleared so we don't
-        // strand a dangling foreign reference.
-        sqlx::query(
-            "UPDATE agent_sessions SET active_plan_id = NULL \
-             WHERE user_id = ? AND active_plan_id = ?",
-        )
-        .bind(user_id)
-        .bind(plan_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
-
         tx.commit().await.map_err(map_sqlx)?;
+        connection.release();
         Ok(())
     }
 
@@ -483,77 +570,135 @@ impl PlanRepository for CloudPlanRepository {
         session_id: &str,
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-
         if let Some(pid) = plan_id {
             validate_plan_id(pid)?;
-            // Clear any OTHER session currently pointing at this plan.
-            sqlx::query(
-                "UPDATE agent_sessions SET active_plan_id = NULL \
-                 WHERE user_id = ? AND active_plan_id = ? AND session_id <> ?",
-            )
-            .bind(user_id)
-            .bind(pid)
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-
-            // Refresh the plans.session_id routing hint.
-            let updated = sqlx::query(
-                "UPDATE plans SET session_id = ?, updated_at = NOW(6) \
-                 WHERE user_id = ? AND plan_id = ?",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .bind(pid)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-            if updated.rows_affected() == 0 {
-                tx.rollback().await.map_err(map_sqlx)?;
-                return Err(PlanLoadError::NotFound(pid.to_string()));
+        }
+        // Discover first, then lock plans and sessions in key order. If the
+        // binding changed while acquiring locks, discard the discovery and
+        // retry without publishing any partial transition.
+        for _ in 0..3 {
+            let mut connection =
+                astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?;
+            let mut tx = connection.begin().await.map_err(map_sqlx)?;
+            let observed: Option<(Option<String>, String)> = sqlx::query_as(
+                "SELECT active_plan_id, status FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            ).bind(user_id).bind(session_id).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+            let Some((previous, status)) = observed else {
+                return Err(PlanLoadError::SessionUnavailable);
+            };
+            if status == "deleting" {
+                return Err(PlanLoadError::SessionUnavailable);
             }
-        } else {
-            // Clear the routing hint of the exact plan this session is
-            // leaving. `plans.session_id` is a denormalized discovery index;
-            // retaining it after approval makes a completed authoring plan
-            // look active again on the next resume.
-            let active: Option<(Option<String>,)> = sqlx::query_as(
-                "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-            if let Some(active_plan_id) = active.and_then(|(id,)| id) {
-                sqlx::query(
-                    "UPDATE plans SET session_id = NULL, updated_at = NOW(6) \
-                     WHERE user_id = ? AND plan_id = ? AND session_id = ?",
+
+            let mut plans: Vec<&str> = previous.as_deref().into_iter().chain(plan_id).collect();
+            plans.sort_unstable();
+            plans.dedup();
+            for pid in plans {
+                let row: Option<(i64,)> = sqlx::query_as(
+                    "SELECT version FROM plans WHERE user_id = ? AND plan_id = ? FOR UPDATE",
                 )
                 .bind(user_id)
-                .bind(active_plan_id)
-                .bind(session_id)
-                .execute(&mut *tx)
+                .bind(pid)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(map_sqlx)?;
+                if row.is_none() {
+                    return Err(PlanLoadError::NotFound(pid.to_string()));
+                }
             }
-        }
 
-        // Session row may not exist yet — no-op in that case.
-        sqlx::query(
-            "UPDATE agent_sessions SET active_plan_id = ? WHERE user_id = ? AND session_id = ?",
+            // Session bindings are authoritative; plans.session_id is only a
+            // hint. Reject takeover instead of invalidating a remote cache.
+            if let Some(pid) = plan_id {
+                let holders: Vec<(String,)> = sqlx::query_as(
+                    "SELECT session_id FROM agent_sessions FORCE INDEX (idx_agent_sessions_active_plan_id) WHERE user_id = ? AND active_plan_id = ? LIMIT 2 FOR UPDATE",
+                ).bind(user_id).bind(pid).fetch_all(&mut *tx).await.map_err(map_sqlx)?;
+                if holders.len() > 1 {
+                    return Err(PlanLoadError::BindingConflict);
+                }
+                if holders
+                    .first()
+                    .is_some_and(|(holder,)| holder != session_id)
+                {
+                    return Err(PlanLoadError::PlanInUse(pid.to_string()));
+                }
+            }
+            let current: Option<(Option<String>, String)> = sqlx::query_as(
+                "SELECT active_plan_id, status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+            ).bind(user_id).bind(session_id).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+            let Some((active, status)) = current else {
+                return Err(PlanLoadError::SessionUnavailable);
+            };
+            if status == "deleting" {
+                return Err(PlanLoadError::SessionUnavailable);
+            }
+            if active != previous {
+                tx.rollback().await.map_err(map_sqlx)?;
+                connection.release();
+                continue;
+            }
+
+            if let Some(old) = previous.as_deref().filter(|old| Some(*old) != plan_id) {
+                sqlx::query("UPDATE plans SET session_id = NULL, updated_at = NOW(6) WHERE user_id = ? AND plan_id = ? AND session_id = ?")
+                    .bind(user_id).bind(old).bind(session_id).execute(&mut *tx).await.map_err(map_sqlx)?;
+            }
+            if let Some(pid) = plan_id {
+                sqlx::query("UPDATE plans SET session_id = ?, updated_at = NOW(6) WHERE user_id = ? AND plan_id = ?")
+                    .bind(session_id).bind(user_id).bind(pid).execute(&mut *tx).await.map_err(map_sqlx)?;
+            }
+            sqlx::query(
+                "UPDATE agent_sessions SET active_plan_id = ? WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(plan_id)
+            .bind(user_id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            tx.commit().await.map_err(map_sqlx)?;
+            connection.release();
+            return Ok(());
+        }
+        Err(PlanLoadError::BindingConflict)
+    }
+
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError> {
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let mut tx = connection.begin().await.map_err(map_sqlx)?;
+        // Plan rows precede session rows in every authoring transition.
+        let version: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM plans WHERE user_id = ? AND plan_id = ? FOR UPDATE",
         )
-        .bind(plan_id)
         .bind(user_id)
-        .bind(session_id)
-        .execute(&mut *tx)
+        .bind(plan_id)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-
+        if version.map(|(version,)| version as u64) != Some(expected_version) {
+            return Ok(false);
+        }
+        let binding = sqlx::query("UPDATE agent_sessions SET active_plan_id = NULL WHERE user_id = ? AND session_id = ? AND active_plan_id = ? AND status <> 'deleting'")
+            .bind(user_id).bind(session_id).bind(plan_id).execute(&mut *tx).await.map_err(map_sqlx)?;
+        if binding.rows_affected() != 1 {
+            tx.rollback().await.map_err(map_sqlx)?;
+            connection.release();
+            return Ok(false);
+        }
+        sqlx::query("UPDATE plans SET session_id = NULL, updated_at = NOW(6) WHERE user_id = ? AND plan_id = ?")
+            .bind(user_id).bind(plan_id).execute(&mut *tx).await.map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)?;
-        Ok(())
+        connection.release();
+        Ok(true)
     }
 
     async fn active_plan_for_session(
@@ -561,15 +706,20 @@ impl PlanRepository for CloudPlanRepository {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, PlanLoadError> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        // Drain the unique-key result before making the connection reusable.
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
             "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
         )
         .bind(user_id)
         .bind(session_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(connection.connection_mut())
         .await
         .map_err(map_sqlx)?;
-        Ok(row.and_then(|(id,)| id))
+        connection.release();
+        Ok(rows.into_iter().next().and_then(|(id,)| id))
     }
 }
 
@@ -640,6 +790,12 @@ impl PlanRepository for InMemoryPlanRepository {
             }
             (Some(actual), _) => {
                 state.version = actual + 1;
+                // Binding changes own this field independently of draft
+                // versioning, just as in the SQL implementation.
+                state.session_hint = guard
+                    .plans
+                    .get(&key)
+                    .and_then(|saved| saved.session_hint.clone());
             }
             (None, _) => {
                 state.version = 1;
@@ -698,12 +854,17 @@ impl PlanRepository for InMemoryPlanRepository {
         validate_plan_id(plan_id)?;
         let key = (user_id.to_string(), plan_id.to_string());
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        if guard.plans.remove(&key).is_none() {
+        if !guard.plans.contains_key(&key) {
             return Err(PlanLoadError::NotFound(plan_id.to_string()));
         }
-        guard
+        if guard
             .active_plans
-            .retain(|(uid, _), active| uid != user_id || active != plan_id);
+            .iter()
+            .any(|((uid, _), active)| uid == user_id && active == plan_id)
+        {
+            return Err(PlanLoadError::PlanInUse(plan_id.to_string()));
+        }
+        guard.plans.remove(&key);
         Ok(())
     }
 
@@ -722,22 +883,24 @@ impl PlanRepository for InMemoryPlanRepository {
             {
                 return Err(PlanLoadError::NotFound(plan_id.to_string()));
             }
+            if guard.active_plans.iter().any(|((uid, sid), active)| {
+                uid == user_id && sid != session_id && active == plan_id
+            }) {
+                return Err(PlanLoadError::PlanInUse(plan_id.to_string()));
+            }
         }
 
         let previous = guard
             .active_plans
             .remove(&(user_id.to_string(), session_id.to_string()));
-        if plan_id.is_none()
-            && let Some(previous) = previous
+        if let Some(previous) = previous
+            && Some(previous.as_str()) != plan_id
             && let Some(state) = guard.plans.get_mut(&(user_id.to_string(), previous))
             && state.session_hint.as_deref() == Some(session_id)
         {
             state.session_hint = None;
         }
         if let Some(plan_id) = plan_id {
-            guard
-                .active_plans
-                .retain(|(uid, _), active| uid != user_id || active != plan_id);
             guard.active_plans.insert(
                 (user_id.to_string(), session_id.to_string()),
                 plan_id.to_string(),
@@ -750,6 +913,32 @@ impl PlanRepository for InMemoryPlanRepository {
             }
         }
         Ok(())
+    }
+
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError> {
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let binding_key = (user_id.to_string(), session_id.to_string());
+        if guard.active_plans.get(&binding_key).map(String::as_str) != Some(plan_id) {
+            return Ok(false);
+        }
+        let Some(plan) = guard
+            .plans
+            .get_mut(&(user_id.to_string(), plan_id.to_string()))
+        else {
+            return Ok(false);
+        };
+        if plan.version != expected_version {
+            return Ok(false);
+        }
+        plan.session_hint = None;
+        guard.active_plans.remove(&binding_key);
+        Ok(true)
     }
 
     async fn active_plan_for_session(
@@ -906,6 +1095,42 @@ mod tests {
             Some("current-plan"),
             "a failed switch must be atomic"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_draft_save_cannot_erase_a_binding_or_enable_takeover() {
+        let repo = InMemoryPlanRepository::new();
+        let mut draft = PlanModeState::new_with_owner("goal".into(), "user".into());
+        repo.save("user", "plan", &mut draft, None).await.unwrap();
+        let mut stale = repo.load("user", "plan").await.unwrap();
+        repo.set_active_plan("user", "first", Some("plan"))
+            .await
+            .unwrap();
+        let version = stale.version;
+        stale.goal = "updated draft".into();
+        repo.save("user", "plan", &mut stale, Some(version))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.load("user", "plan")
+                .await
+                .unwrap()
+                .session_hint
+                .as_deref(),
+            Some("first")
+        );
+        assert!(matches!(
+            repo.set_active_plan("user", "second", Some("plan")).await,
+            Err(PlanLoadError::PlanInUse(_))
+        ));
+        assert!(matches!(
+            repo.delete("user", "plan").await,
+            Err(PlanLoadError::PlanInUse(_))
+        ));
+        repo.set_active_plan("user", "first", None).await.unwrap();
+        repo.set_active_plan("user", "second", Some("plan"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

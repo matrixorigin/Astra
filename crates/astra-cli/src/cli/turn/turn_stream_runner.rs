@@ -24,8 +24,9 @@ struct PreparedTurnStreamState {
 #[derive(Clone, Copy)]
 pub(crate) struct TurnExecutionInput<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
-    pub(crate) profile: Option<&'a str>,
     pub(crate) token: &'a str,
+    /// Verified before preflight so a concurrent refresh cannot change identity.
+    pub(crate) auth_owner: Option<&'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) message: &'a str,
     pub(crate) user_intent: &'a str,
     pub(crate) input_runtime_required_texts: &'a [String],
@@ -60,19 +61,11 @@ pub(crate) enum TurnAttempt {
 
 pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    // Capture the admitted owner after admission/validation but before the
-    // stream is built; only this snapshot may drive in-flight refresh.
-    let auth_owner = match input.admitted_server_turn {
-        Some(turn) => turn.auth_owner.clone(),
-        None => {
-            crate::cli::session::session_runtime::capture_admitted_auth_owner(
-                input.api,
-                input.profile,
-                input.token,
-            )
-            .await
-        }
-    };
+    let auth_owner = input.auth_owner.cloned().or_else(|| {
+        input
+            .admitted_server_turn
+            .and_then(|turn| turn.auth_owner.clone())
+    });
     if let Some(server_turn) = input.admitted_server_turn
         && (!server_turn.attachment_owner.is_current()
             || server_turn
@@ -99,6 +92,9 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
         }));
     }
     let prepared = prepare_turn_stream_state(state).await;
+    prepared.run_control.publish_admitted_auth(
+        crate::cli::session::session_runtime::AdmittedAuth::new(input.token, auth_owner.clone()),
+    );
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
         Some(prepared.run_control.clone());
     let mut params = build_turn_stream_params(state, input, &prepared);
@@ -238,9 +234,9 @@ fn build_turn_stream_params<'a>(
 
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
-        bg_task_commands: Some(state.bg_task_commands.clone()),
+        background_tasks: Some(state.background_tasks.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
-        bash_detach_slot: Some(state.bash_detach_slot.clone()),
+        foreground_wait_control: Some(state.foreground_wait_control.clone()),
         // This clock scopes every local tool mutation, checkpoint and journal
         // event. Server admission allocates its own turn independently.
         turn_index: state.turn.saturating_add(1),
@@ -475,7 +471,7 @@ where
                     || failure.partial.admission_rejected
             }) =>
             {
-                Ok(())
+                Ok(None)
             }
             None => Err(
                 "Server admission identity was not observed before cancellation completed".into(),
@@ -497,13 +493,37 @@ where
         pair = settle => pair,
     };
     let snapshot = incremental_state.snapshot();
+    // The exact cancellation response observes the terminal even if the
+    // local stream stopped before it arrived.
+    let mut context_not_saved = settled
+        .as_ref()
+        .ok()
+        .copied()
+        .filter(|_| snapshot.run_id.is_some());
+    let result_run_id = match &result {
+        Ok(result) => result.run_id.as_deref(),
+        Err(failure) => failure.partial.run_id.as_deref(),
+    };
+    if result_run_id.is_some()
+        && result_run_id != snapshot.run_id.as_deref()
+        && context_not_saved.is_some()
+    {
+        context_not_saved = Some(None);
+    }
     match settled {
-        Ok(()) => result.map_err(|mut failure| {
-            failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
-            failure.partial.remote_cancel_required = false;
-            failure.partial.remote_cancel_run_id = None;
-            failure
-        }),
+        Ok(_) => match result {
+            Ok(mut result) => {
+                result.cancel_context_not_saved = context_not_saved;
+                Ok(result)
+            }
+            Err(mut failure) => {
+                failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
+                failure.partial.remote_cancel_required = false;
+                failure.partial.remote_cancel_run_id = None;
+                failure.partial.cancel_context_not_saved = context_not_saved;
+                Err(failure)
+            }
+        },
         Err(error) => {
             let error = astra_logging::redact_known_secret_patterns(&error);
             tracing::warn!(
@@ -574,7 +594,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
         state,
         TurnExecutionInput {
             api,
-            profile: None,
+
             token,
             message: "continue again",
             user_intent: "continue again",
@@ -586,6 +606,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
                 .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: None,
             explain_analyze_terminal_degraded: None,
+            auth_owner: None,
         },
         &prepared,
     );
@@ -879,6 +900,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_cancel_observes_late_context_terminal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for expected in [Some(true), Some(false), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-owned"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":false
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/chat/runs/run-owned/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":true, "context_not_saved":expected
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let incremental =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+            incremental.set_run_id("run-owned".into());
+            // The local stream already ended on cancellation; the terminal is
+            // observed only after the exact remote cancellation settles.
+            let mut stream = std::pin::pin!(async {
+                super::super::turn_cancellation::fabricate_user_cancel_failure(
+                    "cancelled",
+                    incremental.clone(),
+                )
+            });
+            let failure = super::settle_interactive_user_cancel(
+                &mut stream,
+                &api,
+                "test-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+            assert!(!failure.partial.remote_cancel_required);
+            assert_eq!(failure.partial.cancel_context_not_saved, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_keeps_success_and_context_observation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for observation in [Some(true), Some(false), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-owned"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":true, "context_not_saved":observation
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let incremental =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+            incremental.set_run_id("run-owned".into());
+            let mut stream =
+                std::pin::pin!(async { Ok(crate::tests::stub_stream_result("completed")) });
+            let result = super::settle_interactive_user_cancel(
+                &mut stream,
+                &api,
+                "test-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "completed");
+            assert_eq!(result.cancel_context_not_saved, Some(observation));
+        }
+    }
+
+    #[tokio::test]
     async fn interactive_cancel_known_run_does_not_wait_for_a_blocked_local_callback() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1088,7 +1195,7 @@ mod tests {
             &mut state,
             TurnExecutionInput {
                 api: &api,
-                profile: None,
+
                 token: "token",
                 message: "what work is running?",
                 user_intent: "what work is running?",
@@ -1098,6 +1205,7 @@ mod tests {
                 admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
+                auth_owner: None,
             },
             &prepared,
         );
@@ -1198,7 +1306,7 @@ mod tests {
             &mut state,
             TurnExecutionInput {
                 api: &api,
-                profile: Some("profile"),
+
                 token: "token",
                 message: "continue",
                 user_intent: "continue",
@@ -1208,6 +1316,7 @@ mod tests {
                 admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
+                auth_owner: None,
             },
             &prepared,
         );

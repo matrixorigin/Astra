@@ -18,7 +18,6 @@ use crate::context_sources::ContextSources;
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::recovery_state::RecoveryState;
-use crate::section_types::estimate_text_tokens;
 use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
 
@@ -41,11 +40,9 @@ pub enum HistoryOptimizationOwner {
     DownstreamSemanticCompactor,
 }
 
-/// Pipeline refused to execute due to unrecoverable error state.
+/// Invalid request configuration rejected by the context pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PipelineAbort {
-    /// Consecutive PTL errors exceeded abort threshold (3).
-    ConsecutivePtlExhausted { consecutive_errors: u32 },
     /// The model context limit is invalid, so planning would be unsafe.
     InvalidModelLimit { model_limit: u32 },
 }
@@ -53,13 +50,6 @@ pub enum PipelineAbort {
 impl fmt::Display for PipelineAbort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConsecutivePtlExhausted { consecutive_errors } => {
-                write!(
-                    f,
-                    "pipeline aborted: {} consecutive prompt-too-long errors",
-                    consecutive_errors
-                )
-            }
             Self::InvalidModelLimit { model_limit } => {
                 write!(
                     f,
@@ -86,8 +76,8 @@ impl ContextPipeline {
         &self.config
     }
 
-    /// Run the full pipeline. Returns `Err(PipelineAbort)` if recovery state
-    /// indicates an unrecoverable error streak (e.g., 3+ consecutive PTL errors).
+    /// Run the full pipeline. Invalid capacity metadata is rejected; recovery
+    /// history informs planning and does not disable a new request.
     pub fn run(&self, input: PipelineRunInput<'_>) -> Result<PipelineRunOutput, PipelineAbort> {
         self.run_with_limit_policy(&input, LimitPolicy::Explicit(input.optimize_limits))
     }
@@ -133,13 +123,6 @@ impl ContextPipeline {
         }
 
         let provider_policy = &input.sources.session.provider_policy;
-
-        // Gate: check abort condition before spending compute
-        if input.recovery.should_abort() {
-            return Err(PipelineAbort::ConsecutivePtlExhausted {
-                consecutive_errors: input.recovery.consecutive_ptl_errors,
-            });
-        }
 
         let mut timings = Vec::with_capacity(4);
         let mut plan_elapsed = Duration::ZERO;
@@ -280,49 +263,24 @@ fn estimate_bound_input_tokens(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
 ) -> u32 {
-    // Section tokens come from the pipeline's bound-section measurement.
-    // Message and tool-schema tokens use full JSON serialization
-    // (serde_json::to_string) for a consistent encoded-text estimate. This is a
-    // different method from the wire-budget estimator in runtime/src/prompts,
-    // which recursively walks the JSON tree without serializing intermediate
-    // strings. Both are approximations; the provider tokenizer is authoritative.
+    // Match final-wire text accounting without serializing private replay
+    // storage as provider plaintext. Opaque usage remains provider-authoritative.
     let section_tokens = sections
         .iter()
         .map(|section| section.actual_tokens)
         .fold(0_u32, u32::saturating_add);
     section_tokens
         .saturating_add(estimate_json_values_tokens(messages))
+        .saturating_add((messages.len().min(u32::MAX as usize) as u32).saturating_mul(4))
         .saturating_add(estimate_json_values_tokens(tool_schemas))
 }
 
 fn estimate_json_values_tokens(values: &[serde_json::Value]) -> u32 {
-    let mut serialized_bytes = 0_u64;
-    let tokens = values
+    values
         .iter()
-        .map(|value| match serde_json::to_string(value) {
-            Ok(encoded) => {
-                serialized_bytes = serialized_bytes
-                    .saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
-                estimate_text_tokens(&encoded).max(1)
-            }
-            Err(error) => {
-                astra_core::history_work::record_serialization_failure(
-                    astra_core::history_work::HistoryWorkSite::ContextBinding,
-                    &error,
-                );
-                1
-            }
-        })
-        .fold(0_u32, u32::saturating_add);
-    if astra_core::history_work::instrumentation_enabled() {
-        astra_core::history_work::record_operation(
-            astra_core::history_work::HistoryWorkSite::ContextBinding,
-            serialized_bytes,
-            u64::try_from(values.len()).unwrap_or(u64::MAX),
-            0,
-        );
-    }
-    tokens
+        .map(|value| astra_core::model_wire::token_estimate::measure_message(value).text_tokens)
+        .fold(0_usize, usize::saturating_add)
+        .min(u32::MAX as usize) as u32
 }
 
 pub struct PipelineRunInput<'a> {
@@ -434,41 +392,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_abort_display_contains_error_count() {
-        let abort = PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 3,
-        };
-        let msg = abort.to_string();
-        assert!(msg.contains("3"), "display should contain error count");
-        assert!(
-            msg.contains("prompt-too-long"),
-            "display should name the error type"
-        );
-    }
-
-    #[test]
     fn pipeline_abort_display_contains_invalid_model_limit() {
         let abort = PipelineAbort::InvalidModelLimit { model_limit: 0 };
         let msg = abort.to_string();
         assert!(msg.contains("invalid model context limit"));
         assert!(msg.contains("0"));
-    }
-
-    #[test]
-    fn pipeline_abort_eq_derives_correctly() {
-        let a = PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 3,
-        };
-        let b = PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 3,
-        };
-        let c = PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 4,
-        };
-        let invalid = PipelineAbort::InvalidModelLimit { model_limit: 0 };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(a, invalid);
     }
 
     #[test]
@@ -479,16 +407,6 @@ mod tests {
         let timing = PipelinePhaseTiming::elapsed("test_phase", started);
         assert_eq!(timing.phase, "test_phase");
         // elapsed_micros may be 0 on fast machines, just ensure no panic
-    }
-
-    #[test]
-    fn pipeline_abort_serializes_roundtrip() {
-        let abort = PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 5,
-        };
-        let json = serde_json::to_string(&abort).unwrap();
-        let restored: PipelineAbort = serde_json::from_str(&json).unwrap();
-        assert_eq!(abort, restored);
     }
 
     #[test]

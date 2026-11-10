@@ -23,6 +23,9 @@ use crate::tui::turn_event::TurnEvent;
 pub(crate) struct ReasoningCell {
     pub(crate) model_item_id: Option<String>,
     text: String,
+    chars: usize,
+    newlines: usize,
+    has_content: bool,
     live: bool,
     /// When the cell was created. Used to compute duration on
     /// finalize. Not persisted — we only keep the final
@@ -37,6 +40,9 @@ impl ReasoningCell {
         Self {
             model_item_id: None,
             text: String::new(),
+            chars: 0,
+            newlines: 0,
+            has_content: false,
             live: true,
             started_at: Some(Instant::now()),
             duration: None,
@@ -46,9 +52,14 @@ impl ReasoningCell {
 
     /// Build from a complete reasoning blob (replay path).
     pub fn from_text(text: impl Into<String>, duration_ms: Option<u64>) -> Self {
+        let text = text.into();
+        let (chars, newlines, has_content) = reasoning_text_stats(&text);
         Self {
             model_item_id: None,
-            text: text.into(),
+            chars,
+            newlines,
+            has_content,
+            text,
             live: false,
             started_at: None,
             duration: duration_ms.map(Duration::from_millis),
@@ -62,20 +73,21 @@ impl ReasoningCell {
                 ts,
                 text,
                 duration_ms,
-            } => Some(Self {
-                model_item_id: None,
-                text,
-                live: false,
-                started_at: None,
-                duration: duration_ms.map(Duration::from_millis),
-                ts,
-            }),
+            } => {
+                let mut cell = Self::from_text(text, duration_ms);
+                cell.ts = ts;
+                Some(cell)
+            }
             _ => None,
         }
     }
 
     pub fn push_delta(&mut self, delta: &str) {
         debug_assert!(self.live, "push_delta on finalised ReasoningCell");
+        let (chars, newlines, has_content) = reasoning_text_stats(delta);
+        self.chars += chars;
+        self.newlines += newlines;
+        self.has_content |= has_content;
         self.text.push_str(delta);
     }
 
@@ -100,13 +112,14 @@ impl ReasoningCell {
     /// its body; a live cell is expandable only after its bounded preview has
     /// actually omitted rows.
     pub(crate) fn has_transcript_details(&self, width: u16) -> bool {
-        if self.text.trim().is_empty() {
+        if !self.has_content {
             return false;
         }
         if !self.live {
             return true;
         }
-        wrapped_body_rows(&self.text, width).len() > LIVE_PREVIEW_MAX_ROWS
+        let (tail, truncated) = live_preview_source(&self.text);
+        truncated || wrapped_body_rows(tail, width).len() > LIVE_PREVIEW_MAX_ROWS
     }
 
     /// Render the transcript-specific projection. Expansion is deliberately
@@ -132,8 +145,8 @@ impl ReasoningCell {
         let stat = Style::default().fg(theme.dim);
         let dim = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
         let body = Style::default().fg(theme.dim);
-        let line_count = self.text.lines().count();
-        let token_count = approx_tokens(self.text.chars().count() as u64);
+        let line_count = self.newlines + usize::from(!self.text.ends_with('\n'));
+        let token_count = approx_tokens(self.chars as u64);
         let line_label = if line_count == 1 {
             "1 line".to_string()
         } else {
@@ -166,22 +179,29 @@ impl ReasoningCell {
             Span::styled(stat_text, stat),
         ]);
         let mut lines = vec![header_line];
-        let body_rows = wrapped_body_rows(&self.text, width);
-
         if expanded {
-            for row in body_rows {
+            for row in wrapped_body_rows(&self.text, width) {
                 lines.push(Line::from(vec![Span::raw("  "), Span::styled(row, body)]));
             }
         } else if self.live {
+            let (tail, truncated) = live_preview_source(&self.text);
+            let body_rows = wrapped_body_rows(tail, width);
             let total = body_rows.len();
-            let visible = if total > LIVE_PREVIEW_MAX_ROWS {
+            let visible = if truncated || total > LIVE_PREVIEW_MAX_ROWS {
                 let tail = LIVE_PREVIEW_MAX_ROWS - 1;
-                let hidden = total - tail;
+                let hidden = total.saturating_sub(tail);
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(format!("… {hidden} earlier lines"), dim),
+                    Span::styled(
+                        if truncated {
+                            "… earlier lines".to_string()
+                        } else {
+                            format!("… {hidden} earlier lines")
+                        },
+                        dim,
+                    ),
                 ]));
-                total - tail
+                total.saturating_sub(tail)
             } else {
                 0
             };
@@ -202,6 +222,28 @@ impl ReasoningCell {
 /// a 20-second think. On `finalize()` the whole body collapses
 /// away and only the header remains.
 const LIVE_PREVIEW_MAX_ROWS: usize = 4;
+
+fn reasoning_text_stats(text: &str) -> (usize, usize, bool) {
+    text.chars()
+        .fold((0, 0, false), |(chars, lines, content), ch| {
+            (
+                chars + 1,
+                lines + usize::from(ch == '\n'),
+                content || !ch.is_whitespace(),
+            )
+        })
+}
+
+/// A bounded suffix keeps streaming redraw independent of accumulated text.
+/// Full reasoning remains available for explicit expansion, search and export.
+fn live_preview_source(text: &str) -> (&str, bool) {
+    const MAX_BYTES: usize = 8192;
+    let mut start = text.len().saturating_sub(MAX_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (&text[start..], start != 0)
+}
 
 impl HistoryCell for ReasoningCell {
     fn model_item_id(&self) -> Option<&str> {
@@ -310,6 +352,37 @@ mod tests {
         c.push_delta("user wants X, ");
         c.push_delta("so do Y");
         assert_eq!(c.text(), "user wants X, so do Y");
+    }
+
+    #[test]
+    fn streaming_statistics_and_preview_preserve_full_unicode_text() {
+        let mut cell = ReasoningCell::new_streaming();
+        for chunk in ["first\r", "\n", "界😺\n", &"long ".repeat(3_000), "\nlast"] {
+            cell.push_delta(chunk);
+            assert_eq!(cell.chars, cell.text.chars().count());
+            assert_eq!(
+                cell.newlines + usize::from(!cell.text.ends_with('\n')),
+                cell.text.lines().count()
+            );
+        }
+        let preview = cell.transcript_lines(80, false);
+        let preview = preview
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(preview.contains("earlier lines"));
+        assert!(preview.contains("last"));
+        assert!(!preview.contains("first"));
+        let expanded = cell.transcript_lines(80, true);
+        let expanded = expanded
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(expanded.contains("first"));
+        assert!(expanded.contains("界😺"));
+        assert!(expanded.contains("last"));
     }
 
     #[test]

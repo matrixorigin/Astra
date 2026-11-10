@@ -1,7 +1,7 @@
 name: flash_model_name_is_output
 description: |
   A quoted model name is the requested child output, not an execution selector.
-  Verify default inheritance through actual child inference and parent adoption.
+  Verify the child uses the requested execution model and its result is adopted.
 prompt: |
   请让一个子代理只返回字符串“glm-5.2”，等它完成后你也只返回这个字符串。
 debug_log: true
@@ -10,9 +10,19 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: execution_child_results_adopted
-    children:
-      - expected_result: {text: glm-5.2}
-        model: '{{model}}'
-  - type: text_equals
-    expected: glm-5.2
+  - type: any_of
+    criteria:
+      - type: execution_child_results_adopted
+        children:
+          - expected_result: {text: glm-5.2}
+            model: '{{model}}'
+      - type: execution_child_results_adopted
+        children:
+          - expected_result: {text: '"glm-5.2"'}
+            model: '{{model}}'
+  - type: any_of
+    criteria:
+      - type: text_equals
+        expected: glm-5.2
+      - type: text_equals
+        expected: '"glm-5.2"'

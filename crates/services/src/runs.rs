@@ -1,4 +1,4 @@
-mod permission_control;
+mod settings_control;
 mod terminal;
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
@@ -9,19 +9,30 @@ use astra_turn_types::{
     ModelSelection, SessionAttachmentV1, SessionKeyV1, UserIntentDelivery, UserIntentStatus,
 };
 pub use astra_turn_types::{
-    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
-    RunPermissionModeSnapshot,
+    RunModelOutcome, RunModelRequest, RunModelSelection, RunPermissionModeApplied,
+    RunPermissionModeRequest, RunPermissionModeSelection, RunPermissionModeSnapshot,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
+pub use settings_control::{RunModelApplied, RunModelSettingsSnapshot, RunSettingsSnapshot};
+use settings_control::{RunSettingsChange, RunSettingsEvent};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
+
+/// Current model authority for a child or a resumed execution. This is a
+/// read of the existing run facts, not another stored model state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InheritedRunModel {
+    Explicit(RunModelApplied),
+    Auto(Box<crate::model_routing::ModelRoutingDecision>),
+    Original,
+}
 pub(crate) use terminal::TerminalReceiptRunIdentity;
 pub use terminal::{
     CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalClaim,
@@ -85,6 +96,28 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Permission mode control is unavailable",
+        ))
+    }
+    async fn request_run_model(
+        &self,
+        _user_id: String,
+        _run_id: String,
+        _request: RunModelRequest,
+    ) -> Result<RunModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Model control is unavailable",
+        ))
+    }
+    async fn run_model_snapshot(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _run_id: String,
+    ) -> Result<astra_turn_types::RunModelSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Model control is unavailable",
         ))
     }
     async fn permission_mode_snapshot(
@@ -320,6 +353,20 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Active-run user intents are not supported",
+        ))
+    }
+
+    /// Reconcile one previously submitted intent without streaming a run.
+    async fn run_user_intent_status(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _run_id: String,
+        _intent_id: String,
+    ) -> Result<UserIntentStatus, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Intent status is unavailable",
         ))
     }
 
@@ -1464,6 +1511,8 @@ pub struct CancelRunRecord {
     /// Server-owned execution lease has retired; task verification may safely
     /// begin only when this is true.
     pub execution_settled: bool,
+    /// Observation from the same Run's terminal; absent when unavailable.
+    pub context_not_saved: Option<bool>,
 }
 
 /// Cancellation acceptance is distinct from retiring all session execution
@@ -2139,6 +2188,8 @@ pub struct DurableRunRecord {
     pub owner_lease_expires_at: Option<String>,
     pub run_generation: u64,
     pub last_event_idx: i64,
+    /// Highest committed user-intent event; maintained with the event append.
+    pub last_guidance_event_idx: i64,
     pub current_checkpoint: Option<CurrentCheckpointRef>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -2197,6 +2248,50 @@ pub struct StoredRunAdmission {
 impl StoredRunAdmission {
     pub fn run(&self) -> &DurableRunRecord {
         &self.run
+    }
+}
+
+/// Facts needed before admitting one guidance message. The admission
+/// transaction remains authoritative for the Run and message outcome.
+#[derive(Clone, Debug)]
+pub struct RunGuidancePreflight {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub agent_id: Option<String>,
+    pub source_already_admitted: bool,
+    pub native_anchor: bool,
+}
+
+fn project_run_guidance_preflight<'a>(
+    run: &DurableRunRecord,
+    source_key: &str,
+    events: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> RunGuidancePreflight {
+    let mut source_already_admitted = false;
+    let mut native_anchor = false;
+    for event in events {
+        source_already_admitted |= event
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_key);
+        native_anchor |= event.get("event_type").and_then(serde_json::Value::as_str)
+            == Some(COLLABORATOR_STAGE_EVENT)
+            && serde_json::from_value::<CollaboratorStageAdmission>(
+                event
+                    .get("admission")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .is_ok_and(|admission| admission.anchor_run_id == run.run_id);
+    }
+    RunGuidancePreflight {
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        run_id: run.run_id.clone(),
+        agent_id: run.agent_id.clone(),
+        source_already_admitted,
+        native_anchor,
     }
 }
 
@@ -2794,7 +2889,7 @@ pub(crate) async fn activate_execution_resume_tx(
     run: &mut DurableRunRecord,
     checkpoint: &DurableRunCheckpointRecord,
     owner_pod_id: &str,
-) -> Result<(), ExecutionHandoffReferenceError> {
+) -> Result<bool, ExecutionHandoffReferenceError> {
     use ExecutionHandoffReferenceError::{Rejected, Unavailable};
     if run.status != STATUS_PAUSED || run.waiting_for.is_some() {
         return Err(Rejected("execution checkpoint is not parked"));
@@ -2842,19 +2937,22 @@ pub(crate) async fn activate_execution_resume_tx(
     if affected.rows_affected() != 1 {
         return Err(Rejected("execution owner remains live or changed"));
     }
-    if run_requires_independent_admission(run)
-        && !crate::storage::session_execution_activity(
+    let prior_unresolved_tool_calls = if run_requires_independent_admission(run) {
+        let activity = crate::storage::session_execution_activity(
             tx,
             &run.user_id,
             &run.session_id,
             Some(&run.run_id),
         )
         .await
-        .map_err(|error| Unavailable(error.to_string()))?
-        .is_idle()
-    {
-        return Err(Rejected("session has unsettled execution"));
-    }
+        .map_err(|error| Unavailable(error.to_string()))?;
+        if activity.active_run {
+            return Err(Rejected("session has active execution"));
+        }
+        activity.unresolved_invocations
+    } else {
+        false
+    };
     let row = build_run_event_insert_row(
         &run.user_id,
         &run.run_id,
@@ -2887,7 +2985,7 @@ pub(crate) async fn activate_execution_resume_tx(
     let admission = std::mem::take(&mut run.events);
     *run = resumed;
     run.events = admission;
-    Ok(())
+    Ok(prior_unresolved_tool_calls)
 }
 
 pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
@@ -3449,6 +3547,8 @@ pub struct DurableRunControlRecord {
     /// read so active executors can notice accepted input without another
     /// periodic database query. This is a wake hint, not an applied cursor.
     pub last_event_idx: i64,
+    /// Latest committed user-intent event, read with the existing control row.
+    pub last_guidance_event_idx: i64,
     /// True only when the store can prove an execution owner with an
     /// unexpired lease using its authoritative clock.
     pub owner_lease_live: bool,
@@ -3931,6 +4031,7 @@ impl From<&DurableRunRecord> for DurableRunControlRecord {
             cancellation_requested: false,
             run_generation: run.run_generation,
             last_event_idx: run.last_event_idx,
+            last_guidance_event_idx: run.last_guidance_event_idx,
             owner_lease_live: run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(true),
         }
@@ -4039,7 +4140,7 @@ impl From<&DurableRunCheckpointRecord> for RunCheckpointReceipt {
 
 const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
-     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, last_guidance_event_idx, checkpoint_version, \
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
@@ -4050,7 +4151,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
 // not the potentially large checkpoint body. Executable recovery loads it separately.
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
-     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, last_guidance_event_idx, checkpoint_version, \
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
@@ -6019,6 +6120,60 @@ fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
 
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
+    async fn run_user_intent_status(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        intent_id: &str,
+    ) -> Result<Option<UserIntentStatus>, String> {
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(None);
+        };
+        if run.session_id != session_id {
+            return Ok(None);
+        }
+        let keys = user_intent_status_keys(intent_id);
+        let events: Vec<_> = run
+            .events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut event)| {
+                keys.iter()
+                    .any(|key| {
+                        Some(key.as_str())
+                            == event
+                                .get("idempotency_key")
+                                .and_then(serde_json::Value::as_str)
+                    })
+                    .then(|| {
+                        if event.get("index").is_none() {
+                            event["index"] = serde_json::json!(index);
+                        }
+                        event
+                    })
+            })
+            .collect();
+        user_intent_status_from_events(intent_id, &events)
+    }
+    async fn request_run_model(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        Err("model control is not supported by this store".into())
+    }
+    async fn finish_run_model(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _outcome: &RunModelOutcome,
+        _resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        Err("model control is not supported by this store".into())
+    }
     async fn request_permission_mode(
         &self,
         _user_id: &str,
@@ -6029,11 +6184,56 @@ pub trait RunStateStore: Send + Sync {
     }
     async fn permission_mode_snapshot(
         &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        Ok(self
+            .run_settings_snapshot(user_id, session_id, run_id)
+            .await?
+            .map(|settings| settings.permission))
+    }
+    async fn run_settings_snapshot(
+        &self,
         _user_id: &str,
         _session_id: &str,
         _run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
         Ok(None)
+    }
+    /// Resolve the same model facts used by the parent execution. Database
+    /// implementations read both indexed facts in one round trip.
+    async fn inherited_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<InheritedRunModel, String> {
+        if let Some(choice) = self
+            .run_settings_snapshot(user_id, session_id, run_id)
+            .await?
+            .and_then(|settings| settings.model.applied)
+        {
+            return Ok(InheritedRunModel::Explicit(choice));
+        }
+        let event = self
+            .load_run_event_by_idempotency_key(
+                user_id,
+                run_id,
+                crate::model_routing::EVENT_TYPE,
+                crate::model_routing::DECISION_KEY,
+            )
+            .await?;
+        match event {
+            Some(event) => {
+                let decision: crate::model_routing::ModelRoutingDecision =
+                    serde_json::from_value(event["data"].clone())
+                        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
+                decision.validate_identity(run_id, session_id)?;
+                Ok(InheritedRunModel::Auto(Box::new(decision)))
+            }
+            None => Ok(InheritedRunModel::Original),
+        }
     }
     #[allow(clippy::too_many_arguments)]
     async fn apply_permission_mode(
@@ -6182,6 +6382,20 @@ pub trait RunStateStore: Send + Sync {
             .load_run(user_id, run_id)
             .await?
             .map(|run| StoredRunAdmission { run }))
+    }
+
+    /// Read only the facts used to route one explicit guidance request.
+    /// Implementations must not substitute this observation for atomic admission.
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .map(|run| project_run_guidance_preflight(&run, source_key, &run.events)))
     }
 
     /// Order a no-row terminal receipt against child creation under the same
@@ -7148,8 +7362,7 @@ impl InMemoryRunStateStore {
                         terminal_error_code.as_deref(),
                     )?;
                     if !new_events.is_empty() {
-                        run.events.extend(new_events);
-                        run.last_event_idx = run.events.len() as i64 - 1;
+                        append_in_memory_events(run, new_events);
                     }
                     if release_recovery_owner {
                         run.owner_pod_id = None;
@@ -7248,6 +7461,28 @@ impl InMemoryRunStateStore {
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
         normalize_run_opening(&mut record)?;
+        // New runs use the same contiguous event identities as database rows.
+        // Reject imported sparse fixtures instead of accepting cursors that
+        // vector-based action fences cannot interpret correctly.
+        let frontier = record.events.len() as i64 - 1;
+        if record.last_event_idx > frontier
+            || record.events.iter().enumerate().any(|(position, event)| {
+                event
+                    .get("index")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|index| index != position as i64)
+            })
+        {
+            return Err("Run creation requires contiguous event indices".into());
+        }
+        if record.events.first().is_some_and(is_user_intent_event) {
+            return Err("Run creation cannot place user guidance at event index zero".into());
+        }
+        record.last_guidance_event_idx = record
+            .events
+            .iter()
+            .rposition(is_user_intent_event)
+            .map_or(-1, |index| index as i64);
         if let Some(opening) = record.opening.loaded()? {
             record.opening_hash = Some(opening.encode()?.hash);
             record.context_admission_hash = opening.context_fingerprint();
@@ -7626,6 +7861,74 @@ pub fn normalized_run_user_intent_content(input: &serde_json::Value) -> Option<S
         (None, Some(active_skills)) => Some(active_skills),
         (None, None) => None,
     }
+}
+
+fn user_intent_status_keys(intent_id: &str) -> [String; 3] {
+    [
+        format!("user_intent:{intent_id}"),
+        format!("user_intent_applied:{intent_id}"),
+        format!("user_intent_returned:{intent_id}"),
+    ]
+}
+
+fn user_intent_status_from_events(
+    intent_id: &str,
+    events: &[serde_json::Value],
+) -> Result<Option<UserIntentStatus>, String> {
+    let mut source = None;
+    let mut disposition = None;
+    for event in events {
+        let kind = extract_event_type(event);
+        if kind == "user_intent" {
+            if source.replace(event).is_some() {
+                return Err("duplicate intent source".into());
+            }
+        } else if matches!(
+            kind.as_str(),
+            "user_intent_applied" | "user_intent_returned"
+        ) {
+            if disposition.replace(event).is_some() {
+                return Err("conflicting intent dispositions".into());
+            }
+        } else {
+            return Err("invalid intent status event".into());
+        }
+    }
+    let Some(source) = source else {
+        return if disposition.is_some() {
+            Err("intent disposition has no source".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let source_index = source
+        .get("index")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|index| *index >= 0)
+        .ok_or("intent source has no event index")?;
+    let (source_id, _, _, _) = validated_user_intent_source(source_index, source)?;
+    if source_id != intent_id {
+        return Err("intent source identity mismatch".into());
+    }
+    let Some(disposition) = disposition else {
+        return Ok(Some(UserIntentStatus::AcceptedRemote));
+    };
+    let status = match extract_event_type(disposition).as_str() {
+        "user_intent_applied" => UserIntentStatus::Applied,
+        "user_intent_returned" => UserIntentStatus::Returned,
+        _ => return Err("invalid intent disposition".into()),
+    };
+    let expected = user_intent_disposition_event_from_source(source_index, source, status)?;
+    if ["intent_id", "delivery", "status", "event_index", "input"]
+        .iter()
+        .any(|field| {
+            disposition.get("data").and_then(|data| data.get(*field))
+                != expected.get("data").and_then(|data| data.get(*field))
+        })
+    {
+        return Err("intent disposition does not match its source".into());
+    }
+    Ok(Some(status))
 }
 
 fn validated_user_intent_source(
@@ -8147,6 +8450,25 @@ fn is_checkpoint_version(version: &str) -> bool {
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
+    async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &RunModelOutcome,
+        resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        self.finish_model_request_inner(user_id, session_id, run_id, outcome, resolved)
+            .await
+    }
+    async fn request_run_model(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        self.request_model_inner(user_id, run_id, request).await
+    }
     async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -8156,13 +8478,13 @@ impl RunStateStore for InMemoryRunStateStore {
         self.request_permission_mode_inner(user_id, run_id, request)
             .await
     }
-    async fn permission_mode_snapshot(
+    async fn run_settings_snapshot(
         &self,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
+        self.run_settings_snapshot_inner(user_id, session_id, run_id)
             .await
     }
     async fn apply_permission_mode(
@@ -8376,17 +8698,13 @@ impl RunStateStore for InMemoryRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunControlRecord>, String> {
-        let run = self
-            .runs
-            .read()
-            .await
-            .get(run_id)
-            .filter(|run| run.user_id == user_id)
-            .cloned();
-        let Some(run) = run else {
-            return Ok(None);
+        let mut control = {
+            let runs = self.runs.read().await;
+            let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
+                return Ok(None);
+            };
+            DurableRunControlRecord::from(run)
         };
-        let mut control = DurableRunControlRecord::from(&run);
         control.cancellation_requested = self
             .cancellation_requests
             .read()
@@ -8408,6 +8726,19 @@ impl RunStateStore for InMemoryRunStateStore {
             .get(run_id)
             .filter(|run| run.user_id == user_id)
             .cloned())
+    }
+
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .get(run_id)
+            .filter(|run| run.user_id == user_id)
+            .map(|run| project_run_guidance_preflight(run, source_key, &run.events)))
     }
 
     async fn find_latest_root_run(
@@ -8481,9 +8812,8 @@ impl RunStateStore for InMemoryRunStateStore {
         let expected_key = format!("user_intent:{}", request.intent_id);
         if let Some((position, existing)) =
             run.events.iter().enumerate().rev().find(|(_, event)| {
-                extract_event_type(event) == "user_intent"
-                    && extract_optional_string(event, "idempotency_key").as_deref()
-                        == Some(expected_key.as_str())
+                extract_optional_string(event, "idempotency_key").as_deref()
+                    == Some(expected_key.as_str())
             })
         {
             if !run_guidance_event_matches(existing, request.event) {
@@ -8512,15 +8842,8 @@ impl RunStateStore for InMemoryRunStateStore {
             });
         }
 
-        let event_count = i64::try_from(run.events.len())
-            .map_err(|_| format!("run {} event count exceeds i64", request.run_id))?;
-        let event_index = run
-            .last_event_idx
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?
-            .max(event_count);
-        run.events.push(request.event.clone());
-        run.last_event_idx = event_index;
+        append_in_memory_events(run, vec![request.event.clone()]);
+        let event_index = run.last_event_idx;
         run.updated_at = chrono::Utc::now().to_rfc3339();
 
         Ok(AtomicRunGuidanceAdmission::Committed { event_index })
@@ -8556,13 +8879,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 .events
                 .iter()
                 .enumerate()
-                .find(|(position, event)| {
-                    event
-                        .get("index")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(*position as i64)
-                        == *source_index
-                })
+                .find(|(position, _)| *position as i64 == *source_index)
                 .map(|(_, event)| event)
                 .ok_or(AtomicRunUserIntentApply::SourceMissing {
                     event_index: *source_index,
@@ -8798,10 +9115,7 @@ impl RunStateStore for InMemoryRunStateStore {
             .iter()
             .enumerate()
             .filter_map(|(position, event)| {
-                let index = event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64);
+                let index = position as i64;
                 if index <= after_event_idx {
                     return None;
                 }
@@ -8837,39 +9151,22 @@ impl RunStateStore for InMemoryRunStateStore {
         let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
             return Ok(None);
         };
-        // The in-memory test store permits fixtures with explicit durable gaps;
-        // mirror the database row-key authority instead of trusting vector
-        // position metadata in those fixtures.
-        let authoritative_last_event_idx = run
-            .events
-            .iter()
-            .enumerate()
-            .map(|(position, event)| {
-                event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64)
-            })
-            .max()
-            .unwrap_or(run.last_event_idx)
-            .max(run.last_event_idx);
+        // Like the database row key, vector position owns event identity;
+        // arbitrary event payloads cannot advance the control cursor.
+        let authoritative_last_event_idx = run.last_event_idx;
         let mut indexed_control_events = run
             .events
             .iter()
             .enumerate()
             .filter_map(|(position, event)| {
-                let index = event
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64);
+                let index = position as i64;
                 (index > after_event_idx
                     && index <= authoritative_last_event_idx
                     && is_user_intent_control_event(event))
                 .then_some((index, event))
             })
+            .take(limit_plus_one)
             .collect::<Vec<_>>();
-        indexed_control_events.sort_by_key(|(index, _)| *index);
-        indexed_control_events.truncate(limit_plus_one);
         let has_more = indexed_control_events.len() > limit;
         indexed_control_events.truncate(limit);
         let events = indexed_control_events
@@ -8898,10 +9195,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 .iter()
                 .enumerate()
                 .filter_map(|(position, event)| {
-                    let index = event
-                        .get("index")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(position as i64);
+                    let index = position as i64;
                     let key = extract_optional_string(event, "idempotency_key")?;
                     (index <= authoritative_last_event_idx && disposition_keys.contains(&key))
                         .then_some(event.clone())
@@ -9419,8 +9713,7 @@ impl RunStateStore for InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
-                    run.events.push(event);
-                    run.last_event_idx = run.events.len() as i64 - 1;
+                    append_in_memory_events(run, vec![event]);
                     true
                 }
             } else {
@@ -9557,8 +9850,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.resolved_model_name = Some(selection.selected_model);
             }
             if !new_events.is_empty() {
-                run.events.extend(new_events);
-                run.last_event_idx = run.events.len() as i64 - 1;
+                append_in_memory_events(run, new_events);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
             }
         };
@@ -9848,10 +10140,7 @@ impl RunStateStore for InMemoryRunStateStore {
             if events.is_empty() {
                 return Ok(());
             }
-            let start_idx = run.events.len() as i64;
-            let event_count = events.len() as i64;
-            run.events.extend(events);
-            run.last_event_idx = start_idx + event_count - 1;
+            append_in_memory_events(run, events);
             run.updated_at = chrono::Utc::now().to_rfc3339();
         }
         Ok(())
@@ -11212,7 +11501,7 @@ const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
 
 const RUN_CONTROL_COLUMNS: &str =
     "run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-     run_generation, last_event_idx,
+     run_generation, last_event_idx, last_guidance_event_idx,
      CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
      CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
           AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live";
@@ -11656,6 +11945,9 @@ impl DatabaseRunStateStore {
         }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&event_rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
         update.push(", updated_at = NOW(6) WHERE user_id = ");
         update.push_bind(user_id);
         update.push(" AND session_id = ");
@@ -12508,7 +12800,7 @@ impl DatabaseRunStateStore {
             Some(&run.run_id),
         )
         .await
-        .map(|activity| activity.is_idle())
+        .map(|activity| !activity.active_run)
         .map_err(|source| db_error("check_execution_activity", &run.session_id, source))
     }
 
@@ -13136,18 +13428,25 @@ impl DatabaseRunStateStore {
         #[cfg(test)]
         let mut rows = rows;
         let last_event_idx = rows.last().expect("non-empty staged batch").event_idx;
-        let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
-        )
-        .bind(last_event_idx)
-        .bind(user_id)
-        .bind(&run.session_id)
-        .bind(run_id)
-        .bind(run.last_event_idx)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error("update_run_event_batch_counter", run_id, source))?;
+        let mut update = QueryBuilder::<MySql>::new("UPDATE agent_runs SET last_event_idx = ");
+        update.push_bind(last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
+        update
+            .push(", updated_at = NOW(6) WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(&run.session_id)
+            .push(" AND run_id = ")
+            .push_bind(run_id)
+            .push(" AND last_event_idx = ")
+            .push_bind(run.last_event_idx);
+        let updated = update
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| db_error("update_run_event_batch_counter", run_id, source))?;
         if updated.rows_affected() != 1 {
             return Err(db_error(
                 "update_run_event_batch_counter",
@@ -13346,6 +13645,44 @@ async fn exact_run_event_receipts_match(
     Ok(true)
 }
 
+fn original_run_model_matches(expected: &DurableRunRecord, actual: &DurableRunRecord) -> bool {
+    let OpeningBody::Loaded(Some(opening)) = &actual.opening else {
+        return expected.model_offering_id == actual.model_offering_id
+            && expected.resolved_model_name == actual.resolved_model_name;
+    };
+    let Some(expected_hash) = expected.opening_hash.as_ref() else {
+        return false;
+    };
+    if opening.encode().ok().as_ref().map(|encoded| &encoded.hash) != Some(expected_hash) {
+        return false;
+    }
+    let Ok(admission) = opening.admission_data() else {
+        return false;
+    };
+    match (
+        admission.get("model_selection"),
+        admission.get("resolved_model_selection"),
+    ) {
+        (None, None) => {
+            expected.model_offering_id == actual.model_offering_id
+                && expected.resolved_model_name == actual.resolved_model_name
+        }
+        (Some(selection), Some(resolved)) => {
+            let Ok(selection) = serde_json::from_value::<ModelSelection>(selection.clone()) else {
+                return false;
+            };
+            let Ok(resolved) = serde_json::from_value::<ResolvedModelSelection>(resolved.clone())
+            else {
+                return false;
+            };
+            selection.offering_id == resolved.offering_id
+                && expected.model_offering_id.as_deref() == Some(selection.offering_id.as_str())
+                && expected.resolved_model_name.as_deref() == Some(resolved.model_name.as_str())
+        }
+        _ => false,
+    }
+}
+
 fn durable_run_start_receipt_matches(
     expected: &DurableRunRecord,
     actual: &DurableRunRecord,
@@ -13375,8 +13712,7 @@ fn durable_run_start_receipt_matches(
         && expected.agent_binding_id == actual.agent_binding_id
         && expected.agent_binding_name == actual.agent_binding_name
         && expected.agent_binding_schema_version == actual.agent_binding_schema_version
-        && expected.model_offering_id == actual.model_offering_id
-        && expected.resolved_model_name == actual.resolved_model_name
+        && original_run_model_matches(expected, actual)
         && expected.runtime_profile == actual.runtime_profile
         && expected.opening_hash == actual.opening_hash
         && expected.context_admission_hash == actual.context_admission_hash
@@ -13443,7 +13779,7 @@ impl DatabaseRunStateStore {
             "INSERT INTO agent_runs
              (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
               delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, last_guidance_event_idx,
               checkpoint_version, current_checkpoint_id, current_checkpoint_hash, error_code, error_message,
               total_prompt_tokens, total_completion_tokens, total_tool_calls,
               agent_binding_id, agent_binding_name, agent_binding_schema_version,
@@ -13452,7 +13788,7 @@ impl DatabaseRunStateStore {
               work_id, work_branch_id, work_graph_revision,
               work_item_id, work_item_revision, work_item_attempt_id,
               created_at, updated_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), CASE WHEN CAST(? AS SIGNED) = 1 THEN NOW(6) ELSE NULL END)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), CASE WHEN CAST(? AS SIGNED) = 1 THEN NOW(6) ELSE NULL END)",
             null_shape.iter().copied(),
         );
         sqlx::query(insert_sql)
@@ -13473,6 +13809,7 @@ impl DatabaseRunStateStore {
             .bind(self.lease_ttl_micros())
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
+            .bind(record.last_guidance_event_idx)
             .bind(record.current_checkpoint_version())
             .bind(
                 record
@@ -13653,6 +13990,13 @@ impl DatabaseRunStateStore {
                 &record.session_id,
             ));
         }
+        if events.first().is_some_and(is_user_intent_event) {
+            return Err("Run creation cannot place user guidance at event index zero".into());
+        }
+        record.last_guidance_event_idx = events
+            .iter()
+            .rposition(is_user_intent_event)
+            .map_or(-1, |index| index as i64);
         let opening_count = record
             .opening
             .loaded()?
@@ -14148,14 +14492,19 @@ impl DatabaseRunStateStore {
         let dispatched: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM edge_pending_dispatch
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
-               AND request_id = ?
-               AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
+               AND request_id = ? AND edge_agent_id = ?
+               AND ((status = 'dispatched' AND result_json IS NULL)
+                 OR (? IS NOT NULL AND status = 'completed' AND result_json IS NOT NULL)) FOR UPDATE",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(identity.storage_key())
+        .bind(edge_agent_id)
+        // Only the exact unresolved ledger's captured dispatch owner may
+        // settle an ACK after its result frame. This cannot admit more work.
+        .bind(settlement_dispatch_owner)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|source| {
@@ -14732,7 +15081,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
-        let session_capture_override = if independent {
+        let session_admission = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
                 &record.session_id,
@@ -14756,8 +15105,7 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_capture_override =
-            session_capture_override.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override = session_admission.ok_or(RunAdmissionError::SessionBusy)?;
         let provider_owner = record
             .opening
             .loaded()?
@@ -16248,6 +16596,75 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn run_user_intent_status(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        intent_id: &str,
+    ) -> Result<Option<UserIntentStatus>, String> {
+        validate_expected_run_session_id(session_id)?;
+        if intent_id.trim() != intent_id || intent_id.is_empty() {
+            return Err("invalid intent identity".into());
+        }
+        let [source, applied, returned] = user_intent_status_keys(intent_id);
+        let rows = sqlx::query(
+            "SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=? \
+             UNION ALL SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=? \
+             UNION ALL SELECT payload_json,event_idx,session_id FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND idempotency_key=?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(source)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(applied)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(returned)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|e| e.to_string())?;
+        // MatrixOne chooses a run-wide scan when session_id is in the lookup
+        // predicate. Each unique-key lookup is bounded; verify session before
+        // decoding or returning any payload.
+        for row in &rows {
+            if row
+                .try_get::<String, _>("session_id")
+                .map_err(|e| e.to_string())?
+                != session_id
+            {
+                return Ok(None);
+            }
+        }
+        let events = rows
+            .iter()
+            .map(|row| decode_run_event_payload(row, run_id).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        user_intent_status_from_events(intent_id, &events)
+    }
+    async fn finish_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &RunModelOutcome,
+        resolved: Option<&ResolvedModelSelection>,
+    ) -> Result<Option<RunModelOutcome>, String> {
+        self.finish_model_request_inner(user_id, session_id, run_id, outcome, resolved)
+            .await
+    }
+    async fn request_run_model(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunModelRequest,
+    ) -> Result<RunModelSelection, String> {
+        self.request_model_inner(user_id, run_id, request).await
+    }
     async fn derive_tool_interaction_origin(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
@@ -16474,6 +16891,60 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
     }
 
+    async fn inherited_run_model(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<InheritedRunModel, String> {
+        // Child creation already reads Auto's decision. Include the latest
+        // settings in that same read rather than adding another SQL round trip.
+        let row = sqlx::query(
+            "SELECT settings.payload_json AS settings_payload, routing.payload_json AS routing_payload \
+             FROM agent_runs AS run \
+             LEFT JOIN (SELECT payload_json FROM agent_run_events \
+               WHERE user_id=? AND run_id=? AND event_type=? ORDER BY event_idx DESC LIMIT 1) AS settings ON TRUE \
+             LEFT JOIN (SELECT payload_json FROM agent_run_events \
+               WHERE user_id=? AND run_id=? AND event_type=? AND idempotency_key=? ORDER BY event_idx DESC LIMIT 1) AS routing ON TRUE \
+             WHERE run.user_id=? AND run.session_id=? AND run.run_id=? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(settings_control::SETTINGS)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(crate::model_routing::EVENT_TYPE)
+        .bind(crate::model_routing::DECISION_KEY)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|error| db_error("inherited_run_model", run_id, error).to_string())?
+        .ok_or_else(|| "Parent run does not belong to this session".to_string())?;
+        let settings: Option<String> =
+            row.try_get("settings_payload").map_err(|e| e.to_string())?;
+        if let Some(choice) = settings
+            .as_deref()
+            .map(settings_control::read_settings_snapshot)
+            .transpose()?
+            .and_then(|snapshot| snapshot.model.applied)
+        {
+            return Ok(InheritedRunModel::Explicit(choice));
+        }
+        let routing: Option<String> = row.try_get("routing_payload").map_err(|e| e.to_string())?;
+        if let Some(payload) = routing {
+            let event: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|_| "Invalid durable Auto routing event".to_string())?;
+            let decision: crate::model_routing::ModelRoutingDecision =
+                serde_json::from_value(event["data"].clone())
+                    .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
+            decision.validate_identity(run_id, session_id)?;
+            return Ok(InheritedRunModel::Auto(Box::new(decision)));
+        }
+        Ok(InheritedRunModel::Original)
+    }
+
     async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -16483,13 +16954,13 @@ impl RunStateStore for DatabaseRunStateStore {
         self.request_permission_mode_inner(user_id, run_id, request)
             .await
     }
-    async fn permission_mode_snapshot(
+    async fn run_settings_snapshot(
         &self,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+    ) -> Result<Option<RunSettingsSnapshot>, String> {
+        self.run_settings_snapshot_inner(user_id, session_id, run_id)
             .await
     }
     async fn apply_permission_mode(
@@ -17197,6 +17668,56 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())
     }
 
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The source key and native anchor stage have different owners and
+        // indexes. Keep them as separate equality probes in one round trip;
+        // an OR/IN predicate can make MatrixOne scan the whole Run history.
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx, session_id FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? AND event_idx <= ?
+             UNION ALL
+             SELECT payload_json, event_idx, session_id FROM agent_run_events FORCE INDEX (idx_agent_run_events_owner_session_subject)
+             WHERE user_id = ? AND session_id = ? AND event_type = ? AND subject_run_id = ?
+               AND run_id = ? AND event_idx <= ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(source_key)
+        .bind(run.last_event_idx)
+        .bind(user_id)
+        .bind(&run.session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run.last_event_idx)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_guidance_preflight", run_id, source).to_string())?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id: String = row.try_get("session_id").map_err(|e| e.to_string())?;
+            if session_id != run.session_id {
+                return Err("Guidance event belongs to a different session".into());
+            }
+            events.push(decode_run_event_payload(&row, run_id).map_err(|e| e.to_string())?);
+        }
+        Ok(Some(project_run_guidance_preflight(
+            &run, source_key, &events,
+        )))
+    }
+
     async fn load_run_observation(
         &self,
         user_id: &str,
@@ -17614,11 +18135,12 @@ impl RunStateStore for DatabaseRunStateStore {
         .fetch_optional(connection.connection_mut())
         .await
         .map_err(|source| db_error("load_user_intent_watermark", run_id, source).to_string())?;
-        connection.release();
         let Some(authoritative_last_event_idx) = watermark else {
+            connection.release();
             return Ok(None);
         };
         if after_event_idx >= authoritative_last_event_idx {
+            connection.release();
             return Ok(Some(DurableRunUserIntentControlDelta {
                 authoritative_last_event_idx,
                 page_cursor: after_event_idx,
@@ -17646,7 +18168,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(authoritative_last_event_idx)
             .bind(sql_limit)
             .bind(sql_limit)
-            .fetch_all(self.pool.get())
+            .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| {
                 db_error("load_user_intent_control_delta", run_id, source).to_string()
@@ -17684,7 +18206,7 @@ impl RunStateStore for DatabaseRunStateStore {
             builder.push(" ORDER BY event_idx ASC");
             builder
                 .build()
-                .fetch_all(self.pool.get())
+                .fetch_all(connection.connection_mut())
                 .await
                 .map_err(|source| {
                     db_error("load_user_intent_control_dispositions", run_id, source).to_string()
@@ -17694,6 +18216,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?
         };
+        connection.release();
         Ok(Some(DurableRunUserIntentControlDelta {
             authoritative_last_event_idx,
             page_cursor,
@@ -17791,9 +18314,8 @@ impl RunStateStore for DatabaseRunStateStore {
         // subsequently fences or settles.
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let duplicate = sqlx::query(
-            "SELECT payload_json, event_idx, session_id, invocation_supersession_scope_key FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-               AND idempotency_key = ? LIMIT 1",
+            "SELECT payload_json, event_idx, session_id, event_type, invocation_supersession_scope_key FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
         )
         .bind(request.user_id)
         .bind(request.run_id)
@@ -17804,9 +18326,13 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("admit_run_guidance_load_duplicate", request.run_id, source).to_string()
         })?;
         if let Some(row) = duplicate {
-            let projection_matches = row.try_get::<String, _>("session_id").map_err(|source| {
-                db_error("decode_guidance_duplicate_session", request.run_id, source).to_string()
-            })? == request.expected_session_id
+            let projection_matches = row.try_get::<String, _>("event_type").map_err(|source| {
+                db_error("decode_guidance_duplicate_type", request.run_id, source).to_string()
+            })? == "user_intent"
+                && row.try_get::<String, _>("session_id").map_err(|source| {
+                    db_error("decode_guidance_duplicate_session", request.run_id, source)
+                        .to_string()
+                })? == request.expected_session_id
                 && row
                     .try_get::<Option<String>, _>("invocation_supersession_scope_key")
                     .map_err(|source| {
@@ -17890,11 +18416,12 @@ impl RunStateStore for DatabaseRunStateStore {
         // expire while this transaction owns the row even though no other
         // transaction can mutate it.
         let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
+            "UPDATE agent_runs SET last_event_idx = ?, last_guidance_event_idx = ?, updated_at = NOW(6)
              WHERE user_id = ? AND run_id = ? AND last_event_idx = ?
                AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
                AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)",
         )
+        .bind(event_index)
         .bind(event_index)
         .bind(request.user_id)
         .bind(request.run_id)
@@ -18720,7 +19247,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_control_batch", "batch", source).to_string())?;
-        connection.release();
         let mut results = vec![None; keys.len()];
         for row in rows {
             let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
@@ -18742,10 +19268,12 @@ impl RunStateStore for DatabaseRunStateStore {
                     .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose()),
             );
         }
-        results
+        let results = results
             .into_iter()
             .map(|result| result.ok_or_else(|| "missing run control request ordinal".into()))
-            .collect()
+            .collect::<Result<_, String>>()?;
+        connection.release();
+        Ok(results)
     }
 
     async fn load_run_controls(
@@ -18933,6 +19461,11 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         update.push(", last_event_idx = ");
         update.push_bind(event_idx);
+        if event_row.event_type == "user_intent" {
+            update
+                .push(", last_guidance_event_idx = ")
+                .push_bind(event_idx);
+        }
         update.push(", updated_at = NOW(6) WHERE user_id = ");
         update.push_bind(user_id);
         update.push(" AND session_id = ");
@@ -19225,6 +19758,9 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut update =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET last_event_idx = ");
         update.push_bind(next_last_event_idx);
+        if let Some(index) = latest_guidance_in_rows(&event_rows) {
+            update.push(", last_guidance_event_idx = ").push_bind(index);
+        }
         if let Some(selection) = &selection {
             update.push(", model_offering_id = ");
             update.push_bind(&selection.selected_offering_id);
@@ -23846,6 +24382,19 @@ fn decode_run_control_row(
     row: &sqlx::mysql::MySqlRow,
     entity: &str,
 ) -> Result<DurableRunControlRecord, String> {
+    let last_event_idx: i64 = row
+        .try_get("last_event_idx")
+        .map_err(|source| db_error("decode_run_control_event_index", entity, source).to_string())?;
+    let last_guidance_event_idx: i64 =
+        row.try_get("last_guidance_event_idx").map_err(|source| {
+            db_error("decode_run_control_guidance_index", entity, source).to_string()
+        })?;
+    if last_guidance_event_idx < -1
+        || last_guidance_event_idx == 0
+        || last_guidance_event_idx > last_event_idx
+    {
+        return Err(format!("invalid guidance watermark for run {entity}"));
+    }
     Ok(DurableRunControlRecord {
         run_id: row
             .try_get("run_id")
@@ -23872,9 +24421,8 @@ fn decode_run_control_row(
             |source| db_error("decode_run_control_generation", entity, source).to_string(),
         )?)
         .map_err(|_| format!("negative run generation in control row for {entity}"))?,
-        last_event_idx: row.try_get("last_event_idx").map_err(|source| {
-            db_error("decode_run_control_event_index", entity, source).to_string()
-        })?,
+        last_event_idx,
+        last_guidance_event_idx,
         owner_lease_live: row
             .try_get::<i64, _>("owner_lease_live")
             .map_err(|source| {
@@ -24021,6 +24569,17 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
     let context_admission_hash =
         run_row_optional_string(row, operation, table, "context_admission_hash")?;
     let opening = decode_run_opening_from_row(row)?;
+    let last_event_idx = run_row_at_least_i64(row, operation, table, "last_event_idx", -1)?;
+    let last_guidance_event_idx =
+        run_row_at_least_i64(row, operation, table, "last_guidance_event_idx", -1)?;
+    if last_guidance_event_idx == 0 || last_guidance_event_idx > last_event_idx {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "last_guidance_event_idx",
+            "guidance watermark exceeds the event frontier",
+        ));
+    }
     Ok(DurableRunRecord {
         opening,
         opening_hash,
@@ -24052,7 +24611,8 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             "owner_lease_expires_at",
         )?,
         run_generation: run_row_u64(row, operation, table, "run_generation")?,
-        last_event_idx: run_row_at_least_i64(row, operation, table, "last_event_idx", -1)?,
+        last_event_idx,
+        last_guidance_event_idx,
         current_checkpoint: decode_current_checkpoint_ref(row)?,
         error_code: run_row_optional_string(row, operation, table, "error_code")?,
         error_message: run_row_optional_string(row, operation, table, "error_message")?,
@@ -24241,6 +24801,48 @@ pub fn extract_event_type(event: &serde_json::Value) -> String {
     extract_optional_string(event, "event_type")
         .or_else(|| extract_optional_string(event, "type"))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_user_intent_event(event: &serde_json::Value) -> bool {
+    event
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| event.get("type").and_then(serde_json::Value::as_str))
+        == Some("user_intent")
+}
+
+// Store-assigned positions, not caller-provided payload metadata, identify new
+// events. Index zero is reserved for the initial run receipt.
+fn append_in_memory_events(run: &mut DurableRunRecord, mut events: Vec<serde_json::Value>) {
+    if events.is_empty() {
+        return;
+    }
+    if run.events.is_empty() && is_user_intent_event(&events[0]) {
+        run.events
+            .push(run_created_receipt_event(&run.run_id, &run.session_id));
+    }
+    let first_index = run.events.len() as i64;
+    for (offset, event) in events.iter_mut().enumerate() {
+        let index = first_index.saturating_add(offset as i64);
+        if event.get("index").is_some()
+            && let Some(object) = event.as_object_mut()
+        {
+            object.insert("index".to_string(), serde_json::json!(index));
+        }
+        if is_user_intent_event(event) {
+            run.last_guidance_event_idx = index;
+        }
+        run.last_event_idx = index;
+    }
+    run.events.extend(events);
+}
+
+fn latest_guidance_in_rows(rows: &[RunEventInsertRow]) -> Option<i64> {
+    rows.iter()
+        .rev()
+        .find(|row| row.event_type == "user_intent")
+        .map(|row| row.event_idx)
 }
 
 fn extract_optional_string(event: &serde_json::Value, key: &str) -> Option<String> {
@@ -25196,6 +25798,13 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
+    if event_type == "user_intent" && event_idx == 0 {
+        return Err(db_error(
+            "build_run_event",
+            run_id,
+            sqlx::Error::Protocol("user guidance cannot occupy the initial event index".into()),
+        ));
+    }
     let invocation_supersession_scope_key =
         projected_invocation_supersession_scope_key(user_id, session_id, run_id, event_idx, event);
     let subject_run_id = match event_type.as_str() {
@@ -25286,6 +25895,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "runtime.control.handoff.rejected",
     "user_intent_accepted",
     "permission_mode_applied",
+    "run_model_outcome",
     "user_intent_applied",
     "user_intent_returned",
     "context_meta",
@@ -25335,12 +25945,13 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "work_task_board_update",
 ];
 
-fn project_hook_configuration_warning(event: serde_json::Value) -> serde_json::Value {
+fn project_client_warning(event: serde_json::Value) -> serde_json::Value {
     // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
-    // This message is authored by the typed, redacted hook diagnostic producer.
-    if event.get("code").and_then(serde_json::Value::as_str) != Some("hook_configuration") {
+    // Accepted messages are authored by the typed, redacted hook producer.
+    let Some(code @ "hook_configuration") = event.get("code").and_then(serde_json::Value::as_str)
+    else {
         return serde_json::Value::Null;
-    }
+    };
     let Some(message) = event
         .get("message")
         .and_then(serde_json::Value::as_str)
@@ -25354,7 +25965,7 @@ fn project_hook_configuration_warning(event: serde_json::Value) -> serde_json::V
         return serde_json::Value::Null;
     };
     let mut projected = serde_json::json!({
-        "type": "warning", "code": "hook_configuration", "message": message,
+        "type": "warning", "code": code, "message": message,
     });
     if let Some(index) = event.get("index").and_then(serde_json::Value::as_u64) {
         projected["index"] = index.into();
@@ -25547,7 +26158,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_execution_binding = matches!(client_type, "workspace_bound" | "executor_bound");
         if is_external {
             return if client_type == "warning" {
-                project_hook_configuration_warning(event)
+                project_client_warning(event)
             } else if client_type == "artifact_publication" {
                 project_artifact_publication(event)
             } else if is_tool_call_end {
@@ -25598,7 +26209,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             if let Some(index) = event.get("index") {
                 wire["index"] = index.clone();
             }
-            project_hook_configuration_warning(wire)
+            project_client_warning(wire)
         }
         "workspace_bound" | "executor_bound" => {
             let mut wire = serde_json::Value::Object(data);
@@ -25830,6 +26441,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "turn_evaluation",
                     "status",
                     "cancellation_origin",
+                    "context_not_saved",
                     "outcome",
                     "finish_reason",
                     "error",
@@ -26038,21 +26650,25 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
-        "permission_mode_applied" => {
-            let Ok(applied) = serde_json::from_value::<RunPermissionModeApplied>(
-                serde_json::Value::Object(data.clone()),
-            ) else {
+        "run_settings_snapshot" => {
+            let Ok(settings) =
+                serde_json::from_value::<RunSettingsEvent>(serde_json::Value::Object(data.clone()))
+            else {
                 return serde_json::Value::Null;
             };
-            let mut event = serde_json::json!({"type":"permission_mode_applied", "request_id":applied.selection.request_id,
-                "mode":applied.selection.mode,"revision":applied.selection.revision,
-                "round_index":applied.round_index,"owner_generation":applied.owner_generation});
-            for key in ["run_id", "session_id"] {
-                if let Some(value) = data.get(key) {
-                    event[key] = value.clone();
+            match settings.change {
+                RunSettingsChange::PermissionApplied(applied) => {
+                    serde_json::json!({"type":"permission_mode_applied", "request_id":applied.selection.request_id,
+                    "mode":applied.selection.mode,"revision":applied.selection.revision,
+                    "round_index":applied.round_index,"owner_generation":applied.owner_generation,
+                    "run_id":settings.run_id,"session_id":settings.session_id})
                 }
+                RunSettingsChange::ModelOutcome(outcome) => serde_json::json!({
+                    "type":"run_model_outcome", "run_id":settings.run_id,
+                    "session_id":settings.session_id, "outcome":outcome
+                }),
+                _ => serde_json::Value::Null,
             }
-            event
         }
         "user_intent_applied" => {
             let mut out = serde_json::json!({ "type": "user_intent_applied" });
@@ -26871,7 +27487,7 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hook_config_diagnostics_project_only_marked_redacted_warnings() {
+    fn client_warnings_project_only_marked_redacted_warnings() {
         let message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";
         let data = serde_json::json!({
             "code": "hook_configuration", "message": message,
@@ -27194,11 +27810,21 @@ mod tests {
             owner_generation: 2,
             round_index: 3,
         };
-        let mut data = serde_json::to_value(applied).unwrap();
-        data["run_id"] = "run-1".into();
-        data["session_id"] = "session-1".into();
+        let data = serde_json::to_value(RunSettingsEvent {
+            change: RunSettingsChange::PermissionApplied(applied.clone()),
+            snapshot: RunSettingsSnapshot {
+                permission: RunPermissionModeSnapshot {
+                    requested: None,
+                    applied: Some(applied),
+                },
+                ..Default::default()
+            },
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+        })
+        .unwrap();
         let replay = transform_run_event_for_client(
-            serde_json::json!({"event_type":"permission_mode_applied","data":data}),
+            serde_json::json!({"event_type":"run_settings_snapshot","data":data}),
         );
         assert_eq!(replay["run_id"], "run-1");
         assert_eq!(replay["session_id"], "session-1");
@@ -27207,10 +27833,66 @@ mod tests {
         assert_eq!(transform_run_event_for_client(replay.clone()), replay);
         assert!(
             transform_run_event_for_client(
-                serde_json::json!({"event_type":"permission_mode_applied","data":{}})
+                serde_json::json!({"event_type":"run_settings_snapshot","data":{}})
             )
             .is_null()
         );
+    }
+
+    #[test]
+    fn model_outcome_projection_excludes_internal_model_route() {
+        use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind};
+        let selection = RunModelSelection {
+            request_id: "choose-model".into(),
+            revision: 7,
+            model: ModelSelection {
+                offering_id: "offering".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let outcome = RunModelOutcome {
+            selection: selection.clone(),
+            owner_generation: 2,
+            round_index: 3,
+            result: RunModelOutcomeKind::Applied {
+                model: selection.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let settings = RunSettingsEvent {
+            change: RunSettingsChange::ModelOutcome(outcome.clone()),
+            snapshot: RunSettingsSnapshot {
+                model: RunModelSettingsSnapshot {
+                    requested: Some(selection.clone()),
+                    outcome: Some(outcome.clone()),
+                    applied: Some(RunModelApplied {
+                        selection,
+                        reasoning: ReasoningRequirement::ModelDefault,
+                        resolved: ResolvedModelSelection {
+                            offering_id: "offering".into(),
+                            model_name: "internal-name".into(),
+                            source_identity: Some(ResolvedModelSourceIdentity {
+                                provider: "internal-provider".into(),
+                                access_label: "private-account".into(),
+                            }),
+                        },
+                        owner_generation: 2,
+                        round_index: 3,
+                    }),
+                },
+                ..Default::default()
+            },
+            run_id: "run".into(),
+            session_id: "session".into(),
+        };
+        let event = transform_run_event_for_client(
+            serde_json::json!({"event_type":"run_settings_snapshot", "data":settings}),
+        );
+        assert_eq!(event["type"], "run_model_outcome");
+        assert_eq!(event["outcome"], serde_json::to_value(outcome).unwrap());
+        assert!(!event.to_string().contains("internal-provider"));
+        assert!(!event.to_string().contains("private-account"));
+        assert_eq!(transform_run_event_for_client(event.clone()), event);
     }
 
     #[tokio::test]
@@ -27298,6 +27980,15 @@ mod tests {
             .request_permission_mode("u1", "permission-run", &conflicting)
             .await
             .unwrap();
+        // A delayed retry of the first request must not restore its old
+        // snapshot over a later choice.
+        assert_eq!(
+            store
+                .request_permission_mode("u1", "permission-run", &request)
+                .await
+                .unwrap(),
+            first
+        );
         let snapshot = store
             .permission_mode_snapshot("u1", "s1", "permission-run")
             .await
@@ -27421,6 +28112,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_and_permission_requests_share_a_fenced_snapshot() {
+        use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind};
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("settings-run"))
+            .await
+            .unwrap();
+        let model = RunModelRequest {
+            expected_session_id: "s1".into(),
+            request_id: "model-a".into(),
+            model: ModelSelection {
+                offering_id: "offering-a".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let permission = RunPermissionModeRequest {
+            expected_session_id: "s1".into(),
+            request_id: "mode".into(),
+            mode: astra_turn_types::PermissionMode::Plan,
+        };
+        let first = store
+            .request_run_model("u1", "settings-run", &model)
+            .await
+            .unwrap();
+        let mode = store
+            .request_permission_mode("u1", "settings-run", &permission)
+            .await
+            .unwrap();
+        let mut later = model.clone();
+        later.request_id = "model-b".into();
+        later.model.offering_id = "offering-b".into();
+        let second = store
+            .request_run_model("u1", "settings-run", &later)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .request_run_model("u1", "settings-run", &model)
+                .await
+                .unwrap(),
+            first
+        );
+        let snapshot = store
+            .run_settings_snapshot("u1", "s1", "settings-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.requested, Some(second.clone()));
+        assert_eq!(snapshot.permission.requested, Some(mode));
+        assert!(snapshot.model.applied.is_none());
+        let resolved = ResolvedModelSelection {
+            offering_id: "offering-b".into(),
+            model_name: "model-b".into(),
+            source_identity: None,
+        };
+        let stale = RunModelOutcome {
+            selection: first,
+            owner_generation: 0,
+            round_index: 1,
+            result: RunModelOutcomeKind::Applied {
+                model: model.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let stale_result = store
+            .finish_run_model("u1", "s1", "settings-run", &stale, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stale_result.result,
+            RunModelOutcomeKind::Superseded
+        ));
+        let applied = RunModelOutcome {
+            selection: second.clone(),
+            owner_generation: 0,
+            round_index: 2,
+            result: RunModelOutcomeKind::Applied {
+                model: later.model.clone(),
+                reasoning: ReasoningRequirement::ModelDefault,
+            },
+        };
+        let mut wrong_owner = applied.clone();
+        wrong_owner.owner_generation = 1;
+        assert!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &wrong_owner, Some(&resolved),)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &applied, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(applied.clone())
+        );
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &applied, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(applied)
+        );
+        let mut rejected_request = later.clone();
+        rejected_request.request_id = "model-c".into();
+        rejected_request.model.offering_id = "offering-c".into();
+        let rejected_selection = store
+            .request_run_model("u1", "settings-run", &rejected_request)
+            .await
+            .unwrap();
+        let rejected = RunModelOutcome {
+            selection: rejected_selection,
+            owner_generation: 0,
+            round_index: 3,
+            result: RunModelOutcomeKind::Rejected {
+                kind: astra_core::ErrorKind::Auth,
+                error_code: Some("model_access_denied".into()),
+            },
+        };
+        assert_eq!(
+            store
+                .finish_run_model("u1", "s1", "settings-run", &rejected, None,)
+                .await
+                .unwrap(),
+            Some(rejected.clone())
+        );
+        let snapshot = store
+            .run_settings_snapshot("u1", "s1", "settings-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.applied.unwrap().selection, second);
+        assert_eq!(snapshot.model.outcome, Some(rejected));
+        let mut conflicting = model.clone();
+        conflicting.reasoning = ReasoningRequirement::Off;
+        assert!(
+            store
+                .request_run_model("u1", "settings-run", &conflicting)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .request_run_model("other", "settings-run", &model)
+                .await
+                .is_err()
+        );
+        let mut invalid = model;
+        invalid.request_id = "invalid".into();
+        invalid.reasoning = ReasoningRequirement::Budget { tokens: 0 };
+        assert!(
+            store
+                .request_run_model("u1", "settings-run", &invalid)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_permission_mode_control_round_snapshot() {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -27433,6 +28285,19 @@ mod tests {
         run.user_id = user.clone();
         run.session_id = session.clone();
         store.insert_run(run).await.unwrap();
+        assert_eq!(
+            store
+                .inherited_run_model(&user, &session, &id)
+                .await
+                .unwrap(),
+            InheritedRunModel::Original
+        );
+        assert!(
+            store
+                .inherited_run_model(&user, "wrong-session", &id)
+                .await
+                .is_err()
+        );
         let request = RunPermissionModeRequest {
             expected_session_id: session.clone(),
             request_id: "change".into(),
@@ -27473,6 +28338,102 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.applied.unwrap().selection, selected);
+        let next = RunPermissionModeRequest {
+            request_id: "later".into(),
+            mode: astra_turn_types::PermissionMode::Deny,
+            ..request.clone()
+        };
+        let next_selected = store
+            .request_permission_mode(&user, &id, &next)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .request_permission_mode(&user, &id, &request)
+                .await
+                .unwrap(),
+            selected
+        );
+        let snapshot = store
+            .permission_mode_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.requested, Some(next_selected));
+        assert_eq!(snapshot.applied.unwrap().selection, selected);
+        // Concurrent settings must merge under the same durable run fence.
+        let model = RunModelRequest {
+            expected_session_id: session.clone(),
+            request_id: "concurrent-model".into(),
+            model: ModelSelection {
+                offering_id: "test-offering".into(),
+            },
+            reasoning: astra_turn_types::ReasoningRequirement::ModelDefault,
+        };
+        let concurrent_permission = RunPermissionModeRequest {
+            expected_session_id: session.clone(),
+            request_id: "concurrent-mode".into(),
+            mode: astra_turn_types::PermissionMode::Auto,
+        };
+        let (model_result, permission_result) = tokio::join!(
+            store.request_run_model(&user, &id, &model),
+            store.request_permission_mode(&user, &id, &concurrent_permission),
+        );
+        let model_result = model_result.unwrap();
+        let permission_result = permission_result.unwrap();
+        let snapshot = store
+            .run_settings_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.model.requested, Some(model_result.clone()));
+        assert_eq!(snapshot.permission.requested, Some(permission_result));
+        assert_eq!(snapshot.permission.applied.unwrap().selection, selected);
+        let outcome = RunModelOutcome {
+            selection: model_result,
+            owner_generation: generation,
+            round_index: 1,
+            result: astra_turn_types::RunModelOutcomeKind::Applied {
+                model: model.model.clone(),
+                reasoning: model.reasoning.clone(),
+            },
+        };
+        let resolved = ResolvedModelSelection {
+            offering_id: model.model.offering_id.clone(),
+            model_name: "test-model".into(),
+            source_identity: None,
+        };
+        assert_eq!(
+            store
+                .finish_run_model(&user, &session, &id, &outcome, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(outcome.clone())
+        );
+        assert_eq!(
+            store
+                .finish_run_model(&user, &session, &id, &outcome, Some(&resolved),)
+                .await
+                .unwrap(),
+            Some(outcome)
+        );
+        let run = store.load_run(&user, &id).await.unwrap().unwrap();
+        assert_eq!(run.model_offering_id.as_deref(), Some("test-offering"));
+        assert_eq!(run.resolved_model_name.as_deref(), Some("test-model"));
+        let snapshot = store
+            .run_settings_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let applied = snapshot.model.applied.unwrap();
+        assert_eq!(applied.resolved, resolved);
+        assert_eq!(
+            store
+                .inherited_run_model(&user, &session, &id)
+                .await
+                .unwrap(),
+            InheritedRunModel::Explicit(applied)
+        );
         assert!(
             store
                 .permission_mode_snapshot(&user, &session, "absent-run")
@@ -27533,6 +28494,7 @@ mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -28114,6 +29076,39 @@ mod tests {
         assert!(!durable_run_start_receipt_matches(
             &expected,
             &missing_event
+        ));
+    }
+
+    #[test]
+    fn run_start_receipt_uses_the_immutable_original_model_after_a_switch() {
+        let mut expected = durable_run_record("model-start-receipt");
+        expected.model_offering_id = Some("original-offering".into());
+        expected.resolved_model_name = Some("original-model".into());
+        let opening = DurableRunOpening::new(vec![serde_json::json!({
+            "event_type":"run_started", "data": {
+                "model_selection":{"offering_id":"original-offering"},
+                "resolved_model_selection":{"offering_id":"original-offering","model_name":"original-model"}
+            }
+        })]).unwrap();
+        expected.opening_hash = Some(opening.encode().unwrap().hash);
+        let mut actual = expected.clone();
+        actual.opening = Some(opening).into();
+        actual.model_offering_id = Some("new-offering".into());
+        actual.resolved_model_name = Some("new-model".into());
+        assert!(durable_run_start_receipt_matches(&expected, &actual));
+        let mut wrong_opening = actual.clone();
+        if let OpeningBody::Loaded(Some(opening)) = &mut wrong_opening.opening {
+            opening.events[0]["data"]["resolved_model_selection"]["model_name"] = "other".into();
+        }
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &wrong_opening
+        ));
+        let mut wrong_generation = actual;
+        wrong_generation.run_generation += 1;
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &wrong_generation
         ));
     }
 
@@ -28794,6 +29789,7 @@ mod tests {
                 "depth" => 2,
                 "run_generation" => 3,
                 "last_event_idx" => 4,
+                "last_guidance_event_idx" => -1,
                 "total_prompt_tokens" => 100,
                 "total_completion_tokens" => 25,
                 "total_tool_calls" => 6,
@@ -31039,8 +32035,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_independent_admission_fences_competing_runs_live_leases_and_unknown_effects()
-    {
+    async fn database_independent_admission_fences_live_owners_but_allows_prior_unknown_effects() {
         use crate::tool_invocation_ledger::{
             DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
         };
@@ -31196,16 +32191,34 @@ mod tests {
             .await
             .unwrap();
         let final_run = record("after-effect");
-        assert!(
-            store.insert_run(final_run.clone()).await.is_err(),
-            "terminal Run and executor exit cannot discharge unknown effects"
-        );
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
             &user,
             &session,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
+        // Ordinary controller work may proceed after the Run owner exits,
+        // while destructive workspace reuse still requires settled effects.
+        use crate::session_context_coordinator::{
+            AcquireWriterOutcome, DatabaseSessionContextCoordinator, SessionContextCoordinator,
+        };
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user,
+            "controller",
+            astra_turn_types::ActorKindV1::Cli,
+            astra_turn_types::SessionSurfaceV1::Cli,
+            None,
+            Default::default(),
+        );
+        let AcquireWriterOutcome::Acquired(lease) = coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(60), "after-unknown")
+            .await
+            .expect("a prior unknown result is not a live controller owner")
+        else {
+            panic!("no controller owns this Session")
+        };
+        coordinator.release_writer(&lease).await.unwrap();
         let mut tx = pool.get().begin().await.unwrap();
         let facts =
             crate::storage::admit_context_execution_write_with_facts(&mut tx, &session, &user)
@@ -31220,8 +32233,33 @@ mod tests {
             Some(crate::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool)
         );
         tx.rollback().await.unwrap();
-        // A confirmed effect outcome, rather than a Run status or deleted
-        // pointer, is the existing custody owner's release boundary.
+        store
+            .insert_run(final_run.clone())
+            .await
+            .expect("a prior unknown invocation does not block an independent Run");
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            ToolInvocationState::OutcomeUnknown
+        );
+        assert!(
+            ledger
+                .claim_dispatch(
+                    &identity,
+                    "another-worker",
+                    90_000,
+                    ToolInvocationDispatchAdmission {
+                        expected_control_epoch: -1,
+                        expected_owner_generation: next.run_generation,
+                        expected_owner_pod_id: store.owner_pod_id.clone(),
+                        expected_execution_binding_generation: None,
+                    },
+                )
+                .await
+                .is_err(),
+            "the original invocation must not be redelivered"
+        );
+        // Only a confirmed result settles the original invocation, independently
+        // of admitting a new Run. Destructive changes retain their stricter gate.
         ledger
             .compare_and_complete(
                 &identity,
@@ -31238,10 +32276,6 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .insert_run(final_run.clone())
-            .await
-            .expect("confirmed custody allows the next independent Run");
         cleanup_database_run_fixture(&pool, &other_user, &other_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&other_user)
@@ -31255,9 +32289,10 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
-        for run in [&winner, &next, &final_run] {
+        for run in [&winner, &next] {
             cleanup_database_run_fixture(&pool, &user, &run.run_id).await;
         }
+        cleanup_execution_resume_fixture(&pool, &user, &final_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&user)
             .bind(&session)
@@ -34963,6 +35998,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.replayed);
+        let initial_preflight = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial_preflight.native_anchor);
+        assert!(!initial_preflight.source_already_admitted);
         let native = CollaboratorNativeSession {
             anchor_run_id: anchor_id.clone(),
             provider: CollaboratorProvider::Codex,
@@ -35064,6 +36106,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(association.latest_stage.run_id, next_id);
+        let old_anchor = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            old_anchor.native_anchor,
+            "the anchor remains identifiable after a later stage"
+        );
+        let later_stage = store
+            .load_run_guidance_preflight(&user_id, &next_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !later_stage.native_anchor,
+            "later stages use the canonical association lookup"
+        );
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", &anchor_id, "user_intent:new")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store
                 .load_run(&user_id, &anchor_id)
@@ -42236,6 +43303,7 @@ mod tests {
                     owner_lease_expires_at: None,
                     run_generation: 0,
                     last_event_idx: -1,
+                    last_guidance_event_idx: -1,
                     current_checkpoint: None,
                     error_code: None,
                     error_message: None,
@@ -42336,14 +43404,14 @@ mod tests {
             if live {
                 assert_eq!(
                     result,
-                    AtomicRunGuidanceAdmission::Committed { event_index: 0 }
+                    AtomicRunGuidanceAdmission::Committed { event_index: 1 }
                 );
                 assert_eq!(
                     store
                         .admit_run_guidance(guidance_admission_request(id, id, &event, live))
                         .await
                         .unwrap(),
-                    AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+                    AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
                 );
             } else {
                 assert!(matches!(
@@ -42354,12 +43422,11 @@ mod tests {
             let run = store.load_run("u1", id).await.unwrap().unwrap();
             assert_eq!(run.status, STATUS_PAUSED);
             assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
-            assert_eq!(run.events.len(), usize::from(live));
-            assert!(
-                run.events
-                    .iter()
-                    .all(|event| extract_event_type(event) == "user_intent")
-            );
+            assert_eq!(run.events.len(), 2 * usize::from(live));
+            assert!(run.events.iter().all(|event| matches!(
+                extract_event_type(event).as_str(),
+                "run_created" | "user_intent"
+            )));
         }
     }
 
@@ -42381,7 +43448,7 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AtomicRunGuidanceAdmission::Committed { event_index: 0 }
+            AtomicRunGuidanceAdmission::Committed { event_index: 1 }
         );
         store
             .runs
@@ -42400,7 +43467,7 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+            AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         );
         let mut conflicting = event.clone();
         conflicting["data"]["input"] = json!({"content": "different immutable guidance"});
@@ -42865,7 +43932,7 @@ mod tests {
         assert_eq!(
             outcome,
             AtomicRunActionAdmission::Superseded {
-                user_intent_event_index: 0
+                user_intent_event_index: 1
             }
         );
         let run = store
@@ -42873,8 +43940,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.events.len(), 1);
-        assert_eq!(extract_event_type(&run.events[0]), "user_intent");
+        assert_eq!(run.events.len(), 2);
+        assert_eq!(extract_event_type(&run.events[1]), "user_intent");
     }
 
     #[tokio::test]
@@ -42988,19 +44055,19 @@ mod tests {
             .await
             .unwrap();
         let mut request = action_admission_request("action-observed-intent");
-        request.expected_control_epoch = 0;
+        request.expected_control_epoch = 1;
 
         let started = store.begin_action(request).await.unwrap();
         assert_eq!(
             started,
-            AtomicRunActionAdmission::Started { event_index: 1 }
+            AtomicRunActionAdmission::Started { event_index: 2 }
         );
         assert!(started.is_fresh_grant());
-        assert!(AtomicRunActionAdmission::AckRecoveredStarted { event_index: 1 }.is_fresh_grant());
+        assert!(AtomicRunActionAdmission::AckRecoveredStarted { event_index: 2 }.is_fresh_grant());
         let replay = store.begin_action(request).await.unwrap();
         assert_eq!(
             replay,
-            AtomicRunActionAdmission::AlreadyStarted { event_index: 1 }
+            AtomicRunActionAdmission::AlreadyStarted { event_index: 2 }
         );
         assert!(
             !replay.is_fresh_grant(),
@@ -44853,7 +45920,7 @@ mod tests {
                 .await
                 .unwrap(),
             AtomicRunInteractionBatchRegistration::Superseded {
-                user_intent_event_index: 0
+                user_intent_event_index: 1
             }
         );
         let run = store
@@ -44875,7 +45942,7 @@ mod tests {
             projection.events.last().map(extract_event_type).as_deref(),
             Some("user_intent")
         );
-        assert_eq!(projection.last_event_idx, 0);
+        assert_eq!(projection.last_event_idx, 1);
     }
 
     fn recovered_interaction_event(expected: &RunEventInsertRow) -> RecoveredInteractionEvent {
@@ -45387,17 +46454,18 @@ mod tests {
             let mut run = durable_run_record(&run_id);
             run.status = status.to_string();
             run.waiting_for = waiting_for.map(ToString::to_string);
+            run.events.push(make_event("run_created", json!({})));
             run.events.push(json!({
                 "event_type": "user_intent",
                 "idempotency_key": format!("user_intent:{run_id}"),
-                "index": 0,
+                "index": 1,
                 "data": {
                     "intent_id": format!("intent-{run_id}"),
                     "delivery": "guide_current_run",
                     "input": {"content": "preserve this guidance"}
                 }
             }));
-            run.last_event_idx = 0;
+            run.last_event_idx = 1;
             store.insert_run(run).await.unwrap();
             assert!(store.request_run_cancellation("u1", &run_id).await.unwrap());
 
@@ -45418,18 +46486,18 @@ mod tests {
             assert!(cancelled.waiting_for.is_none(), "{suffix}");
             assert!(cancelled.owner_pod_id.is_none(), "{suffix}");
             assert!(cancelled.owner_lease_expires_at.is_none(), "{suffix}");
-            assert_eq!(cancelled.events.len(), 3, "{suffix}");
+            assert_eq!(cancelled.events.len(), 4, "{suffix}");
             assert_eq!(
-                cancelled.events[1]["event_type"], "user_intent_returned",
+                cancelled.events[2]["event_type"], "user_intent_returned",
                 "{suffix}"
             );
             assert_eq!(
-                cancelled.events[2]["event_type"], "run_finished",
+                cancelled.events[3]["event_type"], "run_finished",
                 "{suffix}"
             );
-            assert_eq!(cancelled.events[2]["data"]["cancelled"], true, "{suffix}");
+            assert_eq!(cancelled.events[3]["data"]["cancelled"], true, "{suffix}");
             assert_eq!(
-                cancelled.events[2]["data"]["cancellation_origin"], "user",
+                cancelled.events[3]["data"]["cancellation_origin"], "user",
                 "{suffix}"
             );
             assert!(
@@ -46814,6 +47882,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_control_batch_reports_only_committed_guidance_watermark() {
+        let store = InMemoryRunStateStore::new();
+        let run = durable_run_record("guidance-batch");
+        store.insert_run(run).await.unwrap();
+        let guidance = json!({"event_type":"user_intent", "idempotency_key":"guide-1"});
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "guidance-batch",
+                &[
+                    make_event("progress", json!({})),
+                    guidance.clone(),
+                    make_event("progress", json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+        // Replaying the same event and appending unrelated work cannot move it.
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "guidance-batch",
+                &[guidance, make_event("progress", json!({}))],
+            )
+            .await
+            .unwrap();
+        let key = |user: &str| RunControlReadKey {
+            user_id: user.into(),
+            run_id: "guidance-batch".into(),
+        };
+        let results = store
+            .load_run_control_batch(&[key("u1"), key("u1"), key("u2")])
+            .await
+            .unwrap();
+        for result in &results[..2] {
+            let control = result.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(control.last_guidance_event_idx, 1);
+            assert_eq!(control.last_event_idx, 3);
+        }
+        assert!(results[2].as_ref().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn guidance_uses_store_assigned_indices_and_rejects_sparse_creation() {
+        let store = InMemoryRunStateStore::new();
+        let mut sparse = durable_run_record("sparse-guidance");
+        sparse.events = vec![json!({"index": 8, "event_type": "user_intent"})];
+        sparse.last_event_idx = 8;
+        assert!(
+            store
+                .insert_run(sparse)
+                .await
+                .unwrap_err()
+                .contains("contiguous")
+        );
+
+        store
+            .insert_run(durable_run_record("canonical-guidance"))
+            .await
+            .unwrap();
+        // A tool payload may also contain an untrusted index. It must not
+        // advance the guidance reader past a later committed user intent.
+        let mut tool = edge_tool_request_event("fake-index", "write_file");
+        tool["index"] = json!(99);
+        assert!(matches!(
+            store
+                .commit_guarded_tool_request(guarded_tool_request(
+                    "canonical-guidance",
+                    "fake-index",
+                    &tool
+                ))
+                .await
+                .unwrap(),
+            AtomicRunToolRequestCommitOutcome::Committed(_)
+        ));
+        let before = store
+            .load_user_intent_control_delta("u1", "canonical-guidance", -1, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.authoritative_last_event_idx, 1);
+        store
+            .append_events_batch(
+                "u1",
+                "s1",
+                "canonical-guidance",
+                &[json!({"index": 99, "event_type": "user_intent", "idempotency_key": "new"})],
+            )
+            .await
+            .unwrap();
+        let control = store
+            .load_run_control("u1", "canonical-guidance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (control.last_event_idx, control.last_guidance_event_idx),
+            (2, 2)
+        );
+        let delta = store
+            .load_user_intent_control_delta("u1", "canonical-guidance", 1, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.events[0]["index"], 2);
+        assert_eq!(
+            store
+                .begin_action(action_admission_request("canonical-guidance"))
+                .await
+                .unwrap(),
+            AtomicRunActionAdmission::Superseded {
+                user_intent_event_index: 2
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn unsettled_user_intent_control_read_ignores_large_unrelated_history() {
         let store = InMemoryRunStateStore::new();
         let mut run = durable_run_record("intent-control-tail");
@@ -46945,26 +48132,29 @@ mod tests {
     async fn user_intent_control_delta_keyset_pages_do_not_skip_or_starve_control_events() {
         let store = InMemoryRunStateStore::new();
         let mut run = durable_run_record("intent-control-delta-pages");
-        run.events = (0..5)
-            .map(|index| {
-                json!({
-                    "index": index,
-                    "event_type": "user_intent",
-                    "idempotency_key": format!("user_intent:intent-page-{index}"),
-                    "data": {
-                        "intent_id": format!("intent-page-{index}"),
-                        "delivery": "guide_current_run",
-                        "input": {"content": format!("page {index}")}
-                    }
+        run.events = vec![make_event("run_created", json!({}))];
+        run.events.extend(
+            (1..=5)
+                .map(|index| {
+                    json!({
+                        "index": index,
+                        "event_type": "user_intent",
+                        "idempotency_key": format!("user_intent:intent-page-{index}"),
+                        "data": {
+                            "intent_id": format!("intent-page-{index}"),
+                            "delivery": "guide_current_run",
+                            "input": {"content": format!("page {index}")}
+                        }
+                    })
                 })
-            })
-            .collect();
-        run.last_event_idx = 8;
+                .collect::<Vec<_>>(),
+        );
+        run.last_event_idx = 9;
         run.events.extend([
-            make_event("reasoning_delta", json!({"index": 5})),
             make_event("reasoning_delta", json!({"index": 6})),
             make_event("reasoning_delta", json!({"index": 7})),
             make_event("reasoning_delta", json!({"index": 8})),
+            make_event("reasoning_delta", json!({"index": 9})),
         ]);
         store.insert_run(run).await.unwrap();
 
@@ -46973,7 +48163,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.page_cursor, 1);
+        assert_eq!(first.page_cursor, 2);
         assert!(first.has_more);
         let second = store
             .load_user_intent_control_delta(
@@ -46985,7 +48175,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.page_cursor, 3);
+        assert_eq!(second.page_cursor, 4);
         assert!(second.has_more);
         let third = store
             .load_user_intent_control_delta(
@@ -46997,8 +48187,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(third.page_cursor, 4);
-        assert_eq!(third.authoritative_last_event_idx, 8);
+        assert_eq!(third.page_cursor, 5);
+        assert_eq!(third.authoritative_last_event_idx, 9);
         assert!(!third.has_more);
         assert_eq!(
             first
@@ -47008,7 +48198,7 @@ mod tests {
                 .chain(&third.events)
                 .filter_map(|event| event["index"].as_i64())
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![1, 2, 3, 4, 5]
         );
     }
 
@@ -47104,6 +48294,7 @@ mod tests {
         let store = InMemoryRunStateStore::new();
         let mut fenced_run = durable_run_record("intent-apply-ack-lost-fence");
         fenced_run.run_generation = 17;
+        fenced_run.events.push(make_event("run_created", json!({})));
         fenced_run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-ack-lost-fence",
@@ -47113,7 +48304,7 @@ mod tests {
                 "input": {"content": "apply before fence"}
             }
         }));
-        fenced_run.last_event_idx = 0;
+        fenced_run.last_event_idx = 1;
         store.insert_run(fenced_run).await.unwrap();
 
         let fenced_request = AtomicRunUserIntentApplyRequest {
@@ -47124,7 +48315,7 @@ mod tests {
             run_id: "intent-apply-ack-lost-fence",
             expected_session_id: "s1",
             expected_owner_generation: 17,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             store.apply_run_user_intents(fenced_request).await.unwrap(),
@@ -47156,6 +48347,9 @@ mod tests {
         let mut terminal_run = durable_run_record("intent-apply-ack-lost-terminal");
         terminal_run.session_id = "s2".to_string();
         terminal_run.run_generation = 23;
+        terminal_run
+            .events
+            .push(make_event("run_created", json!({})));
         terminal_run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-ack-lost-terminal",
@@ -47174,7 +48368,7 @@ mod tests {
                 "input": {"content": "must remain unclaimed"}
             }
         }));
-        terminal_run.last_event_idx = 1;
+        terminal_run.last_event_idx = 2;
         store.insert_run(terminal_run).await.unwrap();
         let terminal_request = AtomicRunUserIntentApplyRequest {
             purpose: UserIntentApplyPurpose::ModelBoundary,
@@ -47184,7 +48378,7 @@ mod tests {
             run_id: "intent-apply-ack-lost-terminal",
             expected_session_id: "s2",
             expected_owner_generation: 23,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             store
@@ -47249,7 +48443,7 @@ mod tests {
                     run_id: "intent-apply-ack-lost-terminal",
                     expected_session_id: "s2",
                     expected_owner_generation: 23,
-                    source_event_indices: &[1],
+                    source_event_indices: &[2],
                 })
                 .await
                 .unwrap(),
@@ -47279,7 +48473,7 @@ mod tests {
             returned[0]
                 .pointer("/data/event_index")
                 .and_then(serde_json::Value::as_u64),
-            Some(1)
+            Some(2)
         );
         assert_eq!(terminal.status, STATUS_CANCELLED);
     }
@@ -47289,6 +48483,7 @@ mod tests {
         let store = std::sync::Arc::new(InMemoryRunStateStore::new());
         let mut run = durable_run_record("intent-apply-guidance-race");
         run.run_generation = 5;
+        run.events.push(make_event("run_created", json!({})));
         run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-old",
@@ -47298,7 +48493,7 @@ mod tests {
                 "input": {"content": "old"}
             }
         }));
-        run.last_event_idx = 0;
+        run.last_event_idx = 1;
         store.insert_run(run).await.unwrap();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
 
@@ -47315,7 +48510,7 @@ mod tests {
                     run_id: "intent-apply-guidance-race",
                     expected_session_id: "s1",
                     expected_owner_generation: 5,
-                    source_event_indices: &[0],
+                    source_event_indices: &[1],
                 })
                 .await
                 .unwrap()
@@ -47372,6 +48567,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intent_receipt_requires_exact_source_and_single_disposition() {
+        let source = json!({"event_type":"user_intent", "index":7,
+        "idempotency_key":"user_intent:guide", "data":{
+            "intent_id":"guide", "delivery":"guide_current_run", "input":{"content":"inspect"}
+        }});
+        assert_eq!(user_intent_status_from_events("guide", &[]).unwrap(), None);
+        assert_eq!(
+            user_intent_status_from_events("guide", std::slice::from_ref(&source)).unwrap(),
+            Some(UserIntentStatus::AcceptedRemote)
+        );
+        let applied =
+            user_intent_disposition_event_from_source(7, &source, UserIntentStatus::Applied)
+                .unwrap();
+        let returned =
+            user_intent_disposition_event_from_source(7, &source, UserIntentStatus::Returned)
+                .unwrap();
+        assert_eq!(
+            user_intent_status_from_events("guide", &[source.clone(), applied.clone()]).unwrap(),
+            Some(UserIntentStatus::Applied)
+        );
+        assert!(
+            user_intent_status_from_events("guide", &[source.clone(), applied.clone(), returned])
+                .is_err()
+        );
+        let mut corrupt = applied;
+        corrupt["data"]["event_index"] = json!(8);
+        assert!(user_intent_status_from_events("guide", &[source, corrupt]).is_err());
+    }
+
+    #[tokio::test]
+    async fn guidance_preflight_does_not_clone_or_load_in_memory_history() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guide-preflight");
+        run.events = (0..5_000)
+            .map(|index| json!({"event_type":"trace", "data":{"index":index}}))
+            .collect();
+        run.events
+            .push(json!({"event_type":"user_intent", "idempotency_key":"user_intent:message"}));
+        run.events
+            .push(json!({"event_type":"tool_result", "idempotency_key":"user_intent:collision"}));
+        let user = run.user_id.clone();
+        let session = run.session_id.clone();
+        store.runs.write().await.insert(run.run_id.clone(), run);
+        let facts = store
+            .load_run_guidance_preflight(&user, "guide-preflight", "user_intent:message")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(facts.source_already_admitted);
+        assert!(!facts.native_anchor);
+        let collision = json!({"event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}});
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    user_id: &user,
+                    run_id: "guide-preflight",
+                    expected_session_id: &session,
+                    intent_id: "collision",
+                    event: &collision,
+                    process_local_execution_live: true,
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", "guide-preflight", "user_intent:message")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.load_run_call_count(), 0);
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_paused_guidance_and_live_delta_share_the_owner_lease_boundary() {
@@ -47410,6 +48682,13 @@ mod tests {
             initial.last_event_idx, 0,
             "insert preserves its run-created receipt"
         );
+        let before = store
+            .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.source_already_admitted);
+        assert!(!before.native_anchor);
         let admission = store.admit_run_guidance(request).await.unwrap();
         assert!(
             matches!(
@@ -47422,6 +48701,36 @@ mod tests {
             store.admit_run_guidance(request).await.unwrap(),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         ));
+        assert!(
+            store
+                .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_already_admitted
+        );
+        let observer = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("observer-pod");
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            Some(UserIntentStatus::AcceptedRemote)
+        );
+        assert_eq!(
+            observer
+                .run_user_intent_status("other-user", &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, "other-session", &id, "paused-guide")
+                .await
+                .unwrap(),
+            None
+        );
         let delta = store
             .load_run_event_delta(&user, &id, initial.last_event_idx)
             .await
@@ -47431,6 +48740,46 @@ mod tests {
         assert!(delta.execution_live);
         assert_eq!(delta.events.len(), 1);
         assert_eq!(extract_event_type(&delta.events[0]), "user_intent");
+        let returned =
+            user_intent_disposition_event_from_source(1, &event, UserIntentStatus::Returned)
+                .unwrap();
+        store
+            .append_event(&user, &session, &id, returned)
+            .await
+            .unwrap();
+        assert_eq!(
+            observer
+                .run_user_intent_status(&user, &session, &id, "paused-guide")
+                .await
+                .unwrap(),
+            Some(UserIntentStatus::Returned)
+        );
+        store
+            .append_event(
+                &user,
+                &session,
+                &id,
+                json!({
+                    "event_type":"tool_result", "idempotency_key":"user_intent:collision", "data":{}
+                }),
+            )
+            .await
+            .unwrap();
+        let collision = json!({
+            "event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}
+        });
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    intent_id: "collision",
+                    event: &collision,
+                    ..request
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
         sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
             .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
         assert!(
@@ -47479,6 +48828,8 @@ mod tests {
         run.user_id = user_id.clone();
         run.session_id = session_id.clone();
         run.run_generation = 9;
+        run.events
+            .push(run_created_receipt_event(&run_id, &session_id));
         run.events.push(json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:intent-matrix-apply",
@@ -47517,7 +48868,7 @@ mod tests {
             run_id: &run_id,
             expected_session_id: &session_id,
             expected_owner_generation: 9,
-            source_event_indices: &[0],
+            source_event_indices: &[1],
         };
         assert!(matches!(
             ack_loss_store.apply_run_user_intents(request).await.unwrap(),
@@ -47530,13 +48881,13 @@ mod tests {
                         .apply_run_user_intents(AtomicRunUserIntentApplyRequest { purpose: UserIntentApplyPurpose::ModelBoundary,
         invocation_identity: None,
 
-                            source_event_indices: &[1],
+                            source_event_indices: &[2],
                             ..request
                         })
                         .await
                         .unwrap(),
                     AtomicRunUserIntentApply::Applied { ref event_indices }
-                        if event_indices == &[4]
+                        if event_indices == &[5]
                 ));
         assert!(matches!(
             store.apply_run_user_intents(request).await.unwrap(),
@@ -47584,7 +48935,7 @@ mod tests {
                     purpose: UserIntentApplyPurpose::ModelBoundary,
                     invocation_identity: None,
 
-                    source_event_indices: &[2],
+                    source_event_indices: &[3],
                     ..request
                 })
                 .await
@@ -47605,7 +48956,7 @@ mod tests {
         assert_eq!(
             store.apply_run_user_intents(request).await.unwrap(),
             AtomicRunUserIntentApply::AlreadyApplied {
-                event_indices: vec![3]
+                event_indices: vec![4]
             }
         );
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
@@ -48019,7 +49370,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.events.len(), 2);
     }
 }
 

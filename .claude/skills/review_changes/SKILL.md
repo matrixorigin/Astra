@@ -74,8 +74,9 @@ git status --short
 git diff --stat
 ```
 
-These are inspections: omit Bash `mode`. `mode=verify` requests a separate
-unchanged-workspace proof after edits, not a check that a diagnostic command ran.
+Use ordinary Bash commands for both inspection and checks. A command result
+records its output and exit status; it does not certify an unchanged workspace
+or global task correctness. Explicit declared checks retain their own contract.
 
 Target resolution:
 

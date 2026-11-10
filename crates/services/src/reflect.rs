@@ -957,18 +957,14 @@ impl AgentDeliveryRollup {
         if self.spawned == 0 {
             return None;
         }
-        let terminal =
-            self.completed + self.interrupted + self.failed + self.cancelled + self.other_terminal;
-        let without_terminal = self.spawned.saturating_sub(terminal);
         Some(format!(
-            "Session agent delivery: {}/{} spawned agents produced complete deliverables; {} interrupted, {} failed, {} cancelled, {} other terminal, {} without terminal evidence.",
-            self.completed,
+            "Session agent events: {} spawned, {} completed, {} interrupted, {} failed, {} cancelled, {} other terminal. These events do not establish task completion.",
             self.spawned,
+            self.completed,
             self.interrupted,
             self.failed,
             self.cancelled,
             self.other_terminal,
-            without_terminal,
         ))
     }
 }
@@ -3143,7 +3139,7 @@ mod tests {
     use astra_core::EvidenceRef;
 
     #[test]
-    fn agent_delivery_rollup_reports_complete_deliverables_not_spawn_consensus() {
+    fn agent_delivery_rollup_reports_events_without_inventing_completion() {
         let summary = AgentDeliveryRollup {
             spawned: 3,
             completed: 0,
@@ -3153,10 +3149,34 @@ mod tests {
         .render_session_summary()
         .unwrap();
 
-        assert!(summary.contains("0/3"), "{summary}");
+        assert!(summary.contains("3 spawned, 0 completed"), "{summary}");
         assert!(summary.contains("3 interrupted"), "{summary}");
         assert!(summary.contains("0 other terminal"), "{summary}");
-        assert!(!summary.contains("validated"), "{summary}");
+        assert!(
+            summary.contains("do not establish task completion"),
+            "{summary}"
+        );
+        assert!(!summary.contains("deliverables"), "{summary}");
+    }
+
+    #[test]
+    fn agent_delivery_counts_do_not_assume_terminal_events_are_disjoint() {
+        let summary = AgentDeliveryRollup {
+            spawned: 1,
+            completed: 1,
+            failed: 1,
+            ..AgentDeliveryRollup::default()
+        }
+        .render_session_summary()
+        .unwrap();
+
+        assert!(summary.contains("1 spawned, 1 completed"), "{summary}");
+        assert!(summary.contains("1 failed"), "{summary}");
+        assert!(!summary.contains("without terminal"), "{summary}");
+        assert!(
+            summary.contains("do not establish task completion"),
+            "{summary}"
+        );
     }
 
     fn model_request_test_record() -> ModelRequestContextRecord {

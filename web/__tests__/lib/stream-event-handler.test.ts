@@ -39,6 +39,20 @@ describe("applyStreamEvent", () => {
     vi.clearAllMocks();
   });
 
+  it.each([true, false, undefined])("projects Context saving separately from the assistant text (%s)", observation => {
+    const state = makeState();
+    state.runId = "root";
+    state.assistantText = "partial answer";
+    applyStreamEvent({ type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: true }, ctx, state);
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
+    const terminal = { type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation } as const;
+    applyStreamEvent(terminal, ctx, state);
+    applyStreamEvent(terminal, ctx, state);
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith("user-a", "chat-1", "assistant-1", { contextNotSaved: observation ?? null });
+    expect(state.assistantText).toBe("partial answer");
+    expect(state.terminalStatus).toBe("cancelled");
+  });
+
   it("shows report publication failure independently of a successful answer", () => {
     const state = makeState();
     const event = { type: "artifact_publication" as const, schema_version: 1 as const,

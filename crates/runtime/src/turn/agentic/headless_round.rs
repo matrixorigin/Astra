@@ -779,19 +779,33 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
     use astra_services::session_journal::ToolCallDisposition;
 
     let disposition = record.effective_disposition();
-    if record.ok && disposition != ToolCallDisposition::Deferred {
+    let execution_fact = result
+        .and_then(|fields| fields.get("execution_fact"))
+        .and_then(Value::as_str);
+    let unknown =
+        if astra_tools::execution_outcome::outcome_is_unknown(result.and_then(Value::as_object)) {
+            true
+        } else {
+            match execution_fact {
+                Some("executed" | "not_executed") => false,
+                _ => {
+                    record.outcome_is_unknown()
+                        || matches!(
+                            record.error_kind,
+                            Some(
+                                astra_core::ErrorKind::Cancelled
+                                    | astra_core::ErrorKind::ToolTimeout
+                                    | astra_core::ErrorKind::ToolOutcomeUnknown
+                            )
+                        )
+                }
+            }
+        };
+    if record.ok && disposition != ToolCallDisposition::Deferred && !unknown {
         return None;
     }
-    let unknown = matches!(
-        record.error_kind,
-        Some(
-            astra_core::ErrorKind::Cancelled
-                | astra_core::ErrorKind::ToolTimeout
-                | astra_core::ErrorKind::ToolOutcomeUnknown
-        )
-    );
     let execution = match disposition {
-        ToolCallDisposition::Executed if unknown => "unknown",
+        _ if unknown => "unknown",
         ToolCallDisposition::Executed if record.execution_ok == Some(true) => "completed",
         ToolCallDisposition::Executed => "failed",
         _ => "not_executed",
@@ -820,11 +834,13 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
             .and_then(|value| value.get(key))
             .or_else(|| rejection.as_ref().and_then(|value| value.get(key)))
     };
-    let evidence = field("recovery_evidence")
-        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
-        .and_then(|value| {
-            serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
-        });
+    let evidence = record.recovery_evidence.clone().or_else(|| {
+        field("recovery_evidence")
+            .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
+            .and_then(|value| {
+                serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
+            })
+    });
     let mut facts = serde_json::json!({
         "disposition": disposition,
         "execution": execution,
@@ -1085,6 +1101,44 @@ mod tests {
     }
 
     #[test]
+    fn source_recovery_evidence_survives_journal_roundtrip_and_compacted_body() {
+        use astra_core::{ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction};
+        for (evidence, execution) in [
+            (
+                ToolFailureEvidence::from_error_kind(ErrorKind::ToolNotFound),
+                "failed",
+            ),
+            (
+                ToolFailureEvidence::new(
+                    ErrorKind::Network,
+                    ToolFailureCause::OutcomeUnknown,
+                    false,
+                    vec![ToolRecoveryAction::ReconcileOutcome],
+                ),
+                "unknown",
+            ),
+        ] {
+            let record = ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                error_kind: Some(evidence.kind),
+                recovery_evidence: Some(evidence.clone()),
+                ..Default::default()
+            };
+            let restored: ToolCallRecord =
+                serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+            let advice = tool_outcome_advisory(&restored, None)
+                .expect("compacted failure keeps its source evidence");
+            let facts: Value =
+                serde_json::from_str(advice.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+            assert_eq!(facts["execution"], execution);
+            assert_eq!(facts["error_kind"], evidence.kind.as_str());
+            assert_eq!(facts["recovery_evidence"], json!(evidence));
+        }
+    }
+
+    #[test]
     fn model_receives_distinct_bounded_execution_and_delivery_facts() {
         use astra_services::session_journal::ToolCallDisposition as Disposition;
 
@@ -1122,6 +1176,37 @@ mod tests {
             );
             assert_eq!(facts["detail"], "provider unavailable");
         }
+        let record = ToolCallRecord {
+            ok: false,
+            disposition: Some(Disposition::Executed),
+            ..Default::default()
+        };
+        let advisory = tool_outcome_advisory(
+            &record,
+            Some(&json!({"execution_fact": "unknown", "retryable": false})),
+        )
+        .unwrap();
+        assert!(
+            advisory.contains("inspect the outcome before repeating")
+                || advisory.contains("Inspect the outcome before repeating"),
+            "{advisory}"
+        );
+        let timed_out = ToolCallRecord {
+            error_kind: Some(astra_core::ErrorKind::ToolTimeout),
+            ..record.clone()
+        };
+        for (fact, expected) in [("executed", "failed"), ("unknown", "unknown")] {
+            let advisory =
+                tool_outcome_advisory(&timed_out, Some(&json!({"execution_fact": fact}))).unwrap();
+            let facts: Value =
+                serde_json::from_str(advisory.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+            assert_eq!(facts["execution"], expected);
+        }
+        let advisory =
+            tool_outcome_advisory(&record, Some(&json!({"outcome_certainty": "unknown"}))).unwrap();
+        let facts: Value =
+            serde_json::from_str(advisory.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+        assert_eq!(facts["execution"], "unknown");
         let ok = ToolCallRecord {
             disposition: Some(Disposition::Executed),
             ok: true,

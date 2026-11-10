@@ -78,3 +78,33 @@ The model should see the visible summary and quality annotation, not arbitrary u
 - Partial timeout output is surfaced as degraded, not success.
 - Large output becomes artifact/summary with manifest.
 - Quality annotations survive compaction and replay.
+
+## Source failures and observation evidence
+
+Filesystem I/O failures retain the existing `ToolFailureEvidence` at the
+operation that receives the OS error. Missing resources, OS access failures,
+and directory targets remain distinct from pre-execution sandbox refusal.
+Rendered text is diagnostic context; it does not determine failure type.
+The canonical tool record retains that evidence for journal replay and
+compacted model-facing outcome advice. A successful file containing error-like
+text remains a successful observation.
+Explicit outcome uncertainty uses the same evidence object's `cause`, retaining
+the source timeout or cancellation `kind`. Recovery advice permits fresh
+observations and scopes reconciliation to potentially state-changing effects.
+
+Failed observations remain visible in error history and error-rate evidence.
+The existing effect classifier distinguishes these observations from pending
+validation, mutations, unknown effects, and incomplete delegated execution.
+A corrected read does not erase an older failed attempt or prove that every
+previously requested range arrived. Outcome pressure describes actual execution
+obligations; quality scores alone do not declare a user request incomplete.
+Only full authoritative arguments establish matching operations. Restored
+redacted arguments or display previews cannot merge failures or prove recovery.
+Recovery evidence advises the model without authorizing hidden retries,
+automatic path substitution, tool suppression, or a separate recovery lifecycle.
+
+Historical failure counts and exact-command matching do not determine whether
+a user's objective is complete. Failed attempts remain diagnostic evidence for
+the model. Run lifecycle, explicit caller verification, canonical Work
+settlement and genuinely unknown effects retain their own authority; the
+evaluator emits no blanket incomplete-answer notice from error history.

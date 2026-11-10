@@ -44,6 +44,7 @@ mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
 pub(crate) mod model_execution_admission;
+pub(crate) mod outbound_trace;
 mod platform_handlers;
 mod preferences_handlers;
 mod provider_runtime_context;
@@ -54,6 +55,7 @@ mod request_trace;
 mod resource_handlers;
 mod router_builder;
 pub mod run;
+pub(crate) mod run_trace;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
 pub mod runtime_tool_executor;
@@ -794,15 +796,6 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for RecordingEdgeDispatchService {
-        async fn insert_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            unreachable!("insert_dispatch is not used in cleanup tests")
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,

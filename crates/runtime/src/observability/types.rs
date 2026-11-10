@@ -66,11 +66,6 @@ pub struct ObservabilitySession {
     /// hard fallback threshold fires.
     pub last_denial_pressure: Option<crate::self_model::DenialPressureView>,
 
-    /// Gap 2: bounded ring of the most recent failing test names observed
-    /// in tool outcomes (e.g., `cargo test` / `pytest` / `npm test`).
-    /// Newest at the back. Capacity managed by the publisher.
-    pub recent_failing_tests: Vec<String>,
-
     /// Gap 3: bounded ring of recent `(tool, reason)` permission rejections
     /// so the SelfModel can tell the agent *why* its last calls were
     /// refused. Newest at the back.
@@ -114,7 +109,7 @@ pub struct ObservabilitySession {
     pub last_feedback_signals: Vec<FeedbackSignal>,
 
     /// Per-channel fingerprint history for runtime-injected prompt signals
-    /// (recent_failing_tests, outcome_bias, volatile_pending).
+    /// (outcome_bias, volatile_pending).
     /// Observed once per SelfModel snapshot build so the
     /// `introspect facet=noise` renderer can flag channels that have
     /// been re-rendered unchanged for many turns — session f85a02bb's

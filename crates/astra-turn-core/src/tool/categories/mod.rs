@@ -267,6 +267,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_input", MU, OR.union(ToolFlags::TASK_MGMT)),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("exec", SH, AE.union(EX)),
@@ -339,7 +340,11 @@ impl ToolRegistry {
     /// consolidated LSP tool include writers despite their display categories.
     pub fn is_read_only_for_recovery(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
         let flags = self.flags(name);
-        self.is_read_only_for(name, args) && !flags.contains(ToolFlags::MATRIXONE) && name != "lsp"
+        // Use the canonical invocation classifier, including its parsed shell
+        // effects, rather than treating every shell observation as a writer.
+        classify(name, args).category.is_read_only()
+            && !flags.contains(ToolFlags::MATRIXONE)
+            && name != "lsp"
     }
 
     pub fn is_mutating_for(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
@@ -1478,6 +1483,31 @@ mod tests {
         assert!(!c.compactable);
         assert!(!c.never_restrict);
         assert!(!c.exploration);
+    }
+
+    #[test]
+    fn recovery_read_safety_uses_canonical_shell_effects() {
+        for (command, read_only) in [
+            ("lsof -p 1", true),
+            ("ps -p 1", true),
+            ("cat source.rs", true),
+            ("cargo test", false),
+            ("cat source.rs; echo changed > source.rs", false),
+            ("cat $(touch changed.txt)", false),
+            ("foreign-command", false),
+        ] {
+            assert_eq!(
+                registry().is_read_only_for_recovery(
+                    "bash",
+                    Some(&serde_json::json!({"command":command}))
+                ),
+                read_only,
+                "{command}"
+            );
+        }
+        assert!(!registry().is_read_only_for_recovery("foreign_tool", None));
+        assert!(!registry().is_read_only_for_recovery("lsp", None));
+        assert!(!registry().is_read_only_for_recovery("mo_query", None));
     }
 
     #[test]

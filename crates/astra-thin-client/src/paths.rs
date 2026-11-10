@@ -333,6 +333,11 @@ pub fn chat_run_user_intents(run_id: &str) -> String {
 }
 
 #[inline]
+pub fn chat_run_user_intent(run_id: &str, intent_id: &str) -> String {
+    format!("/chat/runs/{run_id}/intents/{intent_id}")
+}
+
+#[inline]
 pub fn chat_run_pause(run_id: &str) -> String {
     format!("/chat/runs/{run_id}/pause")
 }
@@ -487,6 +492,10 @@ pub fn session_audit_errors(session_id: &str) -> String {
 
 pub fn chat_run_permission_mode(run_id: &str) -> String {
     format!("{}/permission-mode", chat_run(run_id))
+}
+
+pub fn chat_run_model(run_id: &str) -> String {
+    format!("{}/model", chat_run(run_id))
 }
 
 #[cfg(test)]

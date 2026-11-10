@@ -19,8 +19,7 @@ use serde_json::{Map, Value, json};
 use crate::action_compensation::explicit_approval_reason;
 use crate::cloud::approval_policy::edge_tool_requires_cloud_approval_with_args;
 use crate::edge_ledger::{
-    DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key,
-    discard_ledger_entry_for_cancelled_callback_ack, expect_ledger_entry,
+    DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, expect_ledger_entry,
     persist_value_for_ledger_tool_result, take_ledger_entry, tool_callback_key,
     tool_content_from_ledger_entry,
 };
@@ -283,6 +282,11 @@ fn structured_tool_result(
                     "error_kind".to_string(),
                     Value::String("tool_timeout".to_string()),
                 ),
+                (
+                    "execution_fact".to_string(),
+                    Value::String("unknown".to_string()),
+                ),
+                ("side_effects_maybe".to_string(), Value::Bool(true)),
                 ("retryable".to_string(), Value::Bool(false)),
             ])),
         };
@@ -649,8 +653,8 @@ pub fn sse_maps_through_tool_request(
 
 /// Wait for a thin-client tool callback without turning run cancellation into
 /// a five-minute transport stall. `edge_ledger` is an interactive delivery
-/// transport, so the owning run's cancellation boundary must win over a
-/// callback that can no longer be useful.
+/// transport. Preserve an already received result when cancellation races it;
+/// otherwise return promptly with an explicitly unknown execution outcome.
 pub async fn wait_tool_result_ledger_for_tool_with_cancel(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     edge_agent_id: &str,
@@ -694,23 +698,16 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
             biased;
             _ = cancel_token.cancelled() => {
                 cancelled = true;
-                // Cancellation owns the request from this point onward. Drop
-                // any callback that raced with the cancellation boundary so
-                // a result that can no longer be consumed does not occupy the
-                // process ledger until the lazy five-minute expiry sweep. Keep
-                // only an exact, short-lived cancelled acknowledgement lease:
-                // an executor commonly learns of the same timeout just after
-                // the runtime settles locally and must not receive a false
-                // "unknown callback" response.
-                discard_ledger_entry_for_cancelled_callback_ack(ledger, &t_key).await;
-                None
+                // The zero-wait take checks and closes callback custody under
+                // the same ledger lock, preserving an already arrived result.
+                take_ledger_entry(ledger, &t_key, Duration::ZERO).await
             }
             entry = take_ledger_entry(ledger, &t_key, ledger_wait) => entry,
         }
     } else {
         take_ledger_entry(ledger, &t_key, ledger_wait).await
     };
-    let cancelled_entry = cancelled.then(|| {
+    let cancelled_entry = (cancelled && tr_entry.is_none()).then(|| {
         json!({
             "kind": "tool_result",
             "body": {
@@ -718,12 +715,16 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
                 "output": json!({
                     "status": "cancelled",
                     "error_kind": "cancelled",
-                    "error": format!("Tool '{tool_name}' cancelled before completion"),
+                    "error": format!("Tool '{tool_name}' was cancelled, but its final outcome is unknown. It may have changed state or still be running; inspect the current state before retrying."),
+                    "executed": null,
                     "retryable": false,
                     "next_action": "stop_or_resume_parent_turn",
                 }).to_string(),
                 "error_kind": "cancelled",
                 "cancelled": true,
+                "executed": null,
+                "execution_fact": "unknown",
+                "side_effects_maybe": true,
                 "retryable": false,
             }
         })
@@ -734,7 +735,7 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
         .as_ref()
         .map(tool_content_from_ledger_entry)
         .or_else(|| cancelled_entry.as_ref().map(tool_content_from_ledger_entry))
-        .unwrap_or_else(|| MSG_TOOL_LEDGER_TIMEOUT.to_string());
+        .unwrap_or_else(|| format!("{MSG_TOOL_LEDGER_TIMEOUT}. The tool's final outcome is unknown; it may have changed state or still be running. Inspect the current state before retrying."));
     let raw_output = effective_entry
         .and_then(|entry| entry.get("body").or(Some(entry)))
         .and_then(|body| body.get("output"))
@@ -776,21 +777,36 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
         .as_ref()
         .and_then(|entry| entry.get("body"))
         .cloned()
-        .unwrap_or_else(|| Value::String(redacted_content.clone()));
+        .unwrap_or_else(|| {
+            if timed_out {
+                json!({"status": "timed_out", "executed": null})
+            } else {
+                Value::String(redacted_content.clone())
+            }
+        });
     let mut end = build_tool_call_end_event(id, result_for_status);
-    end.insert("result".to_string(), Value::String(redacted_content));
+    end.insert(
+        "result".to_string(),
+        Value::String(redacted_content.clone()),
+    );
     out.sse_maps.push(end);
-    out.persist_tool_results
-        .extend(persist_value_for_ledger_tool_result(
-            tc,
-            sanitized_effective_entry.as_ref(),
-            timed_out,
-        ));
-    out.tool_results.push(structured_tool_result(
-        id,
-        sanitized_effective_entry.as_ref(),
-        timed_out,
-    ));
+    if let Some(mut persisted) =
+        persist_value_for_ledger_tool_result(tc, sanitized_effective_entry.as_ref(), timed_out)
+    {
+        if timed_out {
+            persisted["result"] = Value::String(redacted_content.clone());
+        }
+        out.persist_tool_results.push(persisted);
+    }
+    let mut structured = structured_tool_result(id, sanitized_effective_entry.as_ref(), timed_out);
+    if timed_out {
+        structured
+            .tool_result_fields
+            .as_mut()
+            .expect("timeout fields")
+            .insert("output".into(), Value::String(redacted_content));
+    }
+    out.tool_results.push(structured);
     out
 }
 
@@ -1215,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_run_interrupts_thin_client_tool_result_wait() {
+    async fn cancelled_run_keeps_an_already_received_tool_result() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let tc = read_tool("c_cancelled");
         let identity = test_identity("u1_cancelled", "c_cancelled");
@@ -1241,32 +1257,47 @@ mod tests {
         .expect("cancellation must beat the callback timeout");
 
         assert_eq!(delivery.tool_results.len(), 1);
-        assert_eq!(delivery.tool_results[0].status, "cancelled");
-        assert_eq!(
-            delivery.tool_results[0]
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("cancelled"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(
-            delivery.tool_messages[0]["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("cancelled before completion"))
-        );
-        let model_error: Value = serde_json::from_str(
-            delivery.tool_messages[0]["content"]
-                .as_str()
-                .expect("cancelled model tool content"),
-        )
-        .expect("cancelled model content must be structured JSON");
-        assert_eq!(model_error["status"], "cancelled");
-        assert_eq!(model_error["error_kind"], "cancelled");
-        assert_eq!(model_error["retryable"], false);
+        assert_eq!(delivery.tool_results[0].status, "completed");
+        assert_eq!(delivery.tool_messages[0]["content"], "raced");
         assert!(
             ledger.lock().await.is_empty(),
-            "cancellation must consume a callback that raced with the terminal boundary"
+            "the delivered callback is consumed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_without_a_callback_reports_unknown_execution() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let tc = read_tool("c_cancel_unknown");
+        let identity = test_identity("u_cancel_unknown", "c_cancel_unknown");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let delivery = tokio::time::timeout(
+            Duration::from_millis(100),
+            super::wait_tool_result_ledger_for_tool_with_cancel(
+                &ledger,
+                TEST_EDGE_AGENT_ID,
+                &identity,
+                &tc,
+                Duration::from_secs(300),
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancellation stays bounded");
+        assert_eq!(delivery.tool_results[0].status, "cancelled");
+        let fields = delivery.tool_results[0]
+            .tool_result_fields
+            .as_ref()
+            .unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(delivery.sse_maps[0].get("executed"), Some(&Value::Null));
+        assert!(
+            delivery.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("final outcome is unknown")
         );
     }
 
@@ -1321,6 +1352,24 @@ mod tests {
 
         assert_eq!(user_a_delivery.tool_results.len(), 1);
         assert_eq!(user_a_delivery.tool_results[0].status, "timed_out");
+        assert_eq!(
+            user_a_delivery.tool_results[0]
+                .tool_result_fields
+                .as_ref()
+                .unwrap()["execution_fact"],
+            "unknown"
+        );
+        assert_eq!(user_a_delivery.sse_maps[0]["success"], false);
+        assert_eq!(
+            user_a_delivery.sse_maps[0].get("executed"),
+            Some(&Value::Null)
+        );
+        assert!(
+            user_a_delivery
+                .raw_tool_output(0)
+                .unwrap()
+                .contains("final outcome is unknown")
+        );
         assert!(
             user_a_delivery.tool_results[0]
                 .tool_result_fields

@@ -202,6 +202,74 @@ impl CancellationFixture {
 
 #[tokio::test]
 #[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn db_previous_unknown_preserves_evidence_without_blocking_a_new_run() {
+    let fixture = CancellationFixture::new(false, true).await;
+    let identity = fixture.tool(true).await;
+    sqlx::query("UPDATE agent_runs SET status = 'cancelled', owner_pod_id = NULL, owner_lease_expires_at = NULL WHERE user_id = ? AND run_id = ?")
+        .bind(&fixture.key.owner_user_id).bind(&fixture.run_id)
+        .execute(fixture.pool.get()).await.unwrap();
+
+    let next_run = format!("continued-{}", Uuid::new_v4());
+    let mut request = super::super::tests::prepared_test_request("continue");
+    request.execution_binding_generation = Some(fixture.binding.generation);
+    let mut participant = RootTurnStartParticipant {
+        service: &fixture.service,
+        user_id: &fixture.key.owner_user_id,
+        session_id: &fixture.key.session_id,
+        run_id: &next_run,
+        request: &request,
+        admission: None,
+        prepared: None,
+        rejection: None,
+        full_llm_capture: None,
+    };
+    fixture
+        .service
+        .run_engine
+        .admit_run_with_context(
+            &next_run,
+            &fixture.key.owner_user_id,
+            &fixture.key.session_id,
+            Some(&fixture.key.session_id),
+            crate::server::run::engine::RunStartContext {
+                original_input: Some(request.message.clone()),
+                ..Default::default()
+            },
+            true,
+            &mut participant,
+        )
+        .await
+        .expect("a prior unknown result must not prevent continuing");
+    assert!(participant.admission.is_some());
+
+    let ledger = astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(
+        fixture.pool.clone(),
+    );
+    assert_eq!(
+        ledger.get(&identity).await.unwrap().unwrap().state,
+        ToolInvocationState::OutcomeUnknown
+    );
+    let third_run = format!("blocked-{}", Uuid::new_v4());
+    assert!(
+        fixture
+            .service
+            .run_engine
+            .start_run(
+                &third_run,
+                &fixture.key.owner_user_id,
+                &fixture.key.session_id,
+            )
+            .await
+            .is_err(),
+        "a genuinely active run still occupies the session"
+    );
+
+    cleanup_lifecycle_run_fixture(&fixture.pool, &fixture.key.owner_user_id, &next_run).await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn db_cancel_session_orphan_rejects_prepared_tool_without_controller_writer() {
     let fixture = CancellationFixture::new(false, true).await;
     let history = json!({"event_type":"fixture_history", "data":{"text":"keep this conversation"}});

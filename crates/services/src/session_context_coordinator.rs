@@ -453,6 +453,7 @@ pub struct ResumedExecutionTurn {
     run: crate::runs::DurableRunRecord,
     checkpoint: crate::runs::DurableRunCheckpointRecord,
     receipt: ResumedExecutionTurnReceipt,
+    prior_unresolved_tool_calls: bool,
 }
 
 impl ResumedExecutionTurn {
@@ -466,6 +467,10 @@ impl ResumedExecutionTurn {
 
     pub fn receipt(&self) -> &ResumedExecutionTurnReceipt {
         &self.receipt
+    }
+
+    pub fn prior_unresolved_tool_calls(&self) -> bool {
+        self.prior_unresolved_tool_calls
     }
 }
 
@@ -1057,9 +1062,7 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
         if current.admission_fingerprint() != authority.admission_fingerprint() {
-            return Err(SessionContextCoordinatorError::Invalid(
-                "Context base changed before empty terminal".into(),
-            ));
+            return Err(SessionContextCoordinatorError::Fenced);
         }
         Ok(())
     }
@@ -1700,7 +1703,7 @@ impl DatabaseSessionContextCoordinator {
             return Ok(binding);
         }
 
-        admit_controller_context_write(&mut tx, key).await?;
+        admit_strict_controller_context_write(&mut tx, key).await?;
         ensure_database_state_admitted(&mut tx, key, AuthorityEpochsV1::default()).await?;
         let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
         if state
@@ -2323,37 +2326,47 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             {
                 return Err(SessionContextCoordinatorError::Fenced);
             }
-            if run.run_generation == request.expected_owner_generation {
-                // The existing custody operation performs the only ownership
-                // CAS and immutable checkpoint association.
-                crate::runs::activate_execution_resume_tx(
-                    &mut tx,
-                    &mut run,
-                    &checkpoint,
-                    request.owner_pod_id,
-                )
-                .await
-                .map_err(execution_resume_storage_error)?;
-            } else {
-                // lock_execution_resume_tx has proven the exact tail custody
-                // claim. Also require its current live owner;
-                // a metadata-only checkpoint receipt never authorizes replay.
-                let live: i64 = sqlx::query_scalar(
-                    "SELECT CAST(COALESCE(status = 'running' AND owner_pod_id = ?
+            let prior_unresolved_tool_calls =
+                if run.run_generation == request.expected_owner_generation {
+                    // The existing custody operation performs the only ownership
+                    // CAS and immutable checkpoint association.
+                    crate::runs::activate_execution_resume_tx(
+                        &mut tx,
+                        &mut run,
+                        &checkpoint,
+                        request.owner_pod_id,
+                    )
+                    .await
+                    .map_err(execution_resume_storage_error)?
+                } else {
+                    // lock_execution_resume_tx has proven the exact tail custody
+                    // claim. Also require its current live owner;
+                    // a metadata-only checkpoint receipt never authorizes replay.
+                    let live: i64 = sqlx::query_scalar(
+                        "SELECT CAST(COALESCE(status = 'running' AND owner_pod_id = ?
                        AND owner_lease_expires_at >= NOW(6), FALSE) AS SIGNED)
                      FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
-                )
-                .bind(request.owner_pod_id)
-                .bind(request.user_id)
-                .bind(request.session_id)
-                .bind(request.run_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|source| database_error("validate_resumed_run_owner", source))?;
-                if live != 1 {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-            }
+                    )
+                    .bind(request.owner_pod_id)
+                    .bind(request.user_id)
+                    .bind(request.session_id)
+                    .bind(request.run_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|source| database_error("validate_resumed_run_owner", source))?;
+                    if live != 1 {
+                        return Err(SessionContextCoordinatorError::Fenced);
+                    }
+                    crate::storage::session_execution_activity(
+                        &mut tx,
+                        request.user_id,
+                        request.session_id,
+                        Some(request.run_id),
+                    )
+                    .await
+                    .map_err(|source| database_error("read_resume_execution_activity", source))?
+                    .unresolved_invocations
+                };
             let binding = match source.binding {
                 RunContextBinding::Absent => 0,
                 RunContextBinding::Present { generation } => generation,
@@ -2382,6 +2395,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 run,
                 checkpoint,
                 receipt,
+                prior_unresolved_tool_calls,
             })
         }
         .await;
@@ -3429,7 +3443,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 source => database_error("admit_forced_writer_fence", source),
             })?;
         } else {
-            admit_controller_context_write(&mut tx, &request.key).await?;
+            admit_strict_controller_context_write(&mut tx, &request.key).await?;
         }
         let now = database_now_ms(&mut tx).await?;
         let expires_at = checked_expiry(now, ttl)?;
@@ -4906,6 +4920,21 @@ async fn admit_controller_context_write(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
 ) -> Result<(), SessionContextCoordinatorError> {
+    admit_controller_context_write_with_effects(tx, key, false).await
+}
+
+async fn admit_strict_controller_context_write(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    admit_controller_context_write_with_effects(tx, key, true).await
+}
+
+async fn admit_controller_context_write_with_effects(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    require_settled_effects: bool,
+) -> Result<(), SessionContextCoordinatorError> {
     let facts = crate::storage::admit_context_execution_write_with_facts(
         tx,
         &key.session_id,
@@ -4916,7 +4945,17 @@ async fn admit_controller_context_write(
         sqlx::Error::RowNotFound => SessionContextCoordinatorError::SessionLifecycleFenced,
         source => database_error("admit_controller_context_write", source),
     })?;
-    if let Some(blocker) = lock_session_run_execution_blocker(tx, key, &facts).await? {
+    let blocker = if require_settled_effects {
+        lock_session_run_execution_blocker(tx, key, &facts).await?
+    } else if crate::storage::session_has_active_run(tx, &key.owner_user_id, &key.session_id, None)
+        .await
+        .map_err(|source| database_error("read_session_execution_activity", source))?
+    {
+        Some(SessionExecutionBlocker::ActiveRun)
+    } else {
+        None
+    };
+    if let Some(blocker) = blocker {
         return Err(SessionContextCoordinatorError::ExecutionOccupied(blocker));
     }
     Ok(())
@@ -4942,7 +4981,7 @@ pub(crate) async fn admit_session_lifecycle_writes(
             ))
     });
     for key in keys {
-        admit_controller_context_write(tx, key).await?;
+        admit_strict_controller_context_write(tx, key).await?;
     }
     Ok(())
 }
