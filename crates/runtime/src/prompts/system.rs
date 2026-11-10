@@ -587,6 +587,7 @@ fn coding_discipline_section() -> &'static str {
 fn turn_discipline_section() -> &'static str {
     "\n## Turn Discipline\n\
      - Announce substantial progress only when compatible with the requested output format.\n\
+     - If the user speaks during ongoing work, respond promptly when appropriate and then continue the task unless they redirect or stop it.\n\
      - **Summarize changes and verification only when requested format permits**; do not append a summary to a constrained answer.\n\
      - **Finish within constraints**: report blocked work truthfully; chosen restrictions are not missing permission. Do not reopen them or request another turn unless asked. Ask only necessary, permitted questions. Required safety/approval still applies. Stop after the requested answer.\n\
      - **No externalized reasoning**: keep deliberation in <think>.\n"

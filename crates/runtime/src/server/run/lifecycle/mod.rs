@@ -5303,6 +5303,7 @@ fn start_active_run_control_watcher(
     cancel_token: Arc<CancellationToken>,
     execution_lease_lost: Arc<AtomicBool>,
     input_wake: tokio::sync::watch::Sender<i64>,
+    guidance_wake: tokio::sync::watch::Sender<i64>,
 ) -> Option<ActiveRunControlWatcher> {
     let run_control = run_control?;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -5316,6 +5317,7 @@ fn start_active_run_control_watcher(
             tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
             ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
         );
+        let mut checked_event_idx = -1;
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -5326,7 +5328,7 @@ fn start_active_run_control_watcher(
                     }
                     let control_status = tokio::time::timeout(
                         ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT,
-                        run_control.control_observation(&user_id, &run_id),
+                        run_control.control_observation(&user_id, &run_id, checked_event_idx),
                     )
                     .await;
                     match control_status {
@@ -5358,6 +5360,22 @@ fn start_active_run_control_watcher(
                                     *current = (*current).max(index);
                                     changed
                                 });
+                            }
+                            match observation.guidance_observation {
+                                Some(Ok(index)) => {
+                                    if let Some(through) = observation.last_event_idx {
+                                        checked_event_idx = checked_event_idx.max(through);
+                                    }
+                                    if let Some(index) = index {
+                                        guidance_wake.send_if_modified(|current| {
+                                            let changed = index > *current;
+                                            *current = (*current).max(index);
+                                            changed
+                                        });
+                                    }
+                                }
+                                Some(Err(error)) => tracing::warn!(run_id = %run_id, %error, "guidance observation failed; retaining the previous cursor"),
+                                None => {}
                             }
                         }
                         Ok(Err(error)) => {
@@ -7491,6 +7509,7 @@ impl AgenticRunLifecycleService {
         let llm_cancel_token = Arc::new(CancellationToken::new());
         let execution_lease_lost = Arc::new(AtomicBool::new(false));
         let (input_wake, _) = tokio::sync::watch::channel(-1);
+        let (guidance_wake, _) = tokio::sync::watch::channel(-1);
         let run_state = RunState {
             run_id,
             user_id,
@@ -7501,6 +7520,7 @@ impl AgenticRunLifecycleService {
             pause_flag: pause_flag.clone(),
             llm_cancel_token: llm_cancel_token.clone(),
             input_wake,
+            guidance_wake,
             live_tx: None,
             attached_event_tx: None,
             waiting_for: None,
@@ -14032,12 +14052,18 @@ impl AgenticRunLifecycleService {
                     bg_run_id.clone(),
                     bg_root_mailbox_agent_id.clone(),
                 );
-                let input_wake = runs
+                let (input_wake, guidance_wake) = runs
                     .read()
                     .await
                     .get(&bg_run_id)
-                    .map(|run| run.input_wake.clone())
-                    .unwrap_or_else(|| tokio::sync::watch::channel(-1).0);
+                    .map(|run| (run.input_wake.clone(), run.guidance_wake.clone()))
+                    .unwrap_or_else(|| {
+                        (
+                            tokio::sync::watch::channel(-1).0,
+                            tokio::sync::watch::channel(-1).0,
+                        )
+                    });
+                state.user_intents.guidance_wake = Some(guidance_wake.subscribe());
                 if let Some(tail) = opening_control_tail {
                     // The fresh opening ACK already covers this prefix. Keep a
                     // newer committed control wake if it raced with preparation.
@@ -14069,6 +14095,7 @@ impl AgenticRunLifecycleService {
                     bg_llm_cancel_token.clone(),
                     bg_execution_lease_lost.clone(),
                     input_wake,
+                    guidance_wake,
                 );
                 state.durable_control_watcher = control_watcher
                     .as_ref()
@@ -17474,6 +17501,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     *current = (*current).max(event_index);
                     changed
                 });
+                run.guidance_wake.send_if_modified(|current| {
+                    let changed = event_index > *current;
+                    *current = (*current).max(event_index);
+                    changed
+                });
                 run.live_tx.clone()
             } else {
                 None
@@ -17490,6 +17522,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
             }
+        } else if let Some(run) = self.runs.read().await.get(&run_id) {
+            // A retry can repair a lost local notification without creating a
+            // second durable source or replaying the input.
+            run.guidance_wake.send_if_modified(|current| {
+                let changed = event_index > *current;
+                *current = (*current).max(event_index);
+                changed
+            });
         }
         Ok(RunUserIntentRecord {
             run_id,
@@ -18030,6 +18070,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
     binding: astra_server_types::edge_connection_pool::ProviderStageDispatchBinding,
     edge_agent_id: &str,
     cursor: &mut usize,
+    delivery_unconfirmed: &mut bool,
 ) -> Result<NativeGuidanceProgress, astra_core::ClassifiedError> {
     use crate::turn::agentic_loop::execution_phase::{
         ProviderBoundaryGate, apply_acknowledged_user_intents, apply_pending_user_intents_once,
@@ -18058,8 +18099,8 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
         )
         .await?;
     }
-    // No later source can overtake a provider-accepted but unacknowledged
-    // source. Retrying this owner is persistence-only, never another steer.
+    // Do not let a later steer overtake an accepted input whose durable
+    // disposition still needs acknowledgement, including after owner loss.
     if !state.user_intents.pending_apply_event_indices().is_empty() {
         return Ok(NativeGuidanceProgress::Continue {
             retry_at: state.user_intents.pending_apply_ack_deadline(),
@@ -18124,6 +18165,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 ),
             });
         }
+        *delivery_unconfirmed = true;
         match pool
             .deliver_provider_stage_input(
                 identity,
@@ -18148,6 +18190,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                             error,
                         )
                     })?;
+                *delivery_unconfirmed = false;
                 *cursor = event.event_index;
                 apply_pending_user_intents_once(
                     host,
@@ -18191,6 +18234,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                             error,
                         )
                     })?;
+                *delivery_unconfirmed = false;
                 *cursor = event.event_index;
                 tracing::warn!(run_id = %identity.run_id, intent_id = %event.intent_id,
                         reason = ?ack.reason, "native guidance was rejected");
@@ -18220,6 +18264,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 });
             }
             Err(error) if !error.may_have_reached_provider => {
+                *delivery_unconfirmed = false;
                 return Ok(NativeGuidanceProgress::Continue {
                     retry_at: Some(
                         tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
@@ -18233,10 +18278,14 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
             }
         }
     }
+    let apply_retry_at = state.user_intents.pending_apply_ack_deadline();
+    let poll_retry_at = poll.snapshot_has_more.then(tokio::time::Instant::now);
+    let retry_at = match (apply_retry_at, poll_retry_at) {
+        (Some(apply), Some(poll)) => Some(apply.min(poll)),
+        (apply, poll) => apply.or(poll),
+    };
     *cursor = (*cursor).max(poll.next_cursor);
-    Ok(NativeGuidanceProgress::Continue {
-        retry_at: poll.snapshot_has_more.then(tokio::time::Instant::now),
-    })
+    Ok(NativeGuidanceProgress::Continue { retry_at })
 }
 
 impl AgenticRunLifecycleService {
@@ -22248,44 +22297,43 @@ impl ServerSubRunExecutor {
                         // Poll physical completion while control I/O is in
                         // progress. A slow poll or persistence call must not
                         // keep the invocation future from observing cancel.
-                        let guidance_deadline = tokio::time::Instant::now()
-                            + astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT;
+                        let mut delivery_unconfirmed = false;
                         let guidance = pump_native_guidance(pool, host, state,
                             &identity, dispatch_binding.expect("this dispatch enabled guidance"),
-                            &edge_agent_id, &mut guidance_cursor);
-                        let mut guidance = Box::pin(tokio::time::timeout_at(guidance_deadline, guidance));
-                        tokio::select! {
+                            &edge_agent_id, &mut guidance_cursor, &mut delivery_unconfirmed);
+                        let mut guidance = Box::pin(guidance);
+                        let mut completed_invocation = None;
+                        let progress = tokio::select! {
+                            biased;
+                            result = &mut guidance => Some(result),
                             result = &mut invocation => {
-                                // Keep deferred completion custody alive while
-                                // an already-started ACK resolves. Completion
-                                // does not renew the control-operation budget.
-                                guidance_disposition_unconfirmed |=
-                                    !matches!(guidance.await, Ok(Ok(NativeGuidanceProgress::Continue { .. } | NativeGuidanceProgress::StoppedConfirmed)));
-                                break result;
+                                completed_invocation = Some(result);
+                                // Result and input ACK use independent Edge
+                                // frames. Give the original waiter a bounded
+                                // drain so frame order cannot discard an ACK;
+                                // this never sends another input.
+                                tokio::time::timeout(
+                                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
+                                    &mut guidance,
+                                ).await.ok()
                             },
-                            result = &mut guidance => {
-                                guidance_enabled = match result {
-                                    Ok(result) => {
-                                        let progress = result?;
-                                        match progress {
-                                            NativeGuidanceProgress::Continue { retry_at } => {
-                                                next_guidance_poll = retry_at;
-                                                true
-                                            }
-                                            NativeGuidanceProgress::StoppedConfirmed => false,
-                                            NativeGuidanceProgress::StoppedUnconfirmed => {
-                                                guidance_disposition_unconfirmed = true;
-                                                false
-                                            }
-                                        }
-                                    },
-                                    Err(_) => {
-                                        guidance_disposition_unconfirmed = true;
-                                        false
-                                    },
-                                };
-                            },
+                        };
+                        drop(guidance);
+                        if let Some(result) = completed_invocation {
+                            guidance_disposition_unconfirmed |= delivery_unconfirmed;
+                            break result;
                         }
+                        guidance_enabled = match progress.expect("one branch completed")? {
+                            NativeGuidanceProgress::Continue { retry_at } => {
+                                next_guidance_poll = retry_at;
+                                true
+                            }
+                            NativeGuidanceProgress::StoppedConfirmed => false,
+                            NativeGuidanceProgress::StoppedUnconfirmed => {
+                                guidance_disposition_unconfirmed = true;
+                                false
+                            }
+                        };
                         if !guidance_enabled {
                             mailbox_enabled = false;
                         }
@@ -22821,6 +22869,15 @@ impl ServerSubRunExecutor {
             Ok(())
         };
         check_admission()?;
+        let execution_binding_generation = config
+            .execution_contract
+            .as_ref()
+            .and_then(|(binding, _)| binding.execution_binding_generation);
+        if let Some(native) = self.native_execution.as_ref()
+            && execution_binding_generation != Some(native.identity.execution_binding_generation)
+        {
+            return Err("native sub-run execution binding changed before admission".into());
+        }
         let Some(run_engine) = self.durable_run_engine() else {
             if config.work_item.is_some() {
                 return Err("WorkItem execution requires durable run admission".into());
@@ -23042,6 +23099,15 @@ impl ServerSubRunExecutor {
                         .map(|native| native.stage_admission.clone()),
                     delegation_authority: config.delegation_authority,
                     interaction_mode: config.interaction_mode,
+                    // A child must retain the same admitted binding generation as
+                    // its provider dispatch; input acknowledgements validate it
+                    // against this immutable opening and the current binding.
+                    execution_metadata: execution_binding_generation.map(|generation| {
+                        serde_json::Map::from_iter([(
+                            "execution_binding_generation".into(),
+                            serde_json::json!(generation),
+                        )])
+                    }),
                     child_runtime_id: Some(config.agent_profile.agent_id.clone()),
                     execution_restrictions: Some(execution_restrictions),
                     requested_model_policy: config.requested_model_policy.clone(),
@@ -24651,6 +24717,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             flag: Some(local_cancel_flag.clone()),
             pause_flag: Some(local_pause_flag.clone()),
             token: Some(local_cancel_token.clone()),
+            inference_token: None,
             execution_lease_lost: Some(local_execution_lease_lost.clone()),
             resolved_origin: None,
         };
@@ -24891,7 +24958,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .await;
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
+        let (guidance_wake, guidance_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
+        loop_state.user_intents.guidance_wake = Some(guidance_ready);
         loop_state.run_settings_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
@@ -24904,6 +24973,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             local_cancel_token,
             local_execution_lease_lost.clone(),
             input_wake,
+            guidance_wake,
         );
 
         loop_state.durable_control_watcher = durable_control_watcher.as_ref().map(|watcher| watcher.alive.clone());

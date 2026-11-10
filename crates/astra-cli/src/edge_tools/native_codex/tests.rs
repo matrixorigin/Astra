@@ -234,6 +234,34 @@ for line in sys.stdin: pass
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn late_steer_ack_uses_original_correlation_after_deadline() {
+    let input = ProviderStageInput::Text {
+        input_id: "late-ack".into(),
+        content: "extra guidance".into(),
+        correlation_id: None,
+        expected_turn_id: Some("turn".into()),
+    };
+    let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+    let mut pending = PendingStageInputAck {
+        request_id: json!(7),
+        input,
+        sender: Some(ack_tx),
+    };
+    tokio::time::advance(astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT * 2).await;
+    assert!(pending.sender.is_some());
+    let mut evidence = Evidence {
+        turn: Some("turn".into()),
+        ..Evidence::default()
+    };
+    pending
+        .resolve(&json!({"id":7,"result":{"turnId":"turn"}}), &mut evidence)
+        .unwrap();
+    let ack = ack_rx.try_recv().expect("late ACK must retain its sender");
+    assert!(ack.accepted);
+    assert_eq!(ack.input_id, "late-ack");
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn uncertain_guidance_never_becomes_a_negative_receipt_or_replay() {

@@ -2116,6 +2116,9 @@ pub struct UserIntentState {
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,
+    /// Advisory wake for committed user input, separate from generic run
+    /// events so ordinary progress cannot interrupt model inference.
+    pub(crate) guidance_wake: Option<tokio::sync::watch::Receiver<i64>>,
     /// Next time a best-effort empty/error intent poll is allowed.
     /// Due release acknowledgements may wake the poll independently.
     next_user_intent_poll_at: Option<tokio::time::Instant>,
@@ -2503,6 +2506,9 @@ pub struct CancellationState {
     pub pause_flag: Option<Arc<AtomicBool>>,
     /// Optional token cancelled with user cancel for immediate LLM/stream wake.
     pub token: Option<Arc<CancellationToken>>,
+    /// Cancels one provider request when newer user guidance arrives. It
+    /// inherits run cancellation but never cancels the run or other work.
+    pub(crate) inference_token: Option<Arc<CancellationToken>>,
     /// Set when this process can no longer prove it owns the durable execution
     /// lease. The shared I/O token is also cancelled, but this typed cause must
     /// never be projected as a user cancellation.
@@ -6436,7 +6442,8 @@ pub(crate) mod tests {
         pre_execution_rejection: Option<String>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
-        provider_response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        pub(crate) provider_response_gate:
+            Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
@@ -6764,7 +6771,30 @@ pub(crate) mod tests {
             }
             if let Some((started, release)) = self.provider_response_gate.take() {
                 started.notify_one();
-                release.notified().await;
+                let cancellation = state
+                    .cancellation
+                    .inference_token
+                    .clone()
+                    .or_else(|| state.cancellation.token.clone());
+                tokio::select! {
+                    _ = release.notified() => {}
+                    _ = async {
+                        match cancellation {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.current_turn += 1;
+                        self.turn_results.remove(0);
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "mock inference cancelled",
+                        ).with_details_json(serde_json::json!({
+                            "partial_full_text": "unsettled completion claim",
+                            "tool_calls": [{"id": "unexecuted-tool-fragment"}],
+                        }).to_string()));
+                    }
+                }
             }
             self.executed_messages.push(state.messages.clone());
             self.executed_model_item_ids

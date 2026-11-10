@@ -3453,7 +3453,25 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
-        let record = match self.control_reads.get(user_id, run_id).await {
+        self.check_control_observation_with_guidance(user_id, run_id, None)
+            .await
+    }
+
+    async fn check_control_observation_with_guidance(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        guidance_after: Option<i64>,
+    ) -> Result<RunControlObservation, String> {
+        let read = match guidance_after {
+            Some(after) => {
+                self.control_reads
+                    .get_with_guidance_after(user_id, run_id, Some(after))
+                    .await
+            }
+            None => self.control_reads.get(user_id, run_id).await,
+        };
+        let record = match read {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record
@@ -3470,6 +3488,7 @@ impl RunEngine {
         let mut observation = RunControlObservation {
             status: None,
             last_event_idx: Some(record.last_event_idx),
+            guidance_observation: record.guidance_observation,
             session_id: Some(record.session_id.clone()),
             run_generation: Some(record.run_generation),
         };
@@ -4604,8 +4623,10 @@ impl RunStatusProvider for RunEngine {
         &self,
         user_id: &str,
         run_id: &str,
+        guidance_after: i64,
     ) -> Result<RunControlObservation, String> {
-        self.check_control_observation(user_id, run_id).await
+        self.check_control_observation_with_guidance(user_id, run_id, Some(guidance_after))
+            .await
     }
 
     async fn cancellation_origin(

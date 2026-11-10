@@ -1720,9 +1720,9 @@ impl EdgeConnectionPool {
                 pending.delivery_generation,
             )
         };
-        let (tx, rx) = oneshot::channel();
         let input_key = format!("{request_id}:{}", input.input_id());
         let owner = Arc::new(());
+        let (tx, rx) = oneshot::channel();
         match pending_inputs.entry(input_key.clone()) {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(PendingEdgeInput {
@@ -1742,11 +1742,8 @@ impl EdgeConnectionPool {
             key: &input_key,
             owner,
         };
-        // Re-check the connection after installing the waiter. A reconnect
-        // may have replaced the socket between the initial lookup and this
-        // point. A different socket is not authorized to steer this dispatch.
-        // Input IDs correlate acknowledgements; they do not prove provider
-        // deduplication and cannot make an unknown delivery safe to replay.
+        // Input IDs correlate acknowledgements; they do not make a replay
+        // safe. The invocation owns this waiter until it settles or ends.
         let still_current = self.connections.get(&key).is_some_and(|entry| {
             entry.value().generation == connection_generation
                 && entry
@@ -1787,17 +1784,17 @@ impl EdgeConnectionPool {
                 "provider stage input could not reach the Edge connection",
             ));
         }
+        // Once sent, await the original ACK under invocation ownership. The
+        // deadline bounds queue admission, not the provider's response; a
+        // timeout cannot prove rejection or make another send safe.
         let received = if let Some(token) = cancel_token {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => None,
-                result = tokio::time::timeout_at(deadline, rx) => result.ok().and_then(Result::ok),
+                result = rx => result.ok(),
             }
         } else {
-            tokio::time::timeout_at(deadline, rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
+            rx.await.ok()
         };
         let Some(ack) = received else {
             return Err(ProviderStageInputDeliveryError::unknown(
@@ -1835,6 +1832,28 @@ impl EdgeConnectionPool {
                 pending.delivery_generation == delivery_generation
             })
             .is_some_and(|(_, pending)| pending.sender.send(ack).is_ok())
+    }
+
+    /// Wake the input owner when the adapter loses its acknowledgement. This
+    /// is an unknown delivery, not permission to replay or reject the input.
+    pub fn mark_provider_stage_input_unconfirmed(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        delivery_generation: u64,
+        input_id: &str,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        let input_key = format!("{request_id}:{input_id}");
+        self.connections.get(&key).is_some_and(|entry| {
+            entry
+                .pending_inputs
+                .remove_if(&input_key, |_, pending| {
+                    pending.delivery_generation == delivery_generation
+                })
+                .is_some()
+        })
     }
 
     /// Remove stale connections (sender closed) and expired pending requests.
@@ -2940,7 +2959,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn provider_stage_input_requires_exact_invocation_and_ack_generation() {
         let pool = EdgeConnectionPool::new();
         let (tx, mut rx) = mpsc::channel(4);
@@ -3026,6 +3045,11 @@ mod tests {
             };
         assert_eq!(observed_request_id, request_id);
         assert_eq!(observed_generation, delivery_generation);
+        tokio::time::advance(PROVIDER_STAGE_INPUT_ACK_TIMEOUT * 2).await;
+        assert!(
+            !delivery.is_finished(),
+            "a slow provider ACK must retain its original waiter"
+        );
 
         let duplicate = pool
             .deliver_provider_stage_input(
@@ -3068,7 +3092,104 @@ mod tests {
                 Some("turn-1".into()),
             ),
         ));
+        assert!(!pool.deliver_provider_stage_input_ack(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            astra_turn_types::ProviderStageInputAck::rejected(
+                &input_for_ack,
+                "conflicting duplicate ACK",
+            ),
+        ));
         assert!(delivery.await.unwrap().unwrap().accepted);
+
+        let input = astra_turn_types::ProviderStageInput::Text {
+            input_id: "message-2".into(),
+            content: "later guidance".into(),
+            correlation_id: None,
+            expected_turn_id: Some("turn-1".into()),
+        };
+        let input_pool = pool.clone();
+        let input_identity = identity.clone();
+        let input_for_ack = input.clone();
+        let second = tokio::spawn(async move {
+            input_pool
+                .deliver_provider_stage_input(
+                    &input_identity,
+                    "edge-a",
+                    ProviderStageDispatchBinding {
+                        connection_generation,
+                        delivery_generation,
+                    },
+                    input,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    None,
+                )
+                .await
+        });
+        assert!(matches!(
+            rx.recv().await.unwrap().into_attempted_message(),
+            EdgeServerMessage::ToolInput { .. }
+        ));
+        assert!(!pool.mark_provider_stage_input_unconfirmed(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation + 1,
+            "message-2",
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let ack_pool = pool.clone();
+        let ack_request = request_id.clone();
+        let ack_barrier = barrier.clone();
+        let ack_thread = std::thread::spawn(move || {
+            ack_barrier.wait();
+            ack_pool.deliver_provider_stage_input_ack(
+                "user-1",
+                "edge-a",
+                &ack_request,
+                delivery_generation,
+                astra_turn_types::ProviderStageInputAck::accepted(
+                    &input_for_ack,
+                    Some("turn-1".into()),
+                ),
+            )
+        });
+        let unknown_pool = pool.clone();
+        let unknown_request = request_id.clone();
+        let unknown_barrier = barrier.clone();
+        let unknown_thread = std::thread::spawn(move || {
+            unknown_barrier.wait();
+            unknown_pool.mark_provider_stage_input_unconfirmed(
+                "user-1",
+                "edge-a",
+                &unknown_request,
+                delivery_generation,
+                "message-2",
+            )
+        });
+        barrier.wait();
+        let accepted = ack_thread.join().unwrap();
+        let unconfirmed = unknown_thread.join().unwrap();
+        assert_ne!(
+            accepted, unconfirmed,
+            "exactly one terminal observation wins"
+        );
+        let outcome = second.await.unwrap();
+        if accepted {
+            assert!(outcome.unwrap().accepted);
+        } else {
+            assert!(outcome.unwrap_err().may_have_reached_provider);
+        }
+        assert!(
+            pool.connections
+                .get(&pool_key("user-1", "edge-a"))
+                .unwrap()
+                .pending_inputs
+                .is_empty()
+        );
+        assert!(rx.try_recv().is_err(), "no input was replayed");
 
         assert!(pool.deliver_tool_result(
             "user-1",

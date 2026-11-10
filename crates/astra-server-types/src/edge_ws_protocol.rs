@@ -228,6 +228,15 @@ pub enum EdgeClientMessage {
         ack: ProviderStageInputAck,
     },
 
+    /// The adapter stopped observing this input without an acceptance or
+    /// rejection. The provider may still have received it.
+    #[serde(rename = "edge_tool_input_unconfirmed")]
+    ToolInputUnconfirmed {
+        request_id: String,
+        delivery_generation: u64,
+        input_id: String,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_capacity_result")]
     CapacityResult {

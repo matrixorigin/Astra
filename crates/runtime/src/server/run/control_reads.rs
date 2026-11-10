@@ -97,6 +97,15 @@ impl ControlReads {
     }
 
     pub(super) async fn get(self: &Arc<Self>, user_id: &str, run_id: &str) -> RunControlReadResult {
+        self.get_with_guidance_after(user_id, run_id, None).await
+    }
+
+    pub(super) async fn get_with_guidance_after(
+        self: &Arc<Self>,
+        user_id: &str,
+        run_id: &str,
+        guidance_after: Option<i64>,
+    ) -> RunControlReadResult {
         // Bound retained key bytes as well as callers. These limits exceed
         // the canonical VARCHAR identity capacities, including UTF-8 bytes.
         if user_id.len() > 512 || run_id.len() > 512 {
@@ -124,6 +133,7 @@ impl ControlReads {
                 key: RunControlReadKey {
                     user_id: user_id.into(),
                     run_id: run_id.into(),
+                    guidance_after,
                 },
                 collect_at: queued_at + COLLECTION_WINDOW,
                 reply,

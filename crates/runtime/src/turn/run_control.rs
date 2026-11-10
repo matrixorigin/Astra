@@ -23,6 +23,7 @@ pub enum RunControlStatus {
 pub struct RunControlObservation {
     pub status: Option<RunControlStatus>,
     pub last_event_idx: Option<i64>,
+    pub guidance_observation: Option<Result<Option<i64>, String>>,
     pub session_id: Option<String>,
     pub run_generation: Option<u64>,
 }
@@ -232,6 +233,7 @@ pub trait RunStatusProvider: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
+        _guidance_after: i64,
     ) -> Result<RunControlObservation, String> {
         Ok(RunControlObservation {
             status: self.control_status(user_id, run_id).await?,

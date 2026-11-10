@@ -3545,6 +3545,9 @@ pub struct DurableRunControlRecord {
     /// read so active executors can notice accepted input without another
     /// periodic database query. This is a wake hint, not an applied cursor.
     pub last_event_idx: i64,
+    /// Optional bounded intent observation for a control watcher. Errors must
+    /// not hide the independently observed cancellation and lease status.
+    pub guidance_observation: Option<Result<Option<i64>, String>>,
     /// True only when the store can prove an execution owner with an
     /// unexpired lease using its authoritative clock.
     pub owner_lease_live: bool,
@@ -3556,6 +3559,7 @@ pub struct DurableRunControlRecord {
 pub struct RunControlReadKey {
     pub user_id: String,
     pub run_id: String,
+    pub guidance_after: Option<i64>,
 }
 
 pub const RUN_CONTROL_READ_BATCH_SIZE: usize = 128;
@@ -4027,6 +4031,7 @@ impl From<&DurableRunRecord> for DurableRunControlRecord {
             cancellation_requested: false,
             run_generation: run.run_generation,
             last_event_idx: run.last_event_idx,
+            guidance_observation: None,
             owner_lease_live: run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(true),
         }
@@ -8689,6 +8694,45 @@ impl RunStateStore for InMemoryRunStateStore {
             .await
             .contains(&(user_id.to_string(), run_id.to_string()));
         Ok(Some(control))
+    }
+
+    async fn load_run_control_batch(
+        &self,
+        keys: &[RunControlReadKey],
+    ) -> Result<Vec<RunControlReadResult>, String> {
+        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
+            return Err("run control read batch exceeds capacity".into());
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            let mut control = self.load_run_control(&key.user_id, &key.run_id).await?;
+            if let (Some(after), Some(control)) = (key.guidance_after, control.as_mut()) {
+                let mut latest = None;
+                if control.last_event_idx > after {
+                    let runs = self.runs.read().await;
+                    if let Some(run) = runs
+                        .get(&key.run_id)
+                        .filter(|run| run.user_id == key.user_id)
+                    {
+                        latest = run
+                            .events
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(position, event)| {
+                                let index = event["index"].as_i64().unwrap_or(position as i64);
+                                (index > after
+                                    && index <= control.last_event_idx
+                                    && extract_event_type(event) == "user_intent")
+                                    .then_some(index)
+                            })
+                            .max();
+                    }
+                }
+                control.guidance_observation = Some(Ok(latest));
+            }
+            results.push(Ok(control));
+        }
+        Ok(results)
     }
 
     async fn load_run(
@@ -14493,14 +14537,19 @@ impl DatabaseRunStateStore {
         let dispatched: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM edge_pending_dispatch
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
-               AND request_id = ?
-               AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
+               AND request_id = ? AND edge_agent_id = ?
+               AND ((status = 'dispatched' AND result_json IS NULL)
+                 OR (? IS NOT NULL AND status = 'completed' AND result_json IS NOT NULL)) FOR UPDATE",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(identity.storage_key())
+        .bind(edge_agent_id)
+        // Only the exact unresolved ledger's captured dispatch owner may
+        // settle an ACK after its result frame. This cannot admit more work.
+        .bind(settlement_dispatch_owner)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|source| {
@@ -19203,6 +19252,7 @@ impl RunStateStore for DatabaseRunStateStore {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let started = tokio::time::Instant::now();
         let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
         query.push(RUN_CONTROL_COLUMNS).push(" FROM (VALUES ");
         for (ordinal, key) in keys.iter().enumerate() {
@@ -19240,7 +19290,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_control_batch", "batch", source).to_string())?;
-        connection.release();
         let mut results = vec![None; keys.len()];
         for row in rows {
             let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
@@ -19262,10 +19311,125 @@ impl RunStateStore for DatabaseRunStateStore {
                     .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose()),
             );
         }
-        results
+        let mut results: Vec<_> = results
             .into_iter()
             .map(|result| result.ok_or_else(|| "missing run control request ordinal".into()))
-            .collect()
+            .collect::<Result<_, String>>()?;
+        let mut changed = Vec::new();
+        for (ordinal, (key, result)) in keys.iter().zip(&mut results).enumerate() {
+            if let (Some(after), Ok(Some(control))) = (key.guidance_after, result) {
+                control.guidance_observation = Some(Ok(None));
+                if control.last_event_idx > after {
+                    changed.push((ordinal, key, after, control.last_event_idx));
+                }
+            }
+        }
+        if changed.is_empty() {
+            connection.release();
+            return Ok(results);
+        }
+
+        // Event rows and the run watermark are committed atomically. Bound
+        // this batch to the observed intervals; later commits are picked up by
+        // the next watcher sweep. Idle runs incur no extra query.
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT requested.ordinal, MAX(e.event_idx) AS latest_guidance_idx FROM (VALUES ",
+        );
+        for (position, (ordinal, key, after, through)) in changed.iter().enumerate() {
+            if position != 0 {
+                query.push(",");
+            }
+            query
+                .push("ROW(")
+                .push(*ordinal)
+                .push(",")
+                .push_bind(&key.user_id)
+                .push(",")
+                .push_bind(&key.run_id)
+                .push(",")
+                .push_bind(*after)
+                .push(",")
+                .push_bind(*through)
+                .push(")");
+        }
+        query.push(
+            ") requested(ordinal, requested_user_id, requested_run_id, after_idx, through_idx)
+            JOIN agent_run_events e FORCE INDEX (idx_agent_run_events_control_type_idx)
+              ON e.user_id = requested.requested_user_id AND e.run_id = requested.requested_run_id
+             AND e.event_type = 'user_intent' AND e.event_idx > requested.after_idx
+             AND e.event_idx <= requested.through_idx WHERE e.run_id IN (",
+        );
+        for (position, (_, key, _, _)) in changed.iter().enumerate() {
+            if position != 0 {
+                query.push(",");
+            }
+            query.push_bind(&key.run_id);
+        }
+        query.push(") GROUP BY requested.ordinal");
+        // Leave time inside the existing control-read deadline for cancel and
+        // lease status to reach the watcher even when the hint query stalls.
+        let deadline = started + std::time::Duration::from_secs(2);
+        let observed = tokio::time::timeout_at(
+            deadline,
+            query.build().fetch_all(connection.connection_mut()),
+        )
+        .await;
+        match observed {
+            Ok(Ok(rows)) => {
+                let mut seen = std::collections::HashSet::new();
+                let parsed = rows
+                    .into_iter()
+                    .map(|row| {
+                        let ordinal = row
+                            .try_get::<i64, _>("ordinal")
+                            .map_err(|error| error.to_string())?;
+                        let ordinal = usize::try_from(ordinal)
+                            .map_err(|_| "negative guidance ordinal".to_string())?;
+                        let index = row
+                            .try_get::<i64, _>("latest_guidance_idx")
+                            .map_err(|error| error.to_string())?;
+                        if !seen.insert(ordinal)
+                            || !changed.iter().any(|(expected, _, after, through)| {
+                                *expected == ordinal && index > *after && index <= *through
+                            })
+                        {
+                            return Err("invalid guidance observation".to_string());
+                        }
+                        Ok((ordinal, index))
+                    })
+                    .collect::<Result<Vec<_>, String>>();
+                match parsed {
+                    Ok(hints) => {
+                        for (ordinal, index) in hints {
+                            if let Ok(Some(control)) = &mut results[ordinal] {
+                                control.guidance_observation = Some(Ok(Some(index)));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for (ordinal, _, _, _) in &changed {
+                            if let Ok(Some(control)) = &mut results[*ordinal] {
+                                control.guidance_observation = Some(Err(error.clone()));
+                            }
+                        }
+                    }
+                }
+                connection.release();
+            }
+            failure => {
+                let error = match failure {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "guidance observation timed out".to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                for (ordinal, _, _, _) in &changed {
+                    if let Ok(Some(control)) = &mut results[*ordinal] {
+                        control.guidance_observation = Some(Err(error.clone()));
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     async fn load_run_controls(
@@ -24395,6 +24559,7 @@ fn decode_run_control_row(
         last_event_idx: row.try_get("last_event_idx").map_err(|source| {
             db_error("decode_run_control_event_index", entity, source).to_string()
         })?,
+        guidance_observation: None,
         owner_lease_live: row
             .try_get::<i64, _>("owner_lease_live")
             .map_err(|source| {
@@ -47786,6 +47951,62 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_control_batch_observes_the_greatest_guidance_in_its_interval() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guidance-batch");
+        run.last_event_idx = 9;
+        // Sparse imports need not have the same vector order as event indices.
+        run.events = vec![
+            json!({"event_type":"user_intent", "index":8}),
+            json!({"event_type":"user_intent", "index":3}),
+            json!({"event_type":"progress", "index":9}),
+        ];
+        store.insert_run(run).await.unwrap();
+        let key = |user: &str, after| RunControlReadKey {
+            user_id: user.into(),
+            run_id: "guidance-batch".into(),
+            guidance_after: after,
+        };
+        let results = store
+            .load_run_control_batch(&[
+                key("u1", Some(2)),
+                key("u1", Some(8)),
+                key("u2", Some(-1)),
+                key("u1", None),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .guidance_observation,
+            Some(Ok(Some(8)))
+        );
+        assert_eq!(
+            results[1]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .guidance_observation,
+            Some(Ok(None))
+        );
+        assert!(results[2].as_ref().unwrap().is_none());
+        assert_eq!(
+            results[3]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .guidance_observation,
+            None
         );
     }
 

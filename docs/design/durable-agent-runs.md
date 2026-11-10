@@ -215,6 +215,21 @@ because guidance arrived. Missing guidance, failed acknowledgement, cancellation
 and owner loss remain fail-closed. Ambiguous admission is reconciled before
 continuation, preserving exact settlement custody.
 
+During inference, committed guidance wakes a cancellation token scoped to that
+provider request. The loop awaits its existing usage and partial-output settlement,
+applies the durable input, then prepares the next request under the same run.
+Generic progress events cannot trigger this cancellation. Cross-node detection
+uses the existing batched control watcher and one indexed event query only for
+changed watermarks; failed event observation preserves cancel/pause results and
+retries the unclassified interval. Streamed replies remain visible alongside live
+tools. Eligible foreground shell work yields through its existing background owner;
+other tool execution retains its own cancellation and settlement contract.
+A pending direct child alone does not buffer its parent's prose; the child
+barrier still prevents final settlement. Explicit verification obligations and
+Work admission retain their existing projection gates. Provider partials cancelled
+by guidance are not promoted into canonical history because they may contain text
+withheld by those gates.
+
 A paused run that retains its waiting obligation and live execution lease may
 accept guidance without resuming. Acceptance records custody; application waits
 for the existing pause control to clear and retries the same acknowledgement,

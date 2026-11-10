@@ -21135,9 +21135,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // A provider answer is provisional while executed-tool evidence still
         // requires a typed completion action. The runtime may reject that
         // answer after this request returns; streaming it now is irreversible.
-        let direct_children_pending = self.direct_child_completion_owner(state)
-            .is_some_and(|owner| owner.has_pending_direct_children());
-        let completion_action_pending = direct_children_pending || state
+        // A running child does not make its parent's progress or response to
+        // guidance a completion claim. The shared child barrier still owns
+        // terminal settlement; only typed completion obligations buffer prose.
+        let completion_action_pending = state
             .hooks
             .completion_settlement
             .completion_action_window
@@ -21655,7 +21656,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
-                    let llm_cancel = llm_cancel_for_state(state);
+                    let llm_cancel = if let Some(token) = state.cancellation.inference_token.as_deref() {
+                        match state.cancellation.flag.as_deref() {
+                            Some(flag) => LlmCancel::FlagAndToken(flag, token),
+                            None => LlmCancel::Token(token),
+                        }
+                    } else {
+                        llm_cancel_for_state(state)
+                    };
                     call_prepared_llm_and_collect_with_stream_callback(
                         prepared_call,
                         llm_cancel,
@@ -51136,6 +51144,21 @@ mod tests {
         let mut state = create_durable_execution_test_state(session_id);
         state.message = "answer normally".to_string();
         state.user_intent = state.message.clone();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let executor = runtime_tool_executor_with_agent_context(workspace.path());
+        let owner = executor.direct_child_completion_owner().unwrap();
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "held-child".into(),
+            run_id: "held-child-run".into(),
+            parent_agent_id: "agent1".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        state.current_run_id = Some("run1".into());
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        assert!(owner.has_pending_direct_children());
 
         let observe_first_text = async {
             let mut visible_order = Vec::new();
@@ -51159,6 +51182,10 @@ mod tests {
                 }
                 if event_type == "text_delta" {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        owner.has_pending_direct_children(),
+                        "reply must not wait for the child"
+                    );
                     assert!(
                         saw_llm_call_started,
                         "visible provider output arrived before the LLM start lifecycle event"
