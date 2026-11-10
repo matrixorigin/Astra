@@ -642,7 +642,8 @@ does not add a second Token counter or ledger in Astra. TaaS's committed usage
 fact remains authoritative; BYOK and other backends outside TaaS stay outside
 that dashboard's coverage. Deploy TaaS verification before enabling the signer,
 and drain old signers before retiring a rotation key. Protocol vectors and the
-paired verifier are tracked in matrixorigin/taas#522 and Astra #1253.
+paired verifier are tracked in matrixorigin/taas#522; the Astra tracking issue
+is matrixorigin/Astra#1253 and its implementation PR is matrixorigin/Astra#1254.
 
 ### Administration
 
