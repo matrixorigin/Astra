@@ -1248,7 +1248,7 @@ mod tests {
         let (first, _) = take_pending_history_batch(&mut pending);
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
-        assert!(first.iter().all(|row| row.line.spans[0].content == "  "));
+        assert_eq!(first[0].line.to_string(), "paragraph 0");
 
         let mut emitted = first;
         while !pending.is_empty() {
