@@ -720,9 +720,20 @@ impl StructuredLlmError {
             .or_else(|| token("type").and_then(llm_error_envelope_code_class))
     }
 
+    /// Derive recovery once for HTTP and untyped SSE consumers. Explicit
+    /// protocol causes win; the generic invalid-request family requires
+    /// provider-neutral input-overflow semantics and no parameter/code cause.
     #[must_use]
     pub fn kind(&self) -> Option<ErrorKind> {
-        self.code().map(|(kind, _)| kind)
+        self.code().map(|(kind, _)| kind).or_else(|| {
+            (self.error_field("code").is_none()
+                && self.error_field("type") == Some("invalid_request_error")
+                && self.error_field("param").is_none()
+                && self.error_field("message").is_some_and(|message| {
+                    is_explicit_input_context_window_message_lower(&message.to_ascii_lowercase())
+                }))
+            .then_some(ErrorKind::ContextWindow)
+        })
     }
 
     /// Extract and validate either the OpenAI-compatible nested request ID or
@@ -749,26 +760,17 @@ impl StructuredLlmError {
         })
     }
 
-    /// Recognize an explicit context-overflow protocol code or Anthropic's
-    /// documented generic `invalid_request_error` family carrying the
-    /// specific `prompt is too long` cause. A specific code or output/input
-    /// parameter rejects prose interpretation, preserving the max_tokens fix.
+    /// Whether [`Self::kind`] derived context recovery from either an
+    /// explicit protocol cause or generic-family input-overflow semantics.
     #[must_use]
     pub fn is_context_window_overflow(&self) -> bool {
-        if matches!(self.code(), Some((ErrorKind::ContextWindow, _))) {
-            return true;
-        }
-        self.error_field("code").is_none()
-            && self.error_field("type") == Some("invalid_request_error")
-            && self.error_field("param").is_none()
-            && self
-                .error_field("message")
-                .is_some_and(|message| message.to_ascii_lowercase().contains("prompt is too long"))
+        self.kind() == Some(ErrorKind::ContextWindow)
     }
 }
 
-/// Classify only a recognized provider envelope code or type. Unrecognized
-/// machine facts return `None` so the HTTP owner can apply its status ladder.
+/// Classify a recognized protocol cause or generic-family input overflow.
+/// Other unrecognized machine facts return `None` so the caller can apply its
+/// status ladder without reinterpretation through output-parameter prose.
 #[must_use]
 pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
     StructuredLlmError::parse(body).and_then(|error| error.kind())
@@ -865,9 +867,9 @@ pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
 /// drive the failure kind: an unrecognized structured category is bounded by
 /// the status ladder instead of authorizing context compaction via needle
 /// matching, and only an explicit context-overflow code may claim
-/// [`ErrorKind::ContextWindow`], apart from the narrowly documented Anthropic
-/// generic-family overflow recognized by
-/// [`StructuredLlmError::is_context_window_overflow`]. A message-only error
+/// [`ErrorKind::ContextWindow`], apart from generic-family input overflow
+/// recognized by [`StructuredLlmError::is_context_window_overflow`]. A
+/// message-only error
 /// object is prose in JSON and does not count.
 #[must_use]
 pub fn has_structured_llm_error_facts(body: &str) -> bool {
@@ -887,13 +889,22 @@ pub fn is_llm_context_window_error(message: &str) -> bool {
 }
 
 fn is_unstructured_llm_context_window_message_lower(lower: &str) -> bool {
+    is_explicit_input_context_window_message_lower(lower)
+        || lower.contains("too many tokens")
+        || is_max_tokens_context_limit_error(lower)
+}
+
+/// Provider-neutral input-overflow semantics shared by generic structured
+/// errors. Output-token parameter matching deliberately stays only in the
+/// unstructured fallback above, never in this generic-family recovery rule.
+fn is_explicit_input_context_window_message_lower(lower: &str) -> bool {
     lower.contains("context_length_exceeded")
         || lower.contains("maximum context length")
         || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
         || lower.contains("input is too long")
         || lower.contains("context window")
-        || is_max_tokens_context_limit_error(lower)
+        || (lower.contains("too many tokens")
+            && (lower.contains("input") || lower.contains("prompt") || lower.contains("context")))
 }
 
 fn is_max_tokens_context_limit_error(lower: &str) -> bool {
@@ -1654,7 +1665,7 @@ mod tests {
                 r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#,
                 Some(ErrorKind::InvalidRequest),
             ),
-            // Only the envelope code may claim context-window overflow.
+            // An explicit envelope code takes precedence over message semantics.
             (
                 r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"context_length_exceeded","param":null,"code":"context_length_exceeded","request_id":"req_def456"}}"#,
                 Some(ErrorKind::ContextWindow),
@@ -1729,9 +1740,18 @@ mod tests {
         )
         .expect("Anthropic envelope");
         assert!(anthropic.is_context_window_overflow());
+        assert_eq!(anthropic.kind(), Some(ErrorKind::ContextWindow));
+
+        let openai = StructuredLlmError::parse(
+            r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+        )
+        .expect("OpenAI envelope");
+        assert!(openai.is_context_window_overflow());
+        assert_eq!(openai.kind(), Some(ErrorKind::ContextWindow));
 
         for body in [
             r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+            r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":null,"code":null}}"#,
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","code":"some_future_code"}}"#,
             r#"{"error":{"message":"prompt is too long","type":"invalid_request_error","param":"max_tokens"}}"#,
         ] {

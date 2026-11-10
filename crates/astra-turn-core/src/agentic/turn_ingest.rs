@@ -1209,40 +1209,49 @@ mod tests {
         assert_eq!(pack.consecutive_context_window_errors, 0);
     }
 
-    /// An SSE error carrying a parsed provider envelope whose cause tokens
-    /// are all outside the classification whitelist (here a 400 output-token
-    /// parameter rejection) must stay out of ContextWindow: prose needle
-    /// matching against the envelope's own message would otherwise escalate
-    /// the context streak and authorize compaction that cannot fix an
-    /// output-parameter problem. Locked through the SSE accumulator →
-    /// snapshot → ingest boundary so an unclassified SSE error event keeps
-    /// `error_kind: None` all the way in.
+    /// Untyped provider errors retain one recovery contract from SSE dispatch
+    /// through snapshot and ingestion, including the output-parameter control.
     #[test]
-    fn fatal_structured_unknown_facts_are_not_context_window() {
-        let accum = ChatTurnSseAccum {
-            error_message: Some(
-                r#"LLM error 400: {"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#
-                    .to_string(),
+    fn fatal_generic_provider_errors_share_http_semantics_through_sse() {
+        for (message, expected_kind, expected_streak) in [
+            (
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
-            error_kind: None,
-            ..Default::default()
-        };
-        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
-        assert_eq!(
-            snap.error_kind, None,
-            "test must exercise the unclassified SSE error branch"
-        );
+            (
+                r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            crate::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {}\n\n", json!({"type":"error","message":message})),
+                &mut accum,
+                &mut Vec::new(),
+            );
+            let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+            assert_eq!(
+                snap.error_kind, None,
+                "test must exercise the unclassified SSE fallback"
+            );
 
-        let mut pack = Pack::new();
-        pack.consecutive_context_window_errors = 3;
-        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
-        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
-            if e.kind == astra_core::ErrorKind::Unknown
-        ));
-        assert_eq!(
-            pack.consecutive_context_window_errors, 0,
-            "unknown structured facts must clear, not escalate, the context streak"
-        );
+            let mut pack = Pack::new();
+            pack.consecutive_context_window_errors = 1;
+            let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+            assert!(
+                matches!(&out, AgenticTurnIngestOutcome::Fatal(error)
+                    if error.kind == expected_kind),
+                "unexpected outcome for {message}: {out:?}"
+            );
+            assert_eq!(pack.consecutive_context_window_errors, expected_streak);
+        }
     }
 
     #[test]
