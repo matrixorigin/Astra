@@ -65,58 +65,66 @@ fn stream_event_is_terminal(event: &StreamEvent) -> bool {
     )
 }
 
-/// Decode one already-admitted SSE response with the same terminal-event
-/// semantics for every streaming endpoint. A transport close after a
-/// terminal event is considered a clean end; EOF before a terminal event is
-/// surfaced as an error so callers cannot report a partial Work turn as
-/// completed.
-fn classified_sse_response(
+/// Decode Astra control events through clean EOF or the explicit terminator.
+fn sse_response_events(
     resp: Response,
+    max_frame_bytes: Option<usize>,
 ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
     stream! {
-        let mut parser = SseParser::new();
+        let mut parser = max_frame_bytes.map_or_else(SseParser::new, SseParser::with_max_frame_bytes);
         let mut byte_stream = resp.bytes_stream();
-        let mut saw_terminal = false;
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    if saw_terminal {
-                        return;
-                    }
                     yield Err(e.into());
                     return;
                 }
             };
-            match parser.push_bytes(&chunk) {
-                Ok(events) => {
-                    for event in events {
-                        saw_terminal |= stream_event_is_terminal(&event);
+            let mut input = chunk.as_ref();
+            while !input.is_empty() {
+                match parser.next_event(&mut input) {
+                    Ok(Some(event)) => {
                         yield Ok(event);
                     }
-                }
-                Err(error) => {
-                    if saw_terminal {
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield Err(error);
                         return;
                     }
-                    yield Err(error);
-                    return;
                 }
+            }
+            if parser.is_finished() {
+                break;
             }
         }
         match parser.finish() {
-            Ok(events) => {
-                for event in events {
+            Ok(Some(event)) => yield Ok(event),
+            Ok(None) => {},
+            Err(error) => yield Err(error),
+        }
+    }
+    .boxed()
+}
+
+/// Require a semantic terminal so a partial turn cannot look successful.
+fn classified_sse_response(
+    resp: Response,
+) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
+    stream! {
+        let mut events = sse_response_events(resp, None);
+        let mut saw_terminal = false;
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(event) => {
                     saw_terminal |= stream_event_is_terminal(&event);
                     yield Ok(event);
                 }
-            }
-            Err(error) => {
-                if saw_terminal {
+                Err(_) if saw_terminal => return,
+                Err(error) => {
+                    yield Err(error);
                     return;
                 }
-                yield Err(error);
-                return;
             }
         }
         if !saw_terminal {
@@ -2058,6 +2066,61 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// Request a model for the next available round; acceptance is not application.
+    pub async fn request_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &astra_turn_types::RunModelRequest,
+    ) -> Result<astra_turn_types::RunModelSelection, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile one guidance receipt without replaying the Run stream.
+    pub async fn get_run_user_intent(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+        intent_id: &str,
+    ) -> Result<astra_turn_types::UserIntentStatus, ThinClientError> {
+        let url = self.url(&paths::chat_run_user_intent(run_id, intent_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Reconcile an uncertain model change without automatically resubmitting it.
+    pub async fn get_run_model(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+    ) -> Result<astra_turn_types::RunModelSnapshot, ThinClientError> {
+        let url = self.url(&paths::chat_run_model(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     /// Request a policy for the next model round; acceptance is not application.
     pub async fn request_run_permission_mode(
         &self,
@@ -2264,35 +2327,9 @@ impl ThinClient {
                     return;
                 }
             };
-            let mut parser = SseParser::new();
-            let mut byte_stream = resp.bytes_stream();
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(e.into());
-                        return;
-                    }
-                };
-                match parser.push_bytes(&chunk) {
-                    Ok(evs) => {
-                        for ev in evs {
-                            yield Ok(ev);
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        return;
-                    }
-                }
-            }
-            match parser.finish() {
-                Ok(evs) => {
-                    for ev in evs {
-                        yield Ok(ev);
-                    }
-                }
-                Err(e) => yield Err(e),
+            let mut events = sse_response_events(resp, None);
+            while let Some(event) = events.next().await {
+                yield event;
             }
         }
         .boxed()
@@ -2634,110 +2671,97 @@ impl ThinClient {
             return Self::typed_json_or_error(response).await;
         }
         let receive = async {
-            let mut parser = SseParser::with_max_frame_bytes(256 * 1024);
-            let mut chunks = response.bytes_stream();
+            let mut events = sse_response_events(response, Some(256 * 1024));
             let mut required_index = None;
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
-                for feed in chunk.chunks(16 * 1024) {
-                    for event in parser.push_bytes(feed)? {
-                        let (event_type, raw) = match event {
-                            StreamEvent::Other { event_type, raw } => (event_type, raw),
-                            StreamEvent::Error { raw, .. } => {
-                                let status = raw
-                                    .get("status")
-                                    .and_then(Value::as_u64)
-                                    .and_then(|status| u16::try_from(status).ok())
-                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
-                                    .filter(|status| {
-                                        status.is_client_error() || status.is_server_error()
-                                    })
-                                    .unwrap_or(reqwest::StatusCode::CONFLICT);
-                                return Err(ThinClientError::Api {
-                                    status,
-                                    body: "native interaction request rejected".into(),
-                                });
-                            }
-                            _ => {
-                                return Err(ThinClientError::InvalidProviderInteractionResponse(
-                                    "unexpected interaction stream event".into(),
-                                ));
-                            }
-                        };
-                        match event_type.as_str() {
-                            "provider_interaction_required" => {
-                                let identity: astra_turn_types::ToolInvocationIdentity =
-                                    serde_json::from_value(
-                                        raw.pointer("/tool_invocation_origin/identity")
-                                            .cloned()
-                                            .ok_or_else(|| {
-                                                ThinClientError::InvalidProviderInteractionResponse(
-                                                    "required event has no invocation origin"
-                                                        .into(),
-                                                )
-                                            })?,
-                                    )?;
-                                let interaction: astra_turn_types::ProviderInteractionRequest =
-                                    serde_json::from_value(
-                                        raw.get("interaction").cloned().ok_or_else(|| {
-                                            ThinClientError::InvalidProviderInteractionResponse(
-                                                "required event has no interaction".into(),
-                                            )
-                                        })?,
-                                    )?;
-                                let index =
-                                    raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+            while let Some(event) = events.next().await {
+                let event = event?;
+                let (event_type, raw) = match event {
+                    StreamEvent::Other { event_type, raw } => (event_type, raw),
+                    StreamEvent::Error { raw, .. } => {
+                        let status = raw
+                            .get("status")
+                            .and_then(Value::as_u64)
+                            .and_then(|status| u16::try_from(status).ok())
+                            .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                            .filter(|status| status.is_client_error() || status.is_server_error())
+                            .unwrap_or(reqwest::StatusCode::CONFLICT);
+                        return Err(ThinClientError::Api {
+                            status,
+                            body: "native interaction request rejected".into(),
+                        });
+                    }
+                    _ => {
+                        return Err(ThinClientError::InvalidProviderInteractionResponse(
+                            "unexpected interaction stream event".into(),
+                        ));
+                    }
+                };
+                match event_type.as_str() {
+                    "provider_interaction_required" => {
+                        let identity: astra_turn_types::ToolInvocationIdentity =
+                            serde_json::from_value(
+                                raw.pointer("/tool_invocation_origin/identity")
+                                    .cloned()
+                                    .ok_or_else(|| {
                                         ThinClientError::InvalidProviderInteractionResponse(
-                                            "required event has no durable index".into(),
+                                            "required event has no invocation origin".into(),
                                         )
-                                    })?;
-                                if identity != body.identity
-                                    || interaction != body.interaction
-                                    || raw.get("run_id").and_then(Value::as_str)
-                                        != Some(body.identity.run_id.as_str())
-                                    || raw
-                                        .pointer("/tool_invocation_origin/edge_agent_id")
-                                        .and_then(Value::as_str)
-                                        != Some(body.edge_agent_id.as_str())
-                                    || required_index.is_some_and(|previous| previous != index)
-                                {
-                                    return Err(
-                                        ThinClientError::InvalidProviderInteractionResponse(
-                                            "required event changed interaction identity".into(),
-                                        ),
-                                    );
-                                }
-                                if required_index.is_none() {
-                                    required_events.send(raw).await.map_err(|_| {
-                                        ThinClientError::InvalidProviderInteractionResponse(
-                                            "interaction consumer closed".into(),
-                                        )
-                                    })?;
-                                    required_index = Some(index);
-                                }
-                            }
-                            "tool_interaction_response" => {
-                                let response: astra_turn_types::ProviderInteractionResponse =
-                                    serde_json::from_value(
-                                        raw.get("response").cloned().ok_or_else(|| {
-                                            ThinClientError::InvalidProviderInteractionResponse(
-                                                "missing terminal interaction response".into(),
-                                            )
-                                        })?,
-                                    )?;
-                                response.validate_for(&body.interaction).map_err(|error| {
+                                    })?,
+                            )?;
+                        let interaction: astra_turn_types::ProviderInteractionRequest =
+                            serde_json::from_value(raw.get("interaction").cloned().ok_or_else(
+                                || {
                                     ThinClientError::InvalidProviderInteractionResponse(
-                                        error.to_string(),
+                                        "required event has no interaction".into(),
                                     )
-                                })?;
-                                return Ok(response);
-                            }
-                            _ => {
-                                return Err(ThinClientError::InvalidProviderInteractionResponse(
-                                    "unexpected interaction stream event".into(),
-                                ));
-                            }
+                                },
+                            )?)?;
+                        let index = raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                            ThinClientError::InvalidProviderInteractionResponse(
+                                "required event has no durable index".into(),
+                            )
+                        })?;
+                        if identity != body.identity
+                            || interaction != body.interaction
+                            || raw.get("run_id").and_then(Value::as_str)
+                                != Some(body.identity.run_id.as_str())
+                            || raw
+                                .pointer("/tool_invocation_origin/edge_agent_id")
+                                .and_then(Value::as_str)
+                                != Some(body.edge_agent_id.as_str())
+                            || required_index.is_some_and(|previous| previous != index)
+                        {
+                            return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                "required event changed interaction identity".into(),
+                            ));
                         }
+                        if required_index.is_none() {
+                            required_events.send(raw).await.map_err(|_| {
+                                ThinClientError::InvalidProviderInteractionResponse(
+                                    "interaction consumer closed".into(),
+                                )
+                            })?;
+                            required_index = Some(index);
+                        }
+                    }
+                    "tool_interaction_response" => {
+                        let response: astra_turn_types::ProviderInteractionResponse =
+                            serde_json::from_value(raw.get("response").cloned().ok_or_else(
+                                || {
+                                    ThinClientError::InvalidProviderInteractionResponse(
+                                        "missing terminal interaction response".into(),
+                                    )
+                                },
+                            )?)?;
+                        response.validate_for(&body.interaction).map_err(|error| {
+                            ThinClientError::InvalidProviderInteractionResponse(error.to_string())
+                        })?;
+                        return Ok(response);
+                    }
+                    _ => {
+                        return Err(ThinClientError::InvalidProviderInteractionResponse(
+                            "unexpected interaction stream event".into(),
+                        ));
                     }
                 }
             }
@@ -5366,6 +5390,85 @@ mod tests {
             .await
             .expect_err("a partial stream must not look like a completed turn");
         assert!(error.to_string().contains("terminal event"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_preserves_valid_eof_terminal_and_rejects_malformed_tail() {
+        for (tail, expected) in [
+            (
+                "\u{feff}data: {\"type\":\"run_finished\",\"run_id\":\"r\",\"status\":\"failed\"}",
+                true,
+            ),
+            ("data: {\"type\":\"run_finished\"", false),
+        ] {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/stream"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(tail))
+                .mount(&srv)
+                .await;
+            let client = ThinClient::new(&srv.uri(), None).unwrap();
+            let result = client
+                .chat_stream_collect(&ChatStreamRequest::new("hi", "m"), None)
+                .await;
+            if expected {
+                assert!(
+                    matches!(result.unwrap().as_slice(), [StreamEvent::RunFinished { status: Some(status), .. }] if status == "failed")
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn done_finishes_control_stream_without_waiting_for_transport_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for terminal in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = if terminal {
+                    "data: {\"type\":\"turn_complete\"}\n\ndata: [DONE]\n\n"
+                } else {
+                    "data: [DONE]\n\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let mut events = classified_sse_response(response);
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut collected = Vec::new();
+                while let Some(event) = events.next().await {
+                    collected.push(event);
+                }
+                collected
+            })
+            .await
+            .expect("DONE must not wait for the server to close");
+            if terminal {
+                assert!(matches!(
+                    result.as_slice(),
+                    [Ok(StreamEvent::TurnComplete { .. })]
+                ));
+            } else {
+                assert!(matches!(
+                    result.as_slice(),
+                    [Err(ThinClientError::SseParse(_))]
+                ));
+            }
+            server.abort();
+        }
     }
 
     // ── 429 retry logic ─────────────────────────────────────────────────

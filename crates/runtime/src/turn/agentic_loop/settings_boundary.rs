@@ -1,32 +1,117 @@
-//! Permission interaction changes are captured once before round preparation.
+//! User settings are captured once before round preparation.
 //! Guidance/action epochs remain independent of this control lane.
 
-use super::host::{AgenticLoopHost, AgenticLoopState, VolatileKind};
+use super::host::{AgenticLoopHost, AgenticLoopState, CancellationState, VolatileKind};
+use astra_turn_core::orchestration_types::CancellationOrigin;
 use astra_turn_types::RunPermissionModeApplied;
+use std::{sync::atomic::Ordering, time::Duration};
+
+pub(crate) fn settings_control_stop(
+    cancellation: &CancellationState,
+    remaining: Option<Duration>,
+) -> Option<astra_core::ClassifiedError> {
+    let lease_lost = cancellation
+        .execution_lease_lost
+        .as_ref()
+        .is_some_and(|lost| lost.load(Ordering::Acquire));
+    let (kind, message) = if lease_lost
+        && cancellation.resolved_origin != Some(CancellationOrigin::User)
+    {
+        (
+            astra_core::ErrorKind::ServerError,
+            "Execution ownership was lost during settings control; its outcome may be unconfirmed",
+        )
+    } else if cancellation
+        .token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+        || cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        (
+            astra_core::ErrorKind::Cancelled,
+            "Settings control was interrupted; its outcome may be unconfirmed",
+        )
+    } else if remaining.is_some_and(|budget| budget.is_zero()) {
+        (
+            astra_core::ErrorKind::BudgetExhausted,
+            "Execution deadline expired during settings control; its outcome may be unconfirmed",
+        )
+    } else {
+        return None;
+    };
+    Some(astra_core::ClassifiedError::new(kind, message))
+}
+
+/// Wait under the original execution authority. Callers must use
+/// cancellation-safe I/O and reconcile a potentially committed write.
+pub(crate) async fn await_settings_control<T>(
+    operation: impl std::future::Future<Output = T>,
+    cancellation: &CancellationState,
+    remaining: Option<Duration>,
+) -> Result<T, astra_core::ClassifiedError> {
+    if let Some(error) = settings_control_stop(cancellation, remaining) {
+        return Err(error);
+    }
+    tokio::select! {
+        biased;
+        result = operation => Ok(result),
+        _ = async {
+            if let Some(token) = &cancellation.token {
+                token.cancelled().await;
+            } else if cancellation.flag.is_some() || cancellation.execution_lease_lost.is_some() {
+                loop {
+                    if settings_control_stop(cancellation, None).is_some() { break; }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => Err(settings_control_stop(cancellation, None).unwrap_or_else(|| boundary_error("settings control was interrupted"))),
+        _ = async {
+            match remaining {
+                Some(remaining) => tokio::time::sleep(remaining).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => Err(settings_control_stop(cancellation, Some(Duration::ZERO)).expect("zero budget stops settings control")),
+    }
+}
 
 fn boundary_error(message: impl std::fmt::Display) -> astra_core::ClassifiedError {
     astra_core::ClassifiedError::new(
         astra_core::ErrorKind::ContractViolation,
-        format!("permission-mode boundary failed: {message}"),
+        format!("run-settings boundary failed: {message}"),
     )
 }
 
-/// Round-local observation of the existing durable permission lane. This is
+/// Round-local observation of the existing durable settings lane. This is
 /// only a read cache: application still requires the exact durable owner ACK.
 /// The control watcher and committed same-pod requests share its wake source.
 #[derive(Default)]
-pub(crate) struct PermissionModeObservation {
+pub(crate) struct RunSettingsObservation {
     wake: Option<tokio::sync::watch::Receiver<i64>>,
-    snapshot: Option<astra_turn_types::RunPermissionModeSnapshot>,
+    snapshot: Option<astra_services::runs::RunSettingsSnapshot>,
 }
 
-impl PermissionModeObservation {
+impl RunSettingsObservation {
+    pub(crate) fn model(&self) -> Option<&astra_services::runs::RunModelSettingsSnapshot> {
+        self.snapshot.as_ref().map(|snapshot| &snapshot.model)
+    }
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(wake) = self.wake.as_mut() {
+            wake.mark_changed();
+        } else {
+            self.snapshot = None;
+        }
+    }
     pub(crate) fn bind_wake(&mut self, wake: tokio::sync::watch::Receiver<i64>) {
         self.wake = Some(wake);
         self.snapshot = None;
     }
 
-    /// The opening ACK proves empty permission history, not an applied mode.
+    /// The opening ACK proves empty settings history, not an applied mode.
     /// Initial restrictions still come from the admitted request; later changes
     /// require their existing durable application acknowledgement.
     pub(crate) fn bind_opening_wake(
@@ -34,7 +119,7 @@ impl PermissionModeObservation {
         mut wake: tokio::sync::watch::Receiver<i64>,
         tail: i64,
     ) {
-        self.snapshot = Some(astra_turn_types::RunPermissionModeSnapshot::default());
+        self.snapshot = Some(astra_services::runs::RunSettingsSnapshot::default());
         let observed = *wake.borrow_and_update();
         if observed > tail {
             wake.mark_changed();
@@ -42,13 +127,13 @@ impl PermissionModeObservation {
         self.wake = Some(wake);
     }
 
-    async fn read(
+    pub(crate) async fn read(
         &mut self,
         control: &dyn crate::turn::run_control::RunControlProvider,
         user_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<astra_turn_types::RunPermissionModeSnapshot>, String> {
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
         let refresh = self.snapshot.is_none()
             || self
                 .wake
@@ -62,7 +147,7 @@ impl PermissionModeObservation {
                 let _ = wake.borrow_and_update();
             }
             match control
-                .permission_mode_snapshot(user_id, session_id, run_id)
+                .run_settings_snapshot(user_id, session_id, run_id)
                 .await
             {
                 Ok(snapshot) => self.snapshot = snapshot,
@@ -78,7 +163,7 @@ impl PermissionModeObservation {
     }
 }
 
-pub(crate) async fn apply_round_permission_mode<H: AgenticLoopHost>(
+pub(crate) async fn apply_round_settings<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
@@ -102,16 +187,27 @@ pub(crate) async fn apply_round_permission_mode<H: AgenticLoopHost>(
         .as_ref()
         .is_some_and(|watcher| watcher.has_changed().is_err())
     {
-        state.permission_mode_observation.wake = None;
+        state.run_settings_observation.wake = None;
     }
-    let Some(snapshot) = state
-        .permission_mode_observation
-        .read(control.as_ref(), &user_id, &session_id, &run_id)
-        .await
-        .map_err(boundary_error)?
-    else {
+    let remaining = host
+        .execution_time_budget_remaining()
+        .map(|budget| budget.total_remaining);
+    let observed = await_settings_control(
+        state
+            .run_settings_observation
+            .read(control.as_ref(), &user_id, &session_id, &run_id),
+        &state.cancellation,
+        remaining,
+    )
+    .await;
+    if observed.is_err() {
+        // A cancelled read consumed its wake before entering I/O.
+        state.run_settings_observation.invalidate();
+    }
+    let Some(snapshot) = observed?.map_err(boundary_error)? else {
         return Ok(());
     };
+    let snapshot = snapshot.permission;
     // Applied state hydrates a recovered executor even if there is no pending
     // request. Capture once: requests arriving during this round wait for the next.
     let selection = match (snapshot.requested, snapshot.applied.as_ref()) {
@@ -131,24 +227,38 @@ pub(crate) async fn apply_round_permission_mode<H: AgenticLoopHost>(
         if let Some(context) = state.permission_context.as_ref() {
             // Preserve inherited/session allow/deny rules, tool allowlists,
             // fingerprint decisions, telemetry, and skill restrictions.
-            context.write().await.inherited.mode = selection.mode;
+            let remaining = host
+                .execution_time_budget_remaining()
+                .map(|budget| budget.total_remaining);
+            await_settings_control(context.write(), &state.cancellation, remaining)
+                .await?
+                .inherited
+                .mode = selection.mode;
         } else {
             state.permission_context = Some(
                 crate::orchestration::PermissionSyncContext::shared_root(selection.mode),
             );
         }
-        if !control
-            .apply_permission_mode(
+        let remaining = host
+            .execution_time_budget_remaining()
+            .map(|budget| budget.total_remaining);
+        let acknowledged = await_settings_control(
+            control.apply_permission_mode(
                 &user_id,
                 &session_id,
                 &run_id,
                 generation,
                 &selection,
                 state.current_round_index,
-            )
-            .await
-            .map_err(boundary_error)?
-        {
+            ),
+            &state.cancellation,
+            remaining,
+        )
+        .await;
+        if !matches!(&acknowledged, Ok(Ok(true))) {
+            state.run_settings_observation.invalidate();
+        }
+        if !acknowledged?.map_err(boundary_error)? {
             return Err(boundary_error(
                 "durable application rejected execution authority",
             ));
@@ -198,6 +308,9 @@ mod tests {
         reads: std::sync::atomic::AtomicUsize,
         control_reads: std::sync::atomic::AtomicUsize,
         reject_read: std::sync::atomic::AtomicBool,
+        hang_read: std::sync::atomic::AtomicBool,
+        hang_ack: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
     }
     impl Control {
         fn request(&self, mode: PermissionMode, revision: i64) {
@@ -219,18 +332,25 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(None)
         }
-        async fn permission_mode_snapshot(
+        async fn run_settings_snapshot(
             &self,
             _: &str,
             _: &str,
             _: &str,
-        ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.hang_read.load(std::sync::atomic::Ordering::Relaxed) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
             if self.reject_read.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err("permission read unavailable".into());
             }
-            Ok(Some(self.snapshot.lock().unwrap().clone()))
+            Ok(Some(astra_services::runs::RunSettingsSnapshot {
+                permission: self.snapshot.lock().unwrap().clone(),
+                ..Default::default()
+            }))
         }
         async fn apply_permission_mode(
             &self,
@@ -241,6 +361,10 @@ mod tests {
             selection: &RunPermissionModeSelection,
             round: u32,
         ) -> Result<bool, String> {
+            if self.hang_ack.load(std::sync::atomic::Ordering::Relaxed) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
             if self.reject_ack.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(false);
             }
@@ -281,6 +405,7 @@ mod tests {
         next: Option<PermissionMode>,
         observed: Vec<PermissionMode>,
         tools: HashSet<String>,
+        deadline: Option<tokio::time::Instant>,
     }
     #[async_trait]
     impl AgenticLoopHost for Host {
@@ -330,6 +455,17 @@ mod tests {
         fn is_quiet(&self) -> bool {
             true
         }
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
+            self.deadline.map(|deadline| {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                astra_turn_types::ExecutionTimeRemaining {
+                    work_remaining: remaining,
+                    total_remaining: remaining,
+                }
+            })
+        }
         fn valid_tool_names(&self) -> &HashSet<String> {
             &self.tools
         }
@@ -350,6 +486,7 @@ mod tests {
                 next: None,
                 observed: Vec::new(),
                 tools: HashSet::from(["read_file".into()]),
+                deadline: None,
             },
             state,
         )
@@ -359,14 +496,14 @@ mod tests {
         use std::sync::atomic::Ordering;
         let control = Control::default();
         let (send, receive) = tokio::sync::watch::channel(2);
-        let mut observation = PermissionModeObservation::default();
+        let mut observation = RunSettingsObservation::default();
         observation.bind_opening_wake(receive, 2);
         assert_eq!(
             observation
                 .read(&control, "owner", "session", "run")
                 .await
                 .unwrap(),
-            Some(RunPermissionModeSnapshot::default())
+            Some(astra_services::runs::RunSettingsSnapshot::default())
         );
         assert_eq!(control.reads.load(Ordering::Relaxed), 0);
         control.request(PermissionMode::Prompt, 3);
@@ -376,13 +513,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(current.requested.unwrap().mode, PermissionMode::Prompt);
+        assert_eq!(
+            current.permission.requested.unwrap().mode,
+            PermissionMode::Prompt
+        );
         assert!(
-            current.applied.is_none(),
+            current.permission.applied.is_none(),
             "observing a request cannot apply its permission mode"
         );
         assert_eq!(control.reads.load(Ordering::Relaxed), 1);
-        let mut attached_late = PermissionModeObservation::default();
+        let mut attached_late = RunSettingsObservation::default();
         attached_late.bind_opening_wake(send.subscribe(), 2);
         assert!(
             attached_late
@@ -390,6 +530,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .permission
                 .requested
                 .is_some()
         );
@@ -418,16 +559,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_settings_waits_respect_cancellation_and_original_deadline() {
+        use std::sync::atomic::Ordering;
+        for hang_read in [true, false] {
+            for cancel in [true, false] {
+                let (mut host, mut state) = fixture(PermissionMode::Plan);
+                let control = host.control.clone();
+                control.hang_read.store(hang_read, Ordering::SeqCst);
+                control.hang_ack.store(!hang_read, Ordering::SeqCst);
+                let (wake, receive) = tokio::sync::watch::channel(0);
+                state.run_settings_observation.bind_opening_wake(receive, 0);
+                wake.send_replace(1);
+                let token = Arc::new(tokio_util::sync::CancellationToken::new());
+                state.cancellation.token = Some(token.clone());
+                if !cancel {
+                    host.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                }
+                let error = {
+                    let prepare =
+                        super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0);
+                    tokio::pin!(prepare);
+                    tokio::select! {
+                        _ = control.entered.notified() => {}
+                        _ = &mut prepare => panic!("settings operation did not wait"),
+                    }
+                    if cancel {
+                        token.cancel();
+                    }
+                    match tokio::time::timeout(Duration::from_secs(2), prepare)
+                        .await
+                        .unwrap()
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("interrupted settings must not admit the model round"),
+                    }
+                };
+                assert_eq!(
+                    error.kind,
+                    if cancel {
+                        astra_core::ErrorKind::Cancelled
+                    } else {
+                        astra_core::ErrorKind::BudgetExhausted
+                    }
+                );
+                assert!(state.applied_permission_mode.is_none());
+                assert!(host.observed.is_empty());
+
+                // A cancelled read or uncertain acknowledgement must not
+                // consume the wake and permanently reuse a stale snapshot.
+                control.hang_read.store(false, Ordering::SeqCst);
+                control.hang_ack.store(false, Ordering::SeqCst);
+                state.cancellation.token = None;
+                host.deadline = None;
+                apply_round_settings(&mut host, &mut state).await.unwrap();
+                assert_eq!(control.reads.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    state.applied_permission_mode.as_ref().unwrap().mode,
+                    PermissionMode::Plan
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn quiet_rounds_reuse_permission_snapshot_but_apply_committed_changes() {
         use std::sync::atomic::Ordering;
         let (mut host, mut state) = fixture(PermissionMode::Bypass);
         let (wake, receive) = tokio::sync::watch::channel(1);
-        state.permission_mode_observation.bind_wake(receive);
+        state.run_settings_observation.bind_wake(receive);
         for round in 0..6 {
             state.current_round_index = round;
-            apply_round_permission_mode(&mut host, &mut state)
-                .await
-                .unwrap();
+            apply_round_settings(&mut host, &mut state).await.unwrap();
             assert_eq!(host.mode, PermissionMode::Bypass);
         }
         assert_eq!(host.control.reads.load(Ordering::Relaxed), 1);
@@ -435,9 +637,7 @@ mod tests {
         host.control.request(PermissionMode::Prompt, 2);
         wake.send_replace(2);
         state.current_round_index = 6;
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         assert_eq!(host.mode, PermissionMode::Prompt);
         assert_eq!(host.control.reads.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -450,9 +650,7 @@ mod tests {
         drop(wake);
         host.control.request(PermissionMode::Deny, 3);
         state.current_round_index = 7;
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         assert_eq!(host.mode, PermissionMode::Deny);
         assert_eq!(host.control.reads.load(Ordering::Relaxed), 3);
     }
@@ -462,18 +660,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (mut host, mut state) = fixture(PermissionMode::Bypass);
         let (_wake, receive) = tokio::sync::watch::channel(1);
-        state.permission_mode_observation.bind_wake(receive);
+        state.run_settings_observation.bind_wake(receive);
         host.control.reject_read.store(true, Ordering::Relaxed);
-        assert!(
-            apply_round_permission_mode(&mut host, &mut state)
-                .await
-                .is_err()
-        );
+        assert!(apply_round_settings(&mut host, &mut state).await.is_err());
         assert!(state.applied_permission_mode.is_none());
         host.control.reject_read.store(false, Ordering::Relaxed);
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         assert_eq!(host.control.reads.load(Ordering::Relaxed), 2);
         assert_eq!(
             state.applied_permission_mode.unwrap().mode,
@@ -514,15 +706,11 @@ mod tests {
         host.next = Some(next);
         let prefix = state.messages.clone();
         let tools = host.tools.clone();
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         host.execute_turn(&mut state).await.unwrap();
         assert_eq!(host.mode, first);
         state.current_round_index = 1;
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         host.execute_turn(&mut state).await.unwrap();
         assert_eq!(host.observed, [first, next]);
         assert_eq!(
@@ -560,9 +748,7 @@ mod tests {
             .push(PermissionRule::tool("bash"));
         context.inherited.allowed_tools = Some(HashSet::from(["read_file".into()]));
         state.permission_context = Some(context.into_shared());
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         let context = state.permission_context.as_ref().unwrap().read().await;
         assert_eq!(context.telemetry().tools_blocked, 1);
         assert!(context.is_denied("bash", Some("echo test")));
@@ -578,26 +764,18 @@ mod tests {
         host.control
             .reject_ack
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            apply_round_permission_mode(&mut host, &mut state)
-                .await
-                .is_err()
-        );
+        assert!(apply_round_settings(&mut host, &mut state).await.is_err());
         assert!(host.observed.is_empty());
         assert!(state.applied_permission_mode.is_none());
         host.control
             .reject_ack
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         state.applied_permission_mode = None;
         state.permission_context = None;
         state.current_run_owner_generation = Some(8);
         host.control.snapshot.lock().unwrap().requested = None;
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         assert_eq!(
             state
                 .permission_context
@@ -626,9 +804,7 @@ mod tests {
         state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
             PermissionMode::Deny,
         ));
-        apply_round_permission_mode(&mut host, &mut state)
-            .await
-            .unwrap();
+        apply_round_settings(&mut host, &mut state).await.unwrap();
         assert_eq!(
             state
                 .permission_context

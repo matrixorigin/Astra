@@ -12302,6 +12302,7 @@ pub(crate) mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -19329,8 +19330,8 @@ pub(crate) mod tests {
     fn frozen_delegation_requirement_applies_omission_and_rejects_conflicts() {
         use astra_turn_types::{
             DelegationModelAdmission, DelegationModelAdmissionOutcome,
-            DelegationModelInstructionSource, DelegationModelSlotConstraint,
-            DelegationReasoningEffort, DelegationReasoningRequirement, ModelSelection,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint, ModelSelection,
+            ReasoningEffort, ReasoningRequirement,
         };
         let admission = DelegationModelAdmission {
             source: DelegationModelInstructionSource {
@@ -19355,8 +19356,8 @@ pub(crate) mod tests {
                     }),
                     requested_model_policy: None,
                     model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
-                    reasoning: Some(DelegationReasoningRequirement::Effort {
-                        effort: DelegationReasoningEffort::High,
+                    reasoning: Some(ReasoningRequirement::Effort {
+                        effort: ReasoningEffort::High,
                     }),
                     reasoning_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
                     task_scope_quote: None,

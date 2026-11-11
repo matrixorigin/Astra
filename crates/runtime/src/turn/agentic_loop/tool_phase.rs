@@ -1985,6 +1985,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 );
             }
         }
+        host.attest_model_messages(state, transcript_append_start);
         state.record_appended_prompt_history_from(transcript_append_start);
         // Freeze schema-addressed selection evidence before post-tool policy or
         // any compaction/checkpoint can rewrite the just-appended pair.  The

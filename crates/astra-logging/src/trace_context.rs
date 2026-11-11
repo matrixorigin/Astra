@@ -293,6 +293,36 @@ pub fn attach_link(span: &tracing::Span, link: &RunLink) {
     }
 }
 
+/// Create the coarse tool span using execution metadata only. Callers supply
+/// the resolved tool name and route, never tool arguments or result bodies.
+pub fn tool_span(tool_name: &str, call_id: Option<&str>, route: &str) -> tracing::Span {
+    let span = tracing::info_span!(
+        target: "astra.tool",
+        "tool.exec",
+        otel.name = %format!("tool.exec {tool_name}"),
+        tool.name = tool_name,
+        tool.route = route,
+        tool.call.id = tracing::field::Empty,
+    );
+    if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
+        span.record("tool.call.id", call_id);
+    }
+    span
+}
+
+/// Construct an LLM attempt span with the zero-based client retry-loop index.
+/// Failure details are recorded later using fixed codes, never cause text.
+pub fn llm_span(retry_attempt: u32) -> tracing::Span {
+    tracing::info_span!(
+        target: "astra.llm",
+        "llm.call",
+        retry.attempt = retry_attempt,
+        http.response.status_code = tracing::field::Empty,
+        error.phase = tracing::field::Empty,
+        error.reason = tracing::field::Empty,
+    )
+}
+
 /// Stable exported status. The description is `code`, not the cause text.
 pub fn mark_error(span: &tracing::Span, code: &'static str) {
     #[cfg(feature = "otel")]
@@ -303,12 +333,18 @@ pub fn mark_error(span: &tracing::Span, code: &'static str) {
     }
 }
 
-tokio::task_local! {
-    static ACTIVE_RUN: RefCell<RunSpan>;
-    static ATTEMPT_CODE: RefCell<Option<&'static str>>;
+#[derive(Clone, Copy)]
+enum AttemptError {
+    Provider(&'static str),
+    Settlement(&'static str),
 }
 
-/// Bind `astra.run` and a fresh attempt-code slot for this task.
+tokio::task_local! {
+    static ACTIVE_RUN: RefCell<RunSpan>;
+    static ATTEMPT_CODE: RefCell<Option<AttemptError>>;
+}
+
+/// Bind `astra.run` for this task. LLM outcomes have a separate per-call scope.
 ///
 /// The run future is large; keep the scopes directly around it. An async
 /// wrapper here adds a copy of that future to every poll's stack frame.
@@ -316,10 +352,13 @@ pub fn bind_run<F>(carrier: &Carrier, future: F) -> impl Future<Output = F::Outp
 where
     F: Future,
 {
-    ATTEMPT_CODE.scope(
-        RefCell::new(None),
-        ACTIVE_RUN.scope(RefCell::new(RunSpan::start(carrier)), future),
-    )
+    ACTIVE_RUN.scope(RefCell::new(RunSpan::start(carrier)), future)
+}
+
+/// Isolate one LLM call's outcomes on every poll, including when multiple
+/// call futures are joined on the same task. This scope also covers drop.
+pub fn in_llm_call<F: Future>(future: F) -> impl Future<Output = F::Output> + use<F> {
+    ATTEMPT_CODE.scope(RefCell::new(None), future)
 }
 
 /// Let `future` see the caller's current run without owning it. The run is
@@ -333,10 +372,7 @@ where
         .try_with(|slot| slot.borrow().link())
         .ok()
         .flatten();
-    ACTIVE_RUN.scope(
-        RefCell::new(RunSpan::observe(link)),
-        ATTEMPT_CODE.scope(RefCell::new(None), future),
-    )
+    ACTIVE_RUN.scope(RefCell::new(RunSpan::observe(link)), future)
 }
 
 /// Run `future` on a new task that can see the current run without owning it.
@@ -392,7 +428,13 @@ pub fn active_run_error_code() -> Option<&'static str> {
 }
 
 pub fn note_attempt_code(code: &'static str) {
-    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(code));
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Provider(code)));
+}
+
+/// Settlement can replace the provider error returned by the adapter. Keep
+/// that distinction in the existing task-local attempt outcome.
+pub fn note_attempt_settlement_error(code: &'static str) {
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Settlement(code)));
 }
 
 pub fn clear_attempt_code() {
@@ -400,7 +442,23 @@ pub fn clear_attempt_code() {
 }
 
 pub fn attempt_code() -> Option<&'static str> {
-    ATTEMPT_CODE.try_with(|slot| *slot.borrow()).ok().flatten()
+    ATTEMPT_CODE
+        .try_with(|slot| match *slot.borrow() {
+            Some(AttemptError::Provider(code) | AttemptError::Settlement(code)) => Some(code),
+            None => None,
+        })
+        .ok()
+        .flatten()
+}
+
+pub fn attempt_settlement_error() -> Option<&'static str> {
+    ATTEMPT_CODE
+        .try_with(|slot| match *slot.borrow() {
+            Some(AttemptError::Settlement(code)) => Some(code),
+            _ => None,
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(feature = "otel")]
@@ -541,6 +599,41 @@ mod carrier_tests {
     use super::Carrier;
 
     #[test]
+    fn attempt_settlement_outcome_is_reset_and_isolated_from_child_tasks() {
+        use super::{
+            attempt_code, attempt_settlement_error, bind_run, clear_attempt_code, in_active_run,
+            in_llm_call, note_attempt_code, note_attempt_settlement_error,
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(bind_run(
+                &Carrier::default(),
+                in_llm_call(async {
+                    note_attempt_code("auth");
+                    note_attempt_settlement_error("network");
+                    assert_eq!(attempt_code(), Some("network"));
+                    assert_eq!(attempt_settlement_error(), Some("network"));
+                    tokio::spawn(in_active_run(in_llm_call(async {
+                        assert_eq!(attempt_code(), None);
+                        note_attempt_code("cancelled");
+                        assert_eq!(attempt_settlement_error(), None);
+                    })))
+                    .await
+                    .unwrap();
+                    assert_eq!(attempt_settlement_error(), Some("network"));
+                    clear_attempt_code();
+                    assert_eq!(attempt_code(), None);
+                    assert_eq!(attempt_settlement_error(), None);
+                    note_attempt_code("auth");
+                    assert_eq!(attempt_settlement_error(), None);
+                }),
+            ));
+        assert_eq!(attempt_code(), None);
+    }
+
+    #[test]
     fn forbidden_version_is_not_a_carrier() {
         let carrier = Carrier::from_header_values(
             Some("ff-0123456789abcdef0123456789abcdef-0123456789abcdef-01"),
@@ -661,6 +754,148 @@ mod tests {
             .with_simple_exporter(capture.clone())
             .build();
         (capture, provider)
+    }
+
+    #[test]
+    fn llm_spans_export_fixed_diagnostics_without_private_causes() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        mark_export_ready();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryLayer::new(provider.tracer("astra-test"))
+                .with_filter(EnvFilter::new("astra.llm=info")),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+        for (attempt, status, phase, reason) in [
+            (0, None, "request", "connection_refused"),
+            (1, Some(429), "response_status", "http_status"),
+        ] {
+            let span = llm_span(attempt);
+            if let Some(status) = status {
+                span.record("http.response.status_code", status);
+            }
+            span.record("error.phase", phase);
+            span.record("error.reason", reason);
+            mark_error(&span, "network");
+            {
+                let _entered = span.enter();
+                tracing::warn!(target: "astra_runtime::llm_client", url = "https://private.invalid", error = "secret cause", "private body");
+            }
+        }
+        drop(llm_span(0)); // Successful calls have no failure or invented status.
+        let captured = exporter.0.lock().unwrap();
+        // Other carrier tests may create manual run spans through the global
+        // provider on another thread. Only this test's LLM spans are relevant.
+        let finished: Vec<_> = captured
+            .iter()
+            .filter(|span| span.name == "llm.call")
+            .collect();
+        assert_eq!(finished.len(), 3);
+        for (span, attempt, status, phase, reason) in [
+            (
+                &finished[0],
+                "0",
+                None,
+                Some("request"),
+                Some("connection_refused"),
+            ),
+            (
+                &finished[1],
+                "1",
+                Some("429"),
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (&finished[2], "0", None, None, None),
+        ] {
+            assert_eq!(span.name, "llm.call");
+            for (key, expected) in [
+                ("retry.attempt", Some(attempt)),
+                ("http.response.status_code", status),
+                ("error.phase", phase),
+                ("error.reason", reason),
+            ] {
+                let actual = span
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key.as_str() == key)
+                    .map(|attr| attr.value.as_str().into_owned());
+                assert_eq!(actual.as_deref(), expected, "{key}");
+            }
+            let rendered = format!("{span:?}");
+            for private in ["private.invalid", "secret cause", "private body"] {
+                assert!(!rendered.contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn tool_spans_export_identity_route_and_parent_without_arguments() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        mark_export_ready();
+        let subscriber = tracing_subscriber::registry().with(
+            OpenTelemetryLayer::new(provider.tracer("astra-test"))
+                .with_filter(EnvFilter::new("astra.tool=info")),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+        let mut run = RunSpan::start(&Carrier::default());
+        let link = run.link().expect("run link");
+
+        for (name, call_id, route) in [
+            ("bash", Some("call-1"), "edge_bound"),
+            ("mcp_lookup", None, "request_scoped_mcp"),
+            ("web_fetch", Some(""), "server_local"),
+        ] {
+            let span = tool_span(name, call_id, route);
+            attach_link(&span, &link);
+            {
+                let _entered = span.enter();
+                tracing::warn!(target: "astra_runtime::tool", command = "secret-command", "private output");
+            }
+            if name == "bash" {
+                mark_error(&span, "stream_transport");
+            }
+            drop(span);
+        }
+        run.end();
+
+        let finished = exporter.0.lock().expect("span capture");
+        for (name, call_id, route) in [
+            ("bash", Some("call-1"), "edge_bound"),
+            ("mcp_lookup", None, "request_scoped_mcp"),
+            ("web_fetch", None, "server_local"),
+        ] {
+            let span = finished
+                .iter()
+                .find(|span| span.name == format!("tool.exec {name}"))
+                .expect("tool span exported");
+            assert_eq!(span.parent_span_id.to_bytes(), link.span_id);
+            for (key, value) in [
+                ("tool.name", Some(name)),
+                ("tool.route", Some(route)),
+                ("tool.call.id", call_id),
+            ] {
+                let actual = span
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key.as_str() == key)
+                    .map(|attr| attr.value.as_str().into_owned());
+                assert_eq!(actual.as_deref(), value);
+            }
+            let rendered = format!("{span:?}");
+            assert!(!rendered.contains("secret-command"));
+            assert!(!rendered.contains("private output"));
+            if name == "bash" {
+                assert_eq!(
+                    span.status,
+                    opentelemetry::trace::Status::error("stream_transport")
+                );
+            }
+        }
     }
 
     #[test]

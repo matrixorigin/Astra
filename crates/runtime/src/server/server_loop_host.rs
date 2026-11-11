@@ -60,7 +60,7 @@ use crate::turn::agentic_loop::host::{
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
-    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call,
+    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call_with_origin,
     provider_supports_no_tool_choice, sleep_ms_or_llm_cancel,
 };
 use crate::turn::llm::summary_client::RuntimeSummaryClient;
@@ -1736,6 +1736,21 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
         (Some(f), Some(t)) => LlmCancel::FlagAndToken(f.as_ref(), t.as_ref()),
         (Some(f), None) => LlmCancel::Flag(f.as_ref()),
         (None, Some(t)) => LlmCancel::Token(t.as_ref()),
+        (None, None) => LlmCancel::None,
+    }
+}
+
+fn request_llm_cancel(
+    cancellation: &crate::turn::agentic_loop::host::CancellationState,
+) -> LlmCancel<'_> {
+    let token = cancellation
+        .inference_token
+        .as_ref()
+        .or(cancellation.token.as_ref());
+    match (cancellation.flag.as_deref(), token.map(AsRef::as_ref)) {
+        (Some(flag), Some(token)) => LlmCancel::FlagAndToken(flag, token),
+        (Some(flag), None) => LlmCancel::Flag(flag),
+        (None, Some(token)) => LlmCancel::Token(token),
         (None, None) => LlmCancel::None,
     }
 }
@@ -4465,15 +4480,150 @@ impl ServerAgenticLoopHost {
         self.open_authorized_private_responses(messages, scope, model)
     }
 
-    fn responses_budget_view(
+    fn model_replay_route(&self) -> Option<String> {
+        let execution = self.admitted_model_execution.as_ref()?;
+        Some(self.model_replay_route_for(execution))
+    }
+
+    fn model_replay_route_for(&self, execution: &astra_services::AdmittedModelExecution) -> String {
+        let protocol = execution
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&execution.provider));
+        let endpoint = execution
+            .completions_url_override
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&execution.base_url);
+        let endpoint = reqwest::Url::parse(endpoint)
+            .map(|mut url| {
+                url.set_fragment(None);
+                url.to_string()
+            })
+            .unwrap_or_else(|_| endpoint.to_string());
+        let mut headers: Vec<_> = execution
+            .header_overrides
+            .iter()
+            .filter(|(name, _)| !name.starts_with("__astra_"))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value))
+            .collect();
+        headers.sort_unstable();
+        let auth_header =
+            if protocol == astra_core::model_wire::LlmProviderProtocol::AnthropicMessages {
+                "x-api-key"
+            } else {
+                "authorization"
+            };
+        let subscription = execution
+            .subscription
+            .as_ref()
+            .map(|value| value.connection_id());
+        let api_key = (subscription.is_none()
+            && !headers.iter().any(|(name, _)| name == auth_header))
+        .then_some(execution.api_key.as_str());
+        // Only the keyed digest is retained. Never log the route material.
+        let identity = json!({
+            "provider": execution.provider, "protocol": protocol, "endpoint": endpoint,
+            "model": execution.wire_model_name.as_deref().unwrap_or(&execution.model_name),
+            "offering": execution.offering_id, "source": execution.source_identity,
+            "subscription": subscription, "api_key": api_key, "headers": headers,
+            "responses_scope": execution.response_scope,
+        });
+        self.encryptor.keyed_digest(
+            "astra.model-replay-route.v1",
+            &astra_core::canonical_json_string(&identity),
+        )
+    }
+
+    fn project_model_history<'a>(
+        &self,
+        messages: &'a [Value],
+        state: &AgenticLoopState,
+    ) -> Result<std::borrow::Cow<'a, [Value]>, astra_core::ClassifiedError> {
+        let (Some(run_id), Some(route)) =
+            (state.current_run_id.as_deref(), self.model_replay_route())
+        else {
+            return Ok(std::borrow::Cow::Borrowed(messages));
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        crate::turn::llm::model_origin::project(&scope, messages)
+    }
+
+    fn attest_current_model_message(&self, state: &AgenticLoopState, message: &mut Value) {
+        let (Some(run_id), Some(route)) =
+            (state.current_run_id.as_deref(), self.model_replay_route())
+        else {
+            return;
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        crate::turn::llm::model_origin::attest(&scope, message);
+    }
+
+    fn attest_messages(&self, state: &mut AgenticLoopState, start: usize, runtime_generated: bool) {
+        let (Some(run_id), Some(route)) = (state.current_run_id.clone(), self.model_replay_route())
+        else {
+            return;
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id: &run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        let start = start.min(state.messages.len());
+        for message in &mut state.messages[start..] {
+            if runtime_generated {
+                crate::turn::llm::model_origin::attest_runtime(&scope, message);
+            } else {
+                crate::turn::llm::model_origin::attest(&scope, message);
+            }
+        }
+    }
+
+    fn provider_budget_view(
         &self,
         messages: &[Value],
         config: &ResolvedTurnLlmConfig,
+        state: &AgenticLoopState,
     ) -> Result<Option<Vec<Value>>, astra_core::ClassifiedError> {
+        let projected = self.project_model_history(messages, state)?;
         let Some((scope, model)) = config.responses_budget_scope() else {
-            return Ok(None);
+            return Ok(match projected {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(messages) => Some(messages),
+            });
         };
-        let mut opened = messages.to_vec();
+        let mut opened = projected.into_owned();
         if config.responses_reasoning_history
             == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
         {
@@ -5477,7 +5627,7 @@ fn fit_physical_retry_wire_budget(
     config: &ResolvedTurnLlmConfig,
     requested_output_tokens: usize,
     state: &AgenticLoopState,
-    prepare_budget_view: impl Fn(&mut [Value]) -> Result<(), astra_core::ClassifiedError>,
+    prepare_budget_view: impl Fn(&[Value]) -> Result<Option<Vec<Value>>, astra_core::ClassifiedError>,
 ) -> Result<
     (
         crate::turn::wire_assembly::WireBudgetStatus,
@@ -5487,13 +5637,7 @@ fn fit_physical_retry_wire_budget(
     astra_core::ClassifiedError,
 > {
     let measure = |messages: &[Value]| -> Result<_, astra_core::ClassifiedError> {
-        let budget_view = if config.responses_budget_scope().is_some() {
-            let mut view = messages.to_vec();
-            prepare_budget_view(&mut view)?;
-            Some(view)
-        } else {
-            None
-        };
+        let budget_view = prepare_budget_view(messages)?;
         let provider_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
             budget_view.as_deref().unwrap_or(messages),
             &config.provider,
@@ -9393,6 +9537,26 @@ impl ServerAgenticLoopHost {
             round_index: state.current_round_index,
             source: Some(source),
         });
+    }
+
+    async fn settle_work_admission_for_request(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let cancellation = state.cancellation.clone();
+        let cancelled = tokio::select! {
+            biased;
+            _ = self.resolve_pending_work_admission(Some(state), true) => false,
+            _ = crate::turn::llm::client::wait_llm_cancel(request_llm_cancel(&cancellation)) => true,
+        };
+        if cancelled {
+            self.abort_pending_work_admission().await;
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Execution cancelled while awaiting semantic judgment",
+            ));
+        }
+        Ok(())
     }
 
     /// Reconcile the owned semantic task. Provider preparation waits for its
@@ -14635,10 +14799,10 @@ impl ServerAgenticLoopHost {
         loop {
             let snapshot = context
                 .run_control
-                .permission_mode_snapshot(&context.user_id, &context.session_id, &context.run_id)
+                .run_settings_snapshot(&context.user_id, &context.session_id, &context.run_id)
                 .await?;
             if snapshot
-                .and_then(|snapshot| snapshot.requested)
+                .and_then(|snapshot| snapshot.permission.requested)
                 .is_some_and(|requested| requested.revision > context.permission_revision)
             {
                 return Ok(());
@@ -17829,14 +17993,16 @@ impl ServerAgenticLoopHost {
             model_context_window,
         );
         let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        let projected_history = self.project_model_history(&state.messages, state)?;
         let planning_messages = if let Some(config) = self.resolved_llm_config.as_ref()
             && let Some((scope, wire_model)) = config.responses_budget_scope()
-            && state.messages.iter().any(|message| {
-                message
-                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                    .is_some()
-            }) {
-            let mut history = state.messages.clone();
+            && (matches!(projected_history, std::borrow::Cow::Owned(_))
+                || state.messages.iter().any(|message| {
+                    message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                })) {
+            let mut history = projected_history.into_owned();
             if config.responses_reasoning_history
                 == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
             {
@@ -17870,7 +18036,10 @@ impl ServerAgenticLoopHost {
             })?;
             Some(items)
         } else {
-            None
+            match projected_history {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(messages) => Some(messages),
+            }
         };
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
@@ -17988,6 +18157,28 @@ impl ServerAgenticLoopHost {
         result
     }
 
+    async fn compact_messages_for_request(
+        &self,
+        state: &mut AgenticLoopState,
+        messages: &[Value],
+        system_messages: &[Value],
+        visible_tools: &[Value],
+        tier: CompactionTier,
+        llm_cfg: &ResolvedTurnLlmConfig,
+    ) -> Result<crate::turn::cloud::compaction::CompactResult, astra_core::ClassifiedError> {
+        let cancellation = state.cancellation.clone();
+        tokio::select! {
+            biased;
+            result = self.compact_messages_via_memoria(state, messages, system_messages, visible_tools, tier, llm_cfg) => Ok(result),
+            _ = crate::turn::llm::client::wait_llm_cancel(request_llm_cancel(&cancellation)) => {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "Execution cancelled during context compaction",
+                ))
+            }
+        }
+    }
+
     /// Assemble the final provider wire and perform bounded pure history
     /// recomposition if the complete payload (including late runtime context
     /// and tool schemas) exceeds the hard input budget. Runtime
@@ -18048,7 +18239,7 @@ impl ServerAgenticLoopHost {
                 state.restore_volatile_attempt_lease();
             })?;
             let budget_source = self
-                .responses_budget_view(&candidate.messages, llm_cfg)
+                .provider_budget_view(&candidate.messages, llm_cfg, state)
                 .inspect_err(|_| state.restore_volatile_attempt_lease())?;
             let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
                 budget_source.as_deref().unwrap_or(&candidate.messages),
@@ -18133,7 +18324,12 @@ impl ServerAgenticLoopHost {
                 break;
             }
             if let Some((previous, output, boundary)) = fallback.take() {
-                assembly = Some((previous, None));
+                // A fallback remains sealed while later candidates are tried.
+                // Open it only if it is ultimately selected.
+                let budget_source = self
+                    .provider_budget_view(&previous.messages, llm_cfg, state)
+                    .inspect_err(|_| state.restore_volatile_attempt_lease())?;
+                assembly = Some((previous, budget_source));
                 selected_output_tokens = output;
                 final_wire_compaction_boundary = boundary;
                 break;
@@ -18157,14 +18353,7 @@ impl ServerAgenticLoopHost {
             ));
         }
 
-        let (candidate, mut budget_source) = assembly.expect("bounded wire assembly must settle");
-        if budget_source.is_none() && llm_cfg.responses_budget_scope().is_some() {
-            // A fallback stays sealed while later candidates are tried, so
-            // concurrent requests do not retain an extra plaintext copy.
-            budget_source = self
-                .responses_budget_view(&candidate.messages, llm_cfg)
-                .inspect_err(|_| state.restore_volatile_attempt_lease())?;
-        }
+        let (candidate, budget_source) = assembly.expect("bounded wire assembly must settle");
         let wire_messages = candidate.messages;
         if let Err(error) =
             state.extend_append_only_runtime_messages(candidate.new_append_only_runtime_messages)
@@ -18838,6 +19027,13 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn attest_model_messages(&self, state: &mut AgenticLoopState, start: usize) {
+        self.attest_messages(state, start, false);
+    }
+
+    fn attest_runtime_messages(&self, state: &mut AgenticLoopState, start: usize) {
+        self.attest_messages(state, start, true);
+    }
     fn context_history_artifacts_available(&self, state: &AgenticLoopState) -> bool {
         let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return false;
@@ -18912,7 +19108,44 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<(), astra_core::ClassifiedError> {
-        self.prepare_auto_model_selection(state).await
+        let settings = state
+            .run_settings_observation
+            .model()
+            .cloned()
+            .unwrap_or_default();
+        let pending = settings.requested.as_ref().is_some_and(|selection| {
+            settings
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| &outcome.selection != selection)
+        });
+        // A recovered Auto choice can have expired while the user is asking
+        // for a different model. Restore its Work facts, but do not require
+        // re-admitting the old model before trying the new one.
+        let defer_auto =
+            settings.applied.is_none() && pending && self.restore_model_routing(state).await?;
+        if settings.applied.is_some() {
+            // Recover existing Auto Work facts without replacing the explicit
+            // model that the run owner already committed.
+            if self.restore_model_routing(state).await? {
+                self.project_work_admission_semantics(state, false);
+            }
+            self.model_routing = None;
+        } else if !defer_auto {
+            self.prepare_auto_model_selection(state).await?;
+        } else {
+            self.project_work_admission_semantics(state, false);
+        }
+        self.apply_explicit_model_settings(state, settings).await?;
+        if defer_auto
+            && state
+                .run_settings_observation
+                .model()
+                .is_none_or(|settings| settings.applied.is_none())
+        {
+            self.prepare_auto_model_selection(state).await?;
+        }
+        Ok(())
     }
     fn parent_model_reasoning_snapshot(
         &self,
@@ -20257,25 +20490,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // User feedback must reach WorkingMemory before this request's context
         // is assembled. Settling the semantic owner does not materialize its
         // Work graph; the existing post-response carrier boundary still does.
-        let cancellation = state.cancellation.clone();
-        let cancel = match (&cancellation.flag, &cancellation.token) {
-            (Some(flag), Some(token)) => LlmCancel::FlagAndToken(flag, token),
-            (Some(flag), None) => LlmCancel::Flag(flag),
-            (None, Some(token)) => LlmCancel::Token(token),
-            (None, None) => LlmCancel::None,
-        };
-        let cancelled = tokio::select! {
-            biased;
-            _ = crate::turn::llm::client::wait_llm_cancel(cancel) => true,
-            _ = self.resolve_pending_work_admission(Some(state), true) => false,
-        };
-        if cancelled {
-            self.abort_pending_work_admission().await;
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Cancelled,
-                "Execution cancelled while awaiting semantic judgment",
-            ));
-        }
+        self.settle_work_admission_for_request(state).await?;
         self.flush_completed_work_admission_phase(state);
         let request_preparation_started = Instant::now();
         // This begins after semantic admission has completed in the shared
@@ -20330,7 +20545,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
                 if let Err(error) =
-                    sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await
+                    sleep_ms_or_llm_cancel(delay_ms, request_llm_cancel(&state.cancellation)).await
                 {
                     self.complete_request_preparation_phase(
                         state,
@@ -20539,16 +20754,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let mut compaction_fixed_context = final_system_messages.clone();
         compaction_fixed_context.extend(final_volatile_preamble.iter().cloned());
-        let compact_result = self
-            .compact_messages_via_memoria(
+        let compact_result = self.compact_messages_for_request(
                 state,
                 &pipeline_messages,
                 &compaction_fixed_context,
                 context_tool_surface,
                 tier,
                 &llm_cfg,
-            )
-            .await;
+            ).await;
+        let compact_result = match compact_result {
+            Ok(result) => result,
+            Err(error) => {
+            self.complete_request_preparation_phase(
+                state,
+                request_preparation_started,
+                0,
+                &mut request_preparation_recorded_attempts,
+                TurnPhaseOutcome::Failed,
+            );
+            return Err(error);
+            }
+        };
         // One Server HTTP turn may execute multiple LLM rounds. Keep repeated
         // snapshots stable within a round without conflating later compactions.
         let context_compactions = crate::turn::wire_assembly::observe_context_compaction(
@@ -20959,9 +21185,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // A provider answer is provisional while executed-tool evidence still
         // requires a typed completion action. The runtime may reject that
         // answer after this request returns; streaming it now is irreversible.
-        let direct_children_pending = self.direct_child_completion_owner(state)
-            .is_some_and(|owner| owner.has_pending_direct_children());
-        let completion_action_pending = direct_children_pending || state
+        // A running child does not make its parent's progress or response to
+        // guidance a completion claim. The shared child barrier still owns
+        // terminal settlement; only typed completion obligations buffer prose.
+        let completion_action_pending = state
             .hooks
             .completion_settlement
             .completion_action_window
@@ -21017,15 +21244,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 let budget = fit_physical_retry_wire_budget(
                     &mut llm_messages, &final_tools, &llm_cfg, effective_max_output, state,
-                    |view| {
-                        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
-                            if llm_cfg.responses_reasoning_history == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn) {
-                                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(view);
-                            }
-                            self.open_authorized_private_responses(view, scope, model)?;
-                        }
-                        Ok(())
-                    },
+                    |view| self.provider_budget_view(view, &llm_cfg, state),
                 ).and_then(|(status, output, boundary)| {
                     primary_thinking.validate_output_budget(output as u64).map_err(|message| {
                         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message)
@@ -21092,6 +21311,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
                 admission_estimated_tokens as u64,
+                request_llm_cancel(&state.cancellation),
             )
             .await
             {
@@ -21200,24 +21420,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // providers, durably staged the execution deadline.  Keep this
             // exact vector immutable through provider dispatch; only the
             // timeout is sampled at the dispatch boundary.
-            let mut attempt_llm_messages_owned = if attempt_in_round == 0 {
+            let attempt_llm_messages_owned = if attempt_in_round == 0 {
                 first_responses_messages.take().unwrap_or_else(|| llm_messages.clone())
             } else {
-                llm_messages.clone()
+                self.provider_budget_view(&llm_messages, &llm_cfg, state)?
+                    .unwrap_or_else(|| llm_messages.clone())
             };
-            if attempt_in_round > 0 && let Some((scope, model)) = llm_cfg.responses_budget_scope() {
-                if llm_cfg.responses_reasoning_history
-                    == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
-                {
-                    crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
-                        &mut attempt_llm_messages_owned,
-                    );
-                }
-                self.open_private_responses(&mut attempt_llm_messages_owned, scope, model)?;
-            }
             let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
             let execution_route = llm_cfg.execution_route();
-            let prepared_call = match prepare_streaming_call(
+            let replay_route = self.model_replay_route();
+            let replay_scope = state.current_run_id.as_deref().zip(replay_route.as_deref()).map(|(run_id, route)|
+                crate::turn::llm::model_origin::ReplayScope {
+                    encryptor: &self.encryptor, user_id: &self.user_id, session_id: &self.session_id,
+                    allowed_session_ids: self.private_reasoning_origins.as_ref(),
+                    run_id, selection_revision: state.run_settings_observation.model()
+                        .and_then(|settings| settings.applied.as_ref())
+                        .map(|applied| applied.selection.revision), route,
+                });
+            let prepared_call = match prepare_streaming_call_with_origin(
                 LlmCall {
                     purpose: state.inference_purpose,
                     messages: attempt_llm_messages,
@@ -21229,6 +21449,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     thinking: &primary_thinking,
                 },
                 if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
+                replay_scope.as_ref(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -21486,7 +21707,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
-                    let llm_cancel = llm_cancel_for_state(state);
+                    let llm_cancel = request_llm_cancel(&state.cancellation);
                     call_prepared_llm_and_collect_with_stream_callback(
                         prepared_call,
                         llm_cancel,
@@ -21495,33 +21716,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         dispatch_budget.client_timeout,
                     ).await.map_err(|error| dispatch_budget.classify_deadline(error))
                 };
-                // Root answer text stays provisional while Work admission is
-                // unresolved, but a provider failure closes that admission
-                // path. Preserve the exact prefix already delivered by the
-                // provider as an interrupted result instead of dropping it
-                // with this callback scope. This does not grant the text
-                // success authority and must never trigger a replay.
-                if provider_result.is_err()
-                    && buffer_root_text_for_active_work
-                    && !completion_action_pending
-                    && crate::turn::llm::client::text_has_actionable_content(&attempt_text)
-                {
-                    if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
-                        && !suffix.is_empty()
-                    {
-                        self.emit_progress_event(json!({
-                            "type": "text_delta",
-                            "content": suffix,
-                        }));
-                        streamed_text.push_str(suffix);
-                    } else if streamed_text.is_empty() {
-                        self.emit_progress_event(json!({
-                            "type": "text_delta",
-                            "content": &attempt_text,
-                        }));
-                        streamed_text.push_str(&attempt_text);
-                    }
-                }
+                // A failed or cancelled provider does not validate a Work-
+                // gated answer. Keep that provisional text private even if
+                // run cancellation races with guidance supersession.
                 if !pending_live_reasoning.is_empty() {
                     let pending = std::mem::take(&mut pending_live_reasoning);
                     self.emit_progress_event(json!({
@@ -21769,6 +21966,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "error",
                         llm_capture_error_response(&e),
                     );
+                    if e.kind == astra_core::ErrorKind::Cancelled {
+                        // Only bytes actually projected to the user belong in
+                        // the next model context. Work-gated text and tool
+                        // fragments are still provisional.
+                        if let Some(message) =
+                            astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+                                &state.messages,
+                                &streamed_text,
+                                state.current_model_item_id.as_deref(),
+                            )
+                        {
+                            state.push_prompt_history_message(message);
+                        }
+                        let mut error = e;
+                        if let Some(Value::Object(mut details)) = error
+                            .details_json
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok())
+                        {
+                            details.insert("partial_full_text".into(), json!(streamed_text));
+                            error.details_json = Some(Value::Object(details).to_string());
+                        }
+                        // Cancellation is an ordinary control transition, not
+                        // a provider failure requiring a synchronous full-request
+                        // artifact on the hot path.
+                        return Err(error);
+                    }
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -21964,7 +22188,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 "canonical Work retry authority is missing content",
                             )
                         })?;
-                let retry_assistant = provider_retry_assistant(&r);
+                let mut retry_assistant = provider_retry_assistant(&r);
+                self.attest_current_model_message(state, &mut retry_assistant);
                 llm_messages.push(retry_assistant.clone());
                 let mut retry_canonical_prefix = state.messages.clone();
                 retry_canonical_prefix.push(retry_assistant.clone());
@@ -22023,7 +22248,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             {
                 output_cap_partial_text = r.full_text.clone();
                 output_cap_partial_reasoning = r.reasoning.clone();
-                let partial_assistant = provider_retry_assistant(&r);
+                let mut partial_assistant = provider_retry_assistant(&r);
+                self.attest_current_model_message(state, &mut partial_assistant);
                 llm_messages.push(partial_assistant.clone());
                 let mut continuation_canonical_prefix = state.messages.clone();
                 continuation_canonical_prefix.push(partial_assistant.clone());
@@ -22257,7 +22483,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.work_admission_execution_topology,
         );
         if admission_must_settle {
-            self.resolve_pending_work_admission(Some(state), true).await;
+            self.settle_work_admission_for_request(state).await?;
             self.flush_completed_work_admission_phase(state);
         } else {
             self.resolve_pending_work_admission(Some(state), false).await;
@@ -22846,16 +23072,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 config.cache_capability,
                 &config.provider,
             );
-        if let Some((scope, model)) = config.responses_budget_scope()
-            && self
-                .authorize_private_responses(&state.messages, scope, model)
-                .is_err()
-        {
-            tracing::warn!(
-                "skipping pre-turn compaction because continuation authorization failed"
-            );
-            return None;
-        }
         let pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
@@ -22892,9 +23108,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         install_interrupted_summary_sink(client.as_mut(), &self.auxiliary_summary_usage);
         let accounted_client =
             AccountedSummaryClient::new(client.as_ref(), Arc::clone(&self.auxiliary_summary_usage));
+        let public_history = match crate::turn::llm::model_origin::public_summary_history(
+            &state.messages[..spill_count],
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::warn!(%error, "skipping pre-turn compaction with incomplete tool history");
+                return None;
+            }
+        };
         let summary_text = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
-            &state.messages[..spill_count],
+            &public_history,
             if matches!(
                 cache_capability.volatile_placement,
                 astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
@@ -24735,7 +24960,11 @@ mod tests {
             &cfg,
             256,
             &create_test_state(),
-            |view| host.open_authorized_private_responses(view, &scope, &cfg.model_name),
+            |messages| {
+                let mut view = messages.to_vec();
+                host.open_authorized_private_responses(&mut view, &scope, &cfg.model_name)?;
+                Ok(Some(view))
+            },
         )
         .unwrap();
         assert_eq!(
@@ -25348,7 +25577,7 @@ mod tests {
                     &cfg,
                     256,
                     &create_test_state(),
-                    |_| Ok(()),
+                    |_| Ok(None),
                 )
                 .unwrap();
                 assert!(!status.hard_limit_exceeded());
@@ -25395,7 +25624,7 @@ mod tests {
         let original = wire.clone();
         let error =
             fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
-                Ok(())
+                Ok(None)
             })
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
@@ -25437,7 +25666,7 @@ mod tests {
         .unwrap();
         let (status, output, boundary) =
             fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
-                Ok(())
+                Ok(None)
             })
             .unwrap();
         assert!(!status.hard_limit_exceeded());
@@ -25503,8 +25732,10 @@ mod tests {
             }
             let original = candidate.clone();
             let (status, output, boundary) =
-                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| Ok(()))
-                    .unwrap();
+                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| {
+                    Ok(None)
+                })
+                .unwrap();
             assert!(!status.hard_limit_exceeded());
             assert_eq!(output, 256);
             assert!(boundary.is_some());
@@ -25545,7 +25776,7 @@ mod tests {
         oversized = projected;
         let original = oversized.clone();
         let error =
-            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(()))
+            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(None))
                 .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(oversized, original);
@@ -30199,6 +30430,35 @@ mod tests {
             timeout_ms,
             128_000,
         )
+    }
+
+    #[test]
+    fn replay_route_tracks_the_actual_account_not_capacity_metadata() {
+        let host = test_host_builder("user", "session").build();
+        let mut execution = test_gateway_execution("https://model.example/v1", None);
+        execution.header_overrides.clear();
+        execution.base_url = "https://model.example/v1".into();
+        execution.completions_url_override = None;
+        execution.api_key = "original-account".into();
+        let route = host.model_replay_route_for(&execution);
+        let mut changed = execution.clone();
+        changed.context_window = Some(256_000);
+        changed.max_completion_tokens = Some(4096);
+        assert_eq!(host.model_replay_route_for(&changed), route);
+
+        changed.api_key = "another-account".into();
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        changed = execution.clone();
+        changed.base_url = "https://other.example/v1".into();
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        changed = execution.clone();
+        changed
+            .header_overrides
+            .insert("Authorization".into(), "Bearer other".into());
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        let override_route = host.model_replay_route_for(&changed);
+        changed.api_key = "unused-default-credential".into();
+        assert_eq!(host.model_replay_route_for(&changed), override_route);
     }
 
     fn nonthinking_test_config() -> ResolvedTurnLlmConfig {
@@ -39123,6 +39383,38 @@ mod tests {
         pending: bool,
     }
 
+    #[tokio::test]
+    async fn request_supersession_cancels_owned_admission_without_cancelling_run() {
+        let mut host = test_host_builder("admission-owner", "admission-session").build();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = started.clone();
+        host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::UserObservation,
+            wait_node_id: None,
+            handle: tokio::spawn(async move {
+                task_started.notify_one();
+                std::future::pending().await
+            }),
+            usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
+            started_at: Instant::now(),
+            round_index: 0,
+            source: None,
+        });
+        let mut state = create_test_state();
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent.clone());
+        state.cancellation.inference_token = Some(request.clone());
+        let cancel = async {
+            started.notified().await;
+            request.cancel();
+        };
+        let (result, ()) = tokio::join!(host.settle_work_admission_for_request(&mut state), cancel);
+        assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+        assert!(host.pending_work_admission_judge.is_none());
+        assert!(!parent.is_cancelled());
+    }
+
     #[async_trait::async_trait]
     impl SummaryLlmClient for InterruptedCompactionSummary {
         async fn summarize(
@@ -39320,6 +39612,54 @@ mod tests {
             );
             assert_ne!(state.messages, original);
         }
+    }
+
+    #[tokio::test]
+    async fn request_supersession_stops_compaction_without_rewriting_history() {
+        let mut host = test_host_builder("compaction-owner", "compaction-session")
+            .with_memoria_client(Some(Arc::new(CompactionMemoryFixture::default())))
+            .build();
+        let started = Arc::new(tokio::sync::Notify::new());
+        host.test_compaction_client = Some(Box::new(InterruptedCompactionSummary {
+            started: started.clone(),
+            pending: true,
+        }));
+        let mut state = create_test_state();
+        state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+        let original = state.messages.clone();
+        state.initialize_canonical_rewrite_proof(
+            &original,
+            &astra_turn_types::canonical_conversation_root(&original),
+            0,
+        );
+        let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+        config.context_window = Some(32_000);
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent.clone());
+        state.cancellation.inference_token = Some(request.clone());
+        let cancel = async {
+            started.notified().await;
+            request.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            host.compact_messages_for_request(
+                &mut state,
+                &original,
+                &[],
+                &[],
+                CompactionTier::AggressivePrune,
+                &config
+            ),
+            cancel,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("compaction must be cancelled"),
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(state.messages, original);
+        assert!(!parent.is_cancelled());
     }
 
     #[tokio::test]
@@ -47046,9 +47386,11 @@ mod tests {
             session_id,
         )
         .unwrap();
+        let mut previous_assistant = json!({"role":"assistant", "content":"previous answer", astra_core::model_wire::responses::CONTINUATION_KEY:previous});
+        host.attest_current_model_message(&state, &mut previous_assistant);
         state.messages = vec![
             json!({"role":"user", "content":"earlier goal"}),
-            json!({"role":"assistant", "content":"previous answer", astra_core::model_wire::responses::CONTINUATION_KEY:previous}),
+            previous_assistant,
             json!({"role":"user", "content":"continue"}),
         ];
         for index in 0..10 {
@@ -50929,6 +51271,21 @@ mod tests {
         let mut state = create_durable_execution_test_state(session_id);
         state.message = "answer normally".to_string();
         state.user_intent = state.message.clone();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let executor = runtime_tool_executor_with_agent_context(workspace.path());
+        let owner = executor.direct_child_completion_owner().unwrap();
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "held-child".into(),
+            run_id: "held-child-run".into(),
+            parent_agent_id: "agent1".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        state.current_run_id = Some("run1".into());
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        assert!(owner.has_pending_direct_children());
 
         let observe_first_text = async {
             let mut visible_order = Vec::new();
@@ -50952,6 +51309,10 @@ mod tests {
                 }
                 if event_type == "text_delta" {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        owner.has_pending_direct_children(),
+                        "reply must not wait for the child"
+                    );
                     assert!(
                         saw_llm_call_started,
                         "visible provider output arrived before the LLM start lifecycle event"
@@ -51594,6 +51955,248 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn guidance_supersession_does_not_publish_buffered_work_answer() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        for parent_cancelled in [false, true] {
+            let session_id = format!("work-stream-cancel-{parent_cancelled}");
+            let release = Arc::new(tokio::sync::Notify::new());
+            let chunks = [
+                json!({"choices":[{"delta":{"content":"Work is complete."}}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"provider reached boundary"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+            let provider = ProviderGateway::start(vec![ProviderScript::new(
+                "cancel_buffered_work_answer",
+                |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+                vec![ProviderResponse::Stream {
+                    content_type: "text/event-stream",
+                    chunks,
+                    release_before_chunk: Some((2, release.clone())),
+                }],
+            )])
+            .await;
+            let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+            let mut host = test_host_builder("user-work-cancel", session_id.clone())
+                .with_provider_observations(
+                    crate::server::provider_test_support::ProviderObservationsFixture::default(),
+                )
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    gateway_url,
+                    Some(3000),
+                )))
+                .build();
+            host.terminal_handoff_window.close();
+            host.pending_work_establishment = Some(PendingWorkEstablishment {
+                call: json!({"id":"pending-work","type":"function","function":{"name":"start_work","arguments":"{}"}}),
+                call_id: "pending-work".into(),
+                operation_id: None,
+                activation: astra_services::work::WorkEstablishmentActivation::Start,
+                control: WorkEstablishmentCarrierControl::Establish,
+                attempts: 1,
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            host.set_event_tx(tx);
+            let mut state = create_durable_execution_test_state(&session_id);
+            state.message = "continue".into();
+            state.user_intent = state.message.clone();
+            let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+            let inference = Arc::new(parent.child_token());
+            state.cancellation.token = Some(parent.clone());
+            state.cancellation.inference_token = Some(inference.clone());
+            let execution = host.execute_turn(&mut state);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    result = &mut execution => match result {
+                        Ok(_) => panic!("provider finished before cancellation"),
+                        Err(error) => panic!("provider failed before cancellation: {error:?}"),
+                    },
+                    event = tokio::time::timeout(Duration::from_secs(5), rx.recv()) => {
+                        let event = event.expect("provider progress").expect("event channel");
+                        assert_ne!(event.get("type").and_then(Value::as_str), Some("text_delta"));
+                        if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
+                            break;
+                        }
+                    }
+                }
+            }
+            if parent_cancelled {
+                parent.cancel();
+            } else {
+                inference.cancel();
+            }
+            let result = execution.await;
+            let error = result.err().expect("cancelled");
+            assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                details["partial_full_text"], "",
+                "unpublished Work text stays private"
+            );
+            release.notify_one();
+            let mut text = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                    text.push(event);
+                }
+            }
+            assert!(text.is_empty(), "provisional Work answer leaked: {text:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn superseded_stream_preserves_visible_context_without_database_dumps() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let mut settings = MatrixOneSettings::from_env();
+        settings.db_pool_min_connections = 0;
+        settings.db_pool_max_connections = 1;
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let user = format!("steer-no-dump-user-{nonce}");
+        let session = format!("steer-no-dump-session-{nonce}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let chunks = [
+            json!({"choices":[{"delta":{"content":"Visible partial."}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n").into_bytes())
+        .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+        .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "cancel a visible provider response",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )])
+        .await;
+        let mut host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        host.terminal_handoff_window.close();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(events_tx);
+        let mut state = create_durable_execution_test_state(&session);
+        state.message = "continue".into();
+        state.user_intent = state.message.clone();
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let inference = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent);
+        state.cancellation.inference_token = Some(inference.clone());
+        let error = {
+            let execution = host.execute_turn(&mut state);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    _ = &mut execution => panic!("provider ended before cancellation"),
+                    event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv()) => {
+                        let event = event.unwrap().unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                            assert_eq!(event["content"], "Visible partial.");
+                            break;
+                        }
+                    }
+                }
+            }
+            // The only connection is unavailable. A diagnostic dump would
+            // block here, even though the interrupted inference has settled.
+            let held = pool.get().acquire().await.unwrap();
+            inference.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut execution)
+                .await
+                .expect("cancelled inference must not wait for the database");
+            drop(held);
+            result.err().expect("inference was superseded")
+        };
+        release.notify_one();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(
+            state.messages.iter().any(|message| {
+                message["role"] == "assistant" && message["content"] == "Visible partial."
+            }),
+            "the next request must see the text the user already saw"
+        );
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 0);
+        provider.assert_complete();
+
+        // Real provider failures retain their existing diagnostics.
+        let failing_provider = ProviderGateway::start(vec![ProviderScript::new(
+            "reject a provider request",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::Json {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error": {"message": "invalid request"}}),
+            }],
+        )])
+        .await;
+        let mut failed_host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", failing_provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        let mut failed_state = create_durable_execution_test_state(&session);
+        let error = failed_host
+            .execute_turn(&mut failed_state)
+            .await
+            .err()
+            .expect("provider failure");
+        assert_ne!(error.kind, astra_core::ErrorKind::Cancelled);
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 1);
+        failing_provider.assert_complete();
+        sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn pending_completion_action_does_not_stream_provisional_success() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-pending-completion-stream";
@@ -51859,9 +52462,9 @@ mod tests {
                 .expect("accepted response");
             state.commit_volatile_attempt_lease();
             assert_eq!(result.accum.tool_calls.len(), batch.len());
-            state
-                .messages
-                .push(json!({"role":"assistant","tool_calls":result.accum.tool_calls}));
+            let mut assistant = json!({"role":"assistant","tool_calls":result.accum.tool_calls});
+            host.attest_current_model_message(&state, &mut assistant);
+            state.messages.push(assistant);
             let accepted = state.messages.last().unwrap()["tool_calls"]
                 .as_array()
                 .unwrap()

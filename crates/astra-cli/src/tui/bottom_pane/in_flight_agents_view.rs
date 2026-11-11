@@ -969,7 +969,7 @@ impl BottomPaneView for InFlightAgentsView {
             hints.push("X stop");
         }
         if selected.is_some_and(|row| row.guide_target().is_some()) {
-            hints.push("G guide");
+            hints.push("G message");
         }
         if self.rows.iter().any(AgentRow::has_attention) {
             hints.push("A attention");
@@ -1807,7 +1807,7 @@ mod tests {
         });
         let mut view = InFlightAgentsView::new(durable_rows);
 
-        assert!(view.hint_keys().unwrap().contains("G guide"));
+        assert!(view.hint_keys().unwrap().contains("G message"));
         view.handle_key(key(KeyCode::Char('g')));
         assert_eq!(
             view.take_action_request(),
@@ -1854,7 +1854,7 @@ mod tests {
     #[test]
     fn guide_uses_the_local_runtime_mailbox_target() {
         let mut local = InFlightAgentsView::new(rows(1));
-        assert!(local.hint_keys().unwrap().contains("G guide"));
+        assert!(local.hint_keys().unwrap().contains("G message"));
         local.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(
             local.take_action_request(),
@@ -1878,7 +1878,7 @@ mod tests {
         paused.handle_key(key(KeyCode::Char('g')));
         assert!(paused.take_action_request().is_none());
         paused.rows[0].available_actions = vec![astra_thin_client::SessionRunAction::Resume];
-        assert!(paused.hint_keys().unwrap().contains("G guide"));
+        assert!(paused.hint_keys().unwrap().contains("G message"));
         paused.handle_key(key(KeyCode::Char('g')));
         assert!(
             matches!(paused.take_action_request(), Some(ViewActionRequest {
@@ -1946,7 +1946,7 @@ mod tests {
         let mut local = InFlightAgentsView::new(rows(1));
         let local_hints = local.hint_keys().unwrap_or_default();
         assert!(!local_hints.contains("P pause/resume"));
-        assert!(local_hints.contains("G guide"));
+        assert!(local_hints.contains("G message"));
         local.handle_key(key(KeyCode::Char('p')));
         assert_eq!(local.take_action_request(), None);
 
@@ -2489,7 +2489,7 @@ mod tests {
         assert!(!out.contains("steps"), "{out}");
         assert_eq!(
             v.hint_keys().as_deref(),
-            Some("↑↓ move · Enter/→ transcript · X stop · G guide · ←/Esc close")
+            Some("↑↓ move · Enter/→ transcript · X stop · G message · ←/Esc close")
         );
     }
 

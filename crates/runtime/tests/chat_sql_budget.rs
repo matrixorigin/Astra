@@ -330,12 +330,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
     }
 }
 
-const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, last_guidance_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
 
 // The real shared control reader batches concurrently active Runs. Match its
 // exact statement for 1..=8 keys, including ordinal and candidate-IN cardinality,
 // rather than classifying any SELECT against agent_runs as periodic work.
-fn is_eight_session_control_observation(sql: &str) -> bool {
+fn is_control_observation_sql(sql: &str) -> bool {
     if !sql.starts_with("SELECT requested.ordinal, run_id,") {
         return false;
     }
@@ -353,18 +353,20 @@ fn is_eight_session_control_observation(sql: &str) -> bool {
 
 #[test]
 fn batched_control_accounting_requires_the_exact_eight_session_contract() {
-    assert!(is_eight_session_control_observation(
-        CONTROL_OBSERVATION_SQL
-    ));
+    assert!(is_control_observation_sql(CONTROL_OBSERVATION_SQL));
     let batch = CONTROL_OBSERVATION_SQL
         .replace("ROW(0,?,?)", "ROW(0,?,?),ROW(1,?,?)")
         .replace("run_id IN (?)", "run_id IN (?,?)");
-    assert!(is_eight_session_control_observation(&batch));
-    assert!(!is_eight_session_control_observation(
+    assert!(is_control_observation_sql(&batch));
+    assert!(!is_control_observation_sql(
         &batch.replace("IN (?,?)", "IN (?)")
     ));
-    assert!(!is_eight_session_control_observation(&format!(
+    assert!(!is_control_observation_sql(&format!(
         "{batch} UNION ALL SELECT 1"
+    )));
+    assert!(!is_control_observation_sql(&batch.replace(
+        "last_event_idx, last_guidance_event_idx,",
+        "last_event_idx,"
     )));
 }
 
@@ -393,7 +395,7 @@ fn assert_scoped_sql_budget(statements: &[String], core_limit: usize, elapsed_ms
     let auth = authentication_snapshot_count(statements);
     let polls = statements
         .iter()
-        .filter(|sql| sql.as_str() == CONTROL_OBSERVATION_SQL)
+        .filter(|sql| is_control_observation_sql(sql))
         .count();
     let poll_limit = (elapsed_ms / 2_000.0).ceil() as usize;
     assert!(
@@ -795,7 +797,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                         let observed = capture.0.lock().unwrap().as_ref().is_some_and(|samples| {
                             samples
                                 .iter()
-                                .any(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+                                .any(|sample| is_control_observation_sql(&sample.sql))
                         });
                         if observed {
                             break;
@@ -907,7 +909,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
 
         let control_observation_sql = samples
             .iter()
-            .filter(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+            .filter(|sample| is_control_observation_sql(&sample.sql))
             .count();
         if held_for_control {
             assert!(control_observation_sql > 0);
@@ -1105,12 +1107,13 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             scenario,
             readonly_rounds,
             warm_context,
+            held_for_control,
             control_observation_sql,
             statements,
             execution_ms,
         ));
     }
-    for (scenario, rounds, warm_context, polls, statements, elapsed_ms) in &budgets {
+    for (scenario, rounds, warm_context, held, polls, statements, elapsed_ms) in &budgets {
         // A warm request restores its prior canonical Context once before
         // execution, in addition to the observer's captured-head materialization.
         // This is required history work, independent of readonly tool rounds.
@@ -1128,13 +1131,15 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         }
         let baseline = budgets
             .iter()
-            .find(|(name, _, warm, _, _, _)| *name == "ordinary" && warm == warm_context)
+            .find(|(name, _, warm, baseline_held, _, _, _)| {
+                *name == "ordinary" && warm == warm_context && baseline_held == held
+            })
             .unwrap();
         // Explain exact periodic reads and at most one request-auth cache
         // miss. Every query remains in the separately bounded raw total.
-        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64
+        let expected = baseline.5.len() as i64 + *polls as i64 - baseline.4 as i64
             + authentication_reads as i64
-            - authentication_snapshot_count(&baseline.4) as i64;
+            - authentication_snapshot_count(&baseline.5) as i64;
         assert_eq!(
             statements.len() as i64,
             expected,
@@ -1646,7 +1651,7 @@ async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
     assert_scoped_sql_budget(&sql, 33, execution_ms);
     let control_polls = sql
         .iter()
-        .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
+        .filter(|statement| is_control_observation_sql(statement))
         .count();
     let authentication_reads = authentication_snapshot_count(&sql);
     for sample in &statements {
@@ -2688,7 +2693,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
         .count();
     let controls = raw
         .iter()
-        .filter(|sample| is_eight_session_control_observation(&sample.sql))
+        .filter(|sample| is_control_observation_sql(&sample.sql))
         .count();
     assert!(controls <= 8 * measurement_start.elapsed().as_millis().div_ceil(2_000) as usize);
     let heartbeats = raw

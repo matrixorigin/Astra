@@ -592,7 +592,6 @@ async fn stream_chat_sse_inner(
         last_artifact_publication: None,
         pending_artifact_publication: None,
         pending_explain_analyze_snapshot: None,
-        deferred_token_projection: None,
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,

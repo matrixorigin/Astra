@@ -5,6 +5,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::turn::llm::client::{LlmCancel, wait_llm_cancel};
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../services/tests/common/mysql_response_proxy.rs"]
+mod mysql_response_proxy;
 use astra_core::{ClassifiedError, ErrorKind, SharedPool};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use serde_json::{Map, Value, json};
@@ -561,10 +567,18 @@ pub(crate) async fn admit_llm_provider_request(
     provider: &str,
     model: &str,
     estimated_tokens: u64,
+    cancel: LlmCancel<'_>,
 ) -> Result<(), ClassifiedError> {
     let config = ProviderAdmissionConfig::from_env();
-    admit_llm_provider_request_with_config(shared_pool, provider, model, estimated_tokens, config)
-        .await
+    admit_llm_provider_request_with_config(
+        shared_pool,
+        provider,
+        model,
+        estimated_tokens,
+        config,
+        cancel,
+    )
+    .await
 }
 
 async fn admit_llm_provider_request_with_config(
@@ -573,6 +587,7 @@ async fn admit_llm_provider_request_with_config(
     model: &str,
     estimated_tokens: u64,
     config: ProviderAdmissionConfig,
+    cancel: LlmCancel<'_>,
 ) -> Result<(), ClassifiedError> {
     let estimated_tokens = estimated_tokens.max(1);
     match config.mode {
@@ -617,8 +632,15 @@ async fn admit_llm_provider_request_with_config(
                     Some(estimated_tokens),
                 );
             };
-            match db_fixed_window_admit(shared_pool, provider, model, &config, estimated_tokens)
-                .await
+            match db_fixed_window_admit(
+                shared_pool,
+                provider,
+                model,
+                &config,
+                estimated_tokens,
+                cancel,
+            )
+            .await
             {
                 Ok(FixedWindowAdmission::Admitted) => {
                     record_attempt(&config, "admitted");
@@ -639,6 +661,7 @@ async fn admit_llm_provider_request_with_config(
                         estimated_tokens,
                     ))
                 }
+                Err(error) if error.kind == ErrorKind::Cancelled => Err(error),
                 Err(error) => {
                     handle_admission_error(&config, "database_error", error, Some(estimated_tokens))
                 }
@@ -714,15 +737,18 @@ fn cleanup_timestamp_slot() -> &'static AtomicI64 {
 }
 
 async fn cleanup_stale_windows_if_due(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     config: &ProviderAdmissionConfig,
     now_ms: i64,
-) {
+) -> Result<(), ClassifiedError> {
     if !should_run_cleanup(now_ms, config.cleanup_interval_ms) {
-        return;
+        return Ok(());
     }
-    match cleanup_stale_windows(shared_pool, config, now_ms).await {
-        Ok(rows) => record_cleanup("ok", rows),
+    match cleanup_stale_windows(connection, config, now_ms).await {
+        Ok(rows) => {
+            record_cleanup("ok", rows);
+            Ok(())
+        }
         Err(error) => {
             tracing::warn!(
                 target: "astra_runtime::llm_provider_admission",
@@ -730,12 +756,13 @@ async fn cleanup_stale_windows_if_due(
                 "llm provider admission window cleanup failed"
             );
             record_cleanup("error", 0);
+            Err(error)
         }
     }
 }
 
 async fn cleanup_stale_windows(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     config: &ProviderAdmissionConfig,
     now_ms: i64,
 ) -> Result<u64, ClassifiedError> {
@@ -743,7 +770,7 @@ async fn cleanup_stale_windows(
     let result = sqlx::query(CLEANUP_WINDOWS_SQL)
         .bind(cutoff_ms)
         .bind(10_000i64)
-        .execute(shared_pool.get())
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
     Ok(result.rows_affected())
@@ -781,15 +808,84 @@ async fn db_fixed_window_admit(
     _model: &str,
     config: &ProviderAdmissionConfig,
     estimated_tokens: u64,
+    cancel: LlmCancel<'_>,
 ) -> Result<FixedWindowAdmission, ClassifiedError> {
+    // Only pool acquisition is cancellable: no database operation has begun.
+    // Once acquired, retain the connection until every submitted claim has a
+    // known result so cancellation cannot leave a reusable connection dirty.
+    let mut connection = acquire_admission_connection(shared_pool, cancel).await?;
+    if cancel.is_triggered() {
+        connection.release();
+        return Err(admission_cancelled());
+    }
+    // Cleanup is best effort. Its connection may be unsynchronized after an
+    // error, so discard it before continuing the actual quota admission.
+    if cleanup_stale_windows_if_due(connection.connection_mut(), config, now_epoch_ms())
+        .await
+        .is_err()
+    {
+        drop(connection);
+        connection = acquire_admission_connection(shared_pool, cancel).await?;
+    }
+    let result = db_fixed_window_admit_on_connection(
+        connection.connection_mut(),
+        provider,
+        config,
+        estimated_tokens,
+        cancel,
+    )
+    .await;
+    // A completed claim can conservatively consume this window if a late
+    // guidance cancellation arrives. Never issue provider work for it.
+    let result = if result.is_ok() && cancel.is_triggered() {
+        Err(admission_cancelled())
+    } else {
+        result
+    };
+    if result
+        .as_ref()
+        .map_or_else(|error| error.kind == ErrorKind::Cancelled, |_| true)
+    {
+        connection.release();
+    }
+    result
+}
+
+async fn acquire_admission_connection(
+    shared_pool: &SharedPool,
+    cancel: LlmCancel<'_>,
+) -> Result<astra_services::CancellationSafePoolConnection, ClassifiedError> {
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(admission_cancelled()),
+        result = astra_services::CancellationSafePoolConnection::acquire(shared_pool.get()) => result.map_err(database_error),
+    }
+}
+
+fn admission_cancelled() -> ClassifiedError {
+    ClassifiedError::new(ErrorKind::Cancelled, "LLM provider admission cancelled")
+}
+
+async fn db_fixed_window_admit_on_connection(
+    connection: &mut sqlx::MySqlConnection,
+    provider: &str,
+    config: &ProviderAdmissionConfig,
+    estimated_tokens: u64,
+    cancel: LlmCancel<'_>,
+) -> Result<FixedWindowAdmission, ClassifiedError> {
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
     let now_ms = now_epoch_ms();
-    cleanup_stale_windows_if_due(shared_pool, config, now_ms).await;
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(provider);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
     let previous_window_start_ms = previous_window_start_ms(window_start_ms, config.window_ms);
     let previous_counts =
-        fetch_window_counts(shared_pool, &bucket_key, previous_window_start_ms).await?;
+        fetch_window_counts(connection, &bucket_key, previous_window_start_ms).await?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
     let previous_weight =
         weighted_previous_window_counts(previous_counts, now_ms, window_start_ms, config.window_ms);
     let rpm_remaining = config
@@ -802,9 +898,12 @@ async fn db_fixed_window_admit(
     sqlx::query(INSERT_WINDOW_SQL)
         .bind(&bucket_key)
         .bind(window_start_ms)
-        .execute(shared_pool.get())
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
 
     let result = match (config.rpm_limit, config.tpm_limit) {
         (Some(rpm_limit), Some(tpm_limit)) => {
@@ -815,7 +914,7 @@ async fn db_fixed_window_admit(
                 .bind(rpm_remaining.unwrap_or_else(|| i64::try_from(rpm_limit).unwrap_or(i64::MAX)))
                 .bind(estimated_tokens_i64)
                 .bind(tpm_remaining.unwrap_or_else(|| i64::try_from(tpm_limit).unwrap_or(i64::MAX)))
-                .execute(shared_pool.get())
+                .execute(&mut *connection)
                 .await
         }
         (Some(rpm_limit), None) => {
@@ -824,7 +923,7 @@ async fn db_fixed_window_admit(
                 .bind(&bucket_key)
                 .bind(window_start_ms)
                 .bind(rpm_remaining.unwrap_or_else(|| i64::try_from(rpm_limit).unwrap_or(i64::MAX)))
-                .execute(shared_pool.get())
+                .execute(&mut *connection)
                 .await
         }
         (None, Some(tpm_limit)) => {
@@ -834,7 +933,7 @@ async fn db_fixed_window_admit(
                 .bind(window_start_ms)
                 .bind(estimated_tokens_i64)
                 .bind(tpm_remaining.unwrap_or_else(|| i64::try_from(tpm_limit).unwrap_or(i64::MAX)))
-                .execute(shared_pool.get())
+                .execute(&mut *connection)
                 .await
         }
         (None, None) => {
@@ -845,12 +944,15 @@ async fn db_fixed_window_admit(
         }
     }
     .map_err(database_error)?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
 
     if result.rows_affected() == 1 {
-        match claim_rpm_pacing(shared_pool, &bucket_key, config, now_ms).await {
+        match claim_rpm_pacing(connection, &bucket_key, config, now_ms, cancel).await {
             Ok(Some(retry_after_ms)) => {
                 release_window_slot(
-                    shared_pool,
+                    connection,
                     &bucket_key,
                     window_start_ms,
                     estimated_tokens_i64,
@@ -862,9 +964,10 @@ async fn db_fixed_window_admit(
                 })
             }
             Ok(None) => Ok(FixedWindowAdmission::Admitted),
+            Err(error) if error.kind == ErrorKind::Cancelled => Err(error),
             Err(error) => {
                 release_window_slot(
-                    shared_pool,
+                    connection,
                     &bucket_key,
                     window_start_ms,
                     estimated_tokens_i64,
@@ -875,7 +978,7 @@ async fn db_fixed_window_admit(
         }
     } else {
         let limit = detect_rejected_limit(
-            shared_pool,
+            connection,
             &bucket_key,
             window_start_ms,
             previous_weight,
@@ -891,7 +994,7 @@ async fn db_fixed_window_admit(
 }
 
 async fn release_window_slot(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     bucket_key: &str,
     window_start_ms: i64,
     estimated_tokens_i64: i64,
@@ -901,21 +1004,21 @@ async fn release_window_slot(
         .bind(estimated_tokens_i64)
         .bind(bucket_key)
         .bind(window_start_ms)
-        .execute(shared_pool.get())
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
     Ok(())
 }
 
 async fn detect_rejected_limit(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     bucket_key: &str,
     window_start_ms: i64,
     previous_weight: WindowCounts,
     config: &ProviderAdmissionConfig,
     estimated_tokens: u64,
 ) -> Result<ProviderAdmissionLimit, ClassifiedError> {
-    let current_counts = fetch_window_counts(shared_pool, bucket_key, window_start_ms).await?;
+    let current_counts = fetch_window_counts(connection, bucket_key, window_start_ms).await?;
     Ok(rejected_limit_from_counts(
         current_counts
             .request_count
@@ -930,14 +1033,14 @@ async fn detect_rejected_limit(
 }
 
 async fn fetch_window_counts(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     bucket_key: &str,
     window_start_ms: i64,
 ) -> Result<WindowCounts, ClassifiedError> {
     let row = sqlx::query(SELECT_WINDOW_COUNTS_SQL)
         .bind(bucket_key)
         .bind(window_start_ms)
-        .fetch_optional(shared_pool.get())
+        .fetch_optional(&mut *connection)
         .await
         .map_err(database_error)?;
     let Some(row) = row else {
@@ -950,10 +1053,11 @@ async fn fetch_window_counts(
 }
 
 async fn claim_rpm_pacing(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     bucket_key: &str,
     config: &ProviderAdmissionConfig,
     now_ms: i64,
+    cancel: LlmCancel<'_>,
 ) -> Result<Option<u64>, ClassifiedError> {
     let Some(rpm_limit) = config.rpm_limit else {
         return Ok(None);
@@ -962,9 +1066,12 @@ async fn claim_rpm_pacing(
     let burst_tolerance_ms = pacing_burst_tolerance_ms(interval_ms, config.burst);
     sqlx::query(INSERT_PACING_SQL)
         .bind(bucket_key)
-        .execute(shared_pool.get())
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
     let allowed_tat_ms =
         now_ms.saturating_add(i64::try_from(burst_tolerance_ms).unwrap_or(i64::MAX));
     let result = sqlx::query(CLAIM_PACING_SQL)
@@ -973,26 +1080,32 @@ async fn claim_rpm_pacing(
         .bind(i64::try_from(interval_ms).unwrap_or(i64::MAX))
         .bind(bucket_key)
         .bind(allowed_tat_ms)
-        .execute(shared_pool.get())
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
     if result.rows_affected() == 1 {
         return Ok(None);
     }
     let retry_after_ms =
-        fetch_pacing_retry_after_ms(shared_pool, bucket_key, now_ms, burst_tolerance_ms).await?;
+        fetch_pacing_retry_after_ms(connection, bucket_key, now_ms, burst_tolerance_ms).await?;
+    if cancel.is_triggered() {
+        return Err(admission_cancelled());
+    }
     Ok(Some(retry_after_ms))
 }
 
 async fn fetch_pacing_retry_after_ms(
-    shared_pool: &SharedPool,
+    connection: &mut sqlx::MySqlConnection,
     bucket_key: &str,
     now_ms: i64,
     burst_tolerance_ms: u64,
 ) -> Result<u64, ClassifiedError> {
     let row = sqlx::query(SELECT_PACING_SQL)
         .bind(bucket_key)
-        .fetch_optional(shared_pool.get())
+        .fetch_optional(&mut *connection)
         .await
         .map_err(database_error)?;
     let Some(row) = row else {
@@ -1393,6 +1506,7 @@ mod tests {
             "claude",
             2_048,
             ProviderAdmissionConfig::disabled(),
+            LlmCancel::None,
         )
         .await;
 
@@ -1492,6 +1606,7 @@ mod tests {
             "claude",
             2_048,
             ProviderAdmissionConfig::db_fixed_window(None),
+            LlmCancel::None,
         )
         .await;
 
@@ -1518,6 +1633,7 @@ mod tests {
             "claude",
             2_048,
             ProviderAdmissionConfig::unsupported(),
+            LlmCancel::None,
         )
         .await;
 
@@ -1540,9 +1656,15 @@ mod tests {
         let mut config = ProviderAdmissionConfig::db_fixed_window(Some(600));
         config.fail_open = true;
 
-        let result =
-            admit_llm_provider_request_with_config(None, "anthropic", "claude", 2_048, config)
-                .await;
+        let result = admit_llm_provider_request_with_config(
+            None,
+            "anthropic",
+            "claude",
+            2_048,
+            config,
+            LlmCancel::None,
+        )
+        .await;
 
         assert!(result.is_ok());
         let rendered = registry.render_prometheus();
@@ -1555,5 +1677,129 @@ mod tests {
         assert!(rendered.contains(
             r#"astra_llm_provider_admission_tokens_total{mode="db_fixed_window",outcome="error_fail_open",scope="provider"} 2048"#
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated MatrixOne test database"]
+    async fn db_admission_cancellation_interrupts_exhausted_pool_without_a_claim() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_min_connections = 0;
+        settings.db_pool_max_connections = 1;
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let held = pool.get().acquire().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut config = ProviderAdmissionConfig::db_fixed_window(Some(600));
+        // Cancellation must never become a successful fail-open admission.
+        config.fail_open = true;
+        let admission = admit_llm_provider_request_with_config(
+            Some(&pool),
+            "test-provider",
+            "test-model",
+            100,
+            config,
+            LlmCancel::Token(&cancel),
+        );
+        let signal = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(admission, signal)
+        })
+        .await
+        .expect("guidance must interrupt pool wait");
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        drop(held);
+        sqlx::query("SELECT 1").execute(pool.get()).await.unwrap();
+
+        // Control: the same one-connection pool can perform a real claim.
+        for ddl in [CREATE_WINDOWS_TABLE_SQL, CREATE_PACING_TABLE_SQL] {
+            sqlx::query(ddl).execute(pool.get()).await.unwrap();
+        }
+        let provider = format!("pr1251-{}", uuid::Uuid::new_v4());
+        let result = admit_llm_provider_request_with_config(
+            Some(&pool),
+            &provider,
+            "test-model",
+            100,
+            ProviderAdmissionConfig::db_fixed_window(Some(600)),
+            LlmCancel::None,
+        )
+        .await;
+        assert!(result.is_ok(), "real quota claim: {result:?}");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT request_count FROM llm_provider_admission_windows WHERE bucket_key = ? LIMIT 1",
+        )
+        .bind(bucket_key(&provider))
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated MatrixOne test database"]
+    async fn db_admission_settles_a_committed_claim_before_cancellation() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let direct = SharedPool::new(&settings).await.unwrap();
+        for ddl in [CREATE_WINDOWS_TABLE_SQL, CREATE_PACING_TABLE_SQL] {
+            sqlx::query(ddl).execute(direct.get()).await.unwrap();
+        }
+        let proxy = mysql_response_proxy::ResponseProxy::start(
+            settings.host.clone(),
+            settings.port,
+            mysql_response_proxy::Boundary::Write(
+                b"\nUPDATE llm_provider_admission_windows\nSET request_count = request_count + 1",
+            ),
+        )
+        .await;
+        let pool = mysql_response_proxy::proxy_pool(&settings, proxy.port).await;
+        let provider = format!("pr1251-claim-{}", uuid::Uuid::new_v4());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let config = ProviderAdmissionConfig::db_fixed_window(Some(600));
+        let admission = admit_llm_provider_request_with_config(
+            Some(&pool),
+            &provider,
+            "test-model",
+            100,
+            config,
+            LlmCancel::Token(&cancel),
+        );
+        tokio::pin!(admission);
+        tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), proxy.gate.received.notified()) => result.expect("claim reaches MatrixOne"),
+            result = &mut admission => panic!("claim response was not gated: {result:?}"),
+        }
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut admission)
+                .await
+                .is_err(),
+            "an in-flight claim must settle before returning"
+        );
+        proxy.gate.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), admission)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        let key = bucket_key(&provider);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT request_count FROM llm_provider_admission_windows WHERE bucket_key = ? LIMIT 1",
+        )
+        .bind(&key)
+        .fetch_one(direct.get())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "a committed claim is retained conservatively");
+        let pacing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_provider_admission_pacing WHERE bucket_key = ?",
+        )
+        .bind(&key)
+        .fetch_one(direct.get())
+        .await
+        .unwrap();
+        assert_eq!(pacing, 0, "no pacing SQL is submitted after cancellation");
     }
 }

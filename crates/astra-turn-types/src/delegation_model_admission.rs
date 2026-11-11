@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelSelection, RequestedModelPolicy};
+use crate::{ModelSelection, ReasoningRequirement, RequestedModelPolicy};
 
 /// Reserved request-context field used only for an authenticated CLI child
 /// handoff. The value is a typed, source-bound requirement snapshot; it is not
@@ -25,34 +25,6 @@ pub struct DelegationModelInstructionSource {
     pub user_intent_digest: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DelegationReasoningEffort {
-    Low,
-    Medium,
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
-    Max,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DelegationReasoningRequirement {
-    ModelDefault,
-    Off,
-    On {},
-    /// `adaptive` is the public tool spelling; normalize it to the canonical
-    /// effort requirement at the deserialization boundary.
-    #[serde(rename = "effort", alias = "adaptive")]
-    Effort {
-        effort: DelegationReasoningEffort,
-    },
-    Budget {
-        tokens: u32,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationModelSlotConstraint {
@@ -66,7 +38,7 @@ pub struct DelegationModelSlotConstraint {
     /// Present whenever either the policy or the concrete selection is
     /// present, including before a configured name is batch-resolved.
     pub model_strength: Option<DelegationRequirementStrength>,
-    pub reasoning: Option<DelegationReasoningRequirement>,
+    pub reasoning: Option<ReasoningRequirement>,
     pub reasoning_strength: Option<DelegationRequirementStrength>,
     /// Bounded source evidence for explaining task binding; never authority
     /// independent of the runtime-created source and exact slot identity.
@@ -208,7 +180,7 @@ pub struct DelegationIntentRequirement {
     pub requirement_id: String,
     pub model_selection: Option<ModelSelection>,
     pub requested_model_policy: Option<RequestedModelPolicy>,
-    pub reasoning: Option<DelegationReasoningRequirement>,
+    pub reasoning: Option<ReasoningRequirement>,
     /// A task-specific requirement still needs admitted applicability at each
     /// invocation; this quote alone never authorizes a slot assignment.
     pub task_scope_quote: Option<String>,
@@ -322,7 +294,7 @@ impl DelegationIntentRequirements {
                             .is_some_and(|scope| scope.trim().is_empty())
                         || matches!(
                             item.reasoning,
-                            Some(DelegationReasoningRequirement::Budget { tokens: 0 })
+                            Some(ReasoningRequirement::Budget { tokens: 0 })
                         )
                     {
                         return Err("delegation requirement is incomplete or duplicated");
@@ -412,6 +384,7 @@ impl DelegationModelAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningEffort;
 
     #[test]
     fn admission_rejects_wrong_identity_and_swapped_slots() {
@@ -613,15 +586,15 @@ mod tests {
 
     #[test]
     fn public_adaptive_reasoning_normalizes_to_canonical_effort() {
-        let reasoning: DelegationReasoningRequirement = serde_json::from_value(serde_json::json!({
+        let reasoning: ReasoningRequirement = serde_json::from_value(serde_json::json!({
             "mode": "adaptive",
             "effort": "high"
         }))
         .unwrap();
         assert_eq!(
             reasoning,
-            DelegationReasoningRequirement::Effort {
-                effort: DelegationReasoningEffort::High
+            ReasoningRequirement::Effort {
+                effort: ReasoningEffort::High
             }
         );
         assert_eq!(

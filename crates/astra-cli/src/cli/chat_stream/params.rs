@@ -129,6 +129,11 @@ pub enum StreamEvent {
     /// loop. Active-run guidance must target this identity, never the CLI's
     /// local orchestration id.
     RunBound(String),
+    RunModelOutcome {
+        run_id: String,
+        session_id: String,
+        outcome: astra_turn_types::RunModelOutcome,
+    },
     /// Catalog-backed raw window and the exact usable input ceiling after
     /// deterministic output/summary/protocol reserves.
     ContextWindowPolicy {

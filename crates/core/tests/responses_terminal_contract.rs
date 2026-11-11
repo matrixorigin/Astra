@@ -22,6 +22,18 @@ fn call(status: Option<&str>) -> Value {
 }
 
 #[test]
+fn clean_eof_accepts_only_a_valid_terminal_response() {
+    let response = terminal("completed", json!([call(Some("completed"))]));
+    for ending in ["", "\n", "\r\n", "\n\n"] {
+        let decoded = decode_sse(&format!("data: {response}{ending}")).unwrap();
+        assert_eq!(decoded.tool_calls[0]["id"], "call-fixture");
+    }
+    assert!(decode_sse("data: {\"type\":\"response.completed\"").is_err());
+    assert!(decode_sse("data: {\"type\":\"response.created\"}\n").is_err());
+    assert!(decode_sse(&format!("data: {}\n", terminal("completed", json!([{}])))).is_err());
+}
+
+#[test]
 fn plaintext_and_encrypted_reasoning_survive_a_complete_tool_round() {
     let connection = "00000000-0000-4000-8000-000000000001";
     for reasoning in [

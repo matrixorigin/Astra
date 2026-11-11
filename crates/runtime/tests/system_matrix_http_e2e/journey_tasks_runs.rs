@@ -51,6 +51,7 @@ async fn seed_orphan_cancel_race_run(
             ),
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,

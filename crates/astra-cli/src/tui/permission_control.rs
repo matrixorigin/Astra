@@ -29,18 +29,25 @@ pub(super) struct ActivePermissionControl {
     latest: Option<ModeIntent>,
     reported_error: Option<String>,
     session_id: Arc<Mutex<Option<String>>>,
+    session_bound: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ActivePermissionControl {
     pub(super) fn new(
         api: ThinClient,
-        profile: Option<String>,
-        remote_run_id: Arc<Mutex<Option<String>>>,
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        mut remote_run_id: watch::Receiver<Option<String>>,
+        mut admitted_auth: watch::Receiver<
+            Option<crate::cli::session::session_runtime::AdmittedAuth>,
+        >,
         signal: crate::cli::permission_manager::PermissionControlSignal,
     ) -> Self {
+        let api = api.without_bearer_provider();
         let session_id = Arc::new(Mutex::new(None::<String>));
         let bound_session = session_id.clone();
+        let session_bound = Arc::new(tokio::sync::Notify::new());
+        let bound_wake = session_bound.clone();
         let (sender, mut receiver) = watch::channel(None::<ModeIntent>);
         let (result_tx, result) = watch::channel(None);
         let task = tokio::spawn(async move {
@@ -50,24 +57,39 @@ impl ActivePermissionControl {
                 };
                 // Startup may not yet have delivered the authenticated Run id.
                 // Only an outstanding user request polls; idle sessions do no work.
-                let (run_id, session_id) = loop {
-                    if let (Some(run_id), Some(session_id)) = (
-                        recover_mutex_lock(&remote_run_id).clone(),
+                let (run_id, session_id, auth) = loop {
+                    if !owner.is_current() {
+                        result_tx.send_replace(Some(SubmissionResult {
+                            request_id: intent.request_id,
+                            outcome: Err(
+                                "Sign-in changed before the permission request was sent.".into()
+                            ),
+                        }));
+                        return;
+                    }
+                    if let (Some(run_id), Some(session_id), Some(auth)) = (
+                        remote_run_id.borrow().clone(),
                         recover_mutex_lock(&bound_session).clone(),
+                        admitted_auth.borrow().clone(),
                     ) {
-                        break (run_id, session_id);
+                        break (run_id, session_id, auth);
                     }
                     tokio::select! {
                         changed = receiver.changed() => {
                             if changed.is_err() { return; }
                             if let Some(latest) = receiver.borrow_and_update().clone() { intent = latest; }
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        changed = remote_run_id.changed() => if changed.is_err() { return; },
+                        changed = admitted_auth.changed() => if changed.is_err() { return; },
+                        _ = bound_wake.notified() => {}
                     }
                 };
                 let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-                    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref())
+                    let token = auth.access_token(&api, None)
                         .await.ok_or_else(|| "Authentication unavailable for permission change".to_string())?;
+                    if !owner.is_current() {
+                        return Err("Sign-in changed before the permission request was sent".to_string());
+                    }
                     let request = RunPermissionModeRequest {
                         expected_session_id: session_id.to_owned(),
                         request_id: intent.request_id.clone(), mode: intent.mode,
@@ -94,6 +116,7 @@ impl ActivePermissionControl {
             latest: None,
             reported_error: None,
             session_id,
+            session_bound,
             task,
         }
     }
@@ -102,17 +125,38 @@ impl ActivePermissionControl {
         let mut bound = recover_mutex_lock(&self.session_id);
         if bound.is_none() {
             *bound = Some(session_id.to_owned());
+            self.session_bound.notify_one();
         }
     }
 
-    pub(super) fn request(&mut self, mode: PermissionMode) {
+    pub(super) fn session_binding(&self) -> Arc<Mutex<Option<String>>> {
+        self.session_id.clone()
+    }
+
+    pub(super) fn session_bound_notification(&self) -> Arc<tokio::sync::Notify> {
+        self.session_bound.clone()
+    }
+
+    pub(super) fn request(&mut self, mode: PermissionMode) -> String {
         let intent = ModeIntent {
             request_id: uuid::Uuid::now_v7().to_string(),
             mode,
         };
         self.reported_error = None;
         self.latest = Some(intent.clone());
+        let request_id = intent.request_id.clone();
         self.sender.send_replace(Some(intent));
+        request_id
+    }
+
+    pub(super) fn is_current_request(&self, request_id: &str) -> bool {
+        self.latest
+            .as_ref()
+            .is_some_and(|intent| intent.request_id == request_id)
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        self.latest.is_some()
     }
 
     /// A stale response must never erase a newer requested mode.
@@ -166,8 +210,9 @@ mod tests {
         let api = ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let mut control = ActivePermissionControl::new(
             api,
-            None,
-            Arc::new(Mutex::new(None)),
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            watch::channel(None).1,
+            watch::channel(None).1,
             PermissionManager::new(false).permission_control_signal(),
         );
         let mut manager = PermissionManager::new(false);
@@ -204,8 +249,9 @@ mod tests {
         let api = ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let mut control = ActivePermissionControl::new(
             api,
-            None,
-            Arc::new(Mutex::new(None)),
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            watch::channel(None).1,
+            watch::channel(None).1,
             PermissionManager::new(false).permission_control_signal(),
         );
         let task = control.task.abort_handle();
@@ -241,8 +287,9 @@ mod tests {
         let mut manager = PermissionManager::new(false);
         let mut control = ActivePermissionControl::new(
             api,
-            None,
-            Arc::new(Mutex::new(None)),
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            watch::channel(None).1,
+            watch::channel(None).1,
             manager.permission_control_signal(),
         );
         control.request(PermissionMode::Bypass);

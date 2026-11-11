@@ -229,9 +229,15 @@ impl ServerSkillSubRunExecutor {
     async fn inherited_model_execution(
         &self,
         parent_run_id: &str,
-    ) -> Result<Option<AdmittedModelExecution>, String> {
+    ) -> Result<
+        (
+            Option<AdmittedModelExecution>,
+            Option<astra_turn_core::thinking_config::ThinkingConfig>,
+        ),
+        String,
+    > {
         let Some(engine) = &self.run_engine else {
-            return Ok(self.admitted_model_execution.clone());
+            return Ok((self.admitted_model_execution.clone(), None));
         };
         crate::server::model_execution_admission::inherit_routed_execution(
             engine,
@@ -974,7 +980,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         };
 
         let execution_result: Result<SubRunResult, String> = async {
-        let admitted_model_execution = self.inherited_model_execution(parent_run_id).await?;
+        let (admitted_model_execution, inherited_thinking) =
+            self.inherited_model_execution(parent_run_id).await?;
         let effective_model = admitted_model_execution.as_ref()
             .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
         let compact_strategy = admitted_model_execution
@@ -1024,6 +1031,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             self.session_id.clone(),
         )
         .with_model(effective_model.clone())
+        .with_preserved_thinking(inherited_thinking.as_ref().is_some_and(|thinking| {
+            *thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+        }))
         .with_model_service(self.model_service.clone())
         .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_provider_scope_bound(admitted_model_execution.as_ref().is_some_and(|execution| {
@@ -1117,6 +1127,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            thinking: inherited_thinking.unwrap_or_default(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
@@ -1160,6 +1171,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 flag: None,
                 pause_flag: None,
                 token: self.cancel_token.clone(),
+                inference_token: None,
                 execution_lease_lost: self.execution_lease_lost.clone(),
                 resolved_origin: None,
             },
@@ -1875,7 +1887,7 @@ mod tests {
             .inherited_model_execution("auto-skill-parent")
             .await
             .unwrap();
-        assert_eq!(inherited, Some(execution));
+        assert_eq!(inherited, (Some(execution), None));
         assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
 
         service.revoke();

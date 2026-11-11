@@ -23,6 +23,7 @@ pub enum RunControlStatus {
 pub struct RunControlObservation {
     pub status: Option<RunControlStatus>,
     pub last_event_idx: Option<i64>,
+    pub last_guidance_event_idx: Option<i64>,
     pub session_id: Option<String>,
     pub run_generation: Option<u64>,
 }
@@ -180,14 +181,26 @@ pub enum UserIntentApplyAck {
 /// cancel/pause control without sticky sessions.
 #[async_trait]
 pub trait RunStatusProvider: Send + Sync {
-    /// Read requested and applied permission choices at a model-round boundary.
-    async fn permission_mode_snapshot(
+    /// Read the run settings once at a model-round boundary.
+    async fn run_settings_snapshot(
         &self,
         _user_id: &str,
         _session_id: &str,
         _run_id: &str,
-    ) -> Result<Option<astra_turn_types::RunPermissionModeSnapshot>, String> {
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
         Ok(None)
+    }
+
+    /// Commit a model decision only for the current durable execution owner.
+    async fn finish_run_model(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _outcome: &astra_turn_types::RunModelOutcome,
+        _resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_turn_types::RunModelOutcome>, String> {
+        Err("model control acknowledgement is unsupported".into())
     }
 
     /// Acknowledge the captured choice under the exact durable execution owner.

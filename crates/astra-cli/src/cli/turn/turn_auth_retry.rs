@@ -33,7 +33,8 @@ pub(crate) fn should_retry_after_auth_refresh(failure: &crate::TurnFailure) -> b
 
 pub(crate) async fn prepare_auth_refresh_retry(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    admitted_token: &str,
     failure: &crate::TurnFailure,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) -> Option<String> {
@@ -41,12 +42,13 @@ pub(crate) async fn prepare_auth_refresh_retry(
         return None;
     }
 
+    // Only the credential that entered this turn may authorize a refresh.
+    // In particular, an environment bearer must never refresh a saved profile.
+    let owner = owner.filter(|owner| owner.is_current())?;
     ui.show_warning("  Token expired, attempting refresh…");
-    if !session_runtime::attempt_token_refresh(api, profile).await {
-        return None;
-    }
-
-    let new_token = session_runtime::current_access_token(profile)?;
+    let new_token = session_runtime::AdmittedAuth::Owner(owner.clone())
+        .access_token(api, Some(admitted_token))
+        .await?;
     ui.show_info(&format!(
         "  {} Token refreshed, retrying…",
         crate::cli::theme::icon_ok()
@@ -56,7 +58,7 @@ pub(crate) async fn prepare_auth_refresh_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_auth_refresh_retry, should_retry_after_auth_refresh};
+    use super::{prepare_auth_refresh_retry, session_runtime, should_retry_after_auth_refresh};
 
     #[test]
     fn should_retry_after_auth_refresh_matches_session_auth_only() {
@@ -122,11 +124,67 @@ mod tests {
         };
         let mut ui = crate::tests::TestUi::default();
 
-        let token = prepare_auth_refresh_retry(&api, None, &failure, &mut ui).await;
+        let token = prepare_auth_refresh_retry(&api, None, "old-access", &failure, &mut ui).await;
 
         assert!(token.is_none());
         assert!(ui.warnings.is_empty());
         assert!(ui.infos.is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn environment_bearer_preflight_401_never_refreshes_a_profile() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "environment-token");
+        }
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("profile-token".into()),
+                refresh_token: Some("profile-refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let failure = crate::TurnFailure {
+            error: "preflight rejected environment credential".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some(astra_core::ErrorKind::Auth.as_str().into()),
+                error_metadata: Some(
+                    serde_json::json!({"source":"model_access", "http_status":401}),
+                ),
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        assert!(
+            prepare_auth_refresh_retry(&api, None, "environment-token", &failure, &mut ui)
+                .await
+                .is_none()
+        );
+        assert!(ui.warnings.is_empty());
+        server.verify().await;
     }
 
     #[serial_test::serial]
@@ -152,6 +210,12 @@ mod tests {
                 },
             );
             save_credentials(&creds).unwrap();
+            let _identity =
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    "default",
+                    Some("user-id-1"),
+                )
+                .unwrap();
             let mock = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/model-access"))
@@ -165,6 +229,8 @@ mod tests {
                 })))
                 .expect(if status == 401 { 1 } else { 0 }).mount(&mock).await;
             let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+            let owner =
+                session_runtime::capture_admitted_auth_owner(&api, None, "old-access").await;
             let ServerDefaultModel::Unavailable(error) =
                 resolve_server_default_model(&api, "old-access").await
             else {
@@ -174,7 +240,9 @@ mod tests {
             // Recovery follows source-authored metadata, not the display wording.
             failure.error = "translated authentication message".into();
             let mut ui = crate::tests::TestUi::default();
-            let token = prepare_auth_refresh_retry(&api, None, &failure, &mut ui).await;
+            let token =
+                prepare_auth_refresh_retry(&api, owner.as_ref(), "old-access", &failure, &mut ui)
+                    .await;
             assert_eq!(
                 token.as_deref(),
                 if status == 401 {

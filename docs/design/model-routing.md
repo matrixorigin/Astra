@@ -245,9 +245,13 @@ never stored in the decision. Primary inference ledger records join through
 the owning run and selected Offering; auxiliary judge calls retain their own
 purpose and usage attribution.
 
-One choice governs all primary rounds of the run. Host recovery loads the
-immutable decision and re-admits that Offering, even if the current policy
-has changed. A recovered host restores the saved Work graph, topology, and
+The Auto choice governs primary rounds until the user explicitly chooses
+another Offering for the running task. A model request already in flight is
+not interrupted. The owner re-admits the requested Offering at a subsequent
+round boundary and records the outcome on the existing Run settings channel.
+Host recovery re-admits the last applied user choice, or the Auto choice when
+no user choice was applied, even if the current policy has changed. A recovered
+host restores the saved Work graph, topology, and
 capabilities through the existing semantic owner before primary execution,
 without another judge call or duplicate feedback observation. If no Work
 decision was available at selection, normal semantic admission still runs.

@@ -199,6 +199,11 @@ later failures retain their source-owned facts.
 
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
 
+Execution inspection reports persisted run totals. Those aggregates can lag
+while a run is active and are not a live count of completed tool calls. Error
+guidance describes the failure category; the run's recovery state determines
+whether a retry is actually in progress.
+
 Edge callback HTTP failures are reported independently of tool execution and
 durable run state. A generic HTTP rejection, including a proxy/WAF HTML block
 page, is not evidence of a lifecycle contract violation. HTTP 409 alone, JSON
@@ -250,6 +255,16 @@ Ctrl+G reads tool activity from existing `agent_run_events` through
 separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
 are independent cursor domains and do not establish a shared chronological order.
 `A` loads older activity; `R` refreshes the conversation and latest activity.
+
+For an open child conversation, the live view renders a bounded tail while
+keeping the full received item available to search and export. Expanding an
+item shows its sanitized Markdown source; inline and separate reasoning can
+be inspected explicitly, while the ordinary preview stays collapsed. When new
+output arrives during expanded reading, the displayed snapshot stays stable
+and indicates that newer output is available; `End` returns to the live tail.
+Search and export use the latest received content. Missing live events remain
+gaps rather than being inferred from the preview, and durable history replaces
+matching live items by their model identity.
 
 Large recorded tool outputs use bounded previews; expanding one activity collapses
 the previously expanded activity. Search and export retain the full available text.
@@ -309,6 +324,12 @@ commit; after those finish, it is released with the request. A still-active
 remote run remains protected by Server session-slot admission. An unconfirmed
 local execution or failed owner cleanup is not treated as a clean stream
 failure and retains its local exclusion until its own authority settles.
+
+CLI stream output, live guidance, and tool lifecycle events share their
+delivery order. If an observer remains unable to receive events, the client
+stops the physical stream with an explicit observer error; the error does not
+assert that remote work stopped or that already-started tools had no effects.
+Partial execution and the durable run remain available for reconciliation.
 
 Transcript progress is described by item sequence and committed cursor.
 Physical page counts, page high watermarks, and page lag are not exposed.

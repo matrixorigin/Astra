@@ -949,6 +949,7 @@ pub async fn seed_pending_approval(
             owner_lease_expires_at: Some(owner_lease_expires_at),
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,

@@ -476,6 +476,9 @@ fn canonical_text_message(
     if let Some(saved) = saved {
         projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
     }
+    if role == "assistant" {
+        preserve_model_replay_identity(message, &mut projected);
+    }
     if message
         .get(crate::cloud::history_summary::HISTORY_SUMMARY_FIELD)
         .and_then(Value::as_u64)
@@ -490,6 +493,15 @@ fn canonical_text_message(
         astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
     }
     Some(projected)
+}
+
+fn preserve_model_replay_identity(source: &Value, projected: &mut Value) {
+    if let Some(origin) = astra_turn_types::model_replay_origin(source)
+        && astra_turn_types::model_item_id(source) == Some(origin.item_id.as_str())
+    {
+        astra_turn_types::mark_model_message(projected, Some(&origin.item_id));
+        astra_turn_types::mark_model_replay_origin(projected, &origin);
+    }
 }
 
 fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
@@ -598,6 +610,7 @@ fn append_complete_tool_group(
             .and_then(|text| prompt_facing_content_for_role("assistant", &text))
             .unwrap_or_default();
         let mut projected = json!({"role":"assistant", "content":content, "tool_calls":[]});
+        preserve_model_replay_identity(assistant, &mut projected);
         projected[INCOMPLETE_TOOL_GROUP_FIELD] = Value::Bool(true);
         if let Some(saved) = saved {
             projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
@@ -629,8 +642,10 @@ fn append_complete_tool_group(
         };
         projected.insert("content".to_string(), content);
     }
-    if let Some(reasoning) = assistant.get("reasoning_content") {
-        projected.insert("reasoning_content".to_string(), reasoning.clone());
+    for field in ["reasoning_content", "reasoning_signature"] {
+        if let Some(reasoning) = assistant.get(field).filter(|value| value.is_string()) {
+            projected.insert(field.to_string(), reasoning.clone());
+        }
     }
     // Keep protocol evidence even for an interrupted group. The codec checks
     // it against canonical pairs before replaying any part of that group.
@@ -643,7 +658,9 @@ fn append_complete_tool_group(
     if incomplete {
         projected.insert(INCOMPLETE_TOOL_GROUP_FIELD.into(), Value::Bool(true));
     }
-    out.push(Value::Object(projected));
+    let mut projected = Value::Object(projected);
+    preserve_model_replay_identity(assistant, &mut projected);
+    out.push(projected);
     out.extend(matched_results);
 }
 

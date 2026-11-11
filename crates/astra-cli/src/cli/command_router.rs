@@ -213,6 +213,7 @@ async fn capture_session_execution(
             "session_id": session_id,
             "owner": owner,
             "run_tree": tree,
+            "run_tree_note": "Tool-call totals are persisted aggregates and may lag while a run is active.",
             "reflection": reflection,
         });
         if include_run_events {
@@ -1413,6 +1414,12 @@ mod token_refresh_error_tests {
                 assert_eq!(capture["transcript"]["items"][1]["item_seq"], 2);
                 assert_eq!(capture["owner"]["api_origin"], api.api_origin());
                 assert_eq!(capture["run_tree"]["session_id"], "session");
+                assert!(
+                    capture["run_tree_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("may lag")
+                );
                 assert_eq!(capture["reflection"]["schema_version"], 2);
             }
             server.verify().await;

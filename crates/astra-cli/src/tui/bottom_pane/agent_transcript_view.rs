@@ -1,7 +1,8 @@
 //! Agent-scoped loading and pagination around the shared transcript surface.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use astra_core::sync_poison::recover_mutex_lock;
 use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect, text::Line};
@@ -105,8 +106,8 @@ fn compact_live_delegation(
 /// objects rather than lines collapsed into a task summary.
 #[derive(Debug)]
 enum LiveTranscriptItem {
-    Assistant(AssistantCell),
-    Reasoning(ReasoningCell),
+    Assistant(Arc<Mutex<AssistantCell>>),
+    Reasoning(Arc<Mutex<ReasoningCell>>),
     Tool {
         tool_use_id: String,
         cell: Option<Arc<ToolCell>>,
@@ -153,10 +154,10 @@ impl LiveTranscript {
         event: Option<&AgentLiveEventKind>,
     ) {
         self.items.retain_mut(|entry| match &mut entry.item {
-            LiveTranscriptItem::Assistant(cell) => !cell
+            LiveTranscriptItem::Assistant(cell) => !recover_mutex_lock(cell)
                 .model_item_id()
                 .is_some_and(|id| canonical.outputs.contains(id)),
-            LiveTranscriptItem::Reasoning(cell) => !cell
+            LiveTranscriptItem::Reasoning(cell) => !recover_mutex_lock(cell)
                 .model_item_id()
                 .is_some_and(|id| canonical.reasoning.contains(id)),
             LiveTranscriptItem::Tool {
@@ -337,8 +338,18 @@ impl LiveTranscript {
 
     fn finish_open_model_item(&mut self) {
         match self.items.last_mut().map(|entry| &mut entry.item) {
-            Some(LiveTranscriptItem::Assistant(cell)) if cell.is_live() => cell.finalize(),
-            Some(LiveTranscriptItem::Reasoning(cell)) if cell.is_live() => cell.finalize(),
+            Some(LiveTranscriptItem::Assistant(cell)) => {
+                let mut cell = recover_mutex_lock(cell);
+                if cell.is_live() {
+                    cell.finalize();
+                }
+            }
+            Some(LiveTranscriptItem::Reasoning(cell)) => {
+                let mut cell = recover_mutex_lock(cell);
+                if cell.is_live() {
+                    cell.finalize();
+                }
+            }
             _ => {}
         }
     }
@@ -346,11 +357,17 @@ impl LiveTranscript {
     fn finish_all_model_items(&mut self) {
         for entry in &mut self.items {
             match &mut entry.item {
-                LiveTranscriptItem::Assistant(cell) if cell.is_live() => {
-                    cell.finalize();
+                LiveTranscriptItem::Assistant(cell) => {
+                    let mut cell = recover_mutex_lock(cell);
+                    if cell.is_live() {
+                        cell.finalize();
+                    }
                 }
-                LiveTranscriptItem::Reasoning(cell) if cell.is_live() => {
-                    cell.finalize();
+                LiveTranscriptItem::Reasoning(cell) => {
+                    let mut cell = recover_mutex_lock(cell);
+                    if cell.is_live() {
+                        cell.finalize();
+                    }
                 }
                 _ => {}
             }
@@ -363,16 +380,19 @@ impl LiveTranscript {
         }
         match self.items.last_mut().map(|entry| &mut entry.item) {
             Some(LiveTranscriptItem::Assistant(cell))
-                if cell.is_live() && cell.model_item_id() == model_item_id =>
+                if {
+                    let cell = recover_mutex_lock(cell);
+                    cell.is_live() && cell.model_item_id() == model_item_id
+                } =>
             {
-                cell.push_delta(text)
+                recover_mutex_lock(cell).push_delta(text)
             }
             _ => {
                 self.finish_open_model_item();
                 let mut cell = AssistantCell::new_streaming();
                 cell.model_item_id = model_item_id.map(str::to_owned);
                 cell.push_delta(text);
-                self.push(LiveTranscriptItem::Assistant(cell));
+                self.push(LiveTranscriptItem::Assistant(Arc::new(Mutex::new(cell))));
             }
         }
     }
@@ -383,16 +403,19 @@ impl LiveTranscript {
         }
         match self.items.last_mut().map(|entry| &mut entry.item) {
             Some(LiveTranscriptItem::Reasoning(cell))
-                if cell.is_live() && cell.model_item_id() == model_item_id =>
+                if {
+                    let cell = recover_mutex_lock(cell);
+                    cell.is_live() && cell.model_item_id() == model_item_id
+                } =>
             {
-                cell.push_delta(text)
+                recover_mutex_lock(cell).push_delta(text)
             }
             _ => {
                 self.finish_open_model_item();
                 let mut cell = ReasoningCell::new_streaming();
                 cell.model_item_id = model_item_id.map(str::to_owned);
                 cell.push_delta(text);
-                self.push(LiveTranscriptItem::Reasoning(cell));
+                self.push(LiveTranscriptItem::Reasoning(Arc::new(Mutex::new(cell))));
             }
         }
     }
@@ -1088,23 +1111,11 @@ impl AgentTranscriptView {
             let before = live_items.len();
             let id = TranscriptItemId::from_widget_id(LIVE_ID_BASE.saturating_add(entry.id));
             match item {
-                LiveTranscriptItem::Assistant(cell) if cell.is_live() => live_items.push(
-                    // This is the same mutable suffix contract as the root
-                    // transcript: preserve current content and provenance,
-                    // but never rebuild a growing Markdown document on every
-                    // live event while the user is inspecting a child run.
-                    TranscriptItem::rendered_kind(
-                        id,
-                        TranscriptItemKind::Assistant,
-                        cell.live_viewport_lines(self.viewport_width, 48),
-                        1,
-                    ),
-                ),
                 LiveTranscriptItem::Assistant(cell) => {
-                    live_items.push(TranscriptItem::committed(id, Arc::new(cell.clone()), 1))
+                    live_items.push(TranscriptItem::live_assistant(id, cell.clone(), 1));
                 }
                 LiveTranscriptItem::Reasoning(cell) => {
-                    live_items.push(TranscriptItem::reasoning(id, cell.clone(), 1));
+                    live_items.push(TranscriptItem::live_reasoning(id, cell.clone(), 1));
                 }
                 LiveTranscriptItem::Tool {
                     tool_use_id,
@@ -1246,7 +1257,95 @@ impl AgentTranscriptView {
             .replace_with(self.transcript_snapshot(), self.viewport_width);
     }
 
+    fn refresh_live_tool_suffix(&mut self) -> bool {
+        if self.activity.is_some()
+            || self.activity_error.is_some()
+            || self.local_root_live.is_some()
+        {
+            return false;
+        }
+        // An overlapping durable request can replace a canonical row; that
+        // reconciliation needs the full identity-aware projection.
+        if self.live.items.iter().any(|entry| {
+            matches!(&entry.item, LiveTranscriptItem::Tool { tool_use_id, cell: Some(_), .. }
+                if self.canonical.tools.contains_key(&(Some(self.run_id.clone()), tool_use_id.clone())))
+        }) {
+            return false;
+        }
+        let mut suffix = Vec::new();
+        self.append_live_projection(&mut suffix);
+        self.transcript
+            .replace_live_suffix(self.canonical.items.len(), suffix, self.viewport_width)
+    }
+
+    /// Consecutive deltas for an existing live tail do not alter canonical
+    /// history. Keep that history and its rendered rows intact.
+    fn refresh_live_tail(&mut self, events: &[AgentLiveEvent]) -> bool {
+        let Some(first) = events.first() else {
+            return false;
+        };
+        if self.run_id.is_empty() || events.iter().any(|event| event.run_id != self.run_id) {
+            return false;
+        }
+        let Some(entry) = self.live.items.last_mut() else {
+            return false;
+        };
+        let id = TranscriptItemId::from_widget_id((1_u64 << 63).saturating_add(entry.id));
+        let item = match (&mut entry.item, &first.kind) {
+            (LiveTranscriptItem::Assistant(cell), AgentLiveEventKind::OutputDelta { model_item_id, .. })
+                if { let cell = recover_mutex_lock(cell); cell.is_live() && cell.model_item_id() == model_item_id.as_deref() }
+                    && !model_item_id.as_ref().is_some_and(|id| self.canonical.outputs.contains(id))
+                    && events.iter().all(|event| matches!(&event.kind,
+                        AgentLiveEventKind::OutputDelta { model_item_id: id, .. } if id == model_item_id)) => {
+                let mut locked = recover_mutex_lock(cell);
+                for event in events {
+                    if let AgentLiveEventKind::OutputDelta { text, .. } = &event.kind {
+                        locked.push_delta(text);
+                    }
+                }
+                drop(locked);
+                TranscriptItem::live_assistant(id, cell.clone(), 1)
+            }
+            (LiveTranscriptItem::Reasoning(cell), AgentLiveEventKind::ThinkingDelta { model_item_id, .. })
+                if { let cell = recover_mutex_lock(cell); cell.is_live() && cell.model_item_id() == model_item_id.as_deref() }
+                    && !model_item_id.as_ref().is_some_and(|id| self.canonical.reasoning.contains(id))
+                    && events.iter().all(|event| matches!(&event.kind,
+                        AgentLiveEventKind::ThinkingDelta { model_item_id: id, .. } if id == model_item_id)) => {
+                let mut locked = recover_mutex_lock(cell);
+                for event in events {
+                    if let AgentLiveEventKind::ThinkingDelta { text, .. } = &event.kind {
+                        locked.push_delta(text);
+                    }
+                }
+                drop(locked);
+                TranscriptItem::live_reasoning(id, cell.clone(), 1)
+            }
+            _ => return false,
+        };
+        self.terminal_refresh_requested = false;
+        if !self.transcript.replace_live_tail(item, self.viewport_width) {
+            self.rebuild_transcript();
+        }
+        true
+    }
+
     fn apply_live_event(&mut self, event: &AgentLiveEvent) -> bool {
+        if self.refresh_live_tail(std::slice::from_ref(event)) {
+            return true;
+        }
+        let changed = self.apply_live_event_without_rebuild(event);
+        if changed
+            && (!matches!(
+                event.kind,
+                AgentLiveEventKind::ToolStarted { .. } | AgentLiveEventKind::ToolCompleted { .. }
+            ) || !self.refresh_live_tool_suffix())
+        {
+            self.rebuild_transcript();
+        }
+        changed
+    }
+
+    fn apply_live_event_without_rebuild(&mut self, event: &AgentLiveEvent) -> bool {
         if event.run_id.trim().is_empty() {
             return false;
         }
@@ -1443,7 +1542,6 @@ impl AgentTranscriptView {
             &self.items,
             Some(&event.kind),
         );
-        self.rebuild_transcript();
         true
     }
 }
@@ -1639,9 +1737,12 @@ fn project_durable_transcript(
     for (item_index, item) in items.iter().enumerate() {
         let canonical_id = transcript_item_identity(item);
         if let Some(reasoning) = item.reasoning.as_deref() {
+            let mut cell =
+                crate::tui::history_cell::reasoning::ReasoningCell::from_text(reasoning, None);
+            cell.model_item_id = item.model_item_id.clone().filter(|id| !id.is_empty());
             projected.push(TranscriptItem::reasoning(
                 TranscriptItemId::from_canonical(canonical_id.clone(), "reasoning"),
-                crate::tui::history_cell::reasoning::ReasoningCell::from_text(reasoning, None),
+                cell,
                 1,
             ));
         }
@@ -1667,15 +1768,12 @@ fn project_durable_transcript(
                 if item.role == "assistant" || !item.tool_calls.is_empty() =>
             {
                 if item.role == "assistant" && !item.content.trim().is_empty() {
-                    projected.push(TranscriptItem::committed(
-                        id,
-                        Arc::new(
-                            crate::tui::history_cell::assistant::AssistantCell::from_markdown(
-                                item.content.clone(),
-                            ),
-                        ),
-                        1,
-                    ));
+                    let mut cell =
+                        crate::tui::history_cell::assistant::AssistantCell::from_markdown(
+                            item.content.clone(),
+                        );
+                    cell.model_item_id = item.model_item_id.clone().filter(|id| !id.is_empty());
+                    projected.push(TranscriptItem::committed(id, Arc::new(cell), 1));
                 }
                 for (index, call) in item.tool_calls.iter().enumerate() {
                     let result_entry = tool_results
@@ -2398,6 +2496,28 @@ impl BottomPaneView for AgentTranscriptView {
         self.apply_live_event(event)
     }
 
+    fn refresh_agent_live_events(&mut self, events: &[AgentLiveEvent]) -> bool {
+        if self.refresh_live_tail(events) {
+            return true;
+        }
+        let mut changed = false;
+        for event in events {
+            changed |= self.apply_live_event_without_rebuild(event);
+        }
+        if changed
+            && (!events.iter().all(|event| {
+                matches!(
+                    event.kind,
+                    AgentLiveEventKind::ToolStarted { .. }
+                        | AgentLiveEventKind::ToolCompleted { .. }
+                )
+            }) || !self.refresh_live_tool_suffix())
+        {
+            self.rebuild_transcript();
+        }
+        changed
+    }
+
     fn refresh_agent_live_gap(
         &mut self,
         gap: &astra_turn_core::agent_live_event::AgentLiveGap,
@@ -2406,6 +2526,9 @@ impl BottomPaneView for AgentTranscriptView {
             return false;
         }
         if self.run_id.trim().is_empty() {
+            if gap.agent_id != self.agent_id {
+                return false;
+            }
             self.run_id = gap.run_id.clone();
             self.error = None;
         } else if gap.run_id != self.run_id {
@@ -4310,6 +4433,365 @@ mod tests {
     }
 
     #[test]
+    fn streaming_agent_output_remains_searchable_and_exportable_in_full() {
+        let mut view = loading_view(80, 24);
+        let body = (0..2000)
+            .map(|line| format!("line-{line:04}\n"))
+            .collect::<String>();
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer".into()),
+                text: body,
+            },
+        });
+
+        let export = view.transcript.export_plain_lines().join("\n");
+        assert!(export.contains("line-0000"));
+        assert!(export.contains("line-1999"));
+        assert!(!rendered(&view).contains("line-0000"));
+
+        for key in [
+            KeyCode::Char('/'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Enter,
+        ] {
+            view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+        }
+        assert!(rendered(&view).contains("line-0000"));
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer".into()),
+                text: "LATEST-OUTPUT-最新输出\n".into(),
+            },
+        });
+        assert!(rendered(&view).contains("New live output"));
+        assert!(rendered(&view).contains("line-0000"));
+        assert!(!rendered(&view).contains("LATEST-OUTPUT"));
+        assert!(
+            view.transcript
+                .export_plain_lines()
+                .join("\n")
+                .contains("LATEST-OUTPUT-最新输出")
+        );
+        view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let followed = rendered(&view);
+        assert!(followed.contains("LATEST-OUTPUT"), "{followed}");
+        view.fit_conversation_workspace(24, 55);
+        let updated = view.transcript.export_plain_lines().join("\n");
+        assert!(updated.contains("line-0000"));
+        assert!(updated.contains("LATEST-OUTPUT-最新输出"));
+    }
+
+    #[test]
+    fn streaming_search_finds_words_split_across_soft_wraps() {
+        for reasoning in [false, true] {
+            for (text, query) in [
+                (format!("{}needle", "x".repeat(19)), "needle"),
+                (
+                    format!("\u{1b}[31m{}İneedle\u{1b}[0m", "界".repeat(10)),
+                    "İneedle",
+                ),
+            ] {
+                let mut view = loading_view(22, 24);
+                let kind = if reasoning {
+                    AgentLiveEventKind::ThinkingDelta {
+                        model_item_id: Some("item".into()),
+                        text,
+                    }
+                } else {
+                    AgentLiveEventKind::OutputDelta {
+                        model_item_id: Some("item".into()),
+                        text,
+                    }
+                };
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind,
+                });
+                for key in std::iter::once(KeyCode::Char('/'))
+                    .chain(query.chars().map(KeyCode::Char))
+                    .chain(std::iter::once(KeyCode::Enter))
+                {
+                    view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+                }
+                let screen = rendered(&view);
+                assert!(
+                    screen.contains("Match 1/1"),
+                    "reasoning={reasoning}: {screen}"
+                );
+                assert!(
+                    !view
+                        .transcript
+                        .export_plain_lines()
+                        .join("\n")
+                        .contains('\u{1b}')
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_and_export_survive_canonical_handoff_for_answer_and_reasoning() {
+        for reasoning in [false, true] {
+            let mut view = loading_view(22, 24);
+            let text = format!("{}needle  \t界\u{1b}[31m红\u{1b}[0m\nlast", "x".repeat(19));
+            let clean = format!("{}needle  \t界红\nlast", "x".repeat(19));
+            let kind = if reasoning {
+                AgentLiveEventKind::ThinkingDelta {
+                    model_item_id: Some("item".into()),
+                    text: text.clone(),
+                }
+            } else {
+                AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("item".into()),
+                    text: text.clone(),
+                }
+            };
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind,
+            });
+            let search = |view: &mut AgentTranscriptView| {
+                view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+                view.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+                for key in "needle".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+                    view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+                }
+                assert!(
+                    rendered(view).contains("Match 1/1"),
+                    "reasoning={reasoning}: {}",
+                    rendered(view)
+                );
+            };
+            search(&mut view);
+            assert!(
+                view.transcript
+                    .export_plain_lines()
+                    .join("\n")
+                    .contains(&clean)
+            );
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            });
+            let mut canonical = page();
+            canonical.items[0].model_item_id = Some("item".into());
+            canonical.items[0].reasoning = reasoning.then(|| text.clone());
+            canonical.items[0].content = if reasoning { String::new() } else { text };
+            canonical.has_more = false;
+            canonical.next_before_seq = None;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            search(&mut view);
+            for width in [12, 80] {
+                view.fit_conversation_workspace(24, width);
+                assert!(
+                    view.transcript
+                        .export_plain_lines()
+                        .join("\n")
+                        .contains(&clean)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_stays_stable_through_output_termination_and_resize() {
+        for (expanded, has_delta) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut view = loading_view(40, 24);
+            let text = (0..100)
+                .map(|i| format!("selected-line-{i:03}\n"))
+                .collect::<String>();
+            let event = |text: String| AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("item".into()),
+                    text,
+                },
+            };
+            view.refresh_agent_live_event(&event(text.clone()));
+            if expanded {
+                view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            }
+            view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            let before = match view.take_action_request() {
+                Some(ViewActionRequest {
+                    action: BottomPaneViewAction::CopyToClipboard { text, .. },
+                    ..
+                }) => text,
+                other => panic!("expected selected text, got {other:?}"),
+            };
+            assert!(before.contains("selected-line"));
+            if has_delta {
+                view.refresh_agent_live_event(&event("new output\n".repeat(100)));
+            }
+            view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            });
+            let mut canonical = page();
+            canonical.items[0].model_item_id = Some("item".into());
+            canonical.items[0].reasoning = None;
+            canonical.items[0].content = if has_delta {
+                format!("{text}{}", "new output\n".repeat(100))
+            } else {
+                text
+            };
+            canonical.has_more = false;
+            canonical.next_before_seq = None;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            view.fit_conversation_workspace(24, 22);
+            let _ = view.take_action_request();
+            view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            match view.take_action_request() {
+                Some(ViewActionRequest {
+                    action: BottomPaneViewAction::CopyToClipboard { text, .. },
+                    ..
+                }) => assert_eq!(text, before),
+                other => panic!("expected frozen selection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collapsing_selected_long_output_ends_selection_before_copy() {
+        for (canonical, collapse) in [false, true].into_iter().flat_map(|canonical| {
+            [KeyCode::Left, KeyCode::Enter, KeyCode::Char('e')]
+                .into_iter()
+                .map(move |collapse| (canonical, collapse))
+        }) {
+            let mut view = loading_view(40, 24);
+            let text = (0..1000)
+                .map(|i| format!("line-{i:04}\n"))
+                .collect::<String>();
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("item".into()),
+                    text: text.clone(),
+                },
+            });
+            view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            if canonical {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind: AgentLiveEventKind::AgentTerminated {
+                        termination:
+                            astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                        duration_ms: 1,
+                        reason: None,
+                    },
+                });
+                let mut page = page();
+                page.items[0].model_item_id = Some("item".into());
+                page.items[0].reasoning = None;
+                page.items[0].content = text;
+                page.has_more = false;
+                page.next_before_seq = None;
+                view.apply_page(page, true, AgentTranscriptSource::DurableServer);
+                let _ = view.take_action_request();
+            }
+            view.handle_key(KeyEvent::new(collapse, KeyModifiers::NONE));
+            assert!(
+                rendered(&view).contains("selection ended"),
+                "{collapse:?}: {}",
+                rendered(&view)
+            );
+            view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            // Y now copies the collapsed current row, not the previous selection.
+            assert!(matches!(
+                view.take_action_request(),
+                Some(ViewActionRequest {
+                    action: BottomPaneViewAction::CopyToClipboard { .. },
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn inline_thought_details_survive_live_completion_and_canonical_refresh() {
+        let mut view = loading_view(80, 24);
+        let thought = format!(
+            "first thought\n{}last thought",
+            "middle thought\n".repeat(1000)
+        );
+        let initial = format!("<think>\n{thought}");
+        let event = |text: String| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("inline".into()),
+                text,
+            },
+        };
+        view.refresh_agent_live_event(&event(initial.clone()));
+        let export = view.transcript.export_plain_lines().join("\n");
+        assert!(export.contains("first thought") && export.contains("last thought"));
+        assert!(!export.contains("<think>"));
+        for key in std::iter::once(KeyCode::Char('/'))
+            .chain("first thought".chars().map(KeyCode::Char))
+            .chain(std::iter::once(KeyCode::Enter))
+        {
+            view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+        }
+        assert!(rendered(&view).contains("first thought"));
+        view.refresh_agent_live_event(&event("</think>\nThe answer.".into()));
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                duration_ms: 1,
+                reason: None,
+            },
+        });
+        let mut canonical = page();
+        canonical.items[0].model_item_id = Some("inline".into());
+        canonical.items[0].reasoning = None;
+        canonical.items[0].content = format!("{initial}</think>\nThe answer.");
+        canonical.has_more = false;
+        canonical.next_before_seq = None;
+        view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+        let export = view.transcript.export_plain_lines().join("\n");
+        assert_eq!(export.matches("first thought").count(), 1);
+        assert!(export.contains("last thought") && export.contains("The answer."));
+        assert!(!export.contains("<think>") && !export.contains("</think>"));
+        assert!(
+            rendered(&view).contains("first thought"),
+            "canonical refresh lost the selected location"
+        );
+    }
+
+    #[test]
     fn durable_tool_guidance_is_rendered_without_mutating_result_evidence() {
         let mut item = page().items.remove(0);
         item.role = "tool".into();
@@ -4735,6 +5217,112 @@ mod tests {
     }
 
     #[test]
+    fn parallel_live_tools_match_a_full_transcript_rebuild() {
+        fn without_running_elapsed(text: String) -> String {
+            text.split_whitespace()
+                .map(|word| {
+                    if word
+                        .strip_prefix('(')
+                        .and_then(|value| value.strip_suffix("ms)"))
+                        .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+                    {
+                        "(elapsed)"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let event = |kind| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind,
+        };
+        let (mut old_tools, _) = delegation_history(1);
+        old_tools[0].item_seq = 200;
+        old_tools[1].item_seq = 201;
+        old_tools[0].tool_calls[0].name = "read_file".into();
+        old_tools[0].tool_calls[0].arguments = "old file".into();
+        old_tools[1].tool_result.as_mut().unwrap().name = Some("read_file".into());
+        old_tools[1].tool_result.as_mut().unwrap().status = Some("success".into());
+        old_tools[1].content = "old result".into();
+        let mut page = transcript_page_with_assistant_lines(200);
+        page.items.extend(old_tools);
+        for view in [&mut incremental, &mut full] {
+            for kind in [
+                AgentLiveEventKind::ToolStarted {
+                    name: "read_file".into(),
+                    description: "old file".into(),
+                    tool_use_id: "spawn-0".into(),
+                },
+                AgentLiveEventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    description: "old file".into(),
+                    tool_use_id: "spawn-0".into(),
+                    status: "success".into(),
+                    duration_ms: 1,
+                    output_summary: None,
+                    output: Some("old result".into()),
+                },
+            ] {
+                view.refresh_agent_live_event(&event(kind));
+            }
+            view.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+            assert!(view.live.items.iter().any(|entry| matches!(&entry.item,
+                LiveTranscriptItem::Tool { tool_use_id, cell: None, .. } if tool_use_id == "spawn-0")));
+        }
+        for event in [
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "first".into(),
+                tool_use_id: "a".into(),
+            }),
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "second".into(),
+                tool_use_id: "b".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "first".into(),
+                status: "success".into(),
+                duration_ms: 1,
+                output_summary: Some("one".into()),
+                output: None,
+                tool_use_id: "a".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "second".into(),
+                status: "success".into(),
+                duration_ms: 2,
+                output_summary: Some("two".into()),
+                output: None,
+                tool_use_id: "b".into(),
+            }),
+        ] {
+            assert!(incremental.refresh_agent_live_event(&event));
+            assert!(
+                incremental.refresh_live_tool_suffix(),
+                "covered old tools must not disable incremental updates"
+            );
+            assert!(full.refresh_agent_live_event(&event));
+            full.rebuild_transcript();
+            assert_eq!(
+                without_running_elapsed(rendered(&incremental)),
+                without_running_elapsed(rendered(&full))
+            );
+            assert_eq!(
+                without_running_elapsed(incremental.transcript.export_plain_lines().join("\n")),
+                without_running_elapsed(full.transcript.export_plain_lines().join("\n"))
+            );
+        }
+    }
+
+    #[test]
     fn empty_completion_termination_renders_human_state_not_wire_reason() {
         let mut view = loading_view(100, 24);
         view.apply_page(page(), true, AgentTranscriptSource::DurableServer);
@@ -4803,8 +5391,8 @@ mod tests {
         assert!(matches!(view.live.items.as_slice(), [
             LiveTranscriptEntry { item: LiveTranscriptItem::Reasoning(reasoning), .. },
             LiveTranscriptEntry { item: LiveTranscriptItem::Assistant(output), .. },
-        ] if reasoning.model_item_id() == Some("accepted-A")
-            && output.model_item_id() == Some("partial-B")));
+        ] if recover_mutex_lock(reasoning).model_item_id() == Some("accepted-A")
+            && recover_mutex_lock(output).model_item_id() == Some("partial-B")));
     }
 
     #[test]
@@ -5068,6 +5656,96 @@ mod tests {
             }),
             "a reused profile must not leak a gap into another run's transcript"
         );
+    }
+
+    #[test]
+    fn unbound_agent_view_ignores_another_agents_gap() {
+        let mut view = AgentTranscriptView::live_unbound(
+            "agent-a".into(),
+            "A".into(),
+            String::new(),
+            None,
+            "agents",
+            80,
+            24,
+        );
+        assert!(
+            !view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-b".into(),
+                agent_id: "agent-b".into(),
+                dropped_event_count: 1,
+            })
+        );
+        assert!(view.has_pending_agent_transcript_identity());
+        assert!(
+            view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-a".into(),
+                agent_id: "agent-a".into(),
+                dropped_event_count: 1,
+            })
+        );
+        assert_eq!(view.run_id, "run-a");
+    }
+
+    #[test]
+    fn live_batch_preserves_the_same_conversation_and_terminal_refresh_as_single_events() {
+        let mut single = loading_view(80, 24);
+        let mut batch = loading_view(80, 24);
+        single.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+        batch.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+        let events = vec![
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ThinkingDelta {
+                    model_item_id: Some("thinking".into()),
+                    text: "Checking ".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "Found ".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "other".into(),
+                run_id: "other-run".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "wrong agent".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "the answer".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            },
+        ];
+        for event in &events {
+            single.refresh_agent_live_event(event);
+        }
+        assert!(batch.refresh_agent_live_events(&events));
+        assert_eq!(rendered(&batch), rendered(&single));
+        assert_eq!(
+            batch.take_action_request().map(|r| r.action),
+            single.take_action_request().map(|r| r.action)
+        );
+        assert!(!rendered(&batch).contains("wrong agent"));
     }
 
     #[test]
@@ -5878,5 +6556,155 @@ mod tests {
                 ..
             }) if !text.is_empty()
         ));
+    }
+
+    #[test]
+    fn incremental_tail_matches_full_rebuild_across_event_boundaries() {
+        fn without_running_elapsed(text: &str) -> String {
+            text.lines()
+                .map(|line| {
+                    if let Some((prefix, rest)) = line.split_once("Running Read (")
+                        && let Some((_, suffix)) = rest.split_once(')')
+                    {
+                        format!("{prefix}Running Read (<elapsed>){suffix}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let page = transcript_page_with_assistant_lines(20);
+        incremental.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+        full.apply_page(page, true, AgentTranscriptSource::DurableServer);
+        let event = |kind| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind,
+        };
+        let events = [
+            event(AgentLiveEventKind::ThinkingDelta {
+                model_item_id: Some("thought".into()),
+                text: "thinking ".into(),
+            }),
+            event(AgentLiveEventKind::ThinkingDelta {
+                model_item_id: Some("thought".into()),
+                text: "more".into(),
+            }),
+            event(AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer-a".into()),
+                text: "answer ".into(),
+            }),
+            event(AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer-b".into()),
+                text: "new item".into(),
+            }),
+            event(AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "file".into(),
+                tool_use_id: "tool".into(),
+            }),
+            event(AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "file".into(),
+                status: "success".into(),
+                duration_ms: 1,
+                output_summary: Some("done".into()),
+                output: None,
+                tool_use_id: "tool".into(),
+            }),
+            event(AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                duration_ms: 1,
+                reason: None,
+            }),
+        ];
+        for (index, event) in events.iter().enumerate() {
+            incremental.refresh_agent_live_event(event);
+            full.apply_live_event_without_rebuild(event);
+            full.rebuild_transcript();
+            if index == 0 {
+                for key in [KeyCode::End, KeyCode::Right] {
+                    let key = KeyEvent::new(key, KeyModifiers::NONE);
+                    incremental.handle_key(key);
+                    full.handle_key(key);
+                }
+            }
+            if index == 1 {
+                assert!(rendered(&incremental).contains("New live output"));
+                for view in [&mut incremental, &mut full] {
+                    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                }
+            }
+            assert_eq!(
+                without_running_elapsed(&rendered(&incremental)),
+                without_running_elapsed(&rendered(&full)),
+                "event {index}"
+            );
+            assert_eq!(
+                incremental
+                    .transcript
+                    .export_plain_lines()
+                    .iter()
+                    .map(|line| without_running_elapsed(line))
+                    .collect::<Vec<_>>(),
+                full.transcript
+                    .export_plain_lines()
+                    .iter()
+                    .map(|line| without_running_elapsed(line))
+                    .collect::<Vec<_>>(),
+                "event {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_live_tail_matches_full_projection_with_history_and_navigation() {
+        let mut incremental = loading_view(80, 24);
+        let mut full = loading_view(80, 24);
+        let page = transcript_page_with_assistant_lines(200);
+        incremental.apply_page(page.clone(), true, AgentTranscriptSource::DurableServer);
+        full.apply_page(page, true, AgentTranscriptSource::DurableServer);
+        let make = |text: &str| AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("live".into()),
+                text: text.into(),
+            },
+        };
+        let first = make("first");
+        incremental.refresh_agent_live_event(&first);
+        full.apply_live_event_without_rebuild(&first);
+        full.rebuild_transcript();
+        for key in [KeyCode::Home, KeyCode::Char('v'), KeyCode::Char('f')] {
+            let key = KeyEvent::new(key, KeyModifiers::NONE);
+            incremental.handle_key(key);
+            full.handle_key(key);
+        }
+        let batch = vec![make(" second"), make(" third")];
+        incremental.refresh_agent_live_events(&batch);
+        for event in &batch {
+            full.apply_live_event_without_rebuild(event);
+        }
+        full.rebuild_transcript();
+        assert_eq!(rendered(&incremental), rendered(&full));
+        assert_eq!(
+            incremental.transcript.export_plain_lines(),
+            full.transcript.export_plain_lines()
+        );
+        incremental.fit_conversation_workspace(24, 55);
+        full.fit_conversation_workspace(24, 55);
+        let next = make(" after resize");
+        incremental.refresh_agent_live_event(&next);
+        full.apply_live_event_without_rebuild(&next);
+        full.rebuild_transcript();
+        assert_eq!(rendered(&incremental), rendered(&full));
+        assert_eq!(
+            incremental.transcript.export_plain_lines(),
+            full.transcript.export_plain_lines()
+        );
     }
 }

@@ -3855,7 +3855,49 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         emitter.llm_call_started(turn_index as u32);
     }
     state.current_model_item_id = Some(Uuid::new_v4().to_string());
-    let turn_result = host.execute_turn(state).await;
+    let parent_cancel = state.cancellation.token.clone();
+    let previous_inference_token = state.cancellation.inference_token.take();
+    let mut guidance_wake = state.user_intents.guidance_wake.clone();
+    let guidance_cursor =
+        i64::try_from(state.user_intents.user_intent_cursor()).unwrap_or(i64::MAX);
+    let supersession = std::sync::Arc::new(
+        parent_cancel
+            .as_ref()
+            .map(|token| token.child_token())
+            .unwrap_or_default(),
+    );
+    if guidance_wake.is_some() {
+        state.cancellation.inference_token = Some(supersession.clone());
+    } else {
+        state.cancellation.inference_token = previous_inference_token.clone();
+    }
+    let (turn_result, guidance_preempted) = {
+        let execution = host.execute_turn(state);
+        tokio::pin!(execution);
+        if let Some(wake) = guidance_wake.as_mut() {
+            loop {
+                if *wake.borrow_and_update() > guidance_cursor {
+                    // Cancel only this inference, then await its existing
+                    // settlement owner; dropping it would lose usage and
+                    // provider-delivery evidence.
+                    supersession.cancel();
+                    break (execution.await, true);
+                }
+                tokio::select! {
+                    biased;
+                    result = &mut execution => break (result, false),
+                    changed = wake.changed() => {
+                        if changed.is_err() {
+                            break (execution.await, false);
+                        }
+                    }
+                }
+            }
+        } else {
+            (execution.await, false)
+        }
+    };
+    state.cancellation.inference_token = previous_inference_token;
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_completed(
             turn_index as u32,
@@ -3891,7 +3933,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // tool execution; it is not itself evidence that the user's requested
     // answer failed. Tool-shaped or empty responses still follow the bounded
     // retry/interruption paths below.
-    if !retain_text_only_for_tool_admission && !provider_recovery_pending {
+    if !retain_text_only_for_tool_admission
+        && !provider_recovery_pending
+        && !(guidance_preempted
+            && turn_result
+                .as_ref()
+                .is_err_and(|error| error.kind == astra_core::ErrorKind::Cancelled))
+    {
         state.hooks.completion_settlement.text_only = false;
     }
     tracing::debug!(
@@ -3923,6 +3971,48 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .is_ok_and(|result| result.accum.has_usage),
     );
     state.record_local_llm_round();
+    let run_cancelled = parent_cancel
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+        || state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        || state
+            .cancellation
+            .execution_lease_lost
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    if guidance_preempted
+        && !run_cancelled
+        && turn_result
+            .as_ref()
+            .is_err_and(|error| error.kind == astra_core::ErrorKind::Cancelled)
+    {
+        let error = turn_result
+            .err()
+            .expect("superseded inference returned cancellation");
+        state.restore_volatile_attempt_lease();
+        fold_provider_completion_error_usage(state, &error);
+        // Provider partials may still be buffered behind completion checks.
+        // Keep the prior canonical history; an interrupted response must not
+        // become an assistant assertion or an executable tool call.
+        state.final_text_model_item_id = None;
+        state.final_text.clear();
+        state.final_text_streamed = false;
+        if !runtime_input_boundary(host, state, RuntimeInputBoundary::IntentReady)
+            .await?
+            .durable_guidance_applied
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "guidance superseded inference without an acknowledged instruction",
+            ));
+        }
+        state.step_recorder.end_turn(false);
+        return Ok(TurnExecutionControl::ContinueLoop);
+    }
     // Capture finish_reason before the match consumes turn_result.
     // Used by textless-stop retry (loop level) and ensure_terminal_text
     // (finalization level) to distinguish true silence from forced truncation
@@ -4235,6 +4325,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // to overwrite it.
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
+    host.attest_model_messages(state, transcript_append_start);
     state.record_appended_prompt_history_from(transcript_append_start);
     if !turn_result.accum.has_tool_calls && turn_result.accum.tool_calls.is_empty() {
         super::finalization::bound_ingested_terminal_message(state, transcript_append_start);
@@ -15226,6 +15317,113 @@ mod tests {
         result.accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage::default());
         record_superseded_llm_round(&mut state, &result, Instant::now());
         assert_eq!(state.last_measured_prompt_tokens, Some(0));
+    }
+
+    #[tokio::test]
+    async fn guidance_preempts_a_stalled_inference_and_continues_the_run() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-preempted-inference".into());
+        state.current_run_owner_generation = Some(7);
+        state.owner_user_id = Some("user-preempted-inference".into());
+        let guidance = "answer the question now, then continue";
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll {
+                next_cursor: 2,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "intent-preempt".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": guidance}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let (wake, receive) = tokio::sync::watch::channel(-1);
+        state.user_intents.guidance_wake = Some(receive);
+        let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(parent_cancel.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let never_release = Arc::new(tokio::sync::Notify::new());
+        let stale = server_tool_result(
+            vec![
+                serde_json::json!({"id":"stale","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+            ],
+            vec![],
+            0,
+            0,
+            None,
+        );
+        let mut host = MockHost::new(vec![stale, text_result("revised result", 5, 2, None)])
+            .with_valid_tools(&["read_file"])
+            .with_admission_hook();
+        host.provider_response_gate = Some((started.clone(), never_release));
+        let run = tokio::spawn(async move {
+            let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (result, host, state)
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("first inference started");
+        wake.send_replace(1);
+        let (outcome, host, state) = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("guidance must not wait for the stalled provider")
+            .unwrap();
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert!(
+            !parent_cancel.is_cancelled(),
+            "the parent run remains active"
+        );
+        assert!(host.admitted_tool_call_batches.is_empty());
+        let resumed = serde_json::to_string(&host.executed_messages).unwrap();
+        assert!(resumed.contains(guidance));
+        assert!(!resumed.contains("unsettled completion claim"));
+        assert!(!resumed.contains("unexecuted-tool-fragment"));
+        assert_eq!(state.final_text, "revised result");
+        assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn guidance_wake_without_an_instruction_does_not_retry_stale_inference() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-empty-guidance-wake".into());
+        state.current_run_owner_generation = Some(7);
+        state.owner_user_id = Some("user-empty-guidance-wake".into());
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll::default(),
+        ])));
+        let (wake, receive) = tokio::sync::watch::channel(-1);
+        state.user_intents.guidance_wake = Some(receive);
+        state.cancellation.token = Some(Arc::new(tokio_util::sync::CancellationToken::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![text_result("stale", 0, 0, None)]);
+        host.provider_response_gate = Some((started.clone(), Arc::new(tokio::sync::Notify::new())));
+        let run = tokio::spawn(async move {
+            let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (result, host)
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        wake.send_replace(1);
+        let (result, host) = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an empty wake must not authorize a retry"),
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(host.admitted_tool_call_batches.is_empty());
     }
 
     #[tokio::test]

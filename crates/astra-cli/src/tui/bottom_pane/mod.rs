@@ -80,6 +80,7 @@ enum ModelCatalogState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NextTurnSubmission {
     Interactive(String),
+    Guidance(PendingUserIntent),
     Conversation {
         target: crate::tui::event_loop::SessionContinuationTarget,
         content: String,
@@ -90,6 +91,7 @@ impl NextTurnSubmission {
     pub(crate) fn text(&self) -> &str {
         match self {
             Self::Interactive(text) => text,
+            Self::Guidance(intent) => &intent.text,
             Self::Conversation { content, .. } => content,
         }
     }
@@ -120,6 +122,9 @@ pub(crate) struct BottomPane {
     file_provider: Option<Arc<dyn FileProvider>>,
     approval_queue: ApprovalQueue,
     pending_user_intents: std::collections::VecDeque<PendingUserIntent>,
+    /// Presentation scope supplied by the session owner; never authorizes a send.
+    session_attachment: Option<(Option<String>, u64)>,
+    active_root_scope: Option<Arc<RootIntentScope>>,
     /// User messages accepted after visible output ended but before the
     /// current turn has committed its canonical boundary. These are next-turn
     /// submissions, not guidance for the previous run.
@@ -161,8 +166,117 @@ pub(crate) struct PendingUserIntent {
     pub(crate) delivery: astra_turn_types::UserIntentDelivery,
     pub(crate) status: astra_turn_types::UserIntentStatus,
     pub(crate) text: String,
+    /// Model-facing text when a local command needs a different wire form.
+    /// The original text remains available for explicit user recovery.
+    pub(crate) wire_text: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
+    /// Physical turn that owns an active-run submission. Child messages keep
+    /// their own captured target and do not use this field.
+    turn_id: Option<String>,
+    pub(crate) next_turn_position: usize,
     custody: PendingUserIntentCustody,
+    root_scope: Option<Arc<RootIntentScope>>,
+}
+
+/// Reuses the foreground turn's owner and first-wins session binding.
+#[derive(Debug)]
+pub(crate) struct RootIntentScope {
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    attachment_epoch: u64,
+    session_binding: Arc<std::sync::Mutex<Option<String>>>,
+    started_unbound: bool,
+}
+
+impl RootIntentScope {
+    pub(crate) fn new(
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        attachment_epoch: u64,
+        session_binding: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        let started_unbound =
+            astra_core::sync_poison::recover_mutex_lock(&session_binding).is_none();
+        Self {
+            owner,
+            attachment_epoch,
+            session_binding,
+            started_unbound,
+        }
+    }
+
+    fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+        if !self.owner.can_view_local_draft() {
+            return false;
+        }
+        match astra_core::sync_poison::recover_mutex_lock(&self.session_binding).as_deref() {
+            Some(bound) => session_id == Some(bound),
+            None => session_id.is_none() && epoch == self.attachment_epoch,
+        }
+    }
+
+    fn returned_unbound_visible_in(&self, session_id: Option<&str>) -> bool {
+        session_id.is_none()
+            && self.owner.can_view_local_draft()
+            && astra_core::sync_poison::recover_mutex_lock(&self.session_binding).is_none()
+    }
+
+    pub(crate) fn attached_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+        if !self.owner.is_current() {
+            return false;
+        }
+        match astra_core::sync_poison::recover_mutex_lock(&self.session_binding).as_deref() {
+            Some(bound) => {
+                session_id == Some(bound)
+                    && epoch
+                        == if self.started_unbound {
+                            self.attachment_epoch.saturating_add(1)
+                        } else {
+                            self.attachment_epoch
+                        }
+            }
+            None => session_id.is_none() && epoch == self.attachment_epoch,
+        }
+    }
+
+    fn same_session(&self, other: &Self) -> bool {
+        if !self.owner.same_presentation_owner(&other.owner) {
+            return false;
+        }
+        if Arc::ptr_eq(&self.session_binding, &other.session_binding) {
+            return true;
+        }
+        let first = astra_core::sync_poison::recover_mutex_lock(&self.session_binding).clone();
+        let second = astra_core::sync_poison::recover_mutex_lock(&other.session_binding).clone();
+        first == second
+    }
+}
+
+impl PartialEq for RootIntentScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.attachment_epoch == other.attachment_epoch
+            && self.owner == other.owner
+            && Arc::ptr_eq(&self.session_binding, &other.session_binding)
+            && self.started_unbound == other.started_unbound
+    }
+}
+
+impl Eq for RootIntentScope {}
+
+impl PendingUserIntent {
+    pub(crate) fn wire_text(&self) -> &str {
+        self.wire_text.as_deref().unwrap_or(&self.text)
+    }
+
+    pub(crate) fn composer_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.wire_text.is_some() {
+            std::borrow::Cow::Borrowed(&self.text)
+        } else {
+            super::slash_dispatch::conversation_for_composer(&self.text)
+        }
+    }
+
+    pub(crate) fn delivery_is_unconfirmed(&self) -> bool {
+        self.custody == PendingUserIntentCustody::Unconfirmed
+    }
 }
 
 /// Why a local guidance intent was not admitted into the pending queue.
@@ -175,6 +289,7 @@ pub(crate) enum UserIntentRejectReason {
     EmptyText,
     InvalidStatus,
     IdentityAlreadyKnown,
+    QueueFull,
 }
 
 impl UserIntentRejectReason {
@@ -187,6 +302,7 @@ impl UserIntentRejectReason {
             Self::IdentityAlreadyKnown => {
                 "Could not queue guidance: this intent is already recorded locally."
             }
+            Self::QueueFull => "Too many messages are waiting. Your draft was not sent.",
         }
     }
 }
@@ -210,20 +326,31 @@ pub(crate) enum PendingUserIntentTarget {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgentDeliveryBarrier {
+    Sending,
+    Unconfirmed(Vec<String>),
+}
+
 fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatus) -> String {
     if intent.custody == PendingUserIntentCustody::Unconfirmed {
         return match &intent.target {
             PendingUserIntentTarget::ActiveRun => {
-                "Guidance delivery uncertain · stable identity retained".to_string()
+                if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                    "Message received · whether it was used is unknown".to_string()
+                } else {
+                    "Message delivery is unknown".to_string()
+                }
             }
             PendingUserIntentTarget::AgentRun { target } => {
                 let agent_name = target.agent_name();
-                let phase = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
-                    "application"
+                let action = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote
+                {
+                    "used"
                 } else {
-                    "delivery"
+                    "received"
                 };
-                format!("Guidance {phase} unknown for {agent_name} · stable identity retained")
+                format!("Can't confirm {agent_name} {action} your message")
             }
         };
     }
@@ -231,55 +358,50 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
         (
             PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-        ) => format!("Sending guidance to {}", target.agent_name()),
+        ) => format!("Sending message to {}", target.agent_name()),
         (
             PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedRemote,
-        ) => format!("Guidance accepted by {} · awaiting application", target.agent_name()),
+        ) => format!(
+            "Message sent to {} · waiting to take effect",
+            target.agent_name()
+        ),
         (
             PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Applied,
-        ) => format!("Guidance applied by {}", target.agent_name()),
+        ) => format!("Message added for {}", target.agent_name()),
         (
             PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Returned,
-        ) => format!("Guidance returned by {}", target.agent_name()),
+        ) => format!("Message returned from {}", target.agent_name()),
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
-            "Sending guidance · awaiting server acceptance".to_string()
+            "Waiting for the current task to receive your message".to_string()
         }
         (
             PendingUserIntentTarget::ActiveRun,
             astra_turn_types::UserIntentStatus::AcceptedRemote,
         ) => match task_status {
             TaskStatus::ToolExecuting { .. } => {
-                "Guidance accepted · before next unstarted action · Ctrl+C requests stop (cooperative)"
-                    .to_string()
+                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
             TaskStatus::WaitingApproval { .. } => {
-                "Guidance accepted by run · superseding the pending approval · Ctrl+C requests stop"
-                    .to_string()
+                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
             TaskStatus::WaitingModel => {
-                "Guidance accepted by run · applying at the next model boundary · Ctrl+C requests stop"
-                    .to_string()
+                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
-            TaskStatus::Cancelling => {
-                "Stopping current run · guidance returns to composer".to_string()
-            }
+            TaskStatus::Cancelling => "Stopping · unused messages return to your input".to_string(),
             TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
-            TaskStatus::Idle => {
-                "Guidance delivery is being reconciled with the finished run".to_string()
-            }
+            TaskStatus::Idle => "Checking whether your message was used".to_string(),
             TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
-                "Guidance accepted by run · applying at the next action boundary · Ctrl+C requests stop"
-                    .to_string()
+                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
         },
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Applied) => {
-            "Guidance applied to current run".to_string()
+            "Message added to the conversation".to_string()
         }
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Returned) => {
-            "Guidance returned to composer".to_string()
+            "Message returned to your input".to_string()
         }
     }
 }
@@ -302,6 +424,8 @@ impl BottomPane {
             file_provider: None,
             approval_queue: ApprovalQueue::new(),
             pending_user_intents: std::collections::VecDeque::new(),
+            session_attachment: None,
+            active_root_scope: None,
             queued_next_turn_submissions: std::collections::VecDeque::new(),
             restored_drafts: std::collections::VecDeque::new(),
             applied_user_intent_ids: std::collections::HashSet::new(),
@@ -315,6 +439,85 @@ impl BottomPane {
 
     pub fn set_skill_items(&mut self, items: Vec<skill_popup::SkillItem>) {
         self.skill_items = items;
+    }
+
+    pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    pub(crate) fn set_root_intent_scope(&mut self, scope: Arc<RootIntentScope>) {
+        self.active_root_scope = Some(scope);
+    }
+
+    fn intent_is_visible(&self, intent: &PendingUserIntent) -> bool {
+        match &intent.target {
+            PendingUserIntentTarget::ActiveRun => intent.root_scope.as_ref().is_none_or(|scope| {
+                self.session_attachment
+                    .as_ref()
+                    .is_some_and(|(session_id, epoch)| {
+                        scope.visible_in(session_id.as_deref(), *epoch)
+                            || (intent.status == astra_turn_types::UserIntentStatus::Returned
+                                && scope.returned_unbound_visible_in(session_id.as_deref()))
+                    })
+            }),
+            PendingUserIntentTarget::AgentRun { target } => self
+                .session_attachment
+                .as_ref()
+                .is_some_and(|(session_id, epoch)| {
+                    target.can_view_draft(session_id.as_deref(), *epoch)
+                }),
+        }
+    }
+
+    fn visible_pending_intents(&self) -> impl Iterator<Item = &PendingUserIntent> {
+        self.pending_user_intents
+            .iter()
+            .filter(|intent| self.intent_is_visible(intent))
+    }
+
+    pub(crate) fn next_recoverable_guidance(&self, after: &str) -> Option<PendingUserIntent> {
+        let candidates: Vec<_> = self
+            .visible_pending_intents()
+            .filter(|intent| match &intent.target {
+                PendingUserIntentTarget::ActiveRun => {
+                    intent.custody == PendingUserIntentCustody::Unconfirmed
+                }
+                PendingUserIntentTarget::AgentRun { .. } => {
+                    intent.custody == PendingUserIntentCustody::Unconfirmed
+                        || intent.status == astra_turn_types::UserIntentStatus::Returned
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let next = candidates
+            .iter()
+            .position(|intent| intent.intent_id == after)
+            .map_or(0, |index| (index + 1) % candidates.len());
+        Some(candidates[next].clone())
+    }
+
+    pub(crate) fn activate_recoverable_guidance(&mut self, intent: &PendingUserIntent) -> bool {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.is_recoverable_guidance(intent))
+        else {
+            return false;
+        };
+        let view = self.view_stack.remove(index);
+        self.view_stack.push(view);
+        true
+    }
+
+    fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
+        self.queued_next_turn_submissions
+            .iter()
+            .filter(|entry| match entry {
+                NextTurnSubmission::Guidance(intent) => self.intent_is_visible(intent),
+                _ => true,
+            })
     }
 
     /// Inject the slash-command catalog used by the inline menu.
@@ -396,6 +599,7 @@ impl BottomPane {
     }
 
     /// Project an intent that was accepted by the active run's control plane.
+    #[cfg(test)]
     pub fn accept_user_intent(
         &mut self,
         intent_id: impl Into<String>,
@@ -410,6 +614,7 @@ impl BottomPane {
     /// Admit an active-run guidance intent and retain the precise local
     /// rejection reason for the event loop. The bool API above remains the
     /// compact projection used by existing callers and tests.
+    #[cfg(test)]
     pub(crate) fn try_accept_user_intent(
         &mut self,
         intent_id: impl Into<String>,
@@ -421,8 +626,42 @@ impl BottomPane {
             intent_id.into(),
             delivery,
             status,
-            text.into(),
+            (text.into(), None),
             PendingUserIntentTarget::ActiveRun,
+            None,
+        )
+    }
+
+    pub(crate) fn accept_turn_user_intent(
+        &mut self,
+        turn_id: &str,
+        intent_id: String,
+        text: String,
+    ) -> Result<(), UserIntentRejectReason> {
+        self.accept_user_intent_for_target(
+            intent_id,
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedLocal,
+            (text, None),
+            PendingUserIntentTarget::ActiveRun,
+            Some(turn_id.to_owned()),
+        )
+    }
+
+    pub(crate) fn accept_turn_plan_intent(
+        &mut self,
+        turn_id: &str,
+        intent_id: String,
+        command: String,
+        wire_text: String,
+    ) -> Result<(), UserIntentRejectReason> {
+        self.accept_user_intent_for_target(
+            intent_id,
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedLocal,
+            (command, Some(wire_text)),
+            PendingUserIntentTarget::ActiveRun,
+            Some(turn_id.to_owned()),
         )
     }
 
@@ -436,10 +675,45 @@ impl BottomPane {
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-            text,
+            (text, None),
             PendingUserIntentTarget::AgentRun { target },
+            None,
         )
         .is_ok()
+    }
+
+    pub(crate) fn agent_delivery_barrier(
+        &self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        acknowledged_unknown: &[String],
+    ) -> Option<AgentDeliveryBarrier> {
+        let acknowledged = acknowledged_unknown
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let mut unknown = Vec::new();
+        for intent in &self.pending_user_intents {
+            let PendingUserIntentTarget::AgentRun { target: previous } = &intent.target else {
+                continue;
+            };
+            if !previous.same_recipient(target) {
+                continue;
+            }
+            match (intent.custody, intent.status) {
+                (PendingUserIntentCustody::Client, _) => {
+                    return Some(AgentDeliveryBarrier::Sending);
+                }
+                (
+                    PendingUserIntentCustody::Unconfirmed,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                ) => unknown.push(intent.intent_id.clone()),
+                _ => {}
+            }
+        }
+        unknown
+            .iter()
+            .any(|id| !acknowledged.contains(id.as_str()))
+            .then_some(AgentDeliveryBarrier::Unconfirmed(unknown))
     }
 
     fn accept_user_intent_for_target(
@@ -447,9 +721,24 @@ impl BottomPane {
         intent_id: String,
         delivery: astra_turn_types::UserIntentDelivery,
         status: astra_turn_types::UserIntentStatus,
-        text: String,
+        text: (String, Option<String>),
         target: PendingUserIntentTarget,
+        turn_id: Option<String>,
     ) -> Result<(), UserIntentRejectReason> {
+        const MAX_PENDING_INTENTS: usize = 64;
+        const MAX_PENDING_BYTES: usize = 1024 * 1024;
+        let (text, wire_text) = text;
+        let counts_toward_limit = |intent: &&PendingUserIntent| match &target {
+            PendingUserIntentTarget::ActiveRun => {
+                matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                    && match (&self.active_root_scope, &intent.root_scope) {
+                        (Some(current), Some(previous)) => current.same_session(previous),
+                        _ => intent.custody == PendingUserIntentCustody::Client,
+                    }
+            }
+            PendingUserIntentTarget::AgentRun { target } => matches!(&intent.target,
+                PendingUserIntentTarget::AgentRun { target: owner } if owner.same_session(target)),
+        };
         let rejection = if intent_id.trim().is_empty() {
             Some(UserIntentRejectReason::EmptyIntentId)
         } else if text.trim().is_empty() {
@@ -467,18 +756,42 @@ impl BottomPane {
                 .any(|pending| pending.intent_id == intent_id)
         {
             Some(UserIntentRejectReason::IdentityAlreadyKnown)
+        } else if self
+            .pending_user_intents
+            .iter()
+            .filter(counts_toward_limit)
+            .count()
+            >= MAX_PENDING_INTENTS
+            || self
+                .pending_user_intents
+                .iter()
+                .filter(counts_toward_limit)
+                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+                .saturating_add(text.len())
+                .saturating_add(wire_text.as_ref().map_or(0, String::len))
+                > MAX_PENDING_BYTES
+        {
+            Some(UserIntentRejectReason::QueueFull)
         } else {
             None
         };
         if let Some(reason) = rejection {
             return Err(reason);
         }
+        let root_scope = matches!(target, PendingUserIntentTarget::ActiveRun)
+            .then(|| self.active_root_scope.clone())
+            .flatten();
         self.pending_user_intents.push_back(PendingUserIntent {
             intent_id,
             delivery,
             status,
             text,
+            wire_text,
             target,
+            turn_id,
+            next_turn_position: self.queued_next_turn_submissions.len(),
+            root_scope,
             custody: if status == astra_turn_types::UserIntentStatus::AcceptedRemote {
                 PendingUserIntentCustody::Run
             } else {
@@ -488,10 +801,41 @@ impl BottomPane {
         Ok(())
     }
 
+    /// Select only an unsent entry belonging to this physical turn. Older
+    /// unconfirmed entries remain visible without blocking a new turn.
+    pub(crate) fn next_unsent_guidance(&self, turn_id: &str) -> Option<&PendingUserIntent> {
+        for intent in &self.pending_user_intents {
+            if intent.turn_id.as_deref() != Some(turn_id)
+                || !matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+            {
+                continue;
+            }
+            match intent.custody {
+                PendingUserIntentCustody::Unconfirmed => return None,
+                PendingUserIntentCustody::Client => return Some(intent),
+                PendingUserIntentCustody::Run => {}
+            }
+        }
+        None
+    }
+
+    pub(crate) fn accepted_turn_guidance(&self, turn_id: &str) -> Vec<PendingUserIntent> {
+        self.pending_user_intents
+            .iter()
+            .filter(|intent| {
+                intent.turn_id.as_deref() == Some(turn_id)
+                    && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                    && intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn promote_agent_guide_accepted(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
                 && matches!(intent.target, PendingUserIntentTarget::AgentRun { .. })
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
         }) else {
             return false;
         };
@@ -500,13 +844,26 @@ impl BottomPane {
         true
     }
 
-    /// Stop detached observation without changing the run's delivery custody.
-    pub(crate) fn retire_detached_agent_observations(&self, session_id: Option<&str>, epoch: u64) {
-        for intent in &self.pending_user_intents {
+    /// Stop detached observation; an in-flight submission remains uncertain.
+    pub(crate) fn retire_detached_agent_observations(
+        &mut self,
+        session_id: Option<&str>,
+        epoch: u64,
+    ) {
+        self.set_session_attachment(session_id, epoch);
+        for intent in &mut self.pending_user_intents {
             if let PendingUserIntentTarget::AgentRun { target } = &intent.target
                 && !target.is_attached(session_id, epoch)
             {
                 target.retire_observation();
+                if intent.status != astra_turn_types::UserIntentStatus::Returned
+                    && matches!(
+                        intent.custody,
+                        PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
+                    )
+                {
+                    intent.custody = PendingUserIntentCustody::Unconfirmed;
+                }
             }
         }
     }
@@ -515,6 +872,7 @@ impl BottomPane {
     pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(
                     intent.custody,
                     PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
@@ -545,6 +903,10 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn user_intent_is_resolved(&self, intent_id: &str) -> bool {
+        self.applied_user_intent_ids.contains(intent_id)
+    }
+
     /// Remove a locally-owned active-run intent after a definitive rejection.
     /// Ambiguous transport failures deliberately do not use this path: the
     /// run may already own the idempotent intent.
@@ -568,6 +930,7 @@ impl BottomPane {
     ) -> Option<PendingUserIntent> {
         let index = self.pending_user_intents.iter().position(|intent| {
             intent.intent_id == intent_id
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target,
                     PendingUserIntentTarget::AgentRun { target }
                         if target.is_attached(session_id, attachment_epoch)
@@ -575,6 +938,150 @@ impl BottomPane {
                 )
         })?;
         self.pending_user_intents.remove(index)
+    }
+
+    /// Settle only the exact attached child receipt named by the live event.
+    pub(crate) fn settle_agent_guide_signal(
+        &mut self,
+        intent_id: &str,
+        run_id: &str,
+        epoch: u64,
+        returned: bool,
+    ) -> Option<crate::tui::event_loop::AgentGuideTarget> {
+        let (session, attached_epoch) = self.session_attachment.as_ref()?;
+        if *attached_epoch != epoch {
+            return None;
+        }
+        let index = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                    if target.is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
+        })?;
+        let intent = self.pending_user_intents.get_mut(index)?;
+        let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
+            return None;
+        };
+        let target = target.clone();
+        target.retire_observation();
+        if returned {
+            intent.status = astra_turn_types::UserIntentStatus::Returned;
+            intent.custody = PendingUserIntentCustody::Run;
+        } else {
+            self.pending_user_intents.remove(index);
+        }
+        Some(target)
+    }
+
+    pub(crate) fn resolve_agent_guide_view(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        status: astra_turn_types::UserIntentStatus,
+    ) {
+        for view in &mut self.view_stack {
+            view.resolve_agent_guide(target, intent_id, status);
+        }
+    }
+
+    pub(crate) fn refresh_agent_guide_recipient(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        recipient: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        for view in &mut self.view_stack {
+            view.refresh_agent_guide_recipient(target, intent_id, recipient);
+        }
+    }
+
+    pub(crate) fn remove_detached_agent_guide(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) -> bool {
+        let Some(index) = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) else {
+            return false;
+        };
+        self.pending_user_intents.remove(index);
+        true
+    }
+
+    pub(crate) fn mark_agent_guide_returned(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) -> bool {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) else {
+            return false;
+        };
+        if intent.status == astra_turn_types::UserIntentStatus::Returned {
+            return false;
+        }
+        intent.status = astra_turn_types::UserIntentStatus::Returned;
+        intent.custody = PendingUserIntentCustody::Run;
+        true
+    }
+
+    pub(crate) fn mark_agent_guide_rejected(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) -> bool {
+        if !self.pending_user_intents.iter().any(|intent| {
+            intent.intent_id == intent_id
+                && intent.status == astra_turn_types::UserIntentStatus::AcceptedLocal
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) {
+            return false;
+        }
+        self.mark_agent_guide_returned(intent_id, target)
+    }
+
+    pub(crate) fn returned_agent_guide(
+        &self,
+        session_id: Option<&str>,
+        attachment_epoch: u64,
+        intent_id: Option<&str>,
+    ) -> Option<&PendingUserIntent> {
+        self.pending_user_intents.iter().find(|intent| {
+            (intent.status == astra_turn_types::UserIntentStatus::Returned
+                || intent.custody == PendingUserIntentCustody::Unconfirmed)
+                && intent_id.is_none_or(|id| id == intent.intent_id)
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                    if target.can_view_draft(session_id, attachment_epoch))
+        })
+    }
+
+    pub(crate) fn take_returned_agent_guide(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        session_id: Option<&str>,
+        attachment_epoch: u64,
+    ) -> Option<PendingUserIntent> {
+        let index = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && (intent.status == astra_turn_types::UserIntentStatus::Returned
+                    || intent.custody == PendingUserIntentCustody::Unconfirmed)
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target) && owner.can_view_draft(session_id, attachment_epoch))
+        })?;
+        self.pending_user_intents.remove(index)
+    }
+
+    pub(crate) fn restore_returned_agent_guide(&mut self, intent: PendingUserIntent) {
+        self.pending_user_intents.push_back(intent);
     }
 
     /// Resolve an applied runtime intent by stable identity. Unknown IDs can
@@ -622,9 +1129,157 @@ impl BottomPane {
             delivery,
             status,
             text: runtime_content.to_string(),
+            wire_text: None,
             target,
+            turn_id: None,
+            next_turn_position: 0,
             custody: PendingUserIntentCustody::Run,
+            root_scope: None,
         })
+    }
+
+    /// A late disposition must not be reduced into a different physical turn.
+    pub(crate) fn user_intent_belongs_to_other_turn(&self, intent_id: &str, turn_id: &str) -> bool {
+        self.pending_user_intents.iter().any(|intent| {
+            intent.intent_id == intent_id
+                && intent
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != turn_id)
+        })
+    }
+
+    pub(crate) fn root_intent_is_visible(&self, intent_id: &str) -> bool {
+        self.visible_pending_intents().any(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.root_scope.as_ref().is_none_or(|scope| {
+                    self.session_attachment
+                        .as_ref()
+                        .is_some_and(|(session_id, epoch)| {
+                            scope.attached_in(session_id.as_deref(), *epoch)
+                        })
+                })
+        })
+    }
+
+    /// Settle an old owner's disposition without projecting it into the
+    /// currently attached conversation. A returned message stays recoverable.
+    pub(crate) fn settle_detached_root_intent(&mut self, intent_id: &str, returned: bool) -> bool {
+        let Some(index) = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.root_scope.as_ref().is_some_and(|scope| {
+                    !self
+                        .session_attachment
+                        .as_ref()
+                        .is_some_and(|(session_id, epoch)| {
+                            scope.attached_in(session_id.as_deref(), *epoch)
+                        })
+                })
+        }) else {
+            return false;
+        };
+        if returned {
+            self.pending_user_intents[index].status = astra_turn_types::UserIntentStatus::Returned;
+            self.pending_user_intents[index].custody = PendingUserIntentCustody::Run;
+        } else {
+            self.pending_user_intents.remove(index);
+            self.applied_user_intent_ids.insert(intent_id.to_owned());
+        }
+        true
+    }
+
+    pub(crate) fn retain_unsent_detached_turn(&mut self, turn_id: &str) {
+        for intent in &mut self.pending_user_intents {
+            if intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+            {
+                intent.status = astra_turn_types::UserIntentStatus::Returned;
+                intent.custody = PendingUserIntentCustody::Run;
+            }
+        }
+    }
+
+    pub(crate) fn retain_unsent_detached_plan(&mut self, intent_id: &str) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+        }) {
+            intent.status = astra_turn_types::UserIntentStatus::Returned;
+            intent.custody = PendingUserIntentCustody::Run;
+        }
+    }
+
+    pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
+        let Some(id) = self
+            .visible_pending_intents()
+            .find(|intent| {
+                matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                    && intent.status == astra_turn_types::UserIntentStatus::Returned
+            })
+            .map(|intent| intent.intent_id.clone())
+        else {
+            return false;
+        };
+        let Some(index) = self
+            .pending_user_intents
+            .iter()
+            .position(|intent| intent.intent_id == id)
+        else {
+            return false;
+        };
+        let Some(intent) = self.pending_user_intents.remove(index) else {
+            return false;
+        };
+        self.start_composer_draft(&intent.composer_text());
+        true
+    }
+
+    pub(crate) fn unconfirmed_root_guidance(
+        &self,
+        intent_id: Option<&str>,
+    ) -> Option<&PendingUserIntent> {
+        self.visible_pending_intents().find(|intent| {
+            matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+                && intent_id.is_none_or(|id| intent.intent_id == id)
+        })
+    }
+
+    pub(crate) fn can_restore_root_guidance(&self, intent: &PendingUserIntent) -> bool {
+        intent.root_scope.as_ref().is_none_or(|scope| {
+            scope.owner.is_current()
+                && self
+                    .session_attachment
+                    .as_ref()
+                    .is_some_and(|(session_id, epoch)| {
+                        scope.visible_in(session_id.as_deref(), *epoch)
+                    })
+        })
+    }
+
+    pub(crate) fn retain_returned_root_guidance(&mut self, mut intent: PendingUserIntent) {
+        intent.status = astra_turn_types::UserIntentStatus::Returned;
+        intent.custody = PendingUserIntentCustody::Run;
+        self.pending_user_intents.push_back(intent);
+    }
+
+    pub(crate) fn dismiss_unconfirmed_root_guidance(&mut self, intent_id: &str) -> bool {
+        if self.unconfirmed_root_guidance(Some(intent_id)).is_none() {
+            return false;
+        }
+        let Some(index) = self
+            .pending_user_intents
+            .iter()
+            .position(|intent| intent.intent_id == intent_id)
+        else {
+            return false;
+        };
+        self.pending_user_intents.remove(index);
+        true
     }
 
     /// Consume a durable ownership return. Only the client that still owns a
@@ -648,11 +1303,23 @@ impl BottomPane {
         }) else {
             return false;
         };
-        self.pending_user_intents.remove(index);
+        if self.pending_user_intents[index].root_scope.is_some() {
+            self.pending_user_intents[index].status = astra_turn_types::UserIntentStatus::Returned;
+            self.pending_user_intents[index].custody = PendingUserIntentCustody::Run;
+            self.applied_user_intent_ids.insert(intent_id.to_string());
+            return true;
+        }
+        let intent = self
+            .pending_user_intents
+            .remove(index)
+            .expect("matched intent");
         self.applied_user_intent_ids.insert(intent_id.to_string());
-        self.restore_into_composer(&super::slash_dispatch::conversation_for_composer(
-            runtime_content,
-        ));
+        let restored = if intent.wire_text.is_some() {
+            std::borrow::Cow::Borrowed(intent.text.as_str())
+        } else {
+            super::slash_dispatch::conversation_for_composer(runtime_content)
+        };
+        self.restore_into_composer(&restored);
         true
     }
 
@@ -722,17 +1389,36 @@ impl BottomPane {
     /// An `AcceptedRemote` acknowledgement transfers delivery ownership to the
     /// server; replaying it as a new turn merely because the local `Applied`
     /// projection raced with run settlement violates exactly-once user intent.
-    pub fn take_client_recoverable_user_intents(&mut self) -> Vec<PendingUserIntent> {
-        self.applied_user_intent_ids.clear();
+    fn take_client_recoverable_for_turn(
+        &mut self,
+        turn_id: Option<&str>,
+    ) -> Vec<PendingUserIntent> {
         let mut locally_owned = Vec::new();
         let mut retained = std::collections::VecDeque::new();
-        while let Some(intent) = self.pending_user_intents.pop_front() {
+        while let Some(mut intent) = self.pending_user_intents.pop_front() {
+            let visible_here = intent.root_scope.as_ref().is_none_or(|scope| {
+                self.session_attachment
+                    .as_ref()
+                    .is_some_and(|(session_id, epoch)| {
+                        scope.attached_in(session_id.as_deref(), *epoch)
+                    })
+            });
             match (&intent.target, intent.custody, intent.status) {
                 (
                     PendingUserIntentTarget::ActiveRun,
                     PendingUserIntentCustody::Client,
                     astra_turn_types::UserIntentStatus::AcceptedLocal,
-                ) => locally_owned.push(intent),
+                ) if intent.turn_id.as_deref() == turn_id => {
+                    if visible_here {
+                        locally_owned.push(intent);
+                    } else {
+                        // Settlement has already resolved any in-flight POST;
+                        // only definitely unsent local messages reach here.
+                        intent.status = astra_turn_types::UserIntentStatus::Returned;
+                        intent.custody = PendingUserIntentCustody::Run;
+                        retained.push_back(intent);
+                    }
+                }
                 (
                     PendingUserIntentTarget::ActiveRun,
                     PendingUserIntentCustody::Run | PendingUserIntentCustody::Unconfirmed,
@@ -758,7 +1444,7 @@ impl BottomPane {
                     PendingUserIntentTarget::ActiveRun,
                     _,
                     astra_turn_types::UserIntentStatus::Returned,
-                ) => {}
+                ) => retained.push_back(intent),
                 (PendingUserIntentTarget::AgentRun { .. }, _, _) => retained.push_back(intent),
                 // Construction rejects every other status/custody pairing.
                 (PendingUserIntentTarget::ActiveRun, _, _) => retained.push_back(intent),
@@ -766,6 +1452,21 @@ impl BottomPane {
         }
         self.pending_user_intents = retained;
         locally_owned
+    }
+
+    pub(crate) fn finish_turn_user_intents(&mut self, turn_id: &str) -> Vec<PendingUserIntent> {
+        self.applied_user_intent_ids.clear();
+        self.take_client_recoverable_for_turn(Some(turn_id))
+    }
+
+    pub(crate) fn take_unsent_turn_guidance(&mut self, turn_id: &str) -> Vec<PendingUserIntent> {
+        self.take_client_recoverable_for_turn(Some(turn_id))
+    }
+
+    #[cfg(test)]
+    pub fn take_client_recoverable_user_intents(&mut self) -> Vec<PendingUserIntent> {
+        self.applied_user_intent_ids.clear();
+        self.take_client_recoverable_for_turn(None)
     }
 
     /// Accept a message for the next safe conversational turn. The event loop
@@ -799,13 +1500,25 @@ impl BottomPane {
 
     /// Insert at the position this text had when the user submitted it.
     /// Entries queued later stay behind it. An index past the end appends.
-    pub(crate) fn insert_next_turn_submission(&mut self, index: usize, text: String) -> bool {
-        if text.trim().is_empty() {
+    pub(crate) fn insert_next_turn_guidance(
+        &mut self,
+        index: usize,
+        intent: PendingUserIntent,
+    ) -> bool {
+        if intent.text.trim().is_empty() {
             return false;
         }
         let index = index.min(self.queued_next_turn_submissions.len());
         self.queued_next_turn_submissions
-            .insert(index, NextTurnSubmission::Interactive(text));
+            .insert(index, NextTurnSubmission::Guidance(intent));
+        for intent in &mut self.pending_user_intents {
+            if matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+                && intent.next_turn_position >= index
+            {
+                intent.next_turn_position += 1;
+            }
+        }
         true
     }
 
@@ -826,10 +1539,9 @@ impl BottomPane {
     }
 
     fn has_pending_composer_queue(&self) -> bool {
-        self.pending_user_intents
-            .iter()
+        self.visible_pending_intents()
             .any(|intent| matches!(intent.target, PendingUserIntentTarget::ActiveRun))
-            || !self.queued_next_turn_submissions.is_empty()
+            || self.visible_next_turn_submissions().next().is_some()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -1063,6 +1775,22 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_agent_live_event(event);
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
+        }
+        refreshed
+    }
+
+    pub(crate) fn refresh_agent_live_events(
+        &mut self,
+        events: &[astra_turn_core::agent_live_event::AgentLiveEvent],
+    ) -> bool {
+        let mut refreshed = false;
+        for view in self.view_stack.iter_mut().rev() {
+            refreshed |= view.refresh_agent_live_events(events);
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -1870,6 +2598,28 @@ impl BottomPane {
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }
+        if key.code == KeyCode::Char('u') && key.modifiers == KeyModifiers::ALT {
+            if self.visible_pending_intents().any(|intent| {
+                intent.status == astra_turn_types::UserIntentStatus::Returned
+                    && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+            }) {
+                return BottomPaneAction::ViewAction(
+                    BottomPaneViewAction::RecoverReturnedRootGuidance,
+                );
+            }
+            if self.unconfirmed_root_guidance(None).is_some() {
+                return BottomPaneAction::ViewAction(
+                    BottomPaneViewAction::OpenUnconfirmedRootGuidance,
+                );
+            }
+            if self.visible_pending_intents().any(|intent| {
+                (intent.status == astra_turn_types::UserIntentStatus::Returned
+                    || intent.custody == PendingUserIntentCustody::Unconfirmed)
+                    && matches!(intent.target, PendingUserIntentTarget::AgentRun { .. })
+            }) {
+                return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenReturnedAgentGuide);
+            }
+        }
         // A trailing pasted newline belongs to editing, before a popup or
         // approval can interpret Enter. The textarea consumes it atomically.
         if key.code == KeyCode::Enter
@@ -2429,6 +3179,15 @@ impl BottomPane {
         if let Some(notice) = &self.update_notice {
             lines.push(Line::styled(notice.clone(), style));
         }
+        if self.visible_pending_intents().any(|intent| {
+            intent.status == astra_turn_types::UserIntentStatus::Returned
+                || intent.custody == PendingUserIntentCustody::Unconfirmed
+        }) {
+            lines.push(Line::styled(
+                "Message needs attention · Alt+U to view",
+                style,
+            ));
+        }
         if let Some(next) = self.restored_drafts.front() {
             let preview: String = next
                 .chars()
@@ -2463,25 +3222,27 @@ impl BottomPane {
     }
 
     fn user_intent_height(&self) -> u16 {
-        if self.pending_user_intents.is_empty() {
+        let count = self.visible_pending_intents().take(3).count();
+        if count == 0 {
             return 0;
         }
-        let preview_rows = self.pending_user_intents.len().min(2) as u16;
-        let more_row = u16::from(self.pending_user_intents.len() > 2);
+        let preview_rows = count.min(2) as u16;
+        let more_row = u16::from(count > 2);
         1 + preview_rows + more_row
     }
 
     fn next_turn_submission_height(&self) -> u16 {
-        if self.queued_next_turn_submissions.is_empty() {
+        let count = self.visible_next_turn_submissions().take(3).count();
+        if count == 0 {
             return 0;
         }
-        let preview_rows = self.queued_next_turn_submissions.len().min(2) as u16;
-        let more_row = u16::from(self.queued_next_turn_submissions.len() > 2);
+        let preview_rows = count.min(2) as u16;
+        let more_row = u16::from(count > 2);
         1 + preview_rows + more_row
     }
 
     fn render_pending_user_intents(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || self.pending_user_intents.is_empty() {
+        if area.height == 0 {
             return;
         }
         let theme = crate::tui::theme::current();
@@ -2495,8 +3256,15 @@ impl BottomPane {
         }
         let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
 
-        let Some(head) = self.pending_user_intents.front() else {
+        let mut visible = self.visible_pending_intents();
+        let Some(head) = visible.next() else {
             return;
+        };
+        let second = visible.next();
+        let remaining = if second.is_some() && area.height >= 4 {
+            visible.count()
+        } else {
+            0
         };
         let title = if self.interrupt_pending {
             "Stopping · unapplied guidance returns to composer".to_string()
@@ -2529,9 +3297,8 @@ impl BottomPane {
         let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
 
         let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, pending) in self
-            .pending_user_intents
-            .iter()
+        for (idx, pending) in std::iter::once(head)
+            .chain(second)
             .take(preview_rows)
             .take(2)
             .enumerate()
@@ -2541,8 +3308,8 @@ impl BottomPane {
                 "unknown"
             } else {
                 match pending.status {
-                    astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
-                    astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
+                    astra_turn_types::UserIntentStatus::AcceptedLocal => "waiting",
+                    astra_turn_types::UserIntentStatus::AcceptedRemote => "received",
                     astra_turn_types::UserIntentStatus::Applied => "applied",
                     astra_turn_types::UserIntentStatus::Returned => "returned",
                 }
@@ -2561,8 +3328,8 @@ impl BottomPane {
                 buf,
             );
         }
-        if self.pending_user_intents.len() > 2 && area.height >= 4 {
-            let line = format!("  +{} more", self.pending_user_intents.len() - 2);
+        if remaining > 0 {
+            let line = format!("  +{remaining} more");
             Widget::render(
                 Line::from(Span::styled(
                     truncate_display(&line, area.width as usize),
@@ -2575,9 +3342,17 @@ impl BottomPane {
     }
 
     fn render_queued_next_turn_submissions(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || self.queued_next_turn_submissions.is_empty() {
+        if area.height == 0 {
             return;
         }
+        let mut visible = self.visible_next_turn_submissions();
+        let Some(first) = visible.next() else { return };
+        let second = visible.next();
+        let remaining = if second.is_some() && area.height >= 4 {
+            visible.count()
+        } else {
+            0
+        };
         let theme = crate::tui::theme::current();
         let panel = crate::tui::style::queue_panel_style();
         for y in area.y..area.y + area.height {
@@ -2604,9 +3379,8 @@ impl BottomPane {
         let tail_style = panel;
         let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
         let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, text) in self
-            .queued_next_turn_submissions
-            .iter()
+        for (idx, text) in std::iter::once(first)
+            .chain(second)
             .take(preview_rows)
             .take(2)
             .enumerate()
@@ -2624,8 +3398,8 @@ impl BottomPane {
                 buf,
             );
         }
-        if self.queued_next_turn_submissions.len() > 2 && area.height >= 4 {
-            let line = format!("  +{} more", self.queued_next_turn_submissions.len() - 2);
+        if remaining > 0 {
+            let line = format!("  +{remaining} more");
             Widget::render(
                 Line::from(Span::styled(
                     truncate_display(&line, area.width as usize),

@@ -731,11 +731,16 @@ pub enum ChatTurnEdgePending {
     },
 }
 
-/// Hints for the CLI live renderer (no-op when the consumer sets `quiet`).
+/// Validated live presentation and control updates for stream consumers.
 #[derive(Debug)]
 pub enum SseRenderEffect {
     /// A visible advisory, independent of assistant output and terminal status.
     SystemWarning(String),
+    /// Exact root-scoped durable guidance disposition for the live client.
+    GuidanceDisposition {
+        intent: StreamAppliedUserIntent,
+        status: astra_turn_types::UserIntentStatus,
+    },
     StopThinkingSpinner,
     StartThinkingSpinner,
     /// Incremental reasoning chunk for a compact terminal preview (CLI).
@@ -1116,20 +1121,27 @@ fn apply_one_event(
                 accum.transcript_evidence.push(evidence);
             }
         }
-        "user_intent_applied" => {
+        "user_intent_applied" | "user_intent_returned" => {
             let event_run_id = event.get("run_id").and_then(Value::as_str);
             // Descendant control facts may share the physical stream. They
             // must not alter the root conversation reconstructed by the thin
             // client.
-            if event_run_id != accum.root_identity.run_id() {
+            if event_run_id.is_none() || event_run_id != accum.root_identity.run_id() {
                 return;
             }
+            let returned =
+                event.get("type").and_then(Value::as_str) == Some("user_intent_returned");
             let parsed = (|| {
                 let status: astra_turn_types::UserIntentStatus =
                     serde_json::from_value(event.get("status").cloned().ok_or("missing status")?)
                         .map_err(|_| "invalid status")?;
-                if status != astra_turn_types::UserIntentStatus::Applied {
-                    return Err("status was not applied");
+                let expected = if returned {
+                    astra_turn_types::UserIntentStatus::Returned
+                } else {
+                    astra_turn_types::UserIntentStatus::Applied
+                };
+                if status != expected {
+                    return Err("status disagrees with disposition type");
                 }
                 let intent_id = event
                     .get("intent_id")
@@ -1160,6 +1172,12 @@ fn apply_one_event(
                 })
             })();
             match parsed {
+                Ok(intent) if returned => {
+                    effects.push(SseRenderEffect::GuidanceDisposition {
+                        intent,
+                        status: astra_turn_types::UserIntentStatus::Returned,
+                    });
+                }
                 Ok(intent) => {
                     if let Some(existing) = accum
                         .applied_user_intents
@@ -1174,6 +1192,10 @@ fn apply_one_event(
                             ));
                         }
                     } else {
+                        effects.push(SseRenderEffect::GuidanceDisposition {
+                            intent: intent.clone(),
+                            status: astra_turn_types::UserIntentStatus::Applied,
+                        });
                         accum.applied_user_intents.push(intent);
                     }
                 }
@@ -2204,9 +2226,50 @@ fn remote_tool_receipt_failure(
     None
 }
 
-/// Parse one SSE event `block` (may contain multiple `data:` lines), update `accum`, append edge work.
+/// Parse one SSE event, update `accum`, and append edge work.
 pub fn dispatch_chat_turn_sse_event_block(
     block: &str,
+    accum: &mut ChatTurnSseAccum,
+    edge_pending: &mut Vec<ChatTurnEdgePending>,
+) -> Vec<SseRenderEffect> {
+    let mut frames = SseBlankLineUtf8Buf::new();
+    let mut input = block.as_bytes();
+    let mut effects = Vec::new();
+    while !input.is_empty() && !accum.stream_complete {
+        match frames.next_frame(&mut input, None) {
+            Ok(Some(frame)) => effects.extend(dispatch_one_sse_event(&frame, accum, edge_pending)),
+            Ok(None) => break,
+            Err(_) => unreachable!("a Rust string has valid UTF-8"),
+        }
+    }
+    if !accum.stream_complete {
+        let tail = frames.take_buf().expect("a Rust string has valid UTF-8");
+        if !tail.is_empty() {
+            effects.extend(dispatch_one_sse_event(&tail, accum, edge_pending));
+        }
+    }
+    effects
+}
+
+fn dispatch_one_sse_event(
+    block: &str,
+    accum: &mut ChatTurnSseAccum,
+    edge_pending: &mut Vec<ChatTurnEdgePending>,
+) -> Vec<SseRenderEffect> {
+    match crate::sse::data_lines::validated_sse_event(block) {
+        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending),
+        Err(_) => {
+            accum.thinking_active = false;
+            if accum.error_message.is_none() {
+                accum.error_message = Some("Error: invalid JSON in SSE data".to_string());
+            }
+            vec![SseRenderEffect::StopThinkingSpinner]
+        }
+    }
+}
+
+pub(crate) fn dispatch_decoded_sse_event(
+    parsed: &crate::sse::data_lines::SseJsonDrain,
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
 ) -> Vec<SseRenderEffect> {
@@ -2214,31 +2277,18 @@ pub fn dispatch_chat_turn_sse_event_block(
         return Vec::new();
     }
     let mut effects = Vec::new();
-    for line in block.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            if accum.thinking_active {
-                accum.thinking_active = false;
-                effects.push(SseRenderEffect::StopThinkingSpinner);
-            }
-            accum.stream_complete = true;
-            break;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            // Synthetic error: protocol parse error should be visible, not silently ignored.
-            accum.thinking_active = false;
-            effects.push(SseRenderEffect::StopThinkingSpinner);
-            if accum.error_message.is_none() {
-                accum.error_message = Some("Error: invalid JSON in SSE data".to_string());
-            }
-            continue;
-        };
-        apply_one_event(&event, accum, edge_pending, &mut effects);
+    for event in &parsed.events {
+        apply_one_event(event, accum, edge_pending, &mut effects);
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             accum.turn_evaluation = None;
         }
+    }
+    if parsed.stream_finished {
+        if accum.thinking_active {
+            accum.thinking_active = false;
+            effects.push(SseRenderEffect::StopThinkingSpinner);
+        }
+        accum.stream_complete = true;
     }
     effects
 }
@@ -2291,10 +2341,28 @@ impl ChatTurnSseFramer {
         Ok(blocks)
     }
 
-    /// Move an unfinished SSE event to the Edge read-ahead lane. HTTP chunks
-    /// can split a UTF-8 character, so this handoff must preserve raw bytes.
-    pub(crate) fn take_pending_bytes(&mut self) -> Vec<u8> {
-        self.sse.take_pending_bytes()
+    pub(crate) fn next_frame(
+        &mut self,
+        input: &mut &[u8],
+    ) -> Result<Option<String>, astra_core::sse_blocks::SseFrameError> {
+        let block = self.sse.next_frame(input, Some(16 * 1024 * 1024))?;
+        if let Some(block) = &block {
+            self.note_ttft_from_raw_event_text(block);
+        }
+        Ok(block)
+    }
+
+    /// Move the parser, including CRLF and UTF-8 boundary state, between the
+    /// main reader and the Edge read-ahead lane.
+    pub(crate) fn take_framing(&mut self) -> SseBlankLineUtf8Buf {
+        let mut replacement = SseBlankLineUtf8Buf::new();
+        replacement.mark_stream_started();
+        std::mem::replace(&mut self.sse, replacement)
+    }
+
+    pub(crate) fn restore_framing(&mut self, framing: SseBlankLineUtf8Buf) {
+        debug_assert_eq!(self.sse.buffered_bytes(), 0);
+        self.sse = framing;
     }
 
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
@@ -2915,7 +2983,12 @@ mod tests {
                 ",\"tool_call\":{\"id\":\"tc-1\",\"type\":\"function\",\"function\":{\"name\":\"noop\",\"arguments\":\"{}\"}}"
             ),
         );
-        dispatch_chat_turn_sse_event_block(&stream, &mut accum, &mut vec![]);
+        for block in ChatTurnSseFramer::new()
+            .push_bytes(stream.as_bytes())
+            .unwrap()
+        {
+            dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut vec![]);
+        }
 
         assert_eq!(accum.reasoning_signature, "sig_realish_base64");
 
@@ -5900,7 +5973,8 @@ mod tests {
     fn done_marker_stops_current_and_later_event_blocks() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: [DONE]\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
+        let block =
+            "data: [DONE]\n\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         dispatch_chat_turn_sse_event_block(
             "data: {\"type\":\"tool_request\",\"request_id\":\"after-done\",\"tool\":\"bash\",\"args\":{}}\n\n",
@@ -6087,7 +6161,17 @@ mod context_manifest_trace_sse_tests {
             "data: {\"type\":\"user_intent_applied\",\"run_id\":\"child-run\",\"intent_id\":\"child-intent\",\"delivery\":\"guide_current_run\",\"status\":\"applied\",\"event_index\":9,\"content\":\"child\"}\n\n"
         );
 
-        dispatch_chat_turn_sse_event_block(stream, &mut accum, &mut pending);
+        let mut effects = Vec::new();
+        for block in ChatTurnSseFramer::new()
+            .push_bytes(stream.as_bytes())
+            .unwrap()
+        {
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &block,
+                &mut accum,
+                &mut pending,
+            ));
+        }
 
         assert_eq!(
             accum.applied_user_intents,
@@ -6099,6 +6183,37 @@ mod context_manifest_trace_sse_tests {
             }]
         );
         assert!(accum.error_kind.is_none());
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SseRenderEffect::GuidanceDisposition { .. }))
+                .count(),
+            1,
+            "a replay or a child must not cause a second live disposition"
+        );
+    }
+
+    #[test]
+    fn guidance_dispositions_require_bound_root_and_matching_status() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let applied = r#"data: {"type":"user_intent_applied","intent_id":"x","delivery":"guide_current_run","status":"applied","event_index":1,"content":"hi"}
+
+"#;
+        assert!(dispatch_chat_turn_sse_event_block(applied, &mut accum, &mut pending).is_empty());
+        assert!(accum.applied_user_intents.is_empty());
+        let returned = concat!(
+            "data: {\"type\":\"run_started\",\"run_id\":\"root\"}\n\n",
+            "data: {\"type\":\"user_intent_returned\",\"run_id\":\"root\",\"intent_id\":\"x\",\"delivery\":\"guide_current_run\",\"status\":\"returned\",\"event_index\":1,\"content\":\"hi\"}\n\n",
+        );
+        let effects = dispatch_chat_turn_sse_event_block(returned, &mut accum, &mut pending);
+        assert!(
+            matches!(effects.as_slice(), [SseRenderEffect::GuidanceDisposition { intent, status: astra_turn_types::UserIntentStatus::Returned }] if intent.intent_id == "x")
+        );
+        assert!(accum.applied_user_intents.is_empty());
+        let malformed = "data: {\"type\":\"user_intent_applied\",\"run_id\":\"root\",\"intent_id\":\"x\",\"delivery\":\"guide_current_run\",\"status\":\"returned\",\"event_index\":1,\"content\":\"hi\"}\n\n";
+        assert!(dispatch_chat_turn_sse_event_block(malformed, &mut accum, &mut pending).is_empty());
+        assert!(accum.error_kind.is_some());
     }
 
     #[test]

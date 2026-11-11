@@ -265,6 +265,7 @@ mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: 4,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,

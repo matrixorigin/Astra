@@ -527,8 +527,23 @@ pub fn validate_active_continuations<'a>(
     connection: &str,
     provider_id: impl Fn(&'a Value) -> Option<&'a str>,
 ) -> Result<(), String> {
+    validate_active_continuations_with_foreign(messages, model, connection, provider_id, |_| false)
+}
+
+/// Validate this model's own continuation while allowing a runtime-verified
+/// public group from a different admitted model to remain in the history.
+pub fn validate_active_continuations_with_foreign<'a>(
+    messages: &'a [Value],
+    model: &str,
+    connection: &str,
+    provider_id: impl Fn(&'a Value) -> Option<&'a str>,
+    foreign: impl Fn(&Value) -> bool,
+) -> Result<(), String> {
     for (index, message) in messages.iter().enumerate() {
         if message["role"] != "assistant" {
+            continue;
+        }
+        if foreign(message) {
             continue;
         }
         let has_calls = match message.get("tool_calls") {
@@ -1211,9 +1226,22 @@ impl ResponseAccumulator {
 /// the same event accumulator with the canonical incremental SSE reader.
 pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
     let mut output = ResponseAccumulator::default();
-    let text = text.replace("\r\n", "\n");
-    for block in text.split("\n\n") {
-        observe_sse_block(&mut output, block)?;
+    let mut frames = crate::sse_blocks::SseBlankLineUtf8Buf::new();
+    let mut input = text.as_bytes();
+    while let Some(block) = frames
+        .next_frame(&mut input, None)
+        .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE framing"))?
+    {
+        observe_sse_block(&mut output, &block)?;
+        if output.completed() {
+            return output.finish();
+        }
+    }
+    if let Some(tail) = frames
+        .finish()
+        .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE framing"))?
+    {
+        observe_sse_block(&mut output, &tail)?;
     }
     output.finish()
 }
@@ -1223,13 +1251,16 @@ pub fn observe_sse_block(
     output: &mut ResponseAccumulator,
     block: &str,
 ) -> Result<(), ResponsesStreamError> {
-    let data = block
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if data.is_empty() || data == "[DONE]" {
+    let Some(data) = crate::sse_blocks::event_data(block) else {
         return Ok(());
+    };
+    if data.trim().is_empty() {
+        return Ok(());
+    }
+    if data == "[DONE]" {
+        return Err(ResponsesStreamError::Codec(
+            "Responses stream ended without response.completed",
+        ));
     }
     let event = serde_json::from_str(&data)
         .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
@@ -1736,6 +1767,17 @@ mod tests {
             .is_err()
         );
         assert!(decode_sse("data: [DONE]\n\n").is_err());
+        let valid_completion = completion(
+            json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]),
+        );
+        assert!(
+            decode_sse(&format!(
+                "data: [DONE]\n\n{}",
+                sse(std::slice::from_ref(&valid_completion))
+            ))
+            .is_err()
+        );
+        assert!(decode_sse(&format!("data:\n\n{}", sse(&[valid_completion]))).is_ok());
         assert!(
             decode_sse(&sse(&[
                 json!({"type":"response.output_text.delta","delta":"partial"}),
