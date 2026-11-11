@@ -7831,9 +7831,18 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             .unwrap();
         assert!(!created.idempotent_replay);
         assert_eq!(created.record.content, request.content);
+        let mut expected_metadata = payload
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        expected_metadata.insert(
+            "sync_outbox".to_string(),
+            request.metadata.as_ref().unwrap()["sync_outbox"].clone(),
+        );
         assert_eq!(
             created.record.metadata,
-            request.metadata.as_ref().unwrap().clone()
+            serde_json::Value::Object(expected_metadata)
         );
         let replay = service
             .create_event(
