@@ -14,6 +14,7 @@ mod persistence;
 pub(crate) use persistence::server_input_source_event_id;
 mod projection;
 pub(crate) mod run_state;
+mod tool_outcome_cache;
 
 use admission::*;
 use projection::*;
@@ -4096,6 +4097,25 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         offset: usize,
         max_bytes: usize,
     ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
+        let service = self
+            .edge_dispatch_service
+            .as_ref()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        let cache_key = exact.map(|(turn, request)| {
+            [
+                self.user_id.clone(),
+                self.session_id.clone(),
+                child_run_id.to_owned(),
+                turn.to_owned(),
+                request.to_owned(),
+            ]
+        });
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
         // Exact recovery can decode a large retained result. Bound aggregate
         // memory without making normal dispatch or list operations wait.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -4112,10 +4132,13 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         } else {
             None
         };
-        let service = self
-            .edge_dispatch_service
-            .as_ref()
-            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        // Another reader may have filled the immutable view while we waited.
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
         let mut rows = tokio::time::timeout_at(
             deadline,
             service.inspect_run_dispatches(
@@ -4213,51 +4236,26 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                         &canonical.output,
                     )
                     .content;
-                    let projection = match astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+                    let output = astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
                         output,
                         astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES as usize,
-                    ) {
-                        Ok(projection) => projection,
-                        Err(_) => {
-                            observation["result"] = json!({
-                                "status": canonical.status,
-                                "duration_ms": canonical.duration_ms,
-                                "tool_result_fields": metadata,
-                                "metadata_omitted": metadata_size > 512,
-                                "output_status": "unavailable",
-                                "reason": "The validated result's output exceeds the safe display limit."
-                            });
-                            observations.push(observation);
-                            continue;
-                        }
-                    };
-                    if offset > projection.total_bytes() {
-                        return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::InvalidOffset);
-                    }
-                    // Keep each JSON response within the normal tool-output budget.
-                    // Re-read only a bounded durable result on each explicit page request.
-                    // An encoded JSON string needs at least two quote bytes.
-                    // Start at the largest possible fitting ASCII window so a
-                    // 4096-byte request is not immediately halved to 2048.
-                    let mut page_bytes = max_bytes.min(3498);
-                    let (window, end, total, _) = loop {
-                        let page = projection.window(offset, page_bytes);
-                        let encoded = serde_json::to_string(&page.0)
-                            .map_err(|_| "invalid tool result output".to_string())?;
-                        if encoded.len() <= 3500 || page_bytes <= 64 {
-                            break page;
-                        }
-                        page_bytes = (page_bytes / 2).max(64);
-                    };
-                    if end.saturating_sub(window.len()) != offset {
-                        return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::UnsafePageBoundary);
-                    }
+                    ).ok();
                     observation["result"] = json!({
-                        "status": canonical.status, "output": window, "offset": offset,
-                        "next_offset": (end < total).then_some(end), "total_bytes": total,
-                        "duration_ms": canonical.duration_ms, "tool_result_fields": metadata,
-                        "metadata_omitted": metadata_size > 512,
+                        "status": canonical.status, "duration_ms": canonical.duration_ms,
+                        "tool_result_fields": metadata, "metadata_omitted": metadata_size > 512,
                     });
+                    if output.is_none() {
+                        observation["result"]["output_status"] = json!("unavailable");
+                        observation["result"]["reason"] = json!("The validated result's output exceeds the safe display limit.");
+                    }
+                    observation["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    let view = Arc::new(tool_outcome_cache::ToolOutcomeView { observation, output });
+                    let page = view.page(offset, max_bytes)?;
+                    if let Some(key) = cache_key.as_ref() {
+                        tool_outcome_cache::insert(key.clone(), view);
+                    }
+                    observations.push(page);
+                    continue;
                 } else if row.status == "failed"
                     && let Some(receipt) = row.result_json.as_deref().and_then(|body|
                         astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
@@ -4311,8 +4309,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     "turn_chain_id": row["turn_chain_id"], "request_id": row["request_id"]
                 })
             });
-        Ok(json!({"observations": observations, "next_cursor": next,
-            "note": "Dispatch status alone does not establish whether a tool ran or succeeded; read an exact result for a validated executor observation. Missing or expired records remain unknown. Inspection does not execute a tool."}))
+        Ok(tool_outcome_cache::response(observations, next))
     }
 
     fn subscribe_remote_child_wake(

@@ -117,12 +117,14 @@ alone does not prove model delivery or settle an unknown outcome. If a session
 is restored before the terminal result
 was observed, the failure may be shown again with its earlier delivery marked
 as unknown. When the workspace save succeeds, its bounded projection retains
-the identity and facts of unknown outcomes or unconfirmed cleanup across session
-restoration; it does not recreate a process handle or a private capture. The
+unobserved unknown outcomes or unconfirmed cleanup across session restoration;
+it does not recreate a process handle or a private capture. The
 task list describes retained history; a missing task does not establish whether
-it ran or caused effects. Unknown outcomes and cleanup-unconfirmed tasks stay
-retained. Known terminal history is bounded and
-may expire under pressure before an undelivered notification can be restored. A
+it ran or caused effects. Unobserved unknown outcomes stay retained. Once their
+facts reach the model, these records use the same bounded history as ordinary
+results; expiry does not settle their execution or cleanup. Known terminal
+history is bounded and may expire under pressure before an undelivered
+notification can be restored. A
 failed save is reported to the user and may leave older facts on disk.
 Observed output may be reclaimed independently of unresolved facts. The shell
 concurrency limit counts live tasks separately from retained unconfirmed facts.
@@ -130,12 +132,12 @@ The tool ledger distinguishes a delivered unknown outcome from a missing
 response: the former closes delivery accounting without asserting what ran,
 while the latter remains unresolved. A later exact inspection can still provide
 new execution evidence.
-The existing session workspace retains these facts across restart. If their
-bounded per-session limit is reached, starting a new session permits further
-commands but does not resolve prior outcomes. A failed workspace write warns
-the user and is retried on a later submission.
-Output chunks
-do not trigger model calls, and local waits perform no periodic SQL. A restored
+The existing session workspace retains unobserved facts across restart. If their
+bounded per-session limit is reached, inspecting existing results with
+`task_list` and `task_output` releases observation backpressure in the same
+session. Acknowledgement proves delivery, not successful execution or cleanup.
+A failed workspace write warns the user and is retried on a later submission.
+Output chunks do not trigger model calls, and local waits perform no periodic SQL. A restored
 plain-shell projection can expose saved output but cannot recreate a lost
 process handle. Weak process-group cleanup never certifies authoritative
 workspace settlement. These limits are not a claim that one workspace or one

@@ -4302,6 +4302,14 @@ mod edge_callback_insert_tests {
             .admit_and_claim_direct_dispatch(&identity, "edge-a", &payload)
             .await
             .unwrap();
+        // The run ended recently, but its request may have started long ago.
+        // Cleanup must leave the normal authenticated late-result path open.
+        sqlx::query("UPDATE edge_pending_dispatch SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND session_id = ? AND run_id = ?")
+            .bind(&identity.user_id).bind(&session).bind(&run).execute(pool.get()).await.unwrap();
+        dispatch
+            .cleanup_stale(Duration::from_secs(86_400))
+            .await
+            .unwrap();
         let engine = crate::server::run::engine::RunEngine::new(Arc::new(
             astra_services::runs::DatabaseRunStateStore::new(pool.clone()),
         ));

@@ -63,13 +63,16 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         }
         async fn inspect_run_dispatches(
             &self,
-            _: &str,
+            owner: &str,
             _: &str,
             _: &str,
             after: Option<(&str, &str)>,
             exact: Option<(&str, &str)>,
         ) -> Result<Vec<EdgeDispatchObservation>, String> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if owner != "u" {
+                return Err("wrong run owner".into());
+            }
             if exact.is_none() {
                 return Ok((0..17)
                     .map(|index| EdgeDispatchObservation {
@@ -92,7 +95,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             Ok(vec![EdgeDispatchObservation {
                 edge_owner_user_id: "u".into(),
                 turn_chain_id: "turn".into(),
-                request_id: "request".into(),
+                request_id: exact.unwrap().1.into(),
                 edge_agent_id: "edge".into(),
                 status: self.status.into(),
                 tool_name: Some("grep".into()),
@@ -109,7 +112,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     let unique = uuid::Uuid::new_v4().to_string();
     let session = format!("session-{unique}");
     let run = format!("child-{unique}");
-    let output = "outcome π\n".repeat(3_000);
+    let output = "outcome π\n".repeat(100_000);
     let fields = json!({"execution_fact":"unknown", "side_effects_maybe":true, "stage":"callback", "extra":"x".repeat(4096)}).as_object().cloned();
     let body = astra_thin_client::ToolResultRequest::new_with_hash(
         astra_thin_client::ToolResultRequestParts {
@@ -156,12 +159,43 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         }
     }
     assert_eq!(rebuilt, output);
-    assert!(pages > 1);
+    assert!(pages > 300, "exercise a complete MiB-scale result");
     assert_eq!(
         service.reads.load(Ordering::Relaxed),
-        pages,
-        "each explicit page reads the bounded authoritative record"
+        1,
+        "validated immutable output must be read once across pages"
     );
+    let wrong_owner = ServerDurableAgentReconciler {
+        run_engine: reconciler.run_engine.clone(),
+        user_id: "other-owner".into(),
+        session_id: reconciler.session_id.clone(),
+        edge_dispatch_service: Some(service.clone()),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    };
+    assert!(
+        wrong_owner
+            .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.reads.load(Ordering::Relaxed),
+        2,
+        "cache cannot bypass owner validation"
+    );
+
+    assert!(matches!(
+        reconciler
+            .inspect_child_tool_outcomes(
+                &run,
+                None,
+                Some(("turn", "request")),
+                output.len() + 1,
+                4096
+            )
+            .await,
+        Err(crate::orchestration::spawner::ToolOutcomeInspectionError::InvalidOffset)
+    ));
 
     // Long identities still produce a usable cursor within the tool output budget.
     let mut cursor: Option<(String, String)> = None;
@@ -200,7 +234,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             session_id: reconciler.session_id.clone(),
             run_id: run.clone(),
             turn_chain_id: "turn".into(),
-            request_id: "request".into(),
+            request_id: "oversized".into(),
             edge_agent_id: "edge".into(),
             status: "completed".into(),
             output: "x".repeat(65536),
@@ -221,7 +255,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
     let result = oversized_reconciler
-        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "oversized")), 0, 4096)
         .await
         .unwrap();
     let page = &result["observations"][0]["result"];
@@ -243,7 +277,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             session_id: reconciler.session_id.clone(),
             run_id: run.clone(),
             turn_chain_id: "turn".into(),
-            request_id: "request".into(),
+            request_id: "dense".into(),
             edge_agent_id: "edge".into(),
             status: "failed".into(),
             output: "[REDACTED:A] ".repeat(300_000),
@@ -266,7 +300,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
     let dense_page = dense_reconciler
-        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "dense")), 0, 4096)
         .await
         .unwrap();
     let dense_result = &dense_page["observations"][0]["result"];
@@ -299,7 +333,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             session_id: reconciler.session_id.clone(),
             run_id: run.clone(),
             turn_chain_id: "turn".into(),
-            request_id: "request".into(),
+            request_id: "escaped".into(),
             edge_agent_id: "edge".into(),
             status: "completed".into(),
             output: "x".repeat(5000),
@@ -319,7 +353,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
     let escaped_page = escaped_reconciler
-        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "escaped")), 0, 4096)
         .await
         .unwrap();
     assert!(serde_json::to_vec(&escaped_page).unwrap().len() < 6000);
@@ -346,7 +380,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             session_id: reconciler.session_id.clone(),
             run_id: run.clone(),
             turn_chain_id: "turn".into(),
-            request_id: "request".into(),
+            request_id: "protected".into(),
             edge_agent_id: "edge".into(),
             status: "completed".into(),
             output: format!(
@@ -370,7 +404,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
     let protected_output = protected_reconciler
-        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "protected")), 0, 4096)
         .await
         .unwrap()
         .to_string();
@@ -390,7 +424,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     ] {
     let receipt = astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt {
         kind,
-        identity: EdgeDispatchIdentity::new("u", &reconciler.session_id, &run, "turn", "request"),
+        identity: EdgeDispatchIdentity::new("u", &reconciler.session_id, &run, "turn", fact),
         edge_agent_id: "edge".into(),
     };
     let receipt_reconciler = ServerDurableAgentReconciler {
@@ -405,7 +439,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
     let receipt_result = receipt_reconciler
-        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", fact)), 0, 4096)
         .await
         .unwrap();
     let result = &receipt_result["observations"][0]["result"];

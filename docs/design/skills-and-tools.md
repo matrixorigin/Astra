@@ -147,12 +147,22 @@ contract provides `get_result` with `tool_outcomes`: an optional paged list of
 that child's retained dispatches, followed by an exact result read. Discover
 the full contract when the resident schema is in use. The read is on demand,
 bounded to an 8 MiB serialized result, scoped to the parent and does not change
-the child outcome. Each explicit result page reads the bounded retained record;
-normal tool execution and child collection incur no extra inspection query. A missing,
+the child outcome. A Server caches only validated immutable terminal display
+views, keyed by run owner, session, child run, turn and request. The shared
+cache holds at most 1,024 entries and 32 MiB for five minutes, rather than reserving
+memory per connected session. Paging a cached view performs no SQL or repeated
+full-result sanitization. `observed_at` identifies the historical result view;
+it does not assert that the underlying row is still retained. Eviction, expiry,
+restart or routing to another Server falls back to the existing canonical read;
+misses and server receipts are not cached. Normal tool execution and child
+collection incur no extra inspection query. A missing,
 expired, oversized or unavailable result does not establish that execution
 never happened. A relay row expiring before claim is reported as that specific
 dispatch fact; it does not by itself rule out an independently replayed
-delivery path. Local-only execution may have no durable dispatch to inspect.
+delivery path. Cleanup protects dispatches while their run is active and for
+the existing retention interval after the run's last update, so a long-running
+request does not lose its callback window immediately when its run ends.
+Local-only execution may have no durable dispatch to inspect.
 `agent.wait` admits a current-run input wait with an optional bounded timeout.
 The shared loop waits after sibling tools settle, releases execution capacity,
 and applies child results, semantic messages, or user guidance through its

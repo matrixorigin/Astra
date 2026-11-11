@@ -3491,19 +3491,36 @@ async fn handle_agent_get_result_action_inner(
     // reconciliation request. The current parent owner is the read authority;
     // unrelated runs cannot use this retained payload.
     let mut retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
-    let needs_terminal_evidence = retained.as_ref().is_some_and(|child| {
-        matches!(
-            child.status,
-            AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
-        )
-    });
+    let inspecting = args.get("tool_outcomes").is_some();
+    let known_inspection_child = if inspecting {
+        if let Some(child) = &retained {
+            Some(child.run_id.clone())
+        } else {
+            ctx.spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .filter(|child| child.parent_run_id == ctx.run_id)
+                .map(|child| child.run_id)
+        }
+    } else {
+        None
+    };
+    // Inspecting one immutable tool observation does not collect or refresh
+    // the child lifecycle. Existing parent ownership already proves its scope.
+    let needs_terminal_evidence = !inspecting
+        && retained.as_ref().is_some_and(|child| {
+            matches!(
+                child.status,
+                AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
+            )
+        });
     if reconcile_durable {
         let refresh = if needs_terminal_evidence {
             let child = retained.as_ref().expect("known terminal child");
             ctx.spawner
                 .reconcile_durable_agent_runs_for(std::slice::from_ref(&child.run_id))
                 .await
-        } else if retained.is_none() {
+        } else if retained.is_none() && known_inspection_child.is_none() {
             if args.get("tool_outcomes").is_some() {
                 match agent_id
                     .rsplit_once('@')
@@ -3590,7 +3607,9 @@ async fn handle_agent_get_result_action_inner(
         // The parent-owned retained result establishes direct-child identity.
         // If it has not yet been retained, accept only a live state with the
         // exact same parent, never a model-supplied run or session identity.
-        let child = if let Some(child) = retained.as_ref() {
+        let child = if known_inspection_child.is_some() {
+            known_inspection_child
+        } else if let Some(child) = retained.as_ref() {
             Some(child.run_id.clone())
         } else {
             ctx.spawner
@@ -4817,13 +4836,17 @@ pub(crate) mod tests {
         Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
     }
 
-    struct OutcomeInspectionReconciler(std::sync::atomic::AtomicUsize);
+    struct OutcomeInspectionReconciler(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    );
 
     #[async_trait::async_trait]
     impl crate::orchestration::spawner::DurableAgentReconciler for OutcomeInspectionReconciler {
         async fn load_agent_recovery(
             &self,
         ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Vec::new())
         }
 
@@ -4851,6 +4874,7 @@ pub(crate) mod tests {
         let spawner = test_spawner(Arc::new(PendingExecutor));
         let ctx = test_spawn_context(spawner.clone(), Some("test-model"));
         let reconciler = Arc::new(OutcomeInspectionReconciler(
+            std::sync::atomic::AtomicUsize::new(0),
             std::sync::atomic::AtomicUsize::new(0),
         ));
         spawner
@@ -4913,6 +4937,32 @@ pub(crate) mod tests {
         assert_eq!(
             unavailable["tool_outcomes"]["observations"][0]["result"]["status"],
             "unavailable"
+        );
+        ctx.fanout_admission.set_direct_child_for_test(
+            crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: Vec::new(),
+                agent_id: "failed-child".into(),
+                run_id: "failed-run".into(),
+                parent_agent_id: ctx.agent_id.clone(),
+                status: AgentStatus::Failed {
+                    error: "callback lost".into(),
+                    partial_result: String::new(),
+                    finish_reason: None,
+                },
+            },
+        );
+        ctx.fanout_admission.take_completed_direct_children();
+        let refreshes = reconciler.1.load(std::sync::atomic::Ordering::Relaxed);
+        let observed = handle_agent_get_result_action(
+            &json!({"agent_id":"failed-child", "tool_outcomes":{}}),
+            Some(&ctx),
+        )
+        .await;
+        assert!(observed.contains("failed-run"), "{observed}");
+        assert_eq!(
+            reconciler.1.load(std::sync::atomic::Ordering::Relaxed),
+            refreshes,
+            "tool pages must not rehydrate a retained failed child's lifecycle"
         );
         assert_eq!(
             astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire(

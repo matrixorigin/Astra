@@ -1108,13 +1108,31 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
             .is_some()
     );
     run.status = "completed".into();
-    sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
-        .bind(&run.status)
-        .bind(&user)
-        .bind(&run.run_id)
-        .execute(pool.get())
+    sqlx::query(
+        "UPDATE agent_runs SET status = ?, updated_at = NOW(6) WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&run.status)
+    .bind(&user)
+    .bind(&run.run_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    service
+        .cleanup_stale(std::time::Duration::from_secs(86_400))
         .await
         .unwrap();
+    for retained in [&identity, &sse_identity] {
+        assert!(
+            service
+                .wait_result(retained, Some(std::time::Duration::ZERO))
+                .await
+                .unwrap()
+                .is_some(),
+            "recently completed runs retain their old request's results"
+        );
+    }
+    sqlx::query("UPDATE agent_runs SET updated_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run.run_id).execute(pool.get()).await.unwrap();
     service
         .cleanup_stale(std::time::Duration::from_secs(86_400))
         .await

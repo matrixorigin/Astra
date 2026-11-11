@@ -199,6 +199,8 @@ pub struct BackgroundShellTerminalFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundShellTaskProjection {
+    // Delivery/uncertainty facts can also accompany a restored running snapshot.
+    // They do not establish process exit or recreate execution ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_facts: Option<BackgroundShellTerminalFacts>,
     pub id: String,

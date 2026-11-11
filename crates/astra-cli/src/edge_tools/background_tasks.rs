@@ -47,8 +47,9 @@ const SMALL_OUTPUT_SCAN_BYTES: u64 = 512 * 1024;
 static SMALL_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static LARGE_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static OUTPUT_SEARCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-// Preserve uncertain facts without allowing an unbounded session registry.
-const MAX_RETAINED_UNSETTLED_TASKS: usize = 256;
+// Backpressure is recoverable by observing results, never by discarding facts
+// that the model has not received. Observed history uses the normal retention.
+const MAX_UNOBSERVED_UNCERTAIN_TASKS: usize = 256;
 
 fn output_read_slots(bytes: u64) -> &'static tokio::sync::Semaphore {
     if bytes <= SMALL_OUTPUT_SCAN_BYTES {
@@ -847,8 +848,8 @@ impl BackgroundTaskRegistry {
                 >= MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS {
                 return Err("Task output retention is full. Inspect pending results with task_output so their private output can be released, or resolve local output cleanup errors before starting more tasks.".into());
             }
-            if state.unsettled_count() >= MAX_RETAINED_UNSETTLED_TASKS {
-                return Err("This session has too many unconfirmed tasks to retain safely. Start a new session to run more commands; earlier outcomes remain unresolved in this session.".into());
+            if state.tasks.values().filter(|task| task.outcome_unsettled() && task.terminal_unobserved()).count() >= MAX_UNOBSERVED_UNCERTAIN_TASKS {
+                return Err("Unconfirmed task results are awaiting observation. Inspect them with task_list and task_output before starting more commands; observation does not prove their effects or cleanup are resolved.".into());
             }
             let id = format!("bg-shell-{}", uuid::Uuid::new_v4().simple());
             // Launch cancellation remains bound through terminal settlement.
@@ -1058,15 +1059,18 @@ impl BackgroundTaskRegistry {
             facts
         }).or_else(|| handle.restored_terminal_facts.as_ref().and_then(|facts| {
             (facts.outcome_unknown || facts.cleanup_unconfirmed).then(|| {
-                json!({"outcome_certainty": if facts.outcome_unknown { "unknown" } else { "known" },
+                let mut fields = json!({"outcome_certainty": if facts.outcome_unknown { "unknown" } else { "known" },
                     "cleanup_unconfirmed": facts.cleanup_unconfirmed,
                     "error": "This restored task no longer has a live process handle; use retained output if available. Do not assume an unknown outcome or unconfirmed cleanup has resolved."})
-                    .as_object().expect("object literal").clone()
+                    .as_object().expect("object literal").clone();
+                if facts.outcome_unknown {
+                    astra_tools::execution_outcome::insert_unknown_execution_fact(&mut fields);
+                }
+                if facts.cleanup_unconfirmed {
+                    fields.insert("cleanup_authoritative".into(), json!(false));
+                }
+                fields
             })
-        })).or_else(|| (handle.live_control == BgTaskLiveControl::StaleHandle && !status.is_terminal()).then(|| {
-            json!({"execution_fact":"unknown", "side_effects_maybe":true, "cleanup_authoritative":false, "retryable":false,
-                "error":"The prior process is no longer observable; its effects and cleanup are unknown."})
-                .as_object().expect("object literal").clone()
         }));
         let terminal_reason = (handle.live_control == BgTaskLiveControl::StaleHandle && status.is_terminal())
             .then_some(handle.terminal_reason.as_deref())
@@ -1595,7 +1599,8 @@ impl TaskRegistryState {
         self.drain_join_set();
         if let Some(handle) = self.tasks.get_mut(id) {
             let changed = (handle.background || handle.outcome_unsettled())
-                && handle.status().is_terminal()
+                && (handle.status().is_terminal()
+                    || handle.live_control == BgTaskLiveControl::StaleHandle)
                 && handle.terminal_unobserved();
             handle.acknowledge_terminal();
             if changed {
@@ -1748,9 +1753,18 @@ impl TaskRegistryState {
             last_activity: Instant::now(),
             work_revision,
             completion: None,
-            restored_terminal_facts: trust_projection_details
-                .then_some(projection.terminal_facts)
-                .flatten(),
+            restored_terminal_facts: Some(
+                trust_projection_details
+                    .then_some(projection.terminal_facts)
+                    .flatten()
+                    .unwrap_or(
+                        astra_services::session_workspace::BackgroundShellTerminalFacts {
+                            unobserved: true,
+                            outcome_unknown: true,
+                            cleanup_unconfirmed: true,
+                        },
+                    ),
+            ),
             input: None,
             // A persisted path is a read-only reference, never authority to
             // delete a file after the original owner has gone away.
@@ -1953,7 +1967,10 @@ impl TaskRegistryState {
         let mut candidates = self
             .tasks
             .values()
-            .filter(|handle| handle.status().is_terminal() && handle.ended_at_ms.is_some())
+            .filter(|handle| {
+                handle.live_control == BgTaskLiveControl::StaleHandle
+                    || (handle.status().is_terminal() && handle.ended_at_ms.is_some())
+            })
             // Foreground results are not part of the visible background
             // history and should be reclaimed before spending that budget.
             .map(|handle| {
@@ -1986,14 +2003,13 @@ impl TaskRegistryState {
             if unobserved && (!handle.background || handle.outcome_unsettled()) {
                 continue;
             }
-            let unsettled = handle.outcome_unsettled();
             let retain = handle.retain_terminal()
                 && (keep_completed.contains(&id) || keep_failed.contains(&id));
             let force_reclaim = force > 0 && handle.capture.is_some() && !unobserved;
             if retain && retained_bytes <= MAX_RETAINED_OUTPUT_BYTES && !force_reclaim {
                 continue;
             }
-            let Some(mut handle) = self.tasks.remove(&id) else {
+            let Some(handle) = self.tasks.remove(&id) else {
                 continue;
             };
             if let Some(owner) = &handle.capture {
@@ -2015,16 +2031,6 @@ impl TaskRegistryState {
                 remove_cached_output(&handle.stdout_path, &handle.stderr_path);
                 tracing::debug!(task_id = %id, "terminal command output evicted by retention budget");
             }
-            if unsettled {
-                // Keep the existing task identity and facts, but not its
-                // private capture, once the result has been observed.
-                if handle.capture.take().is_some() {
-                    let (stdout, stderr) = handle.published_output_paths().unwrap_or_default();
-                    handle.stdout_path = stdout.into();
-                    handle.stderr_path = stderr.into();
-                }
-                self.tasks.insert(id, handle);
-            }
         }
         // Keep startup and the latest boundary per retained task. Slow/absent views
         // cannot accumulate an unbounded queue of progress observations.
@@ -2043,7 +2049,18 @@ impl TaskRegistryState {
         let mut terminal: Vec<_> = self
             .tasks
             .values()
-            .filter(|h| h.retain_terminal() && matches_status(h.status()))
+            .filter(|h| {
+                h.retain_terminal()
+                    && matches_status(
+                        if h.live_control == BgTaskLiveControl::StaleHandle
+                            && !h.status().is_terminal()
+                        {
+                            BgTaskStatus::Failed
+                        } else {
+                            h.status()
+                        },
+                    )
+            })
             .map(|h| {
                 (
                     h.id.clone(),
@@ -2257,29 +2274,31 @@ impl TaskRegistryState {
                     .as_ref()
                     .and_then(|receiver| receiver.borrow().clone());
                 BackgroundShellTaskProjection {
-                    terminal_facts: handle.status().is_terminal().then(|| {
-                        astra_services::session_workspace::BackgroundShellTerminalFacts {
-                            unobserved: handle.terminal_unobserved(),
-                            outcome_unknown: terminal.as_ref().map_or_else(
-                                || {
-                                    handle
-                                        .restored_terminal_facts
-                                        .as_ref()
-                                        .is_none_or(|facts| facts.outcome_unknown)
-                                },
-                                |terminal| terminal.outcome_unknown(),
-                            ),
-                            cleanup_unconfirmed: terminal.as_ref().map_or_else(
-                                || {
-                                    handle
-                                        .restored_terminal_facts
-                                        .as_ref()
-                                        .is_none_or(|facts| facts.cleanup_unconfirmed)
-                                },
-                                |terminal| terminal.cleanup_unconfirmed(),
-                            ),
-                        }
-                    }),
+                    terminal_facts: (handle.status().is_terminal()
+                        || handle.live_control == BgTaskLiveControl::StaleHandle)
+                        .then(
+                            || astra_services::session_workspace::BackgroundShellTerminalFacts {
+                                unobserved: handle.terminal_unobserved(),
+                                outcome_unknown: terminal.as_ref().map_or_else(
+                                    || {
+                                        handle
+                                            .restored_terminal_facts
+                                            .as_ref()
+                                            .is_none_or(|facts| facts.outcome_unknown)
+                                    },
+                                    |terminal| terminal.outcome_unknown(),
+                                ),
+                                cleanup_unconfirmed: terminal.as_ref().map_or_else(
+                                    || {
+                                        handle
+                                            .restored_terminal_facts
+                                            .as_ref()
+                                            .is_none_or(|facts| facts.cleanup_unconfirmed)
+                                    },
+                                    |terminal| terminal.cleanup_unconfirmed(),
+                                ),
+                            },
+                        ),
                     id: handle.id.clone(),
                     status: handle.status().as_str().to_string(),
                     title: astra_text_utils::credential_redaction::truncate_redacted_output(
@@ -5549,7 +5568,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_preserves_observed_uncertain_task_identity_across_restart() {
+    fn observed_uncertain_history_expires_without_certifying_completion() {
         let tmp = crate::tests::test_temp_dir();
         let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for (id, cleanup_unconfirmed) in [("old-unknown", false), ("old-cleanup", true)] {
@@ -5579,19 +5598,18 @@ mod tests {
             .restore_shell_task_projections(projections)
             .unwrap();
         for id in ["old-unknown", "old-cleanup"] {
-            let task = restored
-                .get(id)
-                .expect("uncertain task identity must survive");
-            assert!(!task.terminal_unobserved());
-            assert!(task.outcome_unsettled());
+            assert!(
+                restored.get(id).is_none(),
+                "observed old history is bounded"
+            );
+            assert!(
+                restored.model_context(id).is_none(),
+                "absence must not invent a successful outcome"
+            );
         }
         assert_eq!(
-            restored.model_context("old-unknown").unwrap()["execution"]["outcome_certainty"],
-            "unknown"
-        );
-        assert_eq!(
-            restored.model_context("old-cleanup").unwrap()["execution"]["cleanup_unconfirmed"],
-            true
+            restored.export_shell_task_projections().len(),
+            MAX_RETAINED_FAILED_TASKS
         );
     }
 
@@ -5623,14 +5641,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(task.wait().await.unwrap().output, "new command");
-        assert!(reg.get("unknown-0").unwrap().outcome_unsettled());
+        assert!(
+            reg.all_tasks()
+                .filter(|task| task.id.starts_with("unknown-"))
+                .all(|task| task.outcome_unsettled())
+        );
     }
 
-    #[test]
-    fn exceptionally_many_unconfirmed_tasks_fail_without_losing_facts() {
+    #[tokio::test]
+    async fn observing_restored_unknown_results_unblocks_same_session() {
         let tmp = crate::tests::test_temp_dir();
         let mut registry = BackgroundTaskRegistry::new(tmp.path().join("tasks"));
-        for index in 0..MAX_RETAINED_UNSETTLED_TASKS {
+        for index in 0..MAX_UNOBSERVED_UNCERTAIN_TASKS {
             registry
                 .restore_shell_task_projection(BackgroundShellTaskProjection {
                     terminal_facts: None,
@@ -5658,18 +5680,56 @@ mod tests {
             .err()
             .expect("bounded retention must refuse further launches");
         assert!(
-            error.contains("Start a new session") && error.contains("remain unresolved"),
+            error.contains("task_output") && error.contains("observation"),
             "{error}"
         );
         assert_eq!(
             registry.export_shell_task_projections().len(),
-            MAX_RETAINED_UNSETTLED_TASKS
+            MAX_UNOBSERVED_UNCERTAIN_TASKS
         );
         assert!(registry.get("old-0").unwrap().outcome_unsettled());
+        let executor = crate::edge_tools::ToolExecutor::new(tmp.path())
+            .with_background_tasks(registry.clone());
+        let observed = executor
+            .execute_with_metadata("task_output", &json!({"task_id":"old-0"}))
+            .await;
+        executor
+            .acknowledge_delivered_task_result("task_output", observed.tool_result_fields.as_ref());
+        assert!(
+            !registry.get("old-0").unwrap().terminal_unobserved(),
+            "{observed:?}"
+        );
+        assert!(registry.get("old-0").unwrap().outcome_unsettled());
+        let mut next = registry
+            .start_shell(
+                "true",
+                (
+                    tmp.path().join("next-out"),
+                    tmp.path().join("next-err"),
+                    None,
+                ),
+                true,
+                false,
+                None,
+                |_, _| async { ToolExecutionOutcome::ok("resumed".into()) },
+            )
+            .unwrap();
+        assert_eq!(next.wait().await.unwrap().output, "resumed");
+        let mut reopened = BackgroundTaskRegistry::new(tmp.path().join("reopened"));
+        reopened
+            .restore_shell_task_projections(registry.export_shell_task_projections())
+            .unwrap();
+        assert!(
+            reopened.get("old-0").is_none(),
+            "observed old history may expire under pressure"
+        );
+        let unobserved = reopened.get("old-1").unwrap();
+        assert!(unobserved.terminal_unobserved());
+        assert!(unobserved.outcome_unsettled());
     }
 
     #[tokio::test]
-    async fn capacity_pressure_keeps_observed_unknown_identity_even_after_cleanup() {
+    async fn observed_unknown_history_does_not_exhaust_session_admission() {
         let tmp = crate::tests::test_temp_dir();
         let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let mut original = registry
@@ -5691,7 +5751,7 @@ mod tests {
             .unwrap();
         original.wait().await.unwrap();
         registry.acknowledge_terminal(&original.id);
-        for index in 0..MAX_RETAINED_UNSETTLED_TASKS - 1 {
+        for index in 0..MAX_UNOBSERVED_UNCERTAIN_TASKS - 1 {
             let (mut task, _dir) = test_handle_with_status(BgTaskStatus::Failed);
             task.id = format!("uncertain-{index}");
             task.live_control = BgTaskLiveControl::StaleHandle;
@@ -5704,7 +5764,7 @@ mod tests {
             );
             registry.with_state(|state| state.tasks.insert(task.id.clone(), task));
         }
-        let error = registry
+        let mut next = registry
             .start_shell(
                 "next",
                 (
@@ -5715,19 +5775,22 @@ mod tests {
                 true,
                 false,
                 None,
-                |_, _| async { ToolExecutionOutcome::ok("unexpected".into()) },
+                |_, _| async { ToolExecutionOutcome::ok("continued".into()) },
             )
-            .err()
-            .expect("bounded history must not erase the unknown result");
-        assert!(error.contains("remain unresolved"), "{error}");
-        assert!(registry.get(&original.id).unwrap().outcome_unsettled());
-        let projections = registry.export_shell_task_projections();
-        assert!(projections.iter().any(|task| task.id == original.id));
-        let mut restored = BackgroundTaskRegistry::new(tmp.path().join("restored-pressure"));
-        restored
-            .restore_shell_task_projections(projections)
             .unwrap();
-        assert!(restored.get(&original.id).unwrap().outcome_unsettled());
+        assert_eq!(next.wait().await.unwrap().output, "continued");
+        registry.acknowledge_terminal(&next.id);
+        registry.prune_retained_terminal_tasks();
+        assert!(
+            registry.export_shell_task_projections().len()
+                <= MAX_RETAINED_FAILED_TASKS + MAX_RETAINED_COMPLETED_TASKS
+        );
+        // Historical uncertainty is never rewritten as successful execution.
+        for task in registry.all_tasks() {
+            if task.id != next.id {
+                assert!(task.outcome_unsettled());
+            }
+        }
     }
 
     #[tokio::test]

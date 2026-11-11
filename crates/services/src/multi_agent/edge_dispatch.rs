@@ -2227,6 +2227,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
 
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
         let secs = older_than.as_secs() as i64;
+        // A long-running request must not lose its callback window as soon as
+        // its run ends. Reuse the run's existing update timestamp, which is
+        // advanced by terminal transitions, rather than adding a cleanup lease.
         let expired_result_json = edge_dispatch_failed_result_json(
             serde_json::Value::Null,
             "edge dispatch expired".to_string(),
@@ -2240,9 +2243,11 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                    WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
-                     AND r.status IN ('running', 'waiting', 'paused'))",
+                     AND (r.status IN ('running', 'waiting', 'paused')
+                          OR r.updated_at > DATE_SUB(NOW(6), INTERVAL ? SECOND)))",
         )
         .bind(expired_result_json)
+        .bind(secs)
         .bind(secs)
         .execute(&self.pool)
         .await
@@ -2266,8 +2271,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                    WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
-                     AND r.status IN ('running', 'waiting', 'paused'))",
+                     AND (r.status IN ('running', 'waiting', 'paused')
+                          OR r.updated_at > DATE_SUB(NOW(6), INTERVAL ? SECOND)))",
         )
+        .bind(secs)
         .bind(secs)
         .execute(&self.pool)
         .await
