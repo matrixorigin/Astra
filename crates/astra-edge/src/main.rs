@@ -994,10 +994,8 @@ async fn main() {
     // Register exactly one process-lifetime signal observer. Recreating or
     // dropping ctrl_c futures between connection phases can lose SIGINT.
     let shutdown = CancellationToken::new();
-    let _shutdown_listener = tokio::spawn(observe_shutdown(
-        shutdown.clone(),
-        tokio::signal::ctrl_c(),
-    ));
+    let _shutdown_listener =
+        tokio::spawn(observe_shutdown(shutdown.clone(), tokio::signal::ctrl_c()));
 
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
@@ -1008,8 +1006,7 @@ async fn main() {
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        let connection =
-            run_edge_connection(&config, shutdown.clone()).instrument(edge_span);
+        let connection = run_edge_connection(&config, shutdown.clone()).instrument(edge_span);
         tokio::pin!(connection);
         let connection_result = tokio::select! {
             result = &mut connection => Some(result),
