@@ -8230,8 +8230,21 @@ pub(crate) mod tests {
         *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
         let denied = executor.execute_with_metadata("grep", &args).await;
         assert!(
-            denied.is_error && denied.output.contains(super::SANDBOX_DENIED_PREFIX),
+            denied.is_error
+                && crate::sandbox_retry::sandbox_denied_message_from_result(
+                    &denied.output,
+                    denied.tool_result_fields.as_ref(),
+                )
+                .is_some(),
             "{denied:?}"
+        );
+        assert_eq!(
+            denied
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("execution_fact"))
+                .and_then(Value::as_str),
+            Some("not_executed")
         );
         executor
             .expand_sandbox_path(external.path().canonicalize().unwrap())
