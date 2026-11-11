@@ -120,6 +120,14 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"hf_[A-Za-z0-9]+",
                 "HUGGINGFACE_TOKEN"
             ),
+            // HTTP Basic credentials are base64-encoded user:password.
+            // Redact only the value, retaining the header name and scheme.
+            pat_min!(
+                r"(?i)Authorization:\s*Basic\s+(?P<secret>[A-Za-z0-9+/=]{{{},}})",
+                8,
+                "BASIC_AUTH",
+                Some("secret")
+            ),
             pat_min!(
                 r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{{{},}}",
                 40,
@@ -2922,5 +2930,29 @@ mod fine_grained_github_pat_regression_tests {
         let (redacted, count) = redact_credentials_for_display("github_pat_abc");
         assert_eq!(count, 0);
         assert_eq!(redacted, "github_pat_abc");
+    }
+}
+
+#[cfg(test)]
+mod basic_auth_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_basic_auth_header_value() {
+        let secret = "dXNlcjpzM2NyZXRQYXNzd29yZA==";
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("Authorization: Basic {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("BASIC_AUTH"));
+        assert!(redacted.contains("Authorization: Basic "));
+    }
+
+    #[test]
+    fn leaves_unrelated_basic_word_unchanged() {
+        let text = "Basic authentication is supported";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
     }
 }
