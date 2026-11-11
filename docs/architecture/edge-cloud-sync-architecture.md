@@ -83,10 +83,14 @@ the former single-record protocol; pre-cutover event rows are not silently
 reinterpreted as verified sync receipts. A lost response remains retryable until
 an owner-scoped reconciliation proves the result. Permanent record and
 request-level rejections are quarantined immediately so they cannot block later
-batches forever. Authentication, payment, request-timeout, locking, and
-rate-limit responses remain pending with their reason for retry after credentials,
-access, or capacity recover; a 429 `Retry-After` becomes the persisted next-retry
-deadline. The explicit session-unavailable conflict is
+batches forever. HTTP 401/403 pause background delivery for the current login;
+the TUI reports the access problem, and records remain pending and immediately
+claimable after a new login. This pause is process-local: restart probes once
+again, while changes made by another process or silent permission changes do
+not wake an already-running client. A token rotation within the same login also
+needs an explicit sign-in to resume a blocked sync. Payment, request-timeout, locking, and
+rate-limit responses remain pending for automatic retry; a 429 `Retry-After`
+becomes the persisted next-retry deadline. The explicit session-unavailable conflict is
 terminal; other 409 responses, HTTP 5xx, and transport failures use owner-scoped
 reconciliation because the commit outcome may be unknown. On ACK, the local
 outbox releases the payload already owned by the canonical journal and retains

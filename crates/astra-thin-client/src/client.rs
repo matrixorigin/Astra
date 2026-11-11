@@ -168,13 +168,23 @@ async fn sleep_between_attempts(delay_secs: u64) {
     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
 }
 
-/// Parse the `Retry-After` header value into seconds.
-/// Supports integer seconds format; ignores HTTP-date format.
-/// Clamps to [1, 120] seconds. Returns `None` on missing/unparseable.
-fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+/// Parse Retry-After, rounding dates up so a retry never precedes the deadline.
+fn parse_retry_after(headers: &HeaderMap, now: std::time::SystemTime) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    Some(secs.clamp(1, 120))
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(raw.parse::<u64>().unwrap_or(u64::MAX).max(1));
+    }
+    let delay = httpdate::parse_http_date(raw)
+        .ok()?
+        .duration_since(now)
+        .unwrap_or_default();
+    Some(
+        delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() > 0))
+            .max(1),
+    )
 }
 
 fn http_stream_connect_timeout() -> Duration {
@@ -1753,7 +1763,9 @@ impl ThinClient {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
-                            parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
+                            parse_retry_after(resp.headers(), std::time::SystemTime::now())
+                                .map(|seconds| seconds.min(120))
+                                .unwrap_or(2u64 << attempt);
                         if !quiet {
                             tracing::warn!(
                                 target: "astra.thin_client",
@@ -2516,7 +2528,8 @@ impl ThinClient {
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_seconds = parse_retry_after(resp.headers());
+            let retry_after_seconds =
+                parse_retry_after(resp.headers(), std::time::SystemTime::now());
             let body = resp.text().await?;
             return Err(ThinClientError::SyncOutboxRateLimited {
                 body,
@@ -5691,45 +5704,72 @@ mod tests {
     fn parse_retry_after_valid_integer() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("5"));
-        assert_eq!(parse_retry_after(&headers), Some(5));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(5));
     }
 
     #[test]
-    fn parse_retry_after_clamps_high() {
+    fn parse_retry_after_preserves_long_delays() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("999"));
-        assert_eq!(parse_retry_after(&headers), Some(120));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(999)
+        );
     }
 
     #[test]
     fn parse_retry_after_clamps_zero_to_one() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("0"));
-        assert_eq!(parse_retry_after(&headers), Some(1));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(1));
     }
 
     #[test]
     fn parse_retry_after_missing_header() {
         let headers = HeaderMap::new();
-        assert_eq!(parse_retry_after(&headers), None);
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_non_numeric() {
         let mut headers = HeaderMap::new();
-        // HTTP-date format not supported — returns None
-        headers.insert(
-            "retry-after",
-            HeaderValue::from_static("Wed, 09 Apr 2026 12:00:00 GMT"),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("not a date"));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_whitespace_trimmed() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("  10  "));
-        assert_eq!(parse_retry_after(&headers), Some(10));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(10));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_rounds_up_and_limits_expired_dates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:01:40 GMT"),
+        );
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(90_500);
+        assert_eq!(parse_retry_after(&headers, now), Some(10));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH + Duration::from_secs(200)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_integer_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("18446744073709551616"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(u64::MAX)
+        );
     }
 
     #[tokio::test]

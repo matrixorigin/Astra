@@ -3508,10 +3508,52 @@ fn recover_queued_followups_after_cancelled_read(
 
 fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Option<TuiAppEvent> {
     match event {
+        TuiAppEvent::CloudSyncAccessBlocked(snapshot) => {
+            if snapshot.is_current()
+                && crate::cli::cloud_sync::sync_cloud_access_is_blocked(&snapshot)
+            {
+                let report = crate::cli::cloud_sync::SyncOutboxDrainReport {
+                    blocker: Some(
+                        crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired,
+                    ),
+                    ..Default::default()
+                };
+                report.user_notice().map(TuiAppEvent::SystemWarning)
+            } else {
+                None
+            }
+        }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
         }
         event => Some(event),
+    }
+}
+
+async fn forward_sync_access_warnings(
+    mut source: tokio::sync::watch::Receiver<
+        Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    >,
+    output: tokio::sync::mpsc::Sender<TuiAppEvent>,
+) {
+    loop {
+        let blocked = source.borrow_and_update().clone();
+        if let Some(snapshot) = blocked
+            && output
+                .send(TuiAppEvent::CloudSyncAccessBlocked(snapshot))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        tokio::select! {
+            changed = source.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = output.closed() => return,
+        }
     }
 }
 
@@ -8882,6 +8924,10 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    let sync_access_observer = tokio::spawn(forward_sync_access_warnings(
+        crate::cli::cloud_sync::subscribe_sync_cloud_access(),
+        tui_tx.clone(),
+    ));
     if let Ok(executable) = std::env::current_exe() {
         let update_tx = tui_tx.clone();
         astra_core::client_installation::startup_notice(&executable, move |notice| {
@@ -9572,7 +9618,8 @@ pub(crate) async fn run_tui_session(
                                 plan_task_projection_sequence = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Signed in. Use /model to select or configure your model."));
                                 let report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                if let Some(notice) = report.user_notice() {
+                                if report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                    && let Some(notice) = report.user_notice() {
                                     chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
                                 }
                                 if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane, &mut chat_widget).await {
@@ -13062,7 +13109,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -13117,7 +13165,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -14334,6 +14383,8 @@ pub(crate) async fn run_tui_session(
     while model_setup_tasks.join_next().await.is_some() {}
     login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
+    sync_access_observer.abort();
+    let _ = sync_access_observer.await;
     for task in startup_observation_tasks {
         task.abort();
         let _ = task.await;
@@ -14547,6 +14598,7 @@ fn handle_app_event(
         | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
+        | TuiAppEvent::CloudSyncAccessBlocked(_)
         | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
@@ -25965,6 +26017,52 @@ mod tests {
             apply_startup_ui_effect(receiver.try_recv().unwrap(), &mut pane, &current).as_deref(),
             Some("current account")
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_access_warning_is_checked_when_consumed_and_observer_exits_when_tui_closes() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = install_cli_profile_identity_for_test("a", Some("account-a")).unwrap();
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        let source = crate::cli::cloud_sync::subscribe_sync_cloud_access();
+        let (output, mut events) = tokio::sync::mpsc::channel(2);
+        let observer = tokio::spawn(forward_sync_access_warnings(source, output));
+        let snapshot = cli_owner_auth_snapshot();
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accept_owned_tui_event(event, None),
+            Some(TuiAppEvent::SystemWarning(text)) if text.contains("/login")
+        ));
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot.clone()), None)
+                .is_none()
+        );
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let _other = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot), None).is_none()
+        );
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        observer.abort();
+        let _ = observer.await;
+
+        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
+        let (output, events) = tokio::sync::mpsc::channel(1);
+        let observer = tokio::spawn(forward_sync_access_warnings(access_rx, output));
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(2), observer)
+            .await
+            .expect("observer exits when the TUI is dropped")
+            .unwrap();
     }
 
     #[test]

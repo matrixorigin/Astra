@@ -1380,7 +1380,8 @@ fn apply_delivery_deferral(
     record.last_error = Some(error.to_string());
     record.updated_at_unix_ms = now;
     let delay = retry_after.unwrap_or(SYNC_OUTBOX_DEFERRED_RETRY_DELAY);
-    record.next_retry_after_unix_ms = Some(now.saturating_add(delay.as_millis() as u64));
+    let delay_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+    record.next_retry_after_unix_ms = Some(now.saturating_add(delay_ms));
     true
 }
 
@@ -1853,6 +1854,19 @@ mod tests {
             .expect("server-directed retry deadline");
         assert!(retry_at >= before_deferral.saturating_add(120_000));
         assert!(retry_at <= unix_ms().expect("time").saturating_add(120_000));
+    }
+
+    #[test]
+    fn huge_retry_delay_saturates_instead_of_wrapping() {
+        let mut record = build_record(&event("retry-overflow"), 1, 100).unwrap();
+        assert!(apply_delivery_deferral(
+            &mut record,
+            "rate limited",
+            100,
+            Some(Duration::from_secs(u64::MAX)),
+        ));
+        assert_eq!(record.next_retry_after_unix_ms, Some(u64::MAX));
+        assert_eq!(record.state, SyncOutboxRecordState::Pending);
     }
 
     #[test]

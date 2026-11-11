@@ -150,6 +150,8 @@ pub(crate) enum TuiAppEvent {
     TurnProjectionDrained,
     TurnComplete,
     TurnError(String),
+    /// Cloud sync access denial, bound to the login that observed it.
+    CloudSyncAccessBlocked(crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot),
     SystemWarning(String),
     SystemInfo(String),
     /// One canonical measured Explain Analyze fact from the active run stream.

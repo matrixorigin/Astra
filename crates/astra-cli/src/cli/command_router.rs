@@ -2041,6 +2041,7 @@ async fn execute_cli_command_impl(
         Some(Command::Logout) => {
             if crate::cli::native_auth::active().is_some() {
                 crate::cli::native_auth::logout().await?;
+                crate::cli::cloud_sync::clear_sync_cloud_access();
                 stdout_println!("Logged out of MOI");
                 return Ok(ExitCode::Success);
             }
@@ -2059,6 +2060,7 @@ async fn execute_cli_command_impl(
                 .await
                 .map_err(map_thin_err)?;
             clear_profile_auth(profile.as_deref())?;
+            crate::cli::cloud_sync::clear_sync_cloud_access();
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }

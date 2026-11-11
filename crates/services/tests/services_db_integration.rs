@@ -7352,26 +7352,8 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             })
             .collect()
     }
-    let candidates = (0..9).map(&make_request).collect::<Vec<_>>();
-    let (first, last) = (2..candidates.len())
-        .find_map(|last| {
-            (0..last)
-                .find(|first| {
-                    candidates[*first].event_id.as_deref().unwrap()
-                        > candidates[last].event_id.as_deref().unwrap()
-                })
-                .map(|first| (first, last))
-        })
-        .expect("fixture includes event IDs whose lexical order differs from sequence");
-    let middle = (0..last)
-        .find(|index| *index != first)
-        .expect("three events must have distinct sequence positions");
-    let mut selected = [first, middle, last];
-    selected.sort_unstable();
-    let requests = selected
-        .into_iter()
-        .map(|index| candidates[index].clone())
-        .collect::<Vec<_>>();
+    let mut requests = (0..3).map(&make_request).collect::<Vec<_>>();
+    requests.sort_by(|left, right| right.event_id.cmp(&left.event_id));
 
     let invalid_session = Uuid::new_v4().to_string();
     let invalid = EventCreateRequestData {

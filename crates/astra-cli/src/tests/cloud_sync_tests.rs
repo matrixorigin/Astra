@@ -576,7 +576,7 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn client_rejection_keeps_record_for_retry_without_reconciliation() {
+async fn authentication_rejection_waits_for_new_login_without_losing_records() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -592,6 +592,7 @@ async fn client_rejection_keeps_record_for_retry_without_reconciliation() {
 
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
+        .and(header("authorization", "Bearer token"))
         .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
         .expect(1)
         .mount(&server)
@@ -601,13 +602,17 @@ async fn client_rejection_keeps_record_for_retry_without_reconciliation() {
     assert_eq!(report.attempted, 1);
     assert_eq!(report.acked, 0);
     assert_eq!(report.failed, 1);
-    assert_eq!(report.blocker, None);
+    assert_eq!(
+        report.blocker,
+        Some(cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+    );
     assert!(report.is_incomplete());
     assert!(report.user_notice().is_some());
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.acked, 0);
     assert_eq!(status.pending, 1);
-    assert_eq!(status.retry_deferred, 1);
+    assert_eq!(status.retry_deferred, 0);
+    assert_eq!(status.claimable, 1);
     assert_eq!(status.ack_watermark, 0);
     assert!(
         status
@@ -615,7 +620,155 @@ async fn client_rejection_keeps_record_for_retry_without_reconciliation() {
             .as_deref()
             .is_some_and(|error| error.contains("HTTP 401"))
     );
+    let blocked = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(blocked.blocker, report.blocker);
+    assert_eq!(blocked.attempted, 0);
+    cloud_sync::schedule_sync_outbox_drain();
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let record = SyncOutboxStore::local().ready_records(1).unwrap().remove(0);
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .and(header("authorization", "Bearer new-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": 1,
+            "acks": [{"record_id": record.record_id, "payload_hash": record.payload_hash,
+                "ingestion_status": "created"}],
+            "rejections": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    crate::cli::auth_flow::save_profile_auth_tokens(
+        Some("cloud-sync-test"),
+        "user",
+        &crate::cli::auth_flow::AuthTokenPayload {
+            user_id: "cloud-sync-test-account".into(),
+            access_token: "new-token".into(),
+            refresh_token: "new-refresh".into(),
+        },
+    )
+    .unwrap();
+    let recovered = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(recovered.acked, 1);
+    assert_eq!(recovered.blocker, None);
+    assert_eq!(SyncOutboxStore::local().status().unwrap().pending, 0);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn relogin_hands_claimed_records_to_the_new_authentication() {
+    use axum::{http::StatusCode, response::IntoResponse};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let state = session_state_with_journal("login-race".into());
+    append_cloud_pull_sync_journal_for_immediate_drain(
+        &state,
+        "default",
+        "post_login",
+        &CloudPullResult {
+            cloud_reachable: true,
+        },
+        &[],
+    );
+    let store = SyncOutboxStore::local();
+    let record = store.ready_records(1).unwrap().remove(0);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let new_calls = Arc::new(AtomicUsize::new(0));
+    let ack = json!({
+        "schema_version": 1,
+        "acks": [{"record_id": record.record_id, "payload_hash": record.payload_hash,
+            "ingestion_status": "created"}],
+        "rejections": []
+    });
+    let app = axum::Router::new().route(
+        "/sync/outbox/events",
+        axum::routing::post({
+            let old_calls = old_calls.clone();
+            let new_calls = new_calls.clone();
+            move |headers: axum::http::HeaderMap| {
+                let (started_tx, release_rx, ack, old_calls, new_calls) = (
+                    started_tx.clone(),
+                    release_rx.clone(),
+                    ack.clone(),
+                    old_calls.clone(),
+                    new_calls.clone(),
+                );
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok())
+                        == Some("Bearer token")
+                    {
+                        old_calls.fetch_add(1, Ordering::SeqCst);
+                        if let Some(sender) = started_tx.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        if let Some(receiver) = release_rx.lock().await.take() {
+                            let _ = receiver.await;
+                        }
+                        StatusCode::UNAUTHORIZED.into_response()
+                    } else {
+                        assert_eq!(
+                            headers.get("authorization").and_then(|v| v.to_str().ok()),
+                            Some("Bearer new-token")
+                        );
+                        new_calls.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, axum::Json(ack)).into_response()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &address);
+    cloud_sync::schedule_sync_outbox_drain();
+    tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let old_binding = old_snapshot.legacy_binding.as_ref().unwrap().clone();
+    let old_pair = old_binding.pair.lock().await;
+    crate::cli::auth_flow::save_profile_auth_tokens(
+        Some("cloud-sync-test"),
+        "user",
+        &crate::cli::auth_flow::AuthTokenPayload {
+            user_id: "cloud-sync-test-account".into(),
+            access_token: "new-token".into(),
+            refresh_token: "new-refresh".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cloud_sync::try_drain_sync_outbox(10).await.attempted, 0);
+    // A successful login wakes the old worker without waiting for its response.
+    cloud_sync::clear_sync_cloud_access();
+    cloud_sync::schedule_sync_outbox_drain();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if store.status().unwrap().acked == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new login resumes the settled record");
+    let _ = release_tx.send(());
+    drop(old_pair);
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_calls.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[serial_test::serial]
@@ -788,7 +941,11 @@ async fn forward_sync_test_request(
     let body = response.text().await.expect("read sync response");
     proxy.active.fetch_sub(1, Ordering::Relaxed);
     if uri.path() == "/sync/outbox/events" {
-        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "upstream response: {body}"
+        );
         proxy.writes.fetch_add(1, Ordering::Relaxed);
         // The server has committed; emulate a gateway losing that response.
         (
@@ -915,8 +1072,62 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
     let mut acked = 0;
     while acked < journal_events.len() {
         let report = cloud_sync::try_drain_sync_outbox(64).await;
-        assert!(report.attempted > 0, "sync drain stopped making progress");
-        assert_eq!(report.failed, 0);
+        assert!(
+            report.attempted > 0,
+            "sync drain stopped making progress: {report:?}; outbox: {:?}",
+            store.status()
+        );
+        if report.failed > 0 {
+            eprintln!(
+                "sync report: {report:?}; writes={}, reads={}, elapsed={:?}",
+                proxy.writes.load(Ordering::Relaxed),
+                proxy.reads.load(Ordering::Relaxed),
+                start.elapsed()
+            );
+            eprintln!("sync outbox: {:?}", store.status());
+            let state = std::fs::read(store.path()).and_then(|bytes| {
+                serde_json::from_slice::<Value>(&bytes).map_err(std::io::Error::other)
+            });
+            match state {
+                Ok(state) => {
+                    let mut errors = std::collections::BTreeMap::<
+                        (String, String),
+                        (usize, String, String),
+                    >::new();
+                    for record in state["records"].as_array().into_iter().flatten() {
+                        if let Some(error) = record["last_error"].as_str() {
+                            let key = (
+                                record["state"].as_str().unwrap_or("unknown").to_string(),
+                                error.to_string(),
+                            );
+                            let entry = errors.entry(key).or_insert_with(|| {
+                                (
+                                    0,
+                                    record["record_id"].as_str().unwrap_or("").into(),
+                                    record["payload_hash"].as_str().unwrap_or("").into(),
+                                )
+                            });
+                            entry.0 += 1;
+                        }
+                    }
+                    for ((state, error), (count, id, _)) in &errors {
+                        eprintln!(
+                            "sync failure: state={state}, count={count}, record={id}, error={error:?}"
+                        );
+                    }
+                    for (_, id, hash) in errors.values().take(3) {
+                        let stored = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            sqlx::query_scalar::<_, String>("SELECT payload_hash FROM agent_events WHERE user_id = ? AND event_id = ?")
+                                .bind(&owner).bind(id).fetch_optional(pool.get()),
+                        ).await;
+                        eprintln!("sync failure: record={id}, stored_hash_matches={:?}", stored.map(|result| result.map(|value| value.map(|value| value == *hash))));
+                    }
+                }
+                Err(error) => eprintln!("could not inspect sync outbox: {error}"),
+            }
+            panic!("sync drain did not settle all records");
+        }
         acked += report.acked as usize;
     }
     assert_eq!(acked, journal_events.len());
