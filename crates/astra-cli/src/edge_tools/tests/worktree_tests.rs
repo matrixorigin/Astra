@@ -1600,6 +1600,27 @@ async fn session_worktree_is_the_workspace_for_file_tools() {
     std::fs::write(dir.path().join("example.rs"), "fn original_symbol() {}\n").unwrap();
     std::fs::write(active.join("example.rs"), "fn worktree_symbol() {}\n").unwrap();
 
+    // A stale original checkout must be rejected before execution on every
+    // attempt; the error gives the model the actual selected root and remedy.
+    for _ in 0..2 {
+        let rejected = exe
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "touch stale-workdir-marker", "workdir": dir.path()
+                }),
+            )
+            .await;
+        assert!(rejected.is_error, "{rejected:?}");
+        assert!(
+            rejected.output.contains(active.to_str().unwrap()),
+            "{rejected:?}"
+        );
+        assert!(rejected.output.contains("no command"), "{rejected:?}");
+        assert!(!dir.path().join("stale-workdir-marker").exists());
+        assert!(!active.join("stale-workdir-marker").exists());
+    }
+
     let read = exe
         .execute_with_metadata("read_file", &json!({"path":"tracked.txt"}))
         .await;

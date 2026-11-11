@@ -190,7 +190,16 @@ impl ContextTraceSignal {
 /// snapshots with no live control. This keeps observation freshness separate
 /// from the task's lifecycle instead of inventing a terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellTerminalFacts {
+    pub unobserved: bool,
+    pub outcome_unknown: bool,
+    pub cleanup_unconfirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundShellTaskProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_facts: Option<BackgroundShellTerminalFacts>,
     pub id: String,
     pub status: String,
     pub title: String,
@@ -1777,6 +1786,7 @@ mod tests {
     fn background_shell_tasks_round_trip_through_workspace_yaml() {
         let mut ws = WorkspaceMetadata::with_context("sess-bg", "gpt-4", "/tmp", Some("main"));
         ws.background_shell_tasks = vec![BackgroundShellTaskProjection {
+            terminal_facts: None,
             id: "bg-shell-1".into(),
             status: "running".into(),
             title: "cargo test -p astra-cli".into(),
@@ -2571,6 +2581,7 @@ mod tests {
                 || panic!("workspace should already exist"),
                 |workspace| {
                     workspace.background_shell_tasks = vec![BackgroundShellTaskProjection {
+                        terminal_facts: None,
                         id: "shell-1".into(),
                         status: "running".into(),
                         title: "make check".into(),

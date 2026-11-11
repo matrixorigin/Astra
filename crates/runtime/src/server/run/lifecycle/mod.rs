@@ -4073,6 +4073,7 @@ struct ServerDurableAgentReconciler {
     run_engine: RunEngine,
     user_id: String,
     session_id: String,
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     state: TokioMutex<ServerDurableAgentReconcileState>,
 }
 
@@ -4087,6 +4088,173 @@ struct ServerDurableAgentReconcileState {
 
 #[async_trait]
 impl DurableAgentReconciler for ServerDurableAgentReconciler {
+    async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<Value, String> {
+        let service = self
+            .edge_dispatch_service
+            .as_ref()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        let mut rows = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.inspect_run_dispatches(
+                &self.user_id,
+                &self.session_id,
+                child_run_id,
+                after,
+                exact,
+            ),
+        )
+        .await
+        .map_err(|_| "tool outcome inspection timed out".to_string())??;
+        let mut has_more = rows.len() > 16;
+        rows.truncate(16);
+        let mut observations = Vec::with_capacity(rows.len());
+        let mut page_size = 0_usize;
+        for row in rows {
+            let mut observation = json!({
+                "turn_chain_id": row.turn_chain_id,
+                "request_id": row.request_id,
+                "dispatch_status": row.status,
+                "tool": row.tool_name.as_deref().map(|name| astra_text_utils::credential_redaction::truncate_redacted_output(astra_text_utils::credential_redaction::redact_credentials_for_display(name).0, 128)),
+            });
+            if exact.is_some() {
+                if row.result_too_large {
+                    observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the 64 KiB serialized recovery limit; its execution outcome remains unknown"});
+                } else if row.status == "completed"
+                    && let Some(body) = row.result_json.as_deref()
+                {
+                    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                        &self.user_id,
+                        &self.session_id,
+                        child_run_id,
+                        &row.turn_chain_id,
+                        &row.request_id,
+                    );
+                    let mut canonical =
+                        crate::server::tool_execution_service::canonical_edge_completion(
+                            &identity,
+                            &row.edge_agent_id,
+                            body,
+                        )
+                        .map_err(|_| "retained tool result could not be validated".to_string())?;
+                    let output = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(
+                        &canonical.output,
+                    )
+                    .content;
+                    let projection = astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(output, 256 * 1024)
+                        .map_err(|_| "retained tool result cannot be projected within the memory limit".to_string())?;
+                    let mut metadata = canonical.tool_result_fields.take();
+                    if let Some(fields) = metadata.take() {
+                        metadata = Some(astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(fields).metadata);
+                    }
+                    if let Some(fields) = metadata.as_mut() {
+                        for (key, value) in fields.iter_mut() {
+                            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+                        }
+                    }
+                    let metadata_size = serde_json::to_vec(&metadata)
+                        .map_err(|_| "invalid tool result metadata".to_string())?
+                        .len();
+                    let metadata = if metadata_size <= 512 {
+                        metadata
+                    } else {
+                        metadata.map(|mut fields| {
+                            let mut retained = Map::new();
+                            let mut bytes = 2_usize;
+                            // Preserve concise execution facts before optional diagnostics.
+                            for key in [
+                                "execution_fact",
+                                "execution_started",
+                                "outcome_certainty",
+                                "side_effects_maybe",
+                                "cleanup_authoritative",
+                                "cleanup_unsettled",
+                                "disposition",
+                                "retryable",
+                                "error_kind",
+                                "stage",
+                            ] {
+                                let Some(value) = fields.remove(key) else {
+                                    continue;
+                                };
+                                if !value.is_boolean()
+                                    && !value.as_str().is_some_and(|text| text.len() <= 128)
+                                {
+                                    continue;
+                                }
+                                // A JSON tuple is a conservative bound for an object entry.
+                                let entry_bytes = serde_json::to_vec(&(key, &value))
+                                    .map_or(usize::MAX, |encoded| encoded.len() + 1);
+                                if bytes.saturating_add(entry_bytes) <= 512 {
+                                    bytes += entry_bytes;
+                                    retained.insert(key.to_string(), value);
+                                }
+                            }
+                            retained
+                        })
+                    };
+                    if offset > projection.total_bytes() {
+                        return Err("tool result offset is beyond the retained output".into());
+                    }
+                    // Keep each JSON response within the normal tool-output budget.
+                    // Re-read only a bounded durable result on each explicit page request.
+                    let mut page_bytes = max_bytes;
+                    let (window, end, total, _) = loop {
+                        let page = projection.window(offset, page_bytes);
+                        let encoded = serde_json::to_string(&page.0)
+                            .map_err(|_| "invalid tool result output".to_string())?;
+                        if encoded.len() <= 3500 || page_bytes <= 64 {
+                            break page;
+                        }
+                        page_bytes = (page_bytes / 2).max(64);
+                    };
+                    if end.saturating_sub(window.len()) != offset {
+                        return Err("tool result page would skip an atomic redaction marker or UTF-8 boundary".into());
+                    }
+                    observation["result"] = json!({
+                        "status": canonical.status, "output": window, "offset": offset,
+                        "next_offset": (end < total).then_some(end), "total_bytes": total,
+                        "duration_ms": canonical.duration_ms, "tool_result_fields": metadata,
+                        "metadata_omitted": metadata_size > 512,
+                    });
+                } else {
+                    observation["result"] = json!({"status":"unknown", "reason":"no validated executor result is available"});
+                }
+            }
+            if exact.is_none() {
+                let size = serde_json::to_vec(&observation)
+                    .map_err(|_| "invalid dispatch observation".to_string())?
+                    .len()
+                    + 1;
+                if size > 3500 {
+                    return Err("dispatch identity exceeds the inspection page limit".into());
+                }
+                if page_size + size > 3500 {
+                    has_more = true;
+                    break;
+                }
+                page_size += size;
+            }
+            observations.push(observation);
+        }
+        let next = has_more
+            .then(|| observations.last().cloned())
+            .flatten()
+            .map(|row| {
+                json!({
+                    "turn_chain_id": row["turn_chain_id"], "request_id": row["request_id"]
+                })
+            });
+        Ok(json!({"observations": observations, "next_cursor": next,
+            "note": "Dispatch status alone does not establish whether a tool ran or succeeded; read an exact result for a validated executor observation. Missing or expired records remain unknown. Inspection does not execute a tool."}))
+    }
+
     fn subscribe_remote_child_wake(
         &self,
         parent_run_id: &str,
@@ -6605,6 +6773,7 @@ impl AgenticRunLifecycleService {
                 run_engine: self.run_engine.clone(),
                 user_id: user_id.to_owned(),
                 session_id: session_id.to_owned(),
+                edge_dispatch_service: self.edge_dispatch_service.clone(),
                 state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
             }))
             .await;

@@ -4064,7 +4064,11 @@ async fn refresh_background_task_surfaces(
         drop(cache);
 
         let previous_counts = bottom_pane.footer.bg_task_counts;
-        sync_background_task_footer_from_rows(bottom_pane, &rows);
+        sync_background_task_footer_from_rows(
+            bottom_pane,
+            &rows,
+            background_registry.evicted_uncertain_count(),
+        );
         changed |= bottom_pane.footer.bg_task_counts != previous_counts;
         *next_shared_refresh = now + BACKGROUND_SURFACE_REFRESH_INTERVAL;
     }
@@ -21223,6 +21227,7 @@ mod tests {
             registry
                 .restore_shell_task_projection(
                     astra_services::session_workspace::BackgroundShellTaskProjection {
+                        terminal_facts: None,
                         id: "bg-shell-missing".into(),
                         status: "completed".into(),
                         title: "restored output".into(),
@@ -21265,6 +21270,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),
@@ -21322,6 +21328,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-persist".into(),
                     status: "completed".into(),
                     title: "cargo test".into(),
@@ -21524,6 +21531,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),

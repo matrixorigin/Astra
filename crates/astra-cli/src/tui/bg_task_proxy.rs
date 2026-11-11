@@ -790,7 +790,8 @@ pub(crate) fn background_task_event_system_message(
             "Background shell {} was stopped",
             background_shell_notification_label(id, title)
         )),
-        crate::edge_tools::background_tasks::BgTaskEvent::Started { .. } => None,
+        crate::edge_tools::background_tasks::BgTaskEvent::Started { .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Observed { .. } => None,
     }
 }
 

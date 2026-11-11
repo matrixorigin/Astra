@@ -3155,6 +3155,18 @@ pub trait DurableAgentReconciler: Send + Sync {
         self.load_agent_recovery().await
     }
 
+    /// On-demand inspection only; absence does not prove non-execution.
+    async fn inspect_child_tool_outcomes(
+        &self,
+        _child_run_id: &str,
+        _after: Option<(&str, &str)>,
+        _exact: Option<(&str, &str)>,
+        _offset: usize,
+        _max_bytes: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("durable tool outcome inspection is unavailable".into())
+    }
+
     /// Subscribe to a process-wide durable wake hint for remote direct children.
     /// The hint is not completion evidence; callers must reload exact run IDs.
     /// A reconciler without a remote observer may return None (local-only hosts).
@@ -3616,6 +3628,25 @@ impl DynamicAgentSpawner {
 
     pub async fn set_durable_agent_reconciler(&self, reconciler: Arc<dyn DurableAgentReconciler>) {
         *self.durable_reconciler.write().await = Some(reconciler);
+    }
+
+    pub async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, String> {
+        let reconciler = self
+            .durable_reconciler
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        reconciler
+            .inspect_child_tool_outcomes(child_run_id, after, exact, offset, max_bytes)
+            .await
     }
 
     pub fn retained_child_result(

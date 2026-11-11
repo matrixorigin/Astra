@@ -3504,7 +3504,22 @@ async fn handle_agent_get_result_action_inner(
                 .reconcile_durable_agent_runs_for(std::slice::from_ref(&child.run_id))
                 .await
         } else if retained.is_none() {
-            reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+            if args.get("tool_outcomes").is_some() {
+                match agent_id
+                    .rsplit_once('@')
+                    .map(|(_, run)| run)
+                    .filter(|run| uuid::Uuid::parse_str(run).is_ok())
+                {
+                    Some(candidate) => {
+                        ctx.spawner
+                            .reconcile_durable_agent_runs_for(&[candidate.to_string()])
+                            .await
+                    }
+                    None => Ok(0),
+                }
+            } else {
+                reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+            }
         } else {
             Ok(0)
         };
@@ -3516,6 +3531,125 @@ async fn handle_agent_get_result_action_inner(
 
     if needs_terminal_evidence && reconcile_durable {
         retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
+    }
+
+    if let Some(inspection) = args.get("tool_outcomes") {
+        let Some(inspection) = inspection.as_object() else {
+            return render_agent_tool_error(Some(agent_id), "tool_outcomes must be an object");
+        };
+        let parse_key = |name: &str| -> Result<Option<(&str, &str)>, &str> {
+            let Some(value) = inspection.get(name) else {
+                return Ok(None);
+            };
+            let turn = value
+                .get("turn_chain_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 256);
+            let request = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 256);
+            match (turn, request) {
+                (Some(turn), Some(request)) => Ok(Some((turn, request))),
+                _ => Err("tool_outcomes requires a valid turn_chain_id and request_id"),
+            }
+        };
+        let (after, exact) = match (parse_key("after"), parse_key("exact")) {
+            (Ok(after), Ok(exact)) if after.is_none() || exact.is_none() => (after, exact),
+            _ => {
+                return render_agent_tool_error(
+                    Some(agent_id),
+                    "provide either a valid after cursor or an exact tool identity",
+                );
+            }
+        };
+        let offset = inspection
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_bytes = inspection
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096);
+        if offset > usize::MAX as u64
+            || !(64..=4096).contains(&max_bytes)
+            || inspection
+                .get("offset")
+                .is_some_and(|value| value.as_u64().is_none())
+            || inspection
+                .get("max_bytes")
+                .is_some_and(|value| value.as_u64().is_none())
+            || (exact.is_none()
+                && (inspection.contains_key("offset") || inspection.contains_key("max_bytes")))
+        {
+            return render_agent_tool_error(
+                Some(agent_id),
+                "output paging requires an exact tool identity and max_bytes between 64 and 4096",
+            );
+        }
+        // The parent-owned retained result establishes direct-child identity.
+        // If it has not yet been retained, accept only a live state with the
+        // exact same parent, never a model-supplied run or session identity.
+        let child = if let Some(child) = retained.as_ref() {
+            Some(child.run_id.clone())
+        } else {
+            ctx.spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .filter(|child| child.parent_run_id == ctx.run_id)
+                .map(|child| child.run_id)
+        };
+        let Some(child_run_id) = child else {
+            return render_unknown_agent_result(agent_id, UNKNOWN_AGENT_ID_ERROR);
+        };
+        let observation = match ctx
+            .spawner
+            .inspect_child_tool_outcomes(
+                &child_run_id,
+                after,
+                exact,
+                offset as usize,
+                max_bytes as usize,
+            )
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error) if error == "tool result offset is beyond the retained output" => {
+                json!({"status":"invalid_request", "note":"The requested offset is beyond the retained output. Use a previously returned next_offset."})
+            }
+            Err(error)
+                if error
+                    == "tool result page would skip an atomic redaction marker or UTF-8 boundary" =>
+            {
+                json!({"status":"invalid_request", "note":"This page cannot preserve a redaction marker or UTF-8 boundary. Use a returned next_offset and a larger max_bytes; if the marker exceeds the maximum, that portion is unavailable."})
+            }
+            Err(_) => {
+                json!({"status":"unavailable", "note":"Retained results could not be inspected. Their execution outcomes remain unknown."})
+            }
+        };
+        let inspection_failed = observation
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "unavailable" | "invalid_request"));
+        let exact_unavailable = exact.is_some()
+            && observation
+                .get("observations")
+                .and_then(Value::as_array)
+                .is_none_or(|rows| {
+                    rows.first().is_none_or(|row| {
+                        row.pointer("/result/status")
+                            .and_then(Value::as_str)
+                            .is_none_or(|status| matches!(status, "unavailable" | "unknown"))
+                    })
+                });
+        let status = if inspection_failed || exact_unavailable {
+            "tool_outcomes_unavailable"
+        } else {
+            "tool_outcomes_observed"
+        };
+        return json!({"result_family":"control_receipt", "action":"get_result", "status":status, "success":true,
+            "parent_run_id":ctx.run_id, "agent_id":agent_id, "run_id":child_run_id, "tool_outcomes":observation,
+            "note":"This inspection does not collect the child result; call get_result without tool_outcomes when needed."}).to_string();
     }
 
     let timeout = AGENT_RESULT_OBSERVE_GRACE;
@@ -4681,6 +4815,114 @@ pub(crate) mod tests {
         let tracker = Arc::new(DelegationTracker::new());
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
+    }
+
+    struct OutcomeInspectionReconciler(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::orchestration::spawner::DurableAgentReconciler for OutcomeInspectionReconciler {
+        async fn load_agent_recovery(
+            &self,
+        ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn inspect_child_tool_outcomes(
+            &self,
+            child_run_id: &str,
+            _after: Option<(&str, &str)>,
+            exact: Option<(&str, &str)>,
+            _offset: usize,
+            _max_bytes: usize,
+        ) -> Result<Value, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if exact.is_some() {
+                Ok(
+                    json!({"observations": [{"result": {"status":"unavailable", "reason":"too large"}}]}),
+                )
+            } else {
+                Ok(json!({"observations": [{"child": child_run_id}]}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_outcome_inspection_is_explicit_and_scoped_to_the_parent() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("test-model"));
+        let reconciler = Arc::new(OutcomeInspectionReconciler(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        spawner
+            .set_durable_agent_reconciler(reconciler.clone())
+            .await;
+        let receipt = handle_agent_spawn_action(
+            &json!({"description":"review", "prompt":"review the change"}),
+            Some(&ctx),
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        let agent_id = receipt["agent_id"].as_str().expect("spawned child");
+        let _ordinary =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        assert_eq!(
+            reconciler.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ordinary collection must not inspect dispatch storage"
+        );
+        let result = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {}}),
+            Some(&ctx),
+        )
+        .await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            result["tool_outcomes"]["observations"][0]["child"].is_string(),
+            "{result}"
+        );
+        let projection = astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire(
+            "get_result",
+            true,
+            Some(&result),
+        );
+        assert_eq!(
+            projection.outcome,
+            astra_turn_core::orchestration::agent_result_wire::AgentToolWireOutcomeKind::NoChange
+        );
+        assert_eq!(reconciler.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let mut other = ctx.clone();
+        other.run_id = "other-parent".into();
+        other.fanout_admission = spawner.fanout_parent(&other.run_id);
+        let denied = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {}}),
+            Some(&other),
+        )
+        .await;
+        assert!(!denied.contains("observations"), "{denied}");
+        assert_eq!(reconciler.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let unavailable = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {"exact": {
+                "turn_chain_id":"turn", "request_id":"request"}}}),
+            Some(&ctx),
+        )
+        .await;
+        let unavailable: Value = serde_json::from_str(&unavailable).unwrap();
+        assert_eq!(unavailable["status"], "tool_outcomes_unavailable");
+        assert_eq!(
+            unavailable["tool_outcomes"]["observations"][0]["result"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire(
+                "get_result",
+                true,
+                Some(&unavailable),
+            )
+            .outcome,
+            astra_turn_core::orchestration::agent_result_wire::AgentToolWireOutcomeKind::NoChange
+        );
     }
 
     pub(crate) fn test_spawner_without_executor() -> Arc<DynamicAgentSpawner> {

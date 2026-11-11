@@ -56,6 +56,19 @@ pub struct EdgeDispatchIdentity {
     pub request_id: String,
 }
 
+/// A bounded, read-only observation of a dispatch belonging to one run.
+#[derive(Debug, Clone)]
+pub struct EdgeDispatchObservation {
+    pub turn_chain_id: String,
+    pub request_id: String,
+    pub edge_agent_id: String,
+    pub status: String,
+    pub tool_name: Option<String>,
+    /// Present only for an exact read when the stored result fits the limit.
+    pub result_json: Option<String>,
+    pub result_too_large: bool,
+}
+
 impl EdgeDispatchIdentity {
     pub fn new(
         user_id: impl Into<String>,
@@ -190,6 +203,17 @@ pub trait EdgeDispatchService: Send + Sync {
         result_json: &str,
     ) -> Result<bool, String>;
 
+    /// Terminal runs may settle only a previously claimed dispatch or replay
+    /// the same completed result. An unclaimed pending request was not sent.
+    async fn deliver_terminal_result(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+        _result_json: &str,
+    ) -> Result<bool, String> {
+        Err("terminal dispatch settlement is unavailable".into())
+    }
+
     /// Whether this exact dispatch was already terminalized as a server-owned
     /// cancellation.  The callback endpoint may acknowledge a late
     /// `cancelled` result in that one case: the durable terminal outcome wins,
@@ -222,6 +246,19 @@ pub trait EdgeDispatchService: Send + Sync {
         identity: &EdgeDispatchIdentity,
         timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String>;
+
+    /// Explicitly inspect one run's retained dispatches. This is never used
+    /// for ordinary callbacks or normal child result collection.
+    async fn inspect_run_dispatches(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _after: Option<(&str, &str)>,
+        _exact: Option<(&str, &str)>,
+    ) -> Result<Vec<EdgeDispatchObservation>, String> {
+        Err("durable tool outcome inspection is unavailable".into())
+    }
 
     /// Clean up stale dispatches older than `older_than`.
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String>;
@@ -1407,6 +1444,101 @@ fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Resul
     ))
 }
 
+impl DatabaseEdgeDispatchService {
+    async fn deliver_result_matching(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+        allow_pending: bool,
+    ) -> Result<bool, String> {
+        let start = std::time::Instant::now();
+        let sql = if allow_pending {
+            "UPDATE edge_pending_dispatch \
+             SET status = 'completed', result_json = ?, completed_at = NOW(6) \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')"
+        } else {
+            "UPDATE edge_pending_dispatch \
+             SET status = 'completed', result_json = ?, completed_at = NOW(6) \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ? AND status = 'dispatched'"
+        };
+        let n = sqlx::query(sql)
+            .bind(result_json)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .bind(edge_agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
+        let updated = n.rows_affected() > 0;
+        // A reconnect may replay a result whose first delivery committed but
+        // whose ACK was lost. MatrixOne's JSON column may normalize object key
+        // order and whitespace, so compare JSON values rather than storage
+        // serialization. A semantically conflicting body remains rejected.
+        let accepted = if updated {
+            true
+        } else {
+            let row = sqlx::query(
+                "SELECT status, result_json \
+                 FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                   AND request_id = ? AND edge_agent_id = ?",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .bind(edge_agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
+            match row {
+                None => false,
+                Some(row) => {
+                    let status = row.try_get::<String, _>("status").map_err(|error| {
+                        format!("edge_dispatch replay status decode failed: {error}")
+                    })?;
+                    if status != "completed" {
+                        false
+                    } else {
+                        let body = row
+                            .try_get::<Option<String>, _>("result_json")
+                            .map_err(|error| {
+                                format!("edge_dispatch replay result_json decode failed: {error}")
+                            })?
+                            .ok_or_else(|| {
+                                "edge_dispatch completed replay row is missing result_json"
+                                    .to_string()
+                            })?;
+                        json_payloads_match(&body, result_json)?
+                    }
+                }
+            }
+        };
+        if let Some(ref m) = self.metrics {
+            m.dispatch_deliver_update_latency.record(start.elapsed());
+            if updated {
+                saturating_decrement(&m.dispatch_queue_depth);
+                m.dispatch_deliver_hits_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if !accepted {
+                m.dispatch_deliver_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if accepted {
+            self.wait_coordinator.resolve(identity, result_json).await;
+        }
+        Ok(accepted)
+    }
+}
+
 #[async_trait]
 impl EdgeDispatchService for DatabaseEdgeDispatchService {
     fn pending_limits(&self) -> Option<&EdgeDispatchLimits> {
@@ -1672,84 +1804,18 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String> {
-        let start = std::time::Instant::now();
-        let n = sqlx::query(
-            "UPDATE edge_pending_dispatch \
-             SET status = 'completed', result_json = ?, completed_at = NOW(6) \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-               AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')",
-        )
-        .bind(result_json)
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .bind(edge_agent_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
-        let updated = n.rows_affected() > 0;
-        // A reconnect may replay a result whose first delivery committed but
-        // whose ACK was lost. MatrixOne's JSON column may normalize object key
-        // order and whitespace, so compare JSON values rather than storage
-        // serialization. A semantically conflicting body remains rejected.
-        let accepted = if updated {
-            true
-        } else {
-            let row = sqlx::query(
-                "SELECT status, result_json \
-                 FROM edge_pending_dispatch \
-                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-                   AND request_id = ? AND edge_agent_id = ?",
-            )
-            .bind(&identity.user_id)
-            .bind(&identity.session_id)
-            .bind(&identity.run_id)
-            .bind(&identity.turn_chain_id)
-            .bind(&identity.request_id)
-            .bind(edge_agent_id)
-            .fetch_optional(&self.pool)
+        self.deliver_result_matching(identity, edge_agent_id, result_json, true)
             .await
-            .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
-            match row {
-                None => false,
-                Some(row) => {
-                    let status = row.try_get::<String, _>("status").map_err(|error| {
-                        format!("edge_dispatch replay status decode failed: {error}")
-                    })?;
-                    if status != "completed" {
-                        false
-                    } else {
-                        let body = row
-                            .try_get::<Option<String>, _>("result_json")
-                            .map_err(|error| {
-                                format!("edge_dispatch replay result_json decode failed: {error}")
-                            })?
-                            .ok_or_else(|| {
-                                "edge_dispatch completed replay row is missing result_json"
-                                    .to_string()
-                            })?;
-                        json_payloads_match(&body, result_json)?
-                    }
-                }
-            }
-        };
-        if let Some(ref m) = self.metrics {
-            m.dispatch_deliver_update_latency.record(start.elapsed());
-            if updated {
-                saturating_decrement(&m.dispatch_queue_depth);
-                m.dispatch_deliver_hits_total
-                    .fetch_add(1, Ordering::Relaxed);
-            } else if !accepted {
-                m.dispatch_deliver_misses_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if accepted {
-            self.wait_coordinator.resolve(identity, result_json).await;
-        }
-        Ok(accepted)
+    }
+
+    async fn deliver_terminal_result(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<bool, String> {
+        self.deliver_result_matching(identity, edge_agent_id, result_json, false)
+            .await
     }
 
     async fn is_server_cancelled_dispatch(
@@ -1833,6 +1899,83 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             self.wait_coordinator.resolve(identity, &result_json).await;
         }
         Ok(affected)
+    }
+
+    async fn inspect_run_dispatches(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+    ) -> Result<Vec<EdgeDispatchObservation>, String> {
+        if [user_id, session_id, run_id]
+            .iter()
+            .any(|part| part.trim().is_empty())
+            || after.is_some_and(|(turn, request)| turn.is_empty() || request.is_empty())
+            || exact.is_some_and(|(turn, request)| turn.is_empty() || request.is_empty())
+            || (after.is_some() && exact.is_some())
+        {
+            return Err("invalid dispatch inspection identity".into());
+        }
+        let mut query = sqlx::QueryBuilder::<MySql>::new(
+            "SELECT turn_chain_id, request_id, edge_agent_id, status, \
+             CASE WHEN OCTET_LENGTH(payload_json) <= 65536 THEN JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.tool')) ELSE NULL END AS tool_name, ",
+        );
+        if exact.is_some() {
+            // Keep the database/network read bounded even when a callback is huge.
+            query.push("CASE WHEN OCTET_LENGTH(result_json) <= 65536 THEN result_json ELSE NULL END AS bounded_result, \
+                        CASE WHEN OCTET_LENGTH(result_json) > 65536 THEN 1 ELSE 0 END AS result_too_large ");
+        } else {
+            query.push("NULL AS bounded_result, 0 AS result_too_large ");
+        }
+        query
+            .push("FROM edge_pending_dispatch WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND run_id = ")
+            .push_bind(run_id);
+        if let Some((turn, request)) = exact {
+            query
+                .push(" AND turn_chain_id = ")
+                .push_bind(turn)
+                .push(" AND request_id = ")
+                .push_bind(request);
+        } else if let Some((turn, request)) = after {
+            query
+                .push(" AND (turn_chain_id > ")
+                .push_bind(turn)
+                .push(" OR (turn_chain_id = ")
+                .push_bind(turn)
+                .push(" AND request_id > ")
+                .push_bind(request)
+                .push("))");
+        }
+        if exact.is_none() {
+            query.push(" ORDER BY turn_chain_id, request_id LIMIT 17");
+        }
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("edge dispatch inspection failed: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(EdgeDispatchObservation {
+                    turn_chain_id: row.try_get("turn_chain_id").map_err(|e| e.to_string())?,
+                    request_id: row.try_get("request_id").map_err(|e| e.to_string())?,
+                    edge_agent_id: row.try_get("edge_agent_id").map_err(|e| e.to_string())?,
+                    status: row.try_get("status").map_err(|e| e.to_string())?,
+                    tool_name: row.try_get("tool_name").map_err(|e| e.to_string())?,
+                    result_json: row.try_get("bounded_result").map_err(|e| e.to_string())?,
+                    result_too_large: row
+                        .try_get::<i32, _>("result_too_large")
+                        .map_err(|e| e.to_string())?
+                        != 0,
+                })
+            })
+            .collect()
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = ?timeout.map(|timeout| timeout.as_millis())))]
@@ -3051,6 +3194,99 @@ mod tests {
             error.contains("claimed 2 rows but updated 1"),
             "error should identify claim/update mismatch: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_tool_outcome_inspection_is_scoped_and_bounded() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let writer = DatabaseEdgeDispatchService::from_shared(&pool);
+        let reader = DatabaseEdgeDispatchService::from_shared(&pool);
+        let suffix = Uuid::new_v4().to_string();
+        let user = format!("inspect-{suffix}");
+        let session = format!("session-{suffix}");
+        let run = format!("run-{suffix}");
+        let edge = format!("edge-{suffix}");
+        for index in 0..18 {
+            let identity = EdgeDispatchIdentity::new(
+                &user,
+                &session,
+                &run,
+                "turn",
+                format!("request-{index:02}"),
+            );
+            writer
+                .admit_and_claim_direct_dispatch(
+                    &identity,
+                    &edge,
+                    &json!({"request_id": identity.request_id, "tool":"grep", "args":{}}),
+                )
+                .await
+                .unwrap();
+            let result = if index == 0 {
+                json!({"output":"large".repeat(20_000)})
+            } else {
+                json!({"output":format!("result-{index}")})
+            };
+            assert!(
+                writer
+                    .deliver_result(&identity, &edge, &result.to_string())
+                    .await
+                    .unwrap()
+            );
+        }
+        let page = reader
+            .inspect_run_dispatches(&user, &session, &run, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 17);
+        assert!(page.iter().all(|row| row.result_json.is_none()));
+        assert!(
+            page.iter()
+                .all(|row| row.tool_name.as_deref() == Some("grep"))
+        );
+        let next = reader
+            .inspect_run_dispatches(
+                &user,
+                &session,
+                &run,
+                Some((&page[15].turn_chain_id, &page[15].request_id)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 2);
+        let result = reader
+            .inspect_run_dispatches(&user, &session, &run, None, Some(("turn", "request-01")))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(result[0].result_json.as_ref().unwrap())
+                .unwrap()["output"],
+            "result-1"
+        );
+        let large = reader
+            .inspect_run_dispatches(&user, &session, &run, None, Some(("turn", "request-00")))
+            .await
+            .unwrap();
+        assert!(large[0].result_too_large);
+        assert!(large[0].result_json.is_none());
+        assert!(
+            reader
+                .inspect_run_dispatches("other-user", &session, &run, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query(
+            "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .bind(&run)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

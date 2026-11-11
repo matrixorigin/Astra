@@ -1272,6 +1272,8 @@ fn background_task_output_result_fields(
         "status": snapshot.status.as_str(),
         "terminal": snapshot.status.is_terminal(),
         "mode": observation_mode,
+        "end_offset": snapshot.end_offset,
+        "total_bytes": snapshot.total_bytes,
     });
     if let Some(revision) = snapshot.output_revision {
         observation["output_revision"] = json!(revision);
@@ -1509,7 +1511,24 @@ impl ToolExecutor {
         tool: &str,
         fields: Option<&serde_json::Map<String, Value>>,
     ) {
-        for id in unknown_shell_tasks(tool, fields) {
+        let unknown = unknown_shell_tasks(tool, fields);
+        for id in &unknown {
+            self.background_tasks.acknowledge_terminal(id);
+        }
+        if unknown.is_empty()
+            && tool == "task_output"
+            && let Some(observation) =
+                fields.and_then(|fields| fields.get("background_task_observation"))
+            && observation.get("task_kind").and_then(Value::as_str) == Some("shell")
+            && observation.get("terminal").and_then(Value::as_bool) == Some(true)
+            && observation.get("end_offset").and_then(Value::as_u64)
+                >= observation.get("total_bytes").and_then(Value::as_u64)
+            && observation
+                .get("total_bytes")
+                .and_then(Value::as_u64)
+                .is_some()
+            && let Some(id) = observation.get("task_id").and_then(Value::as_str)
+        {
             self.background_tasks.acknowledge_terminal(id);
         }
     }

@@ -106,6 +106,13 @@ unless the command itself requests them.
 Private cleanup uses the original directory handle; tasks in one namespace
 share that handle. A failed eviction keeps its owner for retry, and a full
 retention budget applies backpressure rather than dropping cleanup ownership.
+The task footer distinguishes unobserved terminal failures from an unknown
+execution or unconfirmed cleanup. Delivering a terminal output observation
+clears the former, but cannot settle the latter. The bounded workspace
+projection retains those terminal facts for retained tasks across session
+restoration; it does not recreate a process handle or a private capture. Once a
+task is evicted, only an in-memory count of unresolved outcomes or cleanup
+remains; the task identity and count are not restored after a process restart.
 Output chunks
 do not trigger model calls, and local waits perform no periodic SQL. A restored
 plain-shell projection can expose saved output but cannot recreate a lost

@@ -42,6 +42,8 @@ pub(crate) fn background_task_rows(
                 handle.observed_output_bytes(),
                 input_available,
                 handle.output_reference(),
+                handle.terminal_needs_attention(),
+                handle.terminal_outcome_unsettled(),
             )
         })
         .collect();
@@ -66,6 +68,8 @@ pub(crate) fn background_task_rows(
                 total_bytes,
                 input_available,
                 output_ref,
+                needs_attention,
+                outcome_unsettled,
             )| {
                 let output_error = output_error
                     .as_ref()
@@ -87,6 +91,7 @@ pub(crate) fn background_task_rows(
                 .with_terminal(exit_code, terminal_reason)
                 .with_timing(Some(started_at_ms), ended_at_ms)
                 .with_input_available(input_available)
+                .with_terminal_attention(needs_attention, outcome_unsettled)
                 .with_local_capture_paths(local_capture_paths)
             },
         )
@@ -487,8 +492,10 @@ pub(crate) fn pending_bash_handoff_row(
 pub(crate) fn sync_background_task_footer_from_rows(
     bottom_pane: &mut BottomPane,
     rows: &[super::bottom_pane::background_task_view::BackgroundTaskRow],
+    evicted_uncertain: usize,
 ) {
-    let counts = super::status_line::BackgroundTaskCounts::from_rows(rows);
+    let mut counts = super::status_line::BackgroundTaskCounts::from_rows(rows);
+    counts.unsettled_shells = counts.unsettled_shells.saturating_add(evicted_uncertain);
     bottom_pane.footer.bg_task_counts = if counts.is_empty() {
         None
     } else {
@@ -595,7 +602,11 @@ async fn reveal_background_task_view_rows_inner(
         background_task_rows_with_agents(background_registry, agent_spawner, restored_local_agents)
             .await;
     rows.extend(extra_rows);
-    sync_background_task_footer_from_rows(bottom_pane, &rows);
+    sync_background_task_footer_from_rows(
+        bottom_pane,
+        &rows,
+        background_registry.evicted_uncertain_count(),
+    );
     if bottom_pane.accepts_background_task_rows() {
         bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
         bottom_pane.sync_popups();
@@ -668,7 +679,11 @@ pub(crate) async fn dispatch_background_task_stop(
         restored_local_agents,
     )
     .await;
-    sync_background_task_footer_from_rows(bottom_pane, &rows);
+    sync_background_task_footer_from_rows(
+        bottom_pane,
+        &rows,
+        background_registry.evicted_uncertain_count(),
+    );
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
@@ -1039,6 +1054,13 @@ mod tests {
         BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
         BackgroundTaskRowInit, LiveControlState,
     };
+
+    #[test]
+    fn footer_includes_evicted_uncertain_outcomes() {
+        let mut pane = BottomPane::new();
+        sync_background_task_footer_from_rows(&mut pane, &[], 2);
+        assert_eq!(pane.footer.bg_task_counts.unwrap().unsettled_shells, 2);
+    }
 
     #[test]
     fn local_capture_paths_do_not_enter_the_model_task_list() {

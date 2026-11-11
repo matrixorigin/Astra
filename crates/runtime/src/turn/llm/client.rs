@@ -23332,6 +23332,13 @@ mod tests {
             &ThinkingConfig::Off,
         );
         let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(schema["properties"].get("tool_outcomes").is_none());
+        assert!(
+            body["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Discover agent for retained child tool outcomes")
+        );
         assert!(schema.get("x-astra-discovery-summary").is_none());
         assert!(
             schema["properties"]["action"]

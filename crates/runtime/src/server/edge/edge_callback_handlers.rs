@@ -292,9 +292,8 @@ pub(crate) async fn post_tool_result_handler(
     // A bearer token authenticates the caller, but does not make the
     // session/run identity in an arbitrary callback body trustworthy. Resolve
     // the strongest durable ownership root available before touching either
-    // delivery lane. Late callbacks for terminal runs are acknowledged and
-    // discarded: retrying cannot make them consumable, while enqueueing them
-    // would create a five-minute orphan.
+    // delivery lane. Terminal callbacks may only settle an existing exact
+    // durable dispatch; they must not reopen a local waiter or the run.
     let durable_target = match state
         .execution
         .run_lifecycle_service
@@ -312,28 +311,6 @@ pub(crate) async fn post_tool_result_handler(
         }
         Err(error) => return Err(error),
     };
-    if let Some(target) = durable_target
-        && astra_services::runs::durable_run_status_is_terminal(&target.status)
-    {
-        tracing::info!(
-            target: "astra_runtime::edge_callback",
-            request_id = %trace.request_id,
-            user_id = %user.user_id,
-            session_id = %body.session_id,
-            run_id = %body.run_id,
-            callback_request_id = %body.request_id,
-            run_status = %target.status,
-            "late tool result acknowledged without enqueueing after run termination"
-        );
-        return Ok(Json(serde_json::json!({
-        "ok": true,
-        "request_id": body.request_id,
-        "ledger_enqueued": false,
-        "dispatch_delivered": false,
-        "delivery_route": "terminal_discard",
-        "terminal_status": target.status,
-        })));
-    }
     // The HTTP callback is itself a persistence boundary. Do not put the
     // caller's raw output into the process ledger or cross-pod dispatch before
     // the later model/journal sanitizer gets a chance to run. Edge-owned
@@ -345,8 +322,8 @@ pub(crate) async fn post_tool_result_handler(
         astra_text_utils::credential_redaction::redact_credentials_for_display(&safe_body.output);
     safe_body.output = safe_output;
     if let Some(fields) = safe_body.tool_result_fields.as_mut() {
-        for value in fields.values_mut() {
-            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
+        for (key, value) in fields.iter_mut() {
+            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
         }
     }
     safe_body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
@@ -369,6 +346,53 @@ pub(crate) async fn post_tool_result_handler(
         &body.turn_chain_id,
         &body.request_id,
     );
+    if let Some(target) = durable_target
+        && astra_services::runs::durable_run_status_is_terminal(&target.status)
+    {
+        let dispatch = &state.execution.edge_dispatch_service;
+        let serialized = serde_json::to_string(&safe_body).map_err(|error| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid tool result: {error}"),
+            )
+        })?;
+        let accepted = dispatch
+            .deliver_terminal_result(&identity, &body.edge_agent_id, &serialized)
+            .await
+            .map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Cannot retain the late tool result",
+                )
+            })?;
+        let cancelled_ack = if !accepted && safe_body.status.eq_ignore_ascii_case("cancelled") {
+            dispatch
+                .is_server_cancelled_dispatch(&identity, &body.edge_agent_id)
+                .await
+                .map_err(|_| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Cannot verify the cancellation result",
+                    )
+                })?
+        } else {
+            false
+        };
+        if !accepted && !cancelled_ack {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "No matching unsettled tool dispatch can accept this result",
+            ));
+        }
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "request_id": body.request_id,
+            "ledger_enqueued": false,
+            "dispatch_delivered": accepted,
+            "delivery_route": if accepted { "terminal_dispatch" } else { "terminal_cancellation_ack" },
+            "terminal_status": target.status,
+        })));
+    }
     let key = tool_callback_key(&identity);
     let mut ledger_value = serde_json::json!({
         "kind": "tool_result",
@@ -2561,6 +2585,16 @@ mod edge_callback_insert_tests {
             Ok(self.deliver_result)
         }
 
+        async fn deliver_terminal_result(
+            &self,
+            identity: &EdgeDispatchIdentity,
+            edge_agent_id: &str,
+            result_json: &str,
+        ) -> Result<bool, String> {
+            self.deliver_result(identity, edge_agent_id, result_json)
+                .await
+        }
+
         async fn is_server_cancelled_dispatch(
             &self,
             _identity: &EdgeDispatchIdentity,
@@ -3991,15 +4025,20 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn late_tool_result_for_cancelled_run_is_idempotently_discarded() {
+    async fn late_cancellation_ack_preserves_the_cancelled_run() {
         let lifecycle = Arc::new(
             ApprovalTargetRunLifecycle::new("run-cancelled", "sess-cancelled")
                 .with_running_edge_wait(),
         );
         *lifecycle.status.lock().unwrap() = astra_core::STATUS_CANCELLED.to_string();
+        let dispatch = Arc::new(RecordingEdgeDispatch {
+            server_cancelled_dispatch: true,
+            ..Default::default()
+        });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(lifecycle);
+            .with_run_lifecycle_service(lifecycle)
+            .with_edge_dispatch_service(dispatch);
 
         let response = post_tool_result_handler(
             Extension(RequestTrace {
@@ -4025,12 +4064,229 @@ mod edge_callback_insert_tests {
         .expect("late terminal callback should be acknowledged without retry");
 
         assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["delivery_route"], "terminal_discard");
+        assert_eq!(response.0["delivery_route"], "terminal_cancellation_ack");
         assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
         assert!(
             state.edge_callback_ledger.lock().await.is_empty(),
             "a terminal run has no consumer, so its callback must not enter the ledger"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_result_settles_only_the_existing_dispatch() {
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new("run-late", "sess-late").with_running_edge_wait(),
+        );
+        *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
+        let dispatch = Arc::new(RecordingEdgeDispatch {
+            deliver_result: true,
+            ..Default::default()
+        });
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle)
+            .with_edge_dispatch_service(dispatch.clone());
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "sess-late".into(),
+                    run_id: "run-late".into(),
+                    turn_chain_id: "chain-late".into(),
+                    request_id: "req-late".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output: "retained output".into(),
+                    duration_ms: 12,
+                    tool_result_fields: json!({"password":"plain-private-value", "nested":{"password":"second-private-value"}}).as_object().cloned(),
+                },
+            )),
+        )
+        .await
+        .expect("the exact durable dispatch accepted the result");
+        assert_eq!(response.0["delivery_route"], "terminal_dispatch");
+        assert_eq!(response.0["terminal_status"], astra_core::STATUS_COMPLETED);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
+        let delivered = dispatch.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].1, "req-late");
+        assert_eq!(delivered[0].2, "edge-a");
+        assert!(delivered[0].3.contains("retained output"));
+        assert!(!delivered[0].3.contains("plain-private-value"));
+        assert!(!delivered[0].3.contains("second-private-value"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_late_terminal_callback_is_retrievable_without_reexecution() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let sender =
+            Arc::new(astra_services::multi_agent::DatabaseEdgeDispatchService::from_shared(&pool));
+        let receiver =
+            Arc::new(astra_services::multi_agent::DatabaseEdgeDispatchService::from_shared(&pool));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let session = format!("late-session-{suffix}");
+        let run = format!("late-run-{suffix}");
+        let identity = EdgeDispatchIdentity::new("u-approval", &session, &run, "chain", "request");
+        let pending = identity.for_request_id("unclaimed");
+        sender
+            .admit_dispatch(
+                &pending,
+                "edge-a",
+                &json!({"request_id":"unclaimed", "tool":"grep", "args":{}}),
+            )
+            .await
+            .unwrap();
+        sender
+            .admit_and_claim_direct_dispatch(
+                &identity,
+                "edge-a",
+                &json!({"request_id":"request", "tool":"grep", "args":{}}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            sender
+                .wait_result(&identity, Some(Duration::ZERO))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let lifecycle =
+            Arc::new(ApprovalTargetRunLifecycle::new(&run, &session).with_running_edge_wait());
+        *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle)
+            .with_edge_dispatch_service(receiver);
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: session.clone(),
+                run_id: run.clone(),
+                turn_chain_id: "chain".into(),
+                request_id: "request".into(),
+                edge_agent_id: "edge-a".into(),
+                status: "completed".into(),
+                output: "late result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let unclaimed = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: session.clone(),
+                run_id: run.clone(),
+                turn_chain_id: "chain".into(),
+                request_id: "unclaimed".into(),
+                edge_agent_id: "edge-a".into(),
+                status: "completed".into(),
+                output: "never dispatched".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let rejected = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(unclaimed),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        let pending_row = sender
+            .inspect_run_dispatches(
+                "u-approval",
+                &session,
+                &run,
+                None,
+                Some(("chain", "unclaimed")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_row[0].status, "pending");
+        for _ in 0..2 {
+            let response = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(body.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["delivery_route"], "terminal_dispatch");
+        }
+        for (edge, output, request) in [
+            ("edge-b", "late result", "request"),
+            ("edge-a", "different result", "request"),
+            ("edge-a", "late result", "other-request"),
+        ] {
+            let conflict = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: session.clone(),
+                    run_id: run.clone(),
+                    turn_chain_id: "chain".into(),
+                    request_id: request.into(),
+                    edge_agent_id: edge.into(),
+                    status: "completed".into(),
+                    output: output.into(),
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            );
+            let error = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(conflict),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+        }
+        let rows = sender
+            .inspect_run_dispatches(
+                "u-approval",
+                &session,
+                &run,
+                None,
+                Some(("chain", "request")),
+            )
+            .await
+            .unwrap();
+        let result = crate::server::tool_execution_service::canonical_edge_completion(
+            &identity,
+            "edge-a",
+            rows[0].result_json.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.output, "late result");
+        assert_eq!(rows.len(), 1);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
+        sqlx::query(
+            "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind("u-approval")
+        .bind(session)
+        .bind(run)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
