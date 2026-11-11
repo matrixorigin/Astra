@@ -147,6 +147,12 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"xox[bp]-[A-Za-z0-9-]+",
                 "SLACK_TOKEN"
             ),
+            // GitLab personal access tokens have a distinct glpat prefix.
+            pat_stream!(
+                r"glpat-[A-Za-z0-9_-]{20,}",
+                r"glpat-[A-Za-z0-9_-]+",
+                "GITLAB_TOKEN"
+            ),
             // HTTP Basic credentials are base64-encoded user:password.
             // Redact only the value, retaining the header name and scheme.
             pat_min!(
@@ -3086,6 +3092,29 @@ mod slack_token_redaction_regression_tests {
     #[test]
     fn leaves_short_slack_prefix_unchanged() {
         let text = "xoxb-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod gitlab_token_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_gitlab_personal_access_token() {
+        let secret = format!("{}-{}", "glpat", "A".repeat(32));
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("gitlab token: {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("GITLAB_TOKEN"));
+    }
+
+    #[test]
+    fn leaves_short_gitlab_prefix_unchanged() {
+        let text = "glpat-demo";
         let (redacted, count) = redact_credentials_for_display(text);
         assert_eq!(count, 0);
         assert_eq!(redacted, text);
