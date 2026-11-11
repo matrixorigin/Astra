@@ -500,7 +500,11 @@ def main():
         if args.mode in {"admit", "cleanup"}:
             return 1
         if args.mode == "schedule":
-            status = 1
+            # A source intentionally routed to hosted macOS is not a scheduler
+            # failure. Other unavailable conditions still fail visibly.
+            if not (isinstance(error, Unavailable)
+                    and str(error) == "source does not prefer mini"):
+                status = 1
     finally:
         if args.mode == "schedule" and src is not None:
             # One owner for cleanup, including obsolescence during admission.
