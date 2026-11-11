@@ -4236,7 +4236,10 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     }
                     // Keep each JSON response within the normal tool-output budget.
                     // Re-read only a bounded durable result on each explicit page request.
-                    let mut page_bytes = max_bytes;
+                    // An encoded JSON string needs at least two quote bytes.
+                    // Start at the largest possible fitting ASCII window so a
+                    // 4096-byte request is not immediately halved to 2048.
+                    let mut page_bytes = max_bytes.min(3498);
                     let (window, end, total, _) = loop {
                         let page = projection.window(offset, page_bytes);
                         let encoded = serde_json::to_string(&page.0)
@@ -4268,13 +4271,17 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                             ),
                             &row.edge_agent_id,
                         ))
-                    && receipt.kind == astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim
                 {
+                    use astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind;
+                    let (fact, action) = match receipt.kind {
+                        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => ("expired_before_claim", "expired"),
+                        EdgeDispatchServerReceiptKind::Cancelled => ("cancelled_before_claim", "was cancelled"),
+                    };
                     observation["result"] = json!({
                         "status": "unknown",
-                        "dispatch_fact": "expired_before_claim",
+                        "dispatch_fact": fact,
                         "execution_fact": "unknown",
-                        "reason": "This relay request expired before it was claimed; execution through another delivery path has not been ruled out."
+                        "reason": format!("This relay request {action} before it was claimed; execution through another delivery path has not been ruled out.")
                     });
                 } else {
                     observation["result"] = json!({"status":"unknown", "reason":"no validated executor result is available"});

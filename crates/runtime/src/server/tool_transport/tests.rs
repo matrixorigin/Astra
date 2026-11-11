@@ -119,6 +119,9 @@ struct StaticEdgeDispatch {
     return_result: bool,
     result_status: &'static str,
     terminal_admission_result: Option<String>,
+    wait_result_override: Option<String>,
+    timeout_server_receipt:
+        Option<astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
     wait_error: bool,
     cancel_on_empty_wait: Option<Arc<CancellationToken>>,
@@ -143,6 +146,8 @@ impl Default for StaticEdgeDispatch {
             return_result: true,
             result_status: "completed",
             terminal_admission_result: None,
+            wait_result_override: None,
+            timeout_server_receipt: None,
             admission_error: None,
             wait_error: false,
             cancel_on_empty_wait: None,
@@ -332,13 +337,24 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn reconcile_timeout(
         &self,
         identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
+        edge_agent_id: &str,
     ) -> Result<astra_services::multi_agent::edge_dispatch::TimeoutReconciliation, String> {
         use astra_services::multi_agent::edge_dispatch::{
             EdgeDispatchTerminal, TimeoutReconciliation, UnvalidatedEdgeResult,
         };
         if self.expire_hangs {
             return std::future::pending().await;
+        }
+        if let Some(kind) = self.timeout_server_receipt {
+            return Ok(TimeoutReconciliation::Terminal(
+                EdgeDispatchTerminal::ServerReceipt(
+                    astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt {
+                        kind,
+                        identity: identity.clone(),
+                        edge_agent_id: edge_agent_id.into(),
+                    },
+                ),
+            ));
         }
         self.failed_dispatches
             .lock()
@@ -387,6 +403,9 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     ) -> Result<Option<String>, String> {
         if self.wait_error {
             return Err("database observation failed".into());
+        }
+        if let Some(result) = &self.wait_result_override {
+            return Ok(Some(result.clone()));
         }
         if !self.return_result {
             if let Some(cancel) = &self.cancel_on_empty_wait {
@@ -4048,6 +4067,9 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
     );
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(metadata["retryable"], false);
+    assert!(!metadata.contains_key("execution_started"));
+    assert!(!metadata.contains_key("runtime_error"));
     assert!(result.output.contains("reconcile its durable invocation"));
     assert!(result.output.contains("database connection failed"));
     assert_eq!(
@@ -4120,7 +4142,7 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         metadata["reason"],
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED
     );
-    assert_eq!(metadata["blocked"], true);
+    assert!(!metadata.contains_key("blocked"));
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert!(result.output.contains("reconcile its durable invocation"));
@@ -4279,7 +4301,85 @@ async fn edge_dispatch_timeout_reports_unclaimed_relay_without_claiming_global_n
     assert_eq!(metadata["dispatch_fact"], "expired_before_claim");
     assert_eq!(metadata["execution_fact"], "unknown");
     assert_eq!(metadata["side_effects_maybe"], true);
+    assert!(!metadata.contains_key("execution_started"));
+    assert!(!metadata.contains_key("runtime_error"));
+    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
+    assert!(!metadata.contains_key("blocked"));
+    assert_eq!(
+        astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+            metadata.get("disposition"),
+            metadata.get("execution_started").and_then(Value::as_bool),
+            astra_tools::execution_outcome::outcome_is_unknown(Some(&metadata)),
+            astra_services::session_journal::ToolCallDisposition::Executed,
+        ),
+        astra_services::session_journal::ToolCallDisposition::Unknown
+    );
     assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result() {
+    use astra_services::multi_agent::edge_dispatch::{
+        EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
+    };
+    for lane in ["admission", "wait", "timeout"] {
+        let request = request(
+            "bash",
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+        let receipt = EdgeDispatchServerReceipt {
+            kind: EdgeDispatchServerReceiptKind::Cancelled,
+            identity: EdgeDispatchIdentity::new(
+                "user-1",
+                "session-1",
+                "run-1",
+                "chain-1",
+                plan.dispatch_request_id(),
+            ),
+            edge_agent_id: "edge-selected".into(),
+        };
+        let body = serde_json::to_string(&receipt).unwrap();
+        let dispatch = Arc::new(StaticEdgeDispatch {
+            terminal_admission_result: (lane == "admission").then(|| body.clone()),
+            wait_result_override: (lane == "wait").then(|| body.clone()),
+            timeout_server_receipt: (lane == "timeout")
+                .then_some(EdgeDispatchServerReceiptKind::Cancelled),
+            ..StaticEdgeDispatch::no_result()
+        });
+        let service = ToolExecutionService::builder()
+            .edge_dispatch_service(dispatch)
+            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+                agents: vec![edge_agent_record("edge-selected")],
+            }))
+            .build();
+        let local = CountingLocalTransport::new();
+        let result = service.execute(request, &local).await;
+        assert!(result.is_error, "{lane}");
+        assert!(
+            result
+                .output
+                .contains("was cancelled before this Edge relay request was claimed"),
+            "{lane}: {}",
+            result.output
+        );
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["dispatch_fact"], "cancelled_before_claim");
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+        assert!(!fields.contains_key("execution_started"));
+        assert_eq!(local.calls(), 0);
+    }
 }
 
 #[tokio::test]

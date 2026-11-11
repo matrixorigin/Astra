@@ -4680,10 +4680,8 @@ fn finish_bash_ownership(
         let fields = outcome
             .tool_result_fields
             .get_or_insert_with(Default::default);
-        fields.insert("execution_fact".into(), json!("unknown"));
+        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
         fields.insert("cleanup_unsettled".into(), json!(true));
-        fields.insert("side_effects_maybe".into(), json!(true));
-        fields.insert("retryable".into(), json!(false));
     }
     outcome
 }

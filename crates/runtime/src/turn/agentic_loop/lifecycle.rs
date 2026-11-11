@@ -528,7 +528,7 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed())
+        .filter(|record| record.was_executed() && !record.outcome_is_unknown())
         .count()
         .min(u32::MAX as usize) as u32
 }
@@ -542,13 +542,13 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed())
+        .filter(|record| record.was_executed() && !record.outcome_is_unknown())
         .count();
     let failed = state
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed() && !record.ok)
+        .filter(|record| record.was_executed() && !record.ok && !record.outcome_is_unknown())
         .count();
     let rejected = state
         .stall
@@ -559,6 +559,12 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
                 == astra_services::session_journal::ToolCallDisposition::Rejected
         })
         .count();
+    let unknown = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.outcome_is_unknown())
+        .count();
     let latest_failure = state
         .stall
         .tool_call_records
@@ -566,6 +572,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         .rev()
         .find(|record| {
             (record.was_executed() && !record.ok)
+                || record.outcome_is_unknown()
                 || record.effective_disposition()
                     == astra_services::session_journal::ToolCallDisposition::Rejected
         })
@@ -574,6 +581,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
                 "tool": record.name,
                 "error_kind": record.error_kind.map(|kind| format!("{kind:?}")),
                 "disposition": format!("{:?}", record.effective_disposition()),
+                "outcome_unknown": record.outcome_is_unknown(),
             })
         });
 
@@ -581,6 +589,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         "tool_calls_completed": executed,
         "tool_calls_failed": failed,
         "tool_calls_rejected": rejected,
+        "tool_calls_unknown": unknown,
         "latest_failure": latest_failure,
     })
 }
@@ -3233,6 +3242,27 @@ mod tests {
         assert_eq!(evidence["tool_calls_failed"], 1);
         assert_eq!(evidence["tool_calls_rejected"], 1);
         assert_eq!(evidence["latest_failure"]["tool"], "read_file");
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "write_file".into(),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Unknown),
+            error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+            ..Default::default()
+        });
+        let evidence = settlement_tool_outcome_evidence(&state);
+        assert_eq!(evidence["tool_calls_completed"], 1);
+        assert_eq!(evidence["tool_calls_unknown"], 1);
+        assert_eq!(evidence["latest_failure"]["tool"], "write_file");
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+            ..Default::default()
+        });
+        let evidence = settlement_tool_outcome_evidence(&state);
+        assert_eq!(evidence["tool_calls_completed"], 1);
+        assert_eq!(evidence["tool_calls_failed"], 1);
+        assert_eq!(evidence["tool_calls_unknown"], 2);
     }
 
     #[tokio::test]

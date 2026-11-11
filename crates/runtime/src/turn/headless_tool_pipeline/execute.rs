@@ -352,62 +352,9 @@ fn structured_command_is_error(fields: &Map<String, Value>) -> Option<bool> {
         .map(astra_tools::exit_semantics::CommandResultClass::is_tool_error)
 }
 
-pub(super) fn execution_error_kind(
-    tool_result_fields: Option<&Map<String, Value>>,
-) -> Option<astra_core::ErrorKind> {
-    tool_result_fields
-        .and_then(|fields| fields.get("error_kind"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(parse_execution_error_kind_tag)
-        .or_else(|| {
-            astra_tools::execution_outcome::outcome_is_unknown(tool_result_fields)
-                .then_some(astra_core::ErrorKind::ToolOutcomeUnknown)
-        })
-}
-
-pub(super) fn execution_recovery_evidence(
-    tool_result_fields: Option<&Map<String, Value>>,
-) -> Option<astra_core::ToolFailureEvidence> {
-    let fields = tool_result_fields?;
-    let mut evidence = fields
-        .get("recovery_evidence")
-        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
-        .cloned()
-        .and_then(|value| serde_json::from_value::<astra_core::ToolFailureEvidence>(value).ok())
-        .or_else(|| {
-            // Compact transport facts use the same evidence type as local
-            // tools, without classifying rendered banners.
-            let kind = execution_error_kind(Some(fields))?;
-            let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
-            evidence.retryable = fields
-                .get("retryable")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(|| kind.is_retryable());
-            Some(evidence)
-        })?;
-    if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) {
-        // Keep the source timeout/cancellation kind; uncertainty describes the
-        // outcome, not its transport cause. Both survive result compaction.
-        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
-        evidence.retryable = false;
-        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
-    }
-    Some(evidence)
-}
-
-fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
-    astra_core::ErrorKind::parse_tag(tag).or(match tag {
-        // These aliases are part of the existing Edge/Server wire contract;
-        // normalize them at the boundary instead of scattering string checks
-        // through recovery and turn-guard code.
-        "capability_denied" | "approval_denied" | "sandbox_denied" => {
-            Some(astra_core::ErrorKind::PolicyDenied)
-        }
-        "approval_timeout" => Some(astra_core::ErrorKind::ToolTimeout),
-        "transport_unavailable" => Some(astra_core::ErrorKind::ToolUnavailable),
-        _ => None,
-    })
-}
+pub(super) use astra_tools::execution_outcome::{
+    execution_error_kind, execution_recovery_evidence,
+};
 
 #[cfg(test)]
 mod tests {
@@ -750,6 +697,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                 fields.get("disposition"),
                 fields.get("execution_started").and_then(Value::as_bool),
+                astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                 astra_services::session_journal::ToolCallDisposition::Executed,
             ) == astra_services::session_journal::ToolCallDisposition::Rejected
         }) {

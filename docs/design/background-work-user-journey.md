@@ -90,8 +90,9 @@ removal. No automatic shell-effect attribution or source rollback is promised.
 Capture and queues are bounded. Each executor admits at most 32 simultaneous
 shell tasks, with a 50 MiB capture limit per task and 256 MiB retained terminal
 capture budget. The ordinary terminal history retains up to 32 completed and
-32 failed tasks; unresolved outcomes still keep their ownership under bounded
-admission. Each retained private capture pins two reader handles. Restored
+32 failed tasks. Unobserved unknown outcomes retain their output within the
+shared capture budget; admission applies backpressure when that budget is full.
+Each retained private capture pins two reader handles. Restored
 references remain read-only and cannot authorize deleting user files. Slow consumers
 retain terminal notifications under bounded launch backpressure. The existing
 safe-output cache has a 64 MiB text budget and a bounded entry count. Cached
@@ -106,17 +107,29 @@ unless the command itself requests them.
 Private cleanup uses the original directory handle; tasks in one namespace
 share that handle. A failed eviction keeps its owner for retry, and a full
 retention budget applies backpressure rather than dropping cleanup ownership.
-The task footer shows terminal failure notifications until they are displayed,
-and separately flags an unknown execution or unconfirmed cleanup. Displaying a
-notification does not claim that the model received the full output, and cannot
-settle an unknown outcome. If a session is restored before the terminal result
+The task footer keeps terminal failures visible until the model inspects the
+terminal result or a complete notification is delivered in a settled turn. An
+inspection acknowledges the terminal fact, not necessarily every output byte;
+partial and unavailable output are explicitly marked, and retained output can
+expire. It separately
+flags an unknown execution or unconfirmed cleanup. Displaying a notification
+alone does not prove model delivery or settle an unknown outcome. If a session
+is restored before the terminal result
 was observed, the failure may be shown again with its earlier delivery marked
-as unknown. When the workspace save succeeds, its bounded projection keeps the
-identity and facts of unknown outcomes or unconfirmed cleanup across session
-restoration; it does not recreate a process handle or a private capture. A
+as unknown. When the workspace save succeeds, its bounded projection retains
+the identity and facts of unknown outcomes or unconfirmed cleanup across session
+restoration; it does not recreate a process handle or a private capture. The
+task list describes retained history; a missing task does not establish whether
+it ran or caused effects. Unknown outcomes and cleanup-unconfirmed tasks stay
+retained. Known terminal history is bounded and
+may expire under pressure before an undelivered notification can be restored. A
 failed save is reported to the user and may leave older facts on disk.
-Observed output may be reclaimed independently of those facts. The shell
+Observed output may be reclaimed independently of unresolved facts. The shell
 concurrency limit counts live tasks separately from retained unconfirmed facts.
+The tool ledger distinguishes a delivered unknown outcome from a missing
+response: the former closes delivery accounting without asserting what ran,
+while the latter remains unresolved. A later exact inspection can still provide
+new execution evidence.
 The existing session workspace retains these facts across restart. If their
 bounded per-session limit is reached, starting a new session permits further
 commands but does not resolve prior outcomes. A failed workspace write warns

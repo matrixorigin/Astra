@@ -228,7 +228,11 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     assert_eq!(page["status"], "completed");
     assert_eq!(page["total_bytes"], 65536);
     let first = page["output"].as_str().unwrap();
-    assert!(!first.is_empty() && first.len() <= 3500);
+    assert_eq!(
+        first.len(),
+        3498,
+        "ASCII pages should use the existing response budget"
+    );
     assert_eq!(first, "x".repeat(first.len()));
     assert_eq!(page["next_offset"], first.len());
 
@@ -380,8 +384,12 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     );
     assert!(protected_output.contains("quoted:"), "{protected_output}");
 
+    for (kind, fact) in [
+        (astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim, "expired_before_claim"),
+        (astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::Cancelled, "cancelled_before_claim"),
+    ] {
     let receipt = astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt {
-        kind: astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim,
+        kind,
         identity: EdgeDispatchIdentity::new("u", &reconciler.session_id, &run, "turn", "request"),
         edge_agent_id: "edge".into(),
     };
@@ -401,8 +409,9 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         .await
         .unwrap();
     let result = &receipt_result["observations"][0]["result"];
-    assert_eq!(result["dispatch_fact"], "expired_before_claim");
+    assert_eq!(result["dispatch_fact"], fact);
     assert_eq!(result["execution_fact"], "unknown");
+    }
 }
 
 #[tokio::test]
@@ -891,6 +900,42 @@ fn completed_run_is_failed_before_commit_when_tool_ledger_is_open() {
         AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &state);
     assert_eq!(status, RunStatus::Failed);
     assert!(error.is_some());
+}
+
+#[test]
+fn completed_run_can_report_a_delivered_unknown_tool_outcome() {
+    use crate::turn::agentic_loop::host::ToolLedgerAttemptBatch;
+    use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+    let svc = test_service();
+    let request = test_request("exercise one tool");
+    let mut state =
+        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
+    state.total_tool_calls = 1;
+    state.tool_ledger_receipt.observe_round(
+        &ToolLedgerAttemptBatch::from_validated_provider_calls(&[json!({"id":"unknown-call"})]),
+        &[ToolCallRecord {
+            tool_call_id: Some("unknown-call".into()),
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Unknown),
+            ..Default::default()
+        }],
+    );
+    let outcome = Ok(AgenticLoopOutcome::Completed);
+    enforce_completed_tool_ledger_closure(&outcome, &mut state);
+    assert!(state.interruption.is_none());
+    assert_eq!(
+        state
+            .tool_ledger_receipt
+            .canonical_aggregate()
+            .result_classes
+            .unknown,
+        1
+    );
+    let (_, status, error) =
+        AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &state);
+    assert_eq!(status, RunStatus::Completed);
+    assert!(error.is_none());
 }
 
 #[test]

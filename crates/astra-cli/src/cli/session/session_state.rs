@@ -535,7 +535,7 @@ pub(crate) struct SessionState {
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
-    pub pending_bg_notifications: Vec<String>,
+    pub pending_bg_notifications: Vec<crate::cli::turn::local_run_control::RuntimeNotification>,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub(crate) background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry,

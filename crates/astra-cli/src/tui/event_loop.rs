@@ -4008,23 +4008,61 @@ async fn submit_active_runtime_notification(
             Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
         >,
     >,
-    content: &str,
+    notification: &crate::cli::turn::local_run_control::RuntimeNotification,
 ) -> Result<(), String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| "active run control is settling".to_string())?;
-    provider.accept_runtime_notification(content)
+    provider.accept_runtime_notification(notification.clone())
 }
 
-fn background_task_event_requires_model_attention(
+fn background_task_notification(
+    registry: &crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     event: &crate::edge_tools::background_tasks::BgTaskEvent,
-) -> bool {
-    matches!(
-        event,
-        crate::edge_tools::background_tasks::BgTaskEvent::Completed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Failed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Killed { .. }
-    )
+) -> Option<crate::cli::turn::local_run_control::RuntimeNotification> {
+    let mut content = crate::edge_tools::background_tasks::format_notification_xml(event);
+    if content.is_empty() {
+        return None;
+    }
+    let terminal_id = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Killed { id, .. } => Some(id),
+        _ => None,
+    };
+    if let Some(execution) = terminal_id
+        .and_then(|id| registry.model_context(id))
+        .and_then(|context| {
+            context
+                .get("execution")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+        })
+    {
+        if astra_tools::execution_outcome::outcome_is_unknown(Some(&execution)) {
+            content.push_str("\nExecution outcome is unknown and may have side effects; inspect state before retrying.");
+        }
+        if execution
+            .get("cleanup_unconfirmed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            content.push_str("\nProcess cleanup is unconfirmed.");
+        }
+    }
+    let complete_shell = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+            if registry.terminal_notification_is_complete(id) =>
+        {
+            Some(id.clone())
+        }
+        _ => None,
+    };
+    Some(crate::cli::turn::local_run_control::RuntimeNotification {
+        content,
+        complete_shell,
+    })
 }
 
 /// Service tool-to-workbench background commands in every event-loop phase.
@@ -9694,7 +9732,7 @@ pub(crate) async fn run_tui_session(
                                     "work_id": work_id,
                                     "action": "inspect the canonical Work plan, establish a useful task graph when the goal has multiple verifiable steps, and continue the Work"
                                 })
-                                .to_string(),
+                                .to_string().into(),
                             );
                             schedule_runtime_notification_wake(
                                 &mut runtime_notification_wake_at,
@@ -12338,16 +12376,18 @@ pub(crate) async fn run_tui_session(
                                                                     update.receipt,
                                                                 ),
                                                             );
-                                                            if let Some(notification) = update.notification
-                                                                && submit_active_runtime_notification(
+                                                            if let Some(notification) = update.notification {
+                                                                let notification = notification.into();
+                                                                if submit_active_runtime_notification(
                                                                     &active_turn_local_run_control,
                                                                     &notification,
                                                                 )
                                                                 .await
                                                                 .is_err()
-                                                            {
-                                                                deferred_active_bg_notifications
-                                                                    .push(notification);
+                                                                {
+                                                                    deferred_active_bg_notifications
+                                                                        .push(notification);
+                                                                }
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
@@ -12386,14 +12426,9 @@ pub(crate) async fn run_tui_session(
                                                     // the next turn instead of fabricating user input.
                                                     let bg_events = background_registry.poll_completions();
                                                     for event in &bg_events {
-                                                        if !background_task_event_requires_model_attention(event) {
+                                                        let Some(notification) = background_task_notification(&background_registry, event) else {
                                                             continue;
-                                                        }
-                                                        let notification =
-                                                            crate::edge_tools::background_tasks::format_notification_xml(event);
-                                                        if notification.is_empty() {
-                                                            continue;
-                                                        }
+                                                        };
                                                         let delivered = output_settled_at.is_none()
                                                             && submit_active_runtime_notification(
                                                                 &active_turn_local_run_control,
@@ -12515,7 +12550,7 @@ pub(crate) async fn run_tui_session(
                                             pending_runtime_notifications.retain(|notification| {
                                                 settled_agent_snapshot
                                                     .notification_still_requires_reconciliation(
-                                                        notification,
+                                                        &notification.content,
                                                     )
                                             });
                                         }
@@ -14016,7 +14051,7 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                     if !agent_notifications.is_empty() {
-                        state.pending_bg_notifications.extend(agent_notifications);
+                        state.pending_bg_notifications.extend(agent_notifications.into_iter().map(Into::into));
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
                     restored_local_agent_task_projections =
@@ -14046,11 +14081,7 @@ pub(crate) async fn run_tui_session(
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
-                    if !background_task_event_requires_model_attention(ev) {
-                        continue;
-                    }
-                    let notification = crate::edge_tools::background_tasks::format_notification_xml(ev);
-                    if !notification.is_empty() {
+                    if let Some(notification) = background_task_notification(&background_registry, ev) {
                         state.pending_bg_notifications.push(notification);
                     }
                 }
@@ -14553,6 +14584,82 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn background_failure_acknowledges_only_a_complete_settled_notification() {
+        use crate::cli::turn::local_run_control::LocalRunControl;
+        use crate::edge_tools::background_tasks::{BackgroundTaskRegistry, BgTaskEvent};
+        use astra_tools::execution_outcome::ToolExecutionOutcome;
+
+        for (output, unknown, complete) in [
+            ("short failure".to_string(), false, true),
+            ("x".repeat(4096), false, false),
+            ("outcome unavailable".to_string(), true, false),
+        ] {
+            let dir = crate::tests::test_temp_dir();
+            let mut registry = BackgroundTaskRegistry::new(dir.path().to_path_buf());
+            let mut task = registry
+                .start_shell(
+                    "test command",
+                    (dir.path().join("out"), dir.path().join("err"), None),
+                    true,
+                    false,
+                    None,
+                    move |_, _| async move {
+                        let mut result = ToolExecutionOutcome::error(output);
+                        if unknown {
+                            result.tool_result_fields = Some(serde_json::Map::from_iter([(
+                                "execution_fact".into(),
+                                serde_json::json!("unknown"),
+                            )]));
+                        }
+                        result
+                    },
+                )
+                .unwrap();
+            task.wait().await.unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(event) = registry
+                        .poll_completions()
+                        .into_iter()
+                        .find(|event| matches!(event, BgTaskEvent::Failed { .. }))
+                    {
+                        break event;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let notification = super::background_task_notification(&registry, &event).unwrap();
+            assert_eq!(notification.complete_shell.is_some(), complete);
+            if unknown {
+                assert!(notification.content.contains("outcome is unknown"));
+                assert!(notification.content.contains("cleanup is unconfirmed"));
+            }
+            let control = LocalRunControl::shared();
+            control.accept_runtime_notification(notification).unwrap();
+            assert_eq!(control.runtime_notifications_for_request().len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+
+            // A failed turn returns its request facts to the next turn.
+            let pending = control.take_pending_runtime_notifications();
+            assert_eq!(pending.len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+            control
+                .accept_runtime_notification(pending[0].clone())
+                .unwrap();
+            control.runtime_notifications_for_request();
+            for settled in control.commit_applied_runtime_notifications() {
+                settled.acknowledge(&registry);
+            }
+            assert_eq!(
+                registry.get(&task.id).unwrap().terminal_unobserved(),
+                !complete
+            );
+        }
+    }
+
     #[test]
     fn runtime_dependency_approval_uses_live_attachment_after_turn_binding() {
         use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse};

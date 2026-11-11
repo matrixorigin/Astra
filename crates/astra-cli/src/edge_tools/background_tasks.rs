@@ -232,7 +232,7 @@ impl TaskCompletion {
             .and_then(|fields| fields.get("cleanup_unsettled"))
             .and_then(Value::as_bool)
             == Some(true)
-            || (authoritative.is_none() && self.outcome_unknown())
+            || (authoritative != Some(true) && self.outcome_unknown())
     }
 }
 
@@ -832,9 +832,6 @@ impl BackgroundTaskRegistry {
             }
             let running = state.running_count();
             if running >= MAX_CONCURRENT_TASKS { return Err(format!("task limit reached ({MAX_CONCURRENT_TASKS} running)")); }
-            if state.unsettled_count() >= MAX_RETAINED_UNSETTLED_TASKS {
-                return Err("This session has too many unconfirmed tasks to retain safely. Start a new session to run more commands; earlier outcomes remain unresolved in this session.".into());
-            }
             let unresolved_bytes = state.tasks.values().filter(|task| {
                 task.terminal_unobserved() && task.completion.as_ref()
                     .and_then(|receiver| receiver.borrow().clone())
@@ -843,12 +840,15 @@ impl BackgroundTaskRegistry {
             if unresolved_bytes >= MAX_RETAINED_OUTPUT_BYTES {
                 return Err("Unconfirmed shell outcomes are using the output budget; inspect them before starting more tasks.".into());
             }
+            if state.pending_completions.len() >= 2 * (MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS) {
+                return Err("Task notifications are awaiting delivery; inspect existing tasks before launching more.".into());
+            }
             if state.tasks.values().filter(|task| task.capture.is_some()).count()
                 >= MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS {
                 return Err("Task output retention is full. Inspect pending results with task_output so their private output can be released, or resolve local output cleanup errors before starting more tasks.".into());
             }
-            if state.pending_completions.len() >= 2 * (MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS) {
-                return Err("Task notifications are awaiting delivery; inspect existing tasks before launching more.".into());
+            if state.unsettled_count() >= MAX_RETAINED_UNSETTLED_TASKS {
+                return Err("This session has too many unconfirmed tasks to retain safely. Start a new session to run more commands; earlier outcomes remain unresolved in this session.".into());
             }
             let id = format!("bg-shell-{}", uuid::Uuid::new_v4().simple());
             // Launch cancellation remains bound through terminal settlement.
@@ -885,9 +885,7 @@ impl BackgroundTaskRegistry {
                 };
                 let fields = outcome.tool_result_fields.get_or_insert_default();
                 if fields.get("error_kind").and_then(Value::as_str) == Some(astra_core::ErrorKind::ToolOutcomeUnknown.as_str()) {
-                    fields.insert("execution_fact".into(), json!("unknown"));
-                    fields.insert("side_effects_maybe".into(), json!(true));
-                    fields.insert("retryable".into(), json!(false));
+                    astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
                 }
                 fields.insert("task_id".into(), serde_json::json!(&task_id));
                 let exit_code = fields.get("exit_code").and_then(serde_json::Value::as_i64).and_then(|n| i32::try_from(n).ok());
@@ -1052,6 +1050,11 @@ impl BackgroundTaskRegistry {
                 }
             }
             facts.insert("error".into(), json!(terminal.error));
+            if terminal.cleanup_unconfirmed() {
+                facts.insert("cleanup_unconfirmed".into(), json!(true));
+            } else if terminal.outcome.tool_result_fields.as_ref().and_then(|fields| fields.get("cleanup_authoritative")).and_then(Value::as_bool) != Some(false) {
+                facts.insert("cleanup_unconfirmed".into(), json!(false));
+            }
             facts
         }).or_else(|| handle.restored_terminal_facts.as_ref().and_then(|facts| {
             (facts.outcome_unknown || facts.cleanup_unconfirmed).then(|| {
@@ -1065,10 +1068,15 @@ impl BackgroundTaskRegistry {
                 "error":"The prior process is no longer observable; its effects and cleanup are unknown."})
                 .as_object().expect("object literal").clone()
         }));
+        let terminal_reason = (handle.live_control == BgTaskLiveControl::StaleHandle && status.is_terminal())
+            .then_some(handle.terminal_reason.as_deref())
+            .flatten()
+            .map(|reason| astra_text_utils::credential_redaction::truncate_redacted_output(
+                astra_text_utils::credential_redaction::redact_credentials_for_display(reason).0, 1024));
         Some(
             json!({"task_id":id,"kind":"shell","status":if handle.live_control == BgTaskLiveControl::StaleHandle && !status.is_terminal() {"unavailable"} else {status.as_str()},
             "controls":{"observe":true,"wait":handle.completion.is_some(),"stdin":handle.stdin_available(),
-                "stop":handle.live_control.is_available() && !status.is_terminal(),"resume":false},"execution":execution}),
+                "stop":handle.live_control.is_available() && !status.is_terminal(),"resume":false},"execution":execution,"terminal_reason":terminal_reason}),
         )
         })
     }
@@ -1076,19 +1084,7 @@ impl BackgroundTaskRegistry {
     /// Advance the existing terminal cursor only after the owner has handed
     /// the result to its consumer or received the server's callback ACK.
     pub fn acknowledge_terminal(&self, id: &str) {
-        self.with_state(|state| {
-            if let Some(handle) = state.tasks.get_mut(id) {
-                let changed = (handle.background || handle.outcome_unsettled())
-                    && handle.status().is_terminal()
-                    && handle.terminal_unobserved();
-                handle.acknowledge_terminal();
-                if changed {
-                    handle.work_revision = handle.work_revision.saturating_add(1);
-                    state.push_event(BgTaskEvent::Updated { id: id.to_string() });
-                    state.publish_task(id);
-                }
-            }
-        });
+        self.with_state(|state| state.acknowledge_terminal(id));
     }
 
     #[cfg(test)]
@@ -1211,10 +1207,6 @@ impl BackgroundTaskRegistry {
             state.unsettled_count() != 0
         })
     }
-    pub fn can_spawn_shell_task(&self) -> bool {
-        self.with_state(|state| state.can_spawn_shell_task())
-    }
-
     /// Reclaim delivered history before opening another capture if the local
     /// process is near its descriptor limit. Unacknowledged unknown outcomes
     /// remain retained.
@@ -1251,7 +1243,7 @@ impl BackgroundTaskRegistry {
         .into_iter()
     }
 
-    /// Snapshot the task rows and undelivered UI failures under one lock.
+    /// Snapshot task rows and failure attention under one lock.
     pub(crate) fn attention_snapshot(&self) -> Vec<(BackgroundTaskHandle, bool)> {
         self.with_state(|state| {
             state.drain_join_set();
@@ -1267,8 +1259,51 @@ impl BackgroundTaskRegistry {
                 .tasks
                 .values()
                 .filter(|task| task.background || task.outcome_unsettled())
-                .map(|task| (task.clone(), pending.contains(task.id.as_str())))
+                .map(|task| {
+                    (
+                        task.clone(),
+                        pending.contains(task.id.as_str()) || task.terminal_unobserved(),
+                    )
+                })
                 .collect()
+        })
+    }
+
+    /// Whether the existing terminal notification contains the whole known
+    /// result. Unknown or truncated results still require explicit inspection.
+    pub(crate) fn terminal_notification_is_complete(&self, id: &str) -> bool {
+        self.with_state(|state| {
+            let Some(task) = state.tasks.get(id) else {
+                return false;
+            };
+            let Some(terminal) = task
+                .completion
+                .as_ref()
+                .and_then(|receiver| receiver.borrow().clone())
+            else {
+                return false;
+            };
+            let fields = terminal.outcome.tool_result_fields.as_ref();
+            matches!(
+                terminal.status,
+                BgTaskStatus::Completed | BgTaskStatus::Failed
+            ) && !terminal.outcome_unknown()
+                && !terminal.cleanup_unconfirmed()
+                && task.output_complete() == Some(true)
+                && terminal.outcome.output.len() <= 2048
+                && task
+                    .capture
+                    .as_ref()
+                    .is_none_or(|capture| capture.bytes() <= 2048)
+                && fields
+                    .and_then(|fields| fields.get("task_output_retained"))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                && fields
+                    .and_then(|fields| fields.get("bash_output_capture"))
+                    .and_then(|capture| capture.get("complete"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
         })
     }
     pub fn export_shell_task_projections(&mut self) -> Vec<BackgroundShellTaskProjection> {
@@ -1558,6 +1593,25 @@ impl TaskRegistryState {
             output_probe_rx,
             last_output_probe_started: None,
             active_work_registry: None,
+        }
+    }
+
+    fn acknowledge_terminal(&mut self, id: &str) {
+        self.drain_join_set();
+        if let Some(handle) = self.tasks.get_mut(id) {
+            let changed = (handle.background || handle.outcome_unsettled())
+                && handle.status().is_terminal()
+                && handle.terminal_unobserved();
+            handle.acknowledge_terminal();
+            if changed {
+                handle.work_revision = handle.work_revision.saturating_add(1);
+                if self.active_work_registry.is_some() {
+                    self.push_event(BgTaskEvent::Updated { id: id.to_string() });
+                } else {
+                    self.pending_completions.retain(|event| event.id() != id);
+                }
+                self.publish_task(id);
+            }
         }
     }
 
@@ -1860,6 +1914,14 @@ impl TaskRegistryState {
             return;
         }
         self.publish_task(&completion_id);
+        if self.active_work_registry.is_none()
+            && self
+                .tasks
+                .get(&completion_id)
+                .is_some_and(|handle| !handle.terminal_unobserved())
+        {
+            return;
+        }
         if let Some(event) = completion.event(title) {
             self.push_event(event);
         }
@@ -2157,11 +2219,6 @@ impl TaskRegistryState {
             .values()
             .filter(|h| h.live_control.is_available() && !h.status().is_terminal())
             .count()
-    }
-
-    pub fn can_spawn_shell_task(&self) -> bool {
-        self.running_count() < MAX_CONCURRENT_TASKS
-            && self.unsettled_count() < MAX_RETAINED_UNSETTLED_TASKS
     }
 
     fn unsettled_count(&self) -> usize {
@@ -3220,7 +3277,7 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
                  <summary>{}</summary>\n\
                  </background_task_notification>",
                 xml_escape(title),
-                exit_code.unwrap_or(0),
+                exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
                 xml_escape(summary),
             )
         }
@@ -3377,7 +3434,7 @@ mod tests {
     async fn panicked_runner_converges_to_failed_event_and_handle() {
         let tmp = crate::tests::test_temp_dir();
         let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let task = registry
+        let mut task = registry
             .start_shell(
                 "panicking task",
                 (tmp.path().join("stdout"), tmp.path().join("stderr"), None),
@@ -3387,6 +3444,11 @@ mod tests {
                 |_, _| async { panic!("injected runner panic") },
             )
             .expect("registered");
+        let outcome = task.wait().await.unwrap();
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert!(!fields.contains_key("disposition"));
+        assert!(!fields.contains_key("execution_started"));
         let task_id = task.id;
 
         let events = wait_for_task_terminal(&mut registry, &task_id).await;
@@ -3450,7 +3512,6 @@ mod tests {
             dirs.push(dir);
         }
 
-        assert!(!reg.can_spawn_shell_task());
         let error = reg
             .start_shell(
                 "true",
@@ -5459,6 +5520,39 @@ mod tests {
         assert!(restarted.get("unobserved-unknown").is_some());
     }
 
+    #[tokio::test]
+    async fn unknown_with_non_authoritative_cleanup_stays_unknown_after_restore() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let mut task = registry
+            .start_shell(
+                "unknown",
+                (tmp.path().join("out"), tmp.path().join("err"), None),
+                true,
+                false,
+                None,
+                |_, _| async {
+                    let mut result = ToolExecutionOutcome::error("transport lost".into());
+                    result.tool_result_fields = Some(serde_json::Map::from_iter([
+                        ("execution_fact".into(), json!("unknown")),
+                        ("cleanup_authoritative".into(), json!(false)),
+                    ]));
+                    result
+                },
+            )
+            .unwrap();
+        task.wait().await.unwrap();
+        let projections = registry.export_shell_task_projections();
+        let mut restored = BackgroundTaskRegistry::new(tmp.path().join("restore-weak-cleanup"));
+        restored
+            .restore_shell_task_projections(projections)
+            .unwrap();
+        assert_eq!(
+            restored.model_context(&task.id).unwrap()["execution"]["cleanup_unconfirmed"],
+            true
+        );
+    }
+
     #[test]
     fn retention_preserves_observed_uncertain_task_identity_across_restart() {
         let tmp = crate::tests::test_temp_dir();
@@ -5523,7 +5617,6 @@ mod tests {
             );
             reg.with_state(|state| state.tasks.insert(task.id.clone(), task));
         }
-        assert!(reg.can_spawn_shell_task());
         let mut task = reg
             .start_shell(
                 "true",
@@ -5581,6 +5674,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_pressure_keeps_observed_unknown_identity_even_after_cleanup() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let mut original = registry
+            .start_shell(
+                "uncertain operation",
+                (tmp.path().join("out"), tmp.path().join("err"), None),
+                true,
+                false,
+                None,
+                |_, _| async {
+                    let mut outcome = ToolExecutionOutcome::error("unknown".into());
+                    outcome.tool_result_fields = Some(serde_json::Map::from_iter([
+                        ("execution_fact".into(), json!("unknown")),
+                        ("cleanup_authoritative".into(), json!(true)),
+                    ]));
+                    outcome
+                },
+            )
+            .unwrap();
+        original.wait().await.unwrap();
+        registry.acknowledge_terminal(&original.id);
+        for index in 0..MAX_RETAINED_UNSETTLED_TASKS - 1 {
+            let (mut task, _dir) = test_handle_with_status(BgTaskStatus::Failed);
+            task.id = format!("uncertain-{index}");
+            task.live_control = BgTaskLiveControl::StaleHandle;
+            task.restored_terminal_facts = Some(
+                astra_services::session_workspace::BackgroundShellTerminalFacts {
+                    unobserved: false,
+                    outcome_unknown: true,
+                    cleanup_unconfirmed: true,
+                },
+            );
+            registry.with_state(|state| state.tasks.insert(task.id.clone(), task));
+        }
+        let error = registry
+            .start_shell(
+                "next",
+                (
+                    tmp.path().join("next-out"),
+                    tmp.path().join("next-err"),
+                    None,
+                ),
+                true,
+                false,
+                None,
+                |_, _| async { ToolExecutionOutcome::ok("unexpected".into()) },
+            )
+            .err()
+            .expect("bounded history must not erase the unknown result");
+        assert!(error.contains("remain unresolved"), "{error}");
+        assert!(registry.get(&original.id).unwrap().outcome_unsettled());
+        let projections = registry.export_shell_task_projections();
+        assert!(projections.iter().any(|task| task.id == original.id));
+        let mut restored = BackgroundTaskRegistry::new(tmp.path().join("restored-pressure"));
+        restored
+            .restore_shell_task_projections(projections)
+            .unwrap();
+        assert!(restored.get(&original.id).unwrap().outcome_unsettled());
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn restored_running_tasks_remain_bounded_unknown_across_restarts() {
         let tmp = crate::tests::test_temp_dir();
@@ -5604,7 +5759,6 @@ mod tests {
                 .unwrap();
         }
         for generation in 0..2 {
-            assert!(registry.can_spawn_shell_task());
             let facts = registry.model_context("stale-0").unwrap();
             assert_eq!(facts["status"], "unavailable");
             assert_eq!(facts["execution"]["execution_fact"], "unknown");
@@ -5629,7 +5783,6 @@ mod tests {
             registry.export_shell_task_projections().len(),
             MAX_CONCURRENT_TASKS + 1
         );
-        assert!(registry.can_spawn_shell_task());
     }
 
     #[tokio::test]
@@ -5758,7 +5911,6 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(registry.can_spawn_shell_task());
         let projections = registry.export_shell_task_projections();
         assert_eq!(projections.len(), MAX_CONCURRENT_TASKS);
         assert!(projections.iter().all(|task| {
@@ -5766,7 +5918,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|facts| facts.outcome_unknown)
         }));
-        assert!(registry.can_spawn_shell_task());
     }
 
     #[tokio::test]
@@ -5833,6 +5984,13 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for idx in 0..(MAX_RETAINED_COMPLETED_TASKS + 2) {
             let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
+            handle.restored_terminal_facts = Some(
+                astra_services::session_workspace::BackgroundShellTerminalFacts {
+                    unobserved: false,
+                    outcome_unknown: false,
+                    cleanup_unconfirmed: false,
+                },
+            );
             handle.id = format!("completed-{idx}");
             handle.started_at_ms = idx as u64;
             handle.ended_at_ms = Some(idx as u64);
@@ -5844,6 +6002,13 @@ mod tests {
         }
         for idx in 0..(MAX_RETAINED_FAILED_TASKS + 2) {
             let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Failed);
+            handle.restored_terminal_facts = Some(
+                astra_services::session_workspace::BackgroundShellTerminalFacts {
+                    unobserved: false,
+                    outcome_unknown: false,
+                    cleanup_unconfirmed: false,
+                },
+            );
             handle.id = format!("failed-{idx}");
             handle.started_at_ms = idx as u64;
             handle.ended_at_ms = Some(idx as u64);
@@ -5955,6 +6120,17 @@ mod tests {
         assert!(!xml.contains("<job_id>"));
         assert!(xml.contains("&lt;unexpected&gt;"));
         assert!(xml.contains("&amp;"));
+    }
+
+    #[test]
+    fn notification_does_not_invent_a_zero_exit_code() {
+        let event = BgTaskEvent::Completed {
+            id: "bg-1".into(),
+            title: "work".into(),
+            exit_code: None,
+            summary: "done".into(),
+        };
+        assert!(format_notification_xml(&event).contains("<exit_code>unknown</exit_code>"));
     }
 
     #[tokio::test]

@@ -2958,7 +2958,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_list",
-                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
+                "description": "List retained background tasks for this session with kind, status, and ids. Older terminal tasks may expire; absence does not establish whether a task ran or caused effects. Use to discover tasks to inspect or stop.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,

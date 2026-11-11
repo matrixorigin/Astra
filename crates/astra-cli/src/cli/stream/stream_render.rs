@@ -9119,6 +9119,7 @@ mod tests {
                 ToolCallDisposition::from_execution_metadata(
                     fields.get("disposition"),
                     fields.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                     ToolCallDisposition::Executed,
                 ),
                 ToolCallDisposition::Rejected

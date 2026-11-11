@@ -357,20 +357,7 @@ pub(crate) async fn post_tool_result_handler(
                     "Cannot retain the late tool result",
                 )
             })?;
-        let cancelled_ack = if !accepted && safe_body.status.eq_ignore_ascii_case("cancelled") {
-            dispatch
-                .is_server_cancelled_dispatch(&identity, &body.edge_agent_id)
-                .await
-                .map_err(|_| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Cannot verify the cancellation result",
-                    )
-                })?
-        } else {
-            false
-        };
-        if !accepted && !cancelled_ack {
+        if !accepted {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 "No matching unsettled tool dispatch can accept this result",
@@ -381,7 +368,7 @@ pub(crate) async fn post_tool_result_handler(
             "request_id": body.request_id,
             "ledger_enqueued": false,
             "dispatch_delivered": accepted,
-            "delivery_route": if accepted { "terminal_dispatch" } else { "terminal_cancellation_ack" },
+            "delivery_route": "terminal_dispatch",
             "terminal_status": target.status,
         })));
     }
@@ -493,58 +480,17 @@ pub(crate) async fn post_tool_result_handler(
             body.edge_agent_id.as_str(),
         );
 
-    // A server cancellation races the edge executor's process cancellation:
-    // `fail_dispatch(..., "cancelled")` has already made the durable outcome
-    // authoritative by the time the executor reports its own cancelled tool.
-    // Acknowledge only that exact, authenticated terminal shape.  In
-    // particular, do not turn an arbitrary late/completed callback into a
-    // success or allow it to overwrite a divergent terminal result.
-    let server_cancelled_dispatch = if !local_callback_accepted
-        && !local_cancelled_callback_ack
-        && !dispatch_delivered
-        && safe_body.status.eq_ignore_ascii_case("cancelled")
-    {
-        match dispatch_svc
-            .is_server_cancelled_dispatch(&identity, edge_agent_id)
-            .await
-        {
-            Ok(cancelled) => cancelled,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::edge_callback",
-                    user_id = %user.user_id,
-                    session_id = %body.session_id,
-                    run_id = %body.run_id,
-                    turn_chain_id = %body.turn_chain_id,
-                    request_id = %body.request_id,
-                    edge_agent_id = %safe_edge_agent_id,
-                    %error,
-                    "Edge: unable to inspect a rejected cancelled tool callback"
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
-
     let delivery_route = if dispatch_delivered {
         "durable_dispatch"
     } else if local_callback_accepted {
         "same_pod_ledger"
     } else if local_cancelled_callback_ack {
         "terminal_local_cancelled"
-    } else if server_cancelled_dispatch {
-        "terminal_dispatch_cancelled"
     } else {
         "none"
     };
 
-    if ledger_capacity_exceeded
-        && !dispatch_delivered
-        && !local_cancelled_callback_ack
-        && !server_cancelled_dispatch
-    {
+    if ledger_capacity_exceeded && !dispatch_delivered && !local_cancelled_callback_ack {
         tracing::warn!(
             target: "astra_runtime::edge_callback",
             user_id = %user.user_id,
@@ -560,11 +506,7 @@ pub(crate) async fn post_tool_result_handler(
             LedgerInsertError::CapacityExceeded,
         ));
     }
-    if !local_callback_accepted
-        && !dispatch_delivered
-        && !local_cancelled_callback_ack
-        && !server_cancelled_dispatch
-    {
+    if !local_callback_accepted && !dispatch_delivered && !local_cancelled_callback_ack {
         tracing::warn!(
             target: "astra_runtime::edge_callback",
             user_id = %user.user_id,
@@ -2550,7 +2492,6 @@ mod edge_callback_insert_tests {
     #[derive(Default)]
     struct RecordingEdgeDispatch {
         deliver_result: bool,
-        server_cancelled_dispatch: bool,
         delivered: Mutex<Vec<(String, String, String, String)>>,
     }
 
@@ -2587,14 +2528,6 @@ mod edge_callback_insert_tests {
         ) -> Result<bool, String> {
             self.deliver_result(identity, edge_agent_id, result_json)
                 .await
-        }
-
-        async fn is_server_cancelled_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-        ) -> Result<bool, String> {
-            Ok(self.server_cancelled_dispatch)
         }
 
         async fn fail_dispatch(
@@ -3759,7 +3692,6 @@ mod edge_callback_insert_tests {
             );
             let dispatch = Arc::new(RecordingEdgeDispatch {
                 deliver_result: true,
-                server_cancelled_dispatch: false,
                 delivered: Mutex::new(Vec::new()),
             });
             let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
@@ -3834,10 +3766,9 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_callback_is_acknowledged_after_server_cancels_exact_dispatch() {
+    async fn cancelled_callback_without_a_claim_is_not_acknowledged() {
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: false,
-            server_cancelled_dispatch: true,
             delivered: Mutex::new(Vec::new()),
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
@@ -3848,7 +3779,7 @@ mod edge_callback_insert_tests {
             ))
             .with_edge_dispatch_service(dispatch.clone());
 
-        let response = post_tool_result_handler(
+        let error = post_tool_result_handler(
             Extension(RequestTrace {
                 request_id: "trace-server-cancelled".into(),
             }),
@@ -3869,10 +3800,9 @@ mod edge_callback_insert_tests {
             )),
         )
         .await
-        .expect("a server-owned cancellation must acknowledge the executor callback");
+        .expect_err("an unclaimed dispatch must not acknowledge an executor callback");
 
-        assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["delivery_route"], "terminal_dispatch_cancelled");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert!(state.edge_callback_ledger.lock().await.is_empty());
         assert_eq!(dispatch.delivered.lock().unwrap().len(), 1);
     }
@@ -3982,7 +3912,6 @@ mod edge_callback_insert_tests {
     async fn completed_callback_is_not_acknowledged_by_cancelled_dispatch_receipt() {
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: false,
-            server_cancelled_dispatch: true,
             delivered: Mutex::new(Vec::new()),
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
@@ -4026,13 +3955,13 @@ mod edge_callback_insert_tests {
         );
         *lifecycle.status.lock().unwrap() = astra_core::STATUS_CANCELLED.to_string();
         let dispatch = Arc::new(RecordingEdgeDispatch {
-            server_cancelled_dispatch: true,
+            deliver_result: true,
             ..Default::default()
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
             .with_run_lifecycle_service(lifecycle)
-            .with_edge_dispatch_service(dispatch);
+            .with_edge_dispatch_service(dispatch.clone());
 
         let response = post_tool_result_handler(
             Extension(RequestTrace {
@@ -4058,7 +3987,8 @@ mod edge_callback_insert_tests {
         .expect("late terminal callback should be acknowledged without retry");
 
         assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["delivery_route"], "terminal_cancellation_ack");
+        assert_eq!(response.0["delivery_route"], "terminal_dispatch");
+        assert_eq!(dispatch.delivered.lock().unwrap().len(), 1);
         assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
         assert!(
             state.edge_callback_ledger.lock().await.is_empty(),
@@ -4162,6 +4092,13 @@ mod edge_callback_insert_tests {
             ),
             "a waiting timeout must not retire an already claimed dispatch"
         );
+        assert!(
+            !sender
+                .fail_dispatch(&identity, "edge-a", "cancelled")
+                .await
+                .unwrap(),
+            "cancellation must not discard a claimed request's eventual result"
+        );
         let expired = identity.for_request_id("expired-before-claim");
         sender
             .admit_dispatch(
@@ -4218,7 +4155,7 @@ mod edge_callback_insert_tests {
                 tool_result_fields: None,
             },
         );
-        *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
+        *lifecycle.status.lock().unwrap() = astra_core::STATUS_CANCELLED.to_string();
         let rejected = post_tool_result_handler(
             Extension(RequestTrace {
                 request_id: "trace".into(),
@@ -4253,6 +4190,7 @@ mod edge_callback_insert_tests {
             .await
             .unwrap();
             assert_eq!(response.0["delivery_route"], "terminal_dispatch");
+            assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
         }
         for (edge, output, request) in [
             ("edge-b", "late result", "request"),
@@ -4688,7 +4626,6 @@ mod edge_callback_insert_tests {
         );
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: true,
-            server_cancelled_dispatch: false,
             delivered: Mutex::new(Vec::new()),
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
