@@ -1540,6 +1540,21 @@ impl TaskRegistryState {
     }
 
     fn push_event(&mut self, event: BgTaskEvent) {
+        // The terminal event also triggers persistence of the latest result
+        // acknowledgement. Do not replace it before the TUI can display it.
+        if matches!(event, BgTaskEvent::Observed { .. })
+            && self.pending_completions.iter().any(|pending| {
+                pending.id() == event.id()
+                    && matches!(
+                        pending,
+                        BgTaskEvent::Completed { .. }
+                            | BgTaskEvent::Failed { .. }
+                            | BgTaskEvent::Killed { .. }
+                    )
+            })
+        {
+            return;
+        }
         self.pending_completions.retain(|pending| {
             pending.id() != event.id()
                 || (matches!(pending, BgTaskEvent::Started { .. })

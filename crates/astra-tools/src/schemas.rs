@@ -1901,6 +1901,7 @@ fn child_tool_outcomes_schema() -> Value {
     json!({
         "type": "object",
         "description": "For get_result: inspect retained child tool outcomes without executing tools. Omit fields for the first page; use after for the next page or exact to read one result. Use offset and max_bytes to page through an exact result. Results over 64 KiB serialized are unavailable; missing results remain unknown.",
+        "x-astra-discovery-summary": "get_result: {} lists; after pages the list; exact selects turn_chain_id/request_id. With exact, offset and max_bytes page output. Over 64 KiB serialized or missing: unavailable/unknown, not proof of nonexecution.",
         "properties": {"after": key.clone(), "exact": key, "offset": {"type":"integer", "minimum":0}, "max_bytes": {"type":"integer", "minimum":64, "maximum":4096}},
         "additionalProperties": false
     })

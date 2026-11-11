@@ -984,6 +984,27 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
             .unwrap()
             .contains(&json!("wait"))
     );
+    let inspect = json!({"action":"get_result", "agent_id":"child", "tool_outcomes":{}});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &inspect, agent)
+            .is_err()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &inspect,
+        canonical_agent,
+    )
+    .expect("child outcome inspection remains callable through the selected full contract");
+    let search = astra_tools::tool_search::tool_search(&full, &json!({"query":"select:agent"}));
+    let search: Value = serde_json::from_str(&search).expect("tool search returns JSON");
+    assert_eq!(search["status"], "completed", "{search}");
+    let guidance = search["matches"][0]["parameters"]["properties"]["tool_outcomes"]["description"]
+        .as_str()
+        .expect("selected child outcome guidance");
+    for term in ["after", "exact", "offset", "64 KiB", "unknown"] {
+        assert!(guidance.contains(term), "missing {term}: {guidance}");
+    }
+
     for schema in [agent, canonical_agent] {
         assert!(
             astra_tools::schemas::validate_tool_arguments_against_schema(

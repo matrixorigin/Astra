@@ -23332,13 +23332,6 @@ mod tests {
             &ThinkingConfig::Off,
         );
         let schema = &body["tools"][0]["function"]["parameters"];
-        assert!(schema["properties"].get("tool_outcomes").is_none());
-        assert!(
-            body["tools"][0]["function"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("Discover agent for retained child tool outcomes")
-        );
         assert!(schema.get("x-astra-discovery-summary").is_none());
         assert!(
             schema["properties"]["action"]
@@ -23379,6 +23372,13 @@ mod tests {
             .find(|tool| tool["function"]["name"] == "agent")
             .unwrap();
         let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("tool_outcomes").is_none());
+        assert!(
+            agent["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Child tool outcomes: tool_search select:agent")
+        );
         assert!(properties["reasoning"]["oneOf"].is_array());
         let reasoning = properties["reasoning"]["description"].as_str().unwrap();
         for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {

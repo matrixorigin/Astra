@@ -219,6 +219,42 @@ async fn partial_terminal_output_does_not_acknowledge_a_later_error() {
 }
 
 #[tokio::test]
+async fn reading_failed_task_does_not_erase_its_pending_notification() {
+    let (_root, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf 'compile failed\\n' >&2; exit 1",
+        false,
+        10.0,
+    )
+    .await;
+    terminal(&executor, &id).await;
+    let mut registry = executor.background_tasks.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            registry.drain_join_set();
+            if registry
+                .get(&id)
+                .is_some_and(|task| task.ended_at_ms.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal event must be queued");
+    let result = call(&executor, "task_output", json!({"task_id": id})).await;
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    let events = registry.poll_completions();
+    let failures: Vec<_> = events.iter().filter(|event| matches!(event,
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id: task, .. } if task == &id
+    )).collect();
+    assert_eq!(failures.len(), 1, "{events:?}");
+    assert!(registry.poll_completions().is_empty());
+}
+
+#[tokio::test]
 async fn real_long_shell_failure_notification_includes_the_error_tail() {
     let (_root, executor) = fixture();
     let id = launch(
