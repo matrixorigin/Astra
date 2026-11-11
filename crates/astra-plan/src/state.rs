@@ -141,11 +141,17 @@ impl PlanModeState {
 
         let mut hasher = DefaultHasher::new();
         goal.hash(&mut hasher);
+        // A seconds-only timestamp repeats for the same goal and can overwrite
+        // an existing plan. Mix in a per-process sequence and subsecond time.
+        static NEXT_PLAN_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        ts.hash(&mut hasher);
+            .unwrap_or_default();
+        ts.as_nanos().hash(&mut hasher);
+        NEXT_PLAN_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .hash(&mut hasher);
         let hash = hasher.finish();
 
         if slug.is_empty() {
@@ -153,5 +159,26 @@ impl PlanModeState {
         } else {
             format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_id_uniqueness_tests {
+    use super::PlanModeState;
+
+    #[test]
+    fn same_goal_in_rapid_succession_gets_distinct_ids() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..128 {
+            let id = PlanModeState::generate_plan_id("Refactor the parser");
+            assert!(ids.insert(id), "generated duplicate plan ID");
+        }
+    }
+
+    #[test]
+    fn blank_goals_get_distinct_ids() {
+        let first = PlanModeState::generate_plan_id("");
+        let second = PlanModeState::generate_plan_id("");
+        assert_ne!(first, second);
     }
 }
