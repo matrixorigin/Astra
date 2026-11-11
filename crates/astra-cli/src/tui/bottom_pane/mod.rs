@@ -2889,31 +2889,33 @@ impl BottomPane {
                 Some(BottomPaneAction::Consumed)
             }
             KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
-                let mut prospective = self.composer.text();
-                prospective.insert(self.composer.cursor_byte(), digit);
-                if !is_open_for(&prospective, &self.slash_items) {
+                // Numbered selection is a shortcut for the *bare* palette.
+                // In a typed slash path, digits belong to the composer.
+                if self.composer.text() != "/" {
                     return None;
                 }
-                if let Some(index) = digit.to_digit(10) {
-                    if index > 0 {
-                        if self
-                            .slash_menu
-                            .as_mut()
-                            .is_some_and(|menu| menu.select(index as usize - 1))
-                        {
-                            if let Some(picked) = self
-                                .slash_menu
-                                .as_ref()
-                                .and_then(|m| m.selected_item())
-                                .map(|i| i.name.to_string())
-                            {
-                                self.composer.set_text(&format!("{picked} "));
-                                self.slash_menu = None;
-                            }
-                        }
-                    }
+                let Some(index) = digit.to_digit(10).filter(|index| *index > 0) else {
+                    return None;
+                };
+                if !self
+                    .slash_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.select(index as usize - 1))
+                {
+                    return None;
                 }
-                Some(BottomPaneAction::Consumed)
+                if let Some(picked) = self
+                    .slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .map(|i| i.name.to_string())
+                {
+                    self.composer.set_text(&format!("{picked} "));
+                    self.slash_menu = None;
+                    Some(BottomPaneAction::Consumed)
+                } else {
+                    None
+                }
             }
             _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
                 let explicit_followup = ChatComposer::is_explicit_followup_key(key);
@@ -2925,6 +2927,20 @@ impl BottomPane {
                         return Some(BottomPaneAction::Consumed);
                     }
                     self.sync_popups();
+                }
+                // Prospective fuzzy matches are suggestions, not implicit
+                // commands. An unregistered path must reach the agent even
+                // when the menu happens to highlight a similar command.
+                if matches!(
+                    crate::tui::slash_dispatch::parse_submission(&self.composer.text()),
+                    crate::tui::slash_dispatch::SubmissionInput::Conversation(_)
+                ) {
+                    if explicit_followup {
+                        let text = self.composer.clear_and_submit();
+                        self.slash_menu = None;
+                        return Some(BottomPaneAction::QueueFollowUp(text));
+                    }
+                    return None; // Let the composer submit the exact text.
                 }
                 if let Some(picked) = self
                     .slash_menu
