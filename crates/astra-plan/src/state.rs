@@ -66,7 +66,9 @@ impl PlanModeState {
             PlanPhase::Completed
         } else if self.plan.subtasks.is_empty() {
             PlanPhase::Planning
-        } else if self.plan.items_done() > 0 {
+        } else if self.plan.items_done() > 0
+            || self.plan.subtasks.iter().any(|task| task.status == TaskStatus::InProgress)
+        {
             PlanPhase::Executing
         } else {
             PlanPhase::Refining
