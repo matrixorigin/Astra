@@ -46,6 +46,11 @@ make test-contract
   change touches that boundary; see the [testing guide](docs/guides/testing.md).
 - Update public or design documentation whenever a contract, configuration,
   command, or supported deployment path changes.
+- Before marking a task complete, you MUST clean up all build caches,
+  generated artifacts, and temporary files created by that task. After final
+  Rust verification in a task worktree, run `cargo clean` so `target/` is not
+  left behind. Record verification evidence in the report or pull request, not
+  in retained build output.
 
 ## Protect users and repository data
 
