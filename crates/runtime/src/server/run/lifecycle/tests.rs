@@ -19,6 +19,144 @@ mod skill_ledger_tests;
 mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+async fn matrixone_terminal_output_pages_need_no_database_after_validation() {
+    use astra_services::multi_agent::{
+        DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchService,
+    };
+
+    assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+    let settings = astra_core::MatrixOneSettings::from_env();
+    astra_services::storage::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let service = Arc::new(DatabaseEdgeDispatchService::from_shared(&pool));
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let session = format!("paged-session-{suffix}");
+    let run = format!("paged-run-{suffix}");
+    let invocation = astra_turn_types::ToolInvocationIdentity::new(
+        "paging-owner",
+        &session,
+        &run,
+        "chain",
+        "call",
+    )
+    .unwrap();
+    let identity = EdgeDispatchIdentity::new(
+        "paging-owner",
+        &session,
+        &run,
+        "chain",
+        invocation.storage_key(),
+    );
+    service
+        .admit_and_claim_direct_dispatch(
+            &identity,
+            "edge",
+            &json!({"identity":invocation,"tool":"grep","args":{}}),
+        )
+        .await
+        .unwrap();
+    let output = "outcome π\n".repeat(100_000);
+    let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        astra_thin_client::ToolResultRequestParts {
+            session_id: session.clone(),
+            run_id: run.clone(),
+            turn_chain_id: identity.turn_chain_id.clone(),
+            request_id: identity.request_id.clone(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: output.clone(),
+            duration_ms: 1,
+            tool_result_fields: None,
+        },
+    );
+    assert!(
+        service
+            .deliver_result(&identity, "edge", &serde_json::to_string(&body).unwrap())
+            .await
+            .unwrap()
+    );
+    let reconciler = Arc::new(ServerDurableAgentReconciler {
+        run_engine: RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+        user_id: identity.user_id.clone(),
+        session_id: session.clone(),
+        edge_dispatch_service: Some(service.clone()),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    });
+    let first = reconciler
+        .inspect_child_tool_outcomes(
+            &run,
+            None,
+            Some((&identity.turn_chain_id, &identity.request_id)),
+            0,
+            4096,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first["observations"][0]["result"]["total_bytes"],
+        output.len()
+    );
+    sqlx::query(
+        "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&identity.user_id)
+    .bind(&session)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    // Close only this test's pool. Any accidental query on a later page fails,
+    // independently of counters or the cache's implementation.
+    pool.close().await;
+    assert!(
+        service
+            .inspect_run_dispatches(
+                &identity.user_id,
+                &session,
+                &run,
+                None,
+                Some((&identity.turn_chain_id, &identity.request_id)),
+            )
+            .await
+            .is_err()
+    );
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (reconciler, run, identity) = (reconciler.clone(), run.clone(), identity.clone());
+        readers.spawn(async move {
+            let mut rebuilt = String::new();
+            let mut offset = 0;
+            loop {
+                let page = reconciler
+                    .inspect_child_tool_outcomes(
+                        &run,
+                        None,
+                        Some((&identity.turn_chain_id, &identity.request_id)),
+                        offset,
+                        4096,
+                    )
+                    .await
+                    .unwrap();
+                let result = &page["observations"][0]["result"];
+                assert_eq!(result["status"], "completed");
+                rebuilt.push_str(result["output"].as_str().unwrap());
+                let Some(next) = result["next_offset"].as_u64() else {
+                    return rebuilt;
+                };
+                offset = next as usize;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    while let Some(result) = readers.join_next().await {
+        assert_eq!(result.unwrap(), output);
+    }
+}
+
 #[tokio::test]
 async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     use astra_services::multi_agent::{
