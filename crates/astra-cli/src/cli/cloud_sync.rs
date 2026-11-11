@@ -18,15 +18,20 @@ use astra_services::{
     SyncOutboxDeliverySettlement, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
     SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
+use astra_sync_protocol::{
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+    SyncOutboxReconcileRequest,
+};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::cli::session::session_runtime;
@@ -36,9 +41,19 @@ use crate::cli::session::session_side_effects::{
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+/// Bound owned record clones retained for one drain, independently of request batches.
+const SYNC_OUTBOX_DRAIN_SERIALIZED_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
 const SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN: Duration = Duration::from_secs(30);
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Stops starting new work well before the 5 minute outbox in-flight lease so
+/// the settlement write still fits inside the lease.
+const SYNC_OUTBOX_DELIVERY_DEADLINE: Duration = Duration::from_secs(180);
+const SYNC_OUTBOX_DEADLINE_ERROR: &str =
+    "sync outbox drain deadline reached before delivery; record stays queued";
+const SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS: usize = 8;
+/// Keep the encoded JSON body within the server's global `DefaultBodyLimit`.
+const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
@@ -1137,7 +1152,7 @@ async fn try_drain_sync_outbox_for_snapshot(
         }
     };
     let records = match run_sync_outbox_io(store.clone(), move |store| {
-        store.claim_ready_records(limit)
+        store.claim_ready_records(limit, SYNC_OUTBOX_DRAIN_SERIALIZED_BYTE_BUDGET)
     })
     .await
     {
@@ -1152,39 +1167,10 @@ async fn try_drain_sync_outbox_for_snapshot(
             return report;
         }
     };
-    let mut settlements = Vec::new();
-    for record in records {
-        report.attempted += 1;
-        let body = event_body_from_outbox_record(&record);
-        let delivery = tokio::time::timeout(
-            SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
-            client.post_sync_outbox_event_json(Some(token.as_str()), &body),
-        )
-        .await;
-        let delivery_error = match delivery {
-            Ok(Ok(ack)) if ack.confirms(&record.record_id, &record.payload_hash) => None,
-            Ok(Ok(ack)) => Some(format!("cloud returned an uncorrelated sync ack: {ack:?}")),
-            Ok(Err(error)) => Some(error.to_string()),
-            Err(_) => Some(format!(
-                "cloud event delivery timed out after {}ms",
-                SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
-            )),
-        };
-        let delivery_confirmed = delivery_error.is_none()
-            || reconcile_sync_outbox_delivery(&client, &token, &record).await;
-        if delivery_confirmed {
-            settlements.push(SyncOutboxDeliverySettlement::Ack {
-                record_id: record.record_id,
-                payload_hash: record.payload_hash,
-            });
-        } else {
-            settlements.push(SyncOutboxDeliverySettlement::Failed {
-                record_id: record.record_id,
-                error: delivery_error
-                    .unwrap_or_else(|| "cloud delivery could not be reconciled".to_string()),
-            });
-        }
-    }
+    report.attempted = report
+        .attempted
+        .saturating_add(records.len().min(u32::MAX as usize) as u32);
+    let settlements = deliver_sync_outbox_records(&client, &token, records).await;
     if !settlements.is_empty() {
         let attempted_settlements = settlements.len();
         let settlement_result = run_sync_outbox_io(store.clone(), move |store| {
@@ -1210,6 +1196,357 @@ async fn try_drain_sync_outbox_for_snapshot(
         }
     }
     report
+}
+
+struct SyncOutboxDeliveryBatch {
+    records: Vec<SyncOutboxRecord>,
+    request: SyncOutboxEventBatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncOutboxReconciliation {
+    Confirmed,
+    /// The cloud stores this event_id with a different payload. No retry can
+    /// resolve that, so the record must become terminal.
+    Conflict,
+    Missing,
+}
+
+/// One HTTP batch attempt: authoritative per-record verdicts, a session that is
+/// gone, or a request-level failure whose commit outcome is unknown.
+enum SyncOutboxBatchAttempt {
+    Verdicts(SyncOutboxBatchResponse),
+    SessionUnavailable,
+    RequestFailed(String),
+}
+
+async fn attempt_sync_outbox_batch(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    request: &SyncOutboxEventBatch,
+) -> SyncOutboxBatchAttempt {
+    match tokio::time::timeout(
+        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
+        client.post_sync_outbox_events_json(Some(token), request),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.schema_version == SYNC_OUTBOX_BATCH_SCHEMA_VERSION => {
+            SyncOutboxBatchAttempt::Verdicts(response)
+        }
+        Ok(Ok(response)) => SyncOutboxBatchAttempt::RequestFailed(format!(
+            "cloud returned an unsupported sync batch response version: {}",
+            response.schema_version
+        )),
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if status.as_u16() == 409
+                && sync_outbox_error_code(&body).as_deref()
+                    == Some(SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE) =>
+        {
+            SyncOutboxBatchAttempt::SessionUnavailable
+        }
+        Ok(Err(error)) => SyncOutboxBatchAttempt::RequestFailed(error.to_string()),
+        Err(_) => SyncOutboxBatchAttempt::RequestFailed(format!(
+            "cloud event batch delivery timed out after {}ms",
+            SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+fn sync_outbox_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<astra_core::ErrorResponse>(body)
+        .ok()
+        .and_then(|response| response.error_code)
+}
+
+async fn deliver_sync_outbox_records(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+) -> Vec<SyncOutboxDeliverySettlement> {
+    deliver_sync_outbox_records_within(
+        client,
+        token,
+        records,
+        Instant::now() + SYNC_OUTBOX_DELIVERY_DEADLINE,
+    )
+    .await
+}
+
+/// Delivers sessions concurrently within a fixed bound. Batches of one session
+/// stay ordered, and no request starts after `deadline`, so a slow session
+/// cannot make the whole drain outlive the outbox in-flight lease.
+async fn deliver_sync_outbox_records_within(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+    deadline: Instant,
+) -> Vec<SyncOutboxDeliverySettlement> {
+    futures_util::stream::iter(
+        sync_outbox_session_batches(records, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES)
+            .map(|batches| deliver_sync_outbox_session(client, token, batches, deadline)),
+    )
+    .buffered(SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn deliver_sync_outbox_session(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    mut batches: SyncOutboxSessionBatches,
+    deadline: Instant,
+) -> Vec<SyncOutboxDeliverySettlement> {
+    let mut settlements = Vec::new();
+    for batch in batches.by_ref() {
+        if Instant::now() >= deadline {
+            settlements.extend(deferred_settlements(
+                batch.records.into_iter(),
+                SYNC_OUTBOX_DEADLINE_ERROR,
+            ));
+            break;
+        }
+        deliver_sync_outbox_batch_records(client, token, batch, &mut settlements, deadline).await;
+    }
+    settlements.extend(deferred_settlements(
+        batches.into_remaining(),
+        SYNC_OUTBOX_DEADLINE_ERROR,
+    ));
+    settlements
+}
+
+/// Settles one batch. Per-record verdicts are authoritative; a request-level
+/// failure is reconciled with one read-only batch read, so healthy siblings are
+/// never re-posted and one bad record never charges the whole batch.
+async fn deliver_sync_outbox_batch_records(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    SyncOutboxDeliveryBatch { records, request }: SyncOutboxDeliveryBatch,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+    deadline: Instant,
+) {
+    // The builder admits an oversized singleton so the record is never lost.
+    // It can never fit the server body limit, so settle it here instead of
+    // sending a request that is guaranteed to fail.
+    if records.len() == 1
+        && serde_json::to_vec(&request)
+            .is_ok_and(|body| body.len() > SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES)
+    {
+        settlements.push(SyncOutboxDeliverySettlement::Failed {
+            record_id: records[0].record_id.clone(),
+            error: format!(
+                "record exceeds the {SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES} byte sync batch body limit"
+            ),
+        });
+        return;
+    }
+    match attempt_sync_outbox_batch(client, token, &request).await {
+        SyncOutboxBatchAttempt::Verdicts(response) => {
+            settle_sync_outbox_verdicts(records, response, settlements);
+        }
+        SyncOutboxBatchAttempt::SessionUnavailable => {
+            settlements.extend(records.into_iter().map(|record| {
+                SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error: "cloud session is unavailable for event ingestion".to_string(),
+                }
+            }));
+        }
+        SyncOutboxBatchAttempt::RequestFailed(error) => {
+            if Instant::now() >= deadline {
+                settlements.extend(deferred_settlements(
+                    records.into_iter(),
+                    SYNC_OUTBOX_DEADLINE_ERROR,
+                ));
+                return;
+            }
+            settle_sync_outbox_reconciliation(client, token, records, error, settlements).await;
+        }
+    }
+}
+
+/// Per-record verdicts are authoritative: accepted records are acked and
+/// rejected records terminate, so one bad record never charges its siblings.
+fn settle_sync_outbox_verdicts(
+    records: Vec<SyncOutboxRecord>,
+    response: SyncOutboxBatchResponse,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+) {
+    let expected = records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut acks = BTreeMap::new();
+    let mut rejections = BTreeMap::new();
+    let usable = response.acks.iter().all(|ack| {
+        expected.contains(ack.record_id.as_str())
+            && acks.insert(ack.record_id.clone(), ack).is_none()
+    }) && response.rejections.iter().all(|rejection| {
+        expected.contains(rejection.record_id.as_str())
+            && !acks.contains_key(&rejection.record_id)
+            && rejections
+                .insert(rejection.record_id.clone(), rejection)
+                .is_none()
+    });
+    if !usable {
+        settlements.extend(deferred_settlements(
+            records.into_iter(),
+            "cloud returned an uncorrelated sync batch verdict",
+        ));
+        return;
+    }
+    for record in records {
+        if let Some(ack) = acks.get(&record.record_id) {
+            if ack.matches(&record.record_id, &record.payload_hash) {
+                settlements.push(SyncOutboxDeliverySettlement::Ack {
+                    record_id: record.record_id,
+                    payload_hash: record.payload_hash,
+                });
+            } else {
+                settlements.push(SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error: "cloud acknowledged a different payload for this record".to_string(),
+                });
+            }
+        } else if let Some(rejection) = rejections.get(&record.record_id) {
+            settlements.push(SyncOutboxDeliverySettlement::Failed {
+                record_id: record.record_id,
+                error: format!("{}: {}", rejection.error_code, rejection.detail),
+            });
+        } else {
+            settlements.push(SyncOutboxDeliverySettlement::Deferred {
+                record_id: record.record_id,
+                error: "cloud accepted the batch without a verdict for this record".to_string(),
+            });
+        }
+    }
+}
+
+/// A request-level failure has an unknown commit outcome. One read-only batch
+/// reconciliation settles every record without re-posting healthy siblings.
+async fn settle_sync_outbox_reconciliation(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+    delivery_error: String,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+) {
+    let Some(reconciliations) = reconcile_sync_outbox_deliveries(client, token, &records).await
+    else {
+        settlements.extend(deferred_settlements(records.into_iter(), &delivery_error));
+        return;
+    };
+    for (record, reconciliation) in records.into_iter().zip(reconciliations) {
+        match reconciliation {
+            SyncOutboxReconciliation::Confirmed => {
+                settlements.push(SyncOutboxDeliverySettlement::Ack {
+                    record_id: record.record_id,
+                    payload_hash: record.payload_hash,
+                });
+            }
+            SyncOutboxReconciliation::Conflict => {
+                let error = format!(
+                    "cloud stores {} with a different payload; retry cannot reconcile it",
+                    record.record_id
+                );
+                settlements.push(SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error,
+                });
+            }
+            SyncOutboxReconciliation::Missing => {
+                settlements.push(SyncOutboxDeliverySettlement::Deferred {
+                    record_id: record.record_id,
+                    error: delivery_error.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Records skipped for time stay retryable; deferral never consumes the finite
+/// poison budget, so the next drain picks them up.
+fn deferred_settlements(
+    records: impl Iterator<Item = SyncOutboxRecord>,
+    error: &str,
+) -> impl Iterator<Item = SyncOutboxDeliverySettlement> {
+    let error = error.to_string();
+    records.map(move |record| SyncOutboxDeliverySettlement::Deferred {
+        record_id: record.record_id,
+        error: error.clone(),
+    })
+}
+
+/// Splits one drain into per-session units so sessions can be delivered
+/// concurrently while each session keeps its event order.
+fn sync_outbox_session_batches(
+    records: Vec<SyncOutboxRecord>,
+    byte_limit: usize,
+) -> impl Iterator<Item = SyncOutboxSessionBatches> {
+    let mut by_session = BTreeMap::<String, Vec<SyncOutboxRecord>>::new();
+    for record in records {
+        by_session
+            .entry(record.session_id.clone())
+            .or_default()
+            .push(record);
+    }
+    let empty_batch_bytes = serde_json::to_vec(&SyncOutboxEventBatch::new(Vec::new()))
+        .expect("sync outbox batch JSON must serialize")
+        .len();
+    by_session
+        .into_values()
+        .map(move |records| SyncOutboxSessionBatches {
+            records: records.into_iter().peekable(),
+            byte_limit,
+            empty_batch_bytes,
+        })
+}
+
+/// Builds one request at a time. Original outbox records remain bounded by the
+/// drain limit, while derived event JSON is retained only for the active batch.
+struct SyncOutboxSessionBatches {
+    records: std::iter::Peekable<std::vec::IntoIter<SyncOutboxRecord>>,
+    byte_limit: usize,
+    empty_batch_bytes: usize,
+}
+
+impl SyncOutboxSessionBatches {
+    fn into_remaining(self) -> impl Iterator<Item = SyncOutboxRecord> {
+        self.records
+    }
+}
+
+impl Iterator for SyncOutboxSessionBatches {
+    type Item = SyncOutboxDeliveryBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut records = Vec::with_capacity(MAX_SYNC_OUTBOX_BATCH_EVENTS);
+        let mut events = Vec::with_capacity(MAX_SYNC_OUTBOX_BATCH_EVENTS);
+        let mut encoded_bytes = self.empty_batch_bytes;
+        while let Some(record) = self.records.peek() {
+            let event = event_body_from_outbox_record(record);
+            let event_bytes = serde_json::to_vec(&event)
+                .expect("sync outbox event JSON must serialize")
+                .len();
+            let additional_bytes = event_bytes + usize::from(!events.is_empty());
+            if !events.is_empty()
+                && (records.len() == MAX_SYNC_OUTBOX_BATCH_EVENTS
+                    || encoded_bytes + additional_bytes > self.byte_limit)
+            {
+                break;
+            }
+            encoded_bytes += additional_bytes;
+            records.push(self.records.next().expect("peeked sync outbox record"));
+            events.push(event);
+        }
+        (!events.is_empty()).then(|| SyncOutboxDeliveryBatch {
+            records,
+            request: SyncOutboxEventBatch::new(events),
+        })
+    }
 }
 
 fn record_settlement_result(
@@ -1284,26 +1621,63 @@ fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
     })
 }
 
-async fn reconcile_sync_outbox_delivery(
+/// Read-only reconciliation for a batch whose commit outcome is unknown.
+/// `None` means the response cannot be trusted; callers must defer.
+async fn reconcile_sync_outbox_deliveries(
     client: &astra_thin_client::ThinClient,
     token: &str,
-    record: &SyncOutboxRecord,
-) -> bool {
-    client
-        .get_event_json(Some(token), &record.record_id)
-        .await
-        .ok()
-        .is_some_and(|event| stored_event_matches_outbox_record(record, &event))
-}
-
-fn stored_event_matches_outbox_record(record: &SyncOutboxRecord, response: &Value) -> bool {
-    response.get("event_id").and_then(Value::as_str) == Some(record.record_id.as_str())
-        && response
-            .get("metadata")
-            .and_then(|metadata| metadata.get("sync_outbox"))
-            .and_then(|sync| sync.get("payload_hash"))
-            .and_then(Value::as_str)
-            == Some(record.payload_hash.as_str())
+    records: &[SyncOutboxRecord],
+) -> Option<Vec<SyncOutboxReconciliation>> {
+    if records.is_empty() {
+        return Some(Vec::new());
+    }
+    let request = SyncOutboxReconcileRequest::new(
+        records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect(),
+    );
+    let response = match tokio::time::timeout(
+        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
+        client.reconcile_sync_outbox_events_json(Some(token), &request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        _ => return None,
+    };
+    let expected = records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    if response.schema_version != SYNC_OUTBOX_BATCH_SCHEMA_VERSION
+        || !response.rejections.is_empty()
+        || response.acks.len() > records.len()
+        || !response.acks.iter().all(|ack| {
+            expected.contains(ack.record_id.as_str()) && seen.insert(ack.record_id.as_str())
+        })
+    {
+        return None;
+    }
+    Some(
+        records
+            .iter()
+            .map(|record| {
+                match response
+                    .acks
+                    .iter()
+                    .find(|ack| ack.record_id == record.record_id)
+                {
+                    Some(ack) if ack.matches(&record.record_id, &record.payload_hash) => {
+                        SyncOutboxReconciliation::Confirmed
+                    }
+                    Some(_) => SyncOutboxReconciliation::Conflict,
+                    None => SyncOutboxReconciliation::Missing,
+                }
+            })
+            .collect(),
+    )
 }
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════
@@ -1464,22 +1838,697 @@ pub(crate) async fn post_auth_cloud_resync(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
-        JournalIngestScheduleOutcome, SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES,
+        JournalIngestScheduleOutcome, MAX_SYNC_OUTBOX_BATCH_EVENTS,
+        SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES, SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES,
         SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW, SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY,
-        SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
-        cloud_pull_warrants_sync_marker, defer_journal_ingest_hint, next_sync_outbox_drain_delay,
-        reconcile_sync_outbox_journal, record_settlement_result,
+        SyncOutboxDeliveryBatch, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
+        cloud_pull_warrants_sync_marker, defer_journal_ingest_hint,
+        deliver_sync_outbox_batch_records, deliver_sync_outbox_records,
+        deliver_sync_outbox_records_within, event_body_from_outbox_record,
+        next_sync_outbox_drain_delay, reconcile_sync_outbox_journal, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
         run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
-        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
+        should_append_cloud_pull_journal, sync_outbox_session_batches,
+        try_claim_sync_outbox_drain_schedule,
     };
+
+    fn delivery_batches(
+        records: Vec<SyncOutboxRecord>,
+    ) -> impl Iterator<Item = SyncOutboxDeliveryBatch> {
+        sync_outbox_session_batches(records, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES).flatten()
+    }
+
+    fn delivery_batches_with_limit(
+        records: Vec<SyncOutboxRecord>,
+        byte_limit: usize,
+    ) -> impl Iterator<Item = SyncOutboxDeliveryBatch> {
+        sync_outbox_session_batches(records, byte_limit).flatten()
+    }
     use astra_services::session_journal::{JournalEvent, JournalWriter, ProcessJournalDirGuard};
-    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
+    use astra_services::{
+        SyncDomain, SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport,
+        SyncOutboxStatus, SyncOutboxStore,
+    };
     use fs2::FileExt;
+
+    fn delivery_record(sequence: u64, session_id: &str) -> SyncOutboxRecord {
+        SyncOutboxRecord {
+            schema_version: 2,
+            sequence,
+            record_id: format!("record-{sequence}"),
+            domain: SyncDomain::Events,
+            session_id: session_id.to_string(),
+            event_type: "journal".to_string(),
+            event_ts: String::new(),
+            payload_hash: format!("sha256:{sequence}"),
+            payload: serde_json::json!({}),
+            state: SyncOutboxRecordState::Pending,
+            attempts: 0,
+            next_retry_after_unix_ms: None,
+            last_error: None,
+            poison_kind: None,
+            poison_reason: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            acked_at_unix_ms: None,
+        }
+    }
+
+    async fn mount_sync_outbox_reconciliation(
+        server: &wiremock::MockServer,
+        records: &[SyncOutboxRecord],
+        confirmed: &[bool],
+    ) {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxIngestionStatus,
+            SyncOutboxReconcileRequest,
+        };
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        assert_eq!(records.len(), confirmed.len());
+        let request = SyncOutboxReconcileRequest::new(
+            records
+                .iter()
+                .map(|record| record.record_id.clone())
+                .collect(),
+        );
+        let acks = records
+            .iter()
+            .zip(confirmed)
+            .filter(|(_, confirmed)| **confirmed)
+            .map(|(record, _)| {
+                SyncOutboxAck::new(
+                    &record.record_id,
+                    &record.payload_hash,
+                    SyncOutboxIngestionStatus::IdempotentReplay,
+                )
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(SyncOutboxBatchResponse::new(acks, Vec::new())),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn sync_outbox_conflict_response(error_code: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(409).set_body_json(
+            astra_core::ErrorResponse::new("sync outbox request rejected")
+                .with_error_code(error_code),
+        )
+    }
+
+    async fn assert_one_batch_and_reconciliation_request(server: &wiremock::MockServer) {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("received outbox requests");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one batch POST and one reconciliation POST; no per-record calls"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "POST")
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/sync/outbox/events")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/sync/outbox/events/reconcile")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn delivery_batches_are_bounded_and_session_ordered() {
+        let batches = delivery_batches(vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-b"),
+            delivery_record(3, "session-a"),
+        ])
+        .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0]
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(batches.iter().all(|batch| {
+            let session_id = &batch.records[0].session_id;
+            batch
+                .records
+                .iter()
+                .all(|record| &record.session_id == session_id)
+        }));
+
+        let oversized = (0..=MAX_SYNC_OUTBOX_BATCH_EVENTS as u64)
+            .map(|sequence| delivery_record(sequence, "session-a"))
+            .collect();
+        let batches = delivery_batches(oversized).collect::<Vec<_>>();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .collect::<Vec<_>>(),
+            vec![MAX_SYNC_OUTBOX_BATCH_EVENTS, 1]
+        );
+        assert!(
+            batches[0]
+                .records
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+    }
+
+    #[test]
+    fn delivery_batches_also_bound_encoded_body_bytes() {
+        let records = (1..=3)
+            .map(|sequence| {
+                let mut record = delivery_record(sequence, "session-a");
+                record.payload = serde_json::json!({"blob": "x".repeat(900)});
+                record
+            })
+            .collect();
+        let batches = delivery_batches_with_limit(records, 2_048).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| {
+            serde_json::to_vec(&batch.request)
+                .expect("batch JSON")
+                .len()
+                <= 2_048
+        }));
+
+        let mut oversized = delivery_record(4, "session-a");
+        oversized.payload = serde_json::json!({"blob": "x".repeat(3_000)});
+        let batches = delivery_batches_with_limit(vec![oversized], 2_048).collect::<Vec<_>>();
+        assert_eq!(
+            batches.len(),
+            1,
+            "an oversized singleton must not be dropped"
+        );
+        assert_eq!(batches[0].records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_drain_deadline_defers_without_requests() {
+        use astra_thin_client::ThinClient;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-b"),
+        ];
+
+        let settlements = deliver_sync_outbox_records_within(
+            &client,
+            "token",
+            records.clone(),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(settlements.len(), records.len());
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an expired drain deadline must not start more requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_conflict_with_different_payload_is_terminal() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let record = delivery_record(1, "session-a");
+        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(&request).unwrap()))
+            .respond_with(sync_outbox_conflict_response(
+                astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "acks": [{
+                    "schema_version": 1,
+                    "record_id": record.record_id,
+                    "payload_hash": "sha256:someone-else",
+                    "ingestion_status": "idempotent_replay"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(
+            matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Failed { .. }]
+            ),
+            "a permanent payload conflict must consume the poison budget instead of deferring forever: {settlements:?}"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_defers_batch_without_reconciliation() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        let request =
+            SyncOutboxEventBatch::new(records.iter().map(event_body_from_outbox_record).collect());
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(&request).unwrap()))
+            .respond_with(sync_outbox_conflict_response(
+                astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let batch = delivery_batches(records).next().expect("one batch");
+        let mut settlements = Vec::new();
+        deliver_sync_outbox_batch_records(
+            &client,
+            "token",
+            batch,
+            &mut settlements,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1,
+            "an expired drain deadline must not start reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_level_bad_request_defers_without_isolation() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        let request =
+            SyncOutboxEventBatch::new(records.iter().map(event_body_from_outbox_record).collect());
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(&request).unwrap()))
+            .respond_with(ResponseTemplate::new(400).set_body_string("unsupported batch schema"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
+
+        let batch = delivery_batches(records).next().expect("one batch");
+        let mut settlements = Vec::new();
+        deliver_sync_outbox_batch_records(
+            &client,
+            "token",
+            batch,
+            &mut settlements,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            2,
+            "a request-level rejection must not be replayed per record"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_verdicts_settle_rejections_and_ack_siblings() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+            SyncOutboxIngestionStatus, SyncOutboxRejection,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+            delivery_record(3, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(
+                serde_json::to_value(SyncOutboxEventBatch::new(
+                    records.iter().map(event_body_from_outbox_record).collect(),
+                ))
+                .unwrap(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
+                    vec![
+                        SyncOutboxAck::new(
+                            &records[0].record_id,
+                            &records[0].payload_hash,
+                            SyncOutboxIngestionStatus::Created,
+                        ),
+                        SyncOutboxAck::new(
+                            &records[2].record_id,
+                            &records[2].payload_hash,
+                            SyncOutboxIngestionStatus::Created,
+                        ),
+                    ],
+                    vec![SyncOutboxRejection::new(
+                        &records[1].record_id,
+                        astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+                        "stored payload differs",
+                    )],
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 3);
+        for (index, settlement) in settlements.iter().enumerate() {
+            match settlement {
+                astra_services::SyncOutboxDeliverySettlement::Ack { record_id, .. } => {
+                    assert_ne!(index, 1);
+                    assert_eq!(record_id, &format!("record-{}", index + 1));
+                }
+                astra_services::SyncOutboxDeliverySettlement::Failed { record_id, .. } => {
+                    assert_eq!(index, 1);
+                    assert_eq!(record_id, "record-2");
+                }
+                astra_services::SyncOutboxDeliverySettlement::Deferred { .. } => {
+                    panic!("a record verdict must not be deferred");
+                }
+            }
+        }
+        server.verify().await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1,
+            "record verdicts must be settled from the single batch response"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_failures_defer_without_record_isolation() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [429_u16, 500] {
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).expect("thin client");
+            let records = vec![
+                delivery_record(1, "session-a"),
+                delivery_record(2, "session-a"),
+            ];
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
+
+            let settlements = deliver_sync_outbox_records(&client, "token", records).await;
+            assert_eq!(settlements.len(), 2);
+            assert!(settlements.iter().all(|settlement| matches!(
+                settlement,
+                astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+            )));
+            server.verify().await;
+            assert_one_batch_and_reconciliation_request(&server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_reconciliation_defers_record_rejection() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn lost_batch_ack_reconciles_without_reposting_committed_records() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gateway lost the response"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records, &[true, true]).await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", records.clone()).await;
+        assert_eq!(settlements.len(), records.len());
+        for (settlement, record) in settlements.iter().zip(&records) {
+            match settlement {
+                astra_services::SyncOutboxDeliverySettlement::Ack { record_id, .. } => {
+                    assert_eq!(record_id, &record.record_id);
+                }
+                astra_services::SyncOutboxDeliverySettlement::Failed { error, .. }
+                | astra_services::SyncOutboxDeliverySettlement::Deferred { error, .. } => {
+                    panic!("committed record must reconcile after a lost ACK: {error}");
+                }
+            }
+        }
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn session_conflict_does_not_isolate_records() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        let request =
+            SyncOutboxEventBatch::new(records.iter().map(event_body_from_outbox_record).collect());
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(sync_outbox_conflict_response(
+                astra_sync_protocol::SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Failed { .. }
+        )));
+        server.verify().await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1,
+            "a deleted session must fail the batch without reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_singleton_is_failed_without_a_request() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let mut record = delivery_record(1, "session-a");
+        record.payload = serde_json::json!({
+            "blob": "x".repeat(super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES),
+        });
+        assert!(
+            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![
+                event_body_from_outbox_record(&record)
+            ]))
+            .unwrap()
+            .len()
+                > super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+
+        let settlements = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(matches!(
+            settlements.as_slice(),
+            [astra_services::SyncOutboxDeliverySettlement::Failed { .. }]
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an oversized record must fail locally instead of sending a doomed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_lost_ack_reconciles_without_repeating_post() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let record = delivery_record(1, "session-a");
+        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gateway lost the response"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, std::slice::from_ref(&record), &[true]).await;
+
+        let settlements = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(
+            matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Ack { .. }]
+            ),
+            "a committed record must reconcile instead of being re-posted: {settlements:?}"
+        );
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
 
     #[test]
     fn journal_ingest_retry_budget_quarantines_and_success_resets() {

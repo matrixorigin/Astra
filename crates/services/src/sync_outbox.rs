@@ -267,6 +267,12 @@ pub enum SyncOutboxDeliverySettlement {
         record_id: String,
         error: String,
     },
+    /// A request-level failure with an unknown or non-record-specific outcome.
+    /// Retry later without charging the record's finite poison-attempt budget.
+    Deferred {
+        record_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -609,7 +615,8 @@ impl SyncOutboxStore {
                             }
                         }
                     }
-                    SyncOutboxDeliverySettlement::Failed { record_id, error } => {
+                    SyncOutboxDeliverySettlement::Failed { record_id, error }
+                    | SyncOutboxDeliverySettlement::Deferred { record_id, error } => {
                         let Some(record) = state
                             .records
                             .iter_mut()
@@ -618,7 +625,16 @@ impl SyncOutboxStore {
                             report.missing = report.missing.saturating_add(1);
                             continue;
                         };
-                        if apply_delivery_failure(record, error, now) {
+                        let updated = match settlement {
+                            SyncOutboxDeliverySettlement::Failed { .. } => {
+                                apply_delivery_failure(record, error, now)
+                            }
+                            SyncOutboxDeliverySettlement::Deferred { .. } => {
+                                apply_delivery_deferral(record, error, now)
+                            }
+                            SyncOutboxDeliverySettlement::Ack { .. } => unreachable!(),
+                        };
+                        if updated {
                             if record.state == SyncOutboxRecordState::Poisoned {
                                 report.poisoned = report.poisoned.saturating_add(1);
                             } else {
@@ -656,20 +672,38 @@ impl SyncOutboxStore {
         })
     }
 
-    pub fn claim_ready_records(&self, limit: usize) -> std::io::Result<Vec<SyncOutboxRecord>> {
+    /// Claim a count- and serialized-byte-bounded owned batch. The first ready
+    /// record is always claimed so an oversized record reaches normal failure
+    /// handling instead of permanently blocking the drain.
+    pub fn claim_ready_records(
+        &self,
+        limit: usize,
+        serialized_byte_budget: usize,
+    ) -> std::io::Result<Vec<SyncOutboxRecord>> {
         let now = unix_ms()?;
         self.with_state(|state| {
             let mut claimed = Vec::new();
+            let mut claimed_bytes = 0usize;
             for record in &mut state.records {
                 if claimed.len() >= limit {
                     break;
                 }
-                if record_ready_for_claim(record, now) {
-                    record.state = SyncOutboxRecordState::InFlight;
-                    record.next_retry_after_unix_ms = None;
-                    record.updated_at_unix_ms = now;
-                    claimed.push(record.clone());
+                if !record_ready_for_claim(record, now) {
+                    continue;
                 }
+                let record_bytes = serde_json::to_vec(&*record)
+                    .map_err(std::io::Error::other)?
+                    .len();
+                if !claimed.is_empty()
+                    && claimed_bytes.saturating_add(record_bytes) > serialized_byte_budget
+                {
+                    break;
+                }
+                claimed_bytes = claimed_bytes.saturating_add(record_bytes);
+                record.state = SyncOutboxRecordState::InFlight;
+                record.next_retry_after_unix_ms = None;
+                record.updated_at_unix_ms = now;
+                claimed.push(record.clone());
             }
             record_serialized_history(
                 astra_core::history_work::HistoryWorkSite::SyncOutboxDeliveryClone,
@@ -1423,6 +1457,21 @@ fn apply_delivery_failure(record: &mut SyncOutboxRecord, error: &str, now: u64) 
     true
 }
 
+fn apply_delivery_deferral(record: &mut SyncOutboxRecord, error: &str, now: u64) -> bool {
+    if matches!(
+        record.state,
+        SyncOutboxRecordState::Acked | SyncOutboxRecordState::Poisoned
+    ) {
+        return false;
+    }
+    record.state = SyncOutboxRecordState::Pending;
+    record.last_error = Some(error.to_string());
+    record.updated_at_unix_ms = now;
+    record.next_retry_after_unix_ms =
+        Some(now.saturating_add(retry_backoff_ms(SYNC_OUTBOX_MAX_ATTEMPTS)));
+    true
+}
+
 fn retry_backoff_ms(attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(6);
     1_000_u64.saturating_mul(1_u64 << shift)
@@ -2050,17 +2099,79 @@ mod tests {
             store.enqueue_journal_event(&event(value)).expect("enqueue");
         }
 
-        let claimed = store.claim_ready_records(10).expect("claim");
+        let claimed = store.claim_ready_records(10, usize::MAX).expect("claim");
         assert_eq!(claimed.len(), 2);
         let status = store.status().expect("status");
         assert_eq!(status.in_flight, 2);
         assert_eq!(status.ready, 0);
         assert!(
             store
-                .claim_ready_records(10)
+                .claim_ready_records(10, usize::MAX)
                 .expect("claim again")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn claim_ready_records_bounds_bytes_and_admits_one_oversized_record() {
+        let (_temp, _guard, store) = test_store();
+        for value in ["one", "two"] {
+            store.enqueue_journal_event(&event(value)).expect("enqueue");
+        }
+        let first = store.ready_records(1).expect("ready records");
+        let first_bytes = serde_json::to_vec(&first[0]).expect("record JSON").len();
+        let claimed = store
+            .claim_ready_records(10, first_bytes)
+            .expect("byte-bounded claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(store.status().expect("status").ready, 1);
+
+        let (_oversized_temp, _oversized_guard, oversized_store) = test_store();
+        oversized_store
+            .enqueue_journal_event(&event("oversized"))
+            .expect("enqueue oversized");
+        let claimed = oversized_store
+            .claim_ready_records(10, 1)
+            .expect("oversized record must still be claimed");
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[test]
+    fn delivery_deferral_does_not_consume_poison_attempts() {
+        let (_temp, _guard, store) = test_store();
+        let SyncOutboxEnqueueOutcome::Inserted { record_id, .. } = store
+            .enqueue_journal_event(&event("systemic-outage"))
+            .expect("enqueue")
+        else {
+            panic!("enqueue record");
+        };
+        store
+            .claim_ready_records(1, usize::MAX)
+            .expect("claim record");
+        for _ in 0..(SYNC_OUTBOX_MAX_ATTEMPTS * 2) {
+            let report = store
+                .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Deferred {
+                    record_id: record_id.clone(),
+                    error: "temporary cloud outage".to_string(),
+                }])
+                .expect("defer delivery");
+            assert_eq!(report.failed, 1);
+            assert_eq!(report.poisoned, 0);
+        }
+        store
+            .with_state_readonly(|state| {
+                let record = state
+                    .records
+                    .iter()
+                    .find(|record| record.record_id == record_id)
+                    .expect("one record");
+                assert_eq!(record.attempts, 0);
+                assert_eq!(record.state, SyncOutboxRecordState::Pending);
+                assert!(record.next_retry_after_unix_ms.is_some());
+                Ok(())
+            })
+            .expect("deferred record state");
+        assert_eq!(store.status().expect("status").poisoned, 0);
     }
 
     #[test]
@@ -2082,7 +2193,7 @@ mod tests {
         else {
             panic!("fail insert");
         };
-        let claimed = store.claim_ready_records(10).expect("claim");
+        let claimed = store.claim_ready_records(10, usize::MAX).expect("claim");
         assert_eq!(claimed.len(), 2);
         let ack_hash = claimed
             .iter()
@@ -2131,7 +2242,7 @@ mod tests {
         else {
             panic!("fail insert");
         };
-        let claimed = store.claim_ready_records(10).expect("claim");
+        let claimed = store.claim_ready_records(10, usize::MAX).expect("claim");
         assert_eq!(claimed.len(), 2);
         let ack_hash = claimed
             .iter()

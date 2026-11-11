@@ -11,7 +11,8 @@ use astra_server_types::{
     WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
-    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+    SyncOutboxReconcileRequest, sync_outbox_request_signature,
 };
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
@@ -2453,20 +2454,52 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /sync/outbox/events` — ingest durable edge sync outbox events.
-    pub async fn post_sync_outbox_event_json(
+    /// `POST /sync/outbox/events` — ingest one bounded durable sync batch.
+    pub async fn post_sync_outbox_events_json(
         &self,
         bearer_override: Option<&str>,
-        body: &Value,
-    ) -> Result<SyncOutboxAck, ThinClientError> {
-        let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
+        batch: &SyncOutboxEventBatch,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(batch).map_err(|error| {
+            ThinClientError::InvalidInput(format!("failed to encode sync-outbox batch: {error}"))
+        })?;
+        self.post_signed_sync_outbox_request(bearer_override, paths::SYNC_OUTBOX_EVENTS, body)
+            .await
+    }
+
+    /// Reconcile a bounded set of record IDs with one read-only batch request.
+    pub async fn reconcile_sync_outbox_events_json(
+        &self,
+        bearer_override: Option<&str>,
+        request: &SyncOutboxReconcileRequest,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(request).map_err(|error| {
+            ThinClientError::InvalidInput(format!(
+                "failed to encode sync-outbox reconciliation: {error}"
+            ))
+        })?;
+        self.post_signed_sync_outbox_request(
+            bearer_override,
+            paths::SYNC_OUTBOX_EVENTS_RECONCILE,
+            body,
+        )
+        .await
+    }
+
+    async fn post_signed_sync_outbox_request(
+        &self,
+        bearer_override: Option<&str>,
+        path: &str,
+        body: Value,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let url = self.url(path)?;
         let mut headers = self.auth_headers_for(bearer_override).await?;
         if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         {
-            let signature = sync_outbox_request_signature(token, body);
+            let signature = sync_outbox_request_signature(token, &body);
             let header = HeaderValue::from_str(&signature).map_err(|error| {
                 ThinClientError::InvalidInput(format!(
                     "failed to encode sync-outbox signature header: {error}"
@@ -2478,7 +2511,7 @@ impl ThinClient {
             .http
             .post(url)
             .headers(headers)
-            .json(body)
+            .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
@@ -4808,9 +4841,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_post_sync_outbox_event_json() {
+    async fn wiremock_post_sync_outbox_events_json() {
         let srv = MockServer::start().await;
-        let body = serde_json::json!({
+        let batch = SyncOutboxEventBatch::new(vec![serde_json::json!({
             "event_id": "sync_evt_1",
             "session_id": "session-1",
             "event_type": "sync_marker",
@@ -4820,7 +4853,8 @@ mod tests {
                     "payload_hash": "sha256:abc"
                 }
             }
-        });
+        })]);
+        let body = serde_json::to_value(&batch).unwrap();
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(header("authorization", "Bearer tok"))
@@ -4828,21 +4862,60 @@ mod tests {
                 "x-astra-sync-outbox-signature",
                 sync_outbox_request_signature("tok", &body),
             ))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "schema_version": 1,
-                "record_id": "sync_evt_1",
-                "payload_hash": "sha256:abc",
-                "ingestion_status": "created"
+                "acks": [{
+                    "schema_version": 1,
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "created"
+                }]
             })))
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let v = client
-            .post_sync_outbox_event_json(Some("tok"), &body)
+        let ack = client
+            .post_sync_outbox_events_json(Some("tok"), &batch)
             .await
             .unwrap();
-        assert!(v.confirms("sync_evt_1", "sha256:abc"));
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_reconcile_sync_outbox_events_json() {
+        let srv = MockServer::start().await;
+        let request =
+            SyncOutboxReconcileRequest::new(vec!["sync_evt_1".to_string(), "missing".to_string()]);
+        let body = serde_json::to_value(&request).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header(
+                "x-astra-sync-outbox-signature",
+                sync_outbox_request_signature("tok", &body),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "acks": [{
+                    "schema_version": 1,
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "idempotent_replay"
+                }]
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let ack = client
+            .reconcile_sync_outbox_events_json(Some("tok"), &request)
+            .await
+            .unwrap();
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
     }
 
     #[tokio::test]

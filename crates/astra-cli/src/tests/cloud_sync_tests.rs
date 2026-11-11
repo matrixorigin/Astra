@@ -14,7 +14,7 @@ use astra_services::SyncOutboxStore;
 use astra_services::session_journal::{self, JournalDirGuard, ProcessJournalDirGuard};
 use astra_sync_protocol::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use serde_json::{Value, json};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct EnvVarGuard {
@@ -348,13 +348,16 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         }),
     );
     let expected_body = json!({
-        "event_id": record.record_id,
-        "session_id": record.session_id,
-        "event_type": record.event_type,
-        "content": record.canonical_payload_json(),
-        "agent_id": "edge_sync",
-        "agent_version": env!("CARGO_PKG_VERSION"),
-        "metadata": Value::Object(metadata),
+        "schema_version": 1,
+        "events": [{
+            "event_id": record.record_id,
+            "session_id": record.session_id,
+            "event_type": record.event_type,
+            "content": record.canonical_payload_json(),
+            "agent_id": "edge_sync",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "metadata": Value::Object(metadata),
+        }]
     });
     let expected_signature = sync_outbox_request_signature("token", &expected_body);
     Mock::given(method("POST"))
@@ -363,9 +366,12 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         .and(header(SYNC_OUTBOX_SIGNATURE_HEADER, expected_signature))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "schema_version": 1,
-            "record_id": record.record_id,
-            "payload_hash": record.payload_hash,
-            "ingestion_status": "created"
+            "acks": [{
+                "schema_version": 1,
+                "record_id": record.record_id,
+                "payload_hash": record.payload_hash,
+                "ingestion_status": "created"
+            }]
         })))
         .expect(1)
         .mount(&server)
@@ -425,13 +431,16 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
         }),
     );
     let expected_body = json!({
-        "event_id": record.record_id,
-        "session_id": record.session_id,
-        "event_type": record.event_type,
-        "content": record.canonical_payload_json(),
-        "agent_id": "edge_sync",
-        "agent_version": env!("CARGO_PKG_VERSION"),
-        "metadata": Value::Object(metadata),
+        "schema_version": 1,
+        "events": [{
+            "event_id": record.record_id,
+            "session_id": record.session_id,
+            "event_type": record.event_type,
+            "content": record.canonical_payload_json(),
+            "agent_id": "edge_sync",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "metadata": Value::Object(metadata),
+        }]
     });
 
     Mock::given(method("POST"))
@@ -446,24 +455,20 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/events/{}", record.record_id)))
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events/reconcile"))
+        .and(body_json(json!({
+            "schema_version": 1,
+            "record_ids": [&record.record_id]
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "event_id": record.record_id,
-            "user_id": "user-a",
-            "session_id": sid,
-            "event_type": record.event_type,
-            "content": "{}",
-            "agent_id": "edge_sync",
-            "agent_version": "0.1.0",
-            "parent_event_id": null,
-            "causal_chain_id": null,
-            "metadata": {
-                "sync_outbox": {
-                    "payload_hash": record.payload_hash
-                }
-            },
-            "created_at": "2026-07-08T00:00:00.000000"
+            "schema_version": 1,
+            "acks": [{
+                "schema_version": 1,
+                "record_id": &record.record_id,
+                "payload_hash": &record.payload_hash,
+                "ingestion_status": "idempotent_replay"
+            }]
         })))
         .expect(1)
         .mount(&server)
@@ -501,15 +506,23 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
         .and(path("/sync/outbox/events"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).expect("sync request JSON");
+            let event = body
+                .get("events")
+                .and_then(Value::as_array)
+                .and_then(|events| events.first())
+                .expect("one sync event");
             ResponseTemplate::new(201).set_body_json(json!({
                 "schema_version": 1,
-                "record_id": body.get("event_id").and_then(Value::as_str),
-                "payload_hash": body
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("sync_outbox"))
-                    .and_then(|sync| sync.get("payload_hash"))
-                    .and_then(Value::as_str),
-                "ingestion_status": "created"
+                "acks": [{
+                    "schema_version": 1,
+                    "record_id": event.get("event_id").and_then(Value::as_str),
+                    "payload_hash": event
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("sync_outbox"))
+                        .and_then(|sync| sync.get("payload_hash"))
+                        .and_then(Value::as_str),
+                    "ingestion_status": "created"
+                }]
             }))
         })
         .expect(1)

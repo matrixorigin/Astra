@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
+use astra_sync_protocol::{
+    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE, SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+};
+
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
     is_duplicate_key_error, matrixone_statement_with_null_shape,
@@ -81,6 +86,61 @@ impl EventCreateOutcome {
     }
 }
 
+/// A permanent, record-scoped verdict inside a batch. It never rolls back the
+/// batch; siblings keep their own verdicts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventCreateRejection {
+    pub record_id: String,
+    pub status: StatusCode,
+    pub error_code: &'static str,
+    pub detail: String,
+}
+
+impl EventCreateRejection {
+    fn invalid(record_id: &str, error: (StatusCode, Json<ErrorResponse>)) -> Self {
+        Self {
+            record_id: record_id.to_string(),
+            status: error.0,
+            error_code: SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE,
+            detail: error.1.0.detail,
+        }
+    }
+
+    fn conflict(record_id: &str, detail: String) -> Self {
+        Self {
+            record_id: record_id.to_string(),
+            status: StatusCode::CONFLICT,
+            error_code: SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+            detail,
+        }
+    }
+
+    /// Single-event endpoints keep their established HTTP verdicts.
+    pub fn into_response(self) -> (StatusCode, Json<ErrorResponse>) {
+        (
+            self.status,
+            Json(ErrorResponse::new(self.detail).with_error_code(self.error_code)),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+// Entries live in a bounded per-batch vector (at most 100 records); boxing the
+// accepted variant would add one allocation per stored event for no gain.
+#[allow(clippy::large_enum_variant)]
+pub enum EventBatchEntry {
+    Accepted(EventCreateOutcome),
+    Rejected(EventCreateRejection),
+}
+
+/// Read-only sync receipt. Reconciliation needs identity and payload hash only,
+/// so full event content is never materialized for a reconcile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncOutboxReceipt {
+    pub event_id: String,
+    pub payload_hash: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventListFilter {
     pub user_id: String,
@@ -150,7 +210,7 @@ fn normalize_required_event_field(
     Ok(value)
 }
 
-fn sync_outbox_payload_hash(metadata: &serde_json::Value) -> Option<&str> {
+pub fn sync_outbox_payload_hash(metadata: &serde_json::Value) -> Option<&str> {
     metadata
         .get("sync_outbox")
         .and_then(|value| value.get("payload_hash"))
@@ -448,7 +508,25 @@ pub trait EventService: Send + Sync {
         &self,
         user_id: String,
         request: EventCreateRequestData,
-    ) -> Result<EventCreateOutcome, (StatusCode, Json<ErrorResponse>)>;
+    ) -> Result<EventCreateOutcome, (StatusCode, Json<ErrorResponse>)> {
+        let mut entries = self.create_events(user_id, vec![request]).await?;
+        match entries.pop() {
+            Some(EventBatchEntry::Accepted(outcome)) => Ok(outcome),
+            Some(EventBatchEntry::Rejected(rejection)) => Err(rejection.into_response()),
+            None => Err(internal_error(
+                "event service returned no outcome for a single-event request",
+            )),
+        }
+    }
+
+    /// Runs an ordered batch in one transaction. Infrastructure and session
+    /// failures roll back the whole batch; record-level verdicts are returned
+    /// per entry, so one invalid record never blocks or charges its siblings.
+    async fn create_events(
+        &self,
+        user_id: String,
+        requests: Vec<EventCreateRequestData>,
+    ) -> Result<Vec<EventBatchEntry>, (StatusCode, Json<ErrorResponse>)>;
 
     async fn list_events(
         &self,
@@ -460,6 +538,13 @@ pub trait EventService: Send + Sync {
         event_id: String,
         user_id: String,
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Read authoritative sync receipts without hydrating unrelated event data.
+    async fn get_sync_outbox_events(
+        &self,
+        user_id: String,
+        event_ids: Vec<String>,
+    ) -> Result<Vec<SyncOutboxReceipt>, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_causal_chain(
         &self,
@@ -603,13 +688,95 @@ pub const EVENT_LIST_SELECT_COLS: &str = "\
     '{}' AS metadata_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at";
 
-#[async_trait]
-impl EventService for DatabaseEventService {
-    async fn create_event(
+#[derive(Clone)]
+struct ExistingEventRecord {
+    record: EventRecord,
+    payload_hash: String,
+}
+
+#[derive(Default)]
+struct EventBatchWriteState {
+    existing_events: std::collections::BTreeMap<String, ExistingEventRecord>,
+    summaries: std::collections::BTreeMap<String, EventBatchSessionSummary>,
+}
+
+#[derive(Default)]
+struct EventBatchSessionSummary {
+    inserted: i64,
+    last_inserted_event_id: Option<String>,
+    repair: bool,
+    replayed_last: bool,
+}
+
+impl EventBatchWriteState {
+    fn note_created(&mut self, session_id: &str, event_id: &str) {
+        let summary = self.summaries.entry(session_id.to_string()).or_default();
+        summary.inserted += 1;
+        summary.last_inserted_event_id = Some(event_id.to_string());
+        summary.replayed_last = false;
+    }
+
+    fn note_sync_replay(&mut self, session_id: &str) {
+        let summary = self.summaries.entry(session_id.to_string()).or_default();
+        summary.repair = true;
+        summary.replayed_last = true;
+    }
+}
+
+impl DatabaseEventService {
+    async fn load_existing_events(
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        user_id: &str,
+        event_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<
+        std::collections::BTreeMap<String, ExistingEventRecord>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        let mut existing = std::collections::BTreeMap::new();
+        if event_ids.is_empty() {
+            return Ok(existing);
+        }
+        let mut query_builder = QueryBuilder::<MySql>::new(format!(
+            "SELECT {}, payload_hash FROM agent_events WHERE user_id = ",
+            EVENT_DETAIL_SELECT_COLS
+        ));
+        query_builder.push_bind(user_id);
+        query_builder.push(" AND event_id IN (");
+        {
+            let mut ids = query_builder.separated(", ");
+            for event_id in event_ids {
+                ids.push_bind(event_id);
+            }
+        }
+        query_builder.push(")");
+        for row in query_builder
+            .build()
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(internal_error)?
+        {
+            let payload_hash = row
+                .try_get::<String, _>("payload_hash")
+                .map_err(internal_error)?;
+            let record = Self::event_record_from_row(row)?;
+            existing.insert(
+                record.event_id.clone(),
+                ExistingEventRecord {
+                    record,
+                    payload_hash,
+                },
+            );
+        }
+        Ok(existing)
+    }
+
+    async fn create_event_in_transaction(
         &self,
-        user_id: String,
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        user_id: &str,
         request: EventCreateRequestData,
-    ) -> Result<EventCreateOutcome, (StatusCode, Json<ErrorResponse>)> {
+        write_state: &mut EventBatchWriteState,
+    ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
         let EventCreateRequestData {
             ingestion_source,
             event_id,
@@ -623,28 +790,38 @@ impl EventService for DatabaseEventService {
             causal_chain_id,
             metadata,
         } = request;
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let session_id = normalize_required_event_field("session_id", session_id)?;
-        let event_type = normalize_required_event_field("event_type", event_type)?;
-
-        // Start transaction for atomicity of INSERT event + UPDATE session
-        let mut connection = CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .map_err(internal_error)?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(internal_error)?;
-
-        let client_event_id = normalize_client_event_id(event_id)?;
+        let record_id = event_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let reject = |error: (StatusCode, Json<ErrorResponse>)| {
+            Ok(EventBatchEntry::Rejected(EventCreateRejection::invalid(
+                &record_id, error,
+            )))
+        };
+        let session_id = match normalize_required_event_field("session_id", session_id) {
+            Ok(value) => value,
+            Err(error) => return reject(error),
+        };
+        let event_type = match normalize_required_event_field("event_type", event_type) {
+            Ok(value) => value,
+            Err(error) => return reject(error),
+        };
+        let client_event_id = match normalize_client_event_id(event_id) {
+            Ok(value) => value,
+            Err(error) => return reject(error),
+        };
         let canonical_content = if ingestion_source == EventIngestionSource::SyncOutbox {
-            serde_json::from_str::<serde_json::Value>(&content).map_err(|_| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    "sync_outbox content must be valid JSON",
-                )
-            })?
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(value) => value,
+                Err(_) => {
+                    return reject(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "sync_outbox content must be valid JSON",
+                    ));
+                }
+            }
         } else {
             serde_json::Value::String(content.clone())
         };
@@ -662,14 +839,17 @@ impl EventService for DatabaseEventService {
                 "metadata": metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
             }));
         let sync_outbox_ingestion = ingestion_source == EventIngestionSource::SyncOutbox;
-        let verified_sync_payload_hash = verified_sync_outbox_payload_hash_for_source(
+        let verified_sync_payload_hash = match verified_sync_outbox_payload_hash_for_source(
             ingestion_source,
             &content,
             metadata.as_ref(),
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => return reject(error),
+        };
         let journal_event = if sync_outbox_ingestion {
             let Some(event_id) = client_event_id.as_deref() else {
-                return Err(error_response(
+                return reject(error_response(
                     StatusCode::BAD_REQUEST,
                     "sync_outbox ingestion requires a stable event_id",
                 ));
@@ -679,71 +859,59 @@ impl EventService for DatabaseEventService {
                     "sync_outbox ingestion reached identity verification without payload hash",
                 ));
             };
-            Some(verify_sync_outbox_event_identity(
+            match verify_sync_outbox_event_identity(
                 &content,
                 payload_hash,
                 event_id,
                 &session_id,
                 &event_type,
-            )?)
+            ) {
+                Ok(event) => Some(event),
+                Err(error) => return reject(error),
+            }
         } else {
             None
         };
-        ensure_event_session_requirement(&mut tx, &session_id, &user_id, sync_outbox_ingestion)
-            .await?;
-        if let Some(existing_id) = client_event_id.as_deref() {
-            let select_sql = format!(
-                "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
-                EVENT_DETAIL_SELECT_COLS
-            );
-            if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
-                .bind(existing_id)
-                .bind(&user_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(internal_error)?
-            {
-                let stored_hash = row
-                    .try_get::<String, _>("payload_hash")
-                    .map_err(internal_error)?;
-                let existing = Self::event_record_from_row(row)?;
-                if stored_hash == payload_hash
-                    && duplicate_event_matches_request(
-                        &existing,
-                        &session_id,
-                        &event_type,
-                        &content,
-                        metadata.as_ref(),
-                        verified_sync_payload_hash.as_deref(),
-                    )
-                {
-                    if sync_outbox_ingestion {
-                        repair_sync_event_session_summary(&mut tx, &session_id, &user_id).await?;
-                    }
-                    tx.commit().await.map_err(internal_error)?;
-                    connection.release();
-                    return Ok(EventCreateOutcome::replayed(existing));
-                }
-                crate::observation_capture::record_observation_collisions(
-                    &mut tx,
-                    &[crate::observation_capture::ObservationCollisionReceipt {
-                        user_id: &user_id,
-                        identity_id: existing_id,
-                        session_id: &session_id,
-                        stored_payload_hash: &stored_hash,
-                        attempted_payload_hash: &payload_hash,
-                        source: "event_service",
-                    }],
+        if let Some(existing_id) = client_event_id.as_deref()
+            && let Some(ExistingEventRecord {
+                record: existing,
+                payload_hash: stored_hash,
+            }) = write_state.existing_events.get(existing_id).cloned()
+        {
+            if stored_hash == payload_hash
+                && duplicate_event_matches_request(
+                    &existing,
+                    &session_id,
+                    &event_type,
+                    &content,
+                    metadata.as_ref(),
+                    verified_sync_payload_hash.as_deref(),
                 )
-                .await
-                .map_err(internal_error)?;
-                tx.commit().await.map_err(internal_error)?;
-                connection.release();
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("event_id {existing_id} already exists with a different payload hash"),
-                ));
+            {
+                if sync_outbox_ingestion {
+                    write_state.note_sync_replay(&session_id);
+                }
+                return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
+                    existing,
+                )));
             }
+            crate::observation_capture::record_observation_collisions(
+                &mut *tx,
+                &[crate::observation_capture::ObservationCollisionReceipt {
+                    user_id,
+                    identity_id: existing_id,
+                    session_id: &session_id,
+                    stored_payload_hash: &stored_hash,
+                    attempted_payload_hash: &payload_hash,
+                    source: "event_service",
+                }],
+            )
+            .await
+            .map_err(internal_error)?;
+            return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
+                existing_id,
+                format!("event_id {existing_id} already exists with a different payload hash"),
+            )));
         }
 
         let client_supplied_event_id = client_event_id.is_some();
@@ -809,7 +977,7 @@ impl EventService for DatabaseEventService {
         let row = match query(insert_sql)
             .bind(&event_id)
             .bind(&session_id)
-            .bind(&user_id)
+            .bind(user_id)
             .bind(&agent_id)
             .bind(&agent_version)
             .bind(&event_type)
@@ -830,7 +998,7 @@ impl EventService for DatabaseEventService {
             .bind(token_fields.token_input)
             .bind(token_fields.token_output)
             .bind(token_fields.token_total)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await
         {
             Ok(result) => result,
@@ -841,8 +1009,8 @@ impl EventService for DatabaseEventService {
                 );
                 if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
                     .bind(&event_id)
-                    .bind(&user_id)
-                    .fetch_optional(&mut *tx)
+                    .bind(user_id)
+                    .fetch_optional(&mut **tx)
                     .await
                     .map_err(internal_error)?
                 {
@@ -861,17 +1029,16 @@ impl EventService for DatabaseEventService {
                         )
                     {
                         if sync_outbox_ingestion {
-                            repair_sync_event_session_summary(&mut tx, &session_id, &user_id)
-                                .await?;
+                            write_state.note_sync_replay(&session_id);
                         }
-                        tx.commit().await.map_err(internal_error)?;
-                        connection.release();
-                        return Ok(EventCreateOutcome::replayed(existing));
+                        return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
+                            existing,
+                        )));
                     }
                     crate::observation_capture::record_observation_collisions(
-                        &mut tx,
+                        &mut *tx,
                         &[crate::observation_capture::ObservationCollisionReceipt {
-                            user_id: &user_id,
+                            user_id,
                             identity_id: &event_id,
                             session_id: &session_id,
                             stored_payload_hash: &stored_hash,
@@ -881,27 +1048,25 @@ impl EventService for DatabaseEventService {
                     )
                     .await
                     .map_err(internal_error)?;
-                    tx.commit().await.map_err(internal_error)?;
-                    connection.release();
                 }
-                return Err(error_response(
-                    StatusCode::CONFLICT,
+                return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
+                    &event_id,
                     format!("event_id {event_id} already exists with a different payload"),
-                ));
+                )));
             }
             Err(error) => return Err(internal_error(error)),
         };
 
         #[cfg(feature = "e2e-hooks")]
         if let Some(hook) = &self.retained_write_hook
-            && hook.after_insert(&user_id, &session_id).await
+            && hook.after_insert(user_id, &session_id).await
         {
             return Err(internal_error("injected retained event receipt failure"));
         }
 
         crate::storage::insert_agent_event_edges(
-            &mut tx,
-            &user_id,
+            &mut *tx,
+            user_id,
             &session_id,
             &event_id,
             primary_parent_event_id.as_deref(),
@@ -910,17 +1075,96 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
-        bump_agent_session_event_count(&mut *tx, &session_id, &user_id, 1, Some(&event_id))
-            .await
-            .map_err(internal_error)?;
+        write_state.note_created(&session_id, &event_id);
 
         let mut result = Self::event_record_from_row(row)?;
         result.parent_event_ids = normalized_parent_event_ids;
+        if client_supplied_event_id {
+            write_state.existing_events.insert(
+                event_id.clone(),
+                ExistingEventRecord {
+                    record: result.clone(),
+                    payload_hash,
+                },
+            );
+        }
 
+        Ok(EventBatchEntry::Accepted(EventCreateOutcome::created(
+            result,
+        )))
+    }
+}
+
+#[async_trait]
+impl EventService for DatabaseEventService {
+    async fn create_events(
+        &self,
+        user_id: String,
+        requests: Vec<EventCreateRequestData>,
+    ) -> Result<Vec<EventBatchEntry>, (StatusCode, Json<ErrorResponse>)> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
+
+        // Admit every session before reading stored events. The replay cache is
+        // then filled under the same write fence that guards inserts and
+        // deletes, so an event deleted concurrently can never be acknowledged
+        // as an idempotent replay.
+        let mut session_sources = std::collections::BTreeMap::<String, bool>::new();
+        for request in &requests {
+            let session_id = request.session_id.trim();
+            if session_id.is_empty() {
+                continue;
+            }
+            let sync_outbox = request.ingestion_source == EventIngestionSource::SyncOutbox;
+            match session_sources.get(session_id) {
+                Some(existing) if *existing != sync_outbox => {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "a batch must not mix sync-outbox and client events for one session",
+                    ));
+                }
+                _ => {
+                    session_sources.insert(session_id.to_string(), sync_outbox);
+                }
+            }
+        }
+        for (session_id, sync_outbox) in &session_sources {
+            ensure_event_session_requirement(&mut tx, session_id, &user_id, *sync_outbox).await?;
+        }
+        let event_ids = requests
+            .iter()
+            .filter_map(|request| request.event_id.as_deref())
+            .map(str::trim)
+            .filter(|event_id| {
+                !event_id.is_empty() && event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
+            })
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut write_state = EventBatchWriteState {
+            existing_events: Self::load_existing_events(&mut tx, &user_id, &event_ids).await?,
+            ..EventBatchWriteState::default()
+        };
+        let mut entries = Vec::with_capacity(requests.len());
+        for request in requests {
+            entries.push(
+                self.create_event_in_transaction(&mut tx, &user_id, request, &mut write_state)
+                    .await?,
+            );
+        }
+        flush_event_batch_session_summaries(&mut tx, &user_id, &write_state).await?;
         tx.commit().await.map_err(internal_error)?;
         connection.release();
-
-        Ok(EventCreateOutcome::created(result))
+        Ok(entries)
     }
 
     async fn list_events(
@@ -1009,6 +1253,46 @@ impl EventService for DatabaseEventService {
         let mut records = vec![Self::event_record_from_row(row)?];
         Self::hydrate_parent_event_ids(&pool, &mut records).await?;
         Ok(records.pop().expect("single event record"))
+    }
+
+    async fn get_sync_outbox_events(
+        &self,
+        user_id: String,
+        event_ids: Vec<String>,
+    ) -> Result<Vec<SyncOutboxReceipt>, (StatusCode, Json<ErrorResponse>)> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let mut query_builder = QueryBuilder::<MySql>::new(
+            "SELECT event_id, payload_hash FROM agent_events WHERE user_id = ",
+        );
+        query_builder.push_bind(user_id);
+        query_builder.push(" AND event_id IN (");
+        {
+            let mut ids = query_builder.separated(", ");
+            for event_id in event_ids {
+                ids.push_bind(event_id);
+            }
+        }
+        query_builder.push(")");
+        query_builder
+            .build()
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|row| {
+                Ok(SyncOutboxReceipt {
+                    event_id: row
+                        .try_get::<String, _>("event_id")
+                        .map_err(internal_error)?,
+                    payload_hash: row
+                        .try_get::<String, _>("payload_hash")
+                        .map_err(internal_error)?,
+                })
+            })
+            .collect()
     }
 
     async fn get_causal_chain(
@@ -1188,6 +1472,17 @@ async fn ensure_event_session_requirement(
         })
 }
 
+fn sync_outbox_error_response(
+    status: StatusCode,
+    detail: impl Into<String>,
+    error_code: &'static str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse::new(detail).with_error_code(error_code)),
+    )
+}
+
 async fn ensure_sync_event_session_header(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -1196,18 +1491,48 @@ async fn ensure_sync_event_session_header(
     crate::storage::admit_session_event_write(tx, session_id, user_id, true)
         .await
         .map_err(|error| match error {
-            sqlx::Error::RowNotFound => error_response(
+            sqlx::Error::RowNotFound => sync_outbox_error_response(
                 StatusCode::CONFLICT,
                 format!("session_id {session_id} is unavailable for event ingestion"),
+                SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
             ),
             error => internal_error(error),
         })
+}
+
+async fn flush_event_batch_session_summaries(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    state: &EventBatchWriteState,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    for (session_id, summary) in &state.summaries {
+        if summary.repair {
+            let last_event_id = if summary.replayed_last {
+                None
+            } else {
+                summary.last_inserted_event_id.as_deref()
+            };
+            repair_sync_event_session_summary(tx, session_id, user_id, last_event_id).await?;
+        } else if summary.inserted > 0 {
+            bump_agent_session_event_count(
+                &mut **tx,
+                session_id,
+                user_id,
+                summary.inserted,
+                summary.last_inserted_event_id.as_deref(),
+            )
+            .await
+            .map_err(internal_error)?;
+        }
+    }
+    Ok(())
 }
 
 async fn repair_sync_event_session_summary(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
+    last_event_id_override: Option<&str>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let count_row = query(
         "SELECT COUNT(*) AS event_count FROM agent_events WHERE session_id = ? AND user_id = ?",
@@ -1220,20 +1545,25 @@ async fn repair_sync_event_session_summary(
     let event_count = count_row
         .try_get::<i64, _>("event_count")
         .map_err(|e| internal_error(format!("sync outbox session summary count decode: {e}")))?;
-    let latest_row = query(
-        "SELECT event_id FROM agent_events \
-         WHERE session_id = ? AND user_id = ? \
-         ORDER BY created_at DESC, event_id DESC LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(internal_error)?;
-    let last_event_id = latest_row
-        .as_ref()
-        .map(|row| event_row_string(row, "event_id"))
-        .transpose()?;
+    let last_event_id = match last_event_id_override {
+        Some(event_id) => Some(event_id.to_string()),
+        None => {
+            let latest_row = query(
+                "SELECT event_id FROM agent_events \
+                 WHERE session_id = ? AND user_id = ? \
+                 ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal_error)?;
+            latest_row
+                .as_ref()
+                .map(|row| event_row_string(row, "event_id"))
+                .transpose()?
+        }
+    };
     query(
         "UPDATE agent_sessions \
          SET event_count = ?, last_event_id = ?, updated_at = NOW(6), last_active_at = NOW(6) \
@@ -1255,11 +1585,11 @@ pub struct UnconfiguredEventService;
 
 #[async_trait]
 impl EventService for UnconfiguredEventService {
-    async fn create_event(
+    async fn create_events(
         &self,
         _: String,
-        _: EventCreateRequestData,
-    ) -> Result<EventCreateOutcome, (StatusCode, Json<ErrorResponse>)> {
+        _: Vec<EventCreateRequestData>,
+    ) -> Result<Vec<EventBatchEntry>, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("event service not configured"))
     }
     async fn list_events(
@@ -1273,6 +1603,13 @@ impl EventService for UnconfiguredEventService {
         _: String,
         _: String,
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("event service not configured"))
+    }
+    async fn get_sync_outbox_events(
+        &self,
+        _: String,
+        _: Vec<String>,
+    ) -> Result<Vec<SyncOutboxReceipt>, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("event service not configured"))
     }
     async fn get_causal_chain(
