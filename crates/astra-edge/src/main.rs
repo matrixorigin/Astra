@@ -28,6 +28,7 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +105,25 @@ fn is_permanent_connection_error(error: &(dyn std::error::Error + 'static)) -> b
         Some(tokio_tungstenite::tungstenite::Error::Http(response))
             if matches!(response.status().as_u16(), 401 | 403)
     )
+}
+
+async fn observe_shutdown(
+    shutdown: CancellationToken,
+    signal: impl Future<Output = std::io::Result<()>>,
+) {
+    if let Err(error) = signal.await {
+        tracing::warn!(%error, "Cannot install Ctrl+C handler");
+    } else {
+        tracing::info!("Ctrl+C received; shutting down");
+        shutdown.cancel();
+    }
+}
+
+async fn wait_for_reconnect(delay: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = shutdown.cancelled() => false,
+    }
 }
 
 fn normalized_hostname() -> String {
@@ -699,7 +719,10 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
-async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_edge_connection(
+    config: &EdgeConfig,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
@@ -802,8 +825,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         .reunite(read)
         .map_err(|_| "Edge socket halves could not be reunited")?;
     let (socket, authenticated_account, _authenticated_edge_id) =
-        astra_edge::authenticate_connection(socket, auth_msg, None, &CancellationToken::new())
-            .await?;
+        astra_edge::authenticate_connection(socket, auth_msg, None, &shutdown).await?;
     // Only the token snapshot proven by this connection may advance persistence.
     config.token_manager.mark_proven(&token_snapshot).await;
 
@@ -833,7 +855,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             executor,
             config.capacity_providers.clone(),
         )),
-        CancellationToken::new(),
+        shutdown,
     )
     .await
     .map_err(|error| error as Box<dyn std::error::Error>)
@@ -969,6 +991,14 @@ async fn main() {
     // Background self-renewal of moi-user-token-v1 edge-registration tokens.
     token_renewal::spawn_renewal_task(config.token_manager.clone());
 
+    // Register exactly one process-lifetime signal observer. Recreating or
+    // dropping ctrl_c futures between connection phases can lose SIGINT.
+    let shutdown = CancellationToken::new();
+    let _shutdown_listener = tokio::spawn(observe_shutdown(
+        shutdown.clone(),
+        tokio::signal::ctrl_c(),
+    ));
+
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
@@ -978,7 +1008,25 @@ async fn main() {
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        match run_edge_connection(&config).instrument(edge_span).await {
+        let connection =
+            run_edge_connection(&config, shutdown.clone()).instrument(edge_span);
+        tokio::pin!(connection);
+        let connection_result = tokio::select! {
+            result = &mut connection => Some(result),
+            _ = shutdown.cancelled() => {
+                // Give authenticated/active connections a bounded opportunity
+                // to settle the work they own after the shared token is cancelled.
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut connection).await;
+                None
+            }
+        };
+        let Some(connection_result) = connection_result else {
+            break;
+        };
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match connection_result {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
                 if !config.reconnect {
@@ -1020,16 +1068,8 @@ async fn main() {
         // Exponential backoff with jitter
         // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
         let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs_f64(jitter)) => {}
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    tracing::warn!(%error, "Cannot install Ctrl+C handler during reconnect");
-                } else {
-                    tracing::info!("Ctrl+C received during reconnect; shutting down");
-                    break;
-                }
-            }
+        if !wait_for_reconnect(Duration::from_secs_f64(jitter), &shutdown).await {
+            break;
         }
         reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
     }
@@ -1049,6 +1089,32 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_signal_cancels_the_process_lifetime_token() {
+        let shutdown = CancellationToken::new();
+        observe_shutdown(shutdown.clone(), std::future::ready(Ok(()))).await;
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn signal_registration_failure_does_not_cancel_or_skip_backoff() {
+        let shutdown = CancellationToken::new();
+        observe_shutdown(
+            shutdown.clone(),
+            std::future::ready(Err(std::io::Error::other("signal registration failed"))),
+        )
+        .await;
+        assert!(!shutdown.is_cancelled());
+        assert!(wait_for_reconnect(Duration::ZERO, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn reconnect_backoff_stops_when_shutdown_arrives() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(!wait_for_reconnect(Duration::from_secs(60), &shutdown).await);
+    }
 
     #[tokio::test]
     async fn connection_errors_cancel_and_reap_parallel_tools_before_returning() {
@@ -1163,7 +1229,10 @@ mod tests {
             .unwrap();
         };
         let (_, result) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(server, run_edge_connection(&config))
+            tokio::join!(
+                server,
+                run_edge_connection(&config, CancellationToken::new())
+            )
         })
         .await
         .unwrap();
@@ -1285,7 +1354,10 @@ mod tests {
             while ws.next().await.is_some_and(|message| message.is_ok()) {}
         };
         let (_, result) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(server, run_edge_connection(&config))
+            tokio::join!(
+                server,
+                run_edge_connection(&config, CancellationToken::new())
+            )
         })
         .await
         .unwrap();
@@ -1375,7 +1447,10 @@ mod tests {
             while ws.next().await.is_some_and(|message| message.is_ok()) {}
         };
         let (_, recovered) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(recovery_server, run_edge_connection(&config))
+            tokio::join!(
+                recovery_server,
+                run_edge_connection(&config, CancellationToken::new())
+            )
         })
         .await
         .unwrap();
