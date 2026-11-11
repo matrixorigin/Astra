@@ -157,7 +157,7 @@ impl PlanModeState {
         if slug.is_empty() {
             format!("plan-{:08x}", hash as u32)
         } else {
-            format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
+            format!("{}-{:08x}", slug.to_lowercase(), hash as u32)
         }
     }
 }
