@@ -128,9 +128,6 @@ impl PlanModeState {
 
     /// Generate a unique plan ID from the goal.
     pub fn generate_plan_id(goal: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let slug: String = goal
             .split_whitespace()
             .take(3)
@@ -141,19 +138,35 @@ impl PlanModeState {
             .take(30)
             .collect();
 
-        let mut hasher = DefaultHasher::new();
-        goal.hash(&mut hasher);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        ts.hash(&mut hasher);
-        let hash = hasher.finish();
-
+        // Random UUIDs avoid same-second collisions across concurrent sessions and
+        // independent server replicas. Keep the human-readable goal prefix.
+        let unique = uuid::Uuid::new_v4().simple();
         if slug.is_empty() {
-            format!("plan-{:08x}", hash as u32)
+            format!("plan-{unique}")
         } else {
-            format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
+            format!("{}-{unique}", slug.to_lowercase())
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_id_regression_tests {
+    use super::PlanModeState;
+
+    #[test]
+    fn repeated_goal_generates_distinct_ids_without_sleeping() {
+        let ids: std::collections::HashSet<_> = (0..128)
+            .map(|_| PlanModeState::generate_plan_id("Refactor the parser"))
+            .collect();
+        assert_eq!(ids.len(), 128);
+        assert!(ids.iter().all(|id| id.starts_with("refactor-the-parser-")));
+    }
+
+    #[test]
+    fn empty_goal_still_generates_unique_ids() {
+        let a = PlanModeState::generate_plan_id("");
+        let b = PlanModeState::generate_plan_id("");
+        assert_ne!(a, b);
+        assert!(a.starts_with("plan-"));
     }
 }
