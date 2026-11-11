@@ -161,6 +161,7 @@ async fn clean_eof_responses_requires_a_valid_semantic_terminal() {
                 .unwrap(),
         );
         let route = LlmExecutionRoute {
+            usage_attestation: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("scope"),
             subscription: None,
