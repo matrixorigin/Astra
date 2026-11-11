@@ -115,7 +115,6 @@ pub enum HistoryWorkSite {
     SyncOutboxPayloadClone,
     SyncOutboxPayloadHash,
     SyncOutboxJournalDeltaClone,
-    SyncOutboxStateClone,
     SyncOutboxDeliveryClone,
     SyncOutboxDeliverySerialization,
     SyncOutboxQueueRead,
@@ -131,7 +130,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 111;
+    const COUNT: usize = 110;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -233,7 +232,6 @@ impl HistoryWorkSite {
         Self::SyncOutboxPayloadClone,
         Self::SyncOutboxPayloadHash,
         Self::SyncOutboxJournalDeltaClone,
-        Self::SyncOutboxStateClone,
         Self::SyncOutboxDeliveryClone,
         Self::SyncOutboxDeliverySerialization,
         Self::SyncOutboxQueueRead,
@@ -356,7 +354,6 @@ impl HistoryWorkSite {
             Self::SyncOutboxPayloadClone => "sync_outbox_payload_clone",
             Self::SyncOutboxPayloadHash => "sync_outbox_payload_hash",
             Self::SyncOutboxJournalDeltaClone => "sync_outbox_journal_delta_clone",
-            Self::SyncOutboxStateClone => "sync_outbox_state_clone",
             Self::SyncOutboxDeliveryClone => "sync_outbox_delivery_clone",
             Self::SyncOutboxDeliverySerialization => "sync_outbox_delivery_serialization",
             Self::SyncOutboxQueueRead => "sync_outbox_queue_read",
@@ -485,7 +482,6 @@ impl HistoryWorkSite {
             Self::SyncOutboxPayloadClone
             | Self::SyncOutboxPayloadHash
             | Self::SyncOutboxJournalDeltaClone
-            | Self::SyncOutboxStateClone
             | Self::SyncOutboxDeliveryClone
             | Self::SyncOutboxDeliverySerialization
             | Self::SyncOutboxQueueRead
