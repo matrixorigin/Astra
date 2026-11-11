@@ -28,6 +28,14 @@ fn boundary_phases() {
         PlanPhase::Completed
     );
     assert_eq!(
+        plan(&[TaskStatus::InProgress]).infer_phase(),
+        PlanPhase::Executing
+    );
+    assert_eq!(
+        plan(&[TaskStatus::Pending, TaskStatus::InProgress]).infer_phase(),
+        PlanPhase::Executing
+    );
+    assert_eq!(
         plan(&[TaskStatus::Completed, TaskStatus::Pending]).infer_phase(),
         PlanPhase::Executing
     );
