@@ -2722,9 +2722,6 @@ impl ThinClient {
             };
 
             drop(permit);
-            if attempt.saturating_add(1) >= CONTROL_CALLBACK_ATTEMPTS as u32 {
-                return Err(error);
-            }
 
             let delay = tool_result_retry_delay(body, attempt, retry_base)
                 .max(Duration::from_secs(retry_after.unwrap_or(0)));
@@ -5195,12 +5192,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_result_delivery_bounds_persistent_retryable_failures() {
+    async fn tool_result_delivery_recovers_after_multiple_transient_failures() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let replies = Arc::clone(&attempts);
         Mock::given(method("POST"))
             .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(2)
+            .respond_with(move |_: &wiremock::Request| {
+                let status = if replies.fetch_add(1, Ordering::SeqCst) < 2 {
+                    503
+                } else {
+                    200
+                };
+                ResponseTemplate::new(status)
+            })
             .mount(&server)
             .await;
         let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
@@ -5215,7 +5223,7 @@ mod tests {
             tool_result_fields: None,
         });
         let client = ThinClient::new(&server.uri(), None).unwrap();
-        let error = client
+        client
             .post_tool_result_with_policy(
                 Some("tok"),
                 Some("edge"),
@@ -5231,9 +5239,17 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, ThinClientError::Api { status, .. } if status.as_u16() == 503));
-        server.verify().await;
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body == requests[0].body)
+        );
+        assert!(requests.iter().all(|request| {
+            request.headers.get("x-astra-edge-id") == requests[0].headers.get("x-astra-edge-id")
+        }));
     }
 
     #[tokio::test]

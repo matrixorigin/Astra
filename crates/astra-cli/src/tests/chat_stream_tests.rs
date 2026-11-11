@@ -298,7 +298,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                             }
                             (
                                 if callback_failed {
-                                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                    // This accounting fixture needs a terminal failure,
+                                    // not the callback retry policy's recovery delay.
+                                    axum::http::StatusCode::NOT_IMPLEMENTED
                                 } else {
                                     axum::http::StatusCode::OK
                                 },
@@ -363,11 +365,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         }
         if admission_rejected {
             let bodies = callback_bodies.lock().unwrap();
-            assert_eq!(
-                bodies.len(),
-                if callback_failed { 2 } else { 1 },
-                "surface refusal sends no callback; persistent delivery failures retry once",
-            );
+            assert_eq!(bodies.len(), 1, "surface refusal sends no callback");
             assert_eq!(bodies[0]["request_id"], "read-0");
             if !callback_failed {
                 assert_eq!(bodies[0]["run_id"], "partial-run");
@@ -425,9 +423,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                         "second evidence"
                     })
             );
-            // Completed results are delivered independently and retried once,
-            // including bounded late delivery; the sibling observation is retained once.
-            let expected_attempts = 2 * callback_count;
+            // Completed results are delivered independently, including bounded
+            // late delivery; the sibling observation is retained once.
+            let expected_attempts = callback_count;
             assert_eq!(
                 callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
                 expected_attempts
