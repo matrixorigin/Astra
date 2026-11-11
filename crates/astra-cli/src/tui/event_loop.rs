@@ -4060,6 +4060,10 @@ impl GuidanceSubmissionError {
             // idempotent durable insert. Conservatively retain ownership
             // ambiguity and reconcile by intent_id.
             astra_thin_client::ThinClientError::Http(_)
+            | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+            | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+            | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+            | astra_thin_client::ThinClientError::CallbackRetryCancelled
             | astra_thin_client::ThinClientError::SyncOutboxBackpressure { .. }
             | astra_thin_client::ThinClientError::Api { .. }
             | astra_thin_client::ThinClientError::Json(_)

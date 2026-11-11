@@ -329,13 +329,13 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// One headless request's late-bound session execution authority.
     pub request_session_execution_lease:
         Option<Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>>,
-    /// Sticky across physical SSE rounds: once local execution can no longer
-    /// settle or observe an admitted durable run, the outer owner must
-    /// terminate the exact affected run instead of leaving a ghost controller.
+    /// Sticky across physical SSE rounds when an admitted run's local owner
+    /// needs settlement. The outer owner distinguishes explicit cancellation
+    /// from a lost observation or callback acknowledgement.
     pub remote_cancel_required: bool,
     /// Set when an edge callback acknowledgement failed. Distinct from other
-    /// reasons `remote_cancel_required` becomes true, so headless settlement
-    /// can describe that callback without rewriting stdout or binding failures.
+    /// reasons `remote_cancel_required` becomes true, so settlement does not
+    /// turn a lost callback acknowledgement into a user cancellation.
     pub callback_client_detached: bool,
     /// Exact durable owner to cancel. Callback failures may name a projected
     /// child; physical-stream failures use the immutable root owner.

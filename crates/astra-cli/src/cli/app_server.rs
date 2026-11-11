@@ -460,7 +460,10 @@ async fn run_app_server_lines(
                     write_response_error(&writer, id, "unknown approvalId").await?;
                     continue;
                 };
-                let _ = pending.response_tx.send(response);
+                if pending.response_tx.send(response).is_err() {
+                    write_response_error(&writer, id, "approval is no longer pending").await?;
+                    continue;
+                }
                 write_response(&writer, id, serde_json::json!({"ok": true})).await?;
             }
             _ => {
@@ -1500,6 +1503,65 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn app_server_rejects_a_closed_approval_without_false_success() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let (closed_tx, closed_rx) = oneshot::channel();
+        drop(closed_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+        {
+            let mut state = state.lock().await;
+            for (id, response_tx) in [("closed", closed_tx), ("live", live_tx)] {
+                state.pending_approvals.insert(
+                    id.into(),
+                    super::PendingApproval {
+                        turn_id: "turn".into(),
+                        response_tx,
+                    },
+                );
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let writer = JsonWriter::start(move |line| {
+            output.lock().unwrap().push(line.to_string());
+            Ok(())
+        });
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            auth_profile: None,
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = ["closed", "live"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, approval_id)| {
+                Ok(serde_json::json!({
+                    "id": index, "method": "approval/respond",
+                    "params": {"approvalId": approval_id, "decision": "allow_once"},
+                })
+                .to_string())
+            });
+        run_app_server_lines(lines, ctx, state.clone(), writer, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let responses: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            responses[0]["error"]["message"],
+            "approval is no longer pending"
+        );
+        assert_eq!(responses[1]["result"]["ok"], true);
+        assert_eq!(live_rx.await.unwrap(), ApprovalResponse::AllowOnce);
+        assert!(state.lock().await.pending_approvals.is_empty());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn blocked_output_does_not_block_the_async_executor() {

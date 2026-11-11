@@ -386,14 +386,21 @@ pub(super) async fn consume_remote_turn(
             if host.failed_run_terminal.is_none()
                 && state.interruption.is_none()
                 && error.kind != astra_core::ErrorKind::Cancelled
-                && let Some((kind, action)) =
-                    astra_turn_core::interruption::interruption_from_error_kind(error.kind)
             {
-                state.interruption = Some(InterruptionRecord::new(
-                    kind,
-                    action,
-                    state.interruption_summary(error.message.clone()),
-                ));
+                let interruption = if host.callback_client_detached {
+                    Some((InterruptionKind::Interrupted, ResumeAction::RequiresIntervention {
+                        description: "The Server has not confirmed the tool result; check the run before continuing.".into(),
+                    }))
+                } else {
+                    astra_turn_core::interruption::interruption_from_error_kind(error.kind)
+                };
+                if let Some((kind, action)) = interruption {
+                    state.interruption = Some(InterruptionRecord::new(
+                        kind,
+                        action,
+                        state.interruption_summary(error.message.clone()),
+                    ));
+                }
             }
         }
         let cancelled = result

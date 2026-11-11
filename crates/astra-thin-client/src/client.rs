@@ -43,10 +43,37 @@ const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// the SSE consumer indefinitely. The budget has to outlast one slow database
 /// transaction; 10 seconds was short enough for the client to disconnect before
 /// the acknowledgement returned. Server handlers are idempotent for an
-/// identical request, so one immediate transport retry is safe.
+/// identical request, so retrying delivery does not repeat tool execution.
 const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 30;
 const CONTROL_CALLBACK_ATTEMPTS: usize = 2;
+const CALLBACK_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// Scoped authority and budget for delivery of an already executed result.
+pub struct ToolResultDelivery<'a> {
+    pub budget: Duration,
+    pub owner_current: &'a (dyn Fn() -> bool + Send + Sync),
+    pub concurrency: Option<&'a tokio::sync::Semaphore>,
+    pub cancel: Option<&'a tokio_util::sync::CancellationToken>,
+    /// The same result has already been sent, for example before a 401 refresh.
+    pub previous_attempt: bool,
+}
+
+fn tool_result_retry_delay(body: &ToolResultRequest, attempt: u32, base: Duration) -> Duration {
+    use std::hash::{Hash, Hasher};
+
+    // Stable per invocation but spread across independent sessions.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&body.session_id, &body.run_id, &body.request_id, attempt).hash(&mut hasher);
+    let base_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
+    let spread_ms = base_ms.saturating_mul(1_u64 << attempt.min(2));
+    let jitter_ms = if spread_ms == 0 {
+        0
+    } else {
+        hasher.finish() % spread_ms
+    };
+    Duration::from_millis((spread_ms / 2).saturating_add(jitter_ms))
+}
 
 fn stream_event_is_terminal(event: &StreamEvent) -> bool {
     matches!(
@@ -375,13 +402,37 @@ impl ThinClient {
     /// acknowledgement boundary; waiting for an optional JSON body can turn
     /// an already-committed callback into a false failure when that body is
     /// delayed or dropped.
-    async fn callback_ack_or_error(resp: Response) -> Result<Value, ThinClientError> {
+    async fn callback_ack_or_error(
+        mut resp: Response,
+        bound_error_capture: bool,
+    ) -> Result<Value, ThinClientError> {
         let status = resp.status();
         if status.is_success() {
             return Ok(Value::Null);
         }
-        let body = resp.text().await.unwrap_or_default();
-        Err(ThinClientError::Api { status, body })
+        if !bound_error_capture {
+            return Err(ThinClientError::Api {
+                status,
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+        // A proxy may stream an error forever. Keep both the diagnostic and
+        // the connection bounded so one bad callback cannot starve a batch.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut body = Vec::new();
+        while body.len() < CALLBACK_ERROR_BODY_LIMIT {
+            match tokio::time::timeout_at(deadline, resp.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    let length = chunk.len().min(CALLBACK_ERROR_BODY_LIMIT - body.len());
+                    body.extend_from_slice(&chunk[..length]);
+                }
+                _ => break,
+            }
+        }
+        Err(ThinClientError::Api {
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        })
     }
 
     async fn typed_json_or_error<T: DeserializeOwned>(
@@ -2565,13 +2616,15 @@ impl ThinClient {
         bearer_override: Option<&str>,
         edge_executor_id: Option<&str>,
         body: &ToolResultRequest,
+        delivery: ToolResultDelivery<'_>,
     ) -> Result<Value, ThinClientError> {
         self.post_tool_result_with_policy(
             bearer_override,
             edge_executor_id,
             body,
             Duration::from_secs(CONTROL_CALLBACK_TIMEOUT_SECS),
-            CONTROL_CALLBACK_ATTEMPTS,
+            Duration::from_secs(5),
+            delivery,
         )
         .await
     }
@@ -2581,32 +2634,120 @@ impl ThinClient {
         bearer_override: Option<&str>,
         edge_executor_id: Option<&str>,
         body: &ToolResultRequest,
-        timeout: Duration,
-        attempts: usize,
+        attempt_timeout: Duration,
+        retry_base: Duration,
+        delivery: ToolResultDelivery<'_>,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::TOOLS_RESULT)?;
-        let attempts = attempts.max(1);
-        for attempt in 0..attempts {
+        let deadline = tokio::time::Instant::now() + delivery.budget;
+        let mut attempt = 0_u32;
+        let mut previous_error = None;
+        loop {
+            let is_retry = attempt > 0 || delivery.previous_attempt;
+            if is_retry && delivery.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(previous_error
+                    .take()
+                    .unwrap_or(ThinClientError::CallbackRetryCancelled));
+            }
+            if !(delivery.owner_current)() {
+                return Err(ThinClientError::CallbackOwnerUnconfirmed);
+            }
+            let permit = if let Some(concurrency) = delivery.concurrency {
+                let acquire = tokio::time::timeout_at(deadline, concurrency.acquire());
+                let acquired = if is_retry && let Some(cancel) = delivery.cancel {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(previous_error.take().unwrap_or(ThinClientError::CallbackRetryCancelled)),
+                        acquired = acquire => acquired,
+                    }
+                } else {
+                    acquire.await
+                };
+                Some(
+                    acquired
+                        .map_err(|_| ThinClientError::CallbackDeadlineExpired)?
+                        .map_err(|_| ThinClientError::CallbackDeadlineExpired)?,
+                )
+            } else {
+                None
+            };
+            if !(delivery.owner_current)() {
+                return Err(ThinClientError::CallbackOwnerUnconfirmed);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ThinClientError::CallbackDeadlineExpired);
+            }
             let mut req = self
                 .http
                 .post(url.clone())
                 .headers(self.auth_headers_for(bearer_override).await?)
-                .timeout(timeout)
+                .timeout(attempt_timeout.min(remaining))
                 .json(body);
             if let Some(id) = edge_executor_id
                 && let Ok(v) = HeaderValue::from_str(id)
             {
                 req = req.header(ASTRA_EDGE_ID_HEADER, v);
             }
-            match req.send().await {
-                Ok(resp) => return Self::callback_ack_or_error(resp).await,
-                Err(error)
-                    if attempt + 1 < attempts
-                        && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
-                Err(error) => return Err(error.into()),
+            if !(delivery.owner_current)() {
+                return Err(ThinClientError::CallbackOwnerUnconfirmed);
             }
+            if is_retry && delivery.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(previous_error
+                    .take()
+                    .unwrap_or(ThinClientError::CallbackRetryCancelled));
+            }
+            let response = req.send().await;
+            let (error, retry_after) = match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after =
+                        parse_retry_after(resp.headers(), std::time::SystemTime::now());
+                    let result = Self::callback_ack_or_error(resp, true).await;
+                    if !matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+                        return result;
+                    }
+                    (
+                        result.expect_err("retryable HTTP status is not successful"),
+                        retry_after,
+                    )
+                }
+                Err(error) => {
+                    let error = ThinClientError::from(error);
+                    if !error.is_transport() {
+                        return Err(error);
+                    }
+                    (error, None)
+                }
+            };
+
+            drop(permit);
+
+            let delay = tool_result_retry_delay(body, attempt, retry_base)
+                .max(Duration::from_secs(retry_after.unwrap_or(0)));
+            if delivery.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(error);
+            }
+            if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                return Err(error);
+            }
+            let http_status = match &error {
+                ThinClientError::Api { status, .. } => Some(status.as_u16()),
+                _ => None,
+            };
+            tracing::warn!(request_id = %body.request_id, attempt, ?delay, ?http_status, "retrying tool-result delivery");
+            previous_error = Some(error);
+            if let Some(cancel) = delivery.cancel {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(previous_error.take().expect("a retry follows a failed attempt")),
+                    _ = tokio::time::sleep(delay) => {},
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
+            attempt = attempt.saturating_add(1);
         }
-        unreachable!("at least one callback attempt is required")
     }
 
     pub async fn post_approval(
@@ -2642,7 +2783,7 @@ impl ThinClient {
                 .send()
                 .await
             {
-                Ok(resp) => return Self::callback_ack_or_error(resp).await,
+                Ok(resp) => return Self::callback_ack_or_error(resp, false).await,
                 Err(error)
                     if attempt + 1 < attempts
                         && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
@@ -2686,7 +2827,7 @@ impl ThinClient {
                 .send()
                 .await
             {
-                Ok(resp) => return Self::callback_ack_or_error(resp).await,
+                Ok(resp) => return Self::callback_ack_or_error(resp, false).await,
                 Err(error)
                     if attempt + 1 < attempts
                         && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
@@ -4966,10 +5107,598 @@ mod tests {
             tool_result_fields: None,
         });
         let v = client
-            .post_tool_result(Some("tok"), Some("edge-abc"), &body)
+            .post_tool_result(
+                Some("tok"),
+                Some("edge-abc"),
+                &body,
+                ToolResultDelivery {
+                    budget: Duration::from_secs(5),
+                    owner_current: &|| true,
+                    concurrency: None,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            )
             .await
             .unwrap();
         assert!(v.is_null(), "callbacks acknowledge by successful status");
+    }
+
+    #[tokio::test]
+    async fn tool_result_delivery_retries_only_transient_failures_with_identical_payload() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for first_status in [500, 429, 409] {
+            let server = MockServer::start().await;
+            let count = Arc::new(AtomicUsize::new(0));
+            let replies = Arc::clone(&count);
+            Mock::given(method("POST"))
+                .and(path("/tools/result"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let status = if replies.fetch_add(1, Ordering::SeqCst) == 0 {
+                        first_status
+                    } else {
+                        200
+                    };
+                    ResponseTemplate::new(status)
+                })
+                .mount(&server)
+                .await;
+            let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: "request".into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "actual tool output".into(),
+                duration_ms: 12,
+                tool_result_fields: None,
+            });
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let result = client
+                .post_tool_result_with_policy(
+                    Some("tok"),
+                    Some("edge"),
+                    &body,
+                    Duration::from_secs(1),
+                    Duration::from_millis(5),
+                    ToolResultDelivery {
+                        budget: Duration::from_secs(2),
+                        owner_current: &|| true,
+                        concurrency: None,
+                        cancel: None,
+                        previous_attempt: false,
+                    },
+                )
+                .await;
+            let requests = server.received_requests().await.unwrap();
+            if first_status == 409 {
+                assert!(
+                    matches!(result, Err(ThinClientError::Api { status, .. }) if status.as_u16() == 409)
+                );
+                assert_eq!(requests.len(), 1);
+            } else {
+                result.unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].body, requests[1].body);
+                assert_eq!(
+                    requests[0].headers.get("x-astra-edge-id"),
+                    requests[1].headers.get("x-astra-edge-id")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_retry_respects_server_advice_and_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "10"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "actual tool output".into(),
+            duration_ms: 12,
+            tool_result_fields: None,
+        });
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let error = client
+            .post_tool_result_with_policy(
+                Some("tok"),
+                Some("edge"),
+                &body,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                ToolResultDelivery {
+                    budget: Duration::from_millis(200),
+                    owner_current: &|| true,
+                    concurrency: None,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ThinClientError::Api { status, .. } if status.as_u16() == 503));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn tool_result_retry_stops_when_the_original_owner_changes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = MockServer::start().await;
+        let current = Arc::new(AtomicBool::new(true));
+        let switched = Arc::clone(&current);
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |_: &wiremock::Request| {
+                switched.store(false, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "actual result".into(),
+            duration_ms: 1,
+            tool_result_fields: None,
+        });
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let error = client
+            .post_tool_result_with_policy(
+                Some("tok"),
+                Some("edge"),
+                &body,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+                ToolResultDelivery {
+                    budget: Duration::from_secs(1),
+                    owner_current: &|| current.load(Ordering::SeqCst),
+                    concurrency: None,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ThinClientError::CallbackOwnerUnconfirmed));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "65-second local outage recovery test"]
+    async fn tool_result_recovers_after_a_long_outage_within_the_issued_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |_: &wiremock::Request| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).insert_header("Retry-After", "65")
+                } else {
+                    ResponseTemplate::new(200)
+                }
+            })
+            .mount(&server)
+            .await;
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "actual result".into(),
+            duration_ms: 1,
+            tool_result_fields: None,
+        });
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let started = tokio::time::Instant::now();
+        client
+            .post_tool_result(
+                Some("tok"),
+                Some("edge"),
+                &body,
+                ToolResultDelivery {
+                    budget: Duration::from_secs(180),
+                    owner_current: &|| true,
+                    concurrency: None,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(65));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_result_backoff_does_not_block_other_completed_results() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        let failed = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&failed);
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["request_id"] == "healthy" {
+                    ResponseTemplate::new(200)
+                } else {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(503).insert_header("Retry-After", "10")
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let body = |request_id: &str| {
+            ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: request_id.into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "actual result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            })
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = Vec::new();
+        for id in ["failed-a", "failed-b"] {
+            let client = client.clone();
+            let body = body(id);
+            let semaphore = semaphore.clone();
+            let cancel = cancel.clone();
+            blocked.push(tokio::spawn(async move {
+                client
+                    .post_tool_result(
+                        Some("tok"),
+                        Some("edge"),
+                        &body,
+                        ToolResultDelivery {
+                            budget: Duration::from_secs(30),
+                            owner_current: &|| true,
+                            concurrency: Some(&semaphore),
+                            cancel: Some(&cancel),
+                            previous_attempt: false,
+                        },
+                    )
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failed.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.post_tool_result(
+                Some("tok"),
+                Some("edge"),
+                &body("healthy"),
+                ToolResultDelivery {
+                    budget: Duration::from_secs(1),
+                    owner_current: &|| true,
+                    concurrency: Some(&semaphore),
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            ),
+        )
+        .await
+        .expect("backoff must release its HTTP permit")
+        .unwrap();
+        cancel.cancel();
+        for task in blocked {
+            assert!(task.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_cancel_interrupts_a_retry_waiting_for_a_permit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(503).insert_header("Retry-After", "1")
+            })
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let retry_started = Arc::new(AtomicBool::new(false));
+        let task = {
+            let semaphore = semaphore.clone();
+            let cancel = cancel.clone();
+            let attempts = attempts.clone();
+            let retry_started = retry_started.clone();
+            tokio::spawn(async move {
+                let body =
+                    ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                        session_id: "session".into(),
+                        run_id: "run".into(),
+                        turn_chain_id: "turn".into(),
+                        request_id: "request".into(),
+                        edge_agent_id: "edge".into(),
+                        status: "completed".into(),
+                        output: "result".into(),
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    });
+                let owner_current = || {
+                    if attempts.load(Ordering::SeqCst) > 0 {
+                        retry_started.store(true, Ordering::SeqCst);
+                    }
+                    true
+                };
+                client
+                    .post_tool_result_with_policy(
+                        Some("tok"),
+                        Some("edge"),
+                        &body,
+                        Duration::from_secs(3),
+                        Duration::from_millis(1),
+                        ToolResultDelivery {
+                            budget: Duration::from_secs(5),
+                            owner_current: &owner_current,
+                            concurrency: Some(&semaphore),
+                            cancel: Some(&cancel),
+                            previous_attempt: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let permit = semaphore.acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !retry_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retry must reach the held semaphore");
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancel must wake a retry blocked on the permit")
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn refreshed_tool_result_cancelled_in_permit_queue_is_not_resent() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.acquire().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = Arc::new(AtomicBool::new(false));
+        let task = {
+            let semaphore = semaphore.clone();
+            let cancel = cancel.clone();
+            let waiting = waiting.clone();
+            tokio::spawn(async move {
+                let body =
+                    ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                        session_id: "session".into(),
+                        run_id: "run".into(),
+                        turn_chain_id: "turn".into(),
+                        request_id: "request".into(),
+                        edge_agent_id: "edge".into(),
+                        status: "completed".into(),
+                        output: "result".into(),
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    });
+                let owner_current = || {
+                    waiting.store(true, Ordering::SeqCst);
+                    true
+                };
+                client
+                    .post_tool_result(
+                        Some("fresh"),
+                        Some("edge"),
+                        &body,
+                        ToolResultDelivery {
+                            budget: Duration::from_secs(5),
+                            owner_current: &owner_current,
+                            concurrency: Some(&semaphore),
+                            cancel: Some(&cancel),
+                            previous_attempt: true,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !waiting.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ThinClientError::CallbackRetryCancelled)
+        ));
+        drop(permit);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn tool_result_slow_error_bodies_keep_the_batch_connection_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let arrived = arrived.clone();
+                connections.spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await.unwrap();
+                    if index == 0 {
+                        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000\r\n\r\n{").await.unwrap();
+                        arrived.send(()).unwrap();
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                    }
+                });
+            }
+            while connections.join_next().await.is_some() {}
+        });
+        let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let body = |id: &str| {
+            ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: id.into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            })
+        };
+        let slow = {
+            let client = client.clone();
+            let semaphore = semaphore.clone();
+            let body = body("slow-a");
+            tokio::spawn(async move {
+                client
+                    .post_tool_result(
+                        Some("tok"),
+                        Some("edge"),
+                        &body,
+                        ToolResultDelivery {
+                            budget: Duration::from_secs(3),
+                            owner_current: &|| true,
+                            concurrency: Some(&semaphore),
+                            cancel: None,
+                            previous_attempt: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        arrivals.recv().await.unwrap();
+        let healthy_body = body("healthy");
+        let healthy = client.post_tool_result(
+            Some("tok"),
+            Some("edge"),
+            &healthy_body,
+            ToolResultDelivery {
+                budget: Duration::from_secs(3),
+                owner_current: &|| true,
+                concurrency: Some(&semaphore),
+                cancel: None,
+                previous_attempt: false,
+            },
+        );
+        tokio::pin!(healthy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut healthy)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(3), healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slow.await.unwrap().is_err());
+        server.abort();
+    }
+
+    #[test]
+    fn tool_result_backoff_spreads_a_thousand_session_retries() {
+        let mut body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: String::new(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: String::new(),
+            duration_ms: 0,
+            tool_result_fields: None,
+        });
+        let mut buckets = [0_u32; 10];
+        for index in 0..1000 {
+            body.session_id = format!("session-{index}");
+            let delay = tool_result_retry_delay(&body, 0, Duration::from_secs(5));
+            let bucket = ((delay.as_millis() - 2500) / 500) as usize;
+            buckets[bucket] += 1;
+        }
+        assert_eq!(buckets.iter().sum::<u32>(), 1000);
+        assert!(buckets.iter().all(|count| *count < 200), "{buckets:?}");
     }
 
     #[tokio::test]

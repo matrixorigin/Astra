@@ -115,9 +115,45 @@ subject to redaction, and display-only markers cannot authorize edits.
 The CLI admits one Server-owned loop; local tools execute only through the
 Server's authenticated callback requests. Missing terminal execution evidence
 does not transfer continuation authority to the CLI. The adapter preserves
-observed results and usage, reports a typed protocol failure, and uses the
-existing physical-run cleanup path for an unsettled owner. It must not replay
-tools or open another admission to complete an incomplete stream.
+observed results and usage, reports a typed protocol failure, and leaves an
+unsettled run under Server authority. Explicit user cancellation and output
+failure continue to use the existing physical-run cleanup path. The adapter
+must not replay tools or open another admission to complete an incomplete stream.
+
+After local execution, the CLI retries transient result-delivery failures with
+the same scoped request and result hash. The tool itself is never replayed.
+Delivery retries remain bounded and stop on cancellation or a permanent
+rejection; an already-started credential rotation is settled by its existing
+owner even if the caller stops waiting. Only a Server acknowledgement marks
+the result delivered. After the receipt window has elapsed, a short best-effort attempt
+may still retain a late result; its acknowledgement does not prove the current
+round consumed it. Unrepeated delivery makes no additional queries; each batch
+retains its existing limit of one callback in flight. Retry backoff does not
+occupy that slot. A request whose response stalls can still hold that slot
+until its timeout, so a sibling result may miss its own receipt deadline.
+
+When durable dispatch is configured, an uncertain write does not release a
+local waiter: the write may have committed before its acknowledgement was
+lost. The same result can be retried; a different canonical result after
+credential redaction is rejected. Explicit local-only hosts continue to use
+the local ledger.
+
+Completed results can be delivered independently, including results from the
+same run. The Server consumes locally available results as they arrive and
+assembles the model-facing batch in its original request order. Each pending
+tool has a local waiter; completed outputs and progress events can coexist in
+memory while a sibling is still running. Durable fallback does not add
+steady-state database polling. A callback accepted by another Server instance
+does not wake a local waiter; the existing durable fallback runs at the local
+deadline. Fallback reads are serialized per batch: if many results time out
+while the durable store is slow, each read gets its own one-second timeout,
+so the batch can wait proportionally longer. In local-only mode, the bounded
+replay cache can evict an already consumed receipt before its HTTP retry
+arrives under load.
+
+If delivery cannot be confirmed, the Server retains run authority; a client
+disconnect does not establish that an outstanding tool stopped. In particular,
+an unconfirmed side effect must not be repeated to manufacture a receipt.
 
 A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that

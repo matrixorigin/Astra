@@ -412,6 +412,72 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
 }
 
 #[tokio::test]
+async fn tool_result_retry_recovers_a_lost_ack_after_server_consumption() {
+    use axum::{middleware, response::IntoResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_run("sess-lost-ack", "run-lost-ack");
+    let (app, ledger) = e2e_app_with_lifecycle(lifecycle);
+    let key = scoped_tool_key("sess-lost-ack", "run-lost-ack", "chain", "tool");
+    expect_ledger_entry(&ledger, &key, "edge-e2e").unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::clone(&count);
+    let app = app.layer(middleware::from_fn(
+        move |request, next: middleware::Next| {
+            let ledger = Arc::clone(&ledger);
+            let key = key.clone();
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let response = next.run(request).await;
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    // The Server has already consumed the result; only its HTTP
+                    // acknowledgement is lost to the client.
+                    assert!(
+                        take_ledger_entry(&ledger, &key, Duration::ZERO)
+                            .await
+                            .is_some()
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else {
+                    response
+                }
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
+    let body = serde_json::from_value(tool_result_payload(
+        "sess-lost-ack",
+        "run-lost-ack",
+        "chain",
+        "tool",
+        "executed once",
+    ))
+    .unwrap();
+    client
+        .post_tool_result(
+            Some("e2e-token"),
+            Some("edge-e2e"),
+            &body,
+            astra_thin_client::client::ToolResultDelivery {
+                budget: Duration::from_secs(20),
+                owner_current: &|| true,
+                concurrency: None,
+                cancel: None,
+                previous_attempt: false,
+            },
+        )
+        .await
+        .expect("an identical retry must recover the consumed result's acknowledgement");
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
 async fn post_approval_respond_resolves_durable_interaction_without_local_ledger() {
     let lifecycle = Arc::new(E2eRunLifecycle::default());
     lifecycle.add_approval_required("sess-ledger", "run-ledger", "ap-9");
