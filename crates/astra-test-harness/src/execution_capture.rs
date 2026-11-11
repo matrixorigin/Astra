@@ -2824,7 +2824,7 @@ pub(crate) mod tests {
                         .remove("result_full");
                 }
                 "disposition" => {
-                    trace.events[0].raw["tool_calls"][0]["disposition"] = "unknown".into()
+                    trace.events[0].raw["tool_calls"][0]["disposition"] = "unrecognized".into()
                 }
                 "count" => snapshot.run_tree.runs[0].total_tool_calls += 1,
                 _ => unreachable!(),

@@ -775,7 +775,8 @@ mod tests {
             .map(|(_, assistant)| assistant.as_str())
             .unwrap_or_default();
         assert_eq!(
-            history_text, "Done.\n\n[Turn context: failed: read_file | tool_calls: 1]",
+            history_text,
+            "Done.\n\n[Turn context: failed: read_file | confirmed executed tool calls: 1]",
             "canonical history should contain only the assistant response and the structured tool projection"
         );
         let feedback = state

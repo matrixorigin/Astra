@@ -1259,12 +1259,7 @@ impl BackgroundTaskRegistry {
                 .tasks
                 .values()
                 .filter(|task| task.background || task.outcome_unsettled())
-                .map(|task| {
-                    (
-                        task.clone(),
-                        pending.contains(task.id.as_str()) || task.terminal_unobserved(),
-                    )
-                })
+                .map(|task| (task.clone(), pending.contains(task.id.as_str())))
                 .collect()
         })
     }
@@ -1605,11 +1600,7 @@ impl TaskRegistryState {
             handle.acknowledge_terminal();
             if changed {
                 handle.work_revision = handle.work_revision.saturating_add(1);
-                if self.active_work_registry.is_some() {
-                    self.push_event(BgTaskEvent::Updated { id: id.to_string() });
-                } else {
-                    self.pending_completions.retain(|event| event.id() != id);
-                }
+                self.push_event(BgTaskEvent::Updated { id: id.to_string() });
                 self.publish_task(id);
             }
         }

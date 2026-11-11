@@ -5192,8 +5192,9 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["cancelled"], true);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
+    assert_eq!(metadata["execution_fact"], "unknown");
+    assert!(!metadata.contains_key("blocked"));
+    assert!(!metadata.contains_key("execution_started"));
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
     assert_eq!(metadata["transport"], "edge_ledger");

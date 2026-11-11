@@ -107,8 +107,8 @@ unless the command itself requests them.
 Private cleanup uses the original directory handle; tasks in one namespace
 share that handle. A failed eviction keeps its owner for retry, and a full
 retention budget applies backpressure rather than dropping cleanup ownership.
-The task footer keeps terminal failures visible until the model inspects the
-terminal result or a complete notification is delivered in a settled turn. An
+The task footer flags ordinary terminal failures until their notification is
+shown to the user. Model delivery is tracked independently. An
 inspection acknowledges the terminal fact, not necessarily every output byte;
 partial and unavailable output are explicitly marked, and retained output can
 expire. It separately

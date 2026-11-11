@@ -6130,6 +6130,8 @@ mod final_json_output_tests {
             serde_json::json!({
                 "succeeded": 2,
                 "failed": 0,
+                "started_unknown": 0,
+                "unknown": 0,
                 "rejected": 0,
                 "reused": 0,
                 "suppressed": 0,
