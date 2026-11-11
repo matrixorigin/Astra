@@ -11674,7 +11674,7 @@ mod tests {
         };
         apply_edge_auth_failure_result(&mut accum, true);
         let error = accum.error_message.as_deref().unwrap_or_default();
-        assert!(error.contains("401 Unauthorized"));
+        assert_eq!(error, super::EDGE_AUTH_FAILURE_MESSAGE);
         assert!(!error.contains("Cancelled by user"));
         assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::Auth));
 

@@ -2722,6 +2722,9 @@ impl ThinClient {
             };
 
             drop(permit);
+            if attempt.saturating_add(1) >= CONTROL_CALLBACK_ATTEMPTS as u32 {
+                return Err(error);
+            }
 
             let delay = tool_result_retry_delay(body, attempt, retry_base)
                 .max(Duration::from_secs(retry_after.unwrap_or(0)));
@@ -5189,6 +5192,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tool_result_delivery_bounds_persistent_retryable_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "actual tool output".into(),
+            duration_ms: 12,
+            tool_result_fields: None,
+        });
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let error = client
+            .post_tool_result_with_policy(
+                Some("tok"),
+                Some("edge"),
+                &body,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                ToolResultDelivery {
+                    budget: Duration::from_secs(2),
+                    owner_current: &|| true,
+                    concurrency: None,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ThinClientError::Api { status, .. } if status.as_u16() == 503));
+        server.verify().await;
     }
 
     #[tokio::test]
