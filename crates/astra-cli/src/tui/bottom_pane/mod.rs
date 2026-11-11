@@ -2894,15 +2894,17 @@ impl BottomPane {
                 if self.composer.text() != "/" {
                     return None;
                 }
+                // An out-of-range number is still a palette shortcut:
+                // ignore it without appending the digit to the draft.
                 let Some(index) = digit.to_digit(10).filter(|index| *index > 0) else {
-                    return None;
+                    return Some(BottomPaneAction::Consumed);
                 };
                 if !self
                     .slash_menu
                     .as_mut()
                     .is_some_and(|menu| menu.select(index as usize - 1))
                 {
-                    return None;
+                    return Some(BottomPaneAction::Consumed);
                 }
                 if let Some(picked) = self
                     .slash_menu
