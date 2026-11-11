@@ -1600,7 +1600,11 @@ impl TaskRegistryState {
             handle.acknowledge_terminal();
             if changed {
                 handle.work_revision = handle.work_revision.saturating_add(1);
-                self.push_event(BgTaskEvent::Updated { id: id.to_string() });
+                if self.active_work_registry.is_some() {
+                    self.push_event(BgTaskEvent::Updated { id: id.to_string() });
+                } else {
+                    self.pending_completions.retain(|event| event.id() != id);
+                }
                 self.publish_task(id);
             }
         }
@@ -5782,7 +5786,8 @@ mod tests {
         let tmp = crate::tests::test_temp_dir();
         let _guard = astra_services::session_journal::ProcessJournalDirGuard::new(tmp.path());
         let session = "foreground-unknown-session";
-        let mut registry = BackgroundTaskRegistry::new(tmp.path().join("tasks"));
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().join("tasks"))
+            .with_active_work_registry(Arc::new(ActiveWorkRegistry::default()));
         let mut task = registry
             .start_shell(
                 "foreground",
