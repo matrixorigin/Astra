@@ -185,7 +185,13 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
     // Prefer a valid persisted moi-user-token-v1 (written by a prior renewal)
     // over the env/flag token; astra JWT flows are untouched.
-    let token_file = token_renewal::resolve_token_file_path(&workspace_dir);
+    let token_file_override = token_renewal::explicit_token_file_override();
+    let managed_dir = managed_background::credential_handoff_dir();
+    let token_file = token_renewal::runner_token_file(
+        &workspace_dir,
+        token_file_override.as_deref(),
+        managed_dir.as_deref(),
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

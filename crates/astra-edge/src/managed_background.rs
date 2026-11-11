@@ -933,13 +933,24 @@ fn accept_parent_ready(
         .write_all(b"1")
         .and_then(|()| channel.flush())
         .map_err(|error| format!("cannot accept runner readiness: {error}"))?;
-    read_confirm(channel, deadline)
+    read_confirm(child, channel, cancelled, deadline)
 }
 
-fn read_confirm(channel: &mut File, deadline: Instant) -> Result<(), String> {
+fn read_confirm(
+    child: &mut Child,
+    channel: &mut File,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), String> {
     loop {
+        // Cancellation and child exit stay authoritative after the ack.
+        // A confirm byte that arrives later must not become success.
+        accept_ready(child, cancelled)?;
         match read_ready_byte(channel)? {
-            ReadyByte::Ready => return Ok(()),
+            ReadyByte::Ready => {
+                accept_ready(child, cancelled)?;
+                return Ok(());
+            }
             ReadyByte::Pending => {
                 if Instant::now() >= deadline {
                     return Err("timed out waiting for the runner to authenticate".into());
@@ -3493,6 +3504,43 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn cancellation_during_confirmation_is_not_reported_as_success() {
+        let (mut parent, mut child_end) = readiness_channel().unwrap();
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                child_end.write_all(b"1").unwrap();
+                child_end.flush().unwrap();
+                let mut ack = [0u8; 1];
+                child_end.read_exact(&mut ack).unwrap();
+                cancelled.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = child_end.write_all(b"1");
+                let _ = child_end.flush();
+            });
+            wait_for_ready(
+                &mut sleeper,
+                &mut parent,
+                Duration::from_secs(2),
+                &cancelled,
+            )
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("cancelled"),
+            "confirmation after cancellation was accepted: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation waited for the startup deadline"
+        );
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
     }
 
     #[test]

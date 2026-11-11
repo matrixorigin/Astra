@@ -238,11 +238,29 @@ fn renew_threshold_secs() -> i64 {
 
 // ─── Token file persistence ──────────────────────────────────────────────────
 
-/// Token file path: `ASTRA_TOKEN_FILE` env override, else `<workspace>/.astra/token`.
-pub fn resolve_token_file_path(workspace_dir: &Path) -> PathBuf {
+/// Where this process persists the credential it has proven.
+///
+/// An explicit `ASTRA_TOKEN_FILE` always wins. A managed runner otherwise
+/// uses a file inside its own state directory, so another runner in the same
+/// workspace cannot replace it. Foreground Edge keeps the workspace file.
+pub fn runner_token_file(
+    workspace_dir: &Path,
+    explicit: Option<&Path>,
+    managed_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    match managed_dir {
+        Some(dir) => dir.join("token"),
+        None => workspace_dir.join(".astra").join("token"),
+    }
+}
+
+pub fn explicit_token_file_override() -> Option<PathBuf> {
     match std::env::var("ASTRA_TOKEN_FILE") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ => workspace_dir.join(".astra").join("token"),
+        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+        _ => None,
     }
 }
 

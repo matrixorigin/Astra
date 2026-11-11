@@ -93,4 +93,6 @@ without waiting for authentication. The runner stays up only after the starting
 command accepts a connection that is still up. Closing the terminal, or losing
 that command before it accepts, cancels the startup, including while the runner
 is still trying to reach the server. The token is not written to the runner
-metadata.
+metadata. Each background runner keeps the credential it last authenticated
+for its own identity, so another runner in the same workspace does not
+replace it.

@@ -376,6 +376,65 @@ mod tests {
         );
     }
 
+    fn runner_token(edge_id: &str, iat: i64, exp: i64, jti: &str) -> String {
+        use base64::Engine as _;
+        let claims = serde_json::json!({
+            "iat": TEST_EPOCH_BASE + iat,
+            "exp": TEST_EPOCH_BASE + exp,
+            "jti": jti,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+            "edge_agent_id": edge_id,
+            "purpose": "edge_registration",
+        });
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        format!("moi-user-token-v1.{encoded}.sig")
+    }
+
+    #[tokio::test]
+    async fn managed_runners_in_one_workspace_keep_their_own_proven_tokens() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runner_a = workspace.path().join("runner-a");
+        let runner_b = workspace.path().join("runner-b");
+        std::fs::create_dir_all(&runner_a).unwrap();
+        std::fs::create_dir_all(&runner_b).unwrap();
+        let path_a =
+            crate::token_renewal::runner_token_file(workspace.path(), None, Some(&runner_a));
+        let path_b =
+            crate::token_renewal::runner_token_file(workspace.path(), None, Some(&runner_b));
+        let shared = crate::token_renewal::runner_token_file(workspace.path(), None, None);
+        assert_ne!(path_a, path_b);
+        assert_ne!(path_a, shared);
+        assert_eq!(path_a, runner_a.join("token"));
+
+        let original_a = runner_token("edge-a", 100, 200, "a-old");
+        let renewed_a = runner_token("edge-a", 150, 250, "a-new");
+        let proven_b = runner_token("edge-b", 100, 200, "b");
+        let manager_a =
+            TokenManager::new(renewed_a.clone(), Some(original_a.clone()), path_a.clone());
+        manager_a.mark_proven(&renewed_a).await;
+        let manager_b = TokenManager::new(proven_b.clone(), None, path_b.clone());
+        manager_b.mark_proven(&proven_b).await;
+
+        assert_eq!(std::fs::read_to_string(&path_a).unwrap(), renewed_a);
+        assert_eq!(std::fs::read_to_string(&path_b).unwrap(), proven_b);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            crate::token_renewal::read_valid_file_token(&path_a, now).as_deref(),
+            Some(renewed_a.as_str()),
+            "restarting runner A lost the credential it had renewed"
+        );
+        assert_ne!(
+            crate::token_renewal::read_valid_file_token(&path_a, now).as_deref(),
+            Some(original_a.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn renewal_applies_and_persists_when_snapshot_matches() {
         let a = make_moi_token(100, 200, "A");
