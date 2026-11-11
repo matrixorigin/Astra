@@ -14,6 +14,7 @@ mod persistence;
 pub(crate) use persistence::server_input_source_event_id;
 mod projection;
 pub(crate) mod run_state;
+mod tool_outcome_cache;
 
 use admission::*;
 use projection::*;
@@ -4073,6 +4074,7 @@ struct ServerDurableAgentReconciler {
     run_engine: RunEngine,
     user_id: String,
     session_id: String,
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     state: TokioMutex<ServerDurableAgentReconcileState>,
 }
 
@@ -4087,6 +4089,234 @@ struct ServerDurableAgentReconcileState {
 
 #[async_trait]
 impl DurableAgentReconciler for ServerDurableAgentReconciler {
+    async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
+        let service = self
+            .edge_dispatch_service
+            .as_ref()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        let cache_key = exact.map(|(turn, request)| {
+            [
+                self.user_id.clone(),
+                self.session_id.clone(),
+                child_run_id.to_owned(),
+                turn.to_owned(),
+                request.to_owned(),
+            ]
+        });
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
+        // Exact recovery can decode a large retained result. Bound aggregate
+        // memory without making normal dispatch or list operations wait.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let _permit = if exact.is_some() {
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    astra_services::multi_agent::edge_dispatch::EDGE_EXACT_RESULT_READS.acquire(),
+                )
+                .await
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?,
+            )
+        } else {
+            None
+        };
+        // Another reader may have filled the immutable view while we waited.
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
+        if offset > 0 && !tool_outcome_cache::can_load_continuation() {
+            return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy);
+        }
+        let mut rows = tokio::time::timeout_at(
+            deadline,
+            service.inspect_run_dispatches(
+                &self.user_id,
+                &self.session_id,
+                child_run_id,
+                after,
+                exact,
+            ),
+        )
+        .await
+        .map_err(|_| "tool outcome inspection timed out".to_string())??;
+        let mut has_more = rows.len() > 16;
+        rows.truncate(16);
+        let mut observations = Vec::with_capacity(rows.len());
+        let mut page_size = 0_usize;
+        for row in rows {
+            let mut observation = json!({
+                "turn_chain_id": row.turn_chain_id,
+                "request_id": row.request_id,
+                "dispatch_status": row.status,
+                "tool": row.tool_name.as_deref().map(|name| astra_text_utils::credential_redaction::truncate_redacted_output(astra_text_utils::credential_redaction::redact_credentials_for_display(name).0, 128)),
+            });
+            if let Some(key) = cache_key.as_ref() {
+                if row.result_too_large {
+                    observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the bounded recovery limit; its execution outcome remains unknown"});
+                } else if row.status == "completed"
+                    && let Some(body) = row.result_json.as_deref()
+                {
+                    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                        &row.edge_owner_user_id,
+                        &self.session_id,
+                        child_run_id,
+                        &row.turn_chain_id,
+                        &row.request_id,
+                    );
+                    let mut canonical =
+                        crate::server::tool_execution_service::canonical_edge_completion(
+                            &identity,
+                            &row.edge_agent_id,
+                            body,
+                        )
+                        .map_err(|_| "retained tool result could not be validated".to_string())?;
+                    let mut metadata = canonical.tool_result_fields.take();
+                    if let Some(fields) = metadata.take() {
+                        metadata = Some(astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(fields).metadata);
+                    }
+                    if let Some(fields) = metadata.as_mut() {
+                        for (key, value) in fields.iter_mut() {
+                            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+                        }
+                    }
+                    let metadata_size = serde_json::to_vec(&metadata)
+                        .map_err(|_| "invalid tool result metadata".to_string())?
+                        .len();
+                    let metadata = if metadata_size <= 512 {
+                        metadata
+                    } else {
+                        metadata.map(|mut fields| {
+                            let mut retained = Map::new();
+                            let mut bytes = 2_usize;
+                            // Preserve concise execution facts before optional diagnostics.
+                            for key in [
+                                "execution_fact",
+                                "execution_started",
+                                "outcome_certainty",
+                                "side_effects_maybe",
+                                "cleanup_authoritative",
+                                "cleanup_unsettled",
+                                "disposition",
+                                "retryable",
+                                "error_kind",
+                                "stage",
+                            ] {
+                                let Some(value) = fields.remove(key) else {
+                                    continue;
+                                };
+                                if !value.is_boolean()
+                                    && !value.as_str().is_some_and(|text| text.len() <= 128)
+                                {
+                                    continue;
+                                }
+                                // A JSON tuple is a conservative bound for an object entry.
+                                let entry_bytes = serde_json::to_vec(&(key, &value))
+                                    .map_or(usize::MAX, |encoded| encoded.len() + 1);
+                                if bytes.saturating_add(entry_bytes) <= 512 {
+                                    bytes += entry_bytes;
+                                    retained.insert(key.to_string(), value);
+                                }
+                            }
+                            retained
+                        })
+                    };
+                    let output = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(
+                        &canonical.output,
+                    )
+                    .content;
+                    let output = astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+                        output,
+                        astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES as usize,
+                    ).ok();
+                    observation["result"] = json!({
+                        "status": canonical.status, "duration_ms": canonical.duration_ms,
+                        "tool_result_fields": metadata, "metadata_omitted": metadata_size > 512,
+                    });
+                    if output.is_none() {
+                        observation["result"]["output_status"] = json!("unavailable");
+                        observation["result"]["reason"] = json!("The validated result's output exceeds the safe display limit.");
+                    }
+                    observation["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    let view = Arc::new(tool_outcome_cache::ToolOutcomeView { observation, output });
+                    let page = tool_outcome_cache::page(
+                        key.clone(),
+                        view,
+                        offset,
+                        max_bytes,
+                    )?;
+                    observations.push(page);
+                    continue;
+                } else if row.status == "failed"
+                    && let Some(receipt) = row.result_json.as_deref().and_then(|body|
+                        astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
+                            body,
+                            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                &row.edge_owner_user_id,
+                                &self.session_id,
+                                child_run_id,
+                                &row.turn_chain_id,
+                                &row.request_id,
+                            ),
+                            &row.edge_agent_id,
+                        ))
+                {
+                    use astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind;
+                    let (fact, action) = match receipt.kind {
+                        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => ("expired_before_claim", "expired"),
+                        EdgeDispatchServerReceiptKind::Cancelled => ("cancelled_before_claim", "was cancelled"),
+                    };
+                    observation["result"] = json!({
+                        "status": "unknown",
+                        "dispatch_fact": fact,
+                        "execution_fact": "unknown",
+                        "reason": format!("This relay request {action} before it was claimed; execution through another delivery path has not been ruled out.")
+                    });
+                } else {
+                    observation["result"] = json!({"status":"unknown", "reason":"no validated executor result is available"});
+                }
+            }
+            if exact.is_none() {
+                let size = serde_json::to_vec(&observation)
+                    .map_err(|_| "invalid dispatch observation".to_string())?
+                    .len()
+                    + 1;
+                if size > 3500 {
+                    return Err("dispatch identity exceeds the inspection page limit".into());
+                }
+                if page_size + size > 3500 {
+                    has_more = true;
+                    break;
+                }
+                page_size += size;
+            }
+            observations.push(observation);
+        }
+        let next = has_more
+            .then(|| observations.last().cloned())
+            .flatten()
+            .map(|row| {
+                json!({
+                    "turn_chain_id": row["turn_chain_id"], "request_id": row["request_id"]
+                })
+            });
+        Ok(tool_outcome_cache::response(observations, next))
+    }
+
     fn subscribe_remote_child_wake(
         &self,
         parent_run_id: &str,
@@ -6605,6 +6835,7 @@ impl AgenticRunLifecycleService {
                 run_engine: self.run_engine.clone(),
                 user_id: user_id.to_owned(),
                 session_id: session_id.to_owned(),
+                edge_dispatch_service: self.edge_dispatch_service.clone(),
                 state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
             }))
             .await;
@@ -16434,6 +16665,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Ok(record)
             }
         }
+    }
+
+    async fn get_tool_callback_run_target(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<astra_services::runs::ToolCallbackRunTarget, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .load_tool_callback_run_target(identity, edge_agent_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("tool callback run lookup", error))?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "Tool result request not found in this session",
+                )
+            })
     }
 
     async fn get_run_status(

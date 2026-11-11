@@ -149,8 +149,11 @@ async fn settle_attempt_without_retry(
         }
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
-                settle_successful_turn(state, dispatch, result).await;
-                TurnSettlementOutcome::Succeeded
+                if settle_successful_turn(state, dispatch, result).await {
+                    TurnSettlementOutcome::Succeeded
+                } else {
+                    TurnSettlementOutcome::Failed
+                }
             }
             Err(mut retry_failure) => {
                 settle_failed_turn(state, dispatch, &mut retry_failure).await;
@@ -447,7 +450,7 @@ mod tests {
                 Some("unfinished evidence")
             );
             assert_eq!(state.diagnostics_context.as_deref(), Some("diagnostic"));
-            assert_eq!(state.pending_bg_notifications, ["child complete"]);
+            assert_eq!(state.pending_bg_notifications[0].content, "child complete");
             assert_eq!(state.resume_restricted_tools, ["bash"]);
             assert_eq!(ui.restored_inputs, ["/model literal task"]);
             assert_eq!(

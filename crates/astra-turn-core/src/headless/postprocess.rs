@@ -12,19 +12,13 @@ use astra_pipeline::step_protocol::{
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 
+use astra_services::session_journal::ToolCallDisposition;
 use serde_json::Value;
 
 /// UI hooks for headless postprocess (CLI maps to colored `eprintln!`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadlessOutputEnrichSignal {
     ResourceLimitObserved { tool: String },
-}
-
-/// Whether the tool implementation ran for a returned terminal result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadlessExecutionDisposition {
-    Executed,
-    RejectedBeforeExecution,
 }
 
 /// Mutable state used while enriching one headless tool result.
@@ -42,7 +36,8 @@ pub struct HeadlessOutputEnrichRequest<'a> {
     pub source_error_kind: Option<ErrorCategory>,
     pub source_recovery_evidence: Option<&'a astra_core::ToolFailureEvidence>,
     pub tool_already_restricted: bool,
-    pub execution_disposition: HeadlessExecutionDisposition,
+    pub execution_disposition: ToolCallDisposition,
+    pub outcome_unknown: bool,
 }
 
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
@@ -59,6 +54,7 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         source_recovery_evidence,
         tool_already_restricted,
         execution_disposition,
+        outcome_unknown,
     } = request;
     let mut resource_limit_recorded = false;
     if *is_err && !tool_already_restricted {
@@ -69,14 +65,14 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         // Admission rejections retain their producer-owned repair instructions.
         // An unknown classification is not evidence of an execution failure or
         // a reason to suggest a different capability or workspace.
-        if execution_disposition == HeadlessExecutionDisposition::RejectedBeforeExecution
+        if execution_disposition == ToolCallDisposition::Rejected
             && category == ErrorCategory::Unknown
         {
             return false;
         }
 
         if matches!(category, ErrorCategory::ResourceLimit) {
-            if execution_disposition == HeadlessExecutionDisposition::Executed {
+            if execution_disposition == ToolCallDisposition::Executed && !outcome_unknown {
                 ctx.turn_guard.health.record_resource_limit_failure(name);
             }
             ctx.turn_guard.errors.record_error(category);
@@ -110,7 +106,8 @@ pub struct HeadlessResultQualityRequest<'a> {
     pub result_str: &'a str,
     pub source_error_kind: Option<ErrorCategory>,
     pub execution_failed: bool,
-    pub execution_disposition: HeadlessExecutionDisposition,
+    pub execution_disposition: ToolCallDisposition,
+    pub outcome_unknown: bool,
     pub resource_limit_recorded: bool,
 }
 
@@ -125,12 +122,17 @@ pub fn append_headless_result_quality_feedback(
         source_error_kind,
         execution_failed,
         execution_disposition,
+        outcome_unknown,
         resource_limit_recorded,
     } = request;
     let result_quality = if resource_limit_recorded {
         ResultQuality::Error
-    } else if execution_disposition == HeadlessExecutionDisposition::RejectedBeforeExecution {
-        turn_guard.record_rejected_tool_result_with_kind(source_error_kind)
+    } else if matches!(
+        execution_disposition,
+        ToolCallDisposition::Rejected | ToolCallDisposition::Unknown
+    ) || outcome_unknown
+    {
+        turn_guard.record_tool_error_without_execution_health(source_error_kind)
     } else if execution_failed {
         turn_guard.record_failed_tool_result_with_kind(name, source_error_kind)
     } else {
@@ -307,7 +309,8 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut ctx,
             |s| signals.push(s),
@@ -341,7 +344,8 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut ctx,
             |s| signals.push(s),
@@ -369,7 +373,8 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+                execution_disposition: ToolCallDisposition::Rejected,
+                outcome_unknown: false,
             },
             &mut HeadlessOutputEnrichCtx {
                 turn_guard: &mut tg,
@@ -383,7 +388,8 @@ mod tests {
                 result_str: "capacity unavailable before execution",
                 source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 execution_failed: true,
-                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+                execution_disposition: ToolCallDisposition::Rejected,
+                outcome_unknown: false,
                 resource_limit_recorded,
             },
             &mut tg,
@@ -417,7 +423,8 @@ mod tests {
                 source_error_kind: None,
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut ctx,
             |s| signals.push(s),
@@ -449,7 +456,8 @@ mod tests {
                     source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
                     source_recovery_evidence: None,
                     tool_already_restricted: false,
-                    execution_disposition: HeadlessExecutionDisposition::Executed,
+                    execution_disposition: ToolCallDisposition::Executed,
+                    outcome_unknown: false,
                 },
                 &mut HeadlessOutputEnrichCtx {
                     turn_guard: &mut turn_guard,
@@ -489,7 +497,8 @@ mod tests {
                 source_error_kind: None,
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut context,
             |_| panic!("a typed success is not a resource failure"),
@@ -506,10 +515,7 @@ mod tests {
 
     #[test]
     fn unclassified_rejection_preserves_source_recovery_without_execution_advice() {
-        for disposition in [
-            HeadlessExecutionDisposition::RejectedBeforeExecution,
-            HeadlessExecutionDisposition::Executed,
-        ] {
+        for disposition in [ToolCallDisposition::Rejected, ToolCallDisposition::Executed] {
             let mut guard = TurnGuard::new();
             let mut advisories = Vec::new();
             let output = json!({"error": {"code": "precondition_changed",
@@ -525,6 +531,7 @@ mod tests {
                     source_recovery_evidence: None,
                     tool_already_restricted: false,
                     execution_disposition: disposition,
+                    outcome_unknown: false,
                 },
                 &mut HeadlessOutputEnrichCtx {
                     turn_guard: &mut guard,
@@ -536,7 +543,7 @@ mod tests {
             assert!(is_error);
             assert_eq!(
                 advisories.is_empty(),
-                disposition == HeadlessExecutionDisposition::RejectedBeforeExecution
+                disposition == ToolCallDisposition::Rejected
             );
             let quality = append_headless_result_quality_feedback(
                 HeadlessResultQualityRequest {
@@ -545,6 +552,7 @@ mod tests {
                     source_error_kind: None,
                     execution_failed: true,
                     execution_disposition: disposition,
+                    outcome_unknown: false,
                     resource_limit_recorded: resource_limit,
                 },
                 &mut guard,
@@ -554,7 +562,7 @@ mod tests {
             assert_eq!(guard.errors.total_errors, 1);
             assert_eq!(
                 guard.health.get("update_plan").is_some(),
-                disposition == HeadlessExecutionDisposition::Executed
+                disposition == ToolCallDisposition::Executed
             );
         }
     }
@@ -574,7 +582,8 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut HeadlessOutputEnrichCtx {
                 turn_guard: &mut turn_guard,
@@ -616,7 +625,8 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
                 source_recovery_evidence: Some(&evidence),
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut context,
             |_| {},
@@ -638,7 +648,8 @@ mod tests {
                 result_str: &out,
                 source_error_kind: None,
                 execution_failed: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
                 resource_limit_recorded: false,
             },
             &mut tg,
@@ -671,7 +682,8 @@ mod tests {
                     result_str: &value.to_string(),
                     source_error_kind: None,
                     execution_failed: failed,
-                    execution_disposition: HeadlessExecutionDisposition::Executed,
+                    execution_disposition: ToolCallDisposition::Executed,
+                    outcome_unknown: false,
                     resource_limit_recorded: false,
                 },
                 &mut guard,
@@ -703,7 +715,8 @@ mod tests {
                     result_str: &out,
                     source_error_kind: None,
                     execution_failed: false,
-                    execution_disposition: HeadlessExecutionDisposition::Executed,
+                    execution_disposition: ToolCallDisposition::Executed,
+                    outcome_unknown: false,
                     resource_limit_recorded: false,
                 },
                 &mut tg,
@@ -735,7 +748,8 @@ mod tests {
                 result_str: &out,
                 source_error_kind: Some(astra_core::ErrorKind::ToolNotFound),
                 execution_failed: true,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
                 resource_limit_recorded: false,
             },
             &mut tg,
@@ -762,7 +776,8 @@ mod tests {
                 result_str: "unknown tool",
                 source_error_kind: Some(astra_core::ErrorKind::ToolNotFound),
                 execution_failed: true,
-                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+                execution_disposition: ToolCallDisposition::Rejected,
+                outcome_unknown: false,
                 resource_limit_recorded: false,
             },
             &mut tg,

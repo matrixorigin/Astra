@@ -128,9 +128,8 @@ pub struct ExecutionTraceReport {
     pub deferred_tool_calls: u32,
     /// Executed records whose outcome was not present in the journal.
     pub unknown_outcome_tool_calls: u32,
-    /// Records carrying a non-null disposition that the current reader does
-    /// not understand. They are excluded from execution buckets and make the
-    /// projection incomplete instead of being guessed as successes.
+    /// Records whose execution disposition is unknown or unrecognized.
+    /// Unrecognized values additionally mark the projection incomplete.
     #[serde(default)]
     pub unknown_disposition_tool_calls: u32,
     /// Every `settle_work_item` request, including rejected or suppressed
@@ -393,19 +392,28 @@ pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport
             }
         };
         match disposition {
+            astra_services::session_journal::ToolCallDisposition::Unknown => {
+                report.unknown_disposition_tool_calls =
+                    report.unknown_disposition_tool_calls.saturating_add(1);
+            }
             astra_services::session_journal::ToolCallDisposition::Executed => {
                 report.executed_tool_calls = report.executed_tool_calls.saturating_add(1);
-                match call.ok {
-                    Some(true) => {
-                        report.successful_tool_calls =
-                            report.successful_tool_calls.saturating_add(1)
-                    }
-                    Some(false) => {
-                        report.failed_tool_calls = report.failed_tool_calls.saturating_add(1)
-                    }
-                    None => {
-                        report.unknown_outcome_tool_calls =
-                            report.unknown_outcome_tool_calls.saturating_add(1)
+                if call.outcome_is_unknown() {
+                    report.unknown_outcome_tool_calls =
+                        report.unknown_outcome_tool_calls.saturating_add(1);
+                } else {
+                    match call.ok {
+                        Some(true) => {
+                            report.successful_tool_calls =
+                                report.successful_tool_calls.saturating_add(1)
+                        }
+                        Some(false) => {
+                            report.failed_tool_calls = report.failed_tool_calls.saturating_add(1)
+                        }
+                        None => {
+                            report.unknown_outcome_tool_calls =
+                                report.unknown_outcome_tool_calls.saturating_add(1)
+                        }
                     }
                 }
             }
@@ -425,6 +433,7 @@ pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport
 
         if call.name == "settle_work_item"
             && disposition == astra_services::session_journal::ToolCallDisposition::Executed
+            && !call.outcome_is_unknown()
             && call.ok == Some(true)
         {
             report.successful_settlements = report.successful_settlements.saturating_add(1);
@@ -1059,6 +1068,33 @@ mod tests {
         assert_eq!(report.execution.settlement_attempts, 3);
         assert_eq!(report.execution.successful_settlements, 1);
         assert_eq!(report.execution.rejected_settlements, 1);
+    }
+
+    #[test]
+    fn execution_trace_preserves_unknown_start_without_counting_execution() {
+        let capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {"name":"bash", "call_id":"uncertain", "ok":false, "disposition":"unknown"}
+        ]))]);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.execution.total_tool_calls, 1);
+        assert_eq!(report.execution.executed_tool_calls, 0);
+        assert_eq!(report.execution.rejected_tool_calls, 0);
+        assert_eq!(report.execution.unknown_disposition_tool_calls, 1);
+        assert!(report.execution.evidence_complete);
+    }
+
+    #[test]
+    fn execution_trace_preserves_unknown_outcomes_after_known_start() {
+        let capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {"name":"bash", "call_id":"u1", "ok":false, "disposition":"executed", "error_kind":"tool_outcome_unknown"},
+            {"name":"bash", "call_id":"u2", "ok":false, "disposition":"executed", "error_kind":"tool_unavailable", "recovery_evidence":{"cause":"outcome_unknown"}},
+            {"name":"bash", "call_id":"f", "ok":false, "disposition":"executed", "error_kind":"tool_unavailable"}
+        ]))]);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.execution.executed_tool_calls, 3);
+        assert_eq!(report.execution.failed_tool_calls, 1);
+        assert_eq!(report.execution.unknown_outcome_tool_calls, 2);
+        assert_eq!(capture.journal_tool_outcome_count("bash", false), 1);
     }
 
     #[test]

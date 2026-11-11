@@ -3401,6 +3401,47 @@ mod tests {
     }
 
     #[test]
+    fn delivered_unknown_receipt_does_not_turn_an_honest_answer_into_incomplete() {
+        let receipt = ToolLedgerReceipt::new(
+            "r",
+            7,
+            1,
+            1,
+            0,
+            crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                unknown: 1,
+                ..Default::default()
+            },
+            1,
+            crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+            true,
+        );
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_bound_server_terminal(
+            &mut accum,
+            format!(
+                ",\"tool_ledger_receipt\":{}",
+                serde_json::to_string(&receipt).unwrap()
+            ),
+            7,
+        );
+        assert!(
+            accum.server_interruption.is_none(),
+            "{:?}",
+            accum.server_interruption
+        );
+        assert_eq!(
+            accum
+                .server_execution_summary
+                .unwrap()
+                .tool_ledger_receipt
+                .result_classes
+                .unknown,
+            1
+        );
+    }
+
+    #[test]
     fn incomplete_receipt_preserves_factual_server_counters_but_not_authority() {
         let mut accum = ChatTurnSseAccum::default();
         for block in [

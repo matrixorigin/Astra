@@ -11448,6 +11448,7 @@ pub(crate) mod tests {
             astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                 fields.get("disposition"),
                 fields.get("execution_started").and_then(Value::as_bool),
+                astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                 astra_services::session_journal::ToolCallDisposition::Executed,
             ),
             astra_services::session_journal::ToolCallDisposition::Rejected,

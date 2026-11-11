@@ -917,7 +917,7 @@ fn char_literal() { let slash = '/'; }
         row = self.tables["edge_pending_dispatch"]
         self.assertEqual(
             row["primary_key"],
-            ["user_id", "session_id", "run_id", "turn_chain_id", "request_id"],
+            ["session_id", "run_id", "turn_chain_id", "request_id", "user_id"],
         )
         self.assertEqual(row["auto_increment_columns"], [])
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")

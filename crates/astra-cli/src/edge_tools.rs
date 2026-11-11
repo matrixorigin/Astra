@@ -981,7 +981,9 @@ fn format_background_task_error(error: &BackgroundTaskError) -> String {
         BackgroundTaskError::NotFound { task_id } => (
             task_id.as_str(),
             "not_found",
-            format!("Background task not found: {task_id}"),
+            format!(
+                "Background task not found in retained history: {task_id}. It may have expired or never existed; this does not establish whether it ran or caused effects."
+            ),
         ),
         BackgroundTaskError::OutputArtifactMissing { task_id, .. } => (
             task_id.as_str(),
@@ -1018,7 +1020,9 @@ fn format_background_task_stop_error(error: &BackgroundTaskError) -> String {
             "not_found",
             false,
             false,
-            format!("Background task not found: {task_id}"),
+            format!(
+                "Background task not found in retained history: {task_id}. It may have expired or never existed; this does not establish whether it ran or caused effects."
+            ),
         ),
         BackgroundTaskError::AlreadyTerminated { task_id } => (
             task_id.as_str(),
@@ -1123,6 +1127,16 @@ fn format_background_task_output(
             };
         }
     }
+    let actual_start = snapshot
+        .end_offset
+        .saturating_sub(snapshot.output.len() as u64);
+    if snapshot.status.is_terminal()
+        && (actual_start > 0 || snapshot.end_offset < snapshot.total_bytes)
+    {
+        result["window_notice"] = json!(
+            "This is only part of the retained output; other output may not be shown, and retained output may expire."
+        );
+    }
     if live_shell {
         result["note"] = json!(
             "Current snapshot; earlier output may be outside this window and incomplete sensitive values may be withheld."
@@ -1219,9 +1233,9 @@ fn format_background_task_output_search(
         snapshot.status.is_terminal(),
     );
     let evidence_contract = if snapshot.status == BgTaskOutputStatus::Failed {
-        "\nDiagnostic search returns evidence, not a classification. Call a test flaky only after a controlled rerun succeeds or equivalent repeatability evidence exists."
+        "\nDiagnostic search returns evidence, not a classification. Call a test flaky only after a controlled rerun succeeds or equivalent repeatability evidence exists. Retained output may expire."
     } else {
-        ""
+        "\nRetained output may expire."
     };
     if snapshot.output.trim().is_empty() {
         return format!("{header}\nNo matching output lines.{evidence_contract}");
@@ -1272,6 +1286,8 @@ fn background_task_output_result_fields(
         "status": snapshot.status.as_str(),
         "terminal": snapshot.status.is_terminal(),
         "mode": observation_mode,
+        "end_offset": snapshot.end_offset,
+        "total_bytes": snapshot.total_bytes,
     });
     if let Some(revision) = snapshot.output_revision {
         observation["output_revision"] = json!(revision);
@@ -1509,8 +1525,47 @@ impl ToolExecutor {
         tool: &str,
         fields: Option<&serde_json::Map<String, Value>>,
     ) {
-        for id in unknown_shell_tasks(tool, fields) {
-            self.background_tasks.acknowledge_terminal(id);
+        let observation = fields.and_then(|fields| fields.get("background_task_observation"));
+        if tool == "task_output"
+            && let Some(observation) = observation
+        {
+            // This acknowledges delivery of the terminal fact, not every
+            // byte of output. Truncation and retention remain explicit.
+            if observation.get("task_kind").and_then(Value::as_str) == Some("shell")
+                && observation.get("terminal").and_then(Value::as_bool) == Some(true)
+                && let Some(id) = observation.get("task_id").and_then(Value::as_str)
+                && fields
+                    .and_then(|fields| fields.get("wait_result"))
+                    .and_then(Value::as_str)
+                    != Some("timeout")
+                && fields
+                    .and_then(|fields| fields.get("task"))
+                    .is_some_and(|task| {
+                        task.get("task_id").and_then(Value::as_str) == Some(id)
+                            && (task.get("status") == observation.get("status")
+                                || (task.get("status").and_then(Value::as_str) == Some("killed")
+                                    && observation.get("status").and_then(Value::as_str)
+                                        == Some("cancelled")))
+                    })
+            {
+                self.background_tasks.acknowledge_terminal(id);
+            }
+        } else {
+            // With no output snapshot, an unknown execution fact can still
+            // be delivered explicitly (for example, unavailable capture).
+            for id in unknown_shell_tasks(tool, fields) {
+                self.background_tasks.acknowledge_terminal(id);
+            }
+            if tool == "task_output"
+                && let Some(task) = fields.and_then(|fields| fields.get("task"))
+                && task
+                    .get("restored_output_unavailable")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && let Some(id) = task.get("task_id").and_then(Value::as_str)
+            {
+                self.background_tasks.acknowledge_terminal(id);
+            }
         }
     }
 
@@ -4993,10 +5048,23 @@ impl ToolExecutor {
                             .and_then(Value::as_str)
                             == Some("unknown")
                     });
+                    let cleanup_unconfirmed = context
+                        .get("execution")
+                        .and_then(|facts| facts.get("cleanup_unconfirmed"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     if let Some(result) = snapshot.as_mut() {
                         if read_failed {
                             // The read error and the owner's current state are
                             // distinct facts; neither replaces the other.
+                            if self.background_tasks.get(id).is_some_and(|task| {
+                                task.live_control
+                                    == background_tasks::BgTaskLiveControl::StaleHandle
+                                    && task.status().is_terminal()
+                            }) {
+                                context["restored_output_unavailable"] = json!(true);
+                                result.insert("output_notice".into(), json!("The original output is unavailable; only the retained task status and reason can be shown."));
+                            }
                             result.insert("task".into(), context.clone());
                         }
                         if let Some(controls) = context.get("controls") {
@@ -5010,8 +5078,19 @@ impl ToolExecutor {
                         if unknown {
                             result.insert("execution_notice".into(), json!("The execution outcome is unknown and may have side effects. Inspect the resulting state before deciding whether to retry."));
                         }
-                    } else if unknown {
-                        outcome.output.push_str("\nThe execution outcome is unknown and may have side effects. Inspect the resulting state before deciding whether to retry.");
+                        if cleanup_unconfirmed {
+                            result.insert(
+                                "cleanup_notice".into(),
+                                json!("Process cleanup is unconfirmed."),
+                            );
+                        }
+                    } else {
+                        if unknown {
+                            outcome.output.push_str("\nThe execution outcome is unknown and may have side effects. Inspect the resulting state before deciding whether to retry.");
+                        }
+                        if cleanup_unconfirmed {
+                            outcome.output.push_str("\nProcess cleanup is unconfirmed.");
+                        }
                     }
                 }
                 outcome
@@ -5423,9 +5502,7 @@ impl ToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
             let fields = tool_result_fields.get_or_insert_with(Default::default);
-            fields.insert("execution_fact".into(), json!("unknown"));
-            fields.insert("side_effects_maybe".into(), json!(true));
-            fields.insert("retryable".into(), json!(false));
+            astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
         }
         let direct_writer_applied = coordination_integrity_valid
             && !nested_run_script_callback
@@ -9513,6 +9590,31 @@ pub(crate) mod tests {
                 "{kind} task_output must return read evidence without becoming a lifecycle producer"
             );
         }
+    }
+
+    #[test]
+    fn skipped_redaction_marker_reports_a_partial_output_window() {
+        let snapshot = BgTaskOutputSnapshot {
+            kind: "shell".into(),
+            title: None,
+            output: String::new(),
+            end_offset: 24,
+            total_bytes: 24,
+            total_lines: 1,
+            status: BgTaskOutputStatus::Failed,
+            output_ref: String::new(),
+            output_revision: None,
+            output_complete: Some(true),
+        };
+        let output =
+            format_background_task_output("task", 0, &snapshot, BgTaskOutputReadMode::Historical);
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert!(
+            output["window_notice"]
+                .as_str()
+                .unwrap()
+                .contains("only part")
+        );
     }
 
     #[test]

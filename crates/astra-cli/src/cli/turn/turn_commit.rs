@@ -1081,6 +1081,7 @@ pub(super) mod tests {
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
         workspace.background_shell_tasks = vec![
             astra_services::session_workspace::BackgroundShellTaskProjection {
+                terminal_facts: None,
                 id: "shell-1".into(),
                 status: "running".into(),
                 title: "make test-online".into(),

@@ -163,7 +163,7 @@ fn mixed_request_retains_only_its_workspace_completion_owner() {
 async fn callback_outcome_facts_reach_the_model_before_recovery() {
     // Use the shared producer, not hand-written rejection metadata. This is
     // the same callback body/metadata the CLI sends after cancellation.
-    for (started, unknown) in [(false, false), (true, false), (true, true)] {
+    for (started, unknown) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut result =
             make_edge_tool_with_args("bash", json!({"command": "perform-external-operation"}), "");
         let cancelled = astra_tools::cancelled_tool_result("bash", started);
@@ -199,7 +199,10 @@ async fn callback_outcome_facts_reach_the_model_before_recovery() {
             .unwrap();
         let record = &state.stall.tool_call_records[0];
         assert_eq!(record.error_kind, Some(astra_core::ErrorKind::Cancelled));
-        assert_eq!(record.was_executed(), started || unknown);
+        assert_eq!(record.was_executed(), started);
+        if !started && unknown {
+            assert_eq!(record.effective_disposition(), ToolCallDisposition::Unknown);
+        }
         assert!(
             !record.ok,
             "the unrelated observation must not settle the original call"
