@@ -289,28 +289,54 @@ pub(crate) async fn post_tool_result_handler(
         astra_text_utils::credential_redaction::redact_credentials_for_display(&edge_id).0;
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        &user.user_id,
+        &body.session_id,
+        &body.run_id,
+        &body.turn_chain_id,
+        &body.request_id,
+    );
     // A bearer token authenticates the caller, but does not make the
     // session/run identity in an arbitrary callback body trustworthy. Resolve
     // the strongest durable ownership root available before touching either
     // delivery lane. Terminal callbacks may only settle an existing exact
     // durable dispatch; they must not reopen a local waiter or the run.
-    let durable_target = match state
+    let target = match state
         .execution
         .run_lifecycle_service
         .get_run_status(body.run_id.clone(), user.user_id.clone())
         .await
     {
-        Ok(target) => {
-            if target.session_id != body.session_id {
-                return Err(error_response(
-                    StatusCode::NOT_FOUND,
-                    "Tool result request not found in this session",
-                ));
-            }
-            Some(target)
+        Ok(target) => target,
+        Err(error) if error.0 == StatusCode::NOT_FOUND => {
+            let owner = state
+                .execution
+                .edge_dispatch_service
+                .callback_run_owner(&identity, &body.edge_agent_id)
+                .await
+                .map_err(|_| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Cannot verify the tool result owner",
+                    )
+                })?;
+            let Some(owner) = owner.filter(|owner| owner != &user.user_id) else {
+                return Err(error);
+            };
+            state
+                .execution
+                .run_lifecycle_service
+                .get_run_status(body.run_id.clone(), owner)
+                .await?
         }
         Err(error) => return Err(error),
     };
+    if target.session_id != body.session_id {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Tool result request not found in this session",
+        ));
+    }
     // The HTTP callback is itself a persistence boundary. Do not put the
     // caller's raw output into the process ledger or cross-pod dispatch before
     // the later model/journal sanitizer gets a chance to run. Edge-owned
@@ -339,16 +365,7 @@ pub(crate) async fn post_tool_result_handler(
             tool_result_fields: safe_body.tool_result_fields.as_ref(),
         },
     );
-    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-        &user.user_id,
-        &body.session_id,
-        &body.run_id,
-        &body.turn_chain_id,
-        &body.request_id,
-    );
-    if let Some(target) = durable_target
-        && astra_services::runs::durable_run_status_is_terminal(&target.status)
-    {
+    if astra_services::runs::durable_run_status_is_terminal(&target.status) {
         let dispatch = &state.execution.edge_dispatch_service;
         let serialized = serde_json::to_string(&safe_body).map_err(|error| {
             error_response(
@@ -2219,6 +2236,7 @@ mod edge_callback_insert_tests {
     struct ApprovalTargetRunLifecycle {
         run_id: String,
         session_id: String,
+        owner: String,
         status: Arc<Mutex<String>>,
         waiting_for: Arc<Mutex<Option<String>>>,
         required: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
@@ -2232,6 +2250,7 @@ mod edge_callback_insert_tests {
             Self {
                 run_id: run_id.into(),
                 session_id: session_id.into(),
+                owner: "u-approval".into(),
                 status: Arc::new(Mutex::new(astra_core::STATUS_WAITING.to_string())),
                 waiting_for: Arc::new(Mutex::new(Some("tool_approval".to_string()))),
                 required: Arc::new(Mutex::new(HashMap::new())),
@@ -2257,6 +2276,11 @@ mod edge_callback_insert_tests {
         fn with_running_edge_wait(self) -> Self {
             *self.status.lock().unwrap() = astra_core::STATUS_RUNNING.to_string();
             *self.waiting_for.lock().unwrap() = None;
+            self
+        }
+
+        fn with_owner(mut self, owner: &str) -> Self {
+            self.owner = owner.into();
             self
         }
 
@@ -2325,7 +2349,7 @@ mod edge_callback_insert_tests {
             run_id: String,
             user_id: String,
         ) -> Result<RunStatusRecord, (StatusCode, Json<crate::ErrorResponse>)> {
-            if run_id != self.run_id || user_id != "u-approval" {
+            if run_id != self.run_id || user_id != self.owner {
                 return Err(astra_core::error_response(
                     StatusCode::NOT_FOUND,
                     "Run not found",
@@ -4161,12 +4185,40 @@ mod edge_callback_insert_tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            !sender
+                .expire_pending_dispatch(&identity, "edge-a")
+                .await
+                .unwrap(),
+            "a waiting timeout must not retire an already claimed dispatch"
+        );
+        let expired = identity.for_request_id("expired-before-claim");
+        sender
+            .admit_dispatch(
+                &expired,
+                "edge-a",
+                &json!({"request_id":"expired-before-claim", "tool":"grep", "args":{}}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            sender
+                .expire_pending_dispatch(&expired, "edge-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !sender
+                .expire_pending_dispatch(&expired, "edge-a")
+                .await
+                .unwrap(),
+            "expiration must be idempotent"
+        );
         let lifecycle =
             Arc::new(ApprovalTargetRunLifecycle::new(&run, &session).with_running_edge_wait());
-        *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(lifecycle)
+            .with_run_lifecycle_service(lifecycle.clone())
             .with_edge_dispatch_service(receiver);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
@@ -4194,6 +4246,7 @@ mod edge_callback_insert_tests {
                 tool_result_fields: None,
             },
         );
+        *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
         let rejected = post_tool_result_handler(
             Extension(RequestTrace {
                 request_id: "trace".into(),
@@ -4278,6 +4331,138 @@ mod edge_callback_insert_tests {
         assert_eq!(result.output, "late result");
         assert_eq!(rows.len(), 1);
         assert!(state.edge_callback_ledger.lock().await.is_empty());
+        let claimable = sender.poll_pending("u-approval", "edge-a").await.unwrap();
+        assert!(
+            claimable
+                .iter()
+                .all(|row| row.request_id != expired.request_id)
+        );
+        assert!(
+            sender
+                .wait_result(&expired, Some(Duration::ZERO))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        sqlx::query(
+            "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind("u-approval")
+        .bind(session)
+        .bind(run)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_service_account_callback_uses_the_dispatch_run_owner() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let dispatch =
+            Arc::new(astra_services::multi_agent::DatabaseEdgeDispatchService::from_shared(&pool));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let session = format!("service-account-session-{suffix}");
+        let run = format!("service-account-run-{suffix}");
+        let invocation = astra_turn_types::ToolInvocationIdentity::new(
+            "run-owner",
+            &session,
+            &run,
+            "chain",
+            "call",
+        )
+        .unwrap();
+        let identity = EdgeDispatchIdentity::new(
+            "u-approval",
+            &session,
+            &run,
+            "chain",
+            invocation.storage_key(),
+        );
+        dispatch
+            .admit_and_claim_direct_dispatch(
+                &identity,
+                "edge-a",
+                &json!({"identity":invocation, "tool":"grep", "args":{}}),
+            )
+            .await
+            .unwrap();
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new(&run, &session)
+                .with_owner("run-owner")
+                .with_run_state(astra_core::STATUS_COMPLETED, None),
+        );
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle)
+            .with_edge_dispatch_service(dispatch.clone());
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: session.clone(),
+                run_id: run.clone(),
+                turn_chain_id: "chain".into(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-a".into(),
+                status: "completed".into(),
+                output: "late result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["delivery_route"], "terminal_dispatch");
+        let rows = dispatch
+            .inspect_run_dispatches(
+                "run-owner",
+                &session,
+                &run,
+                None,
+                Some(("chain", &identity.request_id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].edge_owner_user_id, "u-approval");
+        let mut wrong_edge = body;
+        wrong_edge.edge_agent_id = "edge-b".into();
+        wrong_edge.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+            astra_thin_client::ToolResultHashParts {
+                session_id: &wrong_edge.session_id,
+                run_id: &wrong_edge.run_id,
+                turn_chain_id: &wrong_edge.turn_chain_id,
+                request_id: &wrong_edge.request_id,
+                edge_agent_id: &wrong_edge.edge_agent_id,
+                status: &wrong_edge.status,
+                output: &wrong_edge.output,
+                duration_ms: wrong_edge.duration_ms,
+                tool_result_fields: wrong_edge.tool_result_fields.as_ref(),
+            },
+        );
+        let rejected = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace".into(),
+            }),
+            State(state),
+            HeaderMap::new(),
+            Json(wrong_edge),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::NOT_FOUND);
         sqlx::query(
             "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )

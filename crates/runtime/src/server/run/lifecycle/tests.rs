@@ -72,6 +72,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             if exact.is_none() {
                 return Ok((0..17)
                     .map(|index| EdgeDispatchObservation {
+                        edge_owner_user_id: "u".into(),
                         turn_chain_id: "t".repeat(128),
                         request_id: format!("{index:02}{}", "\"".repeat(120)),
                         edge_agent_id: "edge".into(),
@@ -88,6 +89,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
                     .collect());
             }
             Ok(vec![EdgeDispatchObservation {
+                edge_owner_user_id: "u".into(),
                 turn_chain_id: "turn".into(),
                 request_id: "request".into(),
                 edge_agent_id: "edge".into(),

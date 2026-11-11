@@ -121,6 +121,7 @@ struct StaticEdgeDispatch {
     terminal_admission_result: Option<String>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
     wait_error: bool,
+    expire_hangs: bool,
     direct_claimed: AtomicBool,
     receipt_result: Result<bool, &'static str>,
     fail_result: Result<bool, &'static str>,
@@ -139,6 +140,7 @@ impl Default for StaticEdgeDispatch {
             terminal_admission_result: None,
             admission_error: None,
             wait_error: false,
+            expire_hangs: false,
             direct_claimed: AtomicBool::new(false),
             receipt_result: Ok(true),
             fail_result: Ok(true),
@@ -314,6 +316,21 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .lock()
             .expect("failed dispatches lock")
             .push((identity.request_id.clone(), reason.to_string()));
+        self.fail_result.map_err(str::to_owned)
+    }
+
+    async fn expire_pending_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        if self.expire_hangs {
+            return std::future::pending().await;
+        }
+        self.failed_dispatches
+            .lock()
+            .expect("failed dispatches lock")
+            .push((identity.request_id.clone(), "expired".to_string()));
         self.fail_result.map_err(str::to_owned)
     }
 
@@ -4003,7 +4020,10 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
 
 #[tokio::test]
 async fn edge_dispatch_without_result_reports_transport_disconnected() {
-    let dispatch = Arc::new(StaticEdgeDispatch::no_result());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        fail_result: Ok(false),
+        ..StaticEdgeDispatch::no_result()
+    });
     let _local = CountingLocalTransport::new();
 
     let service = ToolExecutionService::builder()
@@ -4069,6 +4089,85 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         .expect("failed dispatches lock");
     assert_eq!(failed_dispatches.len(), 1);
     assert_eq!(failed_dispatches[0].1, "expired");
+}
+
+#[tokio::test]
+async fn edge_dispatch_timeout_before_claim_reports_not_executed() {
+    let dispatch = Arc::new(StaticEdgeDispatch::no_result());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch)
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(result.output.contains("did not run"));
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["error_kind"], "tool_timeout");
+    assert_eq!(metadata["execution_fact"], "not_executed");
+    assert_eq!(metadata["side_effects_maybe"], false);
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn edge_dispatch_stalled_expiration_reports_unknown_without_hanging() {
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        expire_hangs: true,
+        ..StaticEdgeDispatch::no_result()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch)
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        ),
+    )
+    .await
+    .expect("cleanup must not wait indefinitely");
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]

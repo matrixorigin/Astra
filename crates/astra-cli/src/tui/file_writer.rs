@@ -17,6 +17,9 @@ pub(crate) struct TuiFileWriteError {
 
 impl TuiFileWriteError {
     pub(crate) fn user_message(&self) -> String {
+        if self.path.as_os_str().is_empty() {
+            return format!("{} could not be saved: {}", self.target, self.message);
+        }
         format!(
             "{} could not be saved at {}: {}",
             self.target,
@@ -71,6 +74,10 @@ pub(crate) fn spawn() -> (
 }
 
 impl TuiFileWriter {
+    pub(crate) fn report_failure(&self, target: &'static str, path: PathBuf, message: String) {
+        report_message(&self.error_tx, target, path, message);
+    }
+
     pub(crate) fn append_line(&self, target: &'static str, path: PathBuf, line: String) {
         let error_path = path.clone();
         self.try_enqueue(

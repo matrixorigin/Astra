@@ -14,11 +14,11 @@ use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
 const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
-    "user_id",
     "session_id",
     "run_id",
     "turn_chain_id",
     "request_id",
+    "user_id",
 ];
 const TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS: &[&str] = &["identity_key"];
 const TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS: &[(&str, u64)] = &[("identity_key", 71)];
@@ -4414,7 +4414,7 @@ async fn ensure_core_schema_while_leased(
             dispatched_at DATETIME(6) NULL,
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
+            PRIMARY KEY (session_id, run_id, turn_chain_id, request_id, user_id),
             INDEX idx_edge_dispatch_status_user (status, user_id, edge_agent_id, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",

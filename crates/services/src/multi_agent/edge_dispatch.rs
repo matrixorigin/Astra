@@ -59,6 +59,7 @@ pub struct EdgeDispatchIdentity {
 /// A bounded, read-only observation of a dispatch belonging to one run.
 #[derive(Debug, Clone)]
 pub struct EdgeDispatchObservation {
+    pub edge_owner_user_id: String,
     pub turn_chain_id: String,
     pub request_id: String,
     pub edge_agent_id: String,
@@ -121,6 +122,26 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     let replayed = serde_json::from_str::<serde_json::Value>(replayed)
         .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
     Ok(persisted == replayed)
+}
+
+fn dispatch_run_owner(
+    identity: &EdgeDispatchIdentity,
+    invocation_json: Option<&str>,
+) -> Result<String, String> {
+    let Some(invocation_json) = invocation_json else {
+        // The interactive tool-request lane is owned by the run user itself.
+        return Ok(identity.user_id.clone());
+    };
+    let invocation: astra_turn_types::ToolInvocationIdentity =
+        serde_json::from_str(invocation_json).map_err(|_| "invalid dispatch identity")?;
+    if invocation.session_id != identity.session_id
+        || invocation.run_id != identity.run_id
+        || invocation.turn_chain_id != identity.turn_chain_id
+        || invocation.storage_key() != identity.request_id
+    {
+        return Err("dispatch invocation identity does not match its key".into());
+    }
+    Ok(invocation.user_id)
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -236,6 +257,16 @@ pub trait EdgeDispatchService: Send + Sync {
         reason: &str,
     ) -> Result<bool, String>;
 
+    /// Expire a request only if the Edge has not claimed it. A claimed
+    /// request may still produce a result after the caller stops waiting.
+    async fn expire_pending_dispatch(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        Err("pending dispatch expiration is unavailable".into())
+    }
+
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
     /// Some(zero) performs one exact durable read without subscribing;
     /// Some(nonzero) bounds the wait; None retains the subscription until
@@ -258,6 +289,16 @@ pub trait EdgeDispatchService: Send + Sync {
         _exact: Option<(&str, &str)>,
     ) -> Result<Vec<EdgeDispatchObservation>, String> {
         Err("durable tool outcome inspection is unavailable".into())
+    }
+
+    /// Resolve a callback's run owner from the exact, authenticated Edge
+    /// dispatch. This is only needed when Edge and run owners differ.
+    async fn callback_run_owner(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<Option<String>, String> {
+        Err("dispatch callback owner is unavailable".into())
     }
 
     /// Clean up stale dispatches older than `older_than`.
@@ -1445,6 +1486,51 @@ fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Resul
 }
 
 impl DatabaseEdgeDispatchService {
+    async fn fail_dispatch_matching(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        reason: &str,
+        pending_only: bool,
+    ) -> Result<bool, String> {
+        let output = format!("edge dispatch {reason}");
+        let result_json =
+            edge_dispatch_failed_result_json(identity.request_id_json_value(), output);
+        let query = if pending_only {
+            "UPDATE edge_pending_dispatch \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ? AND status = 'pending'"
+        } else {
+            "UPDATE edge_pending_dispatch \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ? \
+               AND status IN ('pending', 'dispatched')"
+        };
+        let affected = sqlx::query(query)
+            .bind(&result_json)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .bind(edge_agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?
+            .rows_affected()
+            > 0;
+        if affected && let Some(ref m) = self.metrics {
+            saturating_decrement(&m.dispatch_queue_depth);
+            m.dispatch_failed_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if affected {
+            self.wait_coordinator.resolve(identity, &result_json).await;
+        }
+        Ok(affected)
+    }
+
     async fn deliver_result_matching(
         &self,
         identity: &EdgeDispatchIdentity,
@@ -1870,35 +1956,17 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
-        let output = format!("edge dispatch {reason}");
-        let result_json =
-            edge_dispatch_failed_result_json(identity.request_id_json_value(), output);
-        let n = sqlx::query(
-            "UPDATE edge_pending_dispatch \
-             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-               AND request_id = ? AND edge_agent_id = ? \
-               AND status IN ('pending', 'dispatched')",
-        )
-        .bind(&result_json)
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .bind(edge_agent_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?;
-        let affected = n.rows_affected() > 0;
-        if affected && let Some(ref m) = self.metrics {
-            saturating_decrement(&m.dispatch_queue_depth);
-            m.dispatch_failed_total.fetch_add(1, Ordering::Relaxed);
-        }
-        if affected {
-            self.wait_coordinator.resolve(identity, &result_json).await;
-        }
-        Ok(affected)
+        self.fail_dispatch_matching(identity, edge_agent_id, reason, false)
+            .await
+    }
+
+    async fn expire_pending_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        self.fail_dispatch_matching(identity, edge_agent_id, "expired", true)
+            .await
     }
 
     async fn inspect_run_dispatches(
@@ -1919,7 +1987,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             return Err("invalid dispatch inspection identity".into());
         }
         let mut query = sqlx::QueryBuilder::<MySql>::new(
-            "SELECT turn_chain_id, request_id, edge_agent_id, status, \
+            "SELECT user_id, turn_chain_id, request_id, edge_agent_id, status, \
+             JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity')) AS invocation_identity, \
              CASE WHEN OCTET_LENGTH(payload_json) <= 65536 THEN JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.tool')) ELSE NULL END AS tool_name, ",
         );
         if exact.is_some() {
@@ -1930,9 +1999,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             query.push("NULL AS bounded_result, 0 AS result_too_large ");
         }
         query
-            .push("FROM edge_pending_dispatch WHERE user_id = ")
-            .push_bind(user_id)
-            .push(" AND session_id = ")
+            .push("FROM edge_pending_dispatch WHERE session_id = ")
             .push_bind(session_id)
             .push(" AND run_id = ")
             .push_bind(run_id);
@@ -1953,29 +2020,85 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 .push("))");
         }
         if exact.is_none() {
-            query.push(" ORDER BY turn_chain_id, request_id LIMIT 17");
+            query.push(" ORDER BY turn_chain_id, request_id, user_id LIMIT 17");
+        } else {
+            query.push(" LIMIT 2");
         }
         let rows = query
             .build()
             .fetch_all(&self.pool)
             .await
             .map_err(|error| format!("edge dispatch inspection failed: {error}"))?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(EdgeDispatchObservation {
-                    turn_chain_id: row.try_get("turn_chain_id").map_err(|e| e.to_string())?,
-                    request_id: row.try_get("request_id").map_err(|e| e.to_string())?,
-                    edge_agent_id: row.try_get("edge_agent_id").map_err(|e| e.to_string())?,
-                    status: row.try_get("status").map_err(|e| e.to_string())?,
-                    tool_name: row.try_get("tool_name").map_err(|e| e.to_string())?,
-                    result_json: row.try_get("bounded_result").map_err(|e| e.to_string())?,
-                    result_too_large: row
-                        .try_get::<i32, _>("result_too_large")
-                        .map_err(|e| e.to_string())?
-                        != 0,
+        let mut observations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let identity = EdgeDispatchIdentity::new(
+                row.try_get::<String, _>("user_id")
+                    .map_err(|e| e.to_string())?,
+                session_id,
+                run_id,
+                row.try_get::<String, _>("turn_chain_id")
+                    .map_err(|e| e.to_string())?,
+                row.try_get::<String, _>("request_id")
+                    .map_err(|e| e.to_string())?,
+            );
+            let invocation_json: Option<String> = row
+                .try_get("invocation_identity")
+                .map_err(|e| e.to_string())?;
+            if dispatch_run_owner(&identity, invocation_json.as_deref())? != user_id {
+                return Err("dispatch inspection scope does not match the run owner".into());
+            }
+            if observations
+                .last()
+                .is_some_and(|previous: &EdgeDispatchObservation| {
+                    previous.turn_chain_id == identity.turn_chain_id
+                        && previous.request_id == identity.request_id
                 })
-            })
-            .collect()
+            {
+                return Err("dispatch identity is ambiguous across Edge owners".into());
+            }
+            observations.push(EdgeDispatchObservation {
+                edge_owner_user_id: identity.user_id,
+                turn_chain_id: identity.turn_chain_id,
+                request_id: identity.request_id,
+                edge_agent_id: row.try_get("edge_agent_id").map_err(|e| e.to_string())?,
+                status: row.try_get("status").map_err(|e| e.to_string())?,
+                tool_name: row.try_get("tool_name").map_err(|e| e.to_string())?,
+                result_json: row.try_get("bounded_result").map_err(|e| e.to_string())?,
+                result_too_large: row
+                    .try_get::<i32, _>("result_too_large")
+                    .map_err(|e| e.to_string())?
+                    != 0,
+            });
+        }
+        Ok(observations)
+    }
+
+    async fn callback_run_owner(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<Option<String>, String> {
+        let row = sqlx::query(
+            "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity')) AS invocation_identity \
+             FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ? \
+             AND turn_chain_id = ? AND request_id = ? AND edge_agent_id = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(edge_agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("dispatch callback owner lookup failed: {e}"))?;
+        row.map(|row| {
+            let invocation_json: Option<String> = row
+                .try_get("invocation_identity")
+                .map_err(|e| e.to_string())?;
+            dispatch_run_owner(identity, invocation_json.as_deref())
+        })
+        .transpose()
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = ?timeout.map(|timeout| timeout.as_millis())))]
@@ -2049,7 +2172,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
              WHERE status IN ('pending', 'dispatched') \
                AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
                AND NOT EXISTS (SELECT 1 FROM agent_runs r \
-                   WHERE r.user_id = JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')) \
+                   WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
                      AND r.status IN ('running', 'waiting', 'paused'))",
@@ -2075,7 +2198,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
              WHERE status IN ('completed', 'failed') \
                AND COALESCE(completed_at, created_at) <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
                AND NOT EXISTS (SELECT 1 FROM agent_runs r \
-                   WHERE r.user_id = JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')) \
+                   WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
                      AND r.status IN ('running', 'waiting', 'paused'))",
@@ -3275,9 +3398,97 @@ mod tests {
             reader
                 .inspect_run_dispatches("other-user", &session, &run, None, None)
                 .await
-                .unwrap()
-                .is_empty()
+                .is_err()
         );
+        let invocation = astra_turn_types::ToolInvocationIdentity::new(
+            &user,
+            &session,
+            &run,
+            "turn",
+            "service-account-call",
+        )
+        .unwrap();
+        let edge_owner = format!("edge-owner-{suffix}");
+        let cross_owner = EdgeDispatchIdentity::new(
+            &edge_owner,
+            &session,
+            &run,
+            "turn",
+            invocation.storage_key(),
+        );
+        let payload = json!({"identity":invocation, "tool":"grep", "args":{}});
+        writer
+            .admit_and_claim_direct_dispatch(&cross_owner, &edge, &payload)
+            .await
+            .unwrap();
+        let cross_result = reader
+            .inspect_run_dispatches(
+                &user,
+                &session,
+                &run,
+                None,
+                Some((&cross_owner.turn_chain_id, &cross_owner.request_id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_result.len(), 1);
+        assert_eq!(cross_result[0].edge_owner_user_id, edge_owner);
+        assert_eq!(
+            reader
+                .callback_run_owner(&cross_owner, &edge)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(user.as_str())
+        );
+        assert_eq!(
+            reader
+                .callback_run_owner(&cross_owner, "wrong-edge")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            reader
+                .inspect_run_dispatches(
+                    "other-user",
+                    &session,
+                    &run,
+                    None,
+                    Some((&cross_owner.turn_chain_id, &cross_owner.request_id)),
+                )
+                .await
+                .is_err()
+        );
+
+        let other_owner = EdgeDispatchIdentity::new(
+            format!("other-edge-owner-{suffix}"),
+            &session,
+            &run,
+            "turn",
+            &cross_owner.request_id,
+        );
+        writer
+            .admit_and_claim_direct_dispatch(&other_owner, &edge, &payload)
+            .await
+            .unwrap();
+        assert!(
+            reader
+                .inspect_run_dispatches(
+                    &user,
+                    &session,
+                    &run,
+                    None,
+                    Some((&cross_owner.turn_chain_id, &cross_owner.request_id)),
+                )
+                .await
+                .is_err(),
+            "two owners for the same invocation must not be silently selected"
+        );
+        for identity in [&cross_owner, &other_owner] {
+            sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?")
+                .bind(&identity.user_id).bind(&session).bind(&run).execute(pool.get()).await.unwrap();
+        }
         sqlx::query(
             "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )

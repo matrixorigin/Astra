@@ -112,7 +112,6 @@ impl BackgroundTaskCounts {
             }
             if matches!(row.live_control, LiveControlState::StaleHandle)
                 && !(row.kind == BackgroundTaskKind::Shell
-                    && !row.needs_attention
                     && matches!(
                         row.status,
                         BackgroundTaskStatus::Failed

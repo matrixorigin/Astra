@@ -4064,11 +4064,7 @@ async fn refresh_background_task_surfaces(
         drop(cache);
 
         let previous_counts = bottom_pane.footer.bg_task_counts;
-        sync_background_task_footer_from_rows(
-            bottom_pane,
-            &rows,
-            background_registry.evicted_uncertain_count(),
-        );
+        sync_background_task_footer_from_rows(bottom_pane, &rows);
         changed |= bottom_pane.footer.bg_task_counts != previous_counts;
         *next_shared_refresh = now + BACKGROUND_SURFACE_REFRESH_INTERVAL;
     }
@@ -8613,7 +8609,9 @@ fn surface_tui_file_write_errors(
 ) {
     while let Ok(error) = errors.try_recv() {
         let detail = error.user_message();
-        state.session_persistence_error = Some(detail.clone());
+        if !error.path.as_os_str().is_empty() {
+            state.session_persistence_error = Some(detail.clone());
+        }
         if reported.insert(error) {
             chat_widget.commit_ephemeral_warning(format!(
                 "Local persistence degraded · {detail}. Conversation continues; resume/history may be stale."
@@ -8621,6 +8619,12 @@ fn surface_tui_file_write_errors(
             frame_requester.schedule_frame();
         }
     }
+}
+
+fn reset_unbound_persistence_warnings(
+    reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
+) {
+    reported.retain(|error| !error.path.as_os_str().is_empty());
 }
 
 /// Replay a session's canonical root journal transcript into a fresh
@@ -9398,7 +9402,11 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        loop_try!(auth_flow::begin_browser_session_login(&mut state).await);
+                        if let Err(error) = auth_flow::begin_browser_session_login(&mut state).await {
+                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                            frame_requester.schedule_frame();
+                            continue 'main;
+                        }
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -12297,11 +12305,13 @@ pub(crate) async fn run_tui_session(
                                                         local_agent_snapshot = next_snapshot;
                                                         restored_local_agent_task_projections =
                                                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                                                background_registry.owner_scope(),
                                                                 &local_agent_snapshot,
                                                                 &restored_local_agent_task_projections,
                                                                 background_registry_turn_session_id.as_deref(),
                                                                 background_registry_turn_model.as_deref(),
                                                                 &mut background_local_agent_projection_cache,
+                                                                Some(&file_writer),
                                                             )
                                                             .await;
                                                         let changed = chat_widget
@@ -12361,6 +12371,7 @@ pub(crate) async fn run_tui_session(
                                                             background_registry_turn_session_id.as_deref(),
                                                             background_registry_turn_model.as_deref(),
                                                             &mut background_task_projection_cache,
+                                                            Some(&file_writer),
                                                         )
                                                         .await;
                                                     }
@@ -13714,9 +13725,12 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                if state.session_id != background_registry_session_id {
+                let background_owner_changed =
+                    *background_registry.owner_scope() != astra_services::local_owner_scope();
+                if state.session_id != background_registry_session_id || background_owner_changed {
+                    reset_unbound_persistence_warnings(&mut reported_file_write_errors);
                     next_background_surface_refresh = std::time::Instant::now();
-                    let first_session_binding = is_initial_session_binding(
+                    let first_session_binding = !background_owner_changed && is_initial_session_binding(
                         background_registry_session_id.as_deref(),
                         state.session_id.as_deref(),
                     );
@@ -13750,15 +13764,18 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         restored_local_agent_task_projections =
                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &local_agent_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                     } else {
@@ -13767,14 +13784,17 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         if reset_agent_scope
@@ -13786,11 +13806,13 @@ pub(crate) async fn run_tui_session(
                                 .await
                         {
                             let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &retired_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                         }
@@ -13805,6 +13827,7 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         state.background_tasks = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(background_task_output_dir(state.session_id.as_deref()));
@@ -13950,11 +13973,13 @@ pub(crate) async fn run_tui_session(
                     local_agent_snapshot = next_local_agent_snapshot;
                     restored_local_agent_task_projections =
                         persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             state.session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
@@ -14019,6 +14044,7 @@ pub(crate) async fn run_tui_session(
                         state.session_id.as_deref(),
                         state.model.as_deref(),
                         &mut background_task_projection_cache,
+                        Some(&file_writer),
                     )
                     .await;
                 }
@@ -14206,6 +14232,7 @@ pub(crate) async fn run_tui_session(
         state.session_id.as_deref(),
         state.model.as_deref(),
         &mut background_task_projection_cache,
+        Some(&file_writer),
     )
     .await;
     match tokio::time::timeout(Duration::from_secs(2), file_writer_runtime.shutdown()).await {
@@ -21348,6 +21375,7 @@ mod tests {
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
         workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
@@ -21373,6 +21401,7 @@ mod tests {
             Some("main"),
         );
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
+        let captured_owner = astra_services::OwnerScope::user("captured-agent-owner").unwrap();
 
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let input = SpawnAgentInput {
@@ -21388,14 +21417,27 @@ mod tests {
 
         let mut cache = Vec::new();
         let projections = persist_background_local_agent_task_projections_if_changed(
+            &captured_owner,
             Some(&spawner),
             &[],
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
-        let workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        let workspace = astra_services::session_workspace::read_workspace_optional_for_owner(
+            &captured_owner,
+            session_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            astra_services::session_workspace::read_workspace(session_id)
+                .unwrap()
+                .background_local_agent_tasks
+                .is_empty()
+        );
 
         assert_eq!(workspace.background_local_agent_tasks.len(), 1);
         assert_eq!(workspace.background_local_agent_tasks[0].id, agent_id);
@@ -25131,6 +25173,49 @@ mod tests {
             transcript.contains("Local persistence degraded"),
             "{transcript:?}"
         );
+
+        let previous_error = state.session_persistence_error.clone();
+        let unbound = crate::tui::file_writer::TuiFileWriteError {
+            target: "Background task history",
+            path: std::path::PathBuf::new(),
+            message: "no session is bound yet".into(),
+        };
+        tx.send(unbound.clone()).unwrap();
+        tx.send(unbound).unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
+        assert_eq!(
+            widget.history().len(),
+            2,
+            "provisional warnings are also deduplicated"
+        );
+        reset_unbound_persistence_warnings(&mut reported);
+        assert_eq!(reported.len(), 1, "real file errors stay deduplicated");
+        tx.send(crate::tui::file_writer::TuiFileWriteError {
+            target: "Background task history",
+            path: std::path::PathBuf::new(),
+            message: "no session is bound yet".into(),
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(
+            widget.history().len(),
+            3,
+            "a new unbound session must warn again"
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
     }
 
     #[test]

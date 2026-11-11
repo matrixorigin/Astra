@@ -148,7 +148,7 @@ async fn delivered_terminal_output_clears_known_failure_attention() {
     .await;
     terminal(&executor, &id).await;
     let before = executor.background_tasks.get(&id).unwrap();
-    assert!(before.terminal_needs_attention());
+    assert!(before.terminal_unobserved());
 
     let result = call(&executor, "task_output", json!({"task_id": id})).await;
     assert!(result.output.contains("failed check"), "{result:?}");
@@ -157,7 +157,7 @@ async fn delivered_terminal_output_clears_known_failure_attention() {
             .background_tasks
             .get(&id)
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
     executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
     assert!(
@@ -165,7 +165,7 @@ async fn delivered_terminal_output_clears_known_failure_attention() {
             .background_tasks
             .get(&id)
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
     let mut source = executor.background_tasks.clone();
     let projections = source.export_shell_task_projections();
@@ -177,8 +177,8 @@ async fn delivered_terminal_output_clears_known_failure_attention() {
         .restore_shell_task_projections(projections)
         .unwrap();
     let history = restored.get(&id).expect("failed task remains inspectable");
-    assert!(!history.terminal_needs_attention());
-    assert!(!history.terminal_outcome_unsettled());
+    assert!(!history.terminal_unobserved());
+    assert!(!history.outcome_unsettled());
 }
 
 #[tokio::test]
@@ -204,7 +204,7 @@ async fn partial_terminal_output_does_not_acknowledge_a_later_error() {
             .background_tasks
             .get(&id)
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
     let last = call(&executor, "task_output", json!({"task_id": id})).await;
     assert!(last.output.contains("compiler error at end"), "{last:?}");
@@ -214,7 +214,7 @@ async fn partial_terminal_output_does_not_acknowledge_a_later_error() {
             .background_tasks
             .get(&id)
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
 }
 
@@ -325,9 +325,9 @@ async fn restored_unread_failure_can_be_observed_and_persisted() {
         !registry
             .get("restored-failure")
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
-    assert!(registry.poll_completions().iter().any(|event| matches!(event, crate::edge_tools::background_tasks::BgTaskEvent::Observed { id } if id == "restored-failure")));
+    assert!(registry.poll_completions().iter().any(|event| matches!(event, crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. } if id == "restored-failure")));
     let persisted = registry.export_shell_task_projections();
     let mut reopened = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
         root.root.path().join("reopen"),
@@ -337,7 +337,7 @@ async fn restored_unread_failure_can_be_observed_and_persisted() {
         !reopened
             .get("restored-failure")
             .unwrap()
-            .terminal_needs_attention()
+            .terminal_unobserved()
     );
 }
 

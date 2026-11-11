@@ -106,14 +106,19 @@ unless the command itself requests them.
 Private cleanup uses the original directory handle; tasks in one namespace
 share that handle. A failed eviction keeps its owner for retry, and a full
 retention budget applies backpressure rather than dropping cleanup ownership.
-The task footer distinguishes unobserved terminal failures from an unknown
-execution or unconfirmed cleanup. Delivering a terminal output observation
-clears the former, but cannot settle the latter. The bounded workspace
-projection retains those terminal facts for retained tasks across session
-restoration; it does not recreate a process handle or a private capture. Once a
-task is evicted, only an in-memory count of unresolved outcomes or cleanup
-remains; the task identity and count are not restored after a process restart.
-Output chunks
+The task footer shows terminal failure notifications until they are displayed,
+and separately flags an unknown execution or unconfirmed cleanup. Displaying a
+notification does not claim that the model received the full output, and cannot
+settle an unknown outcome. If a session is restored before the terminal result
+was observed, the failure may be shown again with its earlier delivery marked
+as unknown. When the workspace save succeeds, its bounded projection keeps the
+identity and facts of unknown outcomes or unconfirmed cleanup across session
+restoration; it does not recreate a process handle or a private capture. A
+failed save is reported to the user and may leave older facts on disk.
+Observed output may be
+reclaimed independently of those facts. If running and unresolved tasks reach
+the session limit, a new session can run commands while the old session keeps
+its records; starting a new session does not resolve those outcomes. Output chunks
 do not trigger model calls, and local waits perform no periodic SQL. A restored
 plain-shell projection can expose saved output but cannot recreate a lost
 process handle. Weak process-group cleanup never certifies authoritative

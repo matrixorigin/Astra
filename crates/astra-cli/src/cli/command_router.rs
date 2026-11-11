@@ -2765,7 +2765,7 @@ async fn execute_cli_command_impl(
             let shell_shutdown = settle_one_shot_cleanup_observing_interrupt(
                 async {
                     let report = background_tasks.kill_all_and_wait(std::time::Duration::from_secs(2)).await;
-                    let unsettled = report.unsettled.len().saturating_add(report.evicted_unsettled);
+                    let unsettled = report.unsettled.len();
                     let unknown = report.unknown.len();
                     shell_settlement_confirmed = unsettled == 0 && unknown == 0;
                     if !shell_settlement_confirmed {

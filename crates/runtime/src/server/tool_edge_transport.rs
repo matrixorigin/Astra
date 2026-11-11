@@ -11,8 +11,8 @@ use super::tool_transport_errors::{
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_ROUTE_MISMATCH, attach_runtime_error_metadata, attach_runtime_policy_metadata,
-    binding_event_fields, cancelled_runtime_tool_result,
+    TOOL_ERROR_KIND_ROUTE_MISMATCH, TOOL_ERROR_KIND_TOOL_TIMEOUT, attach_runtime_error_metadata,
+    attach_runtime_policy_metadata, binding_event_fields, cancelled_runtime_tool_result,
 };
 use super::tool_transport_plan::{EdgeBoundExecutionPlan, EdgeTransportAttempt};
 
@@ -832,15 +832,43 @@ async fn try_edge_dispatch(
         }
     };
     let Some(result_json) = result_json else {
-        if let Err(e) = dispatch
-            .fail_dispatch(&identity, &agent.edge_agent_id, "expired")
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch.expire_pending_dispatch(&identity, &agent.edge_agent_id),
+        )
+        .await
         {
-            tracing::warn!(
-                error = %e,
-                request_id = %request_id,
-                "failed to mark dispatch as expired"
-            );
+            Ok(Ok(true)) => {
+                let message = format!(
+                    "Tool '{}' timed out before the Edge claimed it. It did not run.",
+                    request.tool_name
+                );
+                let mut metadata = binding_event_fields(&request.workspace, &request.executor);
+                attach_runtime_policy_metadata(&mut metadata, binding);
+                let mut error = astra_runtime_env::RuntimeError::new(
+                    astra_runtime_env::RuntimeErrorKind::ToolTimeout,
+                    &message,
+                );
+                error.retryable = true;
+                attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
+                metadata.insert(
+                    "execution_fact".into(),
+                    Value::String("not_executed".into()),
+                );
+                return EdgeTransportAttempt::Delivered(astra_tools::ToolResult {
+                    output: message,
+                    metadata: Some(metadata),
+                    is_error: true,
+                    exit_semantics: None,
+                });
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, request_id = %request_id, "failed to expire an unclaimed dispatch")
+            }
+            Err(_) => {
+                tracing::warn!(request_id = %request_id, "timed out expiring an unclaimed dispatch")
+            }
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };

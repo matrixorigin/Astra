@@ -4130,7 +4130,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     && let Some(body) = row.result_json.as_deref()
                 {
                     let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-                        &self.user_id,
+                        &row.edge_owner_user_id,
                         &self.session_id,
                         child_run_id,
                         &row.turn_chain_id,
