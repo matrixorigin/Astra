@@ -99,7 +99,7 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
             ),
             // Command-line password flags are explicit secrets even when short.
             pat_min!(
-                r#"(?i)--password(?:\\s+|=)\\s*(?:\\\\*['"])?(?P<secret>[A-Za-z0-9._\\-/+=]{{{},}})"#,
+                r#"(?i)--password(?:\s+|=)\s*(?:\\*['"])?(?P<secret>[A-Za-z0-9._\-/+=]{{{},}})"#,
                 1,
                 "PASSWORD_ARGUMENT",
                 Some("secret")
