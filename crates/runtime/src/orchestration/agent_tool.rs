@@ -3640,7 +3640,7 @@ async fn handle_agent_get_result_action_inner(
                 json!({"status":"invalid_request", "note":"This page cannot preserve a redaction marker or UTF-8 boundary. Use a returned next_offset and a larger max_bytes; if the marker exceeds the maximum, that portion is unavailable."})
             }
             Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy) => {
-                json!({"status":"unavailable", "note":"Tool outcome inspection is busy. Try again shortly; this does not rerun the tool."})
+                json!({"status":"unavailable", "note":"Tool outcome inspection is temporarily busy or at capacity. Try again later; inspection does not rerun the tool."})
             }
             Err(_) => {
                 json!({"status":"unavailable", "note":"Retained results could not be inspected. Their execution outcomes remain unknown."})
@@ -4859,7 +4859,9 @@ pub(crate) mod tests {
             _max_bytes: usize,
         ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if exact.is_some() {
+            if exact.is_some_and(|(_, request)| request == "busy") {
+                Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)
+            } else if exact.is_some() {
                 Ok(
                     json!({"observations": [{"result": {"status":"unavailable", "reason":"too large"}}]}),
                 )
@@ -4937,6 +4939,21 @@ pub(crate) mod tests {
         assert_eq!(
             unavailable["tool_outcomes"]["observations"][0]["result"]["status"],
             "unavailable"
+        );
+        let busy = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {"exact": {
+                "turn_chain_id":"turn", "request_id":"busy"}}}),
+            Some(&ctx),
+        )
+        .await;
+        let busy: Value = serde_json::from_str(&busy).unwrap();
+        assert_eq!(busy["status"], "tool_outcomes_unavailable");
+        assert_eq!(busy["tool_outcomes"]["status"], "unavailable");
+        assert!(
+            busy["tool_outcomes"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("does not rerun")
         );
         ctx.fanout_admission.set_direct_child_for_test(
             crate::orchestration::spawner::DirectChildCompletion {

@@ -4139,6 +4139,9 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                 None,
             ));
         }
+        if offset > 0 && !tool_outcome_cache::can_load_continuation() {
+            return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy);
+        }
         let mut rows = tokio::time::timeout_at(
             deadline,
             service.inspect_run_dispatches(
@@ -4162,7 +4165,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                 "dispatch_status": row.status,
                 "tool": row.tool_name.as_deref().map(|name| astra_text_utils::credential_redaction::truncate_redacted_output(astra_text_utils::credential_redaction::redact_credentials_for_display(name).0, 128)),
             });
-            if exact.is_some() {
+            if let Some(key) = cache_key.as_ref() {
                 if row.result_too_large {
                     observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the bounded recovery limit; its execution outcome remains unknown"});
                 } else if row.status == "completed"
@@ -4250,10 +4253,12 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     }
                     observation["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
                     let view = Arc::new(tool_outcome_cache::ToolOutcomeView { observation, output });
-                    let page = view.page(offset, max_bytes)?;
-                    if let Some(key) = cache_key.as_ref() {
-                        tool_outcome_cache::insert(key.clone(), view);
-                    }
+                    let page = tool_outcome_cache::page(
+                        key.clone(),
+                        view,
+                        offset,
+                        max_bytes,
+                    )?;
                     observations.push(page);
                     continue;
                 } else if row.status == "failed"

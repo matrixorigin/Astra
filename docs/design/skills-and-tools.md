@@ -150,11 +150,16 @@ bounded to an 8 MiB serialized result, scoped to the parent and does not change
 the child outcome. A Server caches only validated immutable terminal display
 views, keyed by run owner, session, child run, turn and request. The shared
 cache holds at most 1,024 entries and 32 MiB for five minutes, rather than reserving
-memory per connected session. Paging a cached view performs no SQL or repeated
-full-result sanitization. `observed_at` identifies the historical result view;
-it does not assert that the underlying row is still retained. Eviction, expiry,
-restart or routing to another Server falls back to the existing canonical read;
-misses and server receipts are not cached. Normal tool execution and child
+memory per connected session. A paged view remains cached until expiry. At
+capacity, the first page and its execution facts remain available, while later
+pages may report temporary unavailability rather than evicting other active
+readers and reloading their complete results on every page. A single-page
+result does not occupy the cache. Paging a cached view performs no
+SQL or repeated full-result sanitization. `observed_at` identifies the
+historical result view; it does not assert that the underlying row is still
+retained. Expiry, restart or routing to another Server can require a canonical
+read, or report temporary capacity exhaustion on that Server; misses and server
+receipts are not cached. Normal tool execution and child
 collection incur no extra inspection query. A missing,
 expired, oversized or unavailable result does not establish that execution
 never happened. A relay row expiring before claim is reported as that specific
