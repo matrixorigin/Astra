@@ -97,6 +97,13 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 "TOKEN_ARGUMENT",
                 Some("secret")
             ),
+            // Command-line password flags are explicit secrets even when short.
+            pat_min!(
+                r#"(?i)--password(?:\\s+|=)\\s*(?:\\\\*['"])?(?P<secret>[A-Za-z0-9._\\-/+=]{{{},}})"#,
+                1,
+                "PASSWORD_ARGUMENT",
+                Some("secret")
+            ),
             pat_stream!(
                 r"gh[pousr]_[A-Za-z0-9_]{36,}",
                 r"gh[pousr]_[A-Za-z0-9_]+",
@@ -2970,5 +2977,28 @@ mod pgp_private_key_regression_tests {
         let (redacted, count) = redact_credentials_for_display(&input);
         assert!(count > 0);
         assert!(!redacted.contains(secret));
+    }
+}
+
+#[cfg(test)]
+mod password_flag_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_mysql_password_argument() {
+        let secret = "S3cretPassw0rd123";
+        let (redacted, count) = redact_credentials_for_display(
+            &format!("mysql --password {secret} -h db")
+        );
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("PASSWORD_ARGUMENT"));
+    }
+
+    #[test]
+    fn hides_short_explicit_password_value() {
+        let (redacted, count) = redact_credentials_for_display("mysql --password=abc -h db");
+        assert_eq!(count, 1);
+        assert!(!redacted.contains("password=abc"));
     }
 }
