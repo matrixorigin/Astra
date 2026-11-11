@@ -3988,6 +3988,9 @@ impl GuidanceSubmissionError {
             {
                 Self::Rejected(astra_thin_client::ThinClientError::Api { status, body }.to_string())
             }
+            error @ astra_thin_client::ThinClientError::SyncOutboxRateLimited { .. } => {
+                Self::Rejected(error.to_string())
+            }
             astra_thin_client::ThinClientError::InvalidBaseUrl(_)
             | astra_thin_client::ThinClientError::InvalidAuthHeader
             | astra_thin_client::ThinClientError::InvalidInput(_)

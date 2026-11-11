@@ -260,6 +260,8 @@ pub enum SyncOutboxDeliverySettlement {
     Deferred {
         record_id: String,
         error: String,
+        /// Server-directed delay; `None` uses the local retry default.
+        retry_after: Option<std::time::Duration>,
     },
 }
 
@@ -604,7 +606,9 @@ impl SyncOutboxStore {
                         }
                     }
                     SyncOutboxDeliverySettlement::Rejected { record_id, error }
-                    | SyncOutboxDeliverySettlement::Deferred { record_id, error } => {
+                    | SyncOutboxDeliverySettlement::Deferred {
+                        record_id, error, ..
+                    } => {
                         let Some(record) = state
                             .records
                             .iter_mut()
@@ -617,8 +621,8 @@ impl SyncOutboxStore {
                             SyncOutboxDeliverySettlement::Rejected { .. } => {
                                 apply_delivery_rejection(record, error, now)
                             }
-                            SyncOutboxDeliverySettlement::Deferred { .. } => {
-                                apply_delivery_deferral(record, error, now)
+                            SyncOutboxDeliverySettlement::Deferred { retry_after, .. } => {
+                                apply_delivery_deferral(record, error, now, *retry_after)
                             }
                             SyncOutboxDeliverySettlement::Ack { .. } => unreachable!(),
                         };
@@ -1360,7 +1364,12 @@ fn apply_delivery_rejection(record: &mut SyncOutboxRecord, error: &str, now: u64
     true
 }
 
-fn apply_delivery_deferral(record: &mut SyncOutboxRecord, error: &str, now: u64) -> bool {
+fn apply_delivery_deferral(
+    record: &mut SyncOutboxRecord,
+    error: &str,
+    now: u64,
+    retry_after: Option<std::time::Duration>,
+) -> bool {
     if matches!(
         record.state,
         SyncOutboxRecordState::Acked | SyncOutboxRecordState::Poisoned
@@ -1370,8 +1379,8 @@ fn apply_delivery_deferral(record: &mut SyncOutboxRecord, error: &str, now: u64)
     record.state = SyncOutboxRecordState::Pending;
     record.last_error = Some(error.to_string());
     record.updated_at_unix_ms = now;
-    record.next_retry_after_unix_ms =
-        Some(now.saturating_add(SYNC_OUTBOX_DEFERRED_RETRY_DELAY.as_millis() as u64));
+    let delay = retry_after.unwrap_or(SYNC_OUTBOX_DEFERRED_RETRY_DELAY);
+    record.next_retry_after_unix_ms = Some(now.saturating_add(delay.as_millis() as u64));
     true
 }
 
@@ -1826,15 +1835,24 @@ mod tests {
             panic!("deferred insert");
         };
 
+        let before_deferral = unix_ms().expect("time");
         store
             .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Deferred {
                 record_id: deferred_id,
                 error: "offline".into(),
+                retry_after: Some(std::time::Duration::from_secs(120)),
             }])
             .expect("defer");
         let ready = store.ready_records(10).expect("ready records");
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].record_id, ready_id);
+        let retry_at = store
+            .status()
+            .expect("status")
+            .next_retry_after_unix_ms
+            .expect("server-directed retry deadline");
+        assert!(retry_at >= before_deferral.saturating_add(120_000));
+        assert!(retry_at <= unix_ms().expect("time").saturating_add(120_000));
     }
 
     #[test]
@@ -1961,6 +1979,7 @@ mod tests {
             .map(|record| SyncOutboxDeliverySettlement::Deferred {
                 record_id: record.record_id.clone(),
                 error: "unknown delivery outcome".into(),
+                retry_after: None,
             })
             .collect::<Vec<_>>();
         store
@@ -2065,6 +2084,7 @@ mod tests {
                 .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Deferred {
                     record_id: record_id.clone(),
                     error: "temporary cloud outage".to_string(),
+                    retry_after: None,
                 }])
                 .expect("defer delivery");
             assert_eq!(report.failed, 1);
@@ -2161,6 +2181,7 @@ mod tests {
                 SyncOutboxDeliverySettlement::Deferred {
                     record_id: fail_id,
                     error: "temporary outage".to_string(),
+                    retry_after: None,
                 },
             ])
             .expect("settle");

@@ -81,9 +81,12 @@ event_id)` order; writes preserve the database's microsecond timestamp precision
 The batch protocol and hash ownership require a fresh sync-data cutover from
 the former single-record protocol; pre-cutover event rows are not silently
 reinterpreted as verified sync receipts. A lost response remains retryable until
-an owner-scoped reconciliation proves the result. Permanent record rejections
-are quarantined immediately. Request-level HTTP 4xx responses other than 409
-remain retryable with their reason. The explicit session-unavailable conflict is
+an owner-scoped reconciliation proves the result. Permanent record and
+request-level rejections are quarantined immediately so they cannot block later
+batches forever. Authentication, payment, request-timeout, locking, and
+rate-limit responses remain pending with their reason for retry after credentials,
+access, or capacity recover; a 429 `Retry-After` becomes the persisted next-retry
+deadline. The explicit session-unavailable conflict is
 terminal; other 409 responses, HTTP 5xx, and transport failures use owner-scoped
 reconciliation because the commit outcome may be unknown. On ACK, the local
 outbox releases the payload already owned by the canonical journal and retains
