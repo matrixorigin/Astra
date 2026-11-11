@@ -1414,7 +1414,10 @@ fn unknown_slash_text_is_not_stolen_by_a_fuzzy_menu_on_enter_or_ctrl_q() {
     for draft in ["/tmp", "/etc", "/home", "/status"] {
         for (key, queue) in [
             (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
-            (KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL), true),
+            (
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                true,
+            ),
         ] {
             let mut pane = BottomPane::new();
             pane.composer = ChatComposer::new_ephemeral();
@@ -1427,7 +1430,12 @@ fn unknown_slash_text_is_not_stolen_by_a_fuzzy_menu_on_enter_or_ctrl_q() {
             // Simulate a completed paste, then a fresh intentional submit.
             pane.composer.set_text(draft);
             pane.sync_popups();
-            assert!(pane.slash_menu.as_ref().and_then(|m| m.selected_item()).is_some());
+            assert!(
+                pane.slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .is_some()
+            );
             let action = pane.handle_key(key);
             match (action, queue) {
                 (BottomPaneAction::SubmitInput(text), false)
@@ -1465,7 +1473,9 @@ fn slash_path_digits_edit_normally_but_bare_palette_numbers_still_select() {
         SlashItem::simple("/model", "model"),
     ]);
     pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-    let second = pane.slash_menu.as_ref().unwrap().matches()[1].name.to_string();
+    let second = pane.slash_menu.as_ref().unwrap().matches()[1]
+        .name
+        .to_string();
     pane.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_eq!(pane.composer.text(), format!("{second} "));
     assert!(pane.slash_menu.is_none());
@@ -1483,7 +1493,12 @@ fn fuzzy_command_selection_requires_an_explicit_tab_gesture() {
     for ch in "/mdl".chars() {
         pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
-    assert!(pane.slash_menu.as_ref().and_then(|m| m.selected_item()).is_some());
+    assert!(
+        pane.slash_menu
+            .as_ref()
+            .and_then(|m| m.selected_item())
+            .is_some()
+    );
     pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(pane.composer.text(), "/model ");
     assert!(pane.slash_menu.is_none());
