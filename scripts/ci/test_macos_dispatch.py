@@ -802,6 +802,15 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(self.invoke(main, "admit", pool="pr", sha=HEAD)[0], 1)
         self.assertEqual(self.invoke(main, "admit", pool="main", sha=MERGE)[0], 1)
 
+    def test_scheduler_skips_sources_not_preferred_for_mini(self):
+        api = ApiFixture()
+        with patch.object(dispatch, "source",
+                          side_effect=dispatch.Unavailable("source does not prefer mini")):
+            self.assertEqual(self.invoke(api, "schedule"), (0, ""))
+        with patch.object(dispatch, "source",
+                          side_effect=dispatch.Unavailable("source head mismatch")):
+            self.assertEqual(self.invoke(api, "schedule"), (1, ""))
+
     def test_unavailable_api_and_missing_controller_fail_without_paid_execution(self):
         api = ApiFixture()
         with patch.object(api, "get", side_effect=RuntimeError("unavailable")):
