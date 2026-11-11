@@ -825,7 +825,7 @@ pub const EVENT_DETAIL_SELECT_COLS: &str = "\
     event_id, user_id, session_id, event_type, content, \
     agent_id, agent_version, parent_event_id, causal_chain_id, \
     IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json, \
-    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at";
 
 pub const EVENT_LIST_SELECT_COLS: &str = "\
     event_id, user_id, session_id, event_type, \
@@ -1034,7 +1034,7 @@ impl DatabaseEventService {
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
               meta_duration_ms, payload_hash, ingestion_write_id, run_id, parent_run_id, turn_seq, \
               token_usage, llm_model_used, token_input, token_output, token_total, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6)) \
              RETURNING {EVENT_DETAIL_SELECT_COLS}"
             )),
             [
@@ -2033,7 +2033,7 @@ mod tests {
                 "event_type" => "tool_call_completed",
                 "content" => r#"{"cmd":"pwd"}"#,
                 "metadata_json" => self.metadata_json,
-                "created_at" => "2026-06-26T12:00:00",
+                "created_at" => "2026-06-26T12:00:00.000000",
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .to_string())
@@ -2088,7 +2088,7 @@ mod tests {
         assert_eq!(record.parent_event_ids, Vec::<String>::new());
         assert_eq!(record.causal_chain_id.as_deref(), Some("chain-1"));
         assert_eq!(record.metadata, serde_json::json!({"tool_name":"bash"}));
-        assert_eq!(record.created_at, "2026-06-26T12:00:00");
+        assert_eq!(record.created_at, "2026-06-26T12:00:00.000000");
     }
 
     #[test]

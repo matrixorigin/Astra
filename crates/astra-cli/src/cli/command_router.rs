@@ -4545,9 +4545,6 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                     status.poisoned
                 );
                 stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
-                if let Some(reason) = status.last_error {
-                    stdout_println!("  {} {}", "Reason:".dim(), reason);
-                }
                 issues.push(summary);
             }
             if status.skipped > 0 {
@@ -4565,6 +4562,9 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 stdout_println!("  {}", "Local changes are waiting to sync".yellow());
             } else if status.poisoned == 0 && status.skipped == 0 {
                 stdout_println!("  {}", "No pending local changes".green());
+            }
+            if let Some(reason) = status.last_error.as_deref() {
+                stdout_println!("  {} {}", "Last sync error:".dim(), reason);
             }
         }
         Err(error) => {

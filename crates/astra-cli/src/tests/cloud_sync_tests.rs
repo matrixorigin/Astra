@@ -373,13 +373,7 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         .expect("ready records");
     assert_eq!(ready.len(), 1);
     let record = ready[0].clone();
-    let mut metadata = record
-        .payload
-        .get("metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    metadata.insert(
+    let metadata = serde_json::Map::from_iter([(
         "sync_outbox".to_string(),
         json!({
             "schema_version": record.schema_version,
@@ -388,7 +382,7 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
             "payload_hash": record.payload_hash,
             "event_ts": record.event_ts,
         }),
-    );
+    )]);
     let expected_body = json!({
         "schema_version": 1,
         "events": [{
@@ -456,13 +450,7 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
         .into_iter()
         .next()
         .expect("outbox record");
-    let mut metadata = record
-        .payload
-        .get("metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    metadata.insert(
+    let metadata = serde_json::Map::from_iter([(
         "sync_outbox".to_string(),
         json!({
             "schema_version": record.schema_version,
@@ -471,7 +459,7 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
             "payload_hash": record.payload_hash,
             "event_ts": record.event_ts,
         }),
-    );
+    )]);
     let expected_body = json!({
         "schema_version": 1,
         "events": [{
@@ -588,7 +576,7 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
+async fn client_rejection_keeps_record_for_retry_without_reconciliation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -604,7 +592,7 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
 
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
         .expect(1)
         .mount(&server)
         .await;
@@ -621,6 +609,13 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     assert_eq!(status.pending, 1);
     assert_eq!(status.retry_deferred, 1);
     assert_eq!(status.ack_watermark, 0);
+    assert!(
+        status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("HTTP 401"))
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[serial_test::serial]

@@ -1333,6 +1333,9 @@ fn acknowledge_record(
         };
     }
     record.state = SyncOutboxRecordState::Acked;
+    // The journal owns the canonical payload. Acked records only need their
+    // identity and hash for deduplication, not another retained payload copy.
+    record.payload = Value::Null;
     record.acked_at_unix_ms = Some(now);
     record.updated_at_unix_ms = now;
     record.last_error = None;
@@ -2124,7 +2127,7 @@ mod tests {
         let SyncOutboxEnqueueOutcome::Inserted {
             record_id: ack_id, ..
         } = store
-            .enqueue_journal_event(&event("ack"))
+            .enqueue_journal_event(&event(&"x".repeat(256 * 1024)))
             .expect("ack enqueue")
         else {
             panic!("ack insert");
@@ -2145,12 +2148,15 @@ mod tests {
             .expect("claimed ack")
             .payload_hash
             .clone();
+        let bytes_before_ack = std::fs::metadata(store.path())
+            .expect("outbox metadata")
+            .len();
 
         let report = store
             .settle_delivery_batch(&[
                 SyncOutboxDeliverySettlement::Ack {
                     record_id: ack_id,
-                    payload_hash: ack_hash,
+                    payload_hash: ack_hash.clone(),
                 },
                 SyncOutboxDeliverySettlement::Deferred {
                     record_id: fail_id,
@@ -2159,12 +2165,37 @@ mod tests {
             ])
             .expect("settle");
 
+        let bytes_after_ack = std::fs::metadata(store.path())
+            .expect("outbox metadata")
+            .len();
+        assert!(
+            bytes_before_ack - bytes_after_ack > 250_000,
+            "ACK must release the retained payload from the durable outbox"
+        );
         assert_eq!(report.acked, 1);
         assert_eq!(report.failed, 1);
         let status = store.status().expect("status");
         assert_eq!(status.acked, 1);
         assert_eq!(status.pending, 1);
         assert_eq!(status.retry_deferred, 1);
+        store
+            .with_state_readonly(|state| {
+                let acked = state
+                    .records
+                    .iter()
+                    .find(|record| record.state == SyncOutboxRecordState::Acked)
+                    .expect("acked record");
+                assert_eq!(acked.payload, Value::Null);
+                assert_eq!(acked.payload_hash, ack_hash);
+                let deferred = state
+                    .records
+                    .iter()
+                    .find(|record| record.state == SyncOutboxRecordState::Pending)
+                    .expect("deferred record");
+                assert!(deferred.payload.is_object());
+                Ok(())
+            })
+            .expect("persisted outbox");
     }
 
     #[test]

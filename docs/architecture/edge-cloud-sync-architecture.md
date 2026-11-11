@@ -75,17 +75,25 @@ payload hash. Other event producers use their own domain-tagged full-event hash,
 so reconciliation can identify both committed sync records and ID collisions
 without trusting request metadata or reading full event content. Sync projection
 metadata comes from the journal event; outer request lineage is rejected.
+Event reads, keyset cursors, and session summaries share the `(created_at,
+event_id)` order; writes preserve the database's microsecond timestamp precision.
 
 The batch protocol and hash ownership require a fresh sync-data cutover from
 the former single-record protocol; pre-cutover event rows are not silently
 reinterpreted as verified sync receipts. A lost response remains retryable until
 an owner-scoped reconciliation proves the result. Permanent record rejections
-are quarantined immediately; unknown transport outcomes remain retryable.
-The local outbox stores one error reason and no retry-attempt counter. Older
-clients cannot read the rewritten outbox format; previously quarantined records
-remain quarantined for diagnosis rather than being retried automatically.
-Independent sessions may make progress concurrently, while a session's later
-batches wait for the earlier batch to reach a known outcome.
+are quarantined immediately. Request-level HTTP 4xx responses other than 409
+remain retryable with their reason. The explicit session-unavailable conflict is
+terminal; other 409 responses, HTTP 5xx, and transport failures use owner-scoped
+reconciliation because the commit outcome may be unknown. On ACK, the local
+outbox releases the payload already owned by the canonical journal and retains
+only the identity, hash, and receipt metadata needed for deduplication. Pending
+records retain their payload for delivery. The outbox stores one error reason
+and no retry-attempt counter. Older clients cannot read the
+rewritten outbox format; previously quarantined records remain quarantined for
+diagnosis rather than being retried automatically. Independent sessions may make
+progress concurrently, while a session's later batches wait for the earlier batch
+to reach a known outcome.
 
 ## Retention
 

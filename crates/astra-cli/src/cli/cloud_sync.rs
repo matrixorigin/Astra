@@ -1221,10 +1221,12 @@ enum SyncOutboxReconciliation {
 }
 
 /// One HTTP batch attempt: authoritative per-record verdicts, a session that is
-/// gone, or a request-level failure whose commit outcome is unknown.
+/// gone, a definitive HTTP rejection, or a request-level failure whose commit
+/// outcome is unknown.
 enum SyncOutboxBatchAttempt {
     Verdicts(SyncOutboxBatchResponse),
     SessionUnavailable,
+    RequestRejected(String),
     RequestFailed(String),
 }
 
@@ -1252,6 +1254,14 @@ async fn attempt_sync_outbox_batch(
                     == Some(SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE) =>
         {
             SyncOutboxBatchAttempt::SessionUnavailable
+        }
+        // Other conflicts may have unknown per-record outcomes; reconcile them.
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if status.is_client_error() && status.as_u16() != 409 =>
+        {
+            SyncOutboxBatchAttempt::RequestRejected(format!(
+                "cloud rejected sync batch with HTTP {status}: {body}"
+            ))
         }
         Ok(Err(error)) => SyncOutboxBatchAttempt::RequestFailed(error.to_string()),
         Err(_) => SyncOutboxBatchAttempt::RequestFailed(format!(
@@ -1371,6 +1381,9 @@ async fn deliver_sync_outbox_batch_records(
                     error: "cloud session is unavailable for event ingestion".to_string(),
                 }
             }));
+        }
+        SyncOutboxBatchAttempt::RequestRejected(error) => {
+            settlements.extend(deferred_settlements(records.into_iter(), &error));
         }
         SyncOutboxBatchAttempt::RequestFailed(error) => {
             if Instant::now() >= deadline {
@@ -1610,22 +1623,6 @@ fn unix_ms() -> Option<u64> {
 }
 
 fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
-    let mut metadata = record
-        .payload
-        .get("metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    metadata.insert(
-        "sync_outbox".to_string(),
-        json!({
-            "schema_version": record.schema_version,
-            "record_id": record.record_id,
-            "sequence": record.sequence,
-            "payload_hash": record.payload_hash,
-            "event_ts": record.event_ts,
-        }),
-    );
     json!({
         "event_id": record.record_id,
         "session_id": record.session_id,
@@ -1633,7 +1630,15 @@ fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
         "content": record.canonical_payload_json(),
         "agent_id": "edge_sync",
         "agent_version": env!("CARGO_PKG_VERSION"),
-        "metadata": Value::Object(metadata),
+        "metadata": {
+            "sync_outbox": {
+                "schema_version": record.schema_version,
+                "record_id": record.record_id,
+                "sequence": record.sequence,
+                "payload_hash": record.payload_hash,
+                "event_ts": record.event_ts,
+            }
+        },
     })
 }
 
@@ -2339,8 +2344,6 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
-
         let batch = delivery_batches(records).next().expect("one batch");
         let mut settlements = Vec::new();
         deliver_sync_outbox_batch_records(
@@ -2363,8 +2366,8 @@ mod tests {
                 .await
                 .expect("recorded requests")
                 .len(),
-            2,
-            "a request-level rejection must not be replayed per record"
+            1,
+            "a definitive request-level rejection must not trigger reconciliation"
         );
     }
 
@@ -2453,30 +2456,28 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        for status in [429_u16, 500] {
-            let server = MockServer::start().await;
-            let client = ThinClient::new(&server.uri(), None).expect("thin client");
-            let records = vec![
-                delivery_record(1, "session-a"),
-                delivery_record(2, "session-a"),
-            ];
-            Mock::given(method("POST"))
-                .and(path("/sync/outbox/events"))
-                .respond_with(ResponseTemplate::new(status))
-                .expect(1)
-                .mount(&server)
-                .await;
-            mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
 
-            let settlements = deliver_sync_outbox_records(&client, "token", records).await;
-            assert_eq!(settlements.len(), 2);
-            assert!(settlements.iter().all(|settlement| matches!(
-                settlement,
-                astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
-            )));
-            server.verify().await;
-            assert_one_batch_and_reconciliation_request(&server).await;
-        }
+        let settlements = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
     }
 
     #[tokio::test]
@@ -2592,6 +2593,63 @@ mod tests {
             1,
             "a deleted session must fail the batch without reconciliation"
         );
+    }
+
+    #[test]
+    fn event_body_keeps_journal_metadata_only_in_content() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+
+        let mut record = delivery_record(1, "session-a");
+        record.payload = serde_json::json!({
+            "metadata": {"large": "x".repeat(2_200_000)},
+        });
+        let event = event_body_from_outbox_record(&record);
+        assert_eq!(event["metadata"].as_object().unwrap().len(), 1);
+        assert!(event["metadata"].get("large").is_none());
+        let content: serde_json::Value =
+            serde_json::from_str(event["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            content["metadata"]["large"].as_str().unwrap().len(),
+            2_200_000
+        );
+
+        let batch = SyncOutboxEventBatch::new(vec![event]);
+        assert!(
+            serde_json::to_vec(&batch).unwrap().len() < super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+            "metadata should not be duplicated into the outer request envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn definitive_client_errors_defer_without_reconciliation() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [401, 403, 429] {
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).expect("thin client");
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("denied"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let record = delivery_record(u64::from(status), &format!("session-{status}"));
+            let settlements = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+            assert!(matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Deferred { error, .. }]
+                    if error.contains(&format!("HTTP {status}"))
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "HTTP {status} cannot have committed the batch and must not trigger reconciliation"
+            );
+            server.verify().await;
+        }
     }
 
     #[tokio::test]

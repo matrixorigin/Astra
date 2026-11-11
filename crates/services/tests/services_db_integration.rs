@@ -7352,7 +7352,26 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             })
             .collect()
     }
-    let requests = (0..3).map(&make_request).collect::<Vec<_>>();
+    let candidates = (0..9).map(&make_request).collect::<Vec<_>>();
+    let (first, last) = (2..candidates.len())
+        .find_map(|last| {
+            (0..last)
+                .find(|first| {
+                    candidates[*first].event_id.as_deref().unwrap()
+                        > candidates[last].event_id.as_deref().unwrap()
+                })
+                .map(|first| (first, last))
+        })
+        .expect("fixture includes event IDs whose lexical order differs from sequence");
+    let middle = (0..last)
+        .find(|index| *index != first)
+        .expect("three events must have distinct sequence positions");
+    let mut selected = [first, middle, last];
+    selected.sort_unstable();
+    let requests = selected
+        .into_iter()
+        .map(|index| candidates[index].clone())
+        .collect::<Vec<_>>();
 
     let invalid_session = Uuid::new_v4().to_string();
     let invalid = EventCreateRequestData {
@@ -7415,6 +7434,53 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .map(|request| request.content.as_str())
             .collect::<Vec<_>>()
     );
+    assert!(
+        created
+            .iter()
+            .all(|outcome| outcome.record.created_at.len() == 26)
+    );
+    assert!(
+        created.windows(2).all(|pair| {
+            pair[0].record.created_at.as_str() < pair[1].record.created_at.as_str()
+        })
+    );
+    let expected_event_ids = requests
+        .iter()
+        .map(|request| request.event_id.clone().unwrap())
+        .collect::<Vec<_>>();
+    let first_page = service
+        .get_session_events(session.clone(), owner.clone(), 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_event_ids[..2]
+    );
+    let second_page = service
+        .get_session_events(
+            session.clone(),
+            owner.clone(),
+            2,
+            Some(
+                first_page
+                    .next_cursor
+                    .expect("first page must have a cursor"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_event_ids[2..]
+    );
 
     let replayed = accepted(
         service
@@ -7432,6 +7498,21 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .iter()
             .map(|outcome| &outcome.record)
             .collect::<Vec<_>>()
+    );
+    let replay_summary = sqlx::query(
+        "SELECT last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        replay_summary
+            .try_get::<Option<String>, _>("last_event_id")
+            .unwrap(),
+        requests.last().unwrap().event_id.clone(),
+        "replaying the session tail must preserve its server-ingest order"
     );
     let mut changed_transport = requests[0].clone();
     changed_transport.agent_version = Some("new-client-version".into());
