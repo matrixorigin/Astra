@@ -1020,7 +1020,17 @@ async fn main() {
         // Exponential backoff with jitter
         // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
         let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
-        tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs_f64(jitter)) => {}
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    tracing::warn!(%error, "Cannot install Ctrl+C handler during reconnect");
+                } else {
+                    tracing::info!("Ctrl+C received during reconnect; shutting down");
+                    break;
+                }
+            }
+        }
         reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
     }
 
