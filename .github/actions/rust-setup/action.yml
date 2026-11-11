@@ -15,7 +15,7 @@ inputs:
     required: false
     default: "true"
   use-mold:
-    description: "Use mold as the Linux linker"
+    description: "Use an available mold or Rust's bundled LLD as the Linux linker"
     required: false
     default: "true"
   install-nextest:
@@ -102,43 +102,27 @@ runs:
       with:
         tool: cargo-nextest@0.9.109
 
-    - name: Install mold linker
+    - name: Configure Linux linker
       if: ${{ inputs.use-mold == 'true' && runner.os == 'Linux' }}
       shell: bash
       run: |
         set -euxo pipefail
-        # mold comes from Ubuntu. Do not refresh unrelated runner repositories
-        # (e.g. Chrome), whose broken indexes can block every Rust CI shard.
-        ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
-        if [[ ! -s "${ubuntu_sources}" ]]; then
-          ubuntu_sources=/etc/apt/sources.list
-        fi
-        test -s "${ubuntu_sources}"
-        apt_options=(
-          -o "Dir::Etc::sourcelist=${ubuntu_sources}"
-          -o "Dir::Etc::sourceparts=-"
-          -o "APT::Get::List-Cleanup=0"
-          -o "APT::Update::Error-Mode=any"
-        )
-        if ! command -v mold >/dev/null; then
-          if sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 "${apt_options[@]}" update &&
-             sudo apt-get "${apt_options[@]}" install -y --no-install-recommends mold; then
-            :
-          else
-            echo "::warning::mold installation failed; using the linker bundled with Rust"
-          fi
-        fi
+        # No package download is needed: the pinned Rust toolchain includes LLD.
         if command -v mold >/dev/null; then
-          ci_linker=mold
+          ci_linker_flags="-C link-arg=-fuse-ld=mold"
         else
           ci_host="$(rustc -vV | sed -n 's/^host: //p')"
-          ci_linker="$(rustc --print sysroot)/lib/rustlib/${ci_host}/bin/gcc-ld/ld.lld"
-          test -x "${ci_linker}"
+          ci_linker_dir="$(rustc --print sysroot)/lib/rustlib/${ci_host}/bin/gcc-ld"
+          test -x "${ci_linker_dir}/ld.lld"
+          # Cargo host build scripts use cc even when the target uses clang.
+          # Both drivers support -B plus the linker name; GCC rejects an
+          # absolute path in -fuse-ld.
+          ci_linker_flags="-C link-arg=-B${ci_linker_dir} -C link-arg=-fuse-ld=lld"
         fi
         if [[ -n "${RUSTFLAGS:-}" ]]; then
-          echo "RUSTFLAGS=-C link-arg=-fuse-ld=${ci_linker} ${RUSTFLAGS}" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=${RUSTFLAGS} ${ci_linker_flags}" >> "$GITHUB_ENV"
         else
-          echo "RUSTFLAGS=-C link-arg=-fuse-ld=${ci_linker}" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=${ci_linker_flags}" >> "$GITHUB_ENV"
         fi
 
     - name: Install sccache
