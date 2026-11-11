@@ -3,8 +3,9 @@ use astra_services::events::*;
 use crate::AppState;
 use astra_core::ErrorResponse;
 use astra_sync_protocol::{
-    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION, SYNC_OUTBOX_SIGNATURE_HEADER,
-    SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE, SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck,
+    SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
     SyncOutboxReconcileRequest, SyncOutboxRejection, sync_outbox_request_signature,
 };
 use axum::{
@@ -34,14 +35,13 @@ pub async fn create_sync_outbox_event_handler(
             format!("Invalid sync outbox batch request: {error}"),
         )
     })?;
-    let requests = sync_outbox_batch_requests(batch)?;
+    let (requests, mut rejections) = sync_outbox_batch_requests(batch)?;
     let user = state.auth_service.current_user(&headers).await?;
     let entries = state
         .event_service
         .create_events(user.user_id, requests)
         .await?;
     let mut acks = Vec::new();
-    let mut rejections = Vec::new();
     for entry in entries {
         match entry {
             EventBatchEntry::Accepted(outcome) => acks.push(sync_outbox_ack_from_outcome(outcome)?),
@@ -114,7 +114,10 @@ pub async fn reconcile_sync_outbox_event_handler(
 
 fn sync_outbox_batch_requests(
     batch: SyncOutboxEventBatch,
-) -> Result<Vec<EventCreateRequestData>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<
+    (Vec<EventCreateRequestData>, Vec<SyncOutboxRejection>),
+    (StatusCode, Json<ErrorResponse>),
+> {
     if batch.schema_version != SYNC_OUTBOX_BATCH_SCHEMA_VERSION {
         return Err(astra_core::error_response(
             StatusCode::BAD_REQUEST,
@@ -136,13 +139,36 @@ fn sync_outbox_batch_requests(
 
     let mut session_id = None::<String>;
     let mut requests = Vec::with_capacity(batch.events.len());
+    let mut rejections = Vec::new();
+    let mut record_ids = std::collections::BTreeSet::new();
     for event in batch.events {
-        let request = serde_json::from_value::<EventCreateRequest>(event).map_err(|error| {
-            astra_core::error_response(
+        let record_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                astra_core::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Every sync outbox event must have a string event_id",
+                )
+            })?
+            .to_string();
+        if !record_ids.insert(record_id.clone()) {
+            return Err(astra_core::error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Invalid sync outbox event request: {error}"),
-            )
-        })?;
+                "A sync outbox batch must not contain duplicate event IDs",
+            ));
+        }
+        let request = match serde_json::from_value::<EventCreateRequest>(event) {
+            Ok(request) => request,
+            Err(error) => {
+                rejections.push(SyncOutboxRejection::new(
+                    record_id,
+                    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE,
+                    format!("Invalid sync outbox event request: {error}"),
+                ));
+                continue;
+            }
+        };
         if let Some(expected) = &session_id
             && request.session_id != *expected
         {
@@ -157,7 +183,7 @@ fn sync_outbox_batch_requests(
             EventIngestionSource::SyncOutbox,
         ));
     }
-    Ok(requests)
+    Ok((requests, rejections))
 }
 
 fn sync_outbox_ack_from_outcome(
@@ -448,15 +474,17 @@ mod sync_outbox_batch_tests {
 
     #[test]
     fn batch_validation_preserves_order_and_session_boundary() {
-        let empty = sync_outbox_batch_requests(SyncOutboxEventBatch::new(Vec::new())).unwrap();
-        assert!(empty.is_empty());
+        let (empty, rejections) =
+            sync_outbox_batch_requests(SyncOutboxEventBatch::new(Vec::new())).unwrap();
+        assert!(empty.is_empty() && rejections.is_empty());
 
-        let requests = sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![
-            event("session-a"),
-            event("session-a"),
-        ]))
-        .unwrap();
+        let mut second = event("session-a");
+        second["event_id"] = "second".into();
+        let (requests, rejections) =
+            sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![event("session-a"), second]))
+                .unwrap();
         assert_eq!(requests.len(), 2);
+        assert!(rejections.is_empty());
         assert!(requests.iter().all(|request| {
             request.ingestion_source == EventIngestionSource::SyncOutbox
                 && request.session_id == "session-a"
@@ -467,6 +495,25 @@ mod sync_outbox_batch_tests {
             event("session-b"),
         ]));
         assert_eq!(mixed.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_identifiable_record_does_not_block_valid_siblings() {
+        let mut invalid = event("session-a");
+        invalid["event_id"] = "invalid".into();
+        invalid["event_type"] = 42.into();
+        let (requests, rejections) = sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![
+            event("session-a"),
+            invalid,
+        ]))
+        .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].record_id, "invalid");
+        assert_eq!(
+            rejections[0].error_code,
+            SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE
+        );
     }
 
     #[test]

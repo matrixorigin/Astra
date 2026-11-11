@@ -107,6 +107,10 @@ fn release_runtime_notification_turn(
 enum StartupUiEffect {
     GitBranch(Option<String>),
     McpCompletions(Vec<(String, String)>),
+    CloudSyncWarning {
+        owner: astra_services::OwnerScope,
+        notice: String,
+    },
 }
 
 /// Completion of the one-shot `/model` catalog action. The catalog stays
@@ -1339,7 +1343,11 @@ fn spawn_turn_post_commit_worker(
 
 /// Applies a presentation-only startup observation after the first frame is
 /// already possible.
-fn apply_startup_ui_effect(effect: StartupUiEffect, bottom_pane: &mut BottomPane) {
+fn apply_startup_ui_effect(
+    effect: StartupUiEffect,
+    bottom_pane: &mut BottomPane,
+    current_owner: &astra_services::OwnerScope,
+) -> Option<String> {
     match effect {
         StartupUiEffect::GitBranch(Some(branch)) => {
             bottom_pane.footer.git_branch = Some(branch);
@@ -1348,7 +1356,11 @@ fn apply_startup_ui_effect(effect: StartupUiEffect, bottom_pane: &mut BottomPane
         StartupUiEffect::McpCompletions(completions) => {
             bottom_pane.update_mcp_completions(completions);
         }
+        StartupUiEffect::CloudSyncWarning { owner, notice } => {
+            return (&owner == current_owner).then_some(notice);
+        }
     }
+    None
 }
 
 /// Projects a completed model-catalog request into the workbench. Returns
@@ -8924,6 +8936,25 @@ pub(crate) async fn run_tui_session(
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
     {
+        let owner = astra_services::local_owner_scope();
+        let startup_effect_tx = startup_effect_tx.clone();
+        startup_observation_tasks.push(tokio::spawn(async move {
+            if let Ok(status) =
+                crate::cli::cloud_sync::read_sync_outbox_status_for_owner(&owner).await
+            {
+                let report = crate::cli::cloud_sync::SyncOutboxDrainReport {
+                    terminal: crate::cli::cloud_sync::terminal_sync_items(&status),
+                    ..Default::default()
+                };
+                if let Some(notice) = report.user_notice() {
+                    let _ = startup_effect_tx
+                        .send(StartupUiEffect::CloudSyncWarning { owner, notice })
+                        .await;
+                }
+            }
+        }));
+    }
+    {
         let startup_effect_tx = startup_effect_tx.clone();
         startup_observation_tasks.push(tokio::spawn(async move {
             let branch = tokio::task::spawn_blocking(detect_git_branch)
@@ -9881,7 +9912,11 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(effect) = startup_effect_rx.recv() => {
-                apply_startup_ui_effect(effect, &mut bottom_pane);
+                if let Some(notice) = apply_startup_ui_effect(effect, &mut bottom_pane, &astra_services::local_owner_scope()) {
+                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                    flush_chat_widget(&mut guard, &mut chat_widget, width);
+                }
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
@@ -25878,11 +25913,19 @@ mod tests {
     fn startup_observations_update_presentation_without_creating_user_input() {
         let mut bottom_pane = BottomPane::new();
         let widget = chat_widget::ChatWidget::new("session-1");
+        let owner = astra_services::OwnerScope::user("current").unwrap();
 
-        apply_startup_ui_effect(StartupUiEffect::GitBranch(None), &mut bottom_pane);
-        apply_startup_ui_effect(
-            StartupUiEffect::GitBranch(Some("feature/fast-start".into())),
-            &mut bottom_pane,
+        assert!(
+            apply_startup_ui_effect(StartupUiEffect::GitBranch(None), &mut bottom_pane, &owner)
+                .is_none()
+        );
+        assert!(
+            apply_startup_ui_effect(
+                StartupUiEffect::GitBranch(Some("feature/fast-start".into())),
+                &mut bottom_pane,
+                &owner,
+            )
+            .is_none()
         );
         assert_eq!(
             bottom_pane.footer.git_branch.as_deref(),
@@ -25891,6 +25934,34 @@ mod tests {
         assert!(widget.history().is_empty());
 
         assert!(widget.history().is_empty());
+    }
+
+    #[test]
+    fn queued_cloud_sync_warning_is_scoped_when_displayed() {
+        let current = astra_services::OwnerScope::user("current").unwrap();
+        let old = astra_services::OwnerScope::user("previous").unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .try_send(StartupUiEffect::CloudSyncWarning {
+                owner: old,
+                notice: "previous account".into(),
+            })
+            .unwrap();
+        sender
+            .try_send(StartupUiEffect::CloudSyncWarning {
+                owner: current.clone(),
+                notice: "current account".into(),
+            })
+            .unwrap();
+        let mut pane = BottomPane::new();
+        assert_eq!(
+            apply_startup_ui_effect(receiver.try_recv().unwrap(), &mut pane, &current),
+            None
+        );
+        assert_eq!(
+            apply_startup_ui_effect(receiver.try_recv().unwrap(), &mut pane, &current).as_deref(),
+            Some("current account")
+        );
     }
 
     #[test]

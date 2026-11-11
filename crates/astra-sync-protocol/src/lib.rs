@@ -123,9 +123,7 @@ impl SyncOutboxRejection {
 pub struct SyncOutboxBatchResponse {
     pub schema_version: u32,
     pub acks: Vec<SyncOutboxAck>,
-    /// Absent means "no permanent rejections"; reconcile responses never carry
-    /// any, while a batch response always lists them explicitly.
-    #[serde(default)]
+    /// Reconciliation returns an empty list; batch ingestion lists every rejection.
     pub rejections: Vec<SyncOutboxRejection>,
 }
 

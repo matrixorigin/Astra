@@ -67,6 +67,26 @@ Cloud ingestion must be idempotent:
 - accepted events advance ack watermark;
 - ingestion emits trace facts for degraded sync and repair.
 
+The sync batch endpoint validates each journal event before admitting its
+session. Valid records share the existing session write fence and transaction;
+an invalid record receives its own rejection and does not create a session.
+The stored event hash for a sync record is the verified canonical journal
+payload hash. Other event producers use their own domain-tagged full-event hash,
+so reconciliation can identify both committed sync records and ID collisions
+without trusting request metadata or reading full event content. Sync projection
+metadata comes from the journal event; outer request lineage is rejected.
+
+The batch protocol and hash ownership require a fresh sync-data cutover from
+the former single-record protocol; pre-cutover event rows are not silently
+reinterpreted as verified sync receipts. A lost response remains retryable until
+an owner-scoped reconciliation proves the result. Permanent record rejections
+are quarantined immediately; unknown transport outcomes remain retryable.
+The local outbox stores one error reason and no retry-attempt counter. Older
+clients cannot read the rewritten outbox format; previously quarantined records
+remain quarantined for diagnosis rather than being retried automatically.
+Independent sessions may make progress concurrently, while a session's later
+batches wait for the earlier batch to reach a known outcome.
+
 ## Retention
 
 Retention policy is per layer:

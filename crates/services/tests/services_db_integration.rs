@@ -7354,6 +7354,42 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
     }
     let requests = (0..3).map(&make_request).collect::<Vec<_>>();
 
+    let invalid_session = Uuid::new_v4().to_string();
+    let invalid = EventCreateRequestData {
+        event_id: Some(" bad-event ".into()),
+        session_id: invalid_session.clone(),
+        content: "not-json".into(),
+        ..make_request(20)
+    };
+    let invalid_result = service
+        .create_events(owner.clone(), vec![invalid])
+        .await
+        .unwrap();
+    match invalid_result.as_slice() {
+        [astra_services::events::EventBatchEntry::Rejected(rejection)] => {
+            assert_eq!(rejection.record_id, " bad-event ");
+        }
+        other => panic!("invalid record must be rejected, got {other:?}"),
+    }
+    for (table, query) in [
+        (
+            "agent_sessions",
+            "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ),
+        (
+            "agent_session_lifecycle_fences",
+            "SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(&owner)
+            .bind(&invalid_session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "invalid input must not create {table}");
+    }
+
     assert!(
         service
             .create_events(owner.clone(), Vec::new())
@@ -7397,6 +7433,28 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .map(|outcome| &outcome.record)
             .collect::<Vec<_>>()
     );
+    let mut changed_transport = requests[0].clone();
+    changed_transport.agent_version = Some("new-client-version".into());
+    changed_transport.metadata.as_mut().unwrap()["sync_outbox"]["sequence"] = 99.into();
+    let replay = accepted(
+        service
+            .create_events(owner.clone(), vec![changed_transport])
+            .await
+            .unwrap(),
+    );
+    assert!(replay[0].idempotent_replay);
+    assert_eq!(replay[0].record, created[0].record);
+
+    let mut forged_lineage = requests[0].clone();
+    forged_lineage.parent_event_id = Some("unverified-parent".into());
+    assert!(matches!(
+        service
+            .create_events(owner.clone(), vec![forged_lineage])
+            .await
+            .unwrap()
+            .as_slice(),
+        [astra_services::events::EventBatchEntry::Rejected(_)]
+    ));
     let event_ids = requests
         .iter()
         .map(|request| request.event_id.clone().unwrap())
@@ -7518,6 +7576,27 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
         .create_event(owner.clone(), stored_conflict)
         .await
         .unwrap();
+    // Another producer may write arbitrary metadata; it must not be mistaken
+    // for a server-verified sync receipt.
+    sqlx::query(
+        "UPDATE agent_events SET metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?",
+    )
+    .bind(conflict.metadata.as_ref().unwrap().to_string())
+    .bind(&owner)
+    .bind(conflict.event_id.as_ref().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let forged_receipt = service
+        .get_sync_outbox_events(owner.clone(), vec![conflict.event_id.clone().unwrap()])
+        .await
+        .unwrap();
+    assert_ne!(
+        forged_receipt[0].payload_hash,
+        astra_services::events::sync_outbox_payload_hash(conflict.metadata.as_ref().unwrap())
+            .unwrap(),
+        "untrusted metadata must not authenticate a sync receipt"
+    );
     let prefix = make_request(7);
     let later = make_request(8);
     let entries = service
@@ -7591,10 +7670,16 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .unwrap()
             .try_get::<i64, _>("event_count")
             .unwrap();
-    assert_eq!(
-        session_event_count, 7,
-        "a hash conflict rejects one record and commits its siblings"
-    );
+    let actual_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual_event_count, 8);
+    assert_eq!(session_event_count, actual_event_count);
 
     let mixed_insert = make_request(9);
     let mixed = accepted(
@@ -7616,7 +7701,7 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(summary.try_get::<i64, _>("event_count").unwrap(), 8);
+    assert_eq!(summary.try_get::<i64, _>("event_count").unwrap(), 9);
     assert_eq!(
         summary
             .try_get::<Option<String>, _>("last_event_id")
@@ -7624,6 +7709,53 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
         mixed_insert.event_id,
         "a replay followed by an insert repairs once and keeps the final insert as the summary pointer"
     );
+
+    let mut untrusted_metadata = make_request(21);
+    untrusted_metadata.metadata.as_mut().unwrap()["tool_call_id"] = "forged".into();
+    let sanitized = accepted(
+        service
+            .create_events(owner.clone(), vec![untrusted_metadata])
+            .await
+            .unwrap(),
+    );
+    assert!(sanitized[0].record.metadata.get("tool_call_id").is_none());
+
+    let with_tool_id = |sequence, tool_id: String| {
+        let mut request = make_request(sequence);
+        let mut event: astra_services::session_journal::JournalEvent =
+            serde_json::from_str(&request.content).unwrap();
+        event.metadata = Some(serde_json::json!({"tool_call_id": tool_id}));
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        request.event_id =
+            Some(astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap());
+        request.content = payload.to_string();
+        request.metadata = Some(serde_json::json!({"sync_outbox": {"payload_hash": hash}}));
+        request
+    };
+    let boundary = with_tool_id(30, "值".repeat(128));
+    let oversized = with_tool_id(31, "x".repeat(129));
+    let oversized_id = oversized.event_id.clone().unwrap();
+    let entries = service
+        .create_events(owner.clone(), vec![boundary, oversized])
+        .await
+        .unwrap();
+    assert!(matches!(
+        entries[0],
+        astra_services::events::EventBatchEntry::Accepted(_)
+    ));
+    assert!(matches!(
+        entries[1],
+        astra_services::events::EventBatchEntry::Rejected(_)
+    ));
+    let rejected_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(&oversized_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rejected_rows, 0);
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner, &session).await;
 }

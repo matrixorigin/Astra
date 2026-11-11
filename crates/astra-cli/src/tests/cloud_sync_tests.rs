@@ -312,6 +312,48 @@ fn enqueue_ingestion_does_not_patch_missing_session_id_from_state() {
 
 #[serial_test::serial]
 #[tokio::test]
+async fn drain_reports_existing_rejections_and_skipped_events_without_ready_work() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let _api = EnvVarGuard::set("ASTRA_API_URL", "http://127.0.0.1:9");
+    let _auth = install_test_cloud_auth(Some("token"));
+    let state = session_state_with_journal("rejected-session".to_owned());
+    append_cloud_pull_sync_journal_for_immediate_drain(
+        &state,
+        "default",
+        "post_login",
+        &CloudPullResult {
+            cloud_reachable: true,
+        },
+        &[],
+    );
+    let store = SyncOutboxStore::local();
+    let record = store.ready_records(1).unwrap().pop().unwrap();
+    store
+        .settle_delivery_batch(&[astra_services::SyncOutboxDeliverySettlement::Rejected {
+            record_id: record.record_id,
+            error: "invalid event".into(),
+        }])
+        .unwrap();
+    store
+        .record_skipped_journal_event(
+            &session_journal::JournalEvent::config_change(None, "model", "gpt-5"),
+            astra_services::SyncOutboxSkipKind::MissingSessionId,
+            "missing session",
+        )
+        .unwrap();
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.terminal, 2);
+    assert!(report.user_notice().unwrap().contains("astra doctor"));
+    let status = cloud_sync::read_sync_outbox_status().await.unwrap();
+    assert_eq!(status.poisoned, 1);
+    assert_eq!(status.skipped, 1);
+}
+
+#[serial_test::serial]
+#[tokio::test]
 async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
@@ -364,14 +406,14 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         .and(path("/sync/outbox/events"))
         .and(header("authorization", "Bearer token"))
         .and(header(SYNC_OUTBOX_SIGNATURE_HEADER, expected_signature))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "schema_version": 1,
             "acks": [{
-                "schema_version": 1,
                 "record_id": record.record_id,
                 "payload_hash": record.payload_hash,
                 "ingestion_status": "created"
-            }]
+            }],
+            "rejections": []
         })))
         .expect(1)
         .mount(&server)
@@ -449,8 +491,9 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
             SYNC_OUTBOX_SIGNATURE_HEADER,
             sync_outbox_request_signature("token", &expected_body),
         ))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "event_id": record.record_id
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": 1,
+            "acks": []
         })))
         .expect(1)
         .mount(&server)
@@ -464,11 +507,11 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "schema_version": 1,
             "acks": [{
-                "schema_version": 1,
                 "record_id": &record.record_id,
                 "payload_hash": &record.payload_hash,
                 "ingestion_status": "idempotent_replay"
-            }]
+            }],
+            "rejections": []
         })))
         .expect(1)
         .mount(&server)
@@ -511,10 +554,9 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
                 .and_then(Value::as_array)
                 .and_then(|events| events.first())
                 .expect("one sync event");
-            ResponseTemplate::new(201).set_body_json(json!({
+            ResponseTemplate::new(200).set_body_json(json!({
                 "schema_version": 1,
                 "acks": [{
-                    "schema_version": 1,
                     "record_id": event.get("event_id").and_then(Value::as_str),
                     "payload_hash": event
                         .get("metadata")
@@ -522,7 +564,8 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
                         .and_then(|sync| sync.get("payload_hash"))
                         .and_then(Value::as_str),
                     "ingestion_status": "created"
-                }]
+                }],
+                "rejections": []
             }))
         })
         .expect(1)
@@ -634,6 +677,291 @@ async fn drain_empty_sync_outbox_does_not_require_cloud_credentials() {
     assert_eq!(report.blocker, None);
     assert!(!report.is_incomplete());
     assert_eq!(report.user_notice(), None);
+}
+
+#[derive(Clone)]
+struct SyncDbTestAuth(String);
+
+type SyncDbAuthResult<T> = Result<
+    T,
+    (
+        axum::http::StatusCode,
+        axum::Json<astra_core::ErrorResponse>,
+    ),
+>;
+
+#[async_trait::async_trait]
+impl astra_services::AuthService for SyncDbTestAuth {
+    async fn register(
+        &self,
+        _: astra_services::AuthRegisterRequestData,
+    ) -> SyncDbAuthResult<astra_services::AuthUserRecord> {
+        Err(astra_core::error_response(
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "test",
+        ))
+    }
+
+    async fn login(
+        &self,
+        _: astra_services::AuthLoginRequestData,
+    ) -> SyncDbAuthResult<astra_services::AuthTokenRecord> {
+        Err(astra_core::error_response(
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "test",
+        ))
+    }
+
+    async fn refresh(
+        &self,
+        _: astra_services::AuthRefreshRequestData,
+    ) -> SyncDbAuthResult<astra_services::AuthTokenRecord> {
+        Err(astra_core::error_response(
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "test",
+        ))
+    }
+
+    async fn logout(&self, _: astra_services::AuthRefreshRequestData) -> SyncDbAuthResult<()> {
+        Err(astra_core::error_response(
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "test",
+        ))
+    }
+
+    async fn current_user(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> SyncDbAuthResult<astra_services::AuthUserRecord> {
+        if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer token") {
+            return Err(astra_core::error_response(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "test",
+            ));
+        }
+        Ok(astra_services::AuthUserRecord {
+            user_id: self.0.clone(),
+            username: self.0.clone(),
+            email: "sync-test@example.test".into(),
+            display_name: None,
+        })
+    }
+}
+
+struct SyncDbTestHealth;
+
+#[async_trait::async_trait]
+impl astra_runtime::HealthChecker for SyncDbTestHealth {
+    async fn database_healthy(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct SyncDbTestProxy {
+    upstream: String,
+    client: reqwest::Client,
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    peak_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn forward_sync_test_request(
+    axum::extract::State(proxy): axum::extract::State<SyncDbTestProxy>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> (axum::http::StatusCode, String) {
+    use std::sync::atomic::Ordering;
+    let active = proxy.active.fetch_add(1, Ordering::Relaxed) + 1;
+    proxy.peak_active.fetch_max(active, Ordering::Relaxed);
+    let response = proxy
+        .client
+        .post(format!("{}{}", proxy.upstream, uri.path()))
+        .header("authorization", headers["authorization"].clone())
+        .header(
+            SYNC_OUTBOX_SIGNATURE_HEADER,
+            headers[SYNC_OUTBOX_SIGNATURE_HEADER].clone(),
+        )
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("forward sync request");
+    let status = response.status();
+    let body = response.text().await.expect("read sync response");
+    proxy.active.fetch_sub(1, Ordering::Relaxed);
+    if uri.path() == "/sync/outbox/events" {
+        assert_eq!(status, axum::http::StatusCode::OK);
+        proxy.writes.fetch_add(1, Ordering::Relaxed);
+        // The server has committed; emulate a gateway losing that response.
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "lost acknowledgement".into(),
+        )
+    } else {
+        proxy.reads.fetch_add(1, Ordering::Relaxed);
+        (status, body)
+    }
+}
+
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an explicitly isolated MatrixOne test database"]
+async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+    let settings = astra_core::MatrixOneSettings::from_env();
+    let test_database = std::env::var("ASTRA_TEST_DATABASE").expect("isolated test database");
+    assert_eq!(settings.database, test_database);
+    assert!(test_database.starts_with("astra_test_"));
+    astra_services::storage::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let events = astra_services::DatabaseEventService::new(settings).with_pool(pool.clone());
+    let app = astra_runtime::build_app(
+        astra_runtime::AppState::new(
+            astra_runtime::ServiceInfo::default(),
+            Arc::new(SyncDbTestHealth),
+        )
+        .with_auth_service(Arc::new(SyncDbTestAuth(owner.clone())))
+        .with_event_service(Arc::new(events)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let runtime = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let proxy = SyncDbTestProxy {
+        upstream,
+        client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        writes: Arc::new(AtomicUsize::new(0)),
+        reads: Arc::new(AtomicUsize::new(0)),
+        active: Arc::new(AtomicUsize::new(0)),
+        peak_active: Arc::new(AtomicUsize::new(0)),
+    };
+    let proxy_app = axum::Router::new()
+        .route(
+            "/sync/outbox/events",
+            axum::routing::post(forward_sync_test_request),
+        )
+        .route(
+            "/sync/outbox/events/reconcile",
+            axum::routing::post(forward_sync_test_request),
+        )
+        .with_state(proxy.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let proxy_task = tokio::spawn(async move { axum::serve(listener, proxy_app).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let _journal = ProcessJournalDirGuard::new(temp.path());
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &proxy_url);
+    let _no_proxy = EnvVarGuard::set("NO_PROXY", "localhost,127.0.0.1");
+    let _auth = install_test_cloud_auth(Some("token"));
+    let store = SyncOutboxStore::local();
+    let scale = std::env::var_os("ASTRA_TEST_SYNC_1000_SESSIONS").is_some();
+    let sessions = if scale { 1_000 } else { 1 };
+    let turns = if scale { 1 } else { 2 };
+    let mut journal_events = Vec::new();
+    for _ in 0..sessions {
+        let session = uuid::Uuid::new_v4().to_string();
+        for turn in 1..=turns {
+            journal_events.push(session_journal::JournalEvent::turn(
+                Some(&session),
+                turn,
+                Some("sync-test"),
+                "question",
+                "answer",
+                0,
+                10,
+                5,
+                1,
+            ));
+        }
+    }
+    store.enqueue_journal_events(&journal_events).unwrap();
+    if !scale {
+        let record = store.ready_records(1).unwrap().remove(0);
+        let valid = json!({
+            "event_id": record.record_id,
+            "session_id": record.session_id,
+            "event_type": record.event_type,
+            "content": record.canonical_payload_json(),
+            "agent_id": "edge_sync",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "metadata": {"sync_outbox": {"payload_hash": record.payload_hash}},
+        });
+        let invalid = json!({
+            "event_id": "malformed-event",
+            "session_id": record.session_id,
+            "event_type": 42,
+            "content": "{}",
+        });
+        let client = astra_thin_client::ThinClient::new(&proxy.upstream, None).unwrap();
+        let response = client
+            .post_sync_outbox_events_json(
+                Some("token"),
+                &astra_sync_protocol::SyncOutboxEventBatch::new(vec![valid, invalid]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.acks.len(), 1);
+        assert_eq!(response.acks[0].record_id, record.record_id);
+        assert_eq!(response.rejections.len(), 1);
+        assert_eq!(response.rejections[0].record_id, "malformed-event");
+    }
+    let start = std::time::Instant::now();
+    let mut acked = 0;
+    while acked < journal_events.len() {
+        let report = cloud_sync::try_drain_sync_outbox(64).await;
+        assert!(report.attempted > 0, "sync drain stopped making progress");
+        assert_eq!(report.failed, 0);
+        acked += report.acked as usize;
+    }
+    assert_eq!(acked, journal_events.len());
+    assert_eq!(
+        store.status().unwrap().ack_watermark,
+        journal_events.len() as u64
+    );
+    assert_eq!(proxy.writes.load(Ordering::Relaxed), sessions);
+    assert_eq!(proxy.reads.load(Ordering::Relaxed), sessions);
+    let peak = proxy.peak_active.load(Ordering::Relaxed);
+    assert!(peak <= 8, "session concurrency must stay bounded");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ?")
+        .bind(&owner)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+    assert_eq!(count, journal_events.len() as i64);
+    if scale {
+        eprintln!(
+            "1000-session lost-ACK workload: {}ms, {} writes, {} reconciliations, peak {} concurrent",
+            start.elapsed().as_millis(),
+            proxy.writes.load(Ordering::Relaxed),
+            proxy.reads.load(Ordering::Relaxed),
+            peak
+        );
+    }
+    for sql in [
+        "DELETE FROM agent_event_edges WHERE user_id = ?",
+        "DELETE FROM agent_events WHERE user_id = ?",
+        "DELETE FROM agent_sessions WHERE user_id = ?",
+        "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ?",
+    ] {
+        sqlx::query(sql)
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+    proxy_task.abort();
+    runtime.abort();
 }
 
 #[serial_test::serial]

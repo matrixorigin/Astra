@@ -4865,11 +4865,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "schema_version": 1,
                 "acks": [{
-                    "schema_version": 1,
                     "record_id": "sync_evt_1",
                     "payload_hash": "sha256:abc",
                     "ingestion_status": "created"
-                }]
+                }],
+                "rejections": []
             })))
             .mount(&srv)
             .await;
@@ -4899,11 +4899,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "schema_version": 1,
                 "acks": [{
-                    "schema_version": 1,
                     "record_id": "sync_evt_1",
                     "payload_hash": "sha256:abc",
                     "ingestion_status": "idempotent_replay"
-                }]
+                }],
+                "rejections": []
             })))
             .expect(1)
             .mount(&srv)

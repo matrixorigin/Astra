@@ -332,10 +332,163 @@ fn duplicate_event_matches_request(
             .as_deref()
             == Some(incoming_hash);
     }
-    existing.session_id == session_id
-        && existing.event_type == event_type
-        && existing.content == content
+    existing.content == content
         && existing.metadata == metadata.cloned().unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Validated event data that may safely acquire a session write fence.
+struct PreparedEvent {
+    request: EventCreateRequestData,
+    payload_hash: String,
+    journal_event: Option<crate::session_journal::JournalEvent>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+}
+
+fn prepare_event(
+    user_id: &str,
+    mut request: EventCreateRequestData,
+) -> Result<PreparedEvent, (StatusCode, Json<ErrorResponse>)> {
+    request.session_id = normalize_required_event_field("session_id", request.session_id)?;
+    request.event_type = normalize_required_event_field("event_type", request.event_type)?;
+    request.event_id = normalize_client_event_id(request.event_id)?;
+
+    let verified_sync_hash = verified_sync_outbox_payload_hash_for_source(
+        request.ingestion_source,
+        &request.content,
+        request.metadata.as_ref(),
+    )?;
+    let journal_event = if let Some(payload_hash) = verified_sync_hash.as_deref() {
+        let event_id = request.event_id.as_deref().ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "sync_outbox ingestion requires a stable event_id",
+            )
+        })?;
+        let event = verify_sync_outbox_event_identity(
+            &request.content,
+            payload_hash,
+            event_id,
+            &request.session_id,
+            &request.event_type,
+        )?;
+        if request.parent_event_id.is_some()
+            || request
+                .parent_event_ids
+                .as_ref()
+                .is_some_and(|parents| !parents.is_empty())
+            || request.causal_chain_id.is_some()
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "sync_outbox lineage must be contained in the journal event",
+            ));
+        }
+
+        // Projection metadata must come from the journal fact covered by the
+        // hash, not from a second, independently mutable request envelope.
+        let sync_metadata = request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("sync_outbox"))
+            .cloned()
+            .ok_or_else(|| internal_error("verified sync metadata is missing"))?;
+        let mut metadata = event
+            .metadata
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        metadata.insert("sync_outbox".to_string(), sync_metadata);
+        request.metadata = Some(serde_json::Value::Object(metadata));
+        Some(event)
+    } else {
+        None
+    };
+
+    let tool_call_id = metadata_tool_call_id(request.metadata.as_ref());
+    let tool_name = metadata_tool_name(request.metadata.as_ref());
+    let (run_id, parent_run_id, _) = journal_event
+        .as_ref()
+        .map(crate::event_ingestion::journal_observation_scope)
+        .unwrap_or((None, None, None));
+    // Validate the actual projected VARCHAR values before any session write.
+    // Otherwise a single oversized value rolls back every valid batch sibling.
+    for (field, value, limit) in [
+        ("session_id", Some(request.session_id.as_str()), 64),
+        ("event_type", Some(request.event_type.as_str()), 64),
+        ("agent_id", request.agent_id.as_deref(), 255),
+        ("agent_version", request.agent_version.as_deref(), 32),
+        (
+            "parent_event_id",
+            request.parent_event_id.as_deref(),
+            crate::storage::AGENT_EVENT_ID_LEN,
+        ),
+        (
+            "causal_chain_id",
+            request.causal_chain_id.as_deref(),
+            crate::storage::AGENT_EVENT_ID_LEN,
+        ),
+        ("tool_call_id", tool_call_id.as_deref(), 128),
+        ("tool_name", tool_name.as_deref(), 255),
+        ("run_id", run_id, 64),
+        ("parent_run_id", parent_run_id, 64),
+        (
+            "model",
+            journal_event
+                .as_ref()
+                .and_then(|event| event.model.as_deref()),
+            128,
+        ),
+    ] {
+        validate_event_column_length(field, value, limit)?;
+    }
+    for parent in request.parent_event_ids.iter().flatten() {
+        validate_event_column_length(
+            "parent_event_id",
+            Some(parent),
+            crate::storage::AGENT_EVENT_ID_LEN,
+        )?;
+    }
+
+    // The hash column is also the receipt authority: sync writes use the
+    // verified journal hash, while all other writers use the disjoint v1
+    // observation hash domain for their complete event envelope.
+    let payload_hash = verified_sync_hash.unwrap_or_else(|| {
+        crate::observation_capture::canonical_agent_event_payload_hash(&serde_json::json!({
+            "session_id": request.session_id,
+            "user_id": user_id,
+            "event_type": request.event_type,
+            "content": request.content,
+            "agent_id": request.agent_id.as_deref().unwrap_or("system"),
+            "agent_version": request.agent_version.as_deref().unwrap_or("1.0.0"),
+            "parent_event_id": request.parent_event_id,
+            "parent_event_ids": request.parent_event_ids,
+            "causal_chain_id": request.causal_chain_id,
+            "metadata": request.metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
+        }))
+    });
+    Ok(PreparedEvent {
+        request,
+        payload_hash,
+        journal_event,
+        tool_call_id,
+        tool_name,
+    })
+}
+
+fn validate_event_column_length(
+    field: &str,
+    value: Option<&str>,
+    limit: usize,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if value.is_some_and(|value| value.chars().take(limit + 1).count() > limit) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{field} exceeds the maximum length of {limit} characters"),
+        ));
+    }
+    Ok(())
 }
 
 fn event_list_query_limit(limit: u32) -> i64 {
@@ -774,12 +927,19 @@ impl DatabaseEventService {
         &self,
         tx: &mut sqlx::Transaction<'_, MySql>,
         user_id: &str,
-        request: EventCreateRequestData,
+        prepared: PreparedEvent,
         write_state: &mut EventBatchWriteState,
     ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
+        let PreparedEvent {
+            request,
+            payload_hash,
+            journal_event,
+            tool_call_id,
+            tool_name: meta_tool_name,
+        } = prepared;
         let EventCreateRequestData {
             ingestion_source,
-            event_id,
+            event_id: client_event_id,
             session_id,
             event_type,
             content,
@@ -790,88 +950,8 @@ impl DatabaseEventService {
             causal_chain_id,
             metadata,
         } = request;
-        let record_id = event_id
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_string();
-        let reject = |error: (StatusCode, Json<ErrorResponse>)| {
-            Ok(EventBatchEntry::Rejected(EventCreateRejection::invalid(
-                &record_id, error,
-            )))
-        };
-        let session_id = match normalize_required_event_field("session_id", session_id) {
-            Ok(value) => value,
-            Err(error) => return reject(error),
-        };
-        let event_type = match normalize_required_event_field("event_type", event_type) {
-            Ok(value) => value,
-            Err(error) => return reject(error),
-        };
-        let client_event_id = match normalize_client_event_id(event_id) {
-            Ok(value) => value,
-            Err(error) => return reject(error),
-        };
-        let canonical_content = if ingestion_source == EventIngestionSource::SyncOutbox {
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(value) => value,
-                Err(_) => {
-                    return reject(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "sync_outbox content must be valid JSON",
-                    ));
-                }
-            }
-        } else {
-            serde_json::Value::String(content.clone())
-        };
-        let payload_hash =
-            crate::observation_capture::canonical_agent_event_payload_hash(&serde_json::json!({
-                "session_id": session_id,
-                "user_id": user_id,
-                "event_type": event_type,
-                "content": canonical_content,
-                "agent_id": agent_id.as_deref().unwrap_or("system"),
-                "agent_version": agent_version.as_deref().unwrap_or("1.0.0"),
-                "parent_event_id": parent_event_id,
-                "parent_event_ids": parent_event_ids,
-                "causal_chain_id": causal_chain_id,
-                "metadata": metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
-            }));
         let sync_outbox_ingestion = ingestion_source == EventIngestionSource::SyncOutbox;
-        let verified_sync_payload_hash = match verified_sync_outbox_payload_hash_for_source(
-            ingestion_source,
-            &content,
-            metadata.as_ref(),
-        ) {
-            Ok(value) => value,
-            Err(error) => return reject(error),
-        };
-        let journal_event = if sync_outbox_ingestion {
-            let Some(event_id) = client_event_id.as_deref() else {
-                return reject(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "sync_outbox ingestion requires a stable event_id",
-                ));
-            };
-            let Some(payload_hash) = verified_sync_payload_hash.as_deref() else {
-                return Err(internal_error(
-                    "sync_outbox ingestion reached identity verification without payload hash",
-                ));
-            };
-            match verify_sync_outbox_event_identity(
-                &content,
-                payload_hash,
-                event_id,
-                &session_id,
-                &event_type,
-            ) {
-                Ok(event) => Some(event),
-                Err(error) => return reject(error),
-            }
-        } else {
-            None
-        };
+        let verified_sync_payload_hash = sync_outbox_ingestion.then_some(payload_hash.as_str());
         if let Some(existing_id) = client_event_id.as_deref()
             && let Some(ExistingEventRecord {
                 record: existing,
@@ -885,7 +965,7 @@ impl DatabaseEventService {
                     &event_type,
                     &content,
                     metadata.as_ref(),
-                    verified_sync_payload_hash.as_deref(),
+                    verified_sync_payload_hash,
                 )
             {
                 if sync_outbox_ingestion {
@@ -933,8 +1013,6 @@ impl DatabaseEventService {
         let agent_id = agent_id.unwrap_or_else(|| "system".to_string());
         let agent_version = agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
-        let tool_call_id = metadata_tool_call_id(metadata.as_ref());
-        let meta_tool_name = metadata_tool_name(metadata.as_ref());
         let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
         let (run_id, parent_run_id, turn_seq) = journal_event
             .as_ref()
@@ -1025,7 +1103,7 @@ impl DatabaseEventService {
                             &event_type,
                             &content,
                             metadata.as_ref(),
-                            verified_sync_payload_hash.as_deref(),
+                            verified_sync_payload_hash,
                         )
                     {
                         if sync_outbox_ingestion {
@@ -1105,6 +1183,26 @@ impl EventService for DatabaseEventService {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            // Keep the submitted id in a rejection so the caller can always
+            // correlate even an invalid or unnormalised record.
+            let record_id = request.event_id.clone().unwrap_or_default();
+            match prepare_event(&user_id, request) {
+                Ok(event) => prepared.push(Ok(event)),
+                Err(error) if error.0.is_client_error() => {
+                    prepared.push(Err(EventCreateRejection::invalid(&record_id, error)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if prepared.iter().all(Result::is_err) {
+            return Ok(prepared
+                .into_iter()
+                .filter_map(Result::err)
+                .map(EventBatchEntry::Rejected)
+                .collect());
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
@@ -1115,16 +1213,12 @@ impl EventService for DatabaseEventService {
             .await
             .map_err(internal_error)?;
 
-        // Admit every session before reading stored events. The replay cache is
-        // then filled under the same write fence that guards inserts and
-        // deletes, so an event deleted concurrently can never be acknowledged
-        // as an idempotent replay.
+        // Fence valid sessions in a stable order before reading replay state.
+        // Invalid records must not create a session or a lifecycle fence.
         let mut session_sources = std::collections::BTreeMap::<String, bool>::new();
-        for request in &requests {
-            let session_id = request.session_id.trim();
-            if session_id.is_empty() {
-                continue;
-            }
+        for event in prepared.iter().filter_map(|entry| entry.as_ref().ok()) {
+            let request = &event.request;
+            let session_id = request.session_id.as_str();
             let sync_outbox = request.ingestion_source == EventIngestionSource::SyncOutbox;
             match session_sources.get(session_id) {
                 Some(existing) if *existing != sync_outbox => {
@@ -1141,25 +1235,25 @@ impl EventService for DatabaseEventService {
         for (session_id, sync_outbox) in &session_sources {
             ensure_event_session_requirement(&mut tx, session_id, &user_id, *sync_outbox).await?;
         }
-        let event_ids = requests
+        let event_ids = prepared
             .iter()
-            .filter_map(|request| request.event_id.as_deref())
-            .map(str::trim)
-            .filter(|event_id| {
-                !event_id.is_empty() && event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
-            })
+            .filter_map(|entry| entry.as_ref().ok())
+            .filter_map(|event| event.request.event_id.as_deref())
             .map(ToOwned::to_owned)
             .collect::<std::collections::BTreeSet<_>>();
         let mut write_state = EventBatchWriteState {
             existing_events: Self::load_existing_events(&mut tx, &user_id, &event_ids).await?,
             ..EventBatchWriteState::default()
         };
-        let mut entries = Vec::with_capacity(requests.len());
-        for request in requests {
-            entries.push(
-                self.create_event_in_transaction(&mut tx, &user_id, request, &mut write_state)
-                    .await?,
-            );
+        let mut entries = Vec::with_capacity(prepared.len());
+        for entry in prepared {
+            entries.push(match entry {
+                Ok(event) => {
+                    self.create_event_in_transaction(&mut tx, &user_id, event, &mut write_state)
+                        .await?
+                }
+                Err(rejection) => EventBatchEntry::Rejected(rejection),
+            });
         }
         flush_event_batch_session_summaries(&mut tx, &user_id, &write_state).await?;
         tx.commit().await.map_err(internal_error)?;

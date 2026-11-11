@@ -4535,7 +4535,50 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 4. Project config
+    // 4. Cloud synchronization
+    stdout_println!("{}", "Cloud Sync".bold().magenta());
+    match crate::cli::cloud_sync::read_sync_outbox_status().await {
+        Ok(status) => {
+            if status.poisoned > 0 {
+                let summary = format!(
+                    "{} item(s) could not be synchronized and remain on this device",
+                    status.poisoned
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                if let Some(reason) = status.last_error {
+                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                }
+                issues.push(summary);
+            }
+            if status.skipped > 0 {
+                let summary = format!(
+                    "{} item(s) could not be prepared for synchronization",
+                    status.skipped
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                if let Some(reason) = status.last_skipped_reason {
+                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                }
+                issues.push(summary);
+            }
+            if status.pending > 0 || status.in_flight > 0 {
+                stdout_println!("  {}", "Local changes are waiting to sync".yellow());
+            } else if status.poisoned == 0 && status.skipped == 0 {
+                stdout_println!("  {}", "No pending local changes".green());
+            }
+        }
+        Err(error) => {
+            stdout_println!(
+                "  {} {}",
+                theme::icon_warn(),
+                "Unable to read sync status".yellow()
+            );
+            issues.push(format!("Unable to read sync status: {error}"));
+        }
+    }
+    stdout_println!();
+
+    // 5. Project config
     stdout_println!("{}", "Project Configuration".bold().magenta());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
@@ -4552,7 +4595,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     stdout_println!("  {} {}", "Working dir:".dim(), cwd.display());
     stdout_println!();
 
-    // 5. MCP configuration
+    // 6. MCP configuration
     stdout_println!("{}", "MCP Configuration".bold().magenta());
     for (scope, path_fn) in &[
         (
@@ -4609,7 +4652,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 6. Environment
+    // 7. Environment
     stdout_println!("{}", "Environment".bold().magenta());
     stdout_println!("  {} {}", "OS:".dim(), std::env::consts::OS);
     stdout_println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
