@@ -4095,13 +4095,29 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         exact: Option<(&str, &str)>,
         offset: usize,
         max_bytes: usize,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
+        // Exact recovery can decode a large retained result. Bound aggregate
+        // memory without making normal dispatch or list operations wait.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let _permit = if exact.is_some() {
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    astra_services::multi_agent::edge_dispatch::EDGE_EXACT_RESULT_READS.acquire(),
+                )
+                .await
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?,
+            )
+        } else {
+            None
+        };
         let service = self
             .edge_dispatch_service
             .as_ref()
             .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
-        let mut rows = tokio::time::timeout(
-            Duration::from_secs(2),
+        let mut rows = tokio::time::timeout_at(
+            deadline,
             service.inspect_run_dispatches(
                 &self.user_id,
                 &self.session_id,
@@ -4125,7 +4141,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
             });
             if exact.is_some() {
                 if row.result_too_large {
-                    observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the 64 KiB serialized recovery limit; its execution outcome remains unknown"});
+                    observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the bounded recovery limit; its execution outcome remains unknown"});
                 } else if row.status == "completed"
                     && let Some(body) = row.result_json.as_deref()
                 {
@@ -4143,12 +4159,6 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                             body,
                         )
                         .map_err(|_| "retained tool result could not be validated".to_string())?;
-                    let output = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(
-                        &canonical.output,
-                    )
-                    .content;
-                    let projection = astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(output, 256 * 1024)
-                        .map_err(|_| "retained tool result cannot be projected within the memory limit".to_string())?;
                     let mut metadata = canonical.tool_result_fields.take();
                     if let Some(fields) = metadata.take() {
                         metadata = Some(astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(fields).metadata);
@@ -4199,8 +4209,30 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                             retained
                         })
                     };
+                    let output = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(
+                        &canonical.output,
+                    )
+                    .content;
+                    let projection = match astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+                        output,
+                        astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES as usize,
+                    ) {
+                        Ok(projection) => projection,
+                        Err(_) => {
+                            observation["result"] = json!({
+                                "status": canonical.status,
+                                "duration_ms": canonical.duration_ms,
+                                "tool_result_fields": metadata,
+                                "metadata_omitted": metadata_size > 512,
+                                "output_status": "unavailable",
+                                "reason": "The validated result's output exceeds the safe display limit."
+                            });
+                            observations.push(observation);
+                            continue;
+                        }
+                    };
                     if offset > projection.total_bytes() {
-                        return Err("tool result offset is beyond the retained output".into());
+                        return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::InvalidOffset);
                     }
                     // Keep each JSON response within the normal tool-output budget.
                     // Re-read only a bounded durable result on each explicit page request.
@@ -4215,13 +4247,34 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                         page_bytes = (page_bytes / 2).max(64);
                     };
                     if end.saturating_sub(window.len()) != offset {
-                        return Err("tool result page would skip an atomic redaction marker or UTF-8 boundary".into());
+                        return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::UnsafePageBoundary);
                     }
                     observation["result"] = json!({
                         "status": canonical.status, "output": window, "offset": offset,
                         "next_offset": (end < total).then_some(end), "total_bytes": total,
                         "duration_ms": canonical.duration_ms, "tool_result_fields": metadata,
                         "metadata_omitted": metadata_size > 512,
+                    });
+                } else if row.status == "failed"
+                    && let Some(receipt) = row.result_json.as_deref().and_then(|body|
+                        astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
+                            body,
+                            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                &row.edge_owner_user_id,
+                                &self.session_id,
+                                child_run_id,
+                                &row.turn_chain_id,
+                                &row.request_id,
+                            ),
+                            &row.edge_agent_id,
+                        ))
+                    && receipt.kind == astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim
+                {
+                    observation["result"] = json!({
+                        "status": "unknown",
+                        "dispatch_fact": "expired_before_claim",
+                        "execution_fact": "unknown",
+                        "reason": "This relay request expired before it was claimed; execution through another delivery path has not been ruled out."
                     });
                 } else {
                     observation["result"] = json!({"status":"unknown", "reason":"no validated executor result is available"});
@@ -16603,6 +16656,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Ok(record)
             }
         }
+    }
+
+    async fn get_tool_callback_run_target(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<astra_services::runs::ToolCallbackRunTarget, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .load_tool_callback_run_target(identity, edge_agent_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("tool callback run lookup", error))?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "Tool result request not found in this session",
+                )
+            })
     }
 
     async fn get_run_status(

@@ -3135,6 +3135,31 @@ pub trait SpawnAgentExecutor: Send + Sync {
     fn bind_parent_session(&self, _session_id: &str) {}
 }
 
+/// Errors at the durable tool-outcome inspection boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolOutcomeInspectionError {
+    #[error("tool result offset is beyond the retained output")]
+    InvalidOffset,
+    #[error("tool result page would skip an atomic redaction marker or UTF-8 boundary")]
+    UnsafePageBoundary,
+    #[error("tool outcome inspection is busy")]
+    Busy,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<String> for ToolOutcomeInspectionError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for ToolOutcomeInspectionError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_owned())
+    }
+}
+
 /// Loads a bounded authoritative session snapshot for agents observed from a
 /// different executor. Implementations own coalescing/backoff so fanout reads
 /// never degrade into per-agent database polling.
@@ -3163,7 +3188,7 @@ pub trait DurableAgentReconciler: Send + Sync {
         _exact: Option<(&str, &str)>,
         _offset: usize,
         _max_bytes: usize,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
         Err("durable tool outcome inspection is unavailable".into())
     }
 
@@ -3637,7 +3662,7 @@ impl DynamicAgentSpawner {
         exact: Option<(&str, &str)>,
         offset: usize,
         max_bytes: usize,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
         let reconciler = self
             .durable_reconciler
             .read()

@@ -1716,7 +1716,11 @@ mod tests {
                     .join(" ");
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
                     || normalized.contains("session_id = ? AND owner_id = ?")
-                    || normalized.contains("session_id = ? AND owner_user_id = ?");
+                    || normalized.contains("session_id = ? AND owner_user_id = ?")
+                    // The dispatch executor can be a service account. Its
+                    // canonical invocation identity carries the run owner.
+                    || (statement.label == "edge_pending_dispatch"
+                        && normalized.contains("session_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity.user_id')), user_id) = ?"));
                 assert!(
                     session_owner_scoped,
                     "{} must be scoped by session identity and its owner",

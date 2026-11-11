@@ -301,36 +301,11 @@ pub(crate) async fn post_tool_result_handler(
     // the strongest durable ownership root available before touching either
     // delivery lane. Terminal callbacks may only settle an existing exact
     // durable dispatch; they must not reopen a local waiter or the run.
-    let target = match state
+    let target = state
         .execution
         .run_lifecycle_service
-        .get_run_status(body.run_id.clone(), user.user_id.clone())
-        .await
-    {
-        Ok(target) => target,
-        Err(error) if error.0 == StatusCode::NOT_FOUND => {
-            let owner = state
-                .execution
-                .edge_dispatch_service
-                .callback_run_owner(&identity, &body.edge_agent_id)
-                .await
-                .map_err(|_| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Cannot verify the tool result owner",
-                    )
-                })?;
-            let Some(owner) = owner.filter(|owner| owner != &user.user_id) else {
-                return Err(error);
-            };
-            state
-                .execution
-                .run_lifecycle_service
-                .get_run_status(body.run_id.clone(), owner)
-                .await?
-        }
-        Err(error) => return Err(error),
-    };
+        .get_tool_callback_run_target(&identity, &body.edge_agent_id)
+        .await?;
     if target.session_id != body.session_id {
         return Err(error_response(
             StatusCode::NOT_FOUND,
@@ -2279,11 +2254,6 @@ mod edge_callback_insert_tests {
             self
         }
 
-        fn with_owner(mut self, owner: &str) -> Self {
-            self.owner = owner.into();
-            self
-        }
-
         fn with_queued_frontier(self) -> Self {
             self.force_queued
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4186,10 +4156,10 @@ mod edge_callback_insert_tests {
                 .is_none()
         );
         assert!(
-            !sender
-                .expire_pending_dispatch(&identity, "edge-a")
-                .await
-                .unwrap(),
+            matches!(
+                sender.reconcile_timeout(&identity, "edge-a").await.unwrap(),
+                astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Unknown
+            ),
             "a waiting timeout must not retire an already claimed dispatch"
         );
         let expired = identity.for_request_id("expired-before-claim");
@@ -4201,17 +4171,19 @@ mod edge_callback_insert_tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            sender.reconcile_timeout(&expired, "edge-a").await.unwrap(),
+            astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::ExpiredBeforeClaim
+        ));
         assert!(
-            sender
-                .expire_pending_dispatch(&expired, "edge-a")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !sender
-                .expire_pending_dispatch(&expired, "edge-a")
-                .await
-                .unwrap(),
+            matches!(
+                sender.reconcile_timeout(&expired, "edge-a").await.unwrap(),
+                astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Terminal(
+                    astra_services::multi_agent::edge_dispatch::EdgeDispatchTerminal::ServerReceipt(
+                        _
+                    )
+                )
+            ),
             "expiration must be idempotent"
         );
         let lifecycle =
@@ -4369,6 +4341,9 @@ mod edge_callback_insert_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let session = format!("service-account-session-{suffix}");
         let run = format!("service-account-run-{suffix}");
+        sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, status) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&run).bind("run-owner").bind(&session).bind(&run).bind("/")
+            .bind(astra_core::STATUS_COMPLETED).execute(pool.get()).await.unwrap();
         let invocation = astra_turn_types::ToolInvocationIdentity::new(
             "run-owner",
             &session,
@@ -4384,19 +4359,72 @@ mod edge_callback_insert_tests {
             "chain",
             invocation.storage_key(),
         );
+        let payload = json!({"identity":invocation, "tool":"grep", "args":{}});
         dispatch
-            .admit_and_claim_direct_dispatch(
-                &identity,
-                "edge-a",
-                &json!({"identity":invocation, "tool":"grep", "args":{}}),
-            )
+            .admit_and_claim_direct_dispatch(&identity, "edge-a", &payload)
             .await
             .unwrap();
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::DatabaseRunStateStore::new(pool.clone()),
+        ));
         let lifecycle = Arc::new(
-            ApprovalTargetRunLifecycle::new(&run, &session)
-                .with_owner("run-owner")
-                .with_run_state(astra_core::STATUS_COMPLETED, None),
+            crate::server::run::lifecycle::AgenticRunLifecycleService::new(
+                settings.clone(),
+                Arc::new(astra_services::FernetTokenEncryptor::new("callback-test-key").unwrap()),
+                Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                engine,
+            )
+            .with_pool(pool.clone()),
         );
+        // Same-owner SSE callbacks need no durable dispatch row.
+        let same_owner = EdgeDispatchIdentity::new("run-owner", &session, &run, "other", "other");
+        assert_eq!(
+            lifecycle
+                .get_tool_callback_run_target(&same_owner, "edge-a")
+                .await
+                .unwrap()
+                .status,
+            astra_core::STATUS_COMPLETED
+        );
+        let wrong_request = identity.for_request_id("different-request");
+        assert_eq!(
+            lifecycle
+                .get_tool_callback_run_target(&wrong_request, "edge-a")
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            lifecycle
+                .get_tool_callback_run_target(&identity, "edge-b")
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let forged = astra_turn_types::ToolInvocationIdentity::new(
+            "other-owner",
+            &session,
+            &run,
+            "chain",
+            "call",
+        )
+        .unwrap();
+        sqlx::query("UPDATE edge_pending_dispatch SET payload_json = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
+            .bind(json!({"identity":forged}).to_string()).bind(&identity.user_id).bind(&session).bind(&run)
+            .bind(&identity.turn_chain_id).bind(&identity.request_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            lifecycle
+                .get_tool_callback_run_target(&identity, "edge-a")
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        sqlx::query("UPDATE edge_pending_dispatch SET payload_json = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
+            .bind(payload.to_string()).bind(&identity.user_id).bind(&session).bind(&run)
+            .bind(&identity.turn_chain_id).bind(&identity.request_id).execute(pool.get()).await.unwrap();
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
             .with_run_lifecycle_service(lifecycle)
@@ -4467,11 +4495,17 @@ mod edge_callback_insert_tests {
             "DELETE FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
         .bind("u-approval")
-        .bind(session)
-        .bind(run)
+        .bind(&session)
+        .bind(&run)
         .execute(pool.get())
         .await
         .unwrap();
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind("run-owner")
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

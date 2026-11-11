@@ -357,18 +357,35 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     })
     .await;
     match persisted {
-        Ok(Ok(())) => *last_persisted = projections,
-        Ok(Err(error)) => {
-            report_workspace_projection_error(reporter, &owner, session_id, error.to_string())
+        Ok(Ok(())) => {
+            *last_persisted = projections;
+            report_workspace_projection_recovery(
+                reporter,
+                super::file_writer::BackgroundProjectionKind::Shell,
+                &owner,
+                session_id,
+            );
         }
-        Err(error) => {
-            report_workspace_projection_error(reporter, &owner, session_id, error.to_string())
-        }
+        Ok(Err(error)) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Shell,
+            &owner,
+            session_id,
+            error.to_string(),
+        ),
+        Err(error) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Shell,
+            &owner,
+            session_id,
+            error.to_string(),
+        ),
     }
 }
 
 fn report_workspace_projection_error(
     reporter: Option<&super::file_writer::TuiFileWriter>,
+    target: super::file_writer::BackgroundProjectionKind,
     owner: &astra_services::OwnerScope,
     session_id: &str,
     error: String,
@@ -377,13 +394,34 @@ fn report_workspace_projection_error(
         "{error}; background task results may be lost on restart. Record important details before exiting"
     );
     if let Some(reporter) = reporter {
-        let path = astra_services::local_session_artifact_store()
-            .session_dir_for_owner(owner, session_id)
-            .map(|dir| dir.join("workspace.yaml"))
-            .unwrap_or_else(|_| "workspace.yaml".into());
-        reporter.report_failure("Background task history", path, message);
+        reporter.report_projection_failure(
+            target,
+            workspace_projection_path(owner, session_id),
+            message,
+        );
     } else {
         tracing::warn!(session_id, %message, "failed to persist background task projections");
+    }
+}
+
+fn workspace_projection_path(
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+) -> std::path::PathBuf {
+    astra_services::local_session_artifact_store()
+        .session_dir_for_owner(owner, session_id)
+        .map(|dir| dir.join("workspace.yaml"))
+        .unwrap_or_else(|_| "workspace.yaml".into())
+}
+
+fn report_workspace_projection_recovery(
+    reporter: Option<&super::file_writer::TuiFileWriter>,
+    target: super::file_writer::BackgroundProjectionKind,
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+) {
+    if let Some(reporter) = reporter {
+        reporter.report_recovery(target, workspace_projection_path(owner, session_id));
     }
 }
 
@@ -446,13 +484,29 @@ pub(crate) async fn persist_background_local_agent_task_projections_from_snapsho
     })
     .await;
     match persisted {
-        Ok(Ok(())) => *last_persisted = projections.clone(),
-        Ok(Err(error)) => {
-            report_workspace_projection_error(reporter, owner, session_id, error.to_string())
+        Ok(Ok(())) => {
+            *last_persisted = projections.clone();
+            report_workspace_projection_recovery(
+                reporter,
+                super::file_writer::BackgroundProjectionKind::Agent,
+                owner,
+                session_id,
+            );
         }
-        Err(error) => {
-            report_workspace_projection_error(reporter, owner, session_id, error.to_string())
-        }
+        Ok(Err(error)) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Agent,
+            owner,
+            session_id,
+            error.to_string(),
+        ),
+        Err(error) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Agent,
+            owner,
+            session_id,
+            error.to_string(),
+        ),
     }
     projections
 }
@@ -938,8 +992,16 @@ mod tests {
             )
             .await;
         }
-        let first = errors.try_recv().unwrap();
-        let second = errors.try_recv().unwrap();
+        let super::super::file_writer::TuiFileWriteEvent::Failed(first) =
+            errors.try_recv().unwrap()
+        else {
+            panic!("expected failure")
+        };
+        let super::super::file_writer::TuiFileWriteEvent::Failed(second) =
+            errors.try_recv().unwrap()
+        else {
+            panic!("expected failure")
+        };
         assert_eq!(
             first, second,
             "the TUI deduplicates repeated identical warnings"
@@ -954,7 +1016,10 @@ mod tests {
             Some(&writer),
         )
         .await;
-        assert!(errors.try_recv().is_err());
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(super::super::file_writer::TuiFileWriteEvent::ProjectionRecovered { .. })
+        ));
         let workspace =
             astra_services::session_workspace::read_workspace("bound-unknown-task").unwrap();
         assert_eq!(workspace.background_shell_tasks[0].id, "unknown-task");
@@ -1015,16 +1080,54 @@ mod tests {
             Some(&writer),
         )
         .await;
-        let warning = errors
+        let super::super::file_writer::TuiFileWriteEvent::ProjectionFailed {
+            error: warning, ..
+        } = errors
             .try_recv()
             .expect("failed persistence must reach the TUI")
-            .user_message();
+        else {
+            panic!("expected a failure")
+        };
+        let warning = warning.user_message();
         assert!(warning.contains("may be lost on restart"), "{warning}");
         assert!(warning.contains("Record important details"), "{warning}");
         assert!(cache.is_empty());
         let previous = astra_services::session_workspace::read_workspace(session_id).unwrap();
         assert_eq!(previous.summary, workspace.summary);
         assert!(previous.background_shell_tasks.is_empty());
+
+        astra_services::session_workspace::update_workspace(
+            session_id,
+            || panic!("workspace exists"),
+            |workspace| workspace.summary = None,
+        )
+        .unwrap();
+        super::persist_background_task_projections_if_changed(
+            &mut registry,
+            Some(session_id),
+            None,
+            &mut cache,
+            Some(&writer),
+        )
+        .await;
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(
+                super::super::file_writer::TuiFileWriteEvent::ProjectionRecovered {
+                    kind: super::super::file_writer::BackgroundProjectionKind::Shell,
+                    ..
+                }
+            )
+        ));
+        let saved = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(saved.background_shell_tasks[0].id, "unknown-task");
+        assert!(
+            saved.background_shell_tasks[0]
+                .terminal_facts
+                .as_ref()
+                .unwrap()
+                .outcome_unknown
+        );
         runtime.shutdown().await.unwrap();
     }
 

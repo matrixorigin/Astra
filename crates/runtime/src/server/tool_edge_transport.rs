@@ -10,9 +10,9 @@ use super::tool_transport_errors::{
 };
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
-    RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_ROUTE_MISMATCH, TOOL_ERROR_KIND_TOOL_TIMEOUT, attach_runtime_error_metadata,
-    attach_runtime_policy_metadata, binding_event_fields, cancelled_runtime_tool_result,
+    RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_ROUTE_MISMATCH,
+    TOOL_ERROR_KIND_TOOL_TIMEOUT, attach_runtime_error_metadata, attach_runtime_policy_metadata,
+    binding_event_fields, cancelled_runtime_tool_result,
 };
 use super::tool_transport_plan::{EdgeBoundExecutionPlan, EdgeTransportAttempt};
 
@@ -777,6 +777,9 @@ async fn try_edge_dispatch(
     {
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
+            if is_expired_relay_receipt(&result_json, &identity, &agent.edge_agent_id) {
+                return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding));
+            }
             return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
@@ -800,7 +803,7 @@ async fn try_edge_dispatch(
                     .fail_dispatch(
                         &identity,
                         &agent.edge_agent_id,
-                        TOOL_ERROR_KIND_CANCELLED,
+                        astra_services::multi_agent::edge_dispatch::EDGE_DISPATCH_CANCELLED_REASON,
                     )
                     .await
                 {
@@ -832,47 +835,107 @@ async fn try_edge_dispatch(
         }
     };
     let Some(result_json) = result_json else {
-        match tokio::time::timeout(
+        use astra_services::multi_agent::edge_dispatch::{
+            EdgeDispatchServerReceiptKind, EdgeDispatchTerminal, TimeoutReconciliation,
+        };
+        // Once a relay timeout is observed, give its pending-only expiration
+        // a bounded chance to settle even if cancellation arrives concurrently.
+        // Otherwise a cancelled but still-pending row could be claimed later.
+        let reconciliation = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            dispatch.expire_pending_dispatch(&identity, &agent.edge_agent_id),
+            dispatch.reconcile_timeout(&identity, &agent.edge_agent_id),
         )
-        .await
-        {
-            Ok(Ok(true)) => {
-                let message = format!(
-                    "Tool '{}' timed out before the Edge claimed it. It did not run.",
-                    request.tool_name
-                );
-                let mut metadata = binding_event_fields(&request.workspace, &request.executor);
-                attach_runtime_policy_metadata(&mut metadata, binding);
-                let mut error = astra_runtime_env::RuntimeError::new(
-                    astra_runtime_env::RuntimeErrorKind::ToolTimeout,
-                    &message,
-                );
-                error.retryable = true;
-                attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
-                metadata.insert(
-                    "execution_fact".into(),
-                    Value::String("not_executed".into()),
-                );
-                return EdgeTransportAttempt::Delivered(astra_tools::ToolResult {
-                    output: message,
-                    metadata: Some(metadata),
-                    is_error: true,
-                    exit_semantics: None,
-                });
+        .await;
+        match reconciliation {
+            Ok(Ok(TimeoutReconciliation::ExpiredBeforeClaim)) => {
+                return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding));
             }
-            Ok(Ok(false)) => {}
+            Ok(Ok(TimeoutReconciliation::Terminal(EdgeDispatchTerminal::ServerReceipt(
+                receipt,
+            )))) if receipt.kind == EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => {
+                return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding));
+            }
+            Ok(Ok(TimeoutReconciliation::Terminal(
+                EdgeDispatchTerminal::UnvalidatedToolResult(body),
+            ))) => {
+                if let Ok(result) = super::tool_execution_service::canonical_edge_completion(
+                    &identity,
+                    &agent.edge_agent_id,
+                    body.json(),
+                ) {
+                    let is_error = astra_thin_client::tool_result_status_is_error(&result.status)
+                        .expect("canonical result has a known status");
+                    return EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
+                        result.output,
+                        is_error,
+                        ToolTransportKind::EdgeLedger,
+                        result.tool_result_fields,
+                    ));
+                }
+            }
             Ok(Err(error)) => {
-                tracing::warn!(%error, request_id = %request_id, "failed to expire an unclaimed dispatch")
+                tracing::warn!(%error, request_id = %request_id, "failed to reconcile dispatch timeout")
             }
             Err(_) => {
-                tracing::warn!(request_id = %request_id, "timed out expiring an unclaimed dispatch")
+                tracing::warn!(request_id = %request_id, "timed out reconciling dispatch timeout")
             }
+            _ => {}
+        }
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
+                request,
+                binding,
+                ToolTransportKind::EdgeLedger,
+                true,
+            ));
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
+    if is_expired_relay_receipt(&result_json, &identity, &agent.edge_agent_id) {
+        return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding));
+    }
     delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
+}
+
+fn is_expired_relay_receipt(
+    body: &str,
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    edge_agent_id: &str,
+) -> bool {
+    astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(body, identity, edge_agent_id)
+        .is_some_and(|receipt| receipt.kind == astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim)
+}
+
+fn unclaimed_relay_result(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
+) -> astra_tools::ToolResult {
+    let message = format!(
+        "Tool '{}' timed out before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+        request.tool_name
+    );
+    let mut metadata = binding_event_fields(&request.workspace, &request.executor);
+    attach_runtime_policy_metadata(&mut metadata, binding);
+    let mut error = astra_runtime_env::RuntimeError::new(
+        astra_runtime_env::RuntimeErrorKind::ToolTimeout,
+        &message,
+    );
+    error.retryable = false;
+    attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
+    metadata.insert(
+        "dispatch_fact".into(),
+        Value::String("expired_before_claim".into()),
+    );
+    astra_tools::ToolResult {
+        output: message,
+        metadata: Some(metadata),
+        is_error: true,
+        exit_semantics: None,
+    }
+    .with_execution_outcome_unknown()
 }
 
 fn delivered_dispatch_result(

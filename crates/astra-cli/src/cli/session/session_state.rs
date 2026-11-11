@@ -416,6 +416,9 @@ pub(crate) struct SessionState {
     /// When set, local resume/fork may restore stale data until a later
     /// successful commit or recovery sync clears it.
     pub session_persistence_error: Option<String>,
+    /// Independent pending failures writing the current local projections.
+    pub(crate) background_persistence_errors:
+        std::collections::BTreeMap<(&'static str, std::path::PathBuf), String>,
     /// Full context-assembly trace from the last successfully committed turn.
     pub latest_context_assembly_trace: Option<LocalContextAssemblyTrace>,
     /// Serialized context-pipeline state restored from the latest heavy checkpoint.
@@ -627,6 +630,7 @@ impl Default for SessionState {
             last_turn_interrupted: false,
             last_turn_event: None,
             session_persistence_error: None,
+            background_persistence_errors: std::collections::BTreeMap::new(),
             latest_context_assembly_trace: None,
             runtime_pipeline_state: None,
             runtime_compaction_state: None,
@@ -698,6 +702,22 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    pub(crate) fn current_persistence_error(&self) -> Option<&str> {
+        use astra_services::SessionArtifactStore;
+        let current_workspace = self.session_id.as_deref().and_then(|session| {
+            astra_services::local_session_artifact_store()
+                .session_dir_for_owner(self.background_tasks.owner_scope(), session)
+                .ok()
+                .map(|dir| dir.join("workspace.yaml"))
+        });
+        self.background_persistence_errors
+            .iter()
+            .find_map(|((_, path), error)| {
+                (Some(path) == current_workspace.as_ref()).then_some(error.as_str())
+            })
+            .or(self.session_persistence_error.as_deref())
+    }
+
     pub(crate) fn native_delivery_refresh_handle(
         &self,
     ) -> crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle {
@@ -777,6 +797,7 @@ impl SessionState {
         self.clear_resume_recovery_state();
         self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
+        self.background_persistence_errors.clear();
     }
 
     /// Reset session-scoped runtime state after starting a new session.
@@ -822,6 +843,7 @@ impl SessionState {
         self.last_turn_interrupted = false;
         self.last_turn_event = None;
         self.session_persistence_error = None;
+        self.background_persistence_errors.clear();
         self.latest_context_assembly_trace = None;
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();

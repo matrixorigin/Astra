@@ -47,6 +47,8 @@ const SMALL_OUTPUT_SCAN_BYTES: u64 = 512 * 1024;
 static SMALL_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static LARGE_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static OUTPUT_SEARCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+// Preserve uncertain facts without allowing an unbounded session registry.
+const MAX_RETAINED_UNSETTLED_TASKS: usize = 256;
 
 fn output_read_slots(bytes: u64) -> &'static tokio::sync::Semaphore {
     if bytes <= SMALL_OUTPUT_SCAN_BYTES {
@@ -830,8 +832,8 @@ impl BackgroundTaskRegistry {
             }
             let running = state.running_count();
             if running >= MAX_CONCURRENT_TASKS { return Err(format!("task limit reached ({MAX_CONCURRENT_TASKS} running)")); }
-            if running + state.unsettled_count() >= MAX_CONCURRENT_TASKS {
-                return Err("This session has reached its limit for running or unresolved shell tasks. Wait for running tasks or start a new session to run more commands; unconfirmed execution or cleanup remains unresolved.".into());
+            if state.unsettled_count() >= MAX_RETAINED_UNSETTLED_TASKS {
+                return Err("This session has too many unconfirmed tasks to retain safely. Start a new session to run more commands; earlier outcomes remain unresolved in this session.".into());
             }
             let unresolved_bytes = state.tasks.values().filter(|task| {
                 task.terminal_unobserved() && task.completion.as_ref()
@@ -843,7 +845,7 @@ impl BackgroundTaskRegistry {
             }
             if state.tasks.values().filter(|task| task.capture.is_some()).count()
                 >= MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS {
-                return Err("Task retention capacity is full; wait for tasks to settle or resolve output cleanup errors before starting more tasks.".into());
+                return Err("Task output retention is full. Inspect pending results with task_output so their private output can be released, or resolve local output cleanup errors before starting more tasks.".into());
             }
             if state.pending_completions.len() >= 2 * (MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS) {
                 return Err("Task notifications are awaiting delivery; inspect existing tasks before launching more.".into());
@@ -1272,6 +1274,7 @@ impl BackgroundTaskRegistry {
     pub fn export_shell_task_projections(&mut self) -> Vec<BackgroundShellTaskProjection> {
         self.with_state(TaskRegistryState::export_shell_task_projections)
     }
+
     pub fn render_background_task_list_xml(&mut self) -> String {
         let rows = crate::tui::bg_task_rendering::background_task_rows(self);
         crate::tui::bg_task_rendering::render_background_task_rows_xml(&rows)
@@ -2157,7 +2160,8 @@ impl TaskRegistryState {
     }
 
     pub fn can_spawn_shell_task(&self) -> bool {
-        self.running_count() + self.unsettled_count() < MAX_CONCURRENT_TASKS
+        self.running_count() < MAX_CONCURRENT_TASKS
+            && self.unsettled_count() < MAX_RETAINED_UNSETTLED_TASKS
     }
 
     fn unsettled_count(&self) -> usize {
@@ -5502,8 +5506,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retained_uncertain_outcomes_have_a_bounded_actionable_limit() {
+    #[tokio::test]
+    async fn observed_uncertain_outcomes_do_not_block_new_commands() {
         let tmp = crate::tests::test_temp_dir();
         let reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for index in 0..MAX_CONCURRENT_TASKS {
@@ -5519,8 +5523,42 @@ mod tests {
             );
             reg.with_state(|state| state.tasks.insert(task.id.clone(), task));
         }
-        assert!(!reg.can_spawn_shell_task());
-        let error = reg
+        assert!(reg.can_spawn_shell_task());
+        let mut task = reg
+            .start_shell(
+                "true",
+                (tmp.path().join("out"), tmp.path().join("err"), None),
+                true,
+                false,
+                None,
+                |_, _| async { ToolExecutionOutcome::ok("new command".into()) },
+            )
+            .unwrap();
+        assert_eq!(task.wait().await.unwrap().output, "new command");
+        assert!(reg.get("unknown-0").unwrap().outcome_unsettled());
+    }
+
+    #[test]
+    fn exceptionally_many_unconfirmed_tasks_fail_without_losing_facts() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().join("tasks"));
+        for index in 0..MAX_RETAINED_UNSETTLED_TASKS {
+            registry
+                .restore_shell_task_projection(BackgroundShellTaskProjection {
+                    terminal_facts: None,
+                    id: format!("old-{index}"),
+                    status: "running".into(),
+                    title: "previous command".into(),
+                    started_at_ms: index as u64,
+                    ended_at_ms: None,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    exit_code: None,
+                    terminal_reason: None,
+                })
+                .unwrap();
+        }
+        let error = registry
             .start_shell(
                 "true",
                 (tmp.path().join("out"), tmp.path().join("err"), None),
@@ -5530,9 +5568,16 @@ mod tests {
                 |_, _| async { ToolExecutionOutcome::ok("unexpected launch".into()) },
             )
             .err()
-            .expect("uncertain tasks require bounded retention");
-        assert!(error.contains("start a new session"), "{error}");
-        assert!(error.contains("remains unresolved"), "{error}");
+            .expect("bounded retention must refuse further launches");
+        assert!(
+            error.contains("Start a new session") && error.contains("remain unresolved"),
+            "{error}"
+        );
+        assert_eq!(
+            registry.export_shell_task_projections().len(),
+            MAX_RETAINED_UNSETTLED_TASKS
+        );
+        assert!(registry.get("old-0").unwrap().outcome_unsettled());
     }
 
     #[tokio::test]
@@ -5542,7 +5587,7 @@ mod tests {
         let _guard = astra_services::session_journal::ProcessJournalDirGuard::new(tmp.path());
         let session = "stale-running-session";
         let mut registry = BackgroundTaskRegistry::new(tmp.path().join("tasks"));
-        for index in 0..MAX_CONCURRENT_TASKS {
+        for index in 0..=MAX_CONCURRENT_TASKS {
             registry
                 .restore_shell_task_projection(BackgroundShellTaskProjection {
                     terminal_facts: None,
@@ -5559,7 +5604,7 @@ mod tests {
                 .unwrap();
         }
         for generation in 0..2 {
-            assert!(!registry.can_spawn_shell_task());
+            assert!(registry.can_spawn_shell_task());
             let facts = registry.model_context("stale-0").unwrap();
             assert_eq!(facts["status"], "unavailable");
             assert_eq!(facts["execution"]["execution_fact"], "unknown");
@@ -5582,9 +5627,9 @@ mod tests {
         }
         assert_eq!(
             registry.export_shell_task_projections().len(),
-            MAX_CONCURRENT_TASKS
+            MAX_CONCURRENT_TASKS + 1
         );
-        assert!(!registry.can_spawn_shell_task());
+        assert!(registry.can_spawn_shell_task());
     }
 
     #[tokio::test]
@@ -5713,7 +5758,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!registry.can_spawn_shell_task());
+        assert!(registry.can_spawn_shell_task());
         let projections = registry.export_shell_task_projections();
         assert_eq!(projections.len(), MAX_CONCURRENT_TASKS);
         assert!(projections.iter().all(|task| {
@@ -5721,7 +5766,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|facts| facts.outcome_unknown)
         }));
-        assert!(!registry.can_spawn_shell_task());
+        assert!(registry.can_spawn_shell_task());
     }
 
     #[tokio::test]

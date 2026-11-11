@@ -5255,6 +5255,7 @@ async fn attest_edge_workspace(
             dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
         )
         .await;
+        let mut recovered_result = None;
         let result_json = match admission {
             Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
@@ -5274,20 +5275,26 @@ async fn attest_edge_workspace(
                     Ok(Ok(None)) | Err(_) => {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(1),
-                            dispatch
-                                .expire_pending_dispatch(&dispatch_identity, &record.edge_agent_id),
+                            dispatch.reconcile_timeout(&dispatch_identity, &record.edge_agent_id),
                         )
                         .await
                         {
-                            Ok(Ok(_)) => {}
+                            Ok(Ok(astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Terminal(
+                                astra_services::multi_agent::edge_dispatch::EdgeDispatchTerminal::UnvalidatedToolResult(result),
+                            ))) => {
+                                recovered_result = Some(result);
+                                String::new()
+                            }
+                            Ok(Ok(_)) => return Err("edge_attestation_no_result"),
                             Ok(Err(error)) => {
-                                tracing::warn!(%error, "failed to expire an unclaimed Edge attestation")
+                                tracing::warn!(%error, "failed to expire an unclaimed Edge attestation");
+                                return Err("edge_attestation_no_result");
                             }
                             Err(_) => {
-                                tracing::warn!("timed out expiring an unclaimed Edge attestation")
+                                tracing::warn!("timed out expiring an unclaimed Edge attestation");
+                                return Err("edge_attestation_no_result");
                             }
                         }
-                        return Err("edge_attestation_no_result");
                     }
                 }
             }
@@ -5298,8 +5305,11 @@ async fn attest_edge_workspace(
                 return Err("edge_attestation_dispatch_outcome_unknown");
             }
         };
+        let result_json = recovered_result
+            .as_ref()
+            .map_or(result_json.as_str(), |result| result.json());
         let result: astra_thin_client::ToolResultRequest =
-            serde_json::from_str(&result_json).map_err(|_| "edge_attestation_result_invalid")?;
+            serde_json::from_str(result_json).map_err(|_| "edge_attestation_result_invalid")?;
         if result.session_id != identity.session_id
             || result.run_id != identity.run_id
             || result.turn_chain_id != identity.turn_chain_id
@@ -9385,11 +9395,12 @@ mod tests {
             ) -> Result<Option<String>, String> {
                 Ok(None)
             }
-            async fn expire_pending_dispatch(
+            async fn reconcile_timeout(
                 &self,
                 _: &EdgeDispatchIdentity,
                 _: &str,
-            ) -> Result<bool, String> {
+            ) -> Result<astra_services::multi_agent::edge_dispatch::TimeoutReconciliation, String>
+            {
                 std::future::pending().await
             }
             async fn cleanup_stale(&self, _: std::time::Duration) -> Result<u64, String> {

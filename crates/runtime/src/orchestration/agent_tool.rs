@@ -3614,14 +3614,14 @@ async fn handle_agent_get_result_action_inner(
             .await
         {
             Ok(observation) => observation,
-            Err(error) if error == "tool result offset is beyond the retained output" => {
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::InvalidOffset) => {
                 json!({"status":"invalid_request", "note":"The requested offset is beyond the retained output. Use a previously returned next_offset."})
             }
-            Err(error)
-                if error
-                    == "tool result page would skip an atomic redaction marker or UTF-8 boundary" =>
-            {
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::UnsafePageBoundary) => {
                 json!({"status":"invalid_request", "note":"This page cannot preserve a redaction marker or UTF-8 boundary. Use a returned next_offset and a larger max_bytes; if the marker exceeds the maximum, that portion is unavailable."})
+            }
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy) => {
+                json!({"status":"unavailable", "note":"Tool outcome inspection is busy. Try again shortly; this does not rerun the tool."})
             }
             Err(_) => {
                 json!({"status":"unavailable", "note":"Retained results could not be inspected. Their execution outcomes remain unknown."})
@@ -4834,7 +4834,7 @@ pub(crate) mod tests {
             exact: Option<(&str, &str)>,
             _offset: usize,
             _max_bytes: usize,
-        ) -> Result<Value, String> {
+        ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if exact.is_some() {
                 Ok(

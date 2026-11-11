@@ -18,8 +18,57 @@ use futures_util::{FutureExt, TryStreamExt};
 use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::db_row::RowExt as EdgeDispatchDbRow;
 use crate::interaction_contract::{InteractionStatus, edge_dispatch_status};
+
+/// Maximum serialized result read by an explicit inspection. Normal tool
+/// delivery is bounded by the server's 4 MiB request limit; allow room for
+/// serialization while keeping each recovery read bounded.
+pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
+pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
+
+/// Bound aggregate memory used by exceptional exact-result reads.
+pub static EDGE_EXACT_RESULT_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// A bounded result whose contents still require executor identity and hash validation.
+#[derive(Debug)]
+pub struct UnvalidatedEdgeResult {
+    json: String,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl UnvalidatedEdgeResult {
+    pub fn json(&self) -> &str {
+        &self.json
+    }
+
+    /// Used by service implementations that already have a bounded result.
+    pub fn try_new(json: String) -> Option<Self> {
+        if json.len() as u64 > MAX_INSPECTED_EDGE_RESULT_BYTES {
+            return None;
+        }
+        let permit = EDGE_EXACT_RESULT_READS.try_acquire().ok()?;
+        Some(Self {
+            json,
+            _permit: permit,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum EdgeDispatchTerminal {
+    UnvalidatedToolResult(UnvalidatedEdgeResult),
+    ServerReceipt(EdgeDispatchServerReceipt),
+}
+
+#[derive(Debug)]
+pub enum TimeoutReconciliation {
+    /// The relay row was still pending. Other delivery paths are not ruled out.
+    ExpiredBeforeClaim,
+    Terminal(EdgeDispatchTerminal),
+    Unknown,
+}
 
 #[derive(Debug)]
 pub struct EdgeDispatchRow {
@@ -47,13 +96,36 @@ impl EdgeDispatchRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EdgeDispatchIdentity {
     pub user_id: String,
     pub session_id: String,
     pub run_id: String,
     pub turn_chain_id: String,
     pub request_id: String,
+}
+
+/// A server-owned observation about the dispatch row, not a tool completion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeDispatchServerReceipt {
+    pub kind: EdgeDispatchServerReceiptKind,
+    pub identity: EdgeDispatchIdentity,
+    pub edge_agent_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDispatchServerReceiptKind {
+    ExpiredBeforeClaim,
+    Cancelled,
+}
+
+impl EdgeDispatchServerReceipt {
+    pub fn parse_matching(body: &str, identity: &EdgeDispatchIdentity, edge: &str) -> Option<Self> {
+        let receipt: Self = serde_json::from_str(body).ok()?;
+        (receipt.identity == *identity && receipt.edge_agent_id == edge).then_some(receipt)
+    }
 }
 
 /// A bounded, read-only observation of a dispatch belonging to one run.
@@ -124,7 +196,7 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     Ok(persisted == replayed)
 }
 
-fn dispatch_run_owner(
+pub(crate) fn dispatch_run_owner(
     identity: &EdgeDispatchIdentity,
     invocation_json: Option<&str>,
 ) -> Result<String, String> {
@@ -257,14 +329,14 @@ pub trait EdgeDispatchService: Send + Sync {
         reason: &str,
     ) -> Result<bool, String>;
 
-    /// Expire a request only if the Edge has not claimed it. A claimed
-    /// request may still produce a result after the caller stops waiting.
-    async fn expire_pending_dispatch(
+    /// Reconcile a timed-out relay without replaying it. Expiration proves only
+    /// that this particular relay was not claimed, not global non-execution.
+    async fn reconcile_timeout(
         &self,
         _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        Err("pending dispatch expiration is unavailable".into())
+    ) -> Result<TimeoutReconciliation, String> {
+        Err("dispatch timeout reconciliation is unavailable".into())
     }
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
@@ -289,16 +361,6 @@ pub trait EdgeDispatchService: Send + Sync {
         _exact: Option<(&str, &str)>,
     ) -> Result<Vec<EdgeDispatchObservation>, String> {
         Err("durable tool outcome inspection is unavailable".into())
-    }
-
-    /// Resolve a callback's run owner from the exact, authenticated Edge
-    /// dispatch. This is only needed when Edge and run owners differ.
-    async fn callback_run_owner(
-        &self,
-        _identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-    ) -> Result<Option<String>, String> {
-        Err("dispatch callback owner is unavailable".into())
     }
 
     /// Clean up stale dispatches older than `older_than`.
@@ -1493,9 +1555,27 @@ impl DatabaseEdgeDispatchService {
         reason: &str,
         pending_only: bool,
     ) -> Result<bool, String> {
-        let output = format!("edge dispatch {reason}");
-        let result_json =
-            edge_dispatch_failed_result_json(identity.request_id_json_value(), output);
+        let server_receipt = if pending_only {
+            Some(EdgeDispatchServerReceiptKind::ExpiredBeforeClaim)
+        } else if reason == EDGE_DISPATCH_CANCELLED_REASON {
+            // This is the dispatch protocol's machine-owned reason code.
+            Some(EdgeDispatchServerReceiptKind::Cancelled)
+        } else {
+            None
+        };
+        let result_json = if let Some(kind) = server_receipt {
+            serde_json::to_string(&EdgeDispatchServerReceipt {
+                kind,
+                identity: identity.clone(),
+                edge_agent_id: edge_agent_id.to_owned(),
+            })
+            .map_err(|error| format!("edge dispatch receipt serialization: {error}"))?
+        } else {
+            edge_dispatch_failed_result_json(
+                identity.request_id_json_value(),
+                format!("edge dispatch {reason}"),
+            )
+        };
         let query = if pending_only {
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
@@ -1508,6 +1588,9 @@ impl DatabaseEdgeDispatchService {
                AND request_id = ? AND edge_agent_id = ? \
                AND status IN ('pending', 'dispatched')"
         };
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(|error| format!("edge_dispatch fail_dispatch connection: {error}"))?;
         let affected = sqlx::query(query)
             .bind(&result_json)
             .bind(&identity.user_id)
@@ -1516,11 +1599,12 @@ impl DatabaseEdgeDispatchService {
             .bind(&identity.turn_chain_id)
             .bind(&identity.request_id)
             .bind(edge_agent_id)
-            .execute(&self.pool)
+            .execute(connection.connection_mut())
             .await
             .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?
             .rows_affected()
             > 0;
+        connection.release();
         if affected && let Some(ref m) = self.metrics {
             saturating_decrement(&m.dispatch_queue_depth);
             m.dispatch_failed_total.fetch_add(1, Ordering::Relaxed);
@@ -1939,13 +2023,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         else {
             return Ok(false);
         };
-        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            format!("edge_dispatch cancelled terminal payload is invalid JSON: {e}")
-        })?;
         Ok(
-            value.get("status").and_then(serde_json::Value::as_str) == Some("error")
-                && value.get("output").and_then(serde_json::Value::as_str)
-                    == Some("edge dispatch cancelled"),
+            EdgeDispatchServerReceipt::parse_matching(&body, identity, edge_agent_id)
+                .is_some_and(|receipt| receipt.kind == EdgeDispatchServerReceiptKind::Cancelled),
         )
     }
 
@@ -1960,13 +2040,69 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .await
     }
 
-    async fn expire_pending_dispatch(
+    async fn reconcile_timeout(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-    ) -> Result<bool, String> {
-        self.fail_dispatch_matching(identity, edge_agent_id, "expired", true)
+    ) -> Result<TimeoutReconciliation, String> {
+        if self
+            .fail_dispatch_matching(identity, edge_agent_id, "expired", true)
+            .await?
+        {
+            return Ok(TimeoutReconciliation::ExpiredBeforeClaim);
+        }
+        // Do not queue unbounded large reads, and never delay expiry on the permit.
+        let Ok(permit) = EDGE_EXACT_RESULT_READS.try_acquire() else {
+            return Ok(TimeoutReconciliation::Unknown);
+        };
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
             .await
+            .map_err(|error| format!("edge dispatch timeout connection: {error}"))?;
+        let row = sqlx::query(
+            "SELECT status, CASE WHEN OCTET_LENGTH(result_json) <= ? THEN result_json ELSE NULL END AS result_json \
+             FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ? \
+             AND turn_chain_id = ? AND request_id = ? AND edge_agent_id = ? \
+             AND status IN ('completed', 'failed')",
+        )
+        .bind(MAX_INSPECTED_EDGE_RESULT_BYTES)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(edge_agent_id)
+        .fetch_optional(connection.connection_mut())
+        .await
+        .map_err(|error| format!("edge dispatch timeout reconciliation: {error}"))?;
+        connection.release();
+        let Some(row) = row else {
+            return Ok(TimeoutReconciliation::Unknown);
+        };
+        let status: String = row.try_get("status").map_err(|error| error.to_string())?;
+        let body: Option<String> = row
+            .try_get("result_json")
+            .map_err(|error| error.to_string())?;
+        let Some(body) = body else {
+            return Ok(TimeoutReconciliation::Unknown);
+        };
+        match status.as_str() {
+            "completed" => Ok(TimeoutReconciliation::Terminal(
+                EdgeDispatchTerminal::UnvalidatedToolResult(UnvalidatedEdgeResult {
+                    json: body,
+                    _permit: permit,
+                }),
+            )),
+            "failed" => Ok(EdgeDispatchServerReceipt::parse_matching(
+                &body,
+                identity,
+                edge_agent_id,
+            )
+            .map(|receipt| {
+                TimeoutReconciliation::Terminal(EdgeDispatchTerminal::ServerReceipt(receipt))
+            })
+            .unwrap_or(TimeoutReconciliation::Unknown)),
+            _ => Ok(TimeoutReconciliation::Unknown),
+        }
     }
 
     async fn inspect_run_dispatches(
@@ -1993,8 +2129,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         );
         if exact.is_some() {
             // Keep the database/network read bounded even when a callback is huge.
-            query.push("CASE WHEN OCTET_LENGTH(result_json) <= 65536 THEN result_json ELSE NULL END AS bounded_result, \
-                        CASE WHEN OCTET_LENGTH(result_json) > 65536 THEN 1 ELSE 0 END AS result_too_large ");
+            query
+                .push("CASE WHEN OCTET_LENGTH(result_json) <= ")
+                .push_bind(MAX_INSPECTED_EDGE_RESULT_BYTES)
+                .push(" THEN result_json ELSE NULL END AS bounded_result, CASE WHEN OCTET_LENGTH(result_json) > ")
+                .push_bind(MAX_INSPECTED_EDGE_RESULT_BYTES)
+                .push(" THEN 1 ELSE 0 END AS result_too_large ");
         } else {
             query.push("NULL AS bounded_result, 0 AS result_too_large ");
         }
@@ -2024,11 +2164,15 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         } else {
             query.push(" LIMIT 2");
         }
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(|error| format!("edge dispatch inspection connection: {error}"))?;
         let rows = query
             .build()
-            .fetch_all(&self.pool)
+            .fetch_all(connection.connection_mut())
             .await
             .map_err(|error| format!("edge dispatch inspection failed: {error}"))?;
+        connection.release();
         let mut observations = Vec::with_capacity(rows.len());
         for row in rows {
             let identity = EdgeDispatchIdentity::new(
@@ -2071,34 +2215,6 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             });
         }
         Ok(observations)
-    }
-
-    async fn callback_run_owner(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-    ) -> Result<Option<String>, String> {
-        let row = sqlx::query(
-            "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity')) AS invocation_identity \
-             FROM edge_pending_dispatch WHERE user_id = ? AND session_id = ? AND run_id = ? \
-             AND turn_chain_id = ? AND request_id = ? AND edge_agent_id = ?",
-        )
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.request_id)
-        .bind(edge_agent_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("dispatch callback owner lookup failed: {e}"))?;
-        row.map(|row| {
-            let invocation_json: Option<String> = row
-                .try_get("invocation_identity")
-                .map_err(|e| e.to_string())?;
-            dispatch_run_owner(identity, invocation_json.as_deref())
-        })
-        .transpose()
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = ?timeout.map(|timeout| timeout.as_millis())))]
@@ -3392,8 +3508,108 @@ mod tests {
             .inspect_run_dispatches(&user, &session, &run, None, Some(("turn", "request-00")))
             .await
             .unwrap();
-        assert!(large[0].result_too_large);
-        assert!(large[0].result_json.is_none());
+        assert!(!large[0].result_too_large);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(large[0].result_json.as_ref().unwrap())
+                .unwrap()["output"],
+            "large".repeat(20_000)
+        );
+        let pending = EdgeDispatchIdentity::new(&user, &session, &run, "turn", "pending-expire");
+        assert_eq!(
+            writer
+                .admit_dispatch(&pending, &edge, &json!({"tool":"bash"}))
+                .await
+                .unwrap(),
+            EdgeDispatchAdmission::Pending
+        );
+        assert!(matches!(
+            writer.reconcile_timeout(&pending, &edge).await.unwrap(),
+            TimeoutReconciliation::ExpiredBeforeClaim
+        ));
+        let expired = reader
+            .inspect_run_dispatches(
+                &user,
+                &session,
+                &run,
+                None,
+                Some((&pending.turn_chain_id, &pending.request_id)),
+            )
+            .await
+            .unwrap();
+        let receipt: EdgeDispatchServerReceipt =
+            serde_json::from_str(expired[0].result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            receipt.kind,
+            EdgeDispatchServerReceiptKind::ExpiredBeforeClaim
+        );
+        assert_eq!(receipt.identity, pending);
+        assert_eq!(receipt.edge_agent_id, edge);
+        assert!(matches!(
+            writer.reconcile_timeout(&pending, &edge).await.unwrap(),
+            TimeoutReconciliation::Terminal(EdgeDispatchTerminal::ServerReceipt(receipt))
+                if receipt.kind == EdgeDispatchServerReceiptKind::ExpiredBeforeClaim
+                    && receipt.identity == pending && receipt.edge_agent_id == edge
+        ));
+        assert!(reader.poll_pending(&user, &edge).await.unwrap().is_empty());
+
+        let raced = EdgeDispatchIdentity::new(&user, &session, &run, "turn", "raced-completion");
+        writer
+            .admit_dispatch(&raced, &edge, &json!({"tool":"bash"}))
+            .await
+            .unwrap();
+        assert_eq!(reader.poll_pending(&user, &edge).await.unwrap().len(), 1);
+        assert!(matches!(
+            writer.reconcile_timeout(&raced, &edge).await.unwrap(),
+            TimeoutReconciliation::Unknown
+        ));
+        let running = reader
+            .inspect_run_dispatches(
+                &user,
+                &session,
+                &run,
+                None,
+                Some((&raced.turn_chain_id, &raced.request_id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(running[0].status, "dispatched");
+        assert!(running[0].result_json.is_none());
+        assert!(
+            writer
+                .deliver_result(&raced, &edge, r#"{"status":"completed","output":"late"}"#)
+                .await
+                .unwrap()
+        );
+        let reconciled = writer.reconcile_timeout(&raced, &edge).await.unwrap();
+        assert!(
+            matches!(&reconciled, TimeoutReconciliation::Terminal(EdgeDispatchTerminal::UnvalidatedToolResult(body)) if body.json().contains("late"))
+        );
+        drop(reconciled);
+        assert!(matches!(
+            writer
+                .reconcile_timeout(&raced, "wrong-edge")
+                .await
+                .unwrap(),
+            TimeoutReconciliation::Unknown
+        ));
+        let completed = reader
+            .inspect_run_dispatches(
+                &user,
+                &session,
+                &run,
+                None,
+                Some((&raced.turn_chain_id, &raced.request_id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed[0].status, "completed");
+        assert!(
+            completed[0]
+                .result_json
+                .as_deref()
+                .unwrap()
+                .contains("late")
+        );
         assert!(
             reader
                 .inspect_run_dispatches("other-user", &session, &run, None, None)
@@ -3433,21 +3649,6 @@ mod tests {
             .unwrap();
         assert_eq!(cross_result.len(), 1);
         assert_eq!(cross_result[0].edge_owner_user_id, edge_owner);
-        assert_eq!(
-            reader
-                .callback_run_owner(&cross_owner, &edge)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(user.as_str())
-        );
-        assert_eq!(
-            reader
-                .callback_run_owner(&cross_owner, "wrong-edge")
-                .await
-                .unwrap(),
-            None
-        );
         assert!(
             reader
                 .inspect_run_dispatches(

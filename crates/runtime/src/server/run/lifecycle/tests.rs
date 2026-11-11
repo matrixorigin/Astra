@@ -28,6 +28,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     struct RecordingService {
         body: String,
         reads: AtomicUsize,
+        status: &'static str,
     }
     #[async_trait]
     impl EdgeDispatchService for RecordingService {
@@ -93,10 +94,15 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
                 turn_chain_id: "turn".into(),
                 request_id: "request".into(),
                 edge_agent_id: "edge".into(),
-                status: "completed".into(),
+                status: self.status.into(),
                 tool_name: Some("grep".into()),
-                result_json: (self.body.len() <= 65536).then(|| self.body.clone()),
-                result_too_large: self.body.len() > 65536,
+                result_json: (self.body.len()
+                    <= astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES
+                        as usize)
+                    .then(|| self.body.clone()),
+                result_too_large: self.body.len()
+                    > astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES
+                        as usize,
             }])
         }
     }
@@ -121,6 +127,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     let service = Arc::new(RecordingService {
         body: serde_json::to_string(&body).unwrap(),
         reads: AtomicUsize::new(0),
+        status: "completed",
     });
     let reconciler = ServerDurableAgentReconciler {
         run_engine: RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
@@ -204,6 +211,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     let oversized_service = Arc::new(RecordingService {
         body: serde_json::to_string(&oversized).unwrap(),
         reads: AtomicUsize::new(0),
+        status: "completed",
     });
     let oversized_reconciler = ServerDurableAgentReconciler {
         run_engine: reconciler.run_engine.clone(),
@@ -216,13 +224,58 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
         .await
         .unwrap();
-    assert_eq!(result["observations"][0]["result"]["status"], "unavailable");
-    assert!(
-        result["observations"][0]["result"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("64 KiB")
+    let page = &result["observations"][0]["result"];
+    assert_eq!(page["status"], "completed");
+    assert_eq!(page["total_bytes"], 65536);
+    let first = page["output"].as_str().unwrap();
+    assert!(!first.is_empty() && first.len() <= 3500);
+    assert_eq!(first, "x".repeat(first.len()));
+    assert_eq!(page["next_offset"], first.len());
+
+    // A valid result can fit the transport limit while marker indexing makes
+    // its safe display projection too large. Its execution facts must survive.
+    let dense = astra_thin_client::ToolResultRequest::new_with_hash(
+        astra_thin_client::ToolResultRequestParts {
+            session_id: reconciler.session_id.clone(),
+            run_id: run.clone(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "failed".into(),
+            output: "[REDACTED:A] ".repeat(300_000),
+            duration_ms: 7,
+            tool_result_fields:
+                json!({"outcome_certainty":"unknown", "cleanup_unsettled":true, "retryable":false})
+                    .as_object()
+                    .cloned(),
+        },
     );
+    let dense_reconciler = ServerDurableAgentReconciler {
+        run_engine: reconciler.run_engine.clone(),
+        user_id: reconciler.user_id.clone(),
+        session_id: reconciler.session_id.clone(),
+        edge_dispatch_service: Some(Arc::new(RecordingService {
+            body: serde_json::to_string(&dense).unwrap(),
+            reads: AtomicUsize::new(0),
+            status: "completed",
+        })),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    };
+    let dense_page = dense_reconciler
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .await
+        .unwrap();
+    let dense_result = &dense_page["observations"][0]["result"];
+    assert_eq!(dense_result["output_status"], "unavailable");
+    assert_eq!(
+        dense_result["tool_result_fields"]["outcome_certainty"],
+        "unknown"
+    );
+    assert_eq!(
+        dense_result["tool_result_fields"]["cleanup_unsettled"],
+        true
+    );
+    assert_eq!(dense_result["tool_result_fields"]["retryable"], false);
 
     // Escaping can enlarge otherwise short fact fields; keep the complete
     // response small enough that its output and cursor reach the model.
@@ -257,6 +310,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         edge_dispatch_service: Some(Arc::new(RecordingService {
             body: serde_json::to_string(&escaped).unwrap(),
             reads: AtomicUsize::new(0),
+            status: "completed",
         })),
         state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
     };
@@ -302,6 +356,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
     let protected_service = Arc::new(RecordingService {
         body: serde_json::to_string(&protected).unwrap(),
         reads: AtomicUsize::new(0),
+        status: "completed",
     });
     let protected_reconciler = ServerDurableAgentReconciler {
         run_engine: reconciler.run_engine.clone(),
@@ -324,6 +379,30 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
         "{protected_output}"
     );
     assert!(protected_output.contains("quoted:"), "{protected_output}");
+
+    let receipt = astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt {
+        kind: astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind::ExpiredBeforeClaim,
+        identity: EdgeDispatchIdentity::new("u", &reconciler.session_id, &run, "turn", "request"),
+        edge_agent_id: "edge".into(),
+    };
+    let receipt_reconciler = ServerDurableAgentReconciler {
+        run_engine: reconciler.run_engine.clone(),
+        user_id: reconciler.user_id.clone(),
+        session_id: reconciler.session_id.clone(),
+        edge_dispatch_service: Some(Arc::new(RecordingService {
+            body: serde_json::to_string(&receipt).unwrap(),
+            reads: AtomicUsize::new(0),
+            status: "failed",
+        })),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    };
+    let receipt_result = receipt_reconciler
+        .inspect_child_tool_outcomes(&run, None, Some(("turn", "request")), 0, 4096)
+        .await
+        .unwrap();
+    let result = &receipt_result["observations"][0]["result"];
+    assert_eq!(result["dispatch_fact"], "expired_before_claim");
+    assert_eq!(result["execution_fact"], "unknown");
 }
 
 #[tokio::test]

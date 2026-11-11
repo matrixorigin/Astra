@@ -15,6 +15,34 @@ pub(crate) struct TuiFileWriteError {
     pub message: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TuiFileWriteEvent {
+    Failed(TuiFileWriteError),
+    ProjectionFailed {
+        kind: BackgroundProjectionKind,
+        error: TuiFileWriteError,
+    },
+    ProjectionRecovered {
+        kind: BackgroundProjectionKind,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundProjectionKind {
+    Shell,
+    Agent,
+}
+
+impl BackgroundProjectionKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "Background shell history",
+            Self::Agent => "Background agent history",
+        }
+    }
+}
+
 impl TuiFileWriteError {
     pub(crate) fn user_message(&self) -> String {
         if self.path.as_os_str().is_empty() {
@@ -47,7 +75,7 @@ enum WriteCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct TuiFileWriter {
     tx: mpsc::Sender<WriteCommand>,
-    error_tx: mpsc::UnboundedSender<TuiFileWriteError>,
+    error_tx: mpsc::UnboundedSender<TuiFileWriteEvent>,
 }
 
 pub(crate) struct TuiFileWriterRuntime {
@@ -58,7 +86,7 @@ pub(crate) struct TuiFileWriterRuntime {
 pub(crate) fn spawn() -> (
     TuiFileWriter,
     TuiFileWriterRuntime,
-    mpsc::UnboundedReceiver<TuiFileWriteError>,
+    mpsc::UnboundedReceiver<TuiFileWriteEvent>,
 ) {
     let (tx, rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
     let (error_tx, error_rx) = mpsc::unbounded_channel();
@@ -76,6 +104,29 @@ pub(crate) fn spawn() -> (
 impl TuiFileWriter {
     pub(crate) fn report_failure(&self, target: &'static str, path: PathBuf, message: String) {
         report_message(&self.error_tx, target, path, message);
+    }
+
+    pub(crate) fn report_projection_failure(
+        &self,
+        kind: BackgroundProjectionKind,
+        path: PathBuf,
+        message: String,
+    ) {
+        tracing::warn!(projection = kind.label(), path = %path.display(), %message, "TUI projection write failed");
+        let error = TuiFileWriteError {
+            target: kind.label(),
+            path,
+            message,
+        };
+        let _ = self
+            .error_tx
+            .send(TuiFileWriteEvent::ProjectionFailed { kind, error });
+    }
+
+    pub(crate) fn report_recovery(&self, kind: BackgroundProjectionKind, path: PathBuf) {
+        let _ = self
+            .error_tx
+            .send(TuiFileWriteEvent::ProjectionRecovered { kind, path });
     }
 
     pub(crate) fn append_line(&self, target: &'static str, path: PathBuf, line: String) {
@@ -108,11 +159,13 @@ impl TuiFileWriter {
                 }
                 mpsc::error::TrySendError::Closed(_) => "write worker is unavailable".to_string(),
             };
-            let _ = self.error_tx.send(TuiFileWriteError {
-                target,
-                path,
-                message,
-            });
+            let _ = self
+                .error_tx
+                .send(TuiFileWriteEvent::Failed(TuiFileWriteError {
+                    target,
+                    path,
+                    message,
+                }));
         }
     }
 
@@ -154,7 +207,7 @@ impl TuiFileWriterRuntime {
 
 async fn run_writer(
     mut rx: mpsc::Receiver<WriteCommand>,
-    error_tx: mpsc::UnboundedSender<TuiFileWriteError>,
+    error_tx: mpsc::UnboundedSender<TuiFileWriteEvent>,
 ) {
     while let Some(command) = rx.recv().await {
         match command {
@@ -184,7 +237,7 @@ async fn run_writer(
 }
 
 fn report_error(
-    error_tx: &mpsc::UnboundedSender<TuiFileWriteError>,
+    error_tx: &mpsc::UnboundedSender<TuiFileWriteEvent>,
     target: &'static str,
     path: PathBuf,
     error: std::io::Error,
@@ -193,17 +246,17 @@ fn report_error(
 }
 
 fn report_message(
-    error_tx: &mpsc::UnboundedSender<TuiFileWriteError>,
+    error_tx: &mpsc::UnboundedSender<TuiFileWriteEvent>,
     target: &'static str,
     path: PathBuf,
     message: String,
 ) {
     tracing::warn!(target, path = %path.display(), %message, "TUI file write failed");
-    let _ = error_tx.send(TuiFileWriteError {
+    let _ = error_tx.send(TuiFileWriteEvent::Failed(TuiFileWriteError {
         target,
         path,
         message,
-    });
+    }));
 }
 
 async fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
@@ -298,7 +351,11 @@ mod tests {
         writer.append_line("history", good_path.clone(), "kept".into());
         writer.flush().await.unwrap();
 
-        let error = errors.try_recv().expect("write error must be observable");
+        let TuiFileWriteEvent::Failed(error) =
+            errors.try_recv().expect("write error must be observable")
+        else {
+            panic!("expected a write failure");
+        };
         assert_eq!(error.target, "transcript");
         assert_eq!(
             tokio::fs::read_to_string(good_path).await.unwrap(),

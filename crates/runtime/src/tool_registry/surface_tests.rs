@@ -1001,7 +1001,14 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     let guidance = search["matches"][0]["parameters"]["properties"]["tool_outcomes"]["description"]
         .as_str()
         .expect("selected child outcome guidance");
-    for term in ["after", "exact", "offset", "64 KiB", "unknown"] {
+    for term in [
+        "after",
+        "exact",
+        "offset",
+        "max_bytes",
+        "unavailable",
+        "nonexecution",
+    ] {
         assert!(guidance.contains(term), "missing {term}: {guidance}");
     }
 

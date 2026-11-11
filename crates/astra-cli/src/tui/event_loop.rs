@@ -8601,17 +8601,35 @@ fn enqueue_approval_request(
 }
 
 fn surface_tui_file_write_errors(
-    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteError>,
+    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteEvent>,
     reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
     state: &mut crate::cli::session::session_state::SessionState,
     chat_widget: &mut chat_widget::ChatWidget,
     frame_requester: &FrameRequester,
 ) {
-    while let Ok(error) = errors.try_recv() {
+    while let Ok(event) = errors.try_recv() {
+        let error = match event {
+            super::file_writer::TuiFileWriteEvent::Failed(error) => {
+                if !error.path.as_os_str().is_empty() {
+                    state.session_persistence_error = Some(error.user_message());
+                }
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionFailed { kind, error } => {
+                state
+                    .background_persistence_errors
+                    .insert((kind.label(), error.path.clone()), error.user_message());
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionRecovered { kind, path } => {
+                state
+                    .background_persistence_errors
+                    .remove(&(kind.label(), path.clone()));
+                reported.retain(|error| error.target != kind.label() || error.path != path);
+                continue;
+            }
+        };
         let detail = error.user_message();
-        if !error.path.as_os_str().is_empty() {
-            state.session_persistence_error = Some(detail.clone());
-        }
         if reported.insert(error) {
             chat_widget.commit_ephemeral_warning(format!(
                 "Local persistence degraded · {detail}. Conversation continues; resume/history may be stale."
@@ -9865,6 +9883,36 @@ pub(crate) async fn run_tui_session(
                     ),
                     event => event,
                 };
+                // Retry only after a user submission, and only when a
+                // previous background projection write failed. Do not turn
+                // persistence recovery into per-session polling.
+                let retry_background_write = !runtime_notification_event
+                    && !state.background_persistence_errors.is_empty()
+                    && state.session_id == background_registry_session_id
+                    && *background_registry.owner_scope() == astra_services::local_owner_scope()
+                    && (matches!(&ev, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Enter)
+                        || matches!(&ev, TuiEvent::QueuedSubmission(_)));
+                if retry_background_write {
+                    persist_background_task_projections_if_changed(
+                        &mut background_registry,
+                        background_registry_session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_task_projection_cache,
+                        Some(&file_writer),
+                    )
+                    .await;
+                    restored_local_agent_task_projections =
+                        persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
+                        )
+                        .await;
+                }
                 match ev {
                     event @ (TuiEvent::Key(_) | TuiEvent::QueuedSubmission(_)) => {
                         let runtime_notification_submission =
@@ -21598,7 +21646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
+    async fn background_task_switcher_can_open_after_failure_event_is_polled() {
         let temp = crate::tests::test_temp_dir();
         let mut completed_registry =
             crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
@@ -21646,7 +21694,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            open_background_task_view(
+            !open_background_task_view(
                 &mut failed_registry,
                 None,
                 &[],
@@ -21654,7 +21702,18 @@ mod tests {
                 &FrameRequester::test_dummy(),
             )
             .await,
-            "failed background tasks must remain reachable from the background-task surface"
+            "a polled failure event no longer counts as pending UI attention"
+        );
+        assert!(
+            force_open_background_task_view(
+                &mut failed_registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "the user's task-panel action must still open retained failures"
         );
         assert!(bottom_pane.has_active_view());
     }
@@ -25146,8 +25205,12 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/transcript.jsonl"),
             message: "disk full".into(),
         };
-        tx.send(error.clone()).unwrap();
-        tx.send(error).unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            error.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(error))
+            .unwrap();
         let mut reported = std::collections::HashSet::new();
         let mut state = crate::cli::session::session_state::SessionState::default();
         let mut widget = chat_widget::ChatWidget::new("session-with-id");
@@ -25180,8 +25243,12 @@ mod tests {
             path: std::path::PathBuf::new(),
             message: "no session is bound yet".into(),
         };
-        tx.send(unbound.clone()).unwrap();
-        tx.send(unbound).unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            unbound.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(unbound))
+            .unwrap();
         surface_tui_file_write_errors(
             &mut rx,
             &mut reported,
@@ -25197,11 +25264,13 @@ mod tests {
         );
         reset_unbound_persistence_warnings(&mut reported);
         assert_eq!(reported.len(), 1, "real file errors stay deduplicated");
-        tx.send(crate::tui::file_writer::TuiFileWriteError {
-            target: "Background task history",
-            path: std::path::PathBuf::new(),
-            message: "no session is bound yet".into(),
-        })
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            crate::tui::file_writer::TuiFileWriteError {
+                target: "Background task history",
+                path: std::path::PathBuf::new(),
+                message: "no session is bound yet".into(),
+            },
+        ))
         .unwrap();
         surface_tui_file_write_errors(
             &mut rx,
@@ -25216,6 +25285,103 @@ mod tests {
             "a new unbound session must warn again"
         );
         assert_eq!(state.session_persistence_error, previous_error);
+    }
+
+    #[test]
+    fn background_projection_errors_survive_other_turns_until_their_own_recovery() {
+        use crate::tui::file_writer::{
+            BackgroundProjectionKind, TuiFileWriteError, TuiFileWriteEvent,
+        };
+        use crate::tui::inspection::{InspectorFactStatus, inspect_workbench};
+        use astra_services::SessionArtifactStore;
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.session_id = Some("projection-recovery-test".into());
+        let path = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                state.background_tasks.owner_scope(),
+                state.session_id.as_deref().unwrap(),
+            )
+            .unwrap()
+            .join("workspace.yaml");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for kind in [
+            BackgroundProjectionKind::Shell,
+            BackgroundProjectionKind::Agent,
+        ] {
+            tx.send(TuiFileWriteEvent::ProjectionFailed {
+                kind,
+                error: TuiFileWriteError {
+                    target: kind.label(),
+                    path: path.clone(),
+                    message: "disk full".into(),
+                },
+            })
+            .unwrap();
+        }
+        let mut reported = std::collections::HashSet::new();
+        let mut widget = chat_widget::ChatWidget::new("projection-recovery-test");
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        state.session_persistence_error = None; // a later turn journal succeeds
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Shell,
+            path: path.clone(),
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Degraded);
+        assert!(fact.value.contains("Background agent history"));
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Background agent history"))
+        );
+
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Agent,
+            path,
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Observed);
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .is_none()
+        );
     }
 
     #[test]

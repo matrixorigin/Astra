@@ -146,11 +146,13 @@ For a direct child whose Edge tool outcome was unavailable, the full `agent`
 contract provides `get_result` with `tool_outcomes`: an optional paged list of
 that child's retained dispatches, followed by an exact result read. Discover
 the full contract when the resident schema is in use. The read is on demand,
-bounded to a 64 KiB serialized result, scoped to the parent and does not change
+bounded to an 8 MiB serialized result, scoped to the parent and does not change
 the child outcome. Each explicit result page reads the bounded retained record;
 normal tool execution and child collection incur no extra inspection query. A missing,
 expired, oversized or unavailable result does not establish that execution
-never happened. Local-only execution may have no durable dispatch to inspect.
+never happened. A relay row expiring before claim is reported as that specific
+dispatch fact; it does not by itself rule out an independently replayed
+delivery path. Local-only execution may have no durable dispatch to inspect.
 `agent.wait` admits a current-run input wait with an optional bounded timeout.
 The shared loop waits after sibling tools settle, releases execution capacity,
 and applies child results, semantic messages, or user guidance through its

@@ -115,10 +115,13 @@ as unknown. When the workspace save succeeds, its bounded projection keeps the
 identity and facts of unknown outcomes or unconfirmed cleanup across session
 restoration; it does not recreate a process handle or a private capture. A
 failed save is reported to the user and may leave older facts on disk.
-Observed output may be
-reclaimed independently of those facts. If running and unresolved tasks reach
-the session limit, a new session can run commands while the old session keeps
-its records; starting a new session does not resolve those outcomes. Output chunks
+Observed output may be reclaimed independently of those facts. The shell
+concurrency limit counts live tasks separately from retained unconfirmed facts.
+The existing session workspace retains these facts across restart. If their
+bounded per-session limit is reached, starting a new session permits further
+commands but does not resolve prior outcomes. A failed workspace write warns
+the user and is retried on a later submission.
+Output chunks
 do not trigger model calls, and local waits perform no periodic SQL. A restored
 plain-shell projection can expose saved output but cannot recreate a lost
 process handle. Weak process-group cleanup never certifies authoritative
