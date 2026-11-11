@@ -141,6 +141,12 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"sk-ant-[A-Za-z0-9_-]+",
                 "ANTHROPIC_API_KEY"
             ),
+            // Slack bot/user tokens have a distinctive xoxb/xoxp prefix.
+            pat_stream!(
+                r"xox[bp]-[A-Za-z0-9-]{20,}",
+                r"xox[bp]-[A-Za-z0-9-]+",
+                "SLACK_TOKEN"
+            ),
             // HTTP Basic credentials are base64-encoded user:password.
             // Redact only the value, retaining the header name and scheme.
             pat_min!(
@@ -3057,6 +3063,29 @@ mod anthropic_api_key_redaction_regression_tests {
     #[test]
     fn leaves_short_anthropic_prefix_unchanged() {
         let text = "sk-ant-api03-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod slack_token_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_slack_bot_token() {
+        let secret = format!("{}-{}-{}-{}", "xoxb", "1".repeat(12), "2".repeat(12), "a".repeat(24));
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("slack token: {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("SLACK_TOKEN"));
+    }
+
+    #[test]
+    fn leaves_short_slack_prefix_unchanged() {
+        let text = "xoxb-demo";
         let (redacted, count) = redact_credentials_for_display(text);
         assert_eq!(count, 0);
         assert_eq!(redacted, text);
