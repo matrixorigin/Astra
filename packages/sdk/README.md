@@ -11,12 +11,17 @@ workspace copy via `file:../packages/sdk` (see `web/package.json`).
 
 ## Installation
 
+Before the first npm release, use a local checkout. From a consuming project,
+install the SDK with a path to its `packages/sdk` directory (for example,
+`npm install file:../Astra/packages/sdk` when the checkout is at `../Astra`).
+You can also install a tarball generated locally with `npm pack` from
+`packages/sdk`.
+
+After the package has been published to the npm registry, install it with:
+
 ```bash
 npm install @astra/sdk
 ```
-
-Before the first npm release, consume `file:../packages/sdk` from a checkout or
-install a locally generated pack tarball.
 
 ## Quick start
 
