@@ -102,6 +102,14 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"gh[pousr]_[A-Za-z0-9_]+",
                 "GITHUB_TOKEN"
             ),
+            // GitHub fine-grained personal access tokens use a different prefix.
+            // Keep the production minimum bounded; streaming may see partial
+            // tokens before the remainder of the chunk arrives.
+            pat_stream!(
+                r"github_pat_[A-Za-z0-9_]{36,}",
+                r"github_pat_[A-Za-z0-9_]+",
+                "GITHUB_TOKEN"
+            ),
             // Hugging Face user-access tokens are opaque bearer credentials.
             // The public `hf_` prefix is fixed while the body is
             // case-sensitive alphanumeric data; accept the documented
@@ -2893,5 +2901,26 @@ mod tests {
         let (redacted, count) = redact_credentials_for_display(forged);
         assert!(count > 0);
         assert!(!redacted.contains("0123456789abcdef0123456789abcdef"));
+    }
+}
+
+#[cfg(test)]
+mod fine_grained_github_pat_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_fine_grained_github_personal_access_tokens() {
+        let token = format!("github_pat_{}", "A".repeat(64));
+        let (redacted, count) = redact_credentials_for_display(&format!("token: {token}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&token));
+        assert!(redacted.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn does_not_hide_short_prefix_without_token_body() {
+        let (redacted, count) = redact_credentials_for_display("github_pat_abc");
+        assert_eq!(count, 0);
+        assert_eq!(redacted, "github_pat_abc");
     }
 }
