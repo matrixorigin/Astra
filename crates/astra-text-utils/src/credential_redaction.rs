@@ -127,6 +127,13 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"hf_[A-Za-z0-9]+",
                 "HUGGINGFACE_TOKEN"
             ),
+            // OpenAI project API keys are often printed without an assignment
+            // context. Recognize their high-confidence provider prefix.
+            pat_stream!(
+                r"sk-proj-[A-Za-z0-9_-]{20,}",
+                r"sk-proj-[A-Za-z0-9_-]+",
+                "OPENAI_API_KEY"
+            ),
             // HTTP Basic credentials are base64-encoded user:password.
             // Redact only the value, retaining the header name and scheme.
             pat_min!(
@@ -3000,5 +3007,28 @@ mod password_flag_redaction_regression_tests {
         let (redacted, count) = redact_credentials_for_display("mysql --password=abc -h db");
         assert_eq!(count, 1);
         assert!(!redacted.contains("password=abc"));
+    }
+}
+
+#[cfg(test)]
+mod openai_project_key_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_project_api_key() {
+        let secret = format!("sk-proj-{}", "A".repeat(48));
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("key is {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn does_not_hide_short_project_key_prefix() {
+        let text = "sk-proj-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
     }
 }
