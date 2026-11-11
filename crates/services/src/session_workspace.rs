@@ -725,12 +725,21 @@ pub fn update_existing_workspace(
     session_id: &str,
     update: impl FnOnce(&mut WorkspaceMetadata),
 ) -> std::io::Result<Option<WorkspaceMetadata>> {
-    let dir = validated_workspace_dir(session_id)?;
+    update_existing_workspace_for_owner(&crate::OwnerScope::local_user(), session_id, update)
+}
+
+/// Update an existing workspace in the owner scope captured by its caller.
+pub fn update_existing_workspace_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<Option<WorkspaceMetadata>> {
+    let dir = validated_workspace_dir_for_owner(owner_scope, session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
     let _lock = lock_workspace(&dir)?;
-    let Some(mut metadata) = read_workspace_optional(session_id)? else {
+    let Some(mut metadata) = read_workspace_optional_for_owner(owner_scope, session_id)? else {
         return Ok(None);
     };
     validate_workspace_identity(session_id, &metadata)?;
@@ -1157,7 +1166,15 @@ pub fn workspace_file_path(session_id: &str) -> std::io::Result<PathBuf> {
 ///
 /// Returns the backup path when a workspace file existed and was renamed.
 pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option<PathBuf>> {
-    let dir = validated_workspace_dir(session_id)?;
+    backup_invalid_workspace_file_for_owner(&crate::OwnerScope::local_user(), session_id)
+}
+
+/// Preserve an invalid workspace without consulting the current global owner.
+pub fn backup_invalid_workspace_file_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let dir = validated_workspace_dir_for_owner(owner_scope, session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -1169,7 +1186,7 @@ pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option
     // The caller's read happened before this lock was acquired. Another
     // writer may have repaired the file meanwhile, so revalidate under the
     // lock before moving anything aside.
-    if read_workspace(session_id).is_ok() {
+    if read_workspace_at_path(session_id, &path).is_ok() {
         return Ok(None);
     }
 
@@ -1184,9 +1201,16 @@ pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option
 }
 
 fn validated_workspace_dir(session_id: &str) -> std::io::Result<PathBuf> {
-    crate::session_journal::validate_session_id(session_id)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    Ok(workspace_dir(session_id))
+    validated_workspace_dir_for_owner(&crate::OwnerScope::local_user(), session_id)
+}
+
+pub(crate) fn validated_workspace_dir_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<PathBuf> {
+    crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {

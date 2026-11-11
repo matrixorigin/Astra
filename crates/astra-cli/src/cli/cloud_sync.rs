@@ -35,12 +35,11 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_side_effects::{
-    enqueue_ingestion_for_immediate_drain_pub, enqueue_ingestion_pub,
-};
+use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+const SYNC_OUTBOX_LOGIN_PROJECTION_WAIT: Duration = Duration::from_secs(2);
 // One full server batch for each concurrent session, still bounded by bytes.
 const SYNC_OUTBOX_BACKGROUND_DRAIN_LIMIT: usize =
     MAX_SYNC_OUTBOX_BATCH_EVENTS * SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS;
@@ -69,7 +68,7 @@ const SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY: Duration = Duration::from_secs
 const SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 static SYNC_OUTBOX_DRAIN_OWNER: AtomicU64 = AtomicU64::new(0);
 static SYNC_OUTBOX_NEXT_DRAIN_OWNER: AtomicU64 = AtomicU64::new(1);
-static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+static SYNC_OUTBOX_RETRY_WAKE: Mutex<Option<SyncOutboxRetryWake>> = Mutex::new(None);
 static SYNC_OUTBOX_CLOUD_ACCESS: LazyLock<
     watch::Sender<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>>,
 > = LazyLock::new(|| watch::channel(None).0);
@@ -258,18 +257,21 @@ impl Drop for SyncOutboxDrainScheduleGuard {
     }
 }
 
-struct SyncOutboxRetryWakeGuard {
+struct SyncOutboxRetryWake {
     deadline: u64,
+    token: u64,
+}
+
+struct SyncOutboxRetryWakeGuard {
+    token: u64,
 }
 
 impl Drop for SyncOutboxRetryWakeGuard {
     fn drop(&mut self) {
-        let _ = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange(
-            self.deadline,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut wake = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+        if wake.as_ref().is_some_and(|wake| wake.token == self.token) {
+            *wake = None;
+        }
     }
 }
 
@@ -585,6 +587,35 @@ async fn reconcile_sync_outbox_journals_for_owner(
     owner_scope: &astra_services::OwnerScope,
     session_ids: &[String],
 ) -> Vec<(String, Result<bool, std::io::Error>)> {
+    let owner = owner_scope.clone();
+    let sessions = session_ids.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        reconcile_sync_outbox_journals_for_owner_blocking(&owner, &sessions)
+    })
+    .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(error) => session_ids
+            .iter()
+            .cloned()
+            .map(|session_id| {
+                (
+                    session_id,
+                    Err(std::io::Error::other(format!(
+                        "journal projection worker failed: {error}"
+                    ))),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Project only durable journal contents, including for callers without a
+/// runtime. Async callers must run this complete operation on the blocking pool.
+pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
+    owner_scope: &astra_services::OwnerScope,
+    session_ids: &[String],
+) -> Vec<(String, Result<bool, std::io::Error>)> {
     const STALE_OFFSET_RETRIES: usize = 3;
     if session_ids.is_empty() {
         return Vec::new();
@@ -612,12 +643,7 @@ async fn reconcile_sync_outbox_journals_for_owner(
         }
         let current_sessions = pending.iter().cloned().collect::<Vec<_>>();
         pending.clear();
-        let offset_sessions = current_sessions.clone();
-        let offsets = match run_sync_outbox_io(store.clone(), move |store| {
-            store.journal_source_offsets(&offset_sessions)
-        })
-        .await
-        {
+        let offsets = match store.journal_source_offsets(&current_sessions) {
             Ok(offsets) => offsets,
             Err(error) => {
                 let message = error.to_string();
@@ -630,40 +656,14 @@ async fn reconcile_sync_outbox_journals_for_owner(
                 break;
             }
         };
-        let read_owner = owner_scope.clone();
-        let read_result = tokio::task::spawn_blocking(move || {
-            current_sessions
-                .into_iter()
-                .map(|session_id| {
-                    let offset = offsets.get(&session_id).copied().unwrap_or(0);
-                    let delta = session_journal::read_durable_journal_append_delta_for_owner(
-                        &read_owner,
-                        &session_id,
-                        offset,
-                    );
-                    (session_id, offset, delta)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        let reads = match read_result {
-            Ok(reads) => reads,
-            Err(error) => {
-                let message = format!("journal delta worker failed: {error}");
-                for session_id in session_ids {
-                    if !outcomes.contains_key(session_id) {
-                        outcomes.insert(
-                            session_id.clone(),
-                            Err(std::io::Error::other(message.clone())),
-                        );
-                    }
-                }
-                break;
-            }
-        };
-
         let mut deltas = Vec::new();
-        for (session_id, offset, delta) in reads {
+        for session_id in current_sessions {
+            let offset = offsets.get(&session_id).copied().unwrap_or(0);
+            let delta = session_journal::read_durable_journal_append_delta_for_owner(
+                owner_scope,
+                &session_id,
+                offset,
+            );
             match delta {
                 Ok(delta) if delta.next_offset == offset => {
                     outcomes.insert(session_id, Ok(false));
@@ -686,10 +686,7 @@ async fn reconcile_sync_outbox_journals_for_owner(
             .iter()
             .map(|delta| delta.source_session_id.clone())
             .collect::<Vec<_>>();
-        let batch_outcome = run_sync_outbox_io(store.clone(), move |store| {
-            store.append_journal_deltas(&deltas)
-        })
-        .await;
+        let batch_outcome = store.append_journal_deltas(&deltas);
         match batch_outcome {
             Ok(batch_outcome) => {
                 let mut terminal = false;
@@ -730,7 +727,7 @@ async fn reconcile_sync_outbox_journals_for_owner(
             }
         }
         if !pending.is_empty() && attempt + 1 < STALE_OFFSET_RETRIES {
-            tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+            std::thread::sleep(Duration::from_millis(5 * (attempt as u64 + 1)));
         }
     }
     session_ids
@@ -780,6 +777,7 @@ pub(crate) struct SyncOutboxDrainReport {
     pub failed: u32,
     pub terminal: u32,
     pub remaining_ready: u32,
+    pub remaining_unconfirmed: u32,
     pub blocker: Option<SyncOutboxDrainBlocker>,
 }
 
@@ -791,14 +789,18 @@ pub(crate) enum SyncOutboxDrainBlocker {
     LocalOutboxRead,
     LocalSettlementWrite,
     LocalStatusRead,
+    LocalJournalSync,
+    LocalSyncPending,
 }
 
 impl SyncOutboxDrainBlocker {
     fn retry_delay(self) -> Option<Duration> {
         match self {
-            Self::LocalOutboxRead | Self::LocalSettlementWrite | Self::LocalStatusRead => {
-                Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY)
-            }
+            Self::LocalOutboxRead
+            | Self::LocalSettlementWrite
+            | Self::LocalStatusRead
+            | Self::LocalJournalSync
+            | Self::LocalSyncPending => Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY),
             Self::MissingAccessToken | Self::CloudAccessRequired | Self::InvalidCloudBaseUrl => {
                 None
             }
@@ -838,6 +840,12 @@ impl SyncOutboxDrainReport {
             Some(SyncOutboxDrainBlocker::LocalStatusRead) => {
                 "the remaining local sync status could not be read".to_string()
             }
+            Some(SyncOutboxDrainBlocker::LocalJournalSync) => {
+                "local journal synchronization could not be confirmed".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::LocalSyncPending) => {
+                "recent synchronization is still in progress or unconfirmed".to_string()
+            }
             None if self.failed > 0 && self.terminal > 0 => format!(
                 "{} item(s) will be retried and {} could not be synchronized",
                 self.failed, self.terminal
@@ -862,6 +870,10 @@ impl SyncOutboxDrainReport {
             "Check cloud access if needed, then use /login in this session to resume synchronization."
         } else if self.blocker == Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl) {
             "Check the configured server address."
+        } else if self.blocker == Some(SyncOutboxDrainBlocker::LocalJournalSync) {
+            "Check local storage or run `astra doctor` for details."
+        } else if self.blocker == Some(SyncOutboxDrainBlocker::LocalSyncPending) {
+            "It may continue in the background; check sync status if needed."
         } else if self.blocker.is_some() {
             "Astra will retry. Run `astra doctor` if the problem continues."
         } else {
@@ -895,6 +907,9 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
         return;
     };
     let Some(schedule_guard) = try_claim_sync_outbox_drain_schedule() else {
+        // A running drain may already have observed an empty outbox. Reuse
+        // the existing coalesced wake so a concurrent enqueue is not lost.
+        schedule_sync_outbox_retry_wake(SYNC_OUTBOX_SERVICE_RETRY_DELAY);
         return;
     };
     spawn_detached_tracked(&handle, async move {
@@ -978,28 +993,41 @@ fn schedule_sync_outbox_retry_wake(delay: Duration) {
         return;
     };
     spawn_detached_tracked(&handle, async move {
-        let _wake_guard = wake_guard;
         tokio::time::sleep(delay).await;
-        if SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS
-            .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let wake = {
+            let mut current = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+            if current
+                .as_ref()
+                .is_some_and(|wake| wake.token == wake_guard.token)
+            {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        };
+        drop(wake_guard);
+        if wake {
             schedule_sync_outbox_drain();
         }
     });
 }
 
 fn try_claim_sync_outbox_drain_schedule() -> Option<SyncOutboxDrainScheduleGuard> {
-    let owner = loop {
-        let candidate = SYNC_OUTBOX_NEXT_DRAIN_OWNER.fetch_add(1, Ordering::Relaxed);
-        if candidate != 0 {
-            break candidate;
-        }
-    };
+    let owner = next_sync_outbox_owner();
     SYNC_OUTBOX_DRAIN_OWNER
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .ok()
         .map(|_| SyncOutboxDrainScheduleGuard { owner })
+}
+
+fn next_sync_outbox_owner() -> u64 {
+    loop {
+        let candidate = SYNC_OUTBOX_NEXT_DRAIN_OWNER.fetch_add(1, Ordering::Relaxed);
+        if candidate != 0 {
+            return candidate;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1008,26 +1036,21 @@ fn release_sync_outbox_drain_schedule() {
 }
 
 fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> Option<SyncOutboxRetryWakeGuard> {
-    let mut current = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.load(Ordering::Acquire);
-    loop {
-        if current != 0 && current <= deadline {
-            return None;
-        }
-        match SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange_weak(
-            current,
-            deadline,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(SyncOutboxRetryWakeGuard { deadline }),
-            Err(next) => current = next,
-        }
+    let mut current = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+    if current
+        .as_ref()
+        .is_some_and(|wake| wake.deadline <= deadline)
+    {
+        return None;
     }
+    let token = next_sync_outbox_owner();
+    *current = Some(SyncOutboxRetryWake { deadline, token });
+    Some(SyncOutboxRetryWakeGuard { token })
 }
 
 #[cfg(test)]
 fn release_sync_outbox_retry_wake_schedule() {
-    SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.store(0, Ordering::Release);
+    *recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE) = None;
 }
 
 fn next_sync_outbox_drain_delay(status: &SyncOutboxStatus) -> Option<Duration> {
@@ -1209,6 +1232,10 @@ async fn try_drain_sync_outbox_for_snapshot(
     match run_sync_outbox_io(store.clone(), |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+            report.remaining_unconfirmed = status
+                .pending
+                .saturating_add(status.in_flight)
+                .min(u64::from(u32::MAX)) as u32;
             report.terminal = terminal_sync_items(&status);
             if report.terminal > 0 {
                 notify_sync_issue(&auth_snapshot.owner_scope);
@@ -1311,6 +1338,10 @@ async fn try_drain_sync_outbox_for_snapshot(
     match run_sync_outbox_io(store, |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+            report.remaining_unconfirmed = status
+                .pending
+                .saturating_add(status.in_flight)
+                .min(u64::from(u32::MAX)) as u32;
             report.terminal = report.terminal.max(terminal_sync_items(&status));
         }
         Err(error) => {
@@ -2291,14 +2322,17 @@ pub(crate) fn append_cloud_pull_sync_journal(
     pull: &CloudPullResult,
     pref_keys: &[String],
 ) {
-    append_cloud_pull_sync_journal_with_enqueue(
-        state,
-        profile,
-        source,
-        pull,
-        pref_keys,
-        enqueue_ingestion_pub,
-    );
+    let result = append_cloud_pull_sync_marker(state, profile, source, pull, pref_keys);
+    if let Err(error) = &result {
+        tracing::warn!(?error, "failed to append cloud pull journal marker");
+    }
+    if !matches!(result, Ok(false))
+        && let Some(writer) = matching_session_journal(state)
+    {
+        // An append error can follow a complete write; let the projector
+        // establish what is actually durable before enqueueing anything.
+        schedule_journal_ingestion(writer);
+    }
 }
 
 pub(crate) fn append_cloud_pull_sync_journal_for_immediate_drain(
@@ -2307,67 +2341,71 @@ pub(crate) fn append_cloud_pull_sync_journal_for_immediate_drain(
     source: &str,
     pull: &CloudPullResult,
     pref_keys: &[String],
-) {
-    append_cloud_pull_sync_journal_with_enqueue(
-        state,
-        profile,
-        source,
-        pull,
-        pref_keys,
-        enqueue_ingestion_for_immediate_drain_pub,
-    );
+) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+    let append = append_cloud_pull_sync_marker(state, profile, source, pull, pref_keys);
+    let binding = (!matches!(append, Ok(false)))
+        .then(|| matching_session_journal(state))
+        .flatten()
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    async move {
+        let projection = if let Some((owner, session_id)) = binding {
+            reconcile_sync_outbox_journals_for_owner(&owner, &[session_id])
+                .await
+                .into_iter()
+                .next()
+                .map(|(_, outcome)| outcome.map(|_| ()))
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::other(
+                        "journal projection returned no outcome",
+                    ))
+                })
+        } else {
+            Ok(())
+        };
+        if append.is_err()
+            && let Err(error) = &projection
+        {
+            tracing::warn!(?error, "journal projection also failed after append error");
+        }
+        // An append error can follow a complete write. Reconcile what is
+        // durable, but preserve the original uncertainty for the caller.
+        append.map(|_| ())?;
+        projection
+    }
 }
 
-fn append_cloud_pull_sync_journal_with_enqueue(
+fn matching_session_journal(state: &SessionState) -> Option<&session_journal::JournalWriter> {
+    let writer = state.journal.as_ref()?;
+    (state.session_id.as_deref() == Some(writer.session_id())).then_some(writer)
+}
+
+fn append_cloud_pull_sync_marker(
     state: &SessionState,
     profile: &str,
     source: &str,
     pull: &CloudPullResult,
     pref_keys: &[String],
-    enqueue: fn(&SessionState, &session_journal::JournalEvent),
-) {
+) -> std::io::Result<bool> {
     if !should_append_cloud_pull_journal(pull, pref_keys, source) {
-        return;
+        return Ok(false);
     }
     let Some(sid) = state.session_id.as_deref() else {
-        return;
+        return Ok(false);
     };
+    let writer = matching_session_journal(state).ok_or_else(|| {
+        std::io::Error::other("cloud pull marker has no matching session journal")
+    })?;
     let reachable_empty_ack =
         pull.cloud_reachable && !cloud_pull_warrants_sync_marker(pull, pref_keys);
-    let evt = session_journal::JournalEvent::cloud_pull_sync_marker(
+    let event = session_journal::JournalEvent::cloud_pull_sync_marker(
         Some(sid),
         profile,
         source,
         pref_keys,
         reachable_empty_ack,
     );
-    let Some(writer) = state.journal.as_ref() else {
-        tracing::warn!(
-            session_id = sid,
-            context = "cloud_sync:cloud_pull_sync_marker",
-            "skipping cloud pull sync marker because the live session has no journal"
-        );
-        return;
-    };
-    if writer.session_id() != sid {
-        tracing::error!(
-            session_id = sid,
-            journal_session_id = writer.session_id(),
-            context = "cloud_sync:cloud_pull_sync_marker",
-            "refusing to append a cloud pull marker through another session's journal"
-        );
-        return;
-    }
-    if let Err(error) = writer.append(&evt) {
-        tracing::warn!(
-            session_id = sid,
-            context = "cloud_sync:cloud_pull_sync_marker",
-            ?error,
-            "failed to append session journal event"
-        );
-    } else {
-        enqueue(state, &evt);
-    }
+    writer.append(&event)?;
+    Ok(true)
 }
 
 /// Re-sync preferences and queued edge events after authentication. Login is
@@ -2377,32 +2415,113 @@ pub(crate) async fn post_auth_cloud_resync(
     profile: Option<&str>,
     state: &mut SessionState,
 ) -> SyncOutboxDrainReport {
+    post_auth_cloud_resync_with_wait(profile, state, SYNC_OUTBOX_LOGIN_PROJECTION_WAIT).await
+}
+
+pub(crate) async fn post_auth_cloud_resync_with_wait(
+    profile: Option<&str>,
+    state: &mut SessionState,
+    wait: Duration,
+) -> SyncOutboxDrainReport {
     clear_sync_cloud_access();
     let profile_name = profile.unwrap_or("default");
     let pull = try_cloud_pull(profile_name).await;
     let pref_keys = try_cloud_pull_preferences(state).await;
-    append_cloud_pull_sync_journal_for_immediate_drain(
+    let binding = matching_session_journal(state)
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    let projection = append_cloud_pull_sync_journal_for_immediate_drain(
         state,
         profile_name,
         "post_login",
         &pull,
         &pref_keys,
     );
-    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.is_incomplete() {
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            attempted = report.attempted,
-            acked = report.acked,
-            failed = report.failed,
-            terminal = report.terminal,
-            remaining_ready = report.remaining_ready,
-            blocker = ?report.blocker,
-            "post-authentication cloud sync did not fully converge"
-        );
+    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let cloud_configured = snapshot.native_binding.is_some() || resolve_cloud_base().is_some();
+    let mut job = tokio::spawn(run_post_auth_sync(projection, binding, snapshot.clone()));
+    match tokio::time::timeout(wait, &mut job).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "post-login sync task failed");
+            SyncOutboxDrainReport {
+                cloud_configured,
+                blocker: Some(SyncOutboxDrainBlocker::LocalJournalSync),
+                ..Default::default()
+            }
+        }
+        Err(_) => {
+            // The job still owns projection and will drain when it finishes.
+            // Existing independent backlog can proceed while it waits.
+            if snapshot.is_current() {
+                schedule_sync_outbox_drain();
+            }
+            SyncOutboxDrainReport {
+                cloud_configured,
+                blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
+                ..Default::default()
+            }
+        }
     }
-    if report.blocker.is_none() {
+}
+
+pub(crate) async fn run_post_auth_sync(
+    projection: impl Future<Output = std::io::Result<()>> + Send,
+    binding: Option<(astra_services::OwnerScope, String)>,
+    snapshot: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> SyncOutboxDrainReport {
+    let projection = projection.await;
+    let mut report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &snapshot).await;
+    let can_drain_remaining = report.blocker.is_none();
+    if let Err(error) = projection {
+        tracing::warn!(
+            ?error,
+            "post-login journal synchronization could not be confirmed"
+        );
+        if let Some((owner, session_id)) = &binding {
+            notify_sync_issue(owner);
+            let _ = schedule_sync_outbox_journal_ingestion_for_owner(owner, session_id);
+        }
+        report
+            .blocker
+            .get_or_insert(SyncOutboxDrainBlocker::LocalJournalSync);
+    }
+    let snapshot_current = snapshot.is_current();
+    if !snapshot_current
+        || binding
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &snapshot.owner_scope)
+    {
+        // A new login for the same owner may have observed records while
+        // this task held them in flight. Hand them to the current binding.
+        if astra_services::local_owner_scope() == snapshot.owner_scope
+            && (!snapshot_current || can_drain_remaining)
+        {
+            schedule_sync_outbox_drain();
+        }
+        // A result captured for a prior owner must not describe the
+        // currently attached account or report its token as invalid.
+        return SyncOutboxDrainReport {
+            cloud_configured: report.cloud_configured,
+            blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
+            ..Default::default()
+        };
+    }
+    if report.remaining_unconfirmed > 0 && !report.is_incomplete() {
+        report.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending);
+    }
+    if report.is_incomplete() {
+        tracing::warn!(target: "astra_cli::cloud_sync", attempted = report.attempted,
+                acked = report.acked, failed = report.failed, terminal = report.terminal,
+                remaining_ready = report.remaining_ready, blocker = ?report.blocker,
+                "post-authentication cloud sync did not fully converge");
+    }
+    if can_drain_remaining && snapshot.is_current() {
         schedule_sync_outbox_drain();
+    } else if snapshot.is_current()
+        && let Some(delay) = report.blocker.and_then(SyncOutboxDrainBlocker::retry_delay)
+    {
+        notify_sync_issue(&snapshot.owner_scope);
+        schedule_sync_outbox_drain_after(delay);
     }
     report
 }
@@ -3957,6 +4076,79 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn concurrent_drain_hint_eventually_delivers_after_the_guard_releases() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _journal = ProcessJournalDirGuard::new(temp.path());
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "sync-wake-test",
+            Some("account"),
+        )
+        .unwrap();
+        crate::cli::auth_flow::save_profile_auth_tokens(
+            Some("sync-wake-test"),
+            "user",
+            &crate::cli::auth_flow::AuthTokenPayload {
+                user_id: "account".into(),
+                access_token: "test-token".into(),
+                refresh_token: "test-refresh".into(),
+            },
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let server = runtime.block_on(MockServer::start());
+        temp_env::with_var("ASTRA_API_URL", Some(server.uri()), || {
+            runtime.block_on(async {
+                Mock::given(method("POST")).and(path("/sync/outbox/events"))
+                    .respond_with(|request: &wiremock::Request| {
+                        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        let event = &body["events"][0];
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "schema_version": 1,
+                            "acks": [{"record_id": event["event_id"], "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"], "ingestion_status": "created"}],
+                            "rejections": []
+                        }))
+                    }).expect(1).mount(&server).await;
+                super::clear_sync_cloud_access();
+                release_sync_outbox_drain_schedule();
+                release_sync_outbox_retry_wake_schedule();
+                let guard = try_claim_sync_outbox_drain_schedule().unwrap();
+                let store = SyncOutboxStore::local();
+                store.enqueue_journal_event(&JournalEvent::config_change(Some("wake-session"), "model", "test")).unwrap();
+                super::schedule_sync_outbox_drain();
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_some());
+                tokio::task::yield_now().await;
+                tokio::time::advance(super::SYNC_OUTBOX_SERVICE_RETRY_DELAY).await;
+                tokio::task::yield_now().await;
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_some(),
+                    "a busy wake must schedule another wake");
+                drop(guard);
+                tokio::task::yield_now().await;
+                tokio::time::advance(super::SYNC_OUTBOX_SERVICE_RETRY_DELAY).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if store.status().unwrap().acked == 1 { break; }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("busy hint must eventually deliver after the active drain releases");
+                server.verify().await;
+                release_sync_outbox_drain_schedule();
+                release_sync_outbox_retry_wake_schedule();
+            });
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn blocked_access_stops_new_drains_and_an_existing_retry_wake() {
         use crate::cli::cli_config::cli_utils::{
             cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
@@ -3985,10 +4177,7 @@ mod tests {
                 );
                 tokio::time::advance(Duration::from_secs(30)).await;
                 tokio::task::yield_now().await;
-                assert_eq!(
-                    super::SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.load(super::Ordering::Acquire),
-                    0
-                );
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_none());
                 drop(
                     try_claim_sync_outbox_drain_schedule()
                         .expect("old wake must not schedule a drain"),
@@ -4043,6 +4232,21 @@ mod tests {
         );
         drop(current);
         assert!(claim_sync_outbox_retry_wake_deadline(150).is_some());
+        release_sync_outbox_retry_wake_schedule();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn stale_retry_wake_guard_cannot_clear_a_reused_deadline() {
+        release_sync_outbox_retry_wake_schedule();
+        let stale = claim_sync_outbox_retry_wake_deadline(200).unwrap();
+        let earlier = claim_sync_outbox_retry_wake_deadline(100).unwrap();
+        drop(earlier);
+        let current = claim_sync_outbox_retry_wake_deadline(200).unwrap();
+        drop(stale);
+        assert!(claim_sync_outbox_retry_wake_deadline(300).is_none());
+        drop(current);
+        assert!(claim_sync_outbox_retry_wake_deadline(300).is_some());
         release_sync_outbox_retry_wake_schedule();
     }
 
