@@ -2527,11 +2527,15 @@ impl ThinClient {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || (status.is_server_error() && resp.headers().contains_key(header::RETRY_AFTER))
+        {
             let retry_after_seconds =
                 parse_retry_after(resp.headers(), std::time::SystemTime::now());
             let body = resp.text().await?;
-            return Err(ThinClientError::SyncOutboxRateLimited {
+            return Err(ThinClientError::SyncOutboxBackpressure {
+                status,
                 body,
                 retry_after_seconds,
             });

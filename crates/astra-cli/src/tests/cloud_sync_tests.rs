@@ -330,10 +330,13 @@ async fn drain_reports_existing_rejections_and_skipped_events_without_ready_work
     let store = SyncOutboxStore::local();
     let record = store.ready_records(1).unwrap().pop().unwrap();
     store
-        .settle_delivery_batch(&[astra_services::SyncOutboxDeliverySettlement::Rejected {
-            record_id: record.record_id,
-            error: "invalid event".into(),
-        }])
+        .settle_delivery_batch(
+            &[astra_services::SyncOutboxDeliverySettlement::Rejected {
+                record_id: record.record_id,
+                error: "invalid event".into(),
+            }],
+            None,
+        )
         .unwrap();
     store
         .record_skipped_journal_event(
@@ -350,6 +353,209 @@ async fn drain_reports_existing_rejections_and_skipped_events_without_ready_work
     let status = cloud_sync::read_sync_outbox_status().await.unwrap();
     assert_eq!(status.poisoned, 1);
     assert_eq!(status.skipped, 1);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn newly_rejected_sync_notifies_the_running_session_after_persistence() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let mut notices = cloud_sync::subscribe_sync_issues();
+    let store = SyncOutboxStore::local();
+    store
+        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            Some("sync-warning-session"),
+            "model",
+            "test",
+        ))
+        .unwrap();
+    let record = store.ready_records(1).unwrap().pop().unwrap();
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": 1,
+            "acks": [],
+            "rejections": [{
+                "record_id": record.record_id,
+                "error_code": "invalid_record",
+                "detail": "invalid event"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(report.terminal, 1);
+    assert_eq!(store.status().unwrap().poisoned, 1);
+    assert_eq!(
+        notices.try_recv().unwrap(),
+        astra_services::local_owner_scope()
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn rate_limit_pauses_newly_queued_sessions_until_the_server_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _auth = install_test_cloud_auth(Some("token"));
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+        .mount(&server)
+        .await;
+    let store = SyncOutboxStore::local();
+    for index in 0..20 {
+        store
+            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+                Some(&format!("rate-limit-{index}")),
+                "model",
+                "test",
+            ))
+            .unwrap();
+    }
+
+    let report = cloud_sync::try_drain_sync_outbox(64).await;
+    assert_eq!(report.failed, 20);
+    let first_requests = server.received_requests().await.unwrap().len();
+    assert!((1..=8).contains(&first_requests));
+    store
+        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            Some("rate-limit-new"),
+            "model",
+            "test",
+        ))
+        .unwrap();
+    assert_eq!(SyncOutboxStore::local().status().unwrap().claimable, 0);
+    assert_eq!(cloud_sync::try_drain_sync_outbox(64).await.attempted, 0);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        first_requests
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn background_sync_uses_a_full_protocol_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let store = SyncOutboxStore::local();
+    let events = (0..astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS)
+        .map(|index| {
+            session_journal::JournalEvent::config_change(
+                Some("full-sync-batch"),
+                "model",
+                &format!("model-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store.enqueue_journal_events(&events).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let acks = body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    json!({
+                        "record_id": event["event_id"],
+                        "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
+                        "ingestion_status": "created"
+                    })
+                })
+                .collect::<Vec<_>>();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"schema_version":1,"acks":acks,"rejections":[]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    cloud_sync::schedule_sync_outbox_drain();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if store.status().unwrap().acked == events.len() as u64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background drain should settle its full batch");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["events"].as_array().unwrap().len(), events.len());
+    server.verify().await;
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
+    use fs2::FileExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let store = SyncOutboxStore::local();
+    store
+        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            Some("lock-recovery"),
+            "model",
+            "test",
+        ))
+        .unwrap();
+    let record = store.ready_records(1).unwrap().remove(0);
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": 1,
+            "acks": [{"record_id": record.record_id, "payload_hash": record.payload_hash, "ingestion_status": "created"}],
+            "rejections": []
+        })))
+        .expect(1).mount(&server).await;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(store.path().parent().unwrap().join("outbox.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let mut notices = cloud_sync::subscribe_sync_issues();
+    cloud_sync::schedule_sync_outbox_drain();
+    let owner = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
+        .await
+        .expect("lock failure should be reported")
+        .unwrap();
+    assert_eq!(owner, astra_services::local_owner_scope());
+    lock.unlock().unwrap();
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(17)).await;
+    tokio::time::resume();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if store.status().unwrap().acked == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending record should sync after the local lock is released");
+    server.verify().await;
 }
 
 #[serial_test::serial]
@@ -1019,7 +1225,15 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
     let store = SyncOutboxStore::local();
     let scale = std::env::var_os("ASTRA_TEST_SYNC_1000_SESSIONS").is_some();
     let sessions = if scale { 1_000 } else { 1 };
-    let turns = if scale { 1 } else { 2 };
+    let turns: u32 = std::env::var("ASTRA_TEST_SYNC_TURNS")
+        .ok()
+        .map(|value| value.parse().expect("valid turn count"))
+        .unwrap_or(if scale { 1 } else { 2 });
+    let drain_limit: usize = std::env::var("ASTRA_TEST_SYNC_DRAIN_LIMIT")
+        .ok()
+        .map(|value| value.parse().expect("valid drain limit"))
+        .unwrap_or(64);
+    assert!(turns > 0 && drain_limit > 0);
     let mut journal_events = Vec::new();
     for _ in 0..sessions {
         let session = uuid::Uuid::new_v4().to_string();
@@ -1038,7 +1252,7 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
         }
     }
     store.enqueue_journal_events(&journal_events).unwrap();
-    if !scale {
+    if !scale && turns == 2 && drain_limit == 64 {
         let record = store.ready_records(1).unwrap().remove(0);
         let valid = json!({
             "event_id": record.record_id,
@@ -1071,7 +1285,7 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
     let start = std::time::Instant::now();
     let mut acked = 0;
     while acked < journal_events.len() {
-        let report = cloud_sync::try_drain_sync_outbox(64).await;
+        let report = cloud_sync::try_drain_sync_outbox(drain_limit).await;
         assert!(
             report.attempted > 0,
             "sync drain stopped making progress: {report:?}; outbox: {:?}",
@@ -1135,8 +1349,12 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
         store.status().unwrap().ack_watermark,
         journal_events.len() as u64
     );
-    assert_eq!(proxy.writes.load(Ordering::Relaxed), sessions);
-    assert_eq!(proxy.reads.load(Ordering::Relaxed), sessions);
+    if sessions == 1 || turns == 1 {
+        let batch_size = drain_limit.min(astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS);
+        let expected_requests = sessions * (turns as usize).div_ceil(batch_size);
+        assert_eq!(proxy.writes.load(Ordering::Relaxed), expected_requests);
+        assert_eq!(proxy.reads.load(Ordering::Relaxed), expected_requests);
+    }
     let peak = proxy.peak_active.load(Ordering::Relaxed);
     assert!(peak <= 8, "session concurrency must stay bounded");
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ?")
@@ -1145,9 +1363,9 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
         .await
         .unwrap();
     assert_eq!(count, journal_events.len() as i64);
-    if scale {
+    if scale || turns != 2 || drain_limit != 64 {
         eprintln!(
-            "1000-session lost-ACK workload: {}ms, {} writes, {} reconciliations, peak {} concurrent",
+            "lost-ACK workload: {sessions} sessions, {turns} turns, drain limit {drain_limit}, {}ms, {} writes, {} reconciliations, peak {} concurrent",
             start.elapsed().as_millis(),
             proxy.writes.load(Ordering::Relaxed),
             proxy.reads.load(Ordering::Relaxed),

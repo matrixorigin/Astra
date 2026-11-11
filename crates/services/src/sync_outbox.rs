@@ -14,7 +14,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -146,6 +146,10 @@ pub fn sync_outbox_canonical_payload_hash(payload: &Value) -> String {
 pub struct SyncOutboxFile {
     pub schema_version: u32,
     pub ack_watermark: u64,
+    /// Server-wide backpressure applies to newly queued records and other
+    /// processes as well as the batch which observed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_retry_after_unix_ms: Option<u64>,
     /// Per-source byte watermark for canonical session journals. The outbox is
     /// a derived delivery projection, so a process can recover a lost
     /// in-memory enqueue by replaying only journal bytes beyond this offset.
@@ -187,6 +191,7 @@ impl Default for SyncOutboxFile {
         Self {
             schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
             ack_watermark: 0,
+            delivery_retry_after_unix_ms: None,
             journal_source_offsets: BTreeMap::new(),
             acked_tombstones: Vec::new(),
             skipped_records: Vec::new(),
@@ -263,6 +268,16 @@ pub enum SyncOutboxDeliverySettlement {
         /// Server-directed delay; `None` uses the local retry default.
         retry_after: Option<std::time::Duration>,
     },
+}
+
+impl SyncOutboxDeliverySettlement {
+    fn record_id(&self) -> &str {
+        match self {
+            Self::Ack { record_id, .. }
+            | Self::Rejected { record_id, .. }
+            | Self::Deferred { record_id, .. } => record_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -373,10 +388,11 @@ impl SyncOutboxStore {
             .map(|event| build_record(event, 0, now))
             .collect::<std::io::Result<Vec<_>>>()?;
         self.with_state(|state| {
-            candidates
+            let mut index = EnqueueIndex::new(state, candidates.iter());
+            Ok(candidates
                 .into_iter()
-                .map(|candidate| enqueue_candidate(state, candidate, now))
-                .collect()
+                .map(|candidate| index.enqueue(state, candidate, now))
+                .collect())
         })
     }
 
@@ -488,6 +504,10 @@ impl SyncOutboxStore {
 
         self.with_state(|state| {
             let mut outcomes = BTreeMap::new();
+            let mut index = EnqueueIndex::new(
+                state,
+                prepared.iter().flat_map(|delta| delta.candidates.iter()),
+            );
             for delta in prepared {
                 let actual_offset = state
                     .journal_source_offsets
@@ -506,7 +526,7 @@ impl SyncOutboxStore {
                 let mut duplicates = 0;
                 let mut poisoned = 0;
                 for candidate in delta.candidates {
-                    match enqueue_candidate(state, candidate, now)? {
+                    match index.enqueue(state, candidate, now) {
                         SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
                         SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
                         SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
@@ -565,33 +585,55 @@ impl SyncOutboxStore {
             else {
                 return Ok(SyncOutboxAckOutcome::NotFound);
             };
-            let outcome = acknowledge_record(&mut state.records[index], payload_hash, unix_ms()?);
-            state.recompute_ack_watermark();
-            Ok(outcome)
+            Ok(acknowledge_record(
+                &mut state.records[index],
+                payload_hash,
+                unix_ms()?,
+            ))
         })
     }
 
     pub fn settle_delivery_batch(
         &self,
         settlements: &[SyncOutboxDeliverySettlement],
+        service_retry_after: Option<std::time::Duration>,
     ) -> std::io::Result<SyncOutboxSettlementReport> {
         self.with_state(|state| {
             let now = unix_ms()?;
+            if let Some(delay) = service_retry_after {
+                let delay_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+                let retry_at = now.saturating_add(delay_ms);
+                state.delivery_retry_after_unix_ms = Some(
+                    state
+                        .delivery_retry_after_unix_ms
+                        .unwrap_or(0)
+                        .max(retry_at),
+                );
+            }
             let mut report = SyncOutboxSettlementReport::default();
+            // Index only the current batch, then scan the outbox once. Looking
+            // through the whole backlog for each settlement is quadratic.
+            let mut positions = settlements
+                .iter()
+                .map(|settlement| (settlement.record_id(), None))
+                .collect::<HashMap<_, _>>();
+            for (index, record) in state.records.iter().enumerate() {
+                if let Some(position) = positions.get_mut(record.record_id.as_str()) {
+                    position.get_or_insert(index);
+                }
+            }
             for settlement in settlements {
-                match settlement {
-                    SyncOutboxDeliverySettlement::Ack {
-                        record_id,
-                        payload_hash,
-                    } => {
-                        let Some(record) = state
-                            .records
-                            .iter_mut()
-                            .find(|record| record.record_id.as_str() == record_id.as_str())
-                        else {
-                            report.missing = report.missing.saturating_add(1);
-                            continue;
-                        };
+                let Some(record) = positions
+                    .get(settlement.record_id())
+                    .copied()
+                    .flatten()
+                    .and_then(|index| state.records.get_mut(index))
+                else {
+                    report.missing = report.missing.saturating_add(1);
+                    continue;
+                };
+                let updated = match settlement {
+                    SyncOutboxDeliverySettlement::Ack { payload_hash, .. } => {
                         match acknowledge_record(record, Some(payload_hash.as_str()), now) {
                             SyncOutboxAckOutcome::Acked { .. }
                             | SyncOutboxAckOutcome::DuplicateAck { .. } => {
@@ -604,41 +646,23 @@ impl SyncOutboxStore {
                                 report.missing = report.missing.saturating_add(1);
                             }
                         }
+                        None
                     }
-                    SyncOutboxDeliverySettlement::Rejected { record_id, error }
-                    | SyncOutboxDeliverySettlement::Deferred {
-                        record_id, error, ..
-                    } => {
-                        let Some(record) = state
-                            .records
-                            .iter_mut()
-                            .find(|record| record.record_id.as_str() == record_id.as_str())
-                        else {
-                            report.missing = report.missing.saturating_add(1);
-                            continue;
-                        };
-                        let updated = match settlement {
-                            SyncOutboxDeliverySettlement::Rejected { .. } => {
-                                apply_delivery_rejection(record, error, now)
-                            }
-                            SyncOutboxDeliverySettlement::Deferred { retry_after, .. } => {
-                                apply_delivery_deferral(record, error, now, *retry_after)
-                            }
-                            SyncOutboxDeliverySettlement::Ack { .. } => unreachable!(),
-                        };
-                        if updated {
-                            if record.state == SyncOutboxRecordState::Poisoned {
-                                report.poisoned = report.poisoned.saturating_add(1);
-                            } else {
-                                report.failed = report.failed.saturating_add(1);
-                            }
-                        } else if record.state == SyncOutboxRecordState::Poisoned {
-                            report.poisoned = report.poisoned.saturating_add(1);
-                        }
+                    SyncOutboxDeliverySettlement::Rejected { error, .. } => {
+                        Some(apply_delivery_rejection(record, error, now))
+                    }
+                    SyncOutboxDeliverySettlement::Deferred {
+                        error, retry_after, ..
+                    } => Some(apply_delivery_deferral(record, error, now, *retry_after)),
+                };
+                if let Some(updated) = updated {
+                    if record.state == SyncOutboxRecordState::Poisoned {
+                        report.poisoned = report.poisoned.saturating_add(1);
+                    } else if updated {
+                        report.failed = report.failed.saturating_add(1);
                     }
                 }
             }
-            state.recompute_ack_watermark();
             Ok(report)
         })
     }
@@ -653,13 +677,25 @@ impl SyncOutboxStore {
     ) -> std::io::Result<Vec<SyncOutboxRecord>> {
         let now = unix_ms()?;
         self.with_state(|state| {
+            if state
+                .delivery_retry_after_unix_ms
+                .is_some_and(|deadline| deadline > now)
+            {
+                return Ok(Vec::new());
+            }
+            state.delivery_retry_after_unix_ms = None;
             let mut indices = Vec::new();
             let mut claimed_bytes = 0usize;
+            let mut sessions = HashMap::<&str, usize>::new();
             for index in claimable_record_indices(&state.records, now) {
                 if indices.len() >= limit {
                     break;
                 }
                 let record = &state.records[index];
+                let count = sessions.entry(record.session_id.as_str()).or_default();
+                if *count >= astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS {
+                    continue;
+                }
                 let record_bytes = serde_json::to_vec(record)
                     .map_err(std::io::Error::other)?
                     .len();
@@ -670,7 +706,9 @@ impl SyncOutboxStore {
                 }
                 claimed_bytes = claimed_bytes.saturating_add(record_bytes);
                 indices.push(index);
+                *count += 1;
             }
+            drop(sessions);
             let mut claimed = Vec::with_capacity(indices.len());
             for index in indices {
                 let record = &mut state.records[index];
@@ -693,6 +731,12 @@ impl SyncOutboxStore {
     pub fn ready_records(&self, limit: usize) -> std::io::Result<Vec<SyncOutboxRecord>> {
         self.with_state_readonly(|state| {
             let now = unix_ms()?;
+            if state
+                .delivery_retry_after_unix_ms
+                .is_some_and(|deadline| deadline > now)
+            {
+                return Ok(Vec::new());
+            }
             Ok(claimable_record_indices(&state.records, now)
                 .take(limit)
                 .map(|index| state.records[index].clone())
@@ -711,6 +755,7 @@ impl SyncOutboxStore {
         let path = self.path();
         self.locked(|state| {
             let result = f(state)?;
+            // Compaction also recomputes the watermark once after all updates.
             state.compact_acked_tail();
             state.compact_skipped_records();
             write_state(&path, state)?;
@@ -777,80 +822,112 @@ impl SyncOutboxStore {
     }
 }
 
-fn enqueue_candidate(
-    state: &mut SyncOutboxFile,
-    candidate: SyncOutboxRecord,
-    now: u64,
-) -> std::io::Result<SyncOutboxEnqueueOutcome> {
-    if let Some(index) = state
-        .records
-        .iter()
-        .position(|record| record.record_id == candidate.record_id)
-    {
-        let existing = &mut state.records[index];
-        if existing.payload_hash == candidate.payload_hash {
-            return Ok(SyncOutboxEnqueueOutcome::Duplicate {
+/// Transaction-local lookup for the submitted records, not another durable
+/// index. Batch enqueue must not rescan the complete backlog for each event.
+struct EnqueueIndex {
+    positions: HashMap<String, (Option<usize>, Option<usize>)>,
+    next_sequence: u64,
+}
+
+impl EnqueueIndex {
+    fn new<'a>(
+        state: &SyncOutboxFile,
+        candidates: impl Iterator<Item = &'a SyncOutboxRecord>,
+    ) -> Self {
+        let mut positions = candidates
+            .map(|candidate| (candidate.record_id.clone(), (None, None)))
+            .collect::<HashMap<_, _>>();
+        for (index, record) in state.records.iter().enumerate() {
+            if let Some((position, _)) = positions.get_mut(&record.record_id) {
+                position.get_or_insert(index);
+            }
+        }
+        for (index, tombstone) in state.acked_tombstones.iter().enumerate() {
+            if let Some((_, position)) = positions.get_mut(&tombstone.record_id) {
+                position.get_or_insert(index);
+            }
+        }
+        Self {
+            positions,
+            next_sequence: state.next_sequence(),
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        state: &mut SyncOutboxFile,
+        candidate: SyncOutboxRecord,
+        now: u64,
+    ) -> SyncOutboxEnqueueOutcome {
+        let position = self
+            .positions
+            .get_mut(&candidate.record_id)
+            .expect("the transaction indexed all submitted records");
+        if let Some(index) = position.0 {
+            let existing = &mut state.records[index];
+            if existing.payload_hash == candidate.payload_hash {
+                return SyncOutboxEnqueueOutcome::Duplicate {
+                    record_id: existing.record_id.clone(),
+                    sequence: existing.sequence,
+                };
+            }
+            existing.state = SyncOutboxRecordState::Poisoned;
+            existing.last_error = Some(format!(
+                "same stable event id has different payload hash: existing={} incoming={}",
+                existing.payload_hash, candidate.payload_hash
+            ));
+            existing.updated_at_unix_ms = now;
+            return SyncOutboxEnqueueOutcome::Poisoned {
                 record_id: existing.record_id.clone(),
                 sequence: existing.sequence,
-            });
+            };
         }
-        existing.state = SyncOutboxRecordState::Poisoned;
-        existing.last_error = Some(format!(
-            "same stable event id has different payload hash: existing={} incoming={}",
-            existing.payload_hash, candidate.payload_hash
-        ));
-        existing.updated_at_unix_ms = now;
-        let outcome = SyncOutboxEnqueueOutcome::Poisoned {
-            record_id: existing.record_id.clone(),
-            sequence: existing.sequence,
-        };
-        state.recompute_ack_watermark();
-        return Ok(outcome);
-    }
-    if let Some(tombstone) = state
-        .acked_tombstones
-        .iter()
-        .find(|tombstone| tombstone.record_id == candidate.record_id)
-    {
-        if !tombstone.payload_hash.is_empty() && tombstone.payload_hash == candidate.payload_hash {
-            return Ok(SyncOutboxEnqueueOutcome::Duplicate {
-                record_id: tombstone.record_id.clone(),
-                sequence: tombstone.sequence,
+        if let Some(index) = position.1 {
+            let tombstone = &state.acked_tombstones[index];
+            if !tombstone.payload_hash.is_empty()
+                && tombstone.payload_hash == candidate.payload_hash
+            {
+                return SyncOutboxEnqueueOutcome::Duplicate {
+                    record_id: tombstone.record_id.clone(),
+                    sequence: tombstone.sequence,
+                };
+            }
+
+            let mut record = candidate;
+            record.sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            record.state = SyncOutboxRecordState::Poisoned;
+            record.last_error = Some(if tombstone.payload_hash.is_empty() {
+                format!(
+                    "compacted ack tombstone payload hash missing: record_id={}",
+                    tombstone.record_id
+                )
+            } else {
+                format!(
+                    "compacted ack tombstone payload hash mismatch: tombstone={} incoming={}",
+                    tombstone.payload_hash, record.payload_hash
+                )
             });
+            let outcome = SyncOutboxEnqueueOutcome::Poisoned {
+                record_id: record.record_id.clone(),
+                sequence: record.sequence,
+            };
+            position.0 = Some(state.records.len());
+            state.records.push(record);
+            return outcome;
         }
 
         let mut record = candidate;
-        record.sequence = state.next_sequence();
-        record.state = SyncOutboxRecordState::Poisoned;
-        record.last_error = Some(if tombstone.payload_hash.is_empty() {
-            format!(
-                "compacted ack tombstone payload hash missing: record_id={}",
-                tombstone.record_id
-            )
-        } else {
-            format!(
-                "compacted ack tombstone payload hash mismatch: tombstone={} incoming={}",
-                tombstone.payload_hash, record.payload_hash
-            )
-        });
-        let outcome = SyncOutboxEnqueueOutcome::Poisoned {
+        record.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let outcome = SyncOutboxEnqueueOutcome::Inserted {
             record_id: record.record_id.clone(),
             sequence: record.sequence,
         };
+        position.0 = Some(state.records.len());
         state.records.push(record);
-        state.recompute_ack_watermark();
-        return Ok(outcome);
+        outcome
     }
-
-    let mut record = candidate;
-    record.sequence = state.next_sequence();
-    let outcome = SyncOutboxEnqueueOutcome::Inserted {
-        record_id: record.record_id.clone(),
-        sequence: record.sequence,
-    };
-    state.records.push(record);
-    state.recompute_ack_watermark();
-    Ok(outcome)
 }
 
 fn lock_exclusive_with_timeout(lock: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
@@ -1195,7 +1272,12 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
             .map(|record| record.event_type.clone()),
         ..Default::default()
     };
-    status.claimable = claimable_record_indices(&state.records, now).count() as u64;
+    let service_retry = state
+        .delivery_retry_after_unix_ms
+        .filter(|deadline| *deadline > now);
+    if service_retry.is_none() {
+        status.claimable = claimable_record_indices(&state.records, now).count() as u64;
+    }
     for record in &state.records {
         match record.state {
             SyncOutboxRecordState::Pending => {
@@ -1249,6 +1331,11 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
         }
     }
     let open_backlog = status.pending.saturating_add(status.in_flight);
+    if open_backlog > 0
+        && let Some(deadline) = service_retry
+    {
+        status.next_retry_after_unix_ms = Some(deadline);
+    }
     status.pending_high_watermark_exceeded = open_backlog > status.pending_high_watermark;
     status.degraded = status.poisoned > 0
         || status.retry_deferred > 0
@@ -1838,11 +1925,14 @@ mod tests {
 
         let before_deferral = unix_ms().expect("time");
         store
-            .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Deferred {
-                record_id: deferred_id,
-                error: "offline".into(),
-                retry_after: Some(std::time::Duration::from_secs(120)),
-            }])
+            .settle_delivery_batch(
+                &[SyncOutboxDeliverySettlement::Deferred {
+                    record_id: deferred_id,
+                    error: "offline".into(),
+                    retry_after: Some(std::time::Duration::from_secs(120)),
+                }],
+                None,
+            )
             .expect("defer");
         let ready = store.ready_records(10).expect("ready records");
         assert_eq!(ready.len(), 1);
@@ -1968,6 +2058,59 @@ mod tests {
     }
 
     #[test]
+    fn service_retry_deadline_blocks_new_records_and_other_store_handles() {
+        let (_temp, _guard, store) = test_store();
+        store.enqueue_journal_event(&event("first")).unwrap();
+        let claimed = store.claim_ready_records(1, usize::MAX).unwrap();
+        store
+            .settle_delivery_batch(
+                &[SyncOutboxDeliverySettlement::Deferred {
+                    record_id: claimed[0].record_id.clone(),
+                    error: "service unavailable".into(),
+                    retry_after: Some(Duration::from_secs(32)),
+                }],
+                Some(Duration::from_secs(60)),
+            )
+            .unwrap();
+        let mut later = event("later");
+        later.session_id = Some("another-session".into());
+        store.enqueue_journal_event(&later).unwrap();
+
+        let other = SyncOutboxStore::local();
+        let status = other.status().unwrap();
+        assert_eq!(status.pending, 2);
+        assert_eq!(status.claimable, 0);
+        assert!(status.next_retry_after_unix_ms.unwrap() > unix_ms().unwrap());
+        assert!(other.claim_ready_records(2, usize::MAX).unwrap().is_empty());
+
+        // Once the service pause expires, new sessions can advance while the
+        // individual failed session still waits for its own retry deadline.
+        store
+            .with_state(|state| {
+                state.delivery_retry_after_unix_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let first = other.claim_ready_records(2, usize::MAX).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].session_id, "another-session");
+        store
+            .with_state(|state| {
+                state
+                    .records
+                    .iter_mut()
+                    .find(|record| record.record_id == claimed[0].record_id)
+                    .unwrap()
+                    .next_retry_after_unix_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let second = other.claim_ready_records(2, usize::MAX).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].session_id, "sess-1");
+    }
+
+    #[test]
     fn unresolved_session_prefix_blocks_later_records_but_not_other_sessions() {
         let (_temp, _guard, store) = test_store();
         let mut events = (0..65)
@@ -1997,7 +2140,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         store
-            .settle_delivery_batch(&deferred)
+            .settle_delivery_batch(&deferred, None)
             .expect("defer prefix");
         let status = store.status().expect("status");
         assert_eq!(status.claimable, 0);
@@ -2043,10 +2186,44 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        store.settle_delivery_batch(&terminal).unwrap();
+        store.settle_delivery_batch(&terminal, None).unwrap();
         let last = store.claim_ready_records(64, usize::MAX).unwrap();
         assert_eq!(last.len(), 1);
         assert_eq!(last[0].sequence, 65);
+    }
+
+    #[test]
+    fn large_session_backlog_does_not_exclude_independent_sessions() {
+        let (_temp, _guard, store) = test_store();
+        let mut events = (0..=astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS)
+            .map(|index| event(&format!("large-session-{index}")))
+            .collect::<Vec<_>>();
+        let mut independent = event("independent");
+        independent.session_id = Some("independent-session".into());
+        events.push(independent);
+        store.enqueue_journal_events(&events).unwrap();
+
+        let claimed = store.claim_ready_records(800, usize::MAX).unwrap();
+        assert_eq!(
+            claimed.len(),
+            astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS + 1
+        );
+        assert!(
+            claimed
+                .iter()
+                .any(|record| record.session_id == "independent-session")
+        );
+        let settlements = claimed
+            .into_iter()
+            .map(|record| SyncOutboxDeliverySettlement::Ack {
+                record_id: record.record_id,
+                payload_hash: record.payload_hash,
+            })
+            .collect::<Vec<_>>();
+        store.settle_delivery_batch(&settlements, None).unwrap();
+        let remaining = store.claim_ready_records(800, usize::MAX).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "sess-1");
     }
 
     #[test]
@@ -2095,11 +2272,14 @@ mod tests {
             assert_eq!(claimed.len(), 1);
             assert_eq!(claimed[0].record_id, record_id);
             let report = store
-                .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Deferred {
-                    record_id: record_id.clone(),
-                    error: "temporary cloud outage".to_string(),
-                    retry_after: None,
-                }])
+                .settle_delivery_batch(
+                    &[SyncOutboxDeliverySettlement::Deferred {
+                        record_id: record_id.clone(),
+                        error: "temporary cloud outage".to_string(),
+                        retry_after: None,
+                    }],
+                    None,
+                )
                 .expect("defer delivery");
             assert_eq!(report.failed, 1);
             assert_eq!(report.poisoned, 0);
@@ -2126,10 +2306,13 @@ mod tests {
         store.enqueue_journal_event(&event("rejected")).unwrap();
         let records = store.ready_records(10).unwrap();
         store
-            .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Rejected {
-                record_id: records[1].record_id.clone(),
-                error: "delivery failed".into(),
-            }])
+            .settle_delivery_batch(
+                &[SyncOutboxDeliverySettlement::Rejected {
+                    record_id: records[1].record_id.clone(),
+                    error: "delivery failed".into(),
+                }],
+                None,
+            )
             .unwrap();
 
         let path = store.path();
@@ -2187,17 +2370,20 @@ mod tests {
             .len();
 
         let report = store
-            .settle_delivery_batch(&[
-                SyncOutboxDeliverySettlement::Ack {
-                    record_id: ack_id,
-                    payload_hash: ack_hash.clone(),
-                },
-                SyncOutboxDeliverySettlement::Deferred {
-                    record_id: fail_id,
-                    error: "temporary outage".to_string(),
-                    retry_after: None,
-                },
-            ])
+            .settle_delivery_batch(
+                &[
+                    SyncOutboxDeliverySettlement::Ack {
+                        record_id: ack_id,
+                        payload_hash: ack_hash.clone(),
+                    },
+                    SyncOutboxDeliverySettlement::Deferred {
+                        record_id: fail_id,
+                        error: "temporary outage".to_string(),
+                        retry_after: None,
+                    },
+                ],
+                None,
+            )
             .expect("settle");
 
         let bytes_after_ack = std::fs::metadata(store.path())
@@ -2234,6 +2420,35 @@ mod tests {
     }
 
     #[test]
+    fn settlement_keeps_ack_when_the_same_record_is_later_deferred() {
+        let (_temp, _guard, store) = test_store();
+        store.enqueue_journal_event(&event("ack")).unwrap();
+        let record = store.claim_ready_records(1, usize::MAX).unwrap().remove(0);
+        let report = store
+            .settle_delivery_batch(
+                &[
+                    SyncOutboxDeliverySettlement::Ack {
+                        record_id: record.record_id.clone(),
+                        payload_hash: record.payload_hash,
+                    },
+                    SyncOutboxDeliverySettlement::Deferred {
+                        record_id: record.record_id,
+                        error: "old request stopped".into(),
+                        retry_after: None,
+                    },
+                    SyncOutboxDeliverySettlement::Rejected {
+                        record_id: "missing".into(),
+                        error: "missing".into(),
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+        assert_eq!((report.acked, report.failed, report.missing), (1, 0, 1));
+        assert_eq!(store.status().unwrap().acked, 1);
+    }
+
+    #[test]
     fn settle_delivery_batch_isolates_record_failure_without_replaying_sibling_ack() {
         let (_temp, _guard, store) = test_store();
         let SyncOutboxEnqueueOutcome::Inserted {
@@ -2262,16 +2477,19 @@ mod tests {
             .clone();
 
         let report = store
-            .settle_delivery_batch(&[
-                SyncOutboxDeliverySettlement::Ack {
-                    record_id: ack_id,
-                    payload_hash: ack_hash,
-                },
-                SyncOutboxDeliverySettlement::Rejected {
-                    record_id: fail_id.clone(),
-                    error: "invalid record".to_string(),
-                },
-            ])
+            .settle_delivery_batch(
+                &[
+                    SyncOutboxDeliverySettlement::Ack {
+                        record_id: ack_id,
+                        payload_hash: ack_hash,
+                    },
+                    SyncOutboxDeliverySettlement::Rejected {
+                        record_id: fail_id.clone(),
+                        error: "invalid record".to_string(),
+                    },
+                ],
+                None,
+            )
             .expect("settle");
 
         assert_eq!(report.acked, 1);
@@ -2320,10 +2538,13 @@ mod tests {
         };
 
         store
-            .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Rejected {
-                record_id: poisoned_id,
-                error: "permanent failure".into(),
-            }])
+            .settle_delivery_batch(
+                &[SyncOutboxDeliverySettlement::Rejected {
+                    record_id: poisoned_id,
+                    error: "permanent failure".into(),
+                }],
+                None,
+            )
             .expect("reject record");
         store.acknowledge(&acked_id, None).expect("ack second");
 

@@ -219,8 +219,11 @@ fn native_interaction_error(
                 status.as_u16()
             ));
         }
-        E::SyncOutboxRateLimited { .. } => {
-            return D::Error("native interaction server rejection (HTTP 429)".to_string());
+        E::SyncOutboxBackpressure { status, .. } => {
+            return D::Error(format!(
+                "native interaction server rejection (HTTP {})",
+                status.as_u16()
+            ));
         }
         E::InvalidBaseUrl(_) | E::InvalidInput(_) => "configuration",
         E::SessionCancellationPending { .. } => "cancellation pending",

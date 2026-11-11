@@ -17,9 +17,10 @@ pub enum ThinClientError {
         status: reqwest::StatusCode,
         body: String,
     },
-    /// A sync endpoint rejected the request with a typed rate-limit delay.
-    #[error("HTTP 429: {body}")]
-    SyncOutboxRateLimited {
+    /// Retry advice from rate limiting or a server error.
+    #[error("HTTP {status}: {body}")]
+    SyncOutboxBackpressure {
+        status: reqwest::StatusCode,
         body: String,
         retry_after_seconds: Option<u64>,
     },

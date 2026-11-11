@@ -81,21 +81,34 @@ event_id)` order; writes preserve the database's microsecond timestamp precision
 The batch protocol and hash ownership require a fresh sync-data cutover from
 the former single-record protocol; pre-cutover event rows are not silently
 reinterpreted as verified sync receipts. A lost response remains retryable until
-an owner-scoped reconciliation proves the result. Permanent record and
-request-level rejections are quarantined immediately so they cannot block later
-batches forever. HTTP 401/403 pause background delivery for the current login;
+an owner-scoped reconciliation proves the result. Only authoritative permanent
+record-level rejections are quarantined; request-level failures leave records
+pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
+oversized singleton pending for the deployment to be corrected. Newly terminal
+sync failures are reported to an active TUI after they are persisted. Local
+outbox I/O failures also produce a warning and remain eligible for bounded
+background retry.
+HTTP 401/403 pause background delivery for the current login;
 the TUI reports the access problem, and records remain pending and immediately
 claimable after a new login. This pause is process-local: restart probes once
 again, while changes made by another process or silent permission changes do
 not wake an already-running client. A token rotation within the same login also
 needs an explicit sign-in to resume a blocked sync. Payment, request-timeout, locking, and
-rate-limit responses remain pending for automatic retry; a 429 `Retry-After`
-becomes the persisted next-retry deadline. The explicit session-unavailable conflict is
+rate-limit responses remain pending for automatic retry; `Retry-After` on a
+rate-limit or server error becomes an owner-scoped durable delivery deadline, also respected by newly
+queued records and other processes. Gateway and transport outages use the same
+bounded delivery pause while dispatched requests still reconcile their unknown
+outcomes. Without explicit server advice, one unresolved session does not stall
+healthy sessions; repeated independent failures pause delivery, and failed records
+retry later than unattempted sessions. A healthy service drains existing backlogs without a fixed high-water
+cooldown. The explicit session-unavailable conflict is
 terminal; other 409 responses, HTTP 5xx, and transport failures use owner-scoped
 reconciliation because the commit outcome may be unknown. On ACK, the local
 outbox releases the payload already owned by the canonical journal and retains
 only the identity, hash, and receipt metadata needed for deduplication. Pending
-records retain their payload for delivery. The outbox stores one error reason
+records retain their payload for delivery. Batched enqueue and settlement index
+the submitted IDs once per durable transaction instead of rescanning the retained
+outbox for every record. The outbox stores one error reason
 and no retry-attempt counter. Older clients cannot read the
 rewritten outbox format; previously quarantined records remain quarantined for
 diagnosis rather than being retried automatically. Independent sessions may make
