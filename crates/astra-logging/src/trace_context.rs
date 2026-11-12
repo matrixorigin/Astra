@@ -339,9 +339,16 @@ enum AttemptError {
     Settlement(&'static str),
 }
 
+#[derive(Default)]
+struct AttemptOutcome {
+    error: Option<AttemptError>,
+    // Diagnostic only: never used to classify the error returned to callers.
+    reason: Option<&'static str>,
+}
+
 tokio::task_local! {
     static ACTIVE_RUN: RefCell<RunSpan>;
-    static ATTEMPT_CODE: RefCell<Option<AttemptError>>;
+    static ATTEMPT_CODE: RefCell<AttemptOutcome>;
 }
 
 /// Bind `astra.run` for this task. LLM outcomes have a separate per-call scope.
@@ -358,7 +365,7 @@ where
 /// Isolate one LLM call's outcomes on every poll, including when multiple
 /// call futures are joined on the same task. This scope also covers drop.
 pub fn in_llm_call<F: Future>(future: F) -> impl Future<Output = F::Output> + use<F> {
-    ATTEMPT_CODE.scope(RefCell::new(None), future)
+    ATTEMPT_CODE.scope(RefCell::new(AttemptOutcome::default()), future)
 }
 
 /// Let `future` see the caller's current run without owning it. The run is
@@ -428,22 +435,37 @@ pub fn active_run_error_code() -> Option<&'static str> {
 }
 
 pub fn note_attempt_code(code: &'static str) {
-    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Provider(code)));
+    let _ =
+        ATTEMPT_CODE.try_with(|slot| slot.borrow_mut().error = Some(AttemptError::Provider(code)));
+}
+
+/// Retain a fixed diagnostic before a collector erases its typed cause.
+/// This per-call observation does not change the collector's error or result.
+pub fn note_attempt_reason(reason: &'static str) {
+    let _ = ATTEMPT_CODE.try_with(|slot| slot.borrow_mut().reason = Some(reason));
+}
+
+pub fn attempt_reason() -> Option<&'static str> {
+    ATTEMPT_CODE
+        .try_with(|slot| slot.borrow().reason)
+        .ok()
+        .flatten()
 }
 
 /// Settlement can replace the provider error returned by the adapter. Keep
 /// that distinction in the existing task-local attempt outcome.
 pub fn note_attempt_settlement_error(code: &'static str) {
-    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(AttemptError::Settlement(code)));
+    let _ = ATTEMPT_CODE
+        .try_with(|slot| slot.borrow_mut().error = Some(AttemptError::Settlement(code)));
 }
 
 pub fn clear_attempt_code() {
-    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = None);
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = AttemptOutcome::default());
 }
 
 pub fn attempt_code() -> Option<&'static str> {
     ATTEMPT_CODE
-        .try_with(|slot| match *slot.borrow() {
+        .try_with(|slot| match slot.borrow().error {
             Some(AttemptError::Provider(code) | AttemptError::Settlement(code)) => Some(code),
             None => None,
         })
@@ -453,7 +475,7 @@ pub fn attempt_code() -> Option<&'static str> {
 
 pub fn attempt_settlement_error() -> Option<&'static str> {
     ATTEMPT_CODE
-        .try_with(|slot| match *slot.borrow() {
+        .try_with(|slot| match slot.borrow().error {
             Some(AttemptError::Settlement(code)) => Some(code),
             _ => None,
         })
@@ -597,6 +619,34 @@ impl opentelemetry::propagation::Injector for MapInjector<'_> {
 #[cfg(test)]
 mod carrier_tests {
     use super::Carrier;
+
+    #[tokio::test]
+    async fn attempt_reasons_are_isolated_and_reset_with_retry_outcomes() {
+        use super::{attempt_reason, clear_attempt_code, in_llm_call, note_attempt_reason};
+
+        let (first, second) = tokio::join!(
+            in_llm_call(async {
+                note_attempt_reason("eof_before_terminal");
+                tokio::task::yield_now().await;
+                assert_eq!(attempt_reason(), Some("eof_before_terminal"));
+                clear_attempt_code();
+                assert_eq!(attempt_reason(), None);
+                note_attempt_reason("invalid_sse");
+                attempt_reason()
+            }),
+            in_llm_call(async {
+                assert_eq!(attempt_reason(), None);
+                note_attempt_reason("connection_reset");
+                tokio::task::yield_now().await;
+                attempt_reason()
+            }),
+        );
+        assert_eq!(first, Some("invalid_sse"));
+        assert_eq!(second, Some("connection_reset"));
+        assert_eq!(attempt_reason(), None);
+        note_attempt_reason("timeout");
+        assert_eq!(attempt_reason(), None);
+    }
 
     #[test]
     fn attempt_settlement_outcome_is_reset_and_isolated_from_child_tasks() {
