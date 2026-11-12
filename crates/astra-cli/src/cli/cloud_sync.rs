@@ -39,6 +39,7 @@ use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+#[cfg(test)]
 const SYNC_OUTBOX_LOGIN_PROJECTION_WAIT: Duration = Duration::from_secs(2);
 // One full server batch for each concurrent session, still bounded by bytes.
 const SYNC_OUTBOX_BACKGROUND_DRAIN_LIMIT: usize =
@@ -2413,6 +2414,7 @@ fn append_cloud_pull_sync_marker(
 /// Re-sync preferences and queued edge events after authentication. Login is
 /// still successful when sync is delayed, but the structured report makes the
 /// partial outcome visible to every UI path.
+#[cfg(test)]
 pub(crate) async fn post_auth_cloud_resync(
     profile: Option<&str>,
     state: &mut SessionState,
@@ -2420,6 +2422,7 @@ pub(crate) async fn post_auth_cloud_resync(
     post_auth_cloud_resync_with_wait(profile, state, SYNC_OUTBOX_LOGIN_PROJECTION_WAIT).await
 }
 
+#[cfg(test)]
 pub(crate) async fn post_auth_cloud_resync_with_wait(
     profile: Option<&str>,
     state: &mut SessionState,
@@ -2539,6 +2542,9 @@ pub(crate) async fn prepare_post_auth_cloud_resync(
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> PostAuthCloudResync {
     if owner.is_current() {
+        // Reuse the canonical login wake: it clears access rejection and also
+        // releases delivery workers waiting on the previous credential owner.
+        clear_sync_cloud_access();
         schedule_sync_outbox_drain();
     }
     let preferences = match owner
@@ -2634,7 +2640,6 @@ pub(crate) fn apply_post_auth_cloud_resync(
     );
     let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     tokio::spawn(run_post_auth_sync(projection, binding, snapshot));
-
 }
 
 #[cfg(test)]

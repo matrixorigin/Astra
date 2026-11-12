@@ -365,10 +365,15 @@ async fn request_memoria_tokens(
     api: &astra_thin_client::ThinClient,
     connection_key: &str,
 ) -> Result<AuthTokenPayload, String> {
-    let body = api
-        .post_auth_memoria_json(&serde_json::json!({ "connection_key": connection_key }))
-        .await
-        .map_err(map_thin_err)?;
+    // Bound the network exchange itself, before credential publication. Dropping
+    // this wait never detaches a credential writer or replays a consumed key.
+    let body = tokio::time::timeout(
+        Duration::from_secs(15),
+        api.post_auth_memoria_json(&serde_json::json!({ "connection_key": connection_key })),
+    )
+    .await
+    .map_err(|_| "Sign-in response was not confirmed. Run astra login again; the connection key will not be replayed.".to_string())?
+    .map_err(map_thin_err)?;
     parse_auth_tokens(&body)
 }
 
@@ -910,7 +915,14 @@ async fn request_register_tokens(
 const AUTH_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
 
-fn ensure_shells_can_rebind(state: &SessionState) -> Result<(), String> {
+pub(crate) fn ensure_authentication_can_rebind(state: &SessionState) -> Result<(), String> {
+    if !state
+        .active_work_registry
+        .active_work_observations()
+        .is_empty()
+    {
+        return Err("Local agent work is still active or awaiting settlement. Wait for it to finish or stop it before changing authentication.".into());
+    }
     if state.background_tasks.running_count() > 0 {
         return Err("Local shell tasks are still running. Wait for them to finish or stop them before switching accounts.".into());
     }
@@ -966,12 +978,18 @@ impl SessionAuthRetirement {
         if uc && owner_changed {
             crate::cli::native_auth::bind_after_login(api)?;
         }
-        if owner_changed && let Some(finalization) = self.finalization {
-            finalization.run(Duration::from_secs(5)).await?;
-        }
+        let retirement_notice = if owner_changed && let Some(finalization) = self.finalization {
+            finalization.run(Duration::from_secs(5)).await.and_then(|outcome| outcome.memory_maintenance).err().map(|_| {
+                tracing::warn!(reason = "old_session_finalization_unconfirmed", "previous session finalization was not confirmed after sign-in");
+                "Signed in, but the previous session could not finish finalization. Its local data was retained. Sign in to the previous account, resume that session and exit to retry finalization.".to_string()
+            })
+        } else {
+            None
+        };
         Ok(BrowserIdentity {
             owner_changed,
             user_id,
+            retirement_notice,
         })
     }
 }
@@ -979,6 +997,7 @@ impl SessionAuthRetirement {
 pub(crate) struct BrowserIdentity {
     pub(crate) owner_changed: bool,
     pub(crate) user_id: String,
+    pub(crate) retirement_notice: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1000,7 +1019,7 @@ fn prepare_session_auth_transition(
     let runtime_needs_initialization = state.agent_spawner.is_none();
 
     let runtime_config = if owner_changed {
-        ensure_shells_can_rebind(state)?;
+        ensure_authentication_can_rebind(state)?;
         let prepared =
             crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
         // The old session must reach its durable boundary while the old owner
@@ -1050,7 +1069,8 @@ fn commit_session_auth_transition(
 /// Cancellation retains the active attachment, model and conversation context.
 pub(crate) fn prepare_browser_session_retirement(
     state: &mut SessionState,
-) -> SessionAuthRetirement {
+) -> Result<SessionAuthRetirement, String> {
+    ensure_authentication_can_rebind(state)?;
     let retirement = SessionAuthRetirement {
         runtime: state.agent_spawner.take(),
         finalization: state
@@ -1059,12 +1079,12 @@ pub(crate) fn prepare_browser_session_retirement(
             .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
     };
     state.session_memory_port = None;
-    retirement
+    Ok(retirement)
 }
 
 #[cfg(test)]
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
-    prepare_browser_session_retirement(state)
+    prepare_browser_session_retirement(state)?
         .retire_runtime()
         .await;
     Ok(())
@@ -2937,6 +2957,114 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn browser_account_switch_converges_new_services_when_old_finalization_is_unconfirmed() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        unsafe {
+            std::env::set_var("ASTRA_EDGE_REGISTRY", "off");
+        }
+        for broken_journal in [false, true] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            super::save_profile_auth_tokens(
+                None,
+                "alice",
+                &AuthTokenPayload {
+                    user_id: "alice".into(),
+                    access_token: "alice-token".into(),
+                    refresh_token: "alice-refresh".into(),
+                },
+            )
+            .unwrap();
+            let previous_owner = astra_services::local_owner_scope();
+            let mut state = crate::SessionState::default();
+            let sid = if broken_journal {
+                "old-session-io-failure"
+            } else {
+                "old-session-memory-unconfirmed"
+            };
+            state.set_session_id(sid);
+            state.journal = Some(astra_services::session_journal::JournalWriter::new(sid).unwrap());
+            let journal_path = state.journal.as_ref().unwrap().path().clone();
+            state.session_memory_port = Some(
+                crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+                    &api, None, "alice",
+                )
+                .await,
+            );
+            assert!(state.session_memory_port.is_some());
+            let retirement = super::prepare_browser_session_retirement(&mut state).unwrap();
+            if broken_journal {
+                std::fs::create_dir_all(&journal_path).unwrap();
+            }
+            Mock::given(method("POST"))
+                .and(path("/auth/memoria"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"bob", "access_token":"bob-token", "refresh_token":"bob-refresh"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            super::do_memoria_login_with_key(&api, None, "synthetic-key")
+                .await
+                .unwrap();
+            let identity = retirement
+                .finish_browser(&previous_owner, false, &api)
+                .await
+                .unwrap();
+            assert!(identity.owner_changed);
+            let notice = identity
+                .retirement_notice
+                .as_deref()
+                .expect("unconfirmed old finalization must be visible");
+            assert!(
+                notice.contains("previous account") && notice.contains("resume"),
+                "{notice}"
+            );
+            assert!(
+                journal_path.exists(),
+                "old session data must remain recoverable"
+            );
+            super::commit_browser_session_identity(
+                &mut state,
+                identity.owner_changed,
+                &identity.user_id,
+            )
+            .unwrap();
+            let prepared = super::prepare_browser_session_login(&api, None, false)
+                .await
+                .unwrap();
+            let completed = super::commit_browser_session_login(prepared, &mut state);
+            completed.registration.unwrap();
+            assert_eq!(
+                crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                Some("bob")
+            );
+            assert_eq!(state.ingestion_user_id.as_deref(), Some("bob"));
+            assert!(state.session_memory_port.is_some());
+            assert!(state.agent_spawner.is_some());
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| !r.url.path().ends_with("/memory/finalize")),
+                "B's bearer must never finalize A's session"
+            );
+            if broken_journal {
+                std::fs::remove_dir(&journal_path).unwrap();
+            }
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn browser_login_does_not_stop_a_running_local_shell() {
         let temp = crate::tests::test_temp_dir();
         let mut state = crate::cli::session::session_state::SessionState::default();
@@ -2957,7 +3085,7 @@ mod tests {
             .background_tasks
             .kill_all_and_wait(Duration::from_secs(3))
             .await;
-        assert!(super::ensure_shells_can_rebind(&state).is_ok());
+        assert!(super::ensure_authentication_can_rebind(&state).is_ok());
     }
 
     #[serial_test::serial]

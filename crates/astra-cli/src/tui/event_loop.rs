@@ -536,6 +536,12 @@ async fn settle_login_tasks_for_shutdown(
     let mut notices = Vec::new();
     while let Some(result) = tasks.join_next().await {
         match result {
+            Ok(Ok(LoginEffect::Completed { identity, .. })) => {
+                if let Some(notice) = identity.retirement_notice {
+                    notices.push(notice);
+                }
+                notices.push("Sign-in saved. Start Astra again to continue.".into());
+            }
             Ok(Ok(LoginEffect::PasswordAuthenticated { context, result })) => {
                 match settle_password_authentication(profile, &context, result, state).await {
                     Ok(_) => notices.push("Sign-in saved. Start Astra again to continue.".into()),
@@ -604,6 +610,28 @@ fn retire_obsolete_browser_attachment(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Reduce the committed identity before publishing notices into its chat view.
+/// Account changes replace that view; recovery guidance must survive the reset.
+fn apply_browser_session_identity(
+    identity: &crate::cli::auth_flow::BrowserIdentity,
+    state: &mut crate::SessionState,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> Result<(), String> {
+    crate::cli::auth_flow::commit_browser_session_identity(
+        state,
+        identity.owner_changed,
+        &identity.user_id,
+    )?;
+    if identity.owner_changed {
+        *chat_widget = chat_widget::ChatWidget::new(String::new());
+        sync_explain_presentation(chat_widget, state);
+    }
+    if let Some(notice) = &identity.retirement_notice {
+        chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+    }
+    Ok(())
 }
 
 fn restore_login_identity_services(
@@ -9916,10 +9944,20 @@ pub(crate) async fn run_tui_session(
                         bottom_pane.push_view(Box::new(LoginView::new(if register { LoginMode::Register } else { LoginMode::Login })));
                     }
                     Ok(LoginEffect::Discovered { method, .. }) => {
-                        // No model/tool work can start while the login task owns input.
-                        // Retire the old owner before the browser publishes credentials.
-                        login_retired_memory = Some((crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(), state.session_memory_port.clone()));
-                        let mut retirement = auth_flow::prepare_browser_session_retirement(&mut state);
+                        // The retirement owner refuses active shell/agent work before
+                        // taking any runtime or memory service from the Session.
+                        let previous_auth = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                        let previous_memory = state.session_memory_port.clone();
+                        let mut retirement = match auth_flow::prepare_browser_session_retirement(&mut state) {
+                            Ok(retirement) => retirement,
+                            Err(error) => {
+                                chat_widget.commit_system(history_cell::system::SystemCell::warning(error));
+                                pending_deferred_slash_flush = false;
+                                authentication_followup_handoff(&mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed, None);
+                                continue;
+                            }
+                        };
+                        login_retired_memory = Some((previous_auth.clone(), previous_memory));
                         let previous_owner = astra_services::local_owner_scope();
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
@@ -9960,9 +9998,15 @@ pub(crate) async fn run_tui_session(
                             }), false).await;
                             // Settle any published owner even if callback completion failed.
                             // An unpublished/cancelled exchange drops the unused finalizer.
-                            let identity = retirement.finish_browser(&previous_owner, uc, &api).await;
-                            login?;
-                            Ok(LoginEffect::Completed { uc, identity: identity? })
+                            let mut identity = retirement.finish_browser(&previous_owner, uc, &api).await?;
+                            if let Err(error) = login {
+                                if previous_auth.is_current() {
+                                    return Err(error);
+                                }
+                                tracing::warn!(reason = "published_login_completion_unconfirmed", "browser login reported an error after identity publication");
+                                identity.retirement_notice.get_or_insert_with(|| "Sign-in was saved, but browser completion was not confirmed. Retry /login if the new connection is unavailable.".into());
+                            }
+                            Ok(LoginEffect::Completed { uc, identity })
                         });
                     }
                     Ok(LoginEffect::PasswordAuthenticated { context, result }) => {
@@ -10044,10 +10088,8 @@ pub(crate) async fn run_tui_session(
                     }
                     Ok(LoginEffect::Completed { uc, identity }) => {
                         login_retired_memory = None;
-                        loop_try!(auth_flow::commit_browser_session_identity(&mut state, identity.owner_changed, &identity.user_id));
+                        loop_try!(apply_browser_session_identity(&identity, &mut state, &mut chat_widget));
                         if identity.owner_changed {
-                            chat_widget = chat_widget::ChatWidget::new(String::new());
-                            sync_explain_presentation(&mut chat_widget, &state);
                             rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
                         }
                         refresh_footer_from_state(&mut bottom_pane, &state);
@@ -11013,7 +11055,8 @@ pub(crate) async fn run_tui_session(
                                         slash_dispatch::SlashResult::Handled => {}
                                         slash_dispatch::SlashResult::Deferred => {}
                                         slash_dispatch::SlashResult::Authenticate { register } => {
-                                            if background_registry.running_count() > 0 || work_start_in_flight {
+                                            if background_registry.running_count() > 0 || work_start_in_flight
+                                                || crate::cli::auth_flow::ensure_authentication_can_rebind(&state).is_err() {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::warning("Wait for or stop background tasks before changing authentication."));
                                                 recover_followups_after_rejected_authentication(
                                                     &mut queued_followup_submissions,
@@ -15580,7 +15623,8 @@ mod tests {
                     .unwrap();
                 let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
                 let original_heartbeat = heartbeat.as_ref().unwrap().abort_handle();
-                let mut retirement = auth_flow::prepare_browser_session_retirement(&mut state);
+                let mut retirement =
+                    auth_flow::prepare_browser_session_retirement(&mut state).unwrap();
                 retirement.retire_runtime().await;
                 let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
                 let opened_tx = std::sync::Mutex::new(Some(opened_tx));
@@ -15896,6 +15940,129 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[test]
+    fn browser_identity_reducer_preserves_recovery_notice_after_chat_reset() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("new-owner"),
+        )
+        .unwrap();
+        let mut state = crate::SessionState::default();
+        state.set_session_id("previous-session");
+        let mut widget = chat_widget::ChatWidget::new("");
+        widget.commit_system(history_cell::system::SystemCell::response(
+            "Old account chat",
+        ));
+        let notice = "Signed in; resume the previous account's session to retry finalization.";
+        apply_browser_session_identity(
+            &crate::cli::auth_flow::BrowserIdentity {
+                owner_changed: true,
+                user_id: "new-owner".into(),
+                retirement_notice: Some(notice.into()),
+            },
+            &mut state,
+            &mut widget,
+        )
+        .unwrap();
+        assert!(state.session_id.is_none());
+        assert_eq!(state.ingestion_user_id.as_deref(), Some("new-owner"));
+        assert_eq!(
+            widget.history().len(),
+            1,
+            "old chat is replaced by recovery guidance"
+        );
+        assert!(matches!(
+            widget.history()[0].to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::System { text, .. }) if text == notice
+        ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_bounds_a_stalled_browser_exchange_without_publishing_credentials() {
+        use crate::cli::auth_flow;
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/memoria"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let before =
+            serde_json::to_value(crate::cli::cli_config::cli_utils::load_credentials()).unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let phase = Arc::new(super::super::login_control::LoginControl::default());
+        let task_phase = phase.clone();
+        let website = server.uri();
+        let origin = website.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            auth_flow::browser_login_with_launcher(
+                &api,
+                None,
+                auth_flow::LoginMethod::Memoria(website),
+                Arc::new(move |progress| {
+                    match progress {
+                        auth_flow::LoginProgress::OpenBrowser(url) => {
+                            let _ = tx.lock().unwrap().take().unwrap().send(url);
+                        }
+                        auth_flow::LoginProgress::Completing => task_phase.begin_exchange()?,
+                        _ => {}
+                    }
+                    Ok(())
+                }),
+                false,
+                async |_| Ok(()),
+            )
+            .await?;
+            Err("a held exchange must not succeed".into())
+        });
+        let url = url::Url::parse(&rx.await.unwrap()).unwrap();
+        let fields: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let browser = tokio::spawn(async move {
+            reqwest::Client::builder().no_proxy().build().unwrap()
+                .post(format!("http://127.0.0.1:{}/callback", fields["port"]))
+                .header("Origin", origin)
+                .json(&serde_json::json!({"state":fields["state"],"memoria_connection_key":"synthetic-key"}))
+                .send().await.unwrap().status()
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut state = crate::SessionState::default();
+        let notices = tokio::time::timeout(
+            Duration::from_secs(20),
+            settle_login_tasks_for_shutdown(&phase, &mut tasks, None, &mut state),
+        )
+        .await
+        .expect("shutdown must not wait for the five-minute browser deadline");
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("not confirmed") && n.contains("login")),
+            "{notices:?}"
+        );
+        assert!(tasks.is_empty());
+        assert_eq!(
+            serde_json::to_value(crate::cli::cli_config::cli_utils::load_credentials()).unwrap(),
+            before
+        );
+        assert_eq!(browser.await.unwrap(), reqwest::StatusCode::BAD_GATEWAY);
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escape_browser_login_restores_memory_and_external_discovery() {
         use crate::cli::{auth_flow, session::session_runtime};
@@ -16009,6 +16176,7 @@ mod tests {
                 identity: auth_flow::BrowserIdentity {
                     owner_changed: false,
                     user_id: "old-owner".into(),
+                    retirement_notice: None,
                 },
             })
         });
@@ -20834,6 +21002,46 @@ mod tests {
             Some("session-a"),
             Some("session-b")
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_login_rejects_running_agents_without_retiring_their_executor() {
+        let mut state = crate::SessionState::default();
+        let spawner = Arc::new(
+            Arc::try_unwrap(test_agent_spawner(Arc::new(PendingAgentExecutor)))
+                .ok()
+                .expect("unique test spawner")
+                .with_active_work_registry(state.active_work_registry.clone()),
+        );
+        let output = spawner
+            .spawn(
+                SpawnAgentInput {
+                    description: "pending review".into(),
+                    prompt: "pending review".into(),
+                    agent_type: "task".into(),
+                    ..Default::default()
+                },
+                &test_spawn_context(),
+            )
+            .await
+            .unwrap();
+        let SpawnAgentOutput::Launched { agent_id, .. } = output;
+        state.agent_spawner = Some(spawner.clone());
+        assert_eq!(state.background_tasks.running_count(), 0);
+        assert!(
+            !state
+                .active_work_registry
+                .active_work_observations()
+                .is_empty()
+        );
+        let error = crate::cli::auth_flow::begin_browser_session_login(&mut state)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Local agent work"), "{error}");
+        assert!(Arc::ptr_eq(state.agent_spawner.as_ref().unwrap(), &spawner));
+        assert!(spawner.background_task_count() > 0);
+        assert!(spawner.get_agent_state_any(&agent_id).await.is_some());
+        retire_local_agent_spawner(spawner).await;
     }
 
     #[tokio::test]
@@ -29518,10 +29726,14 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        Mock::given(path("/sync/outbox/events")).respond_with(|request: &wiremock::Request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            ResponseTemplate::new(201).set_body_json(serde_json::json!({"schema_version":1,"record_id":body["event_id"],"payload_hash":body["metadata"]["sync_outbox"]["payload_hash"],"ingestion_status":"created"}))
-        }).mount(&server).await;
+        Mock::given(path("/sync/outbox/events"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                ResponseTemplate::new(201)
+                    .set_body_json(crate::test_utils::mock_sync_outbox_batch_ack(&body))
+            })
+            .mount(&server)
+            .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         for browser in [false, true] {
             let user = if browser {
@@ -29606,7 +29818,9 @@ mod tests {
         };
         use std::sync::atomic::{AtomicBool, Ordering};
         for stalled in ["preferences", "outbox"] {
-            let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+            let sessions = tempfile::tempdir().unwrap();
+            let _journal =
+                astra_services::session_journal::ProcessJournalDirGuard::new(sessions.path());
             let _home = crate::test_utils::HomeGuard::temp();
             let _creds = crate::tests::isolate_credentials();
             let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
@@ -29628,43 +29842,51 @@ mod tests {
             let reached = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
             let app = Router::new()
-                .route("/preferences", get({
-                    let reached = reached.clone();
-                    let release = release.clone();
-                    move || {
+                .route(
+                    "/preferences",
+                    get({
                         let reached = reached.clone();
                         let release = release.clone();
-                        async move {
-                            if stalled == "preferences" {
-                                reached.notify_one();
-                                release.notified().await;
+                        move || {
+                            let reached = reached.clone();
+                            let release = release.clone();
+                            async move {
+                                if stalled == "preferences" {
+                                    reached.notify_one();
+                                    release.notified().await;
+                                }
+                                Json(serde_json::json!({"preferences":[]}))
                             }
-                            Json(serde_json::json!({"preferences":[]}))
                         }
-                    }
-                }))
-                .route("/sync/outbox/events", post({
-                    let reached = reached.clone();
-                    let release = release.clone();
-                    let first = Arc::new(AtomicBool::new(true));
-                    move |Json(body): Json<serde_json::Value>| {
+                    }),
+                )
+                .route(
+                    "/sync/outbox/events",
+                    post({
                         let reached = reached.clone();
                         let release = release.clone();
-                        let first = first.clone();
-                        async move {
-                            if stalled == "outbox" && first.swap(false, Ordering::SeqCst) {
-                                reached.notify_one();
-                                release.notified().await;
+                        let first = Arc::new(AtomicBool::new(true));
+                        move |Json(body): Json<serde_json::Value>| {
+                            let reached = reached.clone();
+                            let release = release.clone();
+                            let first = first.clone();
+                            async move {
+                                if stalled == "outbox" && first.swap(false, Ordering::SeqCst) {
+                                    reached.notify_one();
+                                    release.notified().await;
+                                }
+                                (
+                                    axum::http::StatusCode::CREATED,
+                                    Json(crate::test_utils::mock_sync_outbox_batch_ack(&body)),
+                                )
                             }
-                            (axum::http::StatusCode::CREATED, Json(serde_json::json!({
-                                "schema_version":1,"record_id":body["event_id"],
-                                "payload_hash":body["metadata"]["sync_outbox"]["payload_hash"],
-                                "ingestion_status":"created"
-                            })))
                         }
-                    }
-                }))
-                .route("/model-access", get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }));
+                    }),
+                )
+                .route(
+                    "/model-access",
+                    get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+                );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -29687,7 +29909,9 @@ mod tests {
                     cloud_reachable: true,
                 },
                 &[],
-            );
+            )
+            .await
+            .unwrap();
             let mut tasks = tokio::task::JoinSet::new();
             let (tx, mut rx) = tokio::sync::mpsc::channel(2);
             let mut widget = chat_widget::ChatWidget::new("");

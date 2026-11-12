@@ -75,7 +75,10 @@ pub(crate) async fn finalize_session_with_budget(
     state: &mut SessionState,
     budget: Duration,
 ) -> Result<(), String> {
-    let result = SessionFinalization::capture(state).run(budget).await;
+    let result = SessionFinalization::capture(state)
+        .run(budget)
+        .await
+        .map(|_| ());
     if let Err(error) = &result {
         state.session_persistence_error = Some(error.clone());
     }
@@ -92,6 +95,12 @@ pub(crate) struct SessionFinalization {
     memory: Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
     facts: astra_runtime::SessionFacts,
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+}
+
+/// Optional memory maintenance must not erase the committed local boundary or
+/// turn a published login into an authentication failure.
+pub(crate) struct SessionFinalizationOutcome {
+    pub(crate) memory_maintenance: Result<(), String>,
 }
 
 impl SessionFinalization {
@@ -118,7 +127,7 @@ impl SessionFinalization {
         }
     }
 
-    pub(crate) async fn run(self, budget: Duration) -> Result<(), String> {
+    pub(crate) async fn run(self, budget: Duration) -> Result<SessionFinalizationOutcome, String> {
         let journal = self
             .journal
             .map(|(owner, sid, expected_path)| {
@@ -138,7 +147,7 @@ impl SessionFinalization {
             self.session_id.as_deref(),
             self.turn,
         )?;
-        finish_session_maintenance(
+        let memory_maintenance = finish_session_maintenance(
             self.session_id,
             self.memory,
             self.facts,
@@ -146,7 +155,7 @@ impl SessionFinalization {
             budget,
         )
         .await;
-        Ok(())
+        Ok(SessionFinalizationOutcome { memory_maintenance })
     }
 }
 
@@ -156,20 +165,25 @@ async fn finish_session_maintenance(
     facts: astra_runtime::SessionFacts,
     hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     budget: Duration,
-) {
+) -> Result<(), String> {
     let mut memory_maintenance = JoinSet::new();
+    let mut memory_result = None;
     if let (Some(port), Some(sid)) = (memory, session_id.clone()) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        memory_result = Some(rx);
         memory_maintenance.spawn(async move {
-            if let Err(error) =
+            let result =
                 astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
                     &facts,
                     &sid,
                     port.as_ref(),
                 )
                 .await
-            {
+                .map(|_| ());
+            if let Err(error) = &result {
                 tracing::warn!(session_id = %sid, %error, "session-end governance failed");
             }
+            let _ = tx.send(result);
         });
     }
     // Await Memoria maintenance under the shared shutdown budget.
@@ -184,6 +198,12 @@ async fn finish_session_maintenance(
         );
     }
     finish_session_process_boundary(hub.as_ref(), session_id.as_deref());
+    if let Some(result) = memory_result {
+        result.await
+            .map_err(|_| "Session memory finalization did not complete; resume the session and exit to retry.".to_string())?
+            .map_err(|_| "Session memory finalization was not confirmed; resume the session and exit to retry.".to_string())?;
+    }
+    Ok(())
 }
 
 async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) -> usize {

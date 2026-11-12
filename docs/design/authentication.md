@@ -210,7 +210,10 @@ the current checkout with the new identity before reporting chat readiness,
 then starts its heartbeat; registration failure is reported explicitly and does
 not complete runtime initialization. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
-changes are refused while local background tasks are running.
+changes are refused while local shell tasks or registered agent work are running
+or awaiting settlement. The active-work owner is checked before discovery and
+again before browser retirement, so a cancelled or same-account login cannot
+interrupt a running local agent.
 
 In-TUI password login and registration establish the same Edge registration
 and heartbeat boundary after saving credentials. Rejected authentication retains
@@ -230,7 +233,13 @@ credentials unpublished until the old owner's durable boundary settles.
 Browser login stops the execution runtime first, but finalizes the captured
 Session only after publication proves that the account or environment changed.
 Same-owner browser reauthentication preserves the Session, transcript and model;
-cancellation never writes a SessionEnd or completes its workspace.
+cancellation never writes a SessionEnd or completes its workspace. Old-session
+journal or optional memory-finalization failures are reported separately from
+committed authentication: the new account still rebuilds its services and
+registers execution. If the old credential generation no longer admits memory
+finalization, the CLI retains the old session data and explicitly asks the user
+to sign in to that account, resume its session and exit to retry. It never borrows
+the new account's credentials or silently claims that memory was finalized.
 Graceful shutdown settles the resulting
 prepared publication through the same credential owner.
 Both password and browser completion rebuild identity-owned Skill/MCP services
@@ -439,7 +448,11 @@ exchange does not follow redirects, bounds response size and duration, and is
 not automatically replayed after failure: consumption may already have
 succeeded. Invalid/mismatched GET callbacks do not trigger token exchange.
 The five-minute local listener deadline remains in effect, including response
-writes and both exchange paths. Each response write/shutdown is additionally
+writes and both exchange paths. The Memoria-to-Astra credential exchange has its
+own 15-second network deadline before local publication. An unconfirmed exchange
+is not replayed; graceful shutdown joins that bounded task instead of waiting
+for the listener's five-minute deadline. Credential publication remains owned
+and settled separately from that network wait. Each response write/shutdown is additionally
 bounded to two seconds; delivery errors are reported without sensitive contents
 and never undo a persisted login. Three invalid callback attempts end the login;
 favicon, OPTIONS and unknown GET paths do not consume that rejection allowance,

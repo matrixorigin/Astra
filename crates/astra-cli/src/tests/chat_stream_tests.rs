@@ -908,7 +908,11 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1006,7 +1010,11 @@ async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_admission_dispatch_evidence_comes_from_the_actual_request_boundary() {
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -2976,6 +2984,9 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn stream_chat_sse_preserves_runtime_notifications_across_admission_and_failure() {
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+
     use crate::cli::turn::local_run_control::LocalRunControl;
     use axum::response::IntoResponse;
     use std::sync::{Arc, Mutex};

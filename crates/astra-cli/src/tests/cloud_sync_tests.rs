@@ -158,11 +158,7 @@ async fn successful_old_owner_upload_hands_the_occupied_drain_to_the_new_owner()
                     }
                     (
                         axum::http::StatusCode::CREATED,
-                        axum::Json(json!({
-                            "schema_version":1,"record_id":body["event_id"],
-                            "payload_hash":body["metadata"]["sync_outbox"]["payload_hash"],
-                            "ingestion_status":"created"
-                        })),
+                        axum::Json(crate::test_utils::mock_sync_outbox_batch_ack(&body)),
                     )
                 }
             }
@@ -196,7 +192,9 @@ async fn successful_old_owner_upload_hands_the_occupied_drain_to_the_new_owner()
                 cloud_reachable: true,
             },
             &[],
-        );
+        )
+        .await
+        .unwrap();
         cloud_sync::schedule_sync_outbox_drain();
         if account == "a" {
             tokio::time::timeout(Duration::from_secs(10), reached.notified())
@@ -211,7 +209,7 @@ async fn successful_old_owner_upload_hands_the_occupied_drain_to_the_new_owner()
         loop {
             if stores
                 .iter()
-                .all(|store| store.status().unwrap().acked == 1)
+                .all(|store| store.status().unwrap().acked == 2)
             {
                 break;
             }
@@ -1540,21 +1538,42 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
     let reached = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let first = Arc::new(AtomicBool::new(true));
-    let app = Router::new().route("/preferences", get(|| async {
-        Json(json!({"preferences":[
-            {"key":"explain_mode","value":"verbose"},
-            {"key":"auto_memory_enabled","value":"true"},
-            {"key":"notifications_enabled","value":"true"},
-            {"key":"notification_method","value":"auto"},
-            {"key":"notification_threshold_secs","value":"99"}
-        ]}))
-    })).route("/sync/outbox/events", post({
-        let reached=reached.clone(); let release=release.clone(); let first=first.clone();
-        move |Json(body): Json<Value>| { let reached=reached.clone(); let release=release.clone(); let first=first.clone(); async move {
-            if first.swap(false, Ordering::SeqCst) { reached.notify_one(); release.notified().await; }
-            (axum::http::StatusCode::CREATED, Json(json!({"schema_version":1,"record_id":body["event_id"],"payload_hash":body["metadata"]["sync_outbox"]["payload_hash"],"ingestion_status":"created"})))
-        }}
-    }));
+    let app = Router::new()
+        .route(
+            "/preferences",
+            get(|| async {
+                Json(json!({"preferences":[
+                    {"key":"explain_mode","value":"verbose"},
+                    {"key":"auto_memory_enabled","value":"true"},
+                    {"key":"notifications_enabled","value":"true"},
+                    {"key":"notification_method","value":"auto"},
+                    {"key":"notification_threshold_secs","value":"99"}
+                ]}))
+            }),
+        )
+        .route(
+            "/sync/outbox/events",
+            post({
+                let reached = reached.clone();
+                let release = release.clone();
+                let first = first.clone();
+                move |Json(body): Json<Value>| {
+                    let reached = reached.clone();
+                    let release = release.clone();
+                    let first = first.clone();
+                    async move {
+                        if first.swap(false, Ordering::SeqCst) {
+                            reached.notify_one();
+                            release.notified().await;
+                        }
+                        (
+                            axum::http::StatusCode::CREATED,
+                            Json(crate::test_utils::mock_sync_outbox_batch_ack(&body)),
+                        )
+                    }
+                }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let _api = EnvVarGuard::set(
         "ASTRA_API_URL",
@@ -1571,7 +1590,9 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
             cloud_reachable: true,
         },
         &[],
-    );
+    )
+    .await
+    .unwrap();
     let baseline = cloud_sync::cloud_preference_snapshot(&state);
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let result = tokio::time::timeout(
