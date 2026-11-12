@@ -155,3 +155,15 @@ test('raw line callbacks include logical blank separators', async () => {
   client.close();
   expect(lines).toEqual([': keepalive', 'data: {"type":"run_finished"}', '']);
 });
+
+for (const value of [null, true, 42, "text", [], {}, { type: null }, { type: 42 }]) {
+  test(`buffered SSE rejects invalid event envelope ${JSON.stringify(value)}`, () => {
+    const raw = `data: ${JSON.stringify(value)}\n\ndata: {"type":"run_finished"}\n\n`;
+    expect(() => parseSseDataEvents(raw)).toThrow('Invalid SSE event envelope');
+  });
+}
+
+test('SSE preserves future event types and additional fields', () => {
+  const event = { type: 'future_event', future: { value: 1 } };
+  expect(parseSseDataEvents(`data: ${JSON.stringify(event)}\n\n`)).toEqual([event]);
+});
