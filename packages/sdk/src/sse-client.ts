@@ -41,7 +41,10 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
 
 function parseSseEvent(data: string): StreamEvent | undefined {
   try {
-    return JSON.parse(data) as StreamEvent;
+    const event: unknown = JSON.parse(data);
+    if (!event || typeof event !== 'object' || Array.isArray(event) ||
+        typeof (event as { type?: unknown }).type !== 'string') return undefined;
+    return event as StreamEvent;
   } catch {
     // Ignore malformed JSON.
     return undefined;

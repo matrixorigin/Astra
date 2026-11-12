@@ -155,3 +155,25 @@ test('raw line callbacks include logical blank separators', async () => {
   client.close();
   expect(lines).toEqual([': keepalive', 'data: {"type":"run_finished"}', '']);
 });
+
+for (const value of [null, true, 42, "text", [], {}, { type: null }, { type: 42 }]) {
+  test(`buffered and live SSE ignore invalid event envelope ${JSON.stringify(value)}`, async () => {
+    const valid = { type: 'run_finished' } as StreamEvent;
+    const raw = `data: ${JSON.stringify(value)}\n\ndata: ${JSON.stringify(valid)}\n\n`;
+    expect(parseSseDataEvents(raw)).toEqual([valid]);
+    const received: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: 'https://example.test/stream', maxRetries: 0, requireTerminalEvent: true,
+      transport: vi.fn().mockResolvedValue(new Response(raw)),
+      onEvent: (event) => received.push(event),
+    });
+    await client.connect();
+    client.close();
+    expect(received).toEqual([valid]);
+  });
+}
+
+test('SSE preserves future event types and additional fields', () => {
+  const event = { type: 'future_event', future: { value: 1 } };
+  expect(parseSseDataEvents(`data: ${JSON.stringify(event)}\n\n`)).toEqual([event]);
+});
