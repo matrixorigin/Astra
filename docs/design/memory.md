@@ -401,15 +401,15 @@ advance, immutable content and cumulative byte/message totals against that
 acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
 completions are coalesced without skipping nodes. The first observation, legacy
 checkpoints without a head, and a compaction-generation change use the existing
-complete fork-aware materializer once. Later child turns do not reload the entire
+complete fork-aware materializer. Later child turns do not reload the entire
 acknowledged inherited prefix, including after ancestor deletion. Corrupt or
 divergent boundaries fail rather than silently falling back or acknowledging.
 Thus ordinary repeated turns read/send new content plus bounded context, rather than reprocessing
 `1 + ... + N` turns. A replacement can resend the new summary/context; this is
 consistent with at-least-once delivery, not an exactly-once extraction promise.
 The stateless Memoria extractor does not reload conversation history from
-`session_id`. Observation therefore includes up to four preceding canonical
-turns / 32 KiB of canonical content as bounded reference context alongside the
+`session_id`. Observation therefore reads up to four preceding canonical
+turns / 32 KiB of canonical content as reference context alongside the
 unacknowledged suffix. One selective ordinary range read returns both parts; the prior
 tail is validated backwards against the acknowledged head's root, cursor and
 totals. The watermark still advances only over newly completed content. This is
@@ -433,6 +433,36 @@ with successful acknowledgement; retries preserve the prior flag. Denied work
 loads no content and conservatively suppresses continuations; a generation reset
 recomputes filtering from the replacement snapshot.
 
+Dispatch respects the actual Memoria LLM input renderer: at most 20 messages,
+500 Unicode scalar values per message, and 6000 rendered UTF-8 bytes including
+role delimiters. Plain text, text blocks and textual tool-result blocks are
+normalized into ordered fragments. Each request reserves at most 12 messages /
+4000 rendered bytes for new text; the remaining eight messages / 2000 bytes
+may carry the most recent reference context, including text delivered earlier
+in this capture. Context may be shortened; newly due text is split and eventually
+delivered in full. Non-text attachments are outside this text extraction contract.
+This proves input coverage, not that an LLM extracts every fact or that every
+candidate passes Memoria's sensitivity/deduplication policies.
+
+At most eight windows are dispatched in one 60-second attempt. Every non-final
+accepted window saves its captured immutable head and text-part/UTF-8 byte
+cursor in `observation_json`, under the existing token/revision/expiry fence
+with receipt read-back. No text or credential is copied into that progress.
+The live lease is retained between windows. An eight-window yield releases it
+and makes the same Session immediately due. A failed window preserves earlier
+accepted progress and uses the existing per-Session backoff. Process restart,
+timeout or uncertain acknowledgements can repeat an accepted window; they cannot
+advance past unseen new text. The observed head/turn and filter flag advance
+only when the entire captured range is settled. A newer Append/Replace remains
+pending until that capture finishes. Denied history is intentionally discarded
+under the pre-existing consent policy and is not counted as extraction success.
+
+Retries and bounded yields revalidate and materialize the pinned unacknowledged
+capture again before continuing at its durable text cursor. Initial/legacy/fork
+and compaction reconstruction can therefore repeat after interruption. This is
+not a streaming/bounded-total-history materialization or a linear-backlog-I/O
+claim; ordinary already-acknowledged suffix selectivity is unchanged.
+
 The canonical head owns the observed-turn checkpoint, revision, receipt and
 independent 5–960-second backoff. A single token/revision/expiry-fenced UPDATE
 writes the checkpoint and next due state; a same-connection receipt read confirms
@@ -442,19 +472,23 @@ is at least once: a backend success followed by uncertain acknowledgement can
 repeat. Session deletion removes the head through existing lifecycle cleanup.
 
 The configured process recovery owner also has an in-memory failure budget.
-Eight consecutive failed attempts open a shared five-second pause **before**
-discovery/claim SQL. One attempt probes after the pause; a failed probe doubles
-the delay up to 960 seconds, while a successful fresh admission/attempt/receipt
-reopens normal draining. No-work/lost claims do not assert dependency health;
+Only proven common storage failures count: the shared due-discovery query or
+canonical-pool I/O, closed-pool, TLS and pool-timeout errors. Eight consecutive
+such failures open a shared five-second pause **before** discovery/claim SQL.
+One attempt probes after the pause; another shared failure doubles the delay
+up to 960 seconds. Successful storage access, including an empty due page or a
+lost claim, reopens draining. A cooldown without I/O does not assert health;
 cancelled probes release the probe reservation with a bounded pause. Epochs
 prevent stale results from resetting a newer failure generation. In-flight
 reservations consume the same eight-attempt budget, so fast failures cannot
 refill the initial cohort while slower attempts are still running.
-This conservatively pauses this optional observer as a whole, so a persistent
-failure can defer unrelated healthy observation work until a successful probe.
-It is process-local, resets on restart, and its cost scales with replicas, not
-with every retained pending Session at the retry cap. It is not distributed
-outage coordination. Durable facts and current authority checks are retained;
+Malformed canonical data, authority errors, backend rejection/timeout and unknown
+Session/provider failures never open or prolong this shared circuit. They retain
+the durable per-Session deadline. In particular, a Memoria endpoint cannot be
+assumed common across users; its failures are isolated, even if several users
+happen to share that endpoint. Concurrency and per-Session backoff still bound
+those attempts. The storage circuit is process-local, resets on restart and is
+not distributed outage coordination. Durable facts and current authority checks are retained;
 no credentials, grants or another durable queue are stored. Per-Session backoff
 still uses only `observation_due_at`; there is no duplicate JSON retry clock.
 
@@ -463,8 +497,11 @@ materialization and two checkpoint/receipt statements, plus fresh authority SQL.
 These five statements are an explicit durability cost over the former volatile
 in-memory dispatch: claim read-back proves this owner's token; the content read
 follows write admission; checkpoint read-back proves the exact fenced receipt.
-MatrixOne affected-row counts alone cannot establish either receipt. Discovery
-and losing claims across replicas add fleet cost. Background execution reduces
+MatrixOne affected-row counts alone cannot establish either receipt. Every
+intermediate accepted-window receipt adds cost: each progress receipt
+uses a fenced UPDATE plus read-back, and each window resolves authority afresh.
+The five-statement minimum applies only to an ordinary one-window attempt.
+Discovery and losing claims across replicas add fleet cost. Background execution reduces
 response-path coupling, not total database work; the revised scoped SQL ceilings
 must not be described as an improvement over the former 20-statement raw budget.
 `CanonicalObservationRead` records returned manifest/content JSON rows and bytes

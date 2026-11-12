@@ -9,6 +9,53 @@ use astra_turn_types::SessionContextHeadV1;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+pub mod window;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ObservationError {
+    #[error("{0}")]
+    SharedDependency(String),
+    #[error("{0}")]
+    Session(String),
+}
+impl ObservationError {
+    pub fn is_shared_dependency(&self) -> bool {
+        matches!(self, Self::SharedDependency(_))
+    }
+    fn database(message: &str, error: &sqlx::Error) -> Self {
+        if shared_database_failure(error) {
+            Self::SharedDependency(message.into())
+        } else {
+            Self::Session(message.into())
+        }
+    }
+}
+impl From<String> for ObservationError {
+    fn from(message: String) -> Self {
+        Self::Session(message)
+    }
+}
+impl From<&str> for ObservationError {
+    fn from(message: &str) -> Self {
+        Self::Session(message.into())
+    }
+}
+fn shared_database_failure(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::PoolClosed
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationProgress {
+    pub head: SessionContextHeadV1,
+    pub cursor: window::ObservationTextCursor,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObservationCheckpoint {
@@ -18,8 +65,10 @@ pub struct ObservationCheckpoint {
     pub attempts: u32,
     pub revision: u64,
     pub receipt_id: Option<String>,
+    pub progress: Option<ObservationProgress>,
 }
 
+#[derive(Clone)]
 pub struct ObservationCandidate {
     pub key: astra_turn_types::SessionKeyV1,
     pub turn: u32,
@@ -27,6 +76,7 @@ pub struct ObservationCandidate {
     pub checkpoint: ObservationCheckpoint,
     lease_token: String,
     pub next_memory_operation_segment: Option<bool>,
+    pub next_progress: Option<ObservationProgress>,
 }
 
 #[derive(Clone)]
@@ -61,11 +111,13 @@ impl SessionObservationStore {
         }
     }
 
-    pub async fn due_keys(&self) -> Result<Vec<(String, String)>, String> {
+    pub async fn due_keys(&self) -> Result<Vec<(String, String)>, ObservationError> {
         sqlx::query_as(DUE_SQL)
             .fetch_all(self.pool.get())
             .await
-            .map_err(|_| "observation due discovery failed".into())
+            .map_err(|_| {
+                ObservationError::SharedDependency("observation due discovery failed".into())
+            })
     }
 
     /// Per-Session CAS, not a bucket lease. A held Session never owns another
@@ -75,14 +127,11 @@ impl SessionObservationStore {
         &self,
         user: &str,
         session: &str,
-    ) -> Result<Option<ObservationCandidate>, String> {
+    ) -> Result<Option<ObservationCandidate>, ObservationError> {
         let lease_token = format!("{}:{}", self.owner, uuid::Uuid::new_v4());
-        let mut connection = self
-            .pool
-            .get()
-            .acquire()
-            .await
-            .map_err(|_| "observation claim connection failed")?;
+        let mut connection = self.pool.get().acquire().await.map_err(|error| {
+            ObservationError::database("observation claim connection failed", &error)
+        })?;
         sqlx::query(CLAIM_SQL)
             .bind(&lease_token)
             .bind(user)
@@ -91,7 +140,7 @@ impl SessionObservationStore {
             .bind(session)
             .execute(&mut *connection)
             .await
-            .map_err(|_| "observation claim failed")?;
+            .map_err(|error| ObservationError::database("observation claim failed", &error))?;
         // Read the token back, rather than relying on affected_rows semantics.
         let Some(row) = sqlx::query(CANDIDATE_SQL)
             .bind(user)
@@ -99,17 +148,19 @@ impl SessionObservationStore {
             .bind(&lease_token)
             .fetch_optional(&mut *connection)
             .await
-            .map_err(|_| "observation claim receipt failed")?
+            .map_err(|error| {
+                ObservationError::database("observation claim receipt failed", &error)
+            })?
         else {
             return Ok(None);
         };
         let key = astra_turn_types::SessionKeyV1::owner_session("server", user, session, "main");
-        let turn = u32::try_from(
+        let mut turn = u32::try_from(
             row.try_get::<i64, _>("completed_turn")
                 .map_err(|_| "invalid observation turn")?,
         )
         .map_err(|_| "invalid observation turn")?;
-        let head = row
+        let mut head = row
             .try_get::<Option<String>, _>("head_json")
             .map_err(|_| "invalid observation head")?
             .ok_or("missing observation head".to_owned())
@@ -124,13 +175,31 @@ impl SessionObservationStore {
                     Err("observation head identity mismatch".into())
                 }
             });
-        let checkpoint = row
+        let checkpoint: ObservationCheckpoint = row
             .try_get::<Option<String>, _>("observation_json")
             .map_err(|_| "invalid observation checkpoint")?
             .map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(|_| "invalid observation checkpoint")?
             .unwrap_or_default();
+        if let Some(progress) = &checkpoint.progress {
+            if progress.head.key != key
+                || progress.head.cursor.completed_turn > turn
+                || progress.head.cursor.completed_turn <= checkpoint.observed_turn
+                || head.as_ref().is_ok_and(|current| {
+                    progress.head.cursor.compaction_generation
+                        > current.cursor.compaction_generation
+                })
+            {
+                return Err("invalid canonical observation progress head".into());
+            }
+            // A partial receipt pins the immutable captured range. A newer
+            // Append/Replace remains due after this range is fully delivered.
+            if head.is_ok() {
+                head = Ok(progress.head.clone());
+                turn = progress.head.cursor.completed_turn;
+            }
+        }
         Ok(Some(ObservationCandidate {
             key,
             turn,
@@ -138,13 +207,14 @@ impl SessionObservationStore {
             checkpoint,
             lease_token,
             next_memory_operation_segment: None,
+            next_progress: None,
         }))
     }
 
     pub async fn materialize(
         &self,
         candidate: &ObservationCandidate,
-    ) -> Result<MaterializedConversationDeltaV1, String> {
+    ) -> Result<MaterializedConversationDeltaV1, ObservationError> {
         let head = candidate.head.as_ref().map_err(Clone::clone)?;
         if candidate
             .checkpoint
@@ -159,6 +229,8 @@ impl SessionObservationStore {
             .await
             .map_err(|error| {
                 use crate::session_context_coordinator::SessionContextCoordinatorError;
+                let shared = matches!(&error,
+                    SessionContextCoordinatorError::Database { source, .. } if shared_database_failure(source));
                 let kind = match error {
                     SessionContextCoordinatorError::Database { operation, source } => {
                         let source_kind = match source {
@@ -182,7 +254,8 @@ impl SessionObservationStore {
                 };
                 // Preserve the failing phase without logging URLs, database
                 // response text, stored content, or owner identifiers.
-                format!("observation canonical context could not be materialized ({kind})")
+                let message = format!("observation canonical context could not be materialized ({kind})");
+                if shared { ObservationError::SharedDependency(message) } else { ObservationError::Session(message) }
             })?;
         astra_core::history_work::record_operation(
             astra_core::history_work::HistoryWorkSite::CanonicalObservationRead,
@@ -200,7 +273,7 @@ impl SessionObservationStore {
         &self,
         candidate: &ObservationCandidate,
         success: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), ObservationError> {
         let mut checkpoint = candidate.checkpoint.clone();
         let receipt_id = uuid::Uuid::new_v4().to_string();
         checkpoint.receipt_id = Some(receipt_id.clone());
@@ -208,7 +281,8 @@ impl SessionObservationStore {
             .revision
             .checked_add(1)
             .ok_or("observation revision overflow")?;
-        if success {
+        let complete = success && candidate.next_progress.is_none();
+        if complete {
             checkpoint.observed_turn = checkpoint.observed_turn.max(candidate.turn);
             checkpoint.observed_head = candidate.head.as_ref().ok().cloned();
             // No payload is loaded on denial: conservatively suppress any
@@ -216,20 +290,68 @@ impl SessionObservationStore {
             checkpoint.memory_operation_segment =
                 candidate.next_memory_operation_segment.unwrap_or(true);
             checkpoint.attempts = 0;
+            checkpoint.progress = None;
+        } else if success {
+            checkpoint.progress = candidate.next_progress.clone();
+            checkpoint.attempts = 0;
         } else {
             checkpoint.attempts = checkpoint.attempts.saturating_add(1);
         }
-        let backoff_ms =
-            (5_000_i64 * (1_i64 << checkpoint.attempts.saturating_sub(1).min(8))).min(960_000);
+        let backoff_ms = if success {
+            0
+        } else {
+            (5_000_i64 * (1_i64 << checkpoint.attempts.saturating_sub(1).min(8))).min(960_000)
+        };
+        self.persist(candidate, &checkpoint, Some((complete, backoff_ms)))
+            .await
+    }
+
+    /// Save only accepted text progress, retaining the existing exact Session
+    /// lease. A crash or an uncertain receipt can repeat delivery, never skip it.
+    pub async fn checkpoint_progress(
+        &self,
+        candidate: &mut ObservationCandidate,
+        cursor: window::ObservationTextCursor,
+    ) -> Result<(), ObservationError> {
+        let mut checkpoint = candidate.checkpoint.clone();
+        checkpoint.revision = checkpoint
+            .revision
+            .checked_add(1)
+            .ok_or("observation revision overflow")?;
+        checkpoint.receipt_id = Some(uuid::Uuid::new_v4().to_string());
+        checkpoint.progress = Some(ObservationProgress {
+            head: candidate.head.as_ref().map_err(Clone::clone)?.clone(),
+            cursor,
+        });
+        self.persist(candidate, &checkpoint, None).await?;
+        candidate.next_progress = checkpoint.progress.clone();
+        candidate.checkpoint = checkpoint;
+        Ok(())
+    }
+
+    pub fn progress(
+        candidate: &ObservationCandidate,
+        cursor: window::ObservationTextCursor,
+    ) -> Result<ObservationProgress, ObservationError> {
+        Ok(ObservationProgress {
+            head: candidate.head.as_ref().map_err(Clone::clone)?.clone(),
+            cursor,
+        })
+    }
+
+    async fn persist(
+        &self,
+        candidate: &ObservationCandidate,
+        checkpoint: &ObservationCheckpoint,
+        release: Option<(bool, i64)>,
+    ) -> Result<(), ObservationError> {
         let json =
             serde_json::to_string(&checkpoint).map_err(|_| "invalid observation checkpoint")?;
-        let mut connection = self
-            .pool
-            .get()
-            .acquire()
-            .await
-            .map_err(|_| "observation checkpoint connection failed")?;
-        sqlx::query("UPDATE session_context_heads
+        let mut connection = self.pool.get().acquire().await.map_err(|error| {
+            ObservationError::database("observation checkpoint connection failed", &error)
+        })?;
+        if let Some((complete, backoff_ms)) = release {
+            sqlx::query("UPDATE session_context_heads
             SET observation_json = ?,
                 observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
                     WHEN completed_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
@@ -237,14 +359,23 @@ impl SessionObservationStore {
             WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
               AND observation_lease_token = ? AND observation_due_at > NOW(6)
               AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
-            .bind(json).bind(success).bind(backoff_ms * 1000).bind(candidate.turn)
+            .bind(json).bind(complete).bind(backoff_ms * 1000).bind(candidate.turn)
             .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
-            .execute(&mut *connection).await.map_err(|_| "observation checkpoint failed")?;
+            .execute(&mut *connection).await.map_err(|error| ObservationError::database("observation checkpoint failed", &error))?;
+        } else {
+            sqlx::query("UPDATE session_context_heads SET observation_json = ?
+                WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
+                  AND observation_lease_token = ? AND observation_due_at > NOW(6)
+                  AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
+                .bind(json).bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id)
+                .bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
+                .execute(&mut *connection).await.map_err(|error| ObservationError::database("observation progress checkpoint failed", &error))?;
+        }
         let stored: Option<String> = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id'))
             FROM session_context_heads WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
             .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).fetch_optional(&mut *connection).await
-            .map_err(|_| "observation checkpoint receipt unavailable")?.flatten();
-        if stored.as_deref() != Some(receipt_id.as_str()) {
+            .map_err(|error| ObservationError::database("observation checkpoint receipt unavailable", &error))?.flatten();
+        if stored.as_deref() != checkpoint.receipt_id.as_deref() {
             return Err("observation checkpoint fence rejected or receipt superseded".into());
         }
         Ok(())
@@ -418,7 +549,7 @@ mod tests {
                 CoordinatorMutationV1::Applied { cursor } => cursor,
                 other => panic!("unexpected commit: {other:?}"),
             });
-            if let Some(candidate) = captured.take() {
+            if let Some(mut candidate) = captured.take() {
                 let materialized = store.materialize(&candidate).await.unwrap_or_else(|error| {
                     panic!(
                         "captured turn {} after {} failed while committing {turn}: {error}",
@@ -499,8 +630,51 @@ mod tests {
                     store.finish(&candidate, true).await.is_err(),
                     "an expired lease must not acknowledge an unstored checkpoint"
                 );
+                if turn == 2 {
+                    assert!(
+                        store
+                            .checkpoint_progress(
+                                &mut candidate,
+                                window::ObservationTextCursor {
+                                    part: 0,
+                                    byte_offset: 1
+                                }
+                            )
+                            .await
+                            .is_err(),
+                        "an expired lease cannot save a partial text receipt"
+                    );
+                }
                 sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 90 SECOND) WHERE session_id = 'captured-head'")
                     .execute(pool.get()).await.unwrap();
+                if turn == 2 {
+                    let stale = candidate.clone();
+                    store
+                        .checkpoint_progress(
+                            &mut candidate,
+                            window::ObservationTextCursor {
+                                part: 0,
+                                byte_offset: 1,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(candidate.checkpoint.observed_turn, 0);
+                    assert!(candidate.checkpoint.progress.is_some());
+                    assert!(
+                        store.finish(&stale, true).await.is_err(),
+                        "partial receipts must fence stale final acknowledgements"
+                    );
+                    assert!(
+                        store
+                            .claim(&key.owner_user_id, &key.session_id)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "partial progress must retain the exact live lease"
+                    );
+                    candidate.next_progress = None;
+                }
                 store.finish(&candidate, true).await.unwrap();
                 assert!(
                     store.finish(&candidate, false).await.is_err(),

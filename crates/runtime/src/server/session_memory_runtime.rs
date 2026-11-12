@@ -2,6 +2,7 @@
 use crate::turn::cloud::memoria_compact::UserScopedMemoriaPort;
 use crate::{AppState, session_memory::durable::DurableMemoriaPort};
 use astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore;
+use astra_services::session_observation::{ObservationError, window::ObservationInput};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -189,6 +190,10 @@ pub(crate) struct SessionObservationRecovery {
     failure_budget: std::sync::Arc<std::sync::Mutex<ObservationFailureBudget>>,
 }
 const OBSERVATION_CONCURRENCY: usize = 8;
+enum ObservationAttempt {
+    Settled(astra_turn_core::contracts::TurnObserverOutcome),
+    Partial,
+}
 #[derive(Default)]
 struct ObservationPending {
     keys: std::collections::VecDeque<(String, String)>,
@@ -196,7 +201,7 @@ struct ObservationPending {
 }
 
 /// Process-local health budget for this configured optional observer. Eight
-/// consecutive failed attempts open a shared pause before any discovery/claim
+/// consecutive proven shared storage failures open a pause before discovery/claim
 /// SQL. One fresh attempt probes recovery; no credentials or work are cached.
 #[derive(Default)]
 struct ObservationFailureBudget {
@@ -259,7 +264,7 @@ impl ObservationHealthPermit {
                 if outcome == Some(false) {
                     state.delay_secs = (state.delay_secs * 2).min(960);
                 }
-                // A lost claim or empty page says nothing about dependency
+                // A tick suppressed without I/O says nothing about dependency
                 // health. Continue to the next key; discovery retains its own
                 // shared idle cooldown, so this cannot spin on an empty catalog.
                 state.retry_at = Some(
@@ -365,11 +370,16 @@ impl SessionObservationRecovery {
         let result = self.drive_one_admitted().await;
         permit.finish(match &result {
             Ok((_, health)) => *health,
-            Err(_) => Some(false),
+            // Owner/provider failures do not establish a common outage. They
+            // already have a durable per-Session due deadline. Successful SQL
+            // also closes a storage probe even when the Session itself fails.
+            Err(error) => Some(!error.is_shared_dependency()),
         });
-        result.map(|(progress, _)| progress)
+        result
+            .map(|(progress, _)| progress)
+            .map_err(|error| error.to_string())
     }
-    async fn drive_one_admitted(&self) -> Result<(bool, Option<bool>), String> {
+    async fn drive_one_admitted(&self) -> Result<(bool, Option<bool>), ObservationError> {
         let key = if let Some(key) = &self.scope {
             key.clone()
         } else {
@@ -386,14 +396,18 @@ impl SessionObservationRecovery {
                 pending.resume_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
                 pending.keys = tokio::time::timeout(Duration::from_secs(5), self.store.due_keys())
                     .await
-                    .map_err(|_| "observation due discovery timed out")??
+                    .map_err(|_| {
+                        ObservationError::SharedDependency(
+                            "observation due discovery timed out".into(),
+                        )
+                    })??
                     .into();
                 if !pending.keys.is_empty() {
                     pending.resume_at = None;
                 }
             }
             let Some(key) = pending.keys.pop_front() else {
-                return Ok((false, None));
+                return Ok((false, Some(true)));
             };
             key
         };
@@ -404,7 +418,7 @@ impl SessionObservationRecovery {
         let Some(mut candidate) = candidate else {
             // Another owner already took this Session; continue to other due
             // identities instead of sleeping or discarding a whole shard.
-            return Ok((self.scope.is_none(), None));
+            return Ok((self.scope.is_none(), Some(true)));
         };
         let result = tokio::time::timeout(Duration::from_secs(60), async {
             if !self
@@ -414,12 +428,9 @@ impl SessionObservationRecovery {
                 .admits_observation(&candidate.key.owner_user_id, &candidate.key.session_id)
                 .await?
             {
-                crate::server::run::lifecycle::record_turn_observer_run_metrics(
-                    Some(&self.state.metrics_registry),
-                    "canonical",
-                    "access_disabled",
-                );
-                return Ok(());
+                return Ok(ObservationAttempt::Settled(
+                    astra_turn_core::contracts::TurnObserverOutcome::AccessDisabled,
+                ));
             }
             let materialized = self.store.materialize(&candidate).await?;
             let same_generation = candidate
@@ -430,45 +441,121 @@ impl SessionObservationRecovery {
                     head.cursor.compaction_generation
                         == materialized.head.cursor.compaction_generation
                 });
-            let (messages, memory_operation_segment) =
-                astra_turn_core::observer::filter_memory_operation_turns_with_context(
+            let (context, messages, memory_operation_segment) =
+                astra_turn_core::observer::filter_memory_operation_parts(
                     &materialized.prior_context,
                     &materialized.messages,
                     same_generation && candidate.checkpoint.memory_operation_segment,
                 );
             candidate.next_memory_operation_segment = Some(memory_operation_segment);
-            let messages = messages
-                .into_iter()
-                .filter_map(|message| message.as_object().cloned())
-                .collect();
-            crate::server::run::lifecycle::run_server_loop_observer_request(
-                self.state.turn_persistence.observer_worker.as_ref(),
-                &candidate.key.session_id,
-                astra_turn_core::contracts::TurnObserverRequest {
-                    user_id: candidate.key.owner_user_id.clone(),
-                    session_id: candidate.key.session_id.clone(),
-                    messages,
-                    turn_count: i64::from(candidate.turn),
-                    session_start: None,
-                },
-                "canonical",
-                Some(&self.state.metrics_registry),
-            )
-            .await
+            let input = ObservationInput::new(&context, &messages);
+            let mut cursor = candidate
+                .checkpoint
+                .progress
+                .as_ref()
+                .map(|p| p.cursor)
+                .unwrap_or_default();
+            // Bound dispatch work as well as time. Accepted windows have fenced
+            // progress receipts; retry never starts again at the backlog prefix.
+            for index in 0..8 {
+                let window = input.window(cursor)?;
+                if window.messages.is_empty() {
+                    candidate.next_progress = None;
+                    return Ok::<_, ObservationError>(ObservationAttempt::Settled(
+                        astra_turn_core::contracts::TurnObserverOutcome::Empty,
+                    ));
+                }
+                let outcome = crate::server::run::lifecycle::run_server_loop_observer_request(
+                    self.state.turn_persistence.observer_worker.as_ref(),
+                    &candidate.key.session_id,
+                    astra_turn_core::contracts::TurnObserverRequest {
+                        user_id: candidate.key.owner_user_id.clone(),
+                        session_id: candidate.key.session_id.clone(),
+                        messages: window.messages,
+                        turn_count: i64::from(candidate.turn),
+                        session_start: None,
+                    },
+                    "canonical",
+                    // Count a logical canonical result only after its fenced
+                    // receipt, rather than reporting each window as a head.
+                    None,
+                )
+                .await?;
+                use astra_turn_core::contracts::TurnObserverOutcome;
+                match outcome {
+                    TurnObserverOutcome::Observed => {}
+                    TurnObserverOutcome::AccessDisabled | TurnObserverOutcome::NotConfigured => {
+                        // Existing consent semantics intentionally discard denied
+                        // history. This is not an extraction-success receipt.
+                        candidate.next_progress = None;
+                        candidate.next_memory_operation_segment = None;
+                        return Ok(ObservationAttempt::Settled(outcome));
+                    }
+                    TurnObserverOutcome::Empty => {
+                        return Err("nonempty observation was not accepted".into());
+                    }
+                }
+                cursor = window.next;
+                if window.complete {
+                    candidate.next_progress = None;
+                    return Ok(ObservationAttempt::Settled(TurnObserverOutcome::Observed));
+                }
+                if index < 7 {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.store.checkpoint_progress(&mut candidate, cursor),
+                    )
+                    .await
+                    .map_err(|_| "observation progress receipt timed out")??;
+                } else {
+                    candidate.next_progress = Some(
+                        astra_services::session_observation::SessionObservationStore::progress(
+                            &candidate, cursor,
+                        )?,
+                    );
+                }
+            }
+            Ok(ObservationAttempt::Partial)
         })
         .await
-        .unwrap_or_else(|_| Err("canonical observation attempt timed out".into()));
-        tokio::time::timeout(
+        .unwrap_or_else(|_| {
+            Err(ObservationError::Session(
+                "canonical observation attempt timed out".into(),
+            ))
+        });
+        let receipt = tokio::time::timeout(
             Duration::from_secs(5),
             self.store.finish(&candidate, result.is_ok()),
         )
         .await
-        .map_err(|_| "observation checkpoint receipt timed out")??;
-        let succeeded = result.is_ok();
+        .map_err(|_| ObservationError::Session("observation checkpoint receipt timed out".into()))
+        .and_then(|result| result);
+        use astra_turn_core::contracts::TurnObserverOutcome;
+        let metric = match (&result, &receipt) {
+            (_, Err(_)) | (Err(_), _) => Some("error"),
+            (Ok(ObservationAttempt::Partial), _) => None,
+            (Ok(ObservationAttempt::Settled(outcome)), _) => Some(match outcome {
+                TurnObserverOutcome::Observed => "success",
+                TurnObserverOutcome::AccessDisabled => "access_disabled",
+                TurnObserverOutcome::NotConfigured => "not_configured",
+                TurnObserverOutcome::Empty => "empty",
+            }),
+        };
+        if let Some(metric) = metric {
+            crate::server::run::lifecycle::record_turn_observer_run_metrics(
+                Some(&self.state.metrics_registry),
+                "canonical",
+                metric,
+            );
+        }
+        receipt?;
         if let Err(error) = result {
+            if error.is_shared_dependency() {
+                return Err(error);
+            }
             tracing::warn!(%error, "canonical observation attempt deferred");
         }
-        Ok((true, Some(succeeded)))
+        Ok((true, Some(true)))
     }
 }
 

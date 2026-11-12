@@ -109,9 +109,21 @@ pub fn filter_memory_operation_turns_with_context(
     messages: &[Value],
     preceding_memory_operation: bool,
 ) -> (Vec<Value>, bool) {
-    let (mut new, flag) = filter_memory_operation_turns_after(messages, preceding_memory_operation);
+    let (mut context, mut new, flag) =
+        filter_memory_operation_parts(context, messages, preceding_memory_operation);
+    context.append(&mut new);
+    (context, flag)
+}
+
+/// Keep reference context separate from newly due text for durable windowing.
+pub fn filter_memory_operation_parts(
+    context: &[Value],
+    messages: &[Value],
+    preceding_memory_operation: bool,
+) -> (Vec<Value>, Vec<Value>, bool) {
+    let (new, flag) = filter_memory_operation_turns_after(messages, preceding_memory_operation);
     if new.is_empty() {
-        return (new, flag);
+        return (Vec::new(), new, flag);
     }
     let continuation_is_memory_operation = messages
         .iter()
@@ -125,9 +137,8 @@ pub fn filter_memory_operation_turns_with_context(
     } else {
         context.len()
     };
-    let mut combined = filter_memory_operation_turns_after(&context[..context_end], true).0;
-    combined.append(&mut new);
-    (combined, flag)
+    let context = filter_memory_operation_turns_after(&context[..context_end], true).0;
+    (context, new, flag)
 }
 
 pub fn build_observer_messages(

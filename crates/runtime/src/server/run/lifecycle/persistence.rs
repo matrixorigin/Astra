@@ -2449,7 +2449,7 @@ pub(crate) async fn run_server_loop_observer_request(
     request: TurnObserverRequest,
     mode: &'static str,
     metrics_registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-) -> Result<(), String> {
+) -> Result<TurnObserverOutcome, String> {
     let _reservation = reserve_server_observer_request(&request);
     let result = tokio::time::timeout(Duration::from_secs(60), observer_worker.run(request))
         .await
@@ -2469,7 +2469,7 @@ pub(crate) async fn run_server_loop_observer_request(
         }
     };
     record_turn_observer_run_metrics(metrics_registry, mode, outcome);
-    result.map(|_| ())
+    result
 }
 
 pub(crate) fn build_run_turn_complete_event_with_interruption(

@@ -4,6 +4,29 @@ This repository is validated through Rust-first checks, contract tests (fast, ma
 
 ## Primary Commands
 
+For the canonical observation extractor boundary, run the ignored
+`chat_sql_budget::canonical_observation_backlog_resumes_only_accepted_extractor_windows`
+case with an isolated MatrixOne. It drives the production recovery owner and
+HTTP worker, checks all three extraction limits, partial failure/restart and a
+newer completion while the previous capture is partial. The default HTTP fixture
+models the published input limits; it is not a live Memoria or model-quality test.
+
+An additional offline check can run the *exact supplied Memoria extraction method*
+with a controlled LLM stub, after building the services tests:
+
+```bash
+python3 scripts/memoria_extractor_boundary.py \
+  --memoria-service-source /path/to/memoria-service/src/service.rs \
+  --deps target/debug/deps
+```
+
+The script compiles the production Astra window planner and supplied upstream
+method without rewriting either, reproduces the old 20-of-30 selection and checks
+that windowed Unicode/long-message input reaches the extraction method intact.
+It reports the method hash for provenance. It uses no network, credentials,
+database or live model; it does not exercise the complete Memoria API/persistence.
+Run it only with trusted source and build artifacts.
+
 ```bash
 # Full suite: workspace + e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne and Memoria for the online portion)
 make test
