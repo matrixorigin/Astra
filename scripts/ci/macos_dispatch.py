@@ -278,8 +278,12 @@ def source(api, repo, run_id, attempt):
         labels = MACOS_MAIN_LABELS
     else:
         raise Unavailable("unsupported source event")
-    if labels not in (MACOS_SELF_HOSTED_LABELS, MACOS_MAIN_LABELS):
+    # Only an explicitly selected hosted macOS runner is a benign no-op.
+    # An empty/unknown selection means missing source metadata: fail closed.
+    if labels == ["macos-15"]:
         raise Unavailable("source does not prefer mini")
+    if labels not in (MACOS_SELF_HOSTED_LABELS, MACOS_MAIN_LABELS):
+        raise Unavailable("source runner metadata unavailable")
     return src
 
 
