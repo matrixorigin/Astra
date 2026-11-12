@@ -22,13 +22,35 @@ use serde_json::Value;
 
 use astra_turn_core::edge_ledger::{
     LEDGER_MAX_ENTRIES, approval_callback_key, ledger_entry_is_expected, ledger_replay_status,
-    sweep_expired_entries_locked, take_cancelled_callback_ack_expectation, tool_callback_key,
+    remember_acknowledged_ledger_entry, sweep_expired_entries_locked,
+    take_cancelled_callback_ack_expectation, tool_callback_key,
 };
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
 /// report them again on the next heartbeat cycle.
 const MAX_LAST_SEEN_REQUEST_IDS: usize = 256;
+
+fn dispatch_delivery_failure_response(
+    error: &astra_services::multi_agent::EdgeDispatchDeliveryError,
+    detail: &'static str,
+) -> (
+    axum::http::StatusCode,
+    axum::Json<astra_core::ErrorResponse>,
+) {
+    if matches!(
+        error,
+        astra_services::multi_agent::EdgeDispatchDeliveryError::Database(_)
+    ) {
+        astra_core::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            detail,
+            astra_core::ErrorKind::DatabaseError.as_str(),
+        )
+    } else {
+        error_response(StatusCode::SERVICE_UNAVAILABLE, detail)
+    }
+}
 
 fn recorded_approval_conflict_response(
     request_id: &str,
@@ -340,38 +362,6 @@ pub(crate) async fn post_tool_result_handler(
             tool_result_fields: safe_body.tool_result_fields.as_ref(),
         },
     );
-    if astra_services::runs::durable_run_status_is_terminal(&target.status) {
-        let dispatch = &state.execution.edge_dispatch_service;
-        let serialized = serde_json::to_string(&safe_body).map_err(|error| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid tool result: {error}"),
-            )
-        })?;
-        let accepted = dispatch
-            .deliver_terminal_result(&identity, &body.edge_agent_id, &serialized)
-            .await
-            .map_err(|_| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Cannot retain the late tool result",
-                )
-            })?;
-        if !accepted {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "No matching unsettled tool dispatch can accept this result",
-            ));
-        }
-        return Ok(Json(serde_json::json!({
-            "ok": true,
-            "request_id": body.request_id,
-            "ledger_enqueued": false,
-            "dispatch_delivered": accepted,
-            "delivery_route": "terminal_dispatch",
-            "terminal_status": target.status,
-        })));
-    }
     let key = tool_callback_key(&identity);
     let mut ledger_value = serde_json::json!({
         "kind": "tool_result",
@@ -408,6 +398,91 @@ pub(crate) async fn post_tool_result_handler(
         }
         None => {}
     }
+    if astra_services::runs::durable_run_status_is_terminal(&target.status) {
+        let dispatch = &state.execution.edge_dispatch_service;
+        let serialized = serde_json::to_string(&safe_body).map_err(|error| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid tool result: {error}"),
+            )
+        })?;
+        let accepted = match dispatch
+            .deliver_terminal_result(&identity, &body.edge_agent_id, &serialized)
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(astra_services::multi_agent::EdgeDispatchDeliveryError::Unconfigured)
+                if safe_body.status == "cancelled" =>
+            {
+                let _ledger = state.edge_callback_ledger.lock().await;
+                let acknowledged =
+                    match ledger_replay_status(&state.edge_callback_ledger, &key, &ledger_value) {
+                        Some(true) => true,
+                        Some(false) => {
+                            return Err(ledger_insert_error_response(
+                                &key,
+                                LedgerInsertError::DuplicateKey,
+                            ));
+                        }
+                        None => {
+                            let accepted = take_cancelled_callback_ack_expectation(
+                                &state.edge_callback_ledger,
+                                &key,
+                                &body.edge_agent_id,
+                            );
+                            if accepted {
+                                remember_acknowledged_ledger_entry(
+                                    &state.edge_callback_ledger,
+                                    &key,
+                                    ledger_value,
+                                );
+                            }
+                            accepted
+                        }
+                    };
+                if acknowledged {
+                    return Ok(Json(serde_json::json!({
+                        "ok": true,
+                        "request_id": body.request_id,
+                        "ledger_enqueued": false,
+                        "dispatch_delivered": false,
+                        "delivery_route": "terminal_local_cancelled",
+                        "terminal_status": target.status,
+                    })));
+                }
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "No matching cancellation acknowledgement can accept this result",
+                ));
+            }
+            Err(astra_services::multi_agent::EdgeDispatchDeliveryError::PayloadConflict) => {
+                return Err(ledger_insert_error_response(
+                    &key,
+                    LedgerInsertError::DuplicateKey,
+                ));
+            }
+            Err(error) => {
+                return Err(dispatch_delivery_failure_response(
+                    &error,
+                    "Cannot retain the late tool result",
+                ));
+            }
+        };
+        if !accepted {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "No matching unsettled tool dispatch can accept this result",
+            ));
+        }
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "request_id": body.request_id,
+            "ledger_enqueued": false,
+            "dispatch_delivered": accepted,
+            "delivery_route": "terminal_dispatch",
+            "terminal_status": target.status,
+        })));
+    }
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
     let dispatch_svc = &state.execution.edge_dispatch_service;
@@ -425,16 +500,26 @@ pub(crate) async fn post_tool_result_handler(
     {
         Ok(true) => true,
         Ok(false) => false,
+        Err(astra_services::multi_agent::EdgeDispatchDeliveryError::PayloadConflict) => {
+            return Err(ledger_insert_error_response(
+                &key,
+                LedgerInsertError::DuplicateKey,
+            ));
+        }
         Err(e) => {
             tracing::warn!(
                 target: "astra_runtime::edge_callback",
+                trace_request_id = %trace.request_id,
                 user_id = %user.user_id,
                 request_id = %body.request_id,
                 edge_agent_id = %safe_edge_agent_id,
                 error = %e,
                 "Edge: failed to cross-pod deliver tool result"
             );
-            false
+            return Err(dispatch_delivery_failure_response(
+                &e,
+                "Cannot retain the tool result; retry the callback",
+            ));
         }
     };
 
@@ -447,17 +532,52 @@ pub(crate) async fn post_tool_result_handler(
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             })?;
     }
-    // Do not release the local waiter until durable acceptance is known. A
-    // failed durable write still permits existing local delivery, without a
-    // reference. Recheck the expectation under lock after the await.
+    // A failed durable write may have committed before its acknowledgement was
+    // lost. Do not release the local waiter until that outcome is known.
+    // Recheck the expectation under lock after the await.
+    let mut local_cancelled_callback_ack = false;
     let ledger_insert_result = {
         let mut lock = state.edge_callback_ledger.lock().await;
-        ledger_entry_is_expected(
+        // A prior delivery can be consumed while this request is awaiting the
+        // durable dispatch. Recheck under the same lock as consumption.
+        match ledger_replay_status(&state.edge_callback_ledger, &key, &ledger_value) {
+            Some(true) => {
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "request_id": body.request_id,
+                    "ledger_enqueued": false,
+                    "dispatch_delivered": dispatch_delivered,
+                    "delivery_route": "idempotent_replay",
+                })));
+            }
+            Some(false) => {
+                return Err(ledger_insert_error_response(
+                    &key,
+                    LedgerInsertError::DuplicateKey,
+                ));
+            }
+            None => {}
+        }
+        if ledger_entry_is_expected(
             &state.edge_callback_ledger,
             &key,
             body.edge_agent_id.as_str(),
-        )
-        .then(|| insert_ledger_entry(&mut lock, key.clone(), ledger_value))
+        ) {
+            Some(insert_ledger_entry(&mut lock, key.clone(), ledger_value))
+        } else {
+            // A late cancellation ACK cannot reopen a waiter. Retain the
+            // accepted receipt under the same lock so its retry is idempotent.
+            local_cancelled_callback_ack = safe_body.status.eq_ignore_ascii_case("cancelled")
+                && take_cancelled_callback_ack_expectation(
+                    &state.edge_callback_ledger,
+                    &key,
+                    body.edge_agent_id.as_str(),
+                );
+            if local_cancelled_callback_ack {
+                remember_acknowledged_ledger_entry(&state.edge_callback_ledger, &key, ledger_value);
+            }
+            None
+        }
     };
     let (local_callback_accepted, ledger_enqueued, ledger_capacity_exceeded) =
         match ledger_insert_result {
@@ -471,15 +591,6 @@ pub(crate) async fn post_tool_result_handler(
             Some(Err(LedgerInsertError::CapacityExceeded)) => (false, false, true),
             None => (false, false, false),
         };
-    // A late cancellation acknowledgement must not reopen normal delivery.
-    let local_cancelled_callback_ack = !local_callback_accepted
-        && safe_body.status.eq_ignore_ascii_case("cancelled")
-        && take_cancelled_callback_ack_expectation(
-            &state.edge_callback_ledger,
-            &key,
-            body.edge_agent_id.as_str(),
-        );
-
     let delivery_route = if dispatch_delivered {
         "durable_dispatch"
     } else if local_callback_accepted {
@@ -2493,6 +2604,9 @@ mod edge_callback_insert_tests {
     struct RecordingEdgeDispatch {
         deliver_result: bool,
         delivered: Mutex<Vec<(String, String, String, String)>>,
+        deliver_error: Option<fn() -> astra_services::multi_agent::EdgeDispatchDeliveryError>,
+        first_delivery_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        delivery_count: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -2510,7 +2624,19 @@ mod edge_callback_insert_tests {
             identity: &EdgeDispatchIdentity,
             edge_agent_id: &str,
             result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+            if self
+                .delivery_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+                && let Some((entered, resume)) = &self.first_delivery_gate
+            {
+                entered.notify_one();
+                resume.notified().await;
+            }
+            if let Some(error) = self.deliver_error {
+                return Err(error());
+            }
             self.delivered.lock().unwrap().push((
                 identity.user_id.clone(),
                 identity.request_id.clone(),
@@ -2525,7 +2651,7 @@ mod edge_callback_insert_tests {
             identity: &EdgeDispatchIdentity,
             edge_agent_id: &str,
             result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             self.deliver_result(identity, edge_agent_id, result_json)
                 .await
         }
@@ -3693,6 +3819,7 @@ mod edge_callback_insert_tests {
             let dispatch = Arc::new(RecordingEdgeDispatch {
                 deliver_result: true,
                 delivered: Mutex::new(Vec::new()),
+                ..Default::default()
             });
             let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
                 .with_auth_service(Arc::new(StaticAuthService))
@@ -3770,6 +3897,7 @@ mod edge_callback_insert_tests {
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: false,
             delivered: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
@@ -3809,35 +3937,34 @@ mod edge_callback_insert_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_callback_is_acknowledged_after_local_waiter_settles() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(Arc::new(
+        for terminal in [false, true] {
+            let lifecycle = Arc::new(
                 ApprovalTargetRunLifecycle::new("run-local-cancelled", "sess-local-cancelled")
                     .with_running_edge_wait(),
-            ));
-        let identity = EdgeDispatchIdentity::new(
-            "u-approval",
-            "sess-local-cancelled",
-            "run-local-cancelled",
-            "chain-local-cancelled",
-            "req-local-cancelled",
-        );
-        let key = tool_callback_key(&identity);
-        expect_ledger_entry(&state.edge_callback_ledger, &key, "edge-a")
-            .expect("the emitted request owns callback custody");
-        assert!(
-            take_ledger_entry(&state.edge_callback_ledger, &key, Duration::ZERO)
-                .await
-                .is_none()
-        );
+            );
+            let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                .with_auth_service(Arc::new(StaticAuthService))
+                .with_run_lifecycle_service(lifecycle.clone());
+            let identity = EdgeDispatchIdentity::new(
+                "u-approval",
+                "sess-local-cancelled",
+                "run-local-cancelled",
+                "chain-local-cancelled",
+                "req-local-cancelled",
+            );
+            let key = tool_callback_key(&identity);
+            expect_ledger_entry(&state.edge_callback_ledger, &key, "edge-a")
+                .expect("the emitted request owns callback custody");
+            assert!(
+                take_ledger_entry(&state.edge_callback_ledger, &key, Duration::ZERO)
+                    .await
+                    .is_none()
+            );
 
-        let response = post_tool_result_handler(
-            Extension(RequestTrace {
-                request_id: "trace-local-cancelled".into(),
-            }),
-            State(state.clone()),
-            HeaderMap::new(),
-            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+            if terminal {
+                *lifecycle.status.lock().unwrap() = astra_core::STATUS_CANCELLED.to_string();
+            }
+            let request = astra_thin_client::ToolResultRequest::new_with_hash(
                 astra_thin_client::ToolResultRequestParts {
                     session_id: identity.session_id.clone(),
                     run_id: identity.run_id.clone(),
@@ -3849,14 +3976,33 @@ mod edge_callback_insert_tests {
                     duration_ms: 12,
                     tool_result_fields: None,
                 },
-            )),
-        )
-        .await
-        .expect("the exact post-cancellation acknowledgement is accepted");
+            );
+            let response = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace-local-cancelled".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request.clone()),
+            )
+            .await
+            .expect("the exact post-cancellation acknowledgement is accepted");
 
-        assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["delivery_route"], "terminal_local_cancelled");
-        assert!(state.edge_callback_ledger.lock().await.is_empty());
+            assert_eq!(response.0["ok"], true);
+            assert_eq!(response.0["delivery_route"], "terminal_local_cancelled");
+            let replay = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace-local-cancelled-retry".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request),
+            )
+            .await
+            .expect("a lost cancellation acknowledgement can be retried");
+            assert_eq!(replay.0["delivery_route"], "idempotent_replay");
+            assert!(state.edge_callback_ledger.lock().await.is_empty());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3913,6 +4059,7 @@ mod edge_callback_insert_tests {
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: false,
             delivered: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
@@ -3920,7 +4067,7 @@ mod edge_callback_insert_tests {
                 ApprovalTargetRunLifecycle::new("run-cancelled-receipt", "sess-cancelled-receipt")
                     .with_running_edge_wait(),
             ))
-            .with_edge_dispatch_service(dispatch);
+            .with_edge_dispatch_service(dispatch.clone());
 
         let error = post_tool_result_handler(
             Extension(RequestTrace {
@@ -4491,6 +4638,87 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn local_waiter_is_not_released_when_durable_delivery_is_uncertain_or_conflicts() {
+        use astra_services::multi_agent::EdgeDispatchDeliveryError;
+
+        let failures: [(fn() -> EdgeDispatchDeliveryError, StatusCode, Option<&str>); 3] = [
+            (
+                || EdgeDispatchDeliveryError::PayloadConflict,
+                StatusCode::CONFLICT,
+                Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE),
+            ),
+            (
+                || EdgeDispatchDeliveryError::Unavailable("lost acknowledgement".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+            ),
+            (
+                || EdgeDispatchDeliveryError::Database(sqlx::Error::PoolClosed),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(astra_core::ErrorKind::DatabaseError.as_str()),
+            ),
+        ];
+        for (failure, status, code) in failures {
+            let lifecycle = Arc::new(
+                ApprovalTargetRunLifecycle::new("run-durable", "sess-durable")
+                    .with_running_edge_wait(),
+            );
+            let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                .with_auth_service(Arc::new(StaticAuthService))
+                .with_run_lifecycle_service(lifecycle)
+                .with_edge_dispatch_service(Arc::new(RecordingEdgeDispatch {
+                    deliver_error: Some(failure),
+                    ..Default::default()
+                }));
+            let identity = EdgeDispatchIdentity::new(
+                "u-approval",
+                "sess-durable",
+                "run-durable",
+                "chain-durable",
+                "req-durable",
+            );
+            let key = tool_callback_key(&identity);
+            astra_turn_core::edge_ledger::expect_ledger_entry(
+                &state.edge_callback_ledger,
+                &key,
+                "edge-a",
+            )
+            .unwrap();
+            let request = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: identity.session_id.clone(),
+                    run_id: identity.run_id.clone(),
+                    turn_chain_id: identity.turn_chain_id.clone(),
+                    request_id: identity.request_id.clone(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output: "tool result".into(),
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            );
+            let error = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace-durable".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request),
+            )
+            .await
+            .expect_err("an uncertain or conflicting durable receipt cannot release a waiter");
+            assert_eq!(error.0, status);
+            assert_eq!(error.1.0.error_code.as_deref(), code);
+            assert!(state.edge_callback_ledger.lock().await.is_empty());
+            assert!(astra_turn_core::edge_ledger::ledger_entry_is_expected(
+                &state.edge_callback_ledger,
+                &key,
+                "edge-a",
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn same_session_edge_agent_cannot_steal_another_agents_callback_custody() {
         let lifecycle = Arc::new(
             ApprovalTargetRunLifecycle::new("run-owned-edge", "sess-shared")
@@ -4624,6 +4852,124 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn local_callback_replay_remains_idempotent_during_consumption_and_after_terminal() {
+        for divergent in [false, true] {
+            let lifecycle = Arc::new(
+                ApprovalTargetRunLifecycle::new("run-replay-race", "sess-replay-race")
+                    .with_running_edge_wait(),
+            );
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let dispatch = Arc::new(RecordingEdgeDispatch {
+                first_delivery_gate: Some((entered.clone(), resume.clone())),
+                ..Default::default()
+            });
+            let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                .with_auth_service(Arc::new(StaticAuthService))
+                .with_run_lifecycle_service(lifecycle.clone())
+                .with_edge_dispatch_service(dispatch);
+            let identity = EdgeDispatchIdentity::new(
+                "u-approval",
+                "sess-replay-race",
+                "run-replay-race",
+                "chain-replay-race",
+                "request-replay-race",
+            );
+            let key = tool_callback_key(&identity);
+            astra_turn_core::edge_ledger::expect_ledger_entry(
+                &state.edge_callback_ledger,
+                &key,
+                "edge-a",
+            )
+            .unwrap();
+            let request = |output: &str| {
+                astra_thin_client::ToolResultRequest::new_with_hash(
+                    astra_thin_client::ToolResultRequestParts {
+                        session_id: identity.session_id.clone(),
+                        run_id: identity.run_id.clone(),
+                        turn_chain_id: identity.turn_chain_id.clone(),
+                        request_id: identity.request_id.clone(),
+                        edge_agent_id: "edge-a".into(),
+                        status: "completed".into(),
+                        output: output.into(),
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    },
+                )
+            };
+            // The delayed request has passed the fast replay check before the
+            // winning request is inserted and consumed.
+            let delayed_state = state.clone();
+            let delayed_body = request(if divergent { "different" } else { "result" });
+            let delayed = tokio::spawn(async move {
+                post_tool_result_handler(
+                    Extension(RequestTrace {
+                        request_id: "delayed".into(),
+                    }),
+                    State(delayed_state),
+                    HeaderMap::new(),
+                    Json(delayed_body),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("first request reaches dispatch");
+            let winner = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "winner".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request("result")),
+            )
+            .await
+            .expect("winning local result");
+            assert_eq!(winner.0["delivery_route"], "same_pod_ledger");
+            assert!(
+                astra_turn_core::edge_ledger::take_ledger_entry(
+                    &state.edge_callback_ledger,
+                    &key,
+                    Duration::ZERO,
+                )
+                .await
+                .is_some()
+            );
+            resume.notify_one();
+            let delayed = delayed.await.unwrap();
+            if divergent {
+                assert_eq!(delayed.unwrap_err().0, StatusCode::CONFLICT);
+            } else {
+                assert_eq!(delayed.unwrap().0["delivery_route"], "idempotent_replay");
+            }
+            *lifecycle.status.lock().unwrap() = astra_core::STATUS_COMPLETED.to_string();
+            let terminal = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "terminal-replay".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request("result")),
+            )
+            .await
+            .expect("an exact consumed receipt remains valid after the run ends");
+            assert_eq!(terminal.0["delivery_route"], "idempotent_replay");
+            let conflict = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "terminal-conflict".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(request("different")),
+            )
+            .await
+            .expect_err("a different terminal result cannot be replayed");
+            assert_eq!(conflict.0, StatusCode::CONFLICT);
+            assert!(state.edge_callback_ledger.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn durable_edge_callback_carries_only_server_owned_completion_reference() {
         let identity = EdgeDispatchIdentity::new(
             "u-approval",
@@ -4635,6 +4981,7 @@ mod edge_callback_insert_tests {
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: true,
             delivered: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
@@ -4642,7 +4989,7 @@ mod edge_callback_insert_tests {
                 ApprovalTargetRunLifecycle::new("run-evidence", "sess-evidence")
                     .with_running_edge_wait(),
             ))
-            .with_edge_dispatch_service(dispatch);
+            .with_edge_dispatch_service(dispatch.clone());
         let key = tool_callback_key(&identity);
         astra_turn_core::edge_ledger::expect_ledger_entry(
             &state.edge_callback_ledger,
@@ -4660,10 +5007,10 @@ mod edge_callback_insert_tests {
                 status: "completed".into(),
                 output: "observed".into(),
                 duration_ms: 1,
-                tool_result_fields: Some(serde_json::Map::from_iter([(
-                    "execution_completion".into(),
-                    json!({"authority":"forged"}),
-                )])),
+                tool_result_fields: Some(serde_json::Map::from_iter([
+                    ("execution_completion".into(), json!({"authority":"forged"})),
+                    ("api_key".into(), json!("first-nonplaceholder-secret")),
+                ])),
             },
         );
         let response = post_tool_result_handler(
@@ -4698,18 +5045,40 @@ mod edge_callback_insert_tests {
             Some(reference.result_hash.as_str()),
             entry.pointer("/body/result_hash").and_then(Value::as_str)
         );
+        assert_ne!(reference.result_hash, request.result_hash);
+        // Secret values intentionally form one canonical result after redaction;
+        // the durable receipt must not preserve either raw value or its hash.
+        let mut replay_fields = request.tool_result_fields.clone().unwrap();
+        replay_fields.insert("api_key".into(), json!("second-nonplaceholder-secret"));
+        let replay_request = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: request.session_id,
+                run_id: request.run_id,
+                turn_chain_id: request.turn_chain_id,
+                request_id: request.request_id,
+                edge_agent_id: request.edge_agent_id,
+                status: request.status,
+                output: request.output,
+                duration_ms: request.duration_ms,
+                tool_result_fields: Some(replay_fields),
+            },
+        );
+        assert_ne!(reference.result_hash, replay_request.result_hash);
         let replay = post_tool_result_handler(
             Extension(RequestTrace {
                 request_id: "trace-replay".into(),
             }),
             State(state.clone()),
             HeaderMap::new(),
-            Json(request),
+            Json(replay_request),
         )
         .await
         .unwrap();
         assert_eq!(replay.0["delivery_route"], "idempotent_replay");
         assert!(state.edge_callback_ledger.lock().await.is_empty());
+        let delivered = dispatch.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(!delivered[0].3.contains("nonplaceholder-secret"));
     }
 
     #[tokio::test(flavor = "current_thread")]
