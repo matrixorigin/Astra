@@ -12,9 +12,9 @@ pub mod metrics;
 // but the module boundaries are now clear.
 pub use edge_dispatch::{
     DatabaseEdgeDispatchService, EdgeDirectDispatchAdmission, EdgeDispatchAdmission,
-    EdgeDispatchAdmissionError, EdgeDispatchFailure, EdgeDispatchFailureCause,
-    EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchLimits, EdgeDispatchObservation,
-    EdgeDispatchRow, EdgeDispatchService, UnconfiguredEdgeDispatchService,
+    EdgeDispatchAdmissionError, EdgeDispatchDeliveryError, EdgeDispatchFailure,
+    EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchLimits,
+    EdgeDispatchObservation, EdgeDispatchRow, EdgeDispatchService, UnconfiguredEdgeDispatchService,
     refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{

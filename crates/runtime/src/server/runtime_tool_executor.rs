@@ -11494,8 +11494,8 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
-            Err("MCP tools must not deliver edge dispatch results".to_string())
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+            Err("MCP tools must not deliver edge dispatch results".into())
         }
 
         async fn fail_dispatch(
@@ -11615,7 +11615,7 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             Ok(true)
         }
 
@@ -11685,7 +11685,7 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             Ok(true)
         }
 
