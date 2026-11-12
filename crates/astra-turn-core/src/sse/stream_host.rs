@@ -47,7 +47,8 @@ pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// still catching genuinely stalled connections.
 pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
 
-/// Bound later executable requests and controls while a batch is in flight.
+/// Pause new reads after this much later work is queued. The already-received
+/// chunk is processed completely so a following terminal can revoke that work.
 const MAX_EDGE_PENDING_BYTES: usize = 1024 * 1024;
 const MISSING_SSE_DONE: &str = "Error: SSE stream ended before the terminal [DONE] marker";
 
@@ -112,6 +113,26 @@ pub struct EdgeToolExecResult {
     /// the model to interpret.
     pub status: String,
     pub duration_ms: u64,
+}
+
+/// A local result and the Server request that owns it. This scope survives
+/// admission failure and cancellation even when no callback can be sent.
+#[derive(Debug, Clone)]
+pub struct ScopedEdgeToolExecResult {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
+    /// The shared consumer rejected this request without attempting a callback.
+    pub local_only: bool,
+    pub result: EdgeToolExecResult,
+}
+
+impl std::ops::Deref for ScopedEdgeToolExecResult {
+    type Target = EdgeToolExecResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
 }
 
 impl crate::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
@@ -183,6 +204,18 @@ pub struct ToolBatchRequest {
 }
 
 impl ToolBatchRequest {
+    /// Retain the producer scope with the local observation, independently of
+    /// whether the callback was admitted or acknowledged.
+    pub fn scoped_result(&self, result: EdgeToolExecResult) -> ScopedEdgeToolExecResult {
+        ScopedEdgeToolExecResult {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_chain_id: self.turn_chain_id.clone(),
+            local_only: false,
+            result,
+        }
+    }
+
     /// Rejection before execution, retaining the effective invocation arguments.
     pub fn rejected_result(&self, args: &Value, error: String) -> EdgeToolExecResult {
         let mut fields = serde_json::Map::new();
@@ -233,7 +266,7 @@ pub struct SseConsumeResult {
     /// Time to first token (ms), measured by the framer.
     pub ttft_ms: Option<u64>,
     /// Tool executions performed during the stream.
-    pub tool_results: Vec<EdgeToolExecResult>,
+    pub tool_results: Vec<ScopedEdgeToolExecResult>,
     /// Approval resolutions performed during the stream.
     pub approval_results: Vec<EdgeApprovalResult>,
 }
@@ -470,7 +503,7 @@ pub trait SseEdgeWork: Send {
     ///
     /// Hosts can mirror tool audit data into an interruption-safe snapshot
     /// before the wider turn finalization hooks run.
-    fn on_tool_result(&mut self, _result: &EdgeToolExecResult) {}
+    fn on_tool_result(&mut self, _result: &ScopedEdgeToolExecResult) {}
 }
 
 // ─── Generic SSE consumer ────────────────────────────────────────────────────
@@ -516,7 +549,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut accum = ChatTurnSseAccum::default();
     let mut framer = ChatTurnSseFramer::new();
     let mut pending = Vec::<SsePending<<H::Observer as SseStreamObserver>::Control>>::new();
-    let mut tool_results: Vec<EdgeToolExecResult> = Vec::new();
+    let mut tool_results: Vec<ScopedEdgeToolExecResult> = Vec::new();
     let mut approval_results: Vec<EdgeApprovalResult> = Vec::new();
     let mut abort: Option<SseAbortReason> = None;
     let mut abort_message: Option<String> = None;
@@ -607,6 +640,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         };
         let received_at = SseEventReceivedAt::now();
         last_received_at = Some(received_at);
+        let mut pending_bytes = 0usize;
         let mut input = bytes.as_slice();
         let mut terminal_marker_seen = false;
         while !input.is_empty() {
@@ -619,6 +653,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     break;
                 }
             };
+            let before = pending.len();
             let processed = process_sse_event_block(
                 &event_str,
                 host,
@@ -635,6 +670,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 abort = Some(error.kind);
                 abort_message = Some(format!("Error: invalid SSE protocol: {error}"));
                 break;
+            }
+            if pending.len() > before {
+                pending_bytes = pending_bytes.saturating_add(event_str.len());
             }
             if let Some(kind) = root_terminal_abort(&accum) {
                 abort = Some(kind);
@@ -669,6 +707,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
         while !terminal_marker_seen
+            && pending_bytes < MAX_EDGE_PENDING_BYTES
             && host.stream_observer_error().is_none()
             && pending_is_coalescible_tool_batch(&pending)
         {
@@ -760,6 +799,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             }
                         };
                         saw_event = true;
+                        let before = pending.len();
                         match process_sse_event_block(
                             &event_str,
                             host,
@@ -782,6 +822,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                     Some(format!("Error: invalid SSE protocol: {error}"));
                                 break;
                             }
+                        }
+                        if pending.len() > before {
+                            pending_bytes = pending_bytes.saturating_add(event_str.len());
                         }
                         if let Some(kind) = root_terminal_abort(&accum) {
                             abort = Some(kind);
@@ -859,7 +902,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     let Some(next) = next else {
                         match framer.take_trailing_dispatch_blob() {
                             Ok(tail) if !tail.trim().is_empty() && abort_message.is_none() => {
-                                let before = pending.len();
                                 let processed = {
                                     let dispatch = process_sse_event_block(
                                         &tail,
@@ -887,18 +929,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                         Some(format!("Error: invalid SSE protocol: {error}"));
                                     if let Some(token) = cancel_token {
                                         token.cancel();
-                                    }
-                                } else if pending.len() > before {
-                                    pending_bytes = pending_bytes.saturating_add(tail.len());
-                                    if pending_bytes > MAX_EDGE_PENDING_BYTES {
-                                        abort = Some(astra_core::ErrorKind::StreamTransport);
-                                        abort_message = Some(format!(
-                                            "Error: pending Edge work exceeded {} bytes while another batch was running",
-                                            MAX_EDGE_PENDING_BYTES
-                                        ));
-                                        if let Some(token) = cancel_token {
-                                            token.cancel();
-                                        }
                                     }
                                 }
                             }
@@ -995,18 +1025,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         }
                         if pending.len() > before {
                             pending_bytes = pending_bytes.saturating_add(block.len());
-                            if pending_bytes > MAX_EDGE_PENDING_BYTES {
-                                abort = Some(astra_core::ErrorKind::StreamTransport);
-                                abort_message = Some(format!(
-                                    "Error: pending Edge work exceeded {} bytes while another batch was running",
-                                    MAX_EDGE_PENDING_BYTES
-                                ));
-                                if let Some(token) = cancel_token {
-                                    token.cancel();
-                                }
-                                finished_reading = true;
-                                break;
-                            }
                         }
                         if let Some(kind) = root_terminal_abort(&accum) {
                             abort = Some(kind);
@@ -1029,9 +1047,22 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             break;
                         }
                     }
+                    if pending_bytes >= MAX_EDGE_PENDING_BYTES {
+                        finished_reading = true;
+                    }
                 }
                 if !flush_done {
-                    flush.await;
+                    if abort.is_some() {
+                        flush.await;
+                    } else {
+                        tokio::select! {
+                            _ = &mut flush => {},
+                            _ = &mut cancel_wait => {
+                                abort.get_or_insert(astra_core::ErrorKind::Cancelled);
+                                flush.await;
+                            }
+                        }
+                    }
                 }
             }
             sse_done_deferred |= done_deferred;
@@ -1555,7 +1586,7 @@ async fn flush_pending_via_host<H: SseEdgeWork>(
     host: &mut H,
     fallback_session_id: Option<&str>,
     fallback_run_id: Option<&str>,
-    tool_results: &mut Vec<EdgeToolExecResult>,
+    tool_results: &mut Vec<ScopedEdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
     let mut work = Vec::new();
@@ -1592,13 +1623,15 @@ async fn flush_work_batch_via_host<H: SseEdgeWork>(
     host: &mut H,
     fallback_session_id: Option<&str>,
     fallback_run_id: Option<&str>,
-    tool_results: &mut Vec<EdgeToolExecResult>,
+    tool_results: &mut Vec<ScopedEdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
     let items = std::mem::take(pending);
     // Retain the server clock authority until the concrete edge executor can
     // both enforce it and post an authenticated terminal callback.
     let mut tool_batch: Vec<ToolBatchRequest> = Vec::new();
+    let mut tool_batch_positions = Vec::new();
+    let mut result_slots: Vec<Option<ScopedEdgeToolExecResult>> = Vec::new();
     let mut approval_requests: Vec<EdgeApprovalRequest> = Vec::new();
 
     for item in items {
@@ -1650,13 +1683,16 @@ async fn flush_work_batch_via_host<H: SseEdgeWork>(
                     tool,
                     args,
                 };
+                let position = result_slots.len();
+                result_slots.push(None);
                 if host.should_abort_edge_work() && host.stream_observer_error().is_none() {
                     let result = request.rejected_result(
                         &request.args,
                         "Execution stopped before tool dispatch".into(),
                     );
-                    host.on_tool_result(&result);
-                    tool_results.push(result);
+                    let mut result = request.scoped_result(result);
+                    result.local_only = true;
+                    result_slots[position] = Some(result);
                     continue;
                 }
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
@@ -1666,10 +1702,12 @@ async fn flush_work_batch_via_host<H: SseEdgeWork>(
                         return;
                     }
                     let result = request.rejected_result(&request.args, error);
-                    host.on_tool_result(&result);
-                    tool_results.push(result);
+                    let mut result = request.scoped_result(result);
+                    result.local_only = true;
+                    result_slots[position] = Some(result);
                     continue;
                 }
+                tool_batch_positions.push(position);
                 tool_batch.push(request);
             }
             ChatTurnEdgePending::ApprovalRequired {
@@ -1760,23 +1798,44 @@ async fn flush_work_batch_via_host<H: SseEdgeWork>(
     }
 
     if host.should_abort_edge_work() && host.stream_observer_error().is_none() {
-        for request in tool_batch {
+        for (position, request) in tool_batch_positions.into_iter().zip(tool_batch) {
             let result = request.rejected_result(
                 &request.args,
                 "Execution stopped before tool dispatch".into(),
             );
-            host.on_tool_result(&result);
-            tool_results.push(result);
+            let mut result = request.scoped_result(result);
+            result.local_only = true;
+            result_slots[position] = Some(result);
         }
-        return;
-    }
-
-    if !tool_batch.is_empty() {
+    } else if !tool_batch.is_empty() {
+        // The host returns results in request order. Preserve that order even
+        // when an earlier/later request was rejected during admission.
+        let scopes: Vec<_> = tool_batch
+            .iter()
+            .map(|request| {
+                (
+                    request.session_id.clone(),
+                    request.run_id.clone(),
+                    request.turn_chain_id.clone(),
+                )
+            })
+            .collect();
         let results = host.execute_tools_batch(tool_batch).await;
-        for result in results {
-            host.on_tool_result(&result);
-            tool_results.push(result);
+        for ((position, (session_id, run_id, turn_chain_id)), result) in
+            tool_batch_positions.into_iter().zip(scopes).zip(results)
+        {
+            result_slots[position] = Some(ScopedEdgeToolExecResult {
+                session_id,
+                run_id,
+                turn_chain_id,
+                local_only: false,
+                result,
+            });
         }
+    }
+    for result in result_slots.into_iter().flatten() {
+        host.on_tool_result(&result);
+        tool_results.push(result);
     }
 }
 
@@ -4173,7 +4232,7 @@ mod tests {
             type Control = ();
             fn apply_control(&mut self, (): ()) {}
 
-            fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
+            fn on_tool_result(&mut self, result: &ScopedEdgeToolExecResult) {
                 self.tool_results.push((
                     result.request_id.clone(),
                     result.tool.clone(),
@@ -4824,13 +4883,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_work_is_bounded_while_prior_tool_settles() {
+    async fn large_pending_tool_pauses_reading_until_prior_work_settles() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct Observer {
+            large_seen: Arc<tokio::sync::Notify>,
+            after_seen: Arc<AtomicBool>,
+        }
+        struct Host {
+            observer: Observer,
+            edge: RecordingEdge,
+        }
+        impl SseStreamHost for Host {
+            type Observer = Observer;
+            type Edge = RecordingEdge;
+            fn split(&mut self) -> (&mut Self::Observer, &mut Self::Edge) {
+                (&mut self.observer, &mut self.edge)
+            }
+        }
+        #[async_trait]
+        impl SseStreamObserver for Observer {
+            type Control = ();
+            async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+            async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<Option<()>, String> {
+                match event.get("request_id").and_then(Value::as_str) {
+                    Some("large") => self.large_seen.notify_one(),
+                    Some("after") => self.after_seen.store(true, Ordering::SeqCst),
+                    _ => {}
+                }
+                Ok(None)
+            }
+        }
+
         for unterminated in [false, true] {
-            let (tx, mut stream) = test_channel();
-            let started = std::sync::Arc::new(tokio::sync::Notify::new());
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let mut host = RecordingSseStreamHost::new();
-            host.edge.tool_gate = Some((started.clone(), cancel.clone()));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut stream = RxStream(rx);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = tokio_util::sync::CancellationToken::new();
+            let large_seen = Arc::new(tokio::sync::Notify::new());
+            let after_seen = Arc::new(AtomicBool::new(false));
+            let mut edge = RecordingSseStreamHost::new().edge;
+            edge.tool_gate = Some((started.clone(), release.clone()));
+            let mut host = Host {
+                observer: Observer {
+                    large_seen: large_seen.clone(),
+                    after_seen: after_seen.clone(),
+                },
+                edge,
+            };
             let bridge = tokio::spawn(async move {
                 tx.send(Ok(sse_event(
                     "tool_request",
@@ -4840,45 +4944,84 @@ mod tests {
                     .await
                     .unwrap();
                 started.notified().await;
-                let long_path = "x".repeat(MAX_EDGE_PENDING_BYTES + 1);
+                let content = "x".repeat(MAX_EDGE_PENDING_BYTES + 1);
                 let frame = sse_event(
                     "tool_request",
                     &format!(
-                        ",\"request_id\":\"later\",\"tool\":\"read_file\",\"args\":{{\"path\":{long_path:?}}}"
+                        ",\"request_id\":\"large\",\"tool\":\"write_file\",\"args\":{{\"path\":\"large.txt\",\"content\":{content:?}}}"
                     ),
                 );
-                let frame = if unterminated {
+                let wire = if unterminated {
                     frame.trim_end().to_string()
                 } else {
-                    frame
+                    format!(
+                        "{frame}{}",
+                        sse_event(
+                            "tool_request",
+                            ",\"request_id\":\"after\",\"tool\":\"read_file\",\"args\":{\"path\":\"large.txt\"}",
+                        )
+                    )
                 };
-                tx.send(Ok(frame.into_bytes())).await.unwrap();
+                tx.send(Ok(wire.into_bytes())).await.unwrap();
+                if unterminated {
+                    drop(tx);
+                    large_seen.notified().await;
+                } else {
+                    large_seen.notified().await;
+                    // The whole received chunk must be observed, then later
+                    // reads wait until the current execution has settled.
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while !after_seen.load(Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the rest of the received chunk must be observed");
+                    tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(100), tx.reserve())
+                            .await
+                            .is_err(),
+                        "later input must wait for execution to settle"
+                    );
+                    drop(tx);
+                }
+                release.cancel();
             });
             let (result, abort) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
                 consume_sse_stream_cancellable(
                     &mut stream,
                     &mut host,
                     stream_idle_timeout(),
-                    Some(&cancel),
+                    None,
                     None,
                 ),
             )
             .await
-            .expect("bounded pending work must settle the active tool");
+            .expect("large pending work must settle");
             bridge.await.unwrap();
-            assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-            assert!(
-                result
-                    .accum
-                    .error_message
-                    .as_deref()
+            assert_eq!(abort, None, "{:?}", result.accum.error_message);
+            assert_eq!(result.tool_results[1].tool, "write_file");
+            assert_eq!(
+                result.tool_results[1].args["content"]
+                    .as_str()
                     .unwrap()
-                    .contains("pending Edge work exceeded")
+                    .len(),
+                MAX_EDGE_PENDING_BYTES + 1,
             );
-            assert_eq!(result.tool_results.len(), 1);
-            assert_eq!(result.tool_results[0].request_id, "first");
-            assert_eq!(host.edge.admitted_deadlines.len(), 1);
+            let ids: Vec<_> = result
+                .tool_results
+                .iter()
+                .map(|r| r.request_id.as_str())
+                .collect();
+            if unterminated {
+                assert_eq!(ids, ["first", "large"]);
+            } else {
+                assert_eq!(ids, ["first", "large", "after"]);
+                assert!(host.observer.after_seen.load(Ordering::SeqCst));
+                assert!(result.accum.stream_complete);
+            }
         }
     }
 

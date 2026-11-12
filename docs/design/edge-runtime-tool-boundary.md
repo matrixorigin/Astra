@@ -127,12 +127,22 @@ rejection; an already-started credential rotation is settled by its existing
 owner even if the caller stops waiting. Only a Server acknowledgement marks
 the result delivered. After the receipt window has elapsed, a short best-effort attempt
 may still retain a late result; its acknowledgement does not prove the current
-round consumed it. Unrepeated delivery makes no additional queries. Each
-result in a tool batch has an independent callback future,
-so retry backoff or a stalled response cannot consume a sibling's delivery
-budget. The process-wide tool-execution limit is unchanged; it does not bound
-callback futures or their retained payloads. Callback count and memory grow
-with outstanding completed results until their individual deadlines settle.
+round consumed it. Unrepeated delivery makes no additional queries. Delivery
+uses at most 16 concurrent callbacks per CLI process and at most four active
+callback tasks per stream, without holding a tool-execution permit. Queued
+results retain their original delivery deadline; congestion can therefore
+cause a result to expire without being sent. Completed outputs are shared with
+their callback rather than copied while waiting, but their total size and the
+number of concurrent streams are not bounded by these limits. The limits are
+per process, not a cluster-wide bound on Server work.
+
+While a tool batch runs, the SSE reader pauses further reads after accumulating
+one MiB of later executable work. It processes the whole already-received
+network chunk first, including a terminal event in that chunk; consequently
+the pending size can exceed the threshold by the size of that chunk. Terminal
+events in later chunks wait while backpressure applies. Callback failure
+warnings are best effort when the output channel cannot accept them; the final
+typed failure remains authoritative.
 
 When durable dispatch is configured, an uncertain write does not release a
 local waiter: the write may have committed before its acknowledgement was

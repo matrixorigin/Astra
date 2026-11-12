@@ -12,12 +12,10 @@ use astra_turn_core::orchestration::agent_result_wire::{
     AgentFanoutControlExecutionFact, AgentFanoutControlReceiptKind,
 };
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
-use astra_turn_core::sse_edge_stderr_lines::{
-    edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
-};
 use astra_turn_core::sse_stream_host::{
-    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseEdgeWork, SseStreamHost,
-    SseStreamObserver, ToolBatchRequest, consume_sse_stream_cancellable, stream_idle_timeout,
+    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, ScopedEdgeToolExecResult,
+    SseEdgeWork, SseStreamHost, SseStreamObserver, ToolBatchRequest,
+    consume_sse_stream_cancellable, stream_idle_timeout,
 };
 use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
@@ -148,11 +146,18 @@ fn tool_completion_is_authoritative(tool: &str, output: &str) -> bool {
 fn tool_result_execution_fact(
     fields: Option<&Map<String, Value>>,
 ) -> Option<AgentFanoutControlExecutionFact> {
-    match fields?.get("executed")? {
-        Value::Bool(false) => Some(AgentFanoutControlExecutionFact::NotExecuted),
-        Value::Bool(true) => Some(AgentFanoutControlExecutionFact::Executed),
-        Value::Null => Some(AgentFanoutControlExecutionFact::Unknown),
-        _ => None,
+    let fields = fields?;
+    match fields.get("executed") {
+        Some(Value::Bool(false)) => Some(AgentFanoutControlExecutionFact::NotExecuted),
+        Some(Value::Bool(true)) => Some(AgentFanoutControlExecutionFact::Executed),
+        Some(Value::Null) => Some(AgentFanoutControlExecutionFact::Unknown),
+        Some(_) => None,
+        None => match fields.get("execution_fact").and_then(Value::as_str) {
+            Some("not_executed") => Some(AgentFanoutControlExecutionFact::NotExecuted),
+            Some("executed") => Some(AgentFanoutControlExecutionFact::Executed),
+            Some("unknown") => Some(AgentFanoutControlExecutionFact::Unknown),
+            _ => None,
+        },
     }
 }
 
@@ -1346,7 +1351,6 @@ struct CliSseEdgeHost<'a> {
     executor_id: &'a str,
     edge_agent_id: String,
     perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
-    pub edge_tool_round: Vec<EdgeToolExecResult>,
     last_bound_run_id: Option<String>,
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
@@ -1877,6 +1881,198 @@ fn acknowledge_callback(
 
 type ParallelCallbackFailures = Vec<(String, String, astra_thin_client::ThinClientError)>;
 
+struct QueuedParallelCallback {
+    identity: Option<ToolResultIdentity>,
+    run_id: String,
+    request_id: String,
+    edge_agent_id: String,
+    tool: String,
+    outcome: Arc<crate::edge_tools::ToolExecutionOutcome>,
+    duration_ms: u64,
+    deadline: tokio::time::Instant,
+}
+
+/// Owns the existing per-batch callback work. Only a small window becomes
+/// Tokio tasks; queued entries share the already-owned outcome without copying it.
+struct ParallelCallbacks {
+    tasks: tokio::task::JoinSet<ParallelCallbackResult>,
+    queued: std::collections::BTreeMap<
+        tokio::time::Instant,
+        std::collections::VecDeque<QueuedParallelCallback>,
+    >,
+    target: EdgeCallbackTarget,
+    executor: Arc<crate::edge_tools::ToolExecutor>,
+}
+
+impl ParallelCallbacks {
+    fn new(target: EdgeCallbackTarget, executor: Arc<crate::edge_tools::ToolExecutor>) -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            queued: std::collections::BTreeMap::new(),
+            target,
+            executor,
+        }
+    }
+
+    fn enqueue(&mut self, mut callback: QueuedParallelCallback) {
+        self.clamp_queued_for_cancel();
+        if self
+            .target
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            callback.deadline = callback.deadline.min(
+                tokio::time::Instant::now()
+                    + crate::cli::stream::streaming_types::INTERACTIVE_CANCEL_TIMEOUT,
+            );
+        }
+        self.queued
+            .entry(callback.deadline)
+            .or_default()
+            .push_back(callback);
+        self.fill_window();
+    }
+
+    fn clamp_queued_for_cancel(&mut self) {
+        if !self
+            .target
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return;
+        }
+        let limit = tokio::time::Instant::now()
+            + crate::cli::stream::streaming_types::INTERACTIVE_CANCEL_TIMEOUT;
+        let later = self.queued.split_off(&limit);
+        for (_, callbacks) in later {
+            for mut callback in callbacks {
+                callback.deadline = limit;
+                self.queued.entry(limit).or_default().push_back(callback);
+            }
+        }
+    }
+
+    fn pop_queued(&mut self) -> Option<QueuedParallelCallback> {
+        let mut entry = self.queued.first_entry()?;
+        let result = entry.get_mut().pop_front();
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+        result
+    }
+
+    fn fill_window(&mut self) {
+        while self.tasks.len() < EDGE_CALLBACK_STREAM_WINDOW {
+            let Some(callback) = self.pop_queued() else {
+                break;
+            };
+            self.target
+                .spawn_result(&mut self.tasks, Arc::clone(&self.executor), callback);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty() && self.queued.is_empty()
+    }
+
+    fn expired_queued(&mut self) -> Option<ParallelCallbackResult> {
+        if tokio::time::Instant::now() < *self.queued.first_key_value()?.0 {
+            return None;
+        }
+        let callback = self.pop_queued().expect("queued deadline has a callback");
+        Some((
+            callback.run_id,
+            (Err(astra_thin_client::ThinClientError::CallbackTaskFailed(
+                "tool-result callback was not sent before its delivery or interruption deadline".into(),
+            )), None),
+            callback.request_id,
+        ))
+    }
+
+    async fn join_next(
+        &mut self,
+    ) -> Option<Result<ParallelCallbackResult, tokio::task::JoinError>> {
+        loop {
+            self.clamp_queued_for_cancel();
+            if let Some(result) = self.expired_queued() {
+                self.fill_window();
+                return Some(Ok(result));
+            }
+            let deadline = self.queued.first_key_value().map(|(deadline, _)| *deadline);
+            let Some(deadline) = deadline else {
+                let result = self.tasks.join_next().await;
+                self.fill_window();
+                return result;
+            };
+            let cancel = self
+                .target
+                .cancel
+                .clone()
+                .filter(|token| !token.is_cancelled());
+            let cancelled = async move {
+                match cancel {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                result = self.tasks.join_next() => {
+                    self.fill_window();
+                    return result;
+                },
+                _ = tokio::time::sleep_until(deadline) => {},
+                _ = cancelled => {},
+            }
+        }
+    }
+
+    fn try_join_next(&mut self) -> Option<Result<ParallelCallbackResult, tokio::task::JoinError>> {
+        self.clamp_queued_for_cancel();
+        let result = self
+            .tasks
+            .try_join_next()
+            .or_else(|| self.expired_queued().map(Ok));
+        self.fill_window();
+        result
+    }
+}
+
+fn parallel_outcome_mut(
+    outcome: &mut Arc<crate::edge_tools::ToolExecutionOutcome>,
+) -> &mut crate::edge_tools::ToolExecutionOutcome {
+    Arc::get_mut(outcome).expect("a sandbox result is changed only before callback delivery")
+}
+
+// Limit concurrent callback requests across CLI streams. The tool execution
+// permit is never held while waiting here: a parent tool may need a child result.
+const EDGE_CALLBACK_DELIVERY_CAPACITY: usize = 16;
+const EDGE_CALLBACK_STREAM_WINDOW: usize = 4;
+
+fn edge_callback_delivery_capacity() -> Arc<tokio::sync::Semaphore> {
+    static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(
+        CAPACITY
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(EDGE_CALLBACK_DELIVERY_CAPACITY))),
+    )
+}
+
+async fn acquire_edge_callback_capacity(
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedSemaphorePermit, astra_thin_client::ThinClientError> {
+    tokio::time::timeout_at(deadline, edge_callback_delivery_capacity().acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            astra_thin_client::ThinClientError::CallbackTaskFailed(
+                "tool-result callback was not sent before its delivery deadline".into(),
+            )
+        })
+}
+
 impl EdgeCallbackTarget {
     async fn bound_token(
         &self,
@@ -1918,20 +2114,52 @@ impl EdgeCallbackTarget {
         &self,
         tasks: &mut tokio::task::JoinSet<ParallelCallbackResult>,
         executor: Arc<crate::edge_tools::ToolExecutor>,
-        tool: String,
-        body: astra_thin_client::ToolResultRequest,
-        deadline: tokio::time::Instant,
+        callback: QueuedParallelCallback,
     ) {
         let target = self.clone();
         tasks.spawn(async move {
-            let run_id = body.run_id.clone();
-            let request_id = body.request_id.clone();
+            let run_id = callback.run_id.clone();
+            let request_id = callback.request_id.clone();
+            let delivery = async {
+                let _permit = match acquire_edge_callback_capacity(callback.deadline).await {
+                    Ok(permit) => permit,
+                    Err(error) => return (Err(error), None),
+                };
+                let Some(identity) = callback.identity.as_ref() else {
+                    return (
+                        Err(astra_thin_client::ThinClientError::SseParse(
+                            "cannot post a tool result without its scoped identity".into(),
+                        )),
+                        None,
+                    );
+                };
+                // Construct and hash the transport payload only after capacity
+                // is available; waiting callbacks share the existing outcome.
+                let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                    astra_thin_client::ToolResultRequestParts {
+                        session_id: identity.session_id.clone(),
+                        run_id: identity.run_id.clone(),
+                        turn_chain_id: identity.turn_chain_id.clone(),
+                        request_id: identity.request_id.clone(),
+                        edge_agent_id: callback.edge_agent_id.clone(),
+                        status: edge_tool_outcome_status(&callback.outcome).to_string(),
+                        output: callback.outcome.output.clone(),
+                        duration_ms: callback.duration_ms,
+                        tool_result_fields: callback.outcome.tool_result_fields.clone(),
+                    },
+                );
+                target.post_with_capacity(&body, callback.deadline).await
+            };
             let result = settle_parallel_callback(
-                settle_after_cancel(target.post(&body, deadline), target.cancel.as_ref()),
+                settle_after_cancel(delivery, target.cancel.as_ref()),
                 || {
-                    crate::cli::edge_lifecycle::record_completed_request(body.request_id.clone());
-                    executor
-                        .acknowledge_delivered_task_result(&tool, body.tool_result_fields.as_ref());
+                    crate::cli::edge_lifecycle::record_completed_request(
+                        callback.request_id.clone(),
+                    );
+                    executor.acknowledge_delivered_task_result(
+                        &callback.tool,
+                        callback.outcome.tool_result_fields.as_ref(),
+                    );
                 },
             )
             .await;
@@ -1999,6 +2227,21 @@ impl EdgeCallbackTarget {
     }
 
     async fn post(
+        &self,
+        body: &astra_thin_client::ToolResultRequest,
+        deadline: tokio::time::Instant,
+    ) -> (
+        Result<Value, astra_thin_client::ThinClientError>,
+        Option<String>,
+    ) {
+        let _permit = match acquire_edge_callback_capacity(deadline).await {
+            Ok(permit) => permit,
+            Err(error) => return (Err(error), None),
+        };
+        self.post_with_capacity(body, deadline).await
+    }
+
+    async fn post_with_capacity(
         &self,
         body: &astra_thin_client::ToolResultRequest,
         deadline: tokio::time::Instant,
@@ -2221,7 +2464,6 @@ impl<'a> CliSseStreamHost<'a> {
             executor_id: ctx.executor_id,
             edge_agent_id: ctx.executor_id.to_string(),
             perm_manager: ctx.perm_manager,
-            edge_tool_round: Vec::new(),
             last_bound_run_id: None,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
@@ -2952,12 +3194,6 @@ impl CliSseEdgeHost<'_> {
             self.mark_edge_auth_failure(run_id);
             return;
         }
-        if !self.render_policy.suppress_tool_ui() {
-            eprintln!(
-                "{}",
-                edge_sse_post_tool_result_fail_line(edge_callback_error_details(e)).yellow()
-            );
-        }
         self.mark_edge_callback_failure("tool-result", run_id, e);
     }
 
@@ -3053,13 +3289,6 @@ impl CliSseEdgeHost<'_> {
                 });
             }
             true
-        } else if !self.render_policy.suppress_tool_ui() {
-            eprintln!(
-                "{}",
-                edge_sse_post_approval_fail_line(edge_callback_error_details(e)).yellow()
-            );
-            self.mark_edge_callback_failure("approval", run_id, e);
-            false
         } else {
             self.mark_edge_callback_failure("approval", run_id, e);
             false
@@ -3090,9 +3319,6 @@ impl CliSseEdgeHost<'_> {
         let Some(owner) = self.owner_auth_snapshot.as_ref() else {
             return false;
         };
-        if !self.render_policy.is_silent() {
-            eprintln!("{}", "  Token expired, attempting refresh…".yellow());
-        }
         if !owner.is_current() {
             return false;
         }
@@ -3108,12 +3334,6 @@ impl CliSseEdgeHost<'_> {
             return false;
         }
         self.token = new_token;
-        if !self.render_policy.is_silent() {
-            eprintln!(
-                "  {} Token refreshed, continuing…",
-                crate::cli::theme::icon_ok()
-            );
-        }
         true
     }
 
@@ -3133,12 +3353,29 @@ impl CliSseEdgeHost<'_> {
             .min(now + astra_turn_core::edge_ledger::MAX_LEDGER_ENTRY_AGE)
     }
 
-    /// Post a tool result to the cloud server with automatic token refresh on 401.
-    /// Only an acknowledgement permits recording it as delivered.
+    /// Post a tool result and record failures immediately for non-rendering callers.
     async fn post_tool_result_with_auth_retry(
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
+        match self.try_post_tool_result(body).await {
+            Ok(()) => Ok(()),
+            Err((result, error)) => {
+                self.record_tool_result_callback_failures(&[(
+                    body.run_id.clone(),
+                    body.request_id.clone(),
+                    error,
+                )]);
+                Err(result)
+            }
+        }
+    }
+
+    // Keep the typed failure until its owner has published ordered events.
+    async fn try_post_tool_result(
+        &mut self,
+        body: &astra_thin_client::ToolResultRequest,
+    ) -> Result<(), (PostToolResultError, astra_thin_client::ThinClientError)> {
         let cancel = self.cancel_token.cloned();
         let outcome = AssertUnwindSafe(settle_after_cancel(
             self.post_tool_result_inner(body),
@@ -3158,22 +3395,16 @@ impl CliSseEdgeHost<'_> {
             ),
         };
         let error = astra_thin_client::ThinClientError::CallbackTaskFailed(reason);
-        let details = edge_callback_error_details(&error);
-        self.record_tool_result_callback_failures(&[(
-            body.run_id.clone(),
-            body.request_id.clone(),
-            error,
-        )]);
-        Err(PostToolResultError::RequestFailed(details))
+        let result = PostToolResultError::RequestFailed(edge_callback_error_details(&error));
+        Err((result, error))
     }
 
     async fn post_tool_result_inner(
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
-    ) -> Result<(), PostToolResultError> {
+    ) -> Result<(), (PostToolResultError, astra_thin_client::ThinClientError)> {
         let deadline = self.tool_result_delivery_deadline(&body.request_id);
-        // Detach any inherited bearer provider so the explicitly admitted owner
-        // token is the only credential source for owned callback posts.
+        // Detach inherited bearer providers: the admitted owner is authoritative.
         let api = self.api.clone().without_bearer_provider();
         let (result, refreshed_token) = EdgeCallbackTarget {
             api,
@@ -3204,54 +3435,55 @@ impl CliSseEdgeHost<'_> {
                     astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
                 );
                 let details = edge_callback_error_details(&error);
-                self.record_tool_result_callback_failures(&[(
-                    body.run_id.clone(),
-                    body.request_id.clone(),
-                    error,
-                )]);
-                if auth_failure && (refreshed || refresh_unconfirmed) {
-                    Err(PostToolResultError::TerminalAuthFailure(details))
+                let result = if auth_failure && (refreshed || refresh_unconfirmed) {
+                    PostToolResultError::TerminalAuthFailure(details)
                 } else if auth_failure {
-                    Err(PostToolResultError::AuthRefreshFailed)
+                    PostToolResultError::AuthRefreshFailed
                 } else {
-                    Err(PostToolResultError::RequestFailed(details))
-                }
+                    PostToolResultError::RequestFailed(details)
+                };
+                Err((result, error))
             }
+        }
+    }
+
+    fn edge_callback_target(&self) -> EdgeCallbackTarget {
+        EdgeCallbackTarget {
+            api: self.api.clone().without_bearer_provider(),
+            token: self.token.clone(),
+            executor_id: self.executor_id.to_string(),
+            owner: self.owner_auth_snapshot.clone(),
+            cancel: self.cancel_token.cloned(),
+            status_tx: self.shared.stream_event_tx.clone(),
+            status_reported: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         }
     }
 
     fn spawn_parallel_tool_result(
         &self,
-        tasks: &mut tokio::task::JoinSet<ParallelCallbackResult>,
-        target: &EdgeCallbackTarget,
+        callbacks: &mut ParallelCallbacks,
         req: &ToolBatchRequest,
-        outcome: &mut crate::edge_tools::ToolExecutionOutcome,
+        outcome: &mut Arc<crate::edge_tools::ToolExecutionOutcome>,
         duration_ms: u64,
     ) {
+        let outcome_mut = parallel_outcome_mut(outcome);
         let fields = Self::tool_result_fields_with_cli_runtime(
             &self.executor,
             &req.tool,
-            outcome.tool_result_fields.take(),
+            outcome_mut.tool_result_fields.take(),
         );
-        outcome.tool_result_fields = Some(fields.clone());
-        let Some(body) = self.tool_result_request(
-            &req.request_id,
-            edge_tool_outcome_status(outcome).to_string(),
-            outcome.output.clone(),
+        outcome_mut.tool_result_fields = Some(fields);
+        callbacks.enqueue(QueuedParallelCallback {
+            identity: self.tool_result_identity(&req.request_id),
+            run_id: req.run_id.clone(),
+            request_id: req.request_id.clone(),
+            edge_agent_id: self.edge_agent_id.clone(),
+            tool: req.tool.clone(),
+            outcome: Arc::clone(outcome),
             duration_ms,
-            Some(fields),
-        ) else {
-            tracing::error!(request_id = %req.request_id, "cannot post a tool result without its scoped identity");
-            return;
-        };
-        let deadline = self.tool_result_delivery_deadline(&body.request_id);
-        target.spawn_result(
-            tasks,
-            Arc::clone(&self.executor),
-            req.tool.clone(),
-            body,
-            deadline,
-        );
+            // Freeze the existing delivery budget before any queue wait.
+            deadline: self.tool_result_delivery_deadline(&req.request_id),
+        });
     }
 
     fn observe_parallel_callback(
@@ -3299,35 +3531,22 @@ impl CliSseEdgeHost<'_> {
                 redact(request_id),
                 edge_callback_error_details(error),
             );
-            let event = chat_stream::StreamEvent::SystemWarning(message.clone());
-            // Diagnostics may use reserved capacity. If the TUI cannot take
-            // them, stderr still reports the failure without corrupting JSON.
-            let channel_delivered = self
-                .stream_event_tx
-                .as_ref()
-                .map(|tx| tx.try_send(event.clone()).is_ok());
-            if let Some(sink) = &self.stream_event_sink {
-                sink.send(event);
-            }
-            if previous_failures == 0
-                && (channel_delivered == Some(false)
-                    || (channel_delivered.is_none() && self.stream_event_sink.is_none()))
-            {
-                // Stderr can also be an unread pipe. Never let a diagnostic
-                // prevent other already-started callbacks from settling.
-                let _ = std::thread::Builder::new()
-                    .name("astra-callback-warning".into())
-                    .spawn(move || {
-                        use std::io::Write;
-                        let _ = writeln!(std::io::stderr().lock(), "{message}");
-                    });
+            // A full diagnostic channel or stderr must not prevent already
+            // started callbacks from settling. The final failure retains the
+            // same details even when this provisional warning cannot be sent.
+            let delivered = self.stream_event_tx.as_ref().is_some_and(|tx| {
+                tx.try_send(chat_stream::StreamEvent::SystemWarning(message.clone()))
+                    .is_ok()
+            });
+            if !delivered && previous_failures == 0 {
+                let _ = crate::cli::stream::output_sink::try_write_stderr_line(&message);
             }
         }
     }
 
     fn drain_parallel_callbacks(
         &mut self,
-        tasks: &mut tokio::task::JoinSet<ParallelCallbackResult>,
+        tasks: &mut ParallelCallbacks,
         original_token: &str,
         failures: &mut ParallelCallbackFailures,
     ) {
@@ -3340,22 +3559,17 @@ impl CliSseEdgeHost<'_> {
         &mut self,
         tool: &str,
         body: &astra_thin_client::ToolResultRequest,
-    ) -> Result<(), PostToolResultError> {
-        self.post_tool_result_with_auth_retry(body).await?;
-        if let Err(error) = acknowledge_callback(|| {
+    ) -> Result<(), (PostToolResultError, astra_thin_client::ThinClientError)> {
+        self.try_post_tool_result(body).await?;
+        acknowledge_callback(|| {
             crate::cli::edge_lifecycle::record_completed_request(body.request_id.clone());
             self.executor
                 .acknowledge_delivered_task_result(tool, body.tool_result_fields.as_ref());
-        }) {
-            let details = edge_callback_error_details(&error);
-            self.record_tool_result_callback_failures(&[(
-                body.run_id.clone(),
-                body.request_id.clone(),
-                error,
-            )]);
-            return Err(PostToolResultError::RequestFailed(details));
-        }
-        Ok(())
+        })
+        .map_err(|error| {
+            let result = PostToolResultError::RequestFailed(edge_callback_error_details(&error));
+            (result, error)
+        })
     }
 
     async fn post_approval_with_auth_retry(
@@ -3523,6 +3737,12 @@ impl CliSseEdgeHost<'_> {
             })
     }
 
+    fn scoped_result_belongs_to_foreground(&self, result: &ScopedEdgeToolExecResult) -> bool {
+        self.last_bound_run_id
+            .as_deref()
+            .is_some_and(|run_id| !run_id.is_empty() && run_id == result.run_id)
+    }
+
     fn callback_delivery_closed(&self) -> bool {
         let session_admission_failed = self
             .request_session_execution_lease
@@ -3585,18 +3805,18 @@ impl CliSseEdgeHost<'_> {
 
     fn journal_child_callback_observations<'result>(
         &self,
-        results: impl IntoIterator<Item = &'result EdgeToolExecResult>,
+        results: impl IntoIterator<Item = &'result ScopedEdgeToolExecResult>,
         note: &str,
     ) {
         use astra_services::session_journal::{JournalWriter, journal_content_redact_enabled};
         let mut children = std::collections::BTreeMap::<_, Vec<_>>::new();
         for result in results {
-            if self.callback_tool_belongs_to_foreground(&result.request_id) {
+            if self.scoped_result_belongs_to_foreground(result)
+                || result.session_id.is_empty()
+                || result.run_id.is_empty()
+            {
                 continue;
             }
-            let Some(identity) = self.tool_result_identities.get(&result.request_id) else {
-                continue;
-            };
             let mut record =
                 astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result);
             if journal_content_redact_enabled() {
@@ -3610,7 +3830,7 @@ impl CliSseEdgeHost<'_> {
                 record.args_full = Some(args.to_string());
             }
             children
-                .entry((&identity.session_id, &identity.run_id))
+                .entry((&result.session_id, &result.run_id))
                 .or_default()
                 .push(record);
         }
@@ -3654,77 +3874,79 @@ impl CliSseEdgeHost<'_> {
         ))
     }
 
-    /// Build an `EdgeToolExecResult` and post it to the cloud API.
-    /// Used for cache-hit and dedup-limit early returns inside `execute_tool`.
-    async fn finish_edge_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        output: String,
-        status: String,
+    fn tool_completion_events(
+        &self,
+        req: &ToolBatchRequest,
+        output: &str,
+        status: &str,
         duration_ms: u64,
-    ) -> EdgeToolExecResult {
-        self.finish_edge_tool_with_fields(request_id, tool, args, output, None, status, duration_ms)
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn finish_edge_tool_with_fields(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        output: String,
-        tool_result_fields: Option<Map<String, Value>>,
-        status: String,
-        duration_ms: u64,
-    ) -> EdgeToolExecResult {
-        let (output, _) =
-            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
-        let typed_fields = tool_result_fields.as_ref();
-        if self.callback_tool_belongs_to_foreground(request_id)
+        fields: Option<&Map<String, Value>>,
+    ) -> Vec<chat_stream::StreamEvent> {
+        let mut events = Vec::new();
+        if self.callback_tool_belongs_to_foreground(&req.request_id)
             && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
         {
             let output_summary = self
                 .render()
-                .format_output_summary(tool, &output, &status)
+                .format_output_summary(&req.tool, output, status)
                 .map(|summary| summary.text)
                 .unwrap_or_default();
-            let tool_description = self.render().format_tool_description(tool, args);
-            if tool == "agent"
-                && let Some(action) = agent_control_action(args)
+            let description = self.render().format_tool_description(&req.tool, &req.args);
+            if req.tool == "agent"
+                && let Some(action) = agent_control_action(&req.args)
             {
-                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
+                events.push(chat_stream::StreamEvent::AgentControlCompleted {
                     action: action.to_string(),
-                    label: agent_control_label(args, tool_description.clone()),
-                    status: status.clone(),
+                    label: agent_control_label(&req.args, description.clone()),
+                    status: status.to_string(),
                     duration_ms,
-                    output: Some(tool_output_event_text(tool, &output)),
-                    tool_use_id: request_id.to_string(),
-                    agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
-                })
-                .await;
+                    output: Some(tool_output_event_text(&req.tool, output)),
+                    tool_use_id: req.request_id.clone(),
+                    agent_id: agent_id_from_output(output)
+                        .or_else(|| agent_id_from_args(&req.args)),
+                });
             }
-            if tool_completion_is_authoritative_with_fields(tool, &output, typed_fields) {
-                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                    name: tool.to_string(),
-                    description: tool_description,
-                    status: status.clone(),
+            if tool_completion_is_authoritative_with_fields(&req.tool, output, fields) {
+                events.push(chat_stream::StreamEvent::ToolCompleted {
+                    name: req.tool.clone(),
+                    description,
+                    status: status.to_string(),
                     duration_ms,
                     output_summary: if output_summary.is_empty() {
                         None
                     } else {
                         Some(output_summary)
                     },
-                    output: Some(tool_output_event_text(tool, &output)),
-                    tool_use_id: request_id.to_string(),
+                    output: Some(tool_output_event_text(&req.tool, output)),
+                    tool_use_id: req.request_id.clone(),
                     parent_tool_use_id: None,
                     server_terminal: None,
-                })
-                .await;
+                });
             }
         }
+        events
+    }
+
+    async fn finish_edge_tool_with_fields(
+        &mut self,
+        req: &ToolBatchRequest,
+        output: String,
+        tool_result_fields: Option<Map<String, Value>>,
+        status: String,
+        duration_ms: u64,
+    ) -> EdgeToolExecResult {
+        let request_id = req.request_id.as_str();
+        let tool = req.tool.as_str();
+        let args = &req.args;
+        let (output, _) =
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
+        let events = self.tool_completion_events(
+            req,
+            &output,
+            &status,
+            duration_ms,
+            tool_result_fields.as_ref(),
+        );
 
         let tool_result_fields =
             Self::tool_result_fields_with_cli_runtime(&self.executor, tool, tool_result_fields);
@@ -3741,21 +3963,34 @@ impl CliSseEdgeHost<'_> {
             status: status.clone(),
             duration_ms,
         };
-        self.edge_tool_round.push(result.clone());
 
-        if let Some(body) = self.tool_result_request(
+        let body = self.tool_result_request(
             request_id,
             status,
             output,
             duration_ms,
             Some(tool_result_fields),
-        ) {
-            let _ = self.deliver_tool_result(tool, &body).await;
-        } else {
-            tracing::error!(
-                request_id,
-                "cannot post edge tool result without scoped tool_request identity"
-            );
+        );
+        let shared = self.shared.clone();
+        let publish = async move {
+            for event in events {
+                shared.emit_stream_event(event).await;
+            }
+        };
+        let delivery = async {
+            if let Some(body) = &body {
+                self.deliver_tool_result(tool, body).await
+            } else {
+                tracing::error!(
+                    request_id,
+                    "cannot post edge tool result without scoped tool_request identity"
+                );
+                Ok(())
+            }
+        };
+        let (_, delivery) = tokio::join!(publish, delivery);
+        if let (Some(body), Err((_, error))) = (body, delivery) {
+            self.record_tool_result_callback_failures(&[(body.run_id, body.request_id, error)]);
         }
         result
     }
@@ -3964,112 +4199,62 @@ impl CliSseEdgeHost<'_> {
         sync_incremental_tool_result_state(incremental_state, result);
     }
 
-    async fn record_synthetic_batch_result(
+    async fn reject_transaction_batch(
         &mut self,
-        req: &ToolBatchRequest,
-        output: String,
-        status: &str,
-        tool_result_fields: Option<Map<String, Value>>,
-    ) -> EdgeToolExecResult {
-        let duration_ms = 0;
-        // Synthetic batch paths used to publish their raw transaction/error
-        // text directly to ToolCompleted, incremental state, and the cloud
-        // callback before the normal executor boundary ran.  These results
-        // are presentation projections, not source-owned reads: sanitize the
-        // output and extensible fields once before any side channel sees
-        // them.
-        let (output, _) =
-            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
-        let mut tool_result_fields = Self::tool_result_fields_with_cli_runtime(
-            &self.executor,
-            &req.tool,
-            tool_result_fields,
-        );
-        for value in tool_result_fields.values_mut() {
-            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
-        }
-        tool_result_fields.extend(rejected_tool_result_fields());
-
-        if self.callback_tool_belongs_to_foreground(&req.request_id)
-            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
-        {
-            let output_summary = self
-                .render()
-                .format_output_summary(&req.tool, &output, status)
-                .map(|summary| summary.text)
-                .unwrap_or_default();
-            let tool_description = self.render().format_tool_description(&req.tool, &req.args);
-            if req.tool == "agent"
-                && let Some(action) = agent_control_action(&req.args)
-            {
-                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
-                    action: action.to_string(),
-                    label: agent_control_label(&req.args, tool_description.clone()),
-                    status: status.to_string(),
-                    duration_ms,
-                    output: Some(tool_output_event_text(&req.tool, &output)),
-                    tool_use_id: req.request_id.clone(),
-                    agent_id: agent_id_from_output(&output)
-                        .or_else(|| agent_id_from_args(&req.args)),
-                })
-                .await;
+        requests: &[ToolBatchRequest],
+    ) -> Vec<EdgeToolExecResult> {
+        let target = self.edge_callback_target();
+        let mut callbacks = ParallelCallbacks::new(target.clone(), Arc::clone(&self.executor));
+        let mut failures = ParallelCallbackFailures::new();
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for req in requests {
+            let mut fields =
+                Self::tool_result_fields_with_cli_runtime(&self.executor, &req.tool, None);
+            for value in fields.values_mut() {
+                astra_text_utils::credential_redaction::redact_credentials_in_json(value);
             }
-            if tool_completion_is_authoritative_with_fields(
-                &req.tool,
-                &output,
-                Some(&tool_result_fields),
+            fields.extend(rejected_tool_result_fields());
+            let mut outcome = Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                output:
+                    "Error: automatic rollback is unsupported; no tools in this batch were run."
+                        .to_string(),
+                tool_result_fields: Some(fields),
+                is_error: true,
+            });
+            self.spawn_parallel_tool_result(&mut callbacks, req, &mut outcome, 0);
+            outcomes.push(outcome);
+        }
+        // Settle every accepted rejection before a full observer can block.
+        while let Some(result) = callbacks.join_next().await {
+            self.observe_parallel_callback(result, &target.token, &mut failures);
+        }
+        let mut results = Vec::with_capacity(requests.len());
+        for (req, outcome) in requests.iter().zip(outcomes) {
+            let outcome = Arc::try_unwrap(outcome)
+                .expect("all callback owners settled before building rejected results");
+            for event in self.tool_completion_events(
+                req,
+                &outcome.output,
+                "failed",
+                0,
+                outcome.tool_result_fields.as_ref(),
             ) {
-                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                    name: req.tool.clone(),
-                    description: tool_description,
-                    status: status.to_string(),
-                    duration_ms,
-                    output_summary: if output_summary.is_empty() {
-                        None
-                    } else {
-                        Some(output_summary)
-                    },
-                    output: Some(tool_output_event_text(&req.tool, &output)),
-                    tool_use_id: req.request_id.clone(),
-                    parent_tool_use_id: None,
-                    server_terminal: None,
-                })
-                .await;
+                self.emit_stream_event(event).await;
             }
+            results.push(EdgeToolExecResult {
+                work_attribution: req.work_attribution.clone(),
+                execution_completion: None,
+                request_id: req.request_id.clone(),
+                tool: req.tool.clone(),
+                args: req.args.clone(),
+                output: outcome.output,
+                tool_result_fields: outcome.tool_result_fields,
+                status: "failed".to_string(),
+                duration_ms: 0,
+            });
         }
-
-        let result = EdgeToolExecResult {
-            work_attribution: req.work_attribution.clone(),
-            execution_completion: None,
-            request_id: req.request_id.clone(),
-            tool: req.tool.clone(),
-            args: req.args.clone(),
-            output: output.clone(),
-            tool_result_fields: Some(tool_result_fields.clone()),
-            status: status.to_string(),
-            duration_ms,
-        };
-        self.edge_tool_round.push(result.clone());
-
-        if let Some(body) = self.tool_result_request(
-            &req.request_id,
-            status.to_string(),
-            output,
-            duration_ms,
-            Some(tool_result_fields),
-        ) {
-            // ── Reconnection dedup: only record when server acked the result ──
-            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
-                crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
-            }
-        } else {
-            tracing::error!(
-                request_id = %req.request_id,
-                "cannot post synthetic edge tool result without scoped tool_request identity"
-            );
-        }
-
-        result
+        self.record_tool_result_callback_failures(&failures);
+        results
     }
     fn effective_tool_cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.active_execution_cancel
@@ -4533,7 +4718,6 @@ async fn settle_unexecuted_server_tool_result(
         result.tool_result_fields.take(),
     );
     result.tool_result_fields = Some(fields.clone());
-    host.edge_tool_round.push(result.clone());
     if host.callback_delivery_closed() {
         return;
     }
@@ -5320,12 +5504,11 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             .accept_server_tool_surface_admission(&request.tool)
     }
 
-    fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
-        // The foreground snapshot belongs to one run, not every callback
-        // transported through its stream. Child results retain their own
-        // durable journal and AgentLive publication.
-        if self.callback_tool_belongs_to_foreground(&result.request_id) {
-            self.sync_incremental_tool_result(result);
+    fn on_tool_result(&mut self, result: &ScopedEdgeToolExecResult) {
+        // A local rejection retains the request's owner even when callback
+        // admission has already closed and no identity map entry exists.
+        if self.scoped_result_belongs_to_foreground(result) {
+            self.sync_incremental_tool_result(&result.result);
         }
     }
 
@@ -5386,7 +5569,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         self.render().stop_thinking();
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.shared.render_policy.suppress_tool_ui() {
-            Some(self.render().tool_start(tool, args))
+            Some(self.render().tool_start_with_animation(tool, args, false))
         } else {
             None
         };
@@ -5415,7 +5598,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                      Do NOT call this tool again with the same arguments.\n\n{}",
                     call_count,
                     max_calls,
-                    &cached_out[..cached_out.len().min(200)],
+                    cached_out.chars().take(200).collect::<String>(),
                 )
             } else {
                 format!(
@@ -5425,14 +5608,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 )
             };
             let status = "failed";
-            if let Some(idx) = tool_idx {
-                self.render().tool_done(idx, tool, args, status, 0, &body);
-            }
-            return self
+            let result = self
                 .finish_edge_tool_with_fields(
-                    request_id,
-                    tool,
-                    args,
+                    request,
                     body,
                     Some(crate::edge_tools::nonexecuted_tool_result_fields(
                         astra_services::session_journal::ToolCallDisposition::Suppressed,
@@ -5441,6 +5619,13 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     0,
                 )
                 .await;
+            if self.callback_failure.is_none()
+                && let Some(idx) = tool_idx
+            {
+                self.render()
+                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
+            }
+            return result;
         }
 
         // Cache hit for read-only (cacheable) tools
@@ -5448,15 +5633,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             && let Some((cached_output, cached_status)) =
                 self.validated_cache_entry(&dedup_sig, tool, args)
         {
-            if let Some(idx) = tool_idx {
-                self.render()
-                    .tool_done(idx, tool, args, &cached_status, 0, &cached_output);
-            }
-            return self
+            let result = self
                 .finish_edge_tool_with_fields(
-                    request_id,
-                    tool,
-                    args,
+                    request,
                     cached_output,
                     Some(crate::edge_tools::nonexecuted_tool_result_fields(
                         astra_services::session_journal::ToolCallDisposition::Reused,
@@ -5465,6 +5644,13 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     0,
                 )
                 .await;
+            if self.callback_failure.is_none()
+                && let Some(idx) = tool_idx
+            {
+                self.render()
+                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
+            }
+            return result;
         }
 
         // Skip local permission check if this tool was already approved through
@@ -6206,12 +6392,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 .get_or_insert_with(Map::new)
                 .extend(rejected_tool_result_fields());
         }
-        // The stream renderer emits ToolCompleted, tool_call_end, and the
-        // callback request before the runtime's durable record pass.  Keep
-        // those earlier lanes on the same executor-owned redacted value.
-        let (sanitized_output, _) =
-            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
-        output = sanitized_output;
         let status = edge_tool_result_status(
             !allowed || tool_execution_marked_error,
             tool_result_fields.as_ref(),
@@ -6248,119 +6428,37 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             // identical-call guard.
             self.tool_cache.reset_read_only_after_workspace_mutation();
         }
-        // Read-only tools: populate output cache for cross-turn dedup.
-        if allowed
+        // Compute the cache validation before callback delivery; insert only
+        // after the existing finish owner has sanitized the result.
+        let cache_validation = if allowed
             && !tool_result_status_is_failure(&status)
             && edge_tool_is_cacheable_read(tool, args)
-            && let Some(validation) = self.cache_validation_for_tool(tool, args)
         {
+            self.cache_validation_for_tool(tool, args)
+        } else {
+            None
+        };
+        let result = self
+            .finish_edge_tool_with_fields(request, output, tool_result_fields, status, duration_ms)
+            .await;
+        if let Some(validation) = cache_validation {
             self.tool_cache.output_cache.insert(
-                dedup_sig.clone(),
+                dedup_sig,
                 EdgeToolCacheEntry {
-                    output: output.clone(),
-                    status: status.clone(),
+                    output: result.output.clone(),
+                    status: result.status.clone(),
                     validation,
                 },
             );
         }
-
-        // Forward tool-completed event to observer channel
-        if self.callback_tool_belongs_to_foreground(request_id)
-            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some())
+        // Do not let terminal presentation prevent callback failure reporting.
+        if self.callback_failure.is_none()
+            && let Some(idx) = tool_idx
         {
-            let output_summary = self
-                .render()
-                .format_output_summary(tool, &output, &status)
-                .map(|summary| summary.text)
-                .unwrap_or_default();
-            let tool_description = self.render().format_tool_description(tool, args);
-            if tool == "agent"
-                && let Some(action) = agent_control_action(args)
-            {
-                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
-                    action: action.to_string(),
-                    label: agent_control_label(args, tool_description.clone()),
-                    status: status.clone(),
-                    duration_ms,
-                    output: Some(tool_output_event_text(tool, &output)),
-                    tool_use_id: request_id.to_string(),
-                    agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
-                })
-                .await;
-            }
-            if tool_completion_is_authoritative_with_fields(
-                tool,
-                &output,
-                tool_result_fields.as_ref(),
-            ) {
-                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                    name: tool.to_string(),
-                    description: tool_description,
-                    status: status.clone(),
-                    duration_ms,
-                    output_summary: if output_summary.is_empty() {
-                        None
-                    } else {
-                        Some(output_summary)
-                    },
-                    output: Some(tool_output_event_text(tool, &output)),
-                    tool_use_id: request_id.to_string(),
-                    parent_tool_use_id: None,
-                    server_terminal: None,
-                })
-                .await;
-            }
-        }
-
-        // Update tool line to show completion.
-        if let Some(idx) = tool_idx {
             self.render()
-                .tool_done(idx, tool, args, &status, duration_ms, &output);
+                .tool_done(idx, tool, args, &result.status, duration_ms, &result.output);
         }
-        let tool_result_fields =
-            Self::tool_result_fields_with_cli_runtime(&self.executor, tool, tool_result_fields);
-        self.edge_tool_round.push(EdgeToolExecResult {
-            work_attribution: self
-                .tool_result_identity(request_id)
-                .and_then(|identity| identity.work_attribution),
-
-            execution_completion: None,
-            request_id: request_id.to_string(),
-            tool: tool.to_string(),
-            args: args.clone(),
-            output: output.clone(),
-            tool_result_fields: Some(tool_result_fields.clone()),
-            status: status.clone(),
-            duration_ms,
-        });
-        if let Some(body) = self.tool_result_request(
-            request_id,
-            status.clone(),
-            output,
-            duration_ms,
-            Some(tool_result_fields),
-        ) {
-            let _ = self.deliver_tool_result(tool, &body).await;
-        } else {
-            tracing::error!(
-                request_id,
-                "cannot post edge tool result without scoped tool_request identity"
-            );
-        }
-        self.edge_tool_round
-            .last()
-            .cloned()
-            .unwrap_or_else(|| EdgeToolExecResult {
-                work_attribution: None,
-                execution_completion: None,
-                request_id: String::new(),
-                tool: String::new(),
-                args: serde_json::Value::Null,
-                output: "Error: no tool result recorded".to_string(),
-                tool_result_fields: None,
-                status: "failed".to_string(),
-                duration_ms: 0,
-            })
+        result
     }
 
     async fn resolve_approval(
@@ -6618,15 +6716,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             .iter()
             .any(|req| req.args.get("transaction_id").is_some())
         {
-            let mut out = Vec::with_capacity(n);
-            for req in &requests {
-                out.push(self.record_synthetic_batch_result(
-                    req,
-                    "Error: automatic rollback is unsupported; no tools in this batch were run.".to_string(),
-                    "failed",
-                    None,
-                ).await);
-            }
+            let out = self.reject_transaction_batch(&requests).await;
             self.render().tool_batch_progress = None;
             return out;
         }
@@ -6749,10 +6839,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         // For parallel tools, clear progress indicator (they all run together).
         self.render().tool_batch_progress = None;
 
-        // Markdown mode: show single grouped spinner for parallel tools.
-        // Non-markdown mode: show individual lines that can update in place.
+        // Parallel progress is static: terminal animation workers must not
+        // block callback settlement if the terminal stops reading.
         let parallel_count = conc_reqs.len();
-        let use_grouped_spinner = self.render().md.is_some() && parallel_count > 1;
+        let use_grouped_tool_ui = self.render().md.is_some() && parallel_count > 1;
 
         let mut ui_indices: Vec<Option<usize>> = Vec::with_capacity(conc_reqs.len());
         for (i, (_, req)) in conc_reqs.iter().enumerate() {
@@ -6785,18 +6875,21 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             }
             self.render().stop_thinking();
 
-            // In grouped mode, only start spinner once for all parallel tools.
+            // In grouped mode, show one progress line for all parallel tools.
             let tool_idx = if !self.shared.render_policy.suppress_tool_ui() {
-                if use_grouped_spinner {
+                if use_grouped_tool_ui {
                     if i == 0 {
-                        // Start grouped spinner for first tool only.
+                        // Show grouped progress for the first tool only.
                         Some(self.render().tool_start_parallel_group(parallel_count))
                     } else {
-                        // Other tools share the group spinner (no individual display).
+                        // Other tools share the group line.
                         None
                     }
                 } else {
-                    Some(self.render().tool_start(&req.tool, &req.args))
+                    Some(
+                        self.render()
+                            .tool_start_with_animation(&req.tool, &req.args, false),
+                    )
                 }
             } else {
                 None
@@ -6936,16 +7029,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             })
             .collect();
 
-        let callback_target = EdgeCallbackTarget {
-            api: self.api.clone().without_bearer_provider(),
-            token: self.token.clone(),
-            executor_id: self.executor_id.to_string(),
-            owner: self.owner_auth_snapshot.clone(),
-            cancel: self.cancel_token.cloned(),
-            status_tx: self.shared.stream_event_tx.clone(),
-            status_reported: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
-        };
-        let mut callback_tasks = tokio::task::JoinSet::new();
+        let callback_target = self.edge_callback_target();
+        let mut callback_tasks =
+            ParallelCallbacks::new(callback_target.clone(), Arc::clone(&self.executor));
         let mut callback_failure = ParallelCallbackFailures::new();
         // A sandbox denial may need an approval after the other tools settle.
         // Reuse each invocation's cancellation token to avoid holding a denied
@@ -6959,7 +7045,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             ),
         >::new();
         let mut denied_deadlines = FuturesUnordered::new();
-        let mut output_slots: Vec<Option<(crate::edge_tools::ToolExecutionOutcome, u64)>> =
+        let mut output_slots: Vec<Option<(Arc<crate::edge_tools::ToolExecutionOutcome>, u64)>> =
             (0..conc_reqs.len()).map(|_| None).collect();
         while !executions.is_empty() {
             tokio::select! {
@@ -6973,14 +7059,15 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 Some(pos) = denied_deadlines.next(), if !denied_deadlines.is_empty() => {
                     if denied.remove(&pos).is_some() {
                         let (outcome, duration_ms) = output_slots[pos].as_mut().expect("denied result settled");
-                        note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
+                        note_sandbox_retry_unavailable(parallel_outcome_mut(outcome), self.cancel_token.is_some_and(|token| token.is_cancelled()));
                         self.spawn_parallel_tool_result(
-                            &mut callback_tasks, &callback_target, conc_reqs[pos].1,
+                            &mut callback_tasks, conc_reqs[pos].1,
                             outcome, *duration_ms,
                         );
                     }
                 }
-                Some((pos, (mut outcome, duration_ms), deadline, deadline_at, deadline_task)) = executions.next() => {
+                Some((pos, (outcome, duration_ms), deadline, deadline_at, deadline_task)) = executions.next() => {
+                    let mut outcome = Arc::new(outcome);
                     let is_denied = crate::sandbox_retry::sandbox_denied_message_from_result(
                         &outcome.output, outcome.tool_result_fields.as_ref(),
                     ).is_some();
@@ -6990,10 +7077,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     } else {
                         drop(deadline_task);
                         if is_denied {
-                            note_sandbox_retry_unavailable(&mut outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
+                            note_sandbox_retry_unavailable(parallel_outcome_mut(&mut outcome), self.cancel_token.is_some_and(|token| token.is_cancelled()));
                         }
                         self.spawn_parallel_tool_result(
-                            &mut callback_tasks, &callback_target, conc_reqs[pos].1,
+                            &mut callback_tasks, conc_reqs[pos].1,
                             &mut outcome, duration_ms,
                         );
                     }
@@ -7007,11 +7094,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             .collect();
 
         // ── Phase 3: Post-execution (sequential, &mut self) ──
-        // Stop grouped spinner if we used one.
-        if use_grouped_spinner {
-            self.render().stop_tool_stderr_running();
-        }
-
         // ── Phase 2.5: Sandbox-denied retry (Auto mode) ──
         // The sequential dispatch path (lines 2025–2181) wraps every
         // tool call in a SANDBOX_DENIED→prompt→retry flow; the parallel
@@ -7051,7 +7133,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
             else {
                 continue;
             };
-            let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outputs[pos].0) else {
+            let Some(sandbox_msg) =
+                normalize_sandbox_denied_outcome(parallel_outcome_mut(&mut outputs[pos].0))
+            else {
                 continue;
             };
             'resolve: {
@@ -7064,14 +7148,17 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     &mut callback_failure,
                 );
                 if !callback_failure.is_empty() {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 if tokio::time::Instant::now() >= execution_deadline {
-                    note_sandbox_retry_unavailable(&mut outputs[pos].0, false);
+                    note_sandbox_retry_unavailable(
+                        parallel_outcome_mut(&mut outputs[pos].0),
+                        false,
+                    );
                     break 'resolve;
                 }
                 let mut completed = Vec::new();
@@ -7107,32 +7194,32 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     &mut callback_failure,
                 );
                 if !callback_failure.is_empty() {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 if stop_new_executions.is_cancelled() {
                     break 'resolve;
                 }
                 if !owner_verified || self.stream_observer_error().is_some() {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (tool was not retried because execution was cancelled or its original account could not be confirmed)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 let tool = req.tool.clone();
                 let args = req.args.clone();
                 let sandbox_tool_key = format!("sandbox_expand:{tool}");
                 let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
-                    outputs[pos].0.output =
+                    parallel_outcome_mut(&mut outputs[pos].0).output =
                         crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
                             &tool,
                             &sandbox_msg,
                         );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 };
                 let guard_args = serde_json::json!({
@@ -7151,10 +7238,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         // see why the sandbox refused to widen, instead of
                         // silently continuing with the original
                         // sandbox-denied output.
-                        outputs[pos].0.output = format!(
+                        parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                             "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
                         );
-                        outputs[pos].0.is_error = true;
+                        parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                         false
                     }
                     crate::cli::permission_manager::GateOutcome::NeedApproval {
@@ -7191,9 +7278,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                                 Some(expired_pos) = denied_deadlines.next(), if !denied_deadlines.is_empty() => {
                                                     if denied.remove(&expired_pos).is_some() {
                                                         let (outcome, duration_ms) = &mut outputs[expired_pos];
-                                                        note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
+                                                        note_sandbox_retry_unavailable(parallel_outcome_mut(outcome), self.cancel_token.is_some_and(|token| token.is_cancelled()));
                                                         self.spawn_parallel_tool_result(
-                                                            &mut callback_tasks, &callback_target, conc_reqs[expired_pos].1,
+                                                            &mut callback_tasks, conc_reqs[expired_pos].1,
                                                             outcome, *duration_ms,
                                                         );
                                                     }
@@ -7221,10 +7308,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                     response
                                 }
                                 Err(error) => {
-                                    outputs[pos].0.output = format!(
+                                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                         "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
                                     );
-                                    outputs[pos].0.is_error = true;
+                                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                                     Ok(ApprovalResponse::Deny)
                                 }
                             };
@@ -7255,20 +7342,20 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                 break 'resolve;
                             }
                             if observer_unavailable {
-                                outputs[pos].0.output = format!(
+                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
                                 );
-                                outputs[pos].0.is_error = true;
+                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             } else if !callback_failure.is_empty() {
-                                outputs[pos].0.output = format!(
+                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                                 );
-                                outputs[pos].0.is_error = true;
+                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             } else if !owner_verified {
-                                outputs[pos].0.output = format!(
+                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because execution was cancelled or its original account could not be confirmed)"
                                 );
-                                outputs[pos].0.is_error = true;
+                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             } else if !approval_interrupted
                                 && let Some(pm) = self.perm_manager.as_mut()
                             {
@@ -7307,10 +7394,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                             // means a misconfiguration. Surface a clear
                             // reason without exposing the sandbox-denied wire
                             // prefix.
-                            outputs[pos].0.output = format!(
+                            parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                 "Error: {sandbox_msg} (approval required for sandbox_expand but no TUI; pass --mode auto or add allow rule)"
                             );
-                            outputs[pos].0.is_error = true;
+                            parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             false
                         }
                     }
@@ -7319,16 +7406,16 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     break 'resolve;
                 }
                 if self.stream_observer_error().is_some() {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (stream observer closed before sandbox retry)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 if retry_cancel.is_cancelled() || tokio::time::Instant::now() >= execution_deadline
                 {
                     note_sandbox_retry_unavailable(
-                        &mut outputs[pos].0,
+                        parallel_outcome_mut(&mut outputs[pos].0),
                         self.cancel_token.is_some_and(|token| token.is_cancelled()),
                     );
                     break 'resolve;
@@ -7338,10 +7425,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     .as_ref()
                     .is_some_and(|owner| !owner.is_current())
                 {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (tool was not retried because its original account changed)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 self.drain_parallel_callbacks(
@@ -7350,10 +7437,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     &mut callback_failure,
                 );
                 if !callback_failure.is_empty() {
-                    outputs[pos].0.output = format!(
+                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
-                    outputs[pos].0.is_error = true;
+                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
                 if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
@@ -7389,9 +7476,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         Some(expired_pos) = denied_deadlines.next(), if !denied_deadlines.is_empty() => {
                             if denied.remove(&expired_pos).is_some() {
                                 let (outcome, duration_ms) = &mut outputs[expired_pos];
-                                note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
+                                note_sandbox_retry_unavailable(parallel_outcome_mut(outcome), self.cancel_token.is_some_and(|token| token.is_cancelled()));
                                 self.spawn_parallel_tool_result(
-                                    &mut callback_tasks, &callback_target, conc_reqs[expired_pos].1,
+                                    &mut callback_tasks, conc_reqs[expired_pos].1,
                                     outcome, *duration_ms,
                                 );
                             }
@@ -7400,76 +7487,42 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 };
                 let mut retried = retried;
                 normalize_sandbox_denied_outcome(&mut retried);
-                outputs[pos] = (retried, retry_dur);
+                outputs[pos] = (Arc::new(retried), retry_dur);
             }
             let (outcome, duration_ms) = &mut outputs[pos];
-            self.spawn_parallel_tool_result(
-                &mut callback_tasks,
-                &callback_target,
-                req,
-                outcome,
-                *duration_ms,
-            );
+            self.spawn_parallel_tool_result(&mut callback_tasks, req, outcome, *duration_ms);
         }
 
-        for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
-            let (orig_idx, req) = conc_reqs[pos];
-            let status = edge_tool_outcome_status(&outcome);
-            let output = outcome.output;
+        // Settle accepted work before presentation: a full output pipe or a slow
+        // consumer must not prevent queued callbacks from reaching the server.
+        while let Some(result) = callback_tasks.join_next().await {
+            self.observe_parallel_callback(result, &callback_target.token, &mut callback_failure);
+        }
 
-            // Forward tool-completed event.
-            if self.callback_tool_belongs_to_foreground(&req.request_id)
-                && (self.shared.stream_event_tx.is_some()
-                    || self.shared.stream_event_sink.is_some())
-            {
-                let output_summary = self
-                    .render()
-                    .format_output_summary(&req.tool, &output, status)
-                    .map(|summary| summary.text)
-                    .unwrap_or_default();
-                let desc = self.render().format_tool_description(&req.tool, &req.args);
-                if req.tool == "agent"
-                    && let Some(action) = agent_control_action(&req.args)
-                {
-                    self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
-                        action: action.to_string(),
-                        label: agent_control_label(&req.args, desc.clone()),
-                        status: status.to_string(),
-                        duration_ms,
-                        output: Some(tool_output_event_text(&req.tool, &output)),
-                        tool_use_id: req.request_id.clone(),
-                        agent_id: agent_id_from_output(&output)
-                            .or_else(|| agent_id_from_args(&req.args)),
-                    })
-                    .await;
-                }
-                if tool_completion_is_authoritative_with_fields(
-                    &req.tool,
-                    &output,
-                    outcome.tool_result_fields.as_ref(),
-                ) {
-                    self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                        name: req.tool.clone(),
-                        description: desc,
-                        status: status.to_string(),
-                        duration_ms,
-                        output_summary: if output_summary.is_empty() {
-                            None
-                        } else {
-                            Some(output_summary)
-                        },
-                        output: Some(tool_output_event_text(&req.tool, &output)),
-                        tool_use_id: req.request_id.clone(),
-                        parent_tool_use_id: None,
-                        server_terminal: None,
-                    })
-                    .await;
-                }
+        for (pos, (outcome, duration_ms)) in outputs.iter().enumerate() {
+            let (_, req) = conc_reqs[pos];
+            let duration_ms = *duration_ms;
+            let status = edge_tool_outcome_status(outcome);
+            let output = &outcome.output;
+
+            for event in self.tool_completion_events(
+                req,
+                output,
+                status,
+                duration_ms,
+                outcome.tool_result_fields.as_ref(),
+            ) {
+                self.emit_stream_event(event).await;
             }
 
+            // On callback failure, presentation must not block reporting the
+            // error (stderr may be a full pipe). Stream events still carry facts.
+            if !callback_failure.is_empty() {
+                continue;
+            }
             // Tool-done UI.
-            if use_grouped_spinner {
-                // Grouped mode: print completion line directly (no spinner update).
+            if use_grouped_tool_ui {
+                // Grouped mode: print the completion line directly.
                 if !self.shared.render_policy.suppress_tool_ui() {
                     self.render().tool_done_inline(
                         &req.tool,
@@ -7483,34 +7536,36 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 self.render()
                     .tool_done(idx, &req.tool, &req.args, status, duration_ms, &output);
             }
+        }
 
+        // Publish completed facts before an internal failure cancels their
+        // stream. An external cancellation retains its normal send semantics.
+        self.record_tool_result_callback_failures(&callback_failure);
+
+        // Callback tasks and their shared references are gone, so the one
+        // existing outcome can move into the final result without another copy.
+        for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
+            let (orig_idx, req) = conc_reqs[pos];
+            let outcome = Arc::try_unwrap(outcome)
+                .expect("all callback owners settled before building final results");
+            let status = edge_tool_outcome_status(&outcome);
             let tool_result_fields = Self::tool_result_fields_with_cli_runtime(
                 &self.executor,
                 &req.tool,
                 outcome.tool_result_fields,
             );
-            let result = EdgeToolExecResult {
+            results[orig_idx] = Some(EdgeToolExecResult {
                 work_attribution: req.work_attribution.clone(),
-
                 execution_completion: None,
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
                 args: req.args.clone(),
-                output: output.clone(),
-                tool_result_fields: Some(tool_result_fields.clone()),
+                output: outcome.output,
+                tool_result_fields: Some(tool_result_fields),
                 status: status.to_string(),
                 duration_ms,
-            };
-            self.edge_tool_round.push(result.clone());
-            results[orig_idx] = Some(result);
+            });
         }
-
-        // One failed callback must not prevent already executed siblings from
-        // submitting their own facts. Report failures only after they settle.
-        while let Some(result) = callback_tasks.join_next().await {
-            self.observe_parallel_callback(result, &callback_target.token, &mut callback_failure);
-        }
-        self.record_tool_result_callback_failures(&callback_failure);
 
         // Clear batch progress when done.
         self.render().tool_batch_progress = None;
@@ -7934,6 +7989,10 @@ impl StreamRenderState {
 
     /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
+        self.tool_start_with_animation(tool, args, true)
+    }
+
+    fn tool_start_with_animation(&mut self, tool: &str, args: &Value, animate: bool) -> usize {
         let description = self.format_tool_description(tool, args);
         let styled_desc = style_tool_description(tool, &description);
         if let Some(pane) = self.thinking_pane.take() {
@@ -7942,6 +8001,15 @@ impl StreamRenderState {
         }
         self.suppress_reasoning_viewport = true;
         if self.md.is_some() {
+            if !animate {
+                let prefix = match self.tool_batch_progress {
+                    Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
+                    _ => String::new(),
+                };
+                let line = format!("  {} {}{} …", theme::icon_running(), prefix, styled_desc);
+                self.show_static_tool_progress(&line);
+                return 0;
+            }
             self.stop_tool_stderr_running();
             if io::stderr().is_terminal() {
                 // Spinner uses plain description (truncated internally with .dim())
@@ -7977,27 +8045,36 @@ impl StreamRenderState {
             g.region.update(lines);
             idx
         };
-        self.tool_stdout_anim = Some(ToolStdoutLineAnim::start(
-            self.tool_ui.clone(),
-            idx,
-            description, // Plain text for spinner animation
-        ));
+        if animate {
+            self.tool_stdout_anim = Some(ToolStdoutLineAnim::start(
+                self.tool_ui.clone(),
+                idx,
+                description, // Plain text for spinner animation
+            ));
+        }
         idx
     }
 
-    /// Start a grouped spinner for N tools running in parallel.
-    /// Shows: `⬢ Running N tools in parallel… Xs ⣾`
-    fn tool_start_parallel_group(&mut self, count: usize) -> usize {
-        self.stop_tool_stderr_running();
-        let description = format!("Running {} tools in parallel", count);
-        if io::stderr().is_terminal() {
-            self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
-        } else {
-            let line = format!("  {} {} …", theme::icon_running(), description.dim());
+    /// Show a static progress line without creating a blocking spinner worker.
+    fn show_static_tool_progress(&mut self, line: &str) {
+        let displayed = if cfg!(target_os = "linux") {
+            crate::cli::stream::output_sink::try_write_stderr_line(line)
+        } else if !io::stderr().is_terminal() {
             eprintln!("{line}");
+            true
+        } else {
+            false
+        };
+        if displayed {
             self.stderr_lines += 1;
         }
-        0 // Index not used for grouped spinner
+    }
+
+    fn tool_start_parallel_group(&mut self, count: usize) -> usize {
+        let description = format!("Running {} tools in parallel", count);
+        let line = format!("  {} {} …", theme::icon_running(), description.dim());
+        self.show_static_tool_progress(&line);
+        0 // Index not used for grouped progress
     }
 
     /// Format a Cursor-style tool description: "Grepped pattern in path", "Read file lines X-Y"
@@ -9271,35 +9348,26 @@ pub(crate) async fn consume_turn_sse(
                 })
                 .await;
         }
-        // Children share this physical callback lane. Only the foreground run
-        // owns the records used by its completion count and local journal.
-        let host_result_count = host.edge_tool_round.len();
-        let mut edge_tool_round = merge_edge_tool_rounds(
-            std::mem::take(&mut host.edge_tool_round),
-            &result.tool_results,
-        );
+        // The consumer owns every local result together with its producer
+        // scope. Child observations and the foreground turn borrow from that
+        // collection instead of merging a second copy by request ID.
+        let scoped_results = std::mem::take(&mut result.tool_results);
         if abort.is_some() || host.callback_delivery_closed() {
             host.journal_child_callback_observations(
-                &edge_tool_round,
+                &scoped_results,
                 "Interrupted callback lane; local tool observations, not Server settlement.",
             );
         } else {
-            // The merge appends consumer-only results after the host's records.
-            // Synchronous admission refusals never reached the callback owner.
             host.journal_child_callback_observations(
-                edge_tool_round[host_result_count..]
-                    .iter()
-                    .filter(|result| {
-                        result.tool_result_fields.as_ref().is_some_and(|fields| {
-                            fields.get("execution_fact").and_then(Value::as_str)
-                                == Some("not_executed")
-                        })
-                    }),
+                scoped_results.iter().filter(|result| result.local_only),
                 "Local pre-execution rejection; no Server callback was sent.",
             );
         }
-        edge_tool_round
-            .retain(|record| host.callback_tool_belongs_to_foreground(&record.request_id));
+        let edge_tool_round = scoped_results
+            .into_iter()
+            .filter(|result| host.scoped_result_belongs_to_foreground(result))
+            .map(|result| result.result)
+            .collect();
         let lw = host.render().lines_written;
         let md = host.render().md.take();
         let auth_failure = host.auth_failure;
@@ -9351,12 +9419,15 @@ pub(crate) async fn consume_turn_sse(
             render.lines_written = pre_clear_lines;
         }
         let mut host = NoopSseStreamHost::default();
-        let (result, _abort) =
+        let (mut result, _abort) =
             consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token, None)
                 .await;
         let lw = render.lines_written;
         let md = render.md.take();
-        let tool_results = result.tool_results.clone();
+        let tool_results = std::mem::take(&mut result.tool_results)
+            .into_iter()
+            .map(|result| result.result)
+            .collect();
         (
             result,
             tool_results,
@@ -9492,33 +9563,6 @@ pub(crate) fn dispatch_turn_event_block(
     apply_sse_render_effects(effects, render, policy);
 }
 
-fn merge_edge_tool_rounds(
-    host_round: Vec<EdgeToolExecResult>,
-    consumed_tool_results: &[EdgeToolExecResult],
-) -> Vec<EdgeToolExecResult> {
-    if consumed_tool_results.is_empty() {
-        return host_round;
-    }
-
-    let mut merged = host_round;
-    let mut seen_request_ids: std::collections::HashSet<String> = merged
-        .iter()
-        .map(|result| result.request_id.clone())
-        .collect();
-
-    // Host wins on duplicate request_id; if consumed has the same id
-    // multiple times (unlikely but not enforced upstream), only the
-    // first unseen occurrence is appended — later duplicates are
-    // silently dropped.
-    for result in consumed_tool_results {
-        if seen_request_ids.insert(result.request_id.clone()) {
-            merged.push(result.clone());
-        }
-    }
-
-    merged
-}
-
 fn turn_has_tool_work(result: &TurnResult) -> bool {
     result.has_tool_calls || !result.edge_tool_round.is_empty()
 }
@@ -9632,12 +9676,12 @@ mod tests {
         edge_tool_is_cacheable_read, edge_tool_outcome_status,
         execute_with_invocation_metadata_responsive, extract_cli_diff_block, file_content_sha256,
         finalize_cli_skill_execution, format_terminal_tool_summary,
-        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
-        normalize_sandbox_denied_outcome, path_mtime_ms, recorded_approval_decision,
-        request_token_usage_from_accum, sanitize_final_stream_text,
-        server_context_window_policy_from_accum, server_tool_completion_id,
-        server_tool_completion_is_authoritative, server_tool_completion_output,
-        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
+        format_tool_display_from_preview, is_edge_auth_failure, normalize_sandbox_denied_outcome,
+        path_mtime_ms, recorded_approval_decision, request_token_usage_from_accum,
+        sanitize_final_stream_text, server_context_window_policy_from_accum,
+        server_tool_completion_id, server_tool_completion_is_authoritative,
+        server_tool_completion_output, server_tool_completion_status,
+        server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
@@ -13785,6 +13829,20 @@ mod tests {
         remove_preserved_test_worktree(repo.path(), &selected);
     }
 
+    fn scoped_test_result(
+        host: &CliSseStreamHost<'_>,
+        result: &EdgeToolExecResult,
+    ) -> super::ScopedEdgeToolExecResult {
+        let owner = host.tool_result_identities.get(&result.request_id).unwrap();
+        super::ScopedEdgeToolExecResult {
+            session_id: owner.session_id.clone(),
+            run_id: owner.run_id.clone(),
+            turn_chain_id: owner.turn_chain_id.clone(),
+            local_only: false,
+            result: result.clone(),
+        }
+    }
+
     fn parallel_batch_request(owner: &str, id: &str, tool: &str, args: Value) -> ToolBatchRequest {
         ToolBatchRequest {
             work_attribution: None,
@@ -14848,7 +14906,8 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         for result in &results {
-            host.on_tool_result(result);
+            let scoped = scoped_test_result(&host, result);
+            host.on_tool_result(&scoped);
         }
         assert_eq!(incremental.snapshot().tool_call_records.len(), 1);
         assert_eq!(
@@ -14903,7 +14962,8 @@ mod tests {
                 }])
                 .await;
             assert_eq!(results[0].status, "completed");
-            host.on_tool_result(&results[0]);
+            let scoped = scoped_test_result(&host, &results[0]);
+            host.on_tool_result(&scoped);
             if request_id == "serial-child" {
                 let fields = results[0]
                     .tool_result_fields
@@ -14954,7 +15014,8 @@ mod tests {
             !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&rejected[0])
                 .was_executed()
         );
-        host.on_tool_result(&rejected[0]);
+        let scoped = scoped_test_result(&host, &rejected[0]);
+        host.on_tool_result(&scoped);
         assert_eq!(incremental.snapshot().tool_call_records.len(), 2);
         assert!(
             rx.try_recv().is_err(),
@@ -16350,6 +16411,1005 @@ mod tests {
         assert_eq!(arrived.load(Ordering::SeqCst), 2);
     }
 
+    fn queued_test_callback(
+        tool: &str,
+        body: astra_thin_client::ToolResultRequest,
+        deadline: tokio::time::Instant,
+    ) -> super::QueuedParallelCallback {
+        assert_eq!(body.status, "completed");
+        super::QueuedParallelCallback {
+            identity: Some(ToolResultIdentity {
+                work_attribution: None,
+                session_id: body.session_id,
+                run_id: body.run_id.clone(),
+                turn_chain_id: body.turn_chain_id,
+                request_id: body.request_id.clone(),
+                execution_deadline_unix_ms: u64::MAX,
+                execution_deadline_at: deadline,
+            }),
+            run_id: body.run_id,
+            request_id: body.request_id,
+            edge_agent_id: body.edge_agent_id,
+            tool: tool.to_string(),
+            outcome: std::sync::Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                output: body.output,
+                tool_result_fields: body.tool_result_fields,
+                is_error: false,
+            }),
+            duration_ms: body.duration_ms,
+            deadline,
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn queued_child_rejection_keeps_owner_after_callback_failure() {
+        use futures_util::StreamExt;
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = arrived.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(403).set_delay(std::time::Duration::from_millis(300))
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let first = concat!(
+            "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
+            "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
+        );
+        let child = "data: {\"type\":\"tool_request\",\"session_id\":\"child-session\",\"run_id\":\"child-run\",\"turn_chain_id\":\"child-chain\",\"request_id\":\"child\",\"tool\":\"read_file\",\"args\":{\"path\":\"never-read.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n";
+        let stream =
+            futures_util::stream::iter(vec![Ok::<Vec<u8>, String>(first.as_bytes().to_vec())])
+                .chain(futures_util::stream::once(async move {
+                    arrived.notified().await;
+                    Ok(child.as_bytes().to_vec())
+                }))
+                .chain(futures_util::stream::pending());
+        let mut stream = Box::pin(stream);
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::consume_sse_stream_cancellable(
+                &mut stream,
+                &mut host,
+                super::stream_idle_timeout(),
+                Some(&cancel),
+                None,
+            ),
+        )
+        .await
+        .expect("callback failure must settle the stream");
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        let child = result
+            .tool_results
+            .iter()
+            .find(|result| result.request_id == "child")
+            .expect("the accepted child is retained");
+        assert_eq!(
+            (&*child.session_id, &*child.run_id, &*child.turn_chain_id),
+            ("child-session", "child-run", "child-chain")
+        );
+        assert!(child.local_only);
+        assert_eq!(
+            child.tool_result_fields.as_ref().unwrap()["execution_fact"],
+            "not_executed"
+        );
+        assert!(!host.tool_result_identities.contains_key("child"));
+        host.journal_child_callback_observations(&result.tool_results, "local observations");
+        let journal = session_journal::read_journal("child-session").unwrap();
+        assert!(journal.iter().any(|event| {
+            event
+                .producer_scope
+                .as_ref()
+                .is_some_and(|scope| scope.run_id == "child-run")
+                && event.tool_calls.as_ref().is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.tool_call_id.as_deref() == Some("child") && !call.was_executed()
+                    })
+                })
+        }));
+        let callbacks = fixture.callbacks.received_requests().await.unwrap();
+        assert_eq!(
+            callbacks.len(),
+            1,
+            "the child must not be posted under a failed callback owner"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_terminal_in_large_received_chunk_prevents_queued_write() {
+        use futures_util::StreamExt;
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = arrived.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true}))
+                    .set_delay(std::time::Duration::from_millis(300))
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let first = concat!(
+            "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
+            "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
+        );
+        let write = serde_json::json!({
+            "type":"tool_request", "session_id":"root-session", "run_id":"root-run",
+            "turn_chain_id":"root-chain", "request_id":"late-write", "tool":"write_file",
+            "args":{"path":"must-not-exist.txt", "content":"x".repeat(1024 * 1024 + 1)},
+            "schema_admitted_by_server":true, "execution_timeout_ms":300000,
+            "execution_deadline_unix_ms":4102444800000u64
+        });
+        let second = format!(
+            "data: {write}\n\ndata: {{\"type\":\"run_finished\",\"run_id\":\"root-run\",\"status\":\"cancelled\"}}\n\n"
+        );
+        let stream =
+            futures_util::stream::iter(vec![Ok::<Vec<u8>, String>(first.as_bytes().to_vec())])
+                .chain(futures_util::stream::once(async move {
+                    arrived.notified().await;
+                    Ok(second.into_bytes())
+                }))
+                .chain(futures_util::stream::pending());
+        let mut stream = Box::pin(stream);
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::consume_sse_stream_cancellable(
+                &mut stream,
+                &mut host,
+                super::stream_idle_timeout(),
+                Some(&cancel),
+                None,
+            ),
+        )
+        .await
+        .expect("terminal must settle accepted execution");
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].request_id, "first");
+        assert!(!workspace.path().join("must-not-exist.txt").exists());
+        let callbacks = fixture.callbacks.received_requests().await.unwrap();
+        assert_eq!(callbacks.len(), 1, "unstarted write must not be posted");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn callback_capacity_is_shared_and_queued_deadline_is_not_extended() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (arrivals_tx, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/tools/result",
+            axum::routing::post({
+                let active = active.clone();
+                let peak = peak.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let arrivals_tx = arrivals_tx.clone();
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        let (release, hold) = tokio::sync::oneshot::channel();
+                        arrivals_tx
+                            .send((body["request_id"].as_str().unwrap().to_string(), release))
+                            .unwrap();
+                        let _ = hold.await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"ok": true}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let workspace = tempdir().unwrap();
+        let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let target = super::EdgeCallbackTarget {
+            api: astra_thin_client::ThinClient::new(&url, None).unwrap(),
+            token: "tok".into(),
+            executor_id: "edge-test".into(),
+            owner: None,
+            cancel: None,
+            status_tx: None,
+            status_reported: None,
+        };
+        let mut owners: Vec<_> = (0..5)
+            .map(|_| super::ParallelCallbacks::new(target.clone(), executor.clone()))
+            .collect();
+        let make = |id: String, deadline| {
+            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "session".into(),
+                    run_id: "run".into(),
+                    turn_chain_id: "turn".into(),
+                    request_id: id.clone(),
+                    edge_agent_id: "edge-test".into(),
+                    status: "completed".into(),
+                    output: id,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            );
+            queued_test_callback("read_file", body, deadline)
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A busy stream cannot occupy every process-wide slot before B arrives.
+        for index in 0..8 {
+            owners[0].enqueue(make(format!("a-{index}"), deadline));
+        }
+        let mut held = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..super::EDGE_CALLBACK_STREAM_WINDOW {
+            let (id, release) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrivals.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(id.starts_with("a-"));
+            seen.insert(id);
+            held.push(release);
+        }
+        for index in 0..8 {
+            owners[1].enqueue(make(format!("b-{index}"), deadline));
+        }
+        let (id, release) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrivals.recv())
+                .await
+                .expect("B must enter while A's callbacks are held")
+                .unwrap();
+        assert!(id.starts_with("b-"));
+        seen.insert(id);
+        held.push(release);
+        for (owner_index, owner) in owners.iter_mut().enumerate().skip(2) {
+            for index in 0..8 {
+                owner.enqueue(make(format!("{owner_index}-{index}"), deadline));
+            }
+        }
+        for _ in held.len()..super::EDGE_CALLBACK_DELIVERY_CAPACITY {
+            let (id, release) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrivals.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            seen.insert(id);
+            held.push(release);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), arrivals.recv())
+                .await
+                .is_err()
+        );
+        owners[0].enqueue(make(
+            "must-expire".into(),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+        ));
+        let expired =
+            tokio::time::timeout(std::time::Duration::from_secs(3), owners[0].join_next())
+                .await
+                .expect("queued deadline must not wait for held callbacks")
+                .unwrap()
+                .unwrap();
+        assert_eq!(expired.2, "must-expire");
+        assert!(
+            expired
+                .1
+                .0
+                .unwrap_err()
+                .to_string()
+                .contains("was not sent")
+        );
+        for release in held {
+            release.send(()).unwrap();
+        }
+        let mut drains = Box::pin(futures_util::future::join_all(owners.into_iter().map(
+            |mut owner| async move {
+                let mut results = Vec::new();
+                while let Some(result) = owner.join_next().await {
+                    results.push(result.unwrap());
+                }
+                results
+            },
+        )));
+        for _ in super::EDGE_CALLBACK_DELIVERY_CAPACITY..40 {
+            let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut drains => panic!("all callbacks must enter the server"),
+                    event = arrivals.recv() => event.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            seen.insert(id);
+            release.send(()).unwrap();
+        }
+        let results = tokio::time::timeout(std::time::Duration::from_secs(10), drains)
+            .await
+            .unwrap();
+        assert!(results.iter().all(|results| results.len() == 8));
+        assert!(
+            results
+                .into_iter()
+                .flatten()
+                .all(|result| result.1.0.is_ok())
+        );
+        assert_eq!(seen.len(), 40);
+        assert!(!seen.contains("must-expire"));
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            super::EDGE_CALLBACK_DELIVERY_CAPACITY
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_still_attempts_already_completed_result() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let target = super::EdgeCallbackTarget {
+            api: fixture.api.clone(),
+            token: "tok".into(),
+            executor_id: "edge-test".into(),
+            owner: None,
+            cancel: Some(cancel.clone()),
+            status_tx: None,
+            status_reported: None,
+        };
+        let mut callbacks = super::ParallelCallbacks::new(
+            target,
+            std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path())),
+        );
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        for _ in 0..super::EDGE_CALLBACK_STREAM_WINDOW {
+            let release = release.clone();
+            callbacks.tasks.spawn(async move {
+                release.notified().await;
+                ("run".into(), (Ok(Value::Null), None), "held".into())
+            });
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: "completed".into(),
+                edge_agent_id: "edge-test".into(),
+                status: "completed".into(),
+                output: "already executed".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        callbacks.enqueue(queued_test_callback("read_file", body, deadline));
+        cancel.cancel();
+        assert!(
+            callbacks.try_join_next().is_none(),
+            "cancellation alone must not discard the queued result"
+        );
+        release.notify_one();
+        assert_eq!(callbacks.join_next().await.unwrap().unwrap().2, "held");
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), callbacks.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(delivered.2, "completed");
+        assert!(delivered.1.0.is_ok());
+        assert_eq!(
+            fixture.callbacks.received_requests().await.unwrap().len(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn callback_warning_pipe_is_nonblocking() {
+        const CHILD_MODE: &str = "ASTRA_TEST_CALLBACK_WARNING_PIPE";
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            // SAFETY: these fcntl calls operate only on this isolated child
+            // process's stderr and restore its original flags before testing.
+            let original = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) };
+            assert!(original >= 0);
+            if mode == "full" {
+                // SAFETY: stderr belongs to this subprocess and the flags are restored.
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(
+                            libc::STDERR_FILENO,
+                            libc::F_SETFL,
+                            original | libc::O_NONBLOCK,
+                        )
+                    },
+                    0
+                );
+                let bytes = [120_u8; 8192];
+                loop {
+                    // SAFETY: bytes is valid for the duration of this call.
+                    let written = unsafe {
+                        libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len())
+                    };
+                    if written < 0 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().kind(),
+                            std::io::ErrorKind::WouldBlock
+                        );
+                        break;
+                    }
+                }
+                // SAFETY: restore the descriptor flags saved above.
+                assert_eq!(
+                    unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, original) },
+                    0
+                );
+            }
+            let written = crate::cli::stream::output_sink::try_write_stderr_line(
+                "callback warning before settlement",
+            );
+            assert_eq!(written, mode == "free");
+            // SAFETY: F_GETFL reads the current descriptor flags without mutation.
+            assert_eq!(
+                unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) },
+                original
+            );
+            return;
+        }
+        for mode in ["free", "full"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::stream::stream_render::tests::callback_warning_pipe_is_nonblocking",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("warning blocked on {mode} stderr pipe");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "warning child failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            if mode == "free" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("callback warning before settlement")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fanout_completion_accepts_canonical_nonexecution_fact() {
+        let fields = serde_json::json!({"execution_fact": "not_executed"});
+        assert!(super::tool_completion_is_authoritative_with_fields(
+            "agent_fanout",
+            "Error: rejected",
+            fields.as_object(),
+        ));
+        let conflict = serde_json::json!({"executed": true, "execution_fact": "not_executed"});
+        assert!(!super::tool_completion_is_authoritative_with_fields(
+            "agent_fanout",
+            "Error: rejected",
+            conflict.as_object(),
+        ));
+        let malformed = serde_json::json!({"executed": "false", "execution_fact": "not_executed"});
+        assert!(!super::tool_completion_is_authoritative_with_fields(
+            "agent_fanout",
+            "Error: rejected",
+            malformed.as_object(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_callback_progresses_while_observer_is_backpressured() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let (callback_tx, mut callbacks) = tokio::sync::mpsc::unbounded_channel();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let id = body["request_id"].as_str().unwrap().to_owned();
+                callback_tx.send(id.clone()).unwrap();
+                if id == "first" {
+                    ResponseTemplate::new(403)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+                }
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.stream_event_tx = Some(tx.clone());
+        host.last_bound_run_id = Some("root".into());
+        tx.try_send(chat_stream::StreamEvent::SystemWarning("occupy".into()))
+            .unwrap();
+        let mut requests = vec![
+            parallel_batch_request(
+                "owner",
+                "first",
+                "write_file",
+                serde_json::json!({
+                    "path": "must-not-exist-first", "content": "x", "transaction_id": "tx"
+                }),
+            ),
+            parallel_batch_request(
+                "owner",
+                "fanout",
+                "agent_fanout",
+                serde_json::json!({"action": "start", "agents": []}),
+            ),
+            parallel_batch_request(
+                "owner",
+                "second",
+                "write_file",
+                serde_json::json!({
+                    "path": "must-not-exist-second", "content": "y"
+                }),
+            ),
+        ];
+        for request in &mut requests {
+            request.run_id = "root".into();
+        }
+        let mut batch = Box::pin(host.execute_tools_batch(requests));
+        let mut delivered = std::collections::HashSet::new();
+        while delivered.len() < 3 {
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    id = callbacks.recv() => id.unwrap(),
+                    _ = &mut batch => panic!("completion must wait for the live observer"),
+                }
+            })
+            .await
+            .expect("every rejection callback must post while the observer remains full");
+            delivered.insert(id);
+        }
+        assert!(
+            delivered.contains("first")
+                && delivered.contains("fanout")
+                && delivered.contains("second")
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "internal failure must not cancel pending completion events"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::SystemWarning(_))
+        ));
+        let mut finished = None;
+        let mut completed = Vec::new();
+        while completed.len() < 3 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    event = rx.recv() => if let Some(chat_stream::StreamEvent::ToolCompleted { tool_use_id, .. }) = event { completed.push(tool_use_id); },
+                    result = &mut batch, if finished.is_none() => finished = Some(result),
+                }
+            }).await.expect("all rejection events must reach the resumed observer");
+        }
+        assert_eq!(completed, ["first", "fanout", "second"]);
+        let results = match finished {
+            Some(results) => results,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), &mut batch)
+                .await
+                .unwrap(),
+        };
+        drop(batch);
+        assert_eq!(results.len(), 3);
+        for result in results {
+            assert_eq!(result.status, "failed");
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["execution_fact"],
+                "not_executed"
+            );
+        }
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            host.callback_failure.as_ref().unwrap().kind,
+            astra_core::ErrorKind::Unknown
+        );
+        assert!(!workspace.path().join("must-not-exist-first").exists());
+        assert!(!workspace.path().join("must-not-exist-second").exists());
+    }
+
+    #[tokio::test]
+    async fn single_result_callback_progresses_while_observer_is_backpressured() {
+        for status in [200, 403] {
+            let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+            let callback_arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+            let signal = callback_arrived.clone();
+            Mock::given(method("POST"))
+                .and(path("/tools/result"))
+                .respond_with(move |_: &wiremock::Request| {
+                    signal.notify_one();
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"ok": status == 200}))
+                })
+                .with_priority(1)
+                .mount(&fixture.callbacks)
+                .await;
+            let workspace = tempdir().unwrap();
+            let mut cache = EdgeToolCache::new(8);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            host.stream_event_tx = Some(tx.clone());
+            host.last_bound_run_id = Some("root".into());
+            let mut request = parallel_recall("owner", "single");
+            request.run_id = "root".into();
+            let mut batch = Box::pin(host.execute_tools_batch(vec![request]));
+            let mut started = false;
+            let mut release = None;
+            while !started || release.is_none() {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::select! {
+                        _ = &mut batch => panic!("tool must start"),
+                        event = rx.recv(), if !started => started = matches!(event, Some(chat_stream::StreamEvent::ToolStarted { .. })),
+                        arrival = arrivals.recv(), if release.is_none() => release = Some(arrival.unwrap().1),
+                    }
+                }).await.unwrap();
+            }
+            tx.try_send(chat_stream::StreamEvent::SystemWarning("occupy".into()))
+                .unwrap();
+            release.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = callback_arrived.notified() => {},
+                    _ = &mut batch => panic!("completion must wait for the live observer"),
+                }
+            })
+            .await
+            .expect("callback must post while the observer remains full");
+            assert!(
+                !cancel.is_cancelled(),
+                "internal failure must not cancel the pending event"
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(chat_stream::StreamEvent::SystemWarning(_))
+            ));
+            let mut finished = None;
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        event = rx.recv() => if let Some(chat_stream::StreamEvent::ToolCompleted {tool_use_id, ..}) = event {
+                            break tool_use_id;
+                        },
+                        result = &mut batch, if finished.is_none() => finished = Some(result),
+                    }
+                }
+            }).await.expect("completed fact must reach the resumed observer");
+            assert_eq!(completed, "single");
+            let results = match finished {
+                Some(results) => results,
+                None => tokio::time::timeout(std::time::Duration::from_secs(5), &mut batch)
+                    .await
+                    .unwrap(),
+            };
+            drop(batch);
+            assert_eq!(results.len(), 1);
+            if status == 403 {
+                assert_eq!(
+                    host.callback_failure.as_ref().unwrap().kind,
+                    astra_core::ErrorKind::Unknown
+                );
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(host.callback_failure.is_none());
+                assert!(!cancel.is_cancelled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_callback_preserves_completions_for_backpressured_observer() {
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["request_id"] == "one" {
+                    ResponseTemplate::new(403)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+                }
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.stream_event_tx = Some(tx.clone());
+        host.last_bound_run_id = Some("root".into());
+        let mut requests = vec![
+            parallel_recall("owner", "one"),
+            parallel_recall("owner", "two"),
+        ];
+        for request in &mut requests {
+            request.run_id = "root".into();
+        }
+        let mut batch = Box::pin(host.execute_tools_batch(requests));
+        let mut started = 0;
+        let mut releases = Vec::new();
+        while started < 2 || releases.len() < 2 {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("tools must be running"),
+                    event = rx.recv(), if started < 2 => {
+                        if matches!(event, Some(chat_stream::StreamEvent::ToolStarted { .. })) { started += 1; }
+                    },
+                    arrival = arrivals.recv(), if releases.len() < 2 => releases.push(arrival.unwrap().1),
+                }
+            }).await.unwrap();
+        }
+        tx.try_send(chat_stream::StreamEvent::SystemWarning("occupy".into()))
+            .unwrap();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut batch)
+                .await
+                .is_err(),
+            "completion must wait for the live observer, not be dropped on internal failure"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::SystemWarning(_))
+        ));
+        let mut completed = Vec::new();
+        let mut finished = None;
+        while completed.len() < 2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    event = rx.recv() => if let Some(chat_stream::StreamEvent::ToolCompleted {tool_use_id, ..}) = event {
+                        completed.push(tool_use_id);
+                    },
+                    result = &mut batch, if finished.is_none() => finished = Some(result),
+                }
+            }).await.expect("all completion events must be delivered");
+        }
+        assert_eq!(completed, ["one", "two"]);
+        let results = match finished {
+            Some(results) => results,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), &mut batch)
+                .await
+                .unwrap(),
+        };
+        drop(batch);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            host.callback_failure.as_ref().unwrap().kind,
+            astra_core::ErrorKind::Unknown
+        );
+        assert!(cancel.is_cancelled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tool_callback_failure_settles_with_full_stderr() {
+        const CHILD: &str = "ASTRA_TEST_PARALLEL_FULL_STDERR";
+        if std::env::var_os(CHILD).is_none() {
+            for mode in ["parallel-pipe", "parallel-pty", "single-pipe", "single-pty"] {
+                let (stderr, keepalive) = if mode.ends_with("pty") {
+                    let pty = nix::pty::openpty(None, None).unwrap();
+                    (std::process::Stdio::from(pty.slave), Some(pty.master))
+                } else {
+                    (std::process::Stdio::piped(), None)
+                };
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "cli::stream::stream_render::tests::tool_callback_failure_settles_with_full_stderr", "--nocapture"])
+                    .env(CHILD, mode)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(stderr)
+                    .spawn().unwrap();
+                let started = std::time::Instant::now();
+                loop {
+                    if child.try_wait().unwrap().is_some() {
+                        break;
+                    }
+                    if started.elapsed() > std::time::Duration::from_secs(20) {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("parallel settlement blocked on full {mode} stderr");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let output = child.wait_with_output().unwrap();
+                drop(keepalive);
+                assert!(
+                    output.status.success(),
+                    "{mode} child failed: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        use std::io::IsTerminal;
+        let mode = std::env::var(CHILD).unwrap();
+        assert_eq!(std::io::stderr().is_terminal(), mode.ends_with("pty"));
+        let count = if mode.starts_with("single") { 1 } else { 6 };
+
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["request_id"] == "tool-0" {
+                    ResponseTemplate::new(403)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+                }
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        host.edge.shared.render_policy = RenderPolicy::Stream;
+        host.render().md = Some(streaming_md::StreamingMarkdown::new(80));
+        let requests: Vec<_> = (0..count)
+            .map(|i| parallel_recall("stderr", &format!("tool-{i}")))
+            .collect();
+        for request in &requests {
+            host.on_server_tool_surface_admission(request).unwrap();
+        }
+        let mut batch = Box::pin(host.execute_tools_batch(requests));
+        let mut releases = Vec::new();
+        for _ in 0..count {
+            let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("every tool must start before the pipe fills"),
+                    arrival = arrivals.recv() => arrival.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            releases.push(release);
+        }
+        // SAFETY: stderr is this subprocess's pipe and flags are restored below.
+        let flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let bytes = [120_u8; 8192];
+        loop {
+            // SAFETY: bytes is valid and stderr belongs to this subprocess.
+            if unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) } < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+        // SAFETY: restore the saved descriptor flags.
+        assert_eq!(
+            unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags) },
+            0
+        );
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let results = tokio::time::timeout(std::time::Duration::from_secs(10), batch)
+            .await
+            .expect("every started result and callback must settle");
+        assert_eq!(results.len(), count);
+        let failure = host
+            .callback_failure
+            .as_ref()
+            .expect("typed callback failure");
+        assert_eq!(failure.kind, astra_core::ErrorKind::Unknown);
+        assert!(failure.message.contains("tool-0"));
+        assert_eq!(
+            fixture.callbacks.received_requests().await.unwrap().len(),
+            count
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_failure_settles_with_a_full_stderr_pipe() {
+        use std::io::{Read, Write};
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[120; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill stderr: {error}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        let stderr: OwnedFd = writer.into();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli::stream::stream_render::tests::edge_callback_rejections_stop_physical_stream_without_reposting", "--nocapture"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::from(stderr)).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let exit = loop {
+            if let Some(exit) = child.try_wait().unwrap() {
+                break exit;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("callback settlement blocked on stderr");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        drop(reader);
+        assert!(exit.success(), "child test failed: {output}");
+        assert!(
+            output.contains("1 passed"),
+            "the intended callback test must run: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn callback_task_panic_retains_identity_and_acknowledgement_fact() {
         #[derive(Debug)]
@@ -16394,9 +17454,11 @@ mod tests {
         target.spawn_result(
             &mut tasks,
             executor,
-            "read_file".into(),
-            body,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            queued_test_callback(
+                "read_file",
+                body,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
         );
         let (run_id, result, request_id) = tasks.join_next().await.unwrap().unwrap();
         assert_eq!(run_id, "child-run");
@@ -16457,21 +17519,23 @@ mod tests {
             target.spawn_result(
                 &mut tasks,
                 host.executor.clone(),
-                "bash".to_string(),
-                astra_thin_client::ToolResultRequest::new_with_hash(
-                    astra_thin_client::ToolResultRequestParts {
-                        session_id: "session".into(),
-                        run_id: "run".into(),
-                        turn_chain_id: "turn".into(),
-                        request_id: id.into(),
-                        edge_agent_id: "edge-test".into(),
-                        status: "completed".into(),
-                        output: format!("{id} executed"),
-                        duration_ms: 1,
-                        tool_result_fields: None,
-                    },
+                queued_test_callback(
+                    "bash",
+                    astra_thin_client::ToolResultRequest::new_with_hash(
+                        astra_thin_client::ToolResultRequestParts {
+                            session_id: "session".into(),
+                            run_id: "run".into(),
+                            turn_chain_id: "turn".into(),
+                            request_id: id.into(),
+                            edge_agent_id: "edge-test".into(),
+                            status: "completed".into(),
+                            output: format!("{id} executed"),
+                            duration_ms: 1,
+                            tool_result_fields: None,
+                        },
+                    ),
+                    deadline,
                 ),
-                deadline,
             );
         }
         while let Some(result) = tasks.join_next().await {
@@ -16517,21 +17581,23 @@ mod tests {
             target.spawn_result(
                 &mut tasks,
                 host.executor.clone(),
-                "read_file".into(),
-                astra_thin_client::ToolResultRequest::new_with_hash(
-                    astra_thin_client::ToolResultRequestParts {
-                        session_id: "session".into(),
-                        run_id: "run".into(),
-                        turn_chain_id: "turn".into(),
-                        request_id: id.into(),
-                        edge_agent_id: "edge-test".into(),
-                        status: "completed".into(),
-                        output: id.into(),
-                        duration_ms: 1,
-                        tool_result_fields: None,
-                    },
+                queued_test_callback(
+                    "read_file",
+                    astra_thin_client::ToolResultRequest::new_with_hash(
+                        astra_thin_client::ToolResultRequestParts {
+                            session_id: "session".into(),
+                            run_id: "run".into(),
+                            turn_chain_id: "turn".into(),
+                            request_id: id.into(),
+                            edge_agent_id: "edge-test".into(),
+                            status: "completed".into(),
+                            output: id.into(),
+                            duration_ms: 1,
+                            tool_result_fields: None,
+                        },
+                    ),
+                    deadline,
                 ),
-                deadline,
             );
             if id == "one" {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -16722,7 +17788,6 @@ mod tests {
             !output.exists(),
             "identity failure must precede tool side effects"
         );
-        assert!(host.edge_tool_round.is_empty());
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
         assert!(cancel.is_cancelled());
@@ -16854,12 +17919,14 @@ mod tests {
             request.run_id = run.into();
             request.session_id = "sess-live".into();
             let error = host.on_server_tool_surface_admission(&request).unwrap_err();
-            host.on_tool_result(&request.rejected_result(&request.args, error));
+            host.on_tool_result(
+                &request.scoped_result(request.rejected_result(&request.args, error)),
+            );
         }
         assert_eq!(incremental_state.snapshot().tool_call_records.len(), 1);
         incremental_state.replace_tool_records(Vec::new());
         incremental_state.replace_tools_used(Vec::new());
-        host.on_tool_result(&EdgeToolExecResult {
+        let result = EdgeToolExecResult {
             work_attribution: None,
             execution_completion: None,
             request_id: "tool-1".to_string(),
@@ -16869,7 +17936,9 @@ mod tests {
             tool_result_fields: None,
             status: "completed".to_string(),
             duration_ms: 7,
-        });
+        };
+        let scoped = scoped_test_result(&host, &result);
+        host.on_tool_result(&scoped);
 
         let snap = incremental_state.snapshot();
         assert_eq!(snap.session_id.as_deref(), Some("sess-live"));
@@ -20412,6 +21481,18 @@ mod tests {
             event_rx.try_recv().is_err(),
             "cache hit should emit exactly start and completion"
         );
+
+        // A cached result can end its preview inside a multi-byte character.
+        let args = serde_json::json!({"path": "cached.txt"});
+        let sig = tool_dedup_signature("read_file", &args);
+        host.tool_cache.output_cache.get_mut(&sig).unwrap().output =
+            format!("{}界", "x".repeat(199));
+        host.tool_cache.max_identical_calls = 1;
+        let mut request = parallel_batch_request("direct", "cache-limit", "read_file", args);
+        request.run_id = "cache-root".into();
+        let result = host.execute_tools_batch(vec![request]).await.remove(0);
+        assert!(result.output.contains("Cached repeat skipped"));
+        assert!(result.output.contains('界'));
     }
 
     #[serial_test::serial]
@@ -20691,46 +21772,6 @@ mod tests {
             "{}",
             result.output
         );
-    }
-
-    #[test]
-    fn test_merge_edge_tool_rounds() {
-        let consumed = vec![EdgeToolExecResult {
-            work_attribution: None,
-            execution_completion: None,
-            request_id: "call-exit".to_string(),
-            tool: "exit_plan_mode".to_string(),
-            args: serde_json::json!({"approved": true}),
-            output: "Exited plan mode; user approved. Next turn will run in auto mode.".to_string(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 12,
-        }];
-
-        // recovers missing host result
-        let merged = merge_edge_tool_rounds(Vec::new(), &consumed);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].request_id, consumed[0].request_id);
-        assert_eq!(merged[0].tool, consumed[0].tool);
-        assert_eq!(merged[0].output, consumed[0].output);
-        assert_eq!(merged[0].status, consumed[0].status);
-
-        // deduplicates by request_id (host wins)
-        let host = vec![EdgeToolExecResult {
-            work_attribution: None,
-            execution_completion: None,
-            request_id: "call-exit".to_string(),
-            tool: "exit_plan_mode".to_string(),
-            args: serde_json::json!({"approved": true}),
-            output: "host output".to_string(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 8,
-        }];
-        let merged = merge_edge_tool_rounds(host.clone(), &consumed);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].request_id, host[0].request_id);
-        assert_eq!(merged[0].output, host[0].output);
     }
 
     // ── sync_incremental_accum / sync_incremental_tool_result ──────────
