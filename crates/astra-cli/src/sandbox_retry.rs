@@ -23,15 +23,13 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone)]
 pub(crate) struct ExplicitPathPreflightTarget {
     pub(crate) tool: String,
-    pub(crate) args: Value,
     pub(crate) path: String,
 }
 
 impl ExplicitPathPreflightTarget {
-    fn new(tool: impl Into<String>, args: Value, path: impl Into<String>) -> Self {
+    fn new(tool: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
             tool: tool.into(),
-            args,
             path: path.into(),
         }
     }
@@ -125,11 +123,7 @@ pub(crate) fn explicit_file_tool_path_targets(
 ) -> Vec<ExplicitPathPreflightTarget> {
     let mut targets = Vec::new();
     for path in explicit_file_tool_path_args(tool, args) {
-        targets.push(ExplicitPathPreflightTarget::new(
-            tool,
-            args.clone(),
-            path.into_owned(),
-        ));
+        targets.push(ExplicitPathPreflightTarget::new(tool, path.into_owned()));
     }
     if tool == "agent" && args.get("action").and_then(Value::as_str) == Some("run_chain") {
         targets.extend(agent_run_chain_explicit_path_targets(args));
@@ -163,9 +157,7 @@ fn agent_run_chain_explicit_path_targets(args: &Value) -> Vec<ExplicitPathPrefli
                 .collect::<Vec<_>>();
             paths
                 .into_iter()
-                .map(move |path| {
-                    ExplicitPathPreflightTarget::new(tool.clone(), resolved_args.clone(), path)
-                })
+                .map(move |path| ExplicitPathPreflightTarget::new(tool.clone(), path))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -372,7 +364,7 @@ fn quoted_segment_is_sensitive_path(segment: &str) -> bool {
     path.is_absolute() && astra_sandbox::is_sensitive_path(&path)
 }
 
-fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> {
+pub(crate) fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> {
     let token = trim_shell_path_token(pathish);
     if pathish_has_forbidden_segment(token) {
         return None;

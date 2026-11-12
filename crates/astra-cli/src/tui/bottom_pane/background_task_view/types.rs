@@ -129,6 +129,9 @@ pub(crate) struct BackgroundTaskRow {
     pub id: String,
     pub kind: BackgroundTaskKind,
     pub status: BackgroundTaskStatus,
+    /// Projection of the task owner's terminal-delivery and cleanup facts.
+    pub needs_attention: bool,
+    pub outcome_unsettled: bool,
     pub live_control: LiveControlState,
     pub elapsed_ms: u64,
     pub no_recent_output_ms: Option<u64>,
@@ -205,6 +208,8 @@ impl BackgroundTaskRow {
             id: init.id,
             kind: init.kind,
             status: init.status,
+            needs_attention: true,
+            outcome_unsettled: false,
             live_control: LiveControlState::Available,
             elapsed_ms: init.elapsed_ms,
             no_recent_output_ms: None,
@@ -242,6 +247,16 @@ impl BackgroundTaskRow {
 
     pub(crate) fn with_input_available(mut self, available: bool) -> Self {
         self.input_available = available;
+        self
+    }
+
+    pub(crate) fn with_terminal_attention(
+        mut self,
+        needs_attention: bool,
+        unsettled: bool,
+    ) -> Self {
+        self.needs_attention = needs_attention;
+        self.outcome_unsettled = unsettled;
         self
     }
 

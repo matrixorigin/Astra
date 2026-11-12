@@ -166,7 +166,9 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
             eprintln!("  ⚠ failed to append session start event: {error}");
             record_session_persistence_error(state, "failed to append session start event");
         }
-        super::session_side_effects::enqueue_ingestion_pub(state, &start_event);
+        super::session_side_effects::schedule_journal_ingestion(
+            state.journal.as_ref().expect("checked journal presence"),
+        );
 
         use astra_config::config_versions::ConfigVersionStore;
         if let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root() {
@@ -190,7 +192,9 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
                 {
                     eprintln!("  ⚠ failed to append config version change event: {error}");
                 }
-                super::session_side_effects::enqueue_ingestion_pub(state, &ev);
+                super::session_side_effects::schedule_journal_ingestion(
+                    state.journal.as_ref().expect("checked journal presence"),
+                );
                 state.config_version_id = Some(id.as_str().to_string());
             }
         }

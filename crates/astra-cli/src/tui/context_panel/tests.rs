@@ -89,6 +89,14 @@ fn session_read_activity_counts_execution_and_repeat_evidence_without_parsing_ou
     assert_eq!(summary.requests_with_exact_identity, 3);
     assert_eq!(summary.exact_repeat_requests, 1);
     assert_eq!(summary.repeats_after_recorded_compaction, 1);
+
+    let unknown = JournalEvent::turn(Some("session"), 5, None, "read", "done", 1, 0, 0, 0)
+        .with_tool_calls(vec![read(ToolCallDisposition::Unknown, None)]);
+    let summary = summarize_session_read_activity(&[unknown]);
+    assert_eq!(
+        (summary.requested, summary.executed, summary.unknown_start),
+        (1, 0, 1)
+    );
 }
 
 // ─── from_trace ───────────────────────────────────────────────────

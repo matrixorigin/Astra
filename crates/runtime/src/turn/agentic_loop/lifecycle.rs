@@ -528,7 +528,7 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed())
+        .filter(|record| record.was_executed() && !record.outcome_is_unknown())
         .count()
         .min(u32::MAX as usize) as u32
 }
@@ -542,13 +542,13 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed())
+        .filter(|record| record.was_executed() && !record.outcome_is_unknown())
         .count();
     let failed = state
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed() && !record.ok)
+        .filter(|record| record.was_executed() && !record.ok && !record.outcome_is_unknown())
         .count();
     let rejected = state
         .stall
@@ -559,6 +559,12 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
                 == astra_services::session_journal::ToolCallDisposition::Rejected
         })
         .count();
+    let unknown = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.outcome_is_unknown())
+        .count();
     let latest_failure = state
         .stall
         .tool_call_records
@@ -566,6 +572,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         .rev()
         .find(|record| {
             (record.was_executed() && !record.ok)
+                || record.outcome_is_unknown()
                 || record.effective_disposition()
                     == astra_services::session_journal::ToolCallDisposition::Rejected
         })
@@ -574,6 +581,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
                 "tool": record.name,
                 "error_kind": record.error_kind.map(|kind| format!("{kind:?}")),
                 "disposition": format!("{:?}", record.effective_disposition()),
+                "outcome_unknown": record.outcome_is_unknown(),
             })
         });
 
@@ -581,6 +589,7 @@ fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
         "tool_calls_completed": executed,
         "tool_calls_failed": failed,
         "tool_calls_rejected": rejected,
+        "tool_calls_unknown": unknown,
         "latest_failure": latest_failure,
     })
 }
@@ -1212,7 +1221,7 @@ fn parallel_agent_budget_exhaustion_summary(
         " You can continue in the next message."
     };
     let mut lines = vec![format!(
-        "[The owner turn reached its execution boundary after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} terminated without a successful result; {} remain live.{}]",
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated without a result; {} remain live. Check each result to determine whether its work is complete.{}]",
         current_agentic_step(state),
         rollup.completed.len(),
         rollup.terminal_issues.len(),
@@ -1221,13 +1230,13 @@ fn parallel_agent_budget_exhaustion_summary(
     )];
     if !rollup.completed.is_empty() {
         lines.push(String::new());
-        lines.push("Completed sub-agent results:".to_string());
+        lines.push("Results from exited sub-agents:".to_string());
         for (idx, entry) in rollup.completed.iter().enumerate() {
             let detail = entry
                 .result
                 .as_deref()
                 .map(summarize_agent_tool_budget_result)
-                .unwrap_or_else(|| "completed; result was already observed".to_string());
+                .unwrap_or_else(|| "exited; result was already observed".to_string());
             lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
         }
     }
@@ -3233,6 +3242,27 @@ mod tests {
         assert_eq!(evidence["tool_calls_failed"], 1);
         assert_eq!(evidence["tool_calls_rejected"], 1);
         assert_eq!(evidence["latest_failure"]["tool"], "read_file");
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "write_file".into(),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Unknown),
+            error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+            ..Default::default()
+        });
+        let evidence = settlement_tool_outcome_evidence(&state);
+        assert_eq!(evidence["tool_calls_completed"], 1);
+        assert_eq!(evidence["tool_calls_unknown"], 1);
+        assert_eq!(evidence["latest_failure"]["tool"], "write_file");
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+            ..Default::default()
+        });
+        let evidence = settlement_tool_outcome_evidence(&state);
+        assert_eq!(evidence["tool_calls_completed"], 1);
+        assert_eq!(evidence["tool_calls_failed"], 1);
+        assert_eq!(evidence["tool_calls_unknown"], 2);
     }
 
     #[tokio::test]
@@ -4028,7 +4058,7 @@ mod tests {
         let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new())
             .expect("compacted completion summary");
         assert!(summary.contains(
-            "1 parallel sub-agent result(s) completed; 0 terminated without a successful result; 0 remain live."
+            "1 sub-agent(s) exited with a result; 0 terminated without a result; 0 remain live."
         ));
     }
 
@@ -4071,6 +4101,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(details.contains(&"parent cancelled this sub-agent"));
         assert!(details.contains(&"child exploded"));
+    }
+
+    #[test]
+    fn budget_exhaustion_does_not_claim_child_work_completed() {
+        let mut state = make_state();
+        state.remaining_turns = 0;
+        state.stall.tool_call_records = vec![agent_record(
+            "get_result",
+            json!({"agent_id":"agent-a"}),
+            Some(
+                json!({"status":"completed", "agent_id":"agent-a", "result":format!(
+                "Findings: {} Review incomplete; final lead unverified.", "x".repeat(400))}),
+            ),
+            None,
+        )];
+        let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new()).unwrap();
+        assert!(summary.contains("Check each result to determine whether its work is complete"));
+        assert!(summary.contains("Review incomplete; final lead unverified"));
+        assert!(summary.contains("Summary truncated"));
+        assert!(!summary.contains("Completed sub-agent results"));
     }
 
     #[test]

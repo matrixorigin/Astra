@@ -179,6 +179,7 @@ pub const AGENTS_EDGE_HEARTBEAT: &str = "/agents/edge/heartbeat";
 /// `POST/GET` — automation event facts (`agent_events`).
 pub const EVENTS: &str = "/events";
 pub const SYNC_OUTBOX_EVENTS: &str = "/sync/outbox/events";
+pub const SYNC_OUTBOX_EVENTS_RECONCILE: &str = "/sync/outbox/events/reconcile";
 
 #[inline]
 pub fn event(event_id: &str) -> String {

@@ -411,7 +411,9 @@ class NextIntegrationPrerequisitesTests(unittest.TestCase):
         condition = "if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'"
         self.assertEqual(setup.count(condition), 3)
         self.assertIn("node-version-file: .nvmrc", setup)
-        self.assertIn("working-directory: web\n        run: npm exec -- playwright install --with-deps chromium --only-shell", setup)
+        self.assertIn("working-directory: web", setup)
+        self.assertIn("run: npm exec -- playwright install chromium --only-shell", setup)
+        self.assertNotIn("--with-deps", setup)
         script = workflow_run_script(".github/workflows/test.yml", "Build Web for real Next integration")
         expected = [
             ["--prefix", "packages/sdk", "ci", "--ignore-scripts"],

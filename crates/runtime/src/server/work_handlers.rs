@@ -5255,6 +5255,7 @@ async fn attest_edge_workspace(
             dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
         )
         .await;
+        let mut recovered_result = None;
         let result_json = match admission {
             Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
@@ -5263,24 +5264,37 @@ async fn attest_edge_workspace(
                     WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS
                         .saturating_add(astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS),
                 );
-                let result = tokio::time::timeout(
+                match tokio::time::timeout(
                     wait_timeout,
                     dispatch.wait_result(&dispatch_identity, Some(wait_timeout)),
                 )
                 .await
-                .map_err(|_| "edge_attestation_no_result")?
-                .map_err(|_| "edge_attestation_dispatch_unavailable")?;
-                match result {
-                    Some(result) => result,
-                    None => {
-                        let _ = dispatch
-                            .fail_dispatch(
-                                &dispatch_identity,
-                                &record.edge_agent_id,
-                                "edge_attestation_timeout",
-                            )
-                            .await;
-                        return Err("edge_attestation_no_result");
+                {
+                    Ok(Ok(Some(result))) => result,
+                    Ok(Err(_)) => return Err("edge_attestation_dispatch_unavailable"),
+                    Ok(Ok(None)) | Err(_) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            dispatch.reconcile_timeout(&dispatch_identity, &record.edge_agent_id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Terminal(
+                                astra_services::multi_agent::edge_dispatch::EdgeDispatchTerminal::UnvalidatedToolResult(result),
+                            ))) => {
+                                recovered_result = Some(result);
+                                String::new()
+                            }
+                            Ok(Ok(_)) => return Err("edge_attestation_no_result"),
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "failed to expire an unclaimed Edge attestation");
+                                return Err("edge_attestation_no_result");
+                            }
+                            Err(_) => {
+                                tracing::warn!("timed out expiring an unclaimed Edge attestation");
+                                return Err("edge_attestation_no_result");
+                            }
+                        }
                     }
                 }
             }
@@ -5291,8 +5305,11 @@ async fn attest_edge_workspace(
                 return Err("edge_attestation_dispatch_outcome_unknown");
             }
         };
+        let result_json = recovered_result
+            .as_ref()
+            .map_or(result_json.as_str(), |result| result.json());
         let result: astra_thin_client::ToolResultRequest =
-            serde_json::from_str(&result_json).map_err(|_| "edge_attestation_result_invalid")?;
+            serde_json::from_str(result_json).map_err(|_| "edge_attestation_result_invalid")?;
         if result.session_id != identity.session_id
             || result.run_id != identity.run_id
             || result.turn_chain_id != identity.turn_chain_id
@@ -9325,6 +9342,102 @@ pub(super) async fn get_work_events_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn edge_attestation_does_not_hang_on_expiration_failure() {
+        use astra_services::multi_agent::{
+            EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity,
+            EdgeDispatchRow, EdgeDispatchService,
+        };
+        use std::sync::Arc;
+
+        struct Healthy;
+        #[async_trait::async_trait]
+        impl crate::app_state::HealthChecker for Healthy {
+            async fn database_healthy(&self) -> bool {
+                true
+            }
+        }
+        struct StalledExpiry;
+        #[async_trait::async_trait]
+        impl EdgeDispatchService for StalledExpiry {
+            async fn admit_dispatch(
+                &self,
+                _: &EdgeDispatchIdentity,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
+                Ok(EdgeDispatchAdmission::Pending)
+            }
+            async fn poll_pending(&self, _: &str, _: &str) -> Result<Vec<EdgeDispatchRow>, String> {
+                Ok(Vec::new())
+            }
+            async fn deliver_result(
+                &self,
+                _: &EdgeDispatchIdentity,
+                _: &str,
+                _: &str,
+            ) -> Result<bool, String> {
+                Ok(false)
+            }
+            async fn fail_dispatch(
+                &self,
+                _: &EdgeDispatchIdentity,
+                _: &str,
+                _: &str,
+            ) -> Result<bool, String> {
+                Ok(false)
+            }
+            async fn wait_result(
+                &self,
+                _: &EdgeDispatchIdentity,
+                _: Option<std::time::Duration>,
+            ) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn reconcile_timeout(
+                &self,
+                _: &EdgeDispatchIdentity,
+                _: &str,
+            ) -> Result<astra_services::multi_agent::edge_dispatch::TimeoutReconciliation, String>
+            {
+                std::future::pending().await
+            }
+            async fn cleanup_stale(&self, _: std::time::Duration) -> Result<u64, String> {
+                Ok(0)
+            }
+        }
+        let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy))
+            .with_edge_dispatch_service(Arc::new(StalledExpiry));
+        let record = astra_services::multi_agent::EdgeAgentRecord {
+            registry_id: "registry".into(),
+            user_id: "user".into(),
+            edge_agent_id: "edge".into(),
+            edge_id: "edge".into(),
+            hostname: None,
+            worktree_path: Some("/workspace".into()),
+            capabilities: None,
+            workspace_id: None,
+            materialization_id: Some("materialization".into()),
+            registered_at: String::new(),
+            last_heartbeat_at: String::new(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            attest_edge_workspace(
+                &state,
+                &record,
+                "session",
+                "operation",
+                1,
+                "preflight",
+                "nonce",
+            ),
+        )
+        .await
+        .expect("expiration must not hang the request");
+        assert_eq!(result.unwrap_err(), "edge_attestation_no_result");
+    }
 
     #[test]
     fn execution_identity_is_session_stable_and_directory_scoped() {

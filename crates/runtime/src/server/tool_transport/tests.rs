@@ -119,8 +119,17 @@ struct StaticEdgeDispatch {
     return_result: bool,
     result_status: &'static str,
     terminal_admission_result: Option<String>,
+    wait_result_override: Option<String>,
+    timeout_server_receipt:
+        Option<astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
     wait_error: bool,
+    cancel_on_empty_wait: Option<Arc<CancellationToken>>,
+    expire_hangs: bool,
+    completed_after_timeout: bool,
+    inspection_reads: AtomicUsize,
+    corrupt_recovered_hash: bool,
+    recovered_wrong_edge: bool,
     direct_claimed: AtomicBool,
     receipt_result: Result<bool, &'static str>,
     fail_result: Result<bool, &'static str>,
@@ -137,8 +146,16 @@ impl Default for StaticEdgeDispatch {
             return_result: true,
             result_status: "completed",
             terminal_admission_result: None,
+            wait_result_override: None,
+            timeout_server_receipt: None,
             admission_error: None,
             wait_error: false,
+            cancel_on_empty_wait: None,
+            expire_hangs: false,
+            completed_after_timeout: false,
+            inspection_reads: AtomicUsize::new(0),
+            corrupt_recovered_hash: false,
+            recovered_wrong_edge: false,
             direct_claimed: AtomicBool::new(false),
             receipt_result: Ok(true),
             fail_result: Ok(true),
@@ -317,6 +334,68 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         self.fail_result.map_err(str::to_owned)
     }
 
+    async fn reconcile_timeout(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<astra_services::multi_agent::edge_dispatch::TimeoutReconciliation, String> {
+        use astra_services::multi_agent::edge_dispatch::{
+            EdgeDispatchTerminal, TimeoutReconciliation, UnvalidatedEdgeResult,
+        };
+        if self.expire_hangs {
+            return std::future::pending().await;
+        }
+        if let Some(kind) = self.timeout_server_receipt {
+            return Ok(TimeoutReconciliation::Terminal(
+                EdgeDispatchTerminal::ServerReceipt(
+                    astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt {
+                        kind,
+                        identity: identity.clone(),
+                        edge_agent_id: edge_agent_id.into(),
+                    },
+                ),
+            ));
+        }
+        self.failed_dispatches
+            .lock()
+            .expect("failed dispatches lock")
+            .push((identity.request_id.clone(), "expired".to_string()));
+        if self.fail_result.map_err(str::to_owned)? {
+            return Ok(TimeoutReconciliation::ExpiredBeforeClaim);
+        }
+        self.inspection_reads.fetch_add(1, Ordering::SeqCst);
+        if !self.completed_after_timeout {
+            return Ok(TimeoutReconciliation::Unknown);
+        }
+        let mut result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: if self.recovered_wrong_edge {
+                    "other-edge"
+                } else {
+                    "edge-selected"
+                }
+                .into(),
+                status: self.result_status.into(),
+                output: "late-result".into(),
+                duration_ms: 12,
+                tool_result_fields: None,
+            },
+        );
+        if self.corrupt_recovered_hash {
+            result.result_hash = "invalid".into();
+        }
+        let body = serde_json::to_string(&result).map_err(|error| error.to_string())?;
+        Ok(UnvalidatedEdgeResult::try_new(body)
+            .map(|result| {
+                TimeoutReconciliation::Terminal(EdgeDispatchTerminal::UnvalidatedToolResult(result))
+            })
+            .unwrap_or(TimeoutReconciliation::Unknown))
+    }
+
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
@@ -325,7 +404,13 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         if self.wait_error {
             return Err("database observation failed".into());
         }
+        if let Some(result) = &self.wait_result_override {
+            return Ok(Some(result.clone()));
+        }
         if !self.return_result {
+            if let Some(cancel) = &self.cancel_on_empty_wait {
+                cancel.cancel();
+            }
             return Ok(None);
         }
         let result = astra_thin_client::ToolResultRequest::new_with_hash(
@@ -3617,6 +3702,8 @@ async fn edge_dispatch_result_reports_edge_ledger_transport() {
     assert_eq!(metadata["executor"]["executor_id"], "edge-selected");
     assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
     assert_eq!(local.calls(), 0);
+    assert_eq!(dispatch.inspection_reads.load(Ordering::SeqCst), 0);
+    assert!(dispatch.failed_dispatches.lock().unwrap().is_empty());
     assert_eq!(
         *dispatch
             .inserted_edge_agent_ids
@@ -3980,6 +4067,9 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
     );
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(metadata["retryable"], false);
+    assert!(!metadata.contains_key("execution_started"));
+    assert!(!metadata.contains_key("runtime_error"));
     assert!(result.output.contains("reconcile its durable invocation"));
     assert!(result.output.contains("database connection failed"));
     assert_eq!(
@@ -4003,7 +4093,10 @@ async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
 
 #[tokio::test]
 async fn edge_dispatch_without_result_reports_transport_disconnected() {
-    let dispatch = Arc::new(StaticEdgeDispatch::no_result());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        fail_result: Ok(false),
+        ..StaticEdgeDispatch::no_result()
+    });
     let _local = CountingLocalTransport::new();
 
     let service = ToolExecutionService::builder()
@@ -4049,7 +4142,7 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         metadata["reason"],
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED
     );
-    assert_eq!(metadata["blocked"], true);
+    assert!(!metadata.contains_key("blocked"));
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["outcome_certainty"], "unknown");
     assert!(result.output.contains("reconcile its durable invocation"));
@@ -4069,6 +4162,265 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         .expect("failed dispatches lock");
     assert_eq!(failed_dispatches.len(), 1);
     assert_eq!(failed_dispatches[0].1, "expired");
+}
+
+#[tokio::test]
+async fn edge_dispatch_expiry_race_returns_the_committed_result_once() {
+    for (status, corrupt_hash, wrong_edge) in [
+        ("completed", false, false),
+        ("failed", false, false),
+        ("completed", true, false),
+        ("completed", false, true),
+    ] {
+        let dispatch = Arc::new(StaticEdgeDispatch {
+            completed_after_timeout: true,
+            fail_result: Ok(false),
+            result_status: status,
+            corrupt_recovered_hash: corrupt_hash,
+            recovered_wrong_edge: wrong_edge,
+            ..StaticEdgeDispatch::no_result()
+        });
+        let service = ToolExecutionService::builder()
+            .edge_dispatch_service(dispatch.clone())
+            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+                agents: vec![edge_agent_record("edge-selected")],
+            }))
+            .build();
+        let local = CountingLocalTransport::new();
+        let result = service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        ExecutorStatus::Online,
+                    ),
+                ),
+                &local,
+            )
+            .await;
+        if corrupt_hash || wrong_edge {
+            assert!(result.is_error);
+            assert_eq!(result.metadata.unwrap()["outcome_certainty"], "unknown");
+        } else {
+            assert_eq!(result.output, "late-result");
+            assert_eq!(result.is_error, status == "failed");
+        }
+        assert_eq!(dispatch.inspection_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            local.calls(),
+            0,
+            "recovery must never execute the tool again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn edge_dispatch_timeout_racing_cancellation_still_expires_the_pending_relay() {
+    let cancel = Arc::new(CancellationToken::new());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        cancel_on_empty_wait: Some(cancel.clone()),
+        ..StaticEdgeDispatch::no_result()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute_with_cancel(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+            Some(cancel),
+        )
+        .await;
+    assert!(result.is_error);
+    assert_eq!(dispatch.failed_dispatches.lock().unwrap()[0].1, "expired");
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn edge_dispatch_timeout_reports_unclaimed_relay_without_claiming_global_nonexecution() {
+    let dispatch = Arc::new(StaticEdgeDispatch::no_result());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch)
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(
+        result
+            .output
+            .contains("before this Edge relay request was claimed")
+    );
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["error_kind"], "tool_timeout");
+    assert_eq!(metadata["dispatch_fact"], "expired_before_claim");
+    assert_eq!(metadata["execution_fact"], "unknown");
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert!(!metadata.contains_key("execution_started"));
+    assert!(!metadata.contains_key("runtime_error"));
+    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
+    assert!(!metadata.contains_key("blocked"));
+    assert_eq!(
+        astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+            metadata.get("disposition"),
+            metadata.get("execution_started").and_then(Value::as_bool),
+            astra_tools::execution_outcome::outcome_is_unknown(Some(&metadata)),
+            astra_services::session_journal::ToolCallDisposition::Executed,
+        ),
+        astra_services::session_journal::ToolCallDisposition::Unknown
+    );
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result() {
+    use astra_services::multi_agent::edge_dispatch::{
+        EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
+    };
+    for lane in ["admission", "wait", "timeout"] {
+        let request = request(
+            "bash",
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+        let receipt = EdgeDispatchServerReceipt {
+            kind: EdgeDispatchServerReceiptKind::Cancelled,
+            identity: EdgeDispatchIdentity::new(
+                "user-1",
+                "session-1",
+                "run-1",
+                "chain-1",
+                plan.dispatch_request_id(),
+            ),
+            edge_agent_id: "edge-selected".into(),
+        };
+        let body = serde_json::to_string(&receipt).unwrap();
+        let dispatch = Arc::new(StaticEdgeDispatch {
+            terminal_admission_result: (lane == "admission").then(|| body.clone()),
+            wait_result_override: (lane == "wait").then(|| body.clone()),
+            timeout_server_receipt: (lane == "timeout")
+                .then_some(EdgeDispatchServerReceiptKind::Cancelled),
+            ..StaticEdgeDispatch::no_result()
+        });
+        let service = ToolExecutionService::builder()
+            .edge_dispatch_service(dispatch)
+            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+                agents: vec![edge_agent_record("edge-selected")],
+            }))
+            .build();
+        let local = CountingLocalTransport::new();
+        let result = service.execute(request, &local).await;
+        assert!(result.is_error, "{lane}");
+        assert!(
+            result
+                .output
+                .contains("was cancelled before this Edge relay request was claimed"),
+            "{lane}: {}",
+            result.output
+        );
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["dispatch_fact"], "cancelled_before_claim");
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+        assert!(!fields.contains_key("execution_started"));
+        assert_eq!(local.calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn edge_dispatch_stalled_expiration_reports_unknown_without_hanging() {
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        expire_hangs: true,
+        ..StaticEdgeDispatch::no_result()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch)
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        ),
+    )
+    .await
+    .expect("cleanup must not wait indefinitely");
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]
@@ -4840,8 +5192,9 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["cancelled"], true);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
+    assert_eq!(metadata["execution_fact"], "unknown");
+    assert!(!metadata.contains_key("blocked"));
+    assert!(!metadata.contains_key("execution_started"));
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
     assert_eq!(metadata["transport"], "edge_ledger");

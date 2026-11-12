@@ -3829,6 +3829,13 @@ mod context_cache_contract_tests {
                         authority_lifetime: None,
                     },
                     astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                        kind: "active_workspace".to_string(),
+                        delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                        payload: json!(format!("workspace snapshot: {frame_value}")),
+                        round_index: 1,
+                        authority_lifetime: Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
+                    },
+                    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
                         kind: "policy_advisory".to_string(),
                         delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence,
                         payload: json!({"revision": 3, "instruction": frame_value}),
@@ -3893,6 +3900,11 @@ mod context_cache_contract_tests {
         assert!(!system.contains("frame-alpha-dynamic-value"));
         assert!(!message_text(&second[0]).contains("frame-beta-dynamic-value"));
         assert!(
+            first.iter().any(|message| message_text(message)
+                .contains("workspace snapshot: frame-alpha-dynamic-value")),
+            "required workspace must reach strict-history provider wire"
+        );
+        assert!(
             first
                 .iter()
                 .all(|message| { !message_text(message).contains("runtime-advisory-evidence") }),
@@ -3919,8 +3931,10 @@ mod context_cache_contract_tests {
         );
         assert!(message_text(&delivered_first[advisory_index + 1]).contains("active_turn_frame"));
         assert_eq!(delivered_first[advisory_index + 2]["role"], "user");
+        assert!(message_text(&delivered_first[advisory_index + 2]).contains("active_workspace"));
+        assert_eq!(delivered_first[advisory_index + 3]["role"], "user");
         assert_eq!(
-            message_text(&delivered_first[advisory_index + 2]),
+            message_text(&delivered_first[advisory_index + 3]),
             "summarize it"
         );
         assert_eq!(
