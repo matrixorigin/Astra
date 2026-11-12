@@ -6,6 +6,9 @@
 
 mod common;
 
+#[path = "inference_execution_db_it/runner_device_db_cases.rs"]
+mod runner_device_db_cases;
+
 use astra_services::runtime_maintenance::{RuntimeMaintenancePolicy, maintain_runtime_storage};
 use astra_services::{
     InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,

@@ -1113,8 +1113,17 @@ async fn serve_connection_on_owner(
                             Ok(EdgeServerMessage::AuthOk { .. } | EdgeServerMessage::AuthError { .. }) => {
                                 // ignore duplicate auth
                             }
+                            Ok(message) => {
+                                // Inference has a separately negotiated connection owner.
+                                // A tool registration cannot execute its frames.
+                                return Err(format!(
+                                    "Unexpected {} frame on the tool connection",
+                                    message.diagnostic_kind()
+                                ).into());
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "Failed to parse server message");
+                                let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
+                                tracing::warn!(category = diagnostic.category, line = diagnostic.line, column = diagnostic.column, "Failed to parse server message");
                             }
                         }
                     }
@@ -2348,3 +2357,11 @@ mod tests {
         );
     }
 }
+
+pub mod chatgpt;
+pub mod inference_host;
+mod inference_journal;
+#[cfg(unix)]
+pub mod local_host;
+
+pub mod inference_connection;

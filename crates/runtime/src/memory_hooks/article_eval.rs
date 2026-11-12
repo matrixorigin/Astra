@@ -34,6 +34,7 @@ impl std::fmt::Debug for Model {
 impl Model {
     fn route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            device_binding: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,

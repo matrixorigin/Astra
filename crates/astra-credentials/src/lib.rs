@@ -10,7 +10,16 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod chatgpt;
+mod local_model_scope;
+mod local_models;
 pub mod native;
+pub use local_model_scope::LocalModelScope;
+pub use local_models::{
+    LOCAL_MODELS_FILE_VERSION, LocalChatgptModel, LocalCredentialRef, LocalInferenceProtocol,
+    LocalModelConfig, LocalModelConfigError, LocalModelConfigLease, LocalModelConfigStore,
+    LocalModelDefinition, LocalModelProbeState, LocalSecretStore, ResolvedLocalCredential,
+};
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -680,3 +689,5 @@ mod tests {
         );
     }
 }
+
+pub mod native_device;

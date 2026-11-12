@@ -18,6 +18,7 @@ use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
 use astra_turn_types::ModelSelector;
 mod catalog_reader;
+mod device;
 mod genesis;
 mod thinking_probe;
 use astra_core::{
@@ -1223,6 +1224,9 @@ impl RuntimeModelReasoningControl {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    /// Explicit device transport material. A device route must never fall
+    /// through to the Server's HTTP client, including auxiliary inference.
+    pub device_binding: Option<crate::runner_model_bindings::ResolvedRunnerModelBinding>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub response_scope: Option<String>,
@@ -1330,6 +1334,14 @@ impl AdmittedModelExecution {
     pub fn has_same_execution_identity(&self, other: &Self) -> bool {
         self.offering_id == other.offering_id
             && self
+                .device_binding
+                .as_ref()
+                .map(|binding| &binding.definition.source)
+                == other
+                    .device_binding
+                    .as_ref()
+                    .map(|binding| &binding.definition.source)
+            && self
                 .subscription
                 .as_ref()
                 .map(|binding| binding.connection_id())
@@ -1360,6 +1372,7 @@ impl AdmittedModelExecution {
         let header_overrides = offering.model.execution_header_overrides()?;
         let scope_key = offering.model.response_scope_key.clone();
         let mut execution = Self {
+            device_binding: None,
             inference_protocol: offering.model.inference_protocol,
             responses_reasoning_history: offering.model.responses_reasoning_history,
             response_scope: None,
@@ -1407,6 +1420,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            device_binding: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -2790,6 +2804,7 @@ fn admitted_user_model_from_row(
     let cache_capability =
         personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
+        device_binding: None,
         responses_reasoning_history,
         inference_protocol,
         response_scope: None,
@@ -4509,7 +4524,10 @@ impl ModelService for DatabaseModelService {
         user_id: String,
     ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
         if let Some(subject) = self.uc_subject(&user_id).await? {
-            let catalog = self.genesis_catalog(&subject).await?;
+            let mut catalog = self.genesis_catalog(&subject).await?;
+            catalog
+                .items
+                .extend(self.device_catalog(&user_id, &subject).await?);
             return Ok(UserModelCatalog {
                 items: catalog.items,
                 default_offering_id: catalog.default_offering_id,
@@ -5236,6 +5254,9 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         offering_id: String,
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id.starts_with("runner-") {
+            return self.admit_device(&user_id, &offering_id).await;
+        }
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return self.admit_genesis(&subject, &offering_id).await;
         }
@@ -5257,6 +5278,13 @@ impl ModelService for DatabaseModelService {
             .map_err(model_offering_resolution_error_response)?;
         if offering_ids.is_empty() {
             return Ok(Vec::new());
+        }
+        if offering_ids.iter().any(|id| id.starts_with("runner-")) {
+            let mut admitted = Vec::with_capacity(offering_ids.len());
+            for offering in offering_ids {
+                admitted.push(self.admit_model_offering(user_id.clone(), offering).await?);
+            }
+            return Ok(admitted);
         }
         if let Some(subject) = self.uc_subject(&user_id).await? {
             let catalog = self.genesis_catalog(&subject).await?;
@@ -5306,13 +5334,12 @@ impl ModelService for DatabaseModelService {
             validate_model_selector_admissions(&selectors, &offering_ids, None, &admitted)?;
             return Ok(admitted);
         }
-        if let Some(subject) = self.uc_subject(&user_id).await? {
-            let catalog = self.genesis_catalog(&subject).await?;
+        if self.uc_subject(&user_id).await?.is_some() {
+            let catalog = self.user_model_catalog(user_id.clone()).await?;
             let offering_ids = resolve_model_selector_offerings(&selectors, &catalog.items)?;
-            let admitted = offering_ids
-                .iter()
-                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
-                .collect::<Result<Vec<_>, _>>()?;
+            let admitted = self
+                .admit_model_offerings(user_id.clone(), offering_ids.clone())
+                .await?;
             validate_model_selector_admissions(
                 &selectors,
                 &offering_ids,
@@ -5491,8 +5518,8 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
-        if let Some(subject) = self.uc_subject(&user_id).await? {
-            return Ok(self.genesis_catalog(&subject).await?.items);
+        if self.uc_subject(&user_id).await?.is_some() {
+            return Ok(self.user_model_catalog(user_id).await?.items);
         }
         let deployment_allowed = is_admin || self.allows_deployment_models(user_id.clone()).await?;
         self.list_models_with_deployment_access(user_id, is_admin, deployment_allowed)
@@ -8891,6 +8918,7 @@ mod tests {
         .expect("unchanged catalog identity is admitted");
 
         let changed_name = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -8907,6 +8935,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT);
 
         let changed_source = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9347,6 +9376,7 @@ mod tests {
         .expect("admitted execution");
 
         let refreshed_material = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9358,6 +9388,7 @@ mod tests {
         assert!(selected.has_same_execution_identity(&refreshed_material));
 
         let changed_upstream = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9367,6 +9398,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_upstream));
 
         let changed_provider = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9376,6 +9408,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_provider));
 
         let changed_source = AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,

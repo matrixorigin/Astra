@@ -11884,6 +11884,7 @@ impl AgenticRunLifecycleService {
         .with_provider_scope_bound(provider_scope_bound)
         .with_admitted_execution_deadline(execution_deadline)
         .with_admitted_model_execution(authorization.model_execution.clone())
+        .with_inference_edges(self.edge_connection_pool.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
         .with_full_llm_capture(full_llm_capture)
         .with_explain_analyze_requested(explain)
@@ -24748,6 +24749,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .with_admitted_model_execution(admitted_model_execution)
         .with_admitted_execution_deadline(config.execution_deadline)
+        .with_inference_edges(self.edge_connection_pool.clone())
         .with_inference_owner_pod_id(
             self.run_engine
                 .as_ref()

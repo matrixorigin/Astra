@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-10-v124";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-12-v125";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -4154,6 +4154,24 @@ async fn ensure_core_schema_while_leased(
             started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
             context_expired_at DATETIME(6) NULL,
+            runner_id VARCHAR(64) NULL,
+            runner_journal_id VARCHAR(64) NULL,
+            runner_grant_json TEXT NULL,
+            runner_grant_expires_at DATETIME(6) NULL,
+            runner_deadline_at DATETIME(6) NULL,
+            runner_capacity_retired_at DATETIME(6) NULL,
+            runner_capacity_retired_by_boot VARCHAR(64) NULL,
+            runner_cancel_requested_at DATETIME(6) NULL,
+            runner_response_artifact_id VARCHAR(64) NULL,
+            runner_response_hash CHAR(64) NULL,
+            runner_response_bytes BIGINT NULL,
+            runner_terminal_hash CHAR(64) NULL,
+            runner_terminal_conflict BOOLEAN NOT NULL DEFAULT FALSE,
+            runner_dispatch_claim_token VARCHAR(64) NULL,
+            runner_dispatch_claim_expires_at DATETIME(6) NULL,
+            runner_local_fence_at DATETIME(6) NULL,
+            runner_provider_started_at DATETIME(6) NULL,
+            runner_no_start_evidence VARCHAR(32) NULL,
             PRIMARY KEY (user_id, attempt_id),
             CONSTRAINT chk_inference_provider_attempts_status
                 CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
@@ -4164,6 +4182,7 @@ async fn ensure_core_schema_while_leased(
                     AND provider_wire_bytes > 0),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
+            INDEX idx_inference_runner_recovery (runner_id, status, runner_grant_expires_at, user_id, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id)
         )",
     )
@@ -4387,6 +4406,10 @@ async fn ensure_core_schema_while_leased(
             registration_claim_expires_at DATETIME(6) NULL,
             registration_state TINYINT NOT NULL DEFAULT 1,
             registration_previous_edge_id VARCHAR(128) NULL,
+            inference_journal_id VARCHAR(64) NULL,
+            inference_boot_nonce VARCHAR(64) NULL,
+            inference_edge_id VARCHAR(128) NULL,
+            inference_publication_revision BIGINT NOT NULL DEFAULT 0,
             registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
@@ -4398,6 +4421,26 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
+    core_schema_create!(pool, "runner_model_binding_publications",
+        "CREATE TABLE IF NOT EXISTS runner_model_binding_publications (
+            user_id VARCHAR(128) NOT NULL,
+            runner_id VARCHAR(64) NOT NULL,
+            journal_id VARCHAR(64) NOT NULL,
+            publication_revision BIGINT NOT NULL,
+            operation_id VARCHAR(64) NOT NULL,
+            operation_hash CHAR(64) NOT NULL,
+            binding_id VARCHAR(64) NOT NULL,
+            binding_revision BIGINT NOT NULL,
+            profile_revision BIGINT NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            definition_json TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, runner_id, journal_id, publication_revision),
+            UNIQUE KEY uq_runner_binding_operation (user_id, runner_id, journal_id, operation_id),
+            INDEX idx_runner_binding_latest (user_id, runner_id, journal_id, binding_id, publication_revision)
+        )"
+    ).execute(&pool).await?;
 
     core_schema_create!(pool, "edge_pending_dispatch",
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (

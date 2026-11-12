@@ -249,90 +249,7 @@ fn normalized_usage(
         .unwrap_or_default()
 }
 
-fn invalid_aliases(values: [Option<&serde_json::Value>; 2]) -> bool {
-    let mut previous = None;
-    for value in values
-        .into_iter()
-        .flatten()
-        .filter(|value| !value.is_null())
-    {
-        let count = value.as_u64().filter(|count| i64::try_from(*count).is_ok());
-        if count.is_none() || previous.is_some_and(|previous| Some(previous) != count) {
-            return true;
-        }
-        previous = count;
-    }
-    false
-}
-
-// Only the fields understood by the usage parser belong in the cumulative
-// snapshot; arbitrary provider extensions must not grow retained state.
-fn usage_update(
-    raw: &serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut update = serde_json::Map::new();
-    for (source, target) in [
-        ("prompt_tokens", "prompt_tokens"),
-        ("completion_tokens", "completion_tokens"),
-        ("prompt_cache_hit_tokens", "prompt_cache_hit_tokens"),
-        ("prompt_cache_miss_tokens", "prompt_cache_miss_tokens"),
-        ("cache_read_input_tokens", "cache_read_input_tokens"),
-        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
-        ("input_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens"),
-    ] {
-        if let Some(value) = raw.get(source).filter(|value| !value.is_null()) {
-            update.insert(
-                target.into(),
-                if value.is_number() || value.is_null() {
-                    value.clone()
-                } else {
-                    serde_json::Value::Bool(false)
-                },
-            );
-        }
-    }
-    for (first, second, target) in [
-        ("input_tokens", "prompt_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens", "completion_tokens"),
-    ] {
-        if invalid_aliases([raw.get(first), raw.get(second)]) {
-            update.insert(target.into(), serde_json::Value::Bool(false));
-        }
-    }
-    let details = [
-        raw.get("input_tokens_details"),
-        raw.get("prompt_tokens_details"),
-    ];
-    if details.iter().flatten().any(|value| !value.is_null()) {
-        let value = if details
-            .iter()
-            .flatten()
-            .any(|value| !value.is_null() && !value.is_object())
-        {
-            serde_json::Value::Bool(false)
-        } else {
-            let mut filtered = serde_json::Map::new();
-            for key in [
-                "cached_tokens",
-                "cache_creation_input_tokens",
-                "cache_write_tokens",
-            ] {
-                let values = details.map(|detail| detail.and_then(|value| value.get(key)));
-                if invalid_aliases(values) {
-                    filtered.insert(key.into(), serde_json::Value::Bool(false));
-                } else if let Some(value) =
-                    values.into_iter().flatten().find(|value| !value.is_null())
-                {
-                    filtered.insert(key.into(), value.clone());
-                }
-            }
-            serde_json::Value::Object(filtered)
-        };
-        update.insert("prompt_tokens_details".into(), value);
-    }
-    update
-}
+use astra_turn_types::token_usage::responses_usage_update as usage_update;
 
 type UsageSnapshot = (
     crate::turn::token_usage::TokenUsage,
@@ -409,6 +326,34 @@ pub(super) async fn collect(
     route: LlmExecutionRoute<'_>,
     names: &HashSet<String>,
     cancel: LlmCancel<'_>,
+    callback: Option<&mut LlmStreamCallback<'_>>,
+    started: Instant,
+    budget: Option<Duration>,
+    lease: Option<&astra_services::chatgpt::CredentialLease>,
+    usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_stream(
+        response.bytes_stream(),
+        route,
+        names,
+        cancel,
+        callback,
+        started,
+        budget,
+        lease,
+        usage_observer,
+    )
+    .await
+}
+
+/// Both a live Server response and authenticated device custody use this
+/// codec and the same tool admission, continuation and usage rules.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn collect_stream(
+    stream: impl futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin,
+    route: LlmExecutionRoute<'_>,
+    names: &HashSet<String>,
+    cancel: LlmCancel<'_>,
     mut callback: Option<&mut LlmStreamCallback<'_>>,
     started: Instant,
     budget: Option<Duration>,
@@ -432,7 +377,7 @@ pub(super) async fn collect(
     let mut latest_usage = None;
     let mut rejected = false;
     let exchange = async {
-        let mut stream = response.bytes_stream();
+        let mut stream = stream;
         let mut frames = SseBlankLineUtf8Buf::new();
         let mut size = 0usize;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout();

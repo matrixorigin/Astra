@@ -352,3 +352,91 @@ pub fn public_root_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
     .with_no_client_auth();
     std::sync::Arc::new(config)
 }
+
+/// The local host startup/attachment boundary uses this complete set of
+/// supported network settings. It is not a general environment allowlist.
+pub const RUNNER_NETWORK_ENV_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ASTRA_RUNNER_CA_BUNDLE",
+];
+
+/// Build the client used by Runner-local model traffic.
+///
+/// Proxy settings use the same explicit external-egress policy as Server
+/// providers. Enterprises may additionally point `ASTRA_RUNNER_CA_BUNDLE` at
+/// a PEM bundle. The path and certificate contents are deliberately excluded
+/// from errors because this function is also used by user-facing diagnostics.
+pub fn runner_provider_client_builder()
+-> Result<reqwest::ClientBuilder, RunnerProviderNetworkConfigError> {
+    const MAX_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+
+    // A provider credential is authorized for exactly the configured origin.
+    // Following even a seemingly harmless redirect would let an untrusted or
+    // compromised endpoint choose the next Authorization recipient. Provider
+    // migrations must therefore be an explicit binding revision, not HTTP
+    // control flow.
+    let mut builder = apply_env_proxy(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none()),
+    );
+    let Some(path) = std::env::var_os("ASTRA_RUNNER_CA_BUNDLE") else {
+        return Ok(builder);
+    };
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    if !metadata.is_file() {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CA_BUNDLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CA_BUNDLE_BYTES {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    let certificates = reqwest::Certificate::from_pem_bundle(&bytes)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleInvalid)?;
+    if certificates.is_empty() {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerProviderNetworkConfigError {
+    CaBundleUnreadable,
+    CaBundleInvalid,
+}
+
+impl std::fmt::Display for RunnerProviderNetworkConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CaBundleUnreadable => "Runner private CA bundle cannot be read",
+            Self::CaBundleInvalid => {
+                "Runner private CA bundle must be a non-empty PEM certificate bundle of at most 4 MiB"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RunnerProviderNetworkConfigError {}

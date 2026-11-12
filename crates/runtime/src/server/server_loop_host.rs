@@ -1995,6 +1995,7 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    device_binding: Option<astra_services::runner_model_bindings::ResolvedRunnerModelBinding>,
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     response_scope: Option<String>,
@@ -2047,6 +2048,7 @@ impl ResolvedTurnLlmConfig {
 
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            device_binding: self.device_binding.clone(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.clone(),
             subscription: self.subscription.clone(),
@@ -3278,6 +3280,7 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        device_binding: execution.device_binding.clone(),
         inference_protocol: execution.inference_protocol,
         responses_reasoning_history: execution.responses_reasoning_history,
         response_scope: execution.response_scope.clone(),
@@ -3623,6 +3626,7 @@ pub struct ServerAgenticLoopHost {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    inference_edges: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     private_reasoning_origins: Option<HashSet<String>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     provider_observations:
@@ -5443,6 +5447,12 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
 impl crate::turn::llm::client::ProviderAttemptObserver
     for ExplainAnalyzeProviderAttemptObserver<'_>
 {
+    fn device_transport(&self) -> Option<&crate::turn::llm::client::RunDeviceInference> {
+        self.inner.device_transport()
+    }
+    fn note_remote_request_id(&self, index: u32, request_id: &str) {
+        self.inner.note_remote_request_id(index, request_id)
+    }
     async fn begin_attempt(
         &self,
         wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
@@ -5929,6 +5939,7 @@ pub struct ServerAgenticLoopHostBuilder {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    inference_edges: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     provider_observations:
         Option<crate::server::provider_test_support::ProviderObservationsFixture>,
@@ -6026,6 +6037,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone,
             encryptor,
             shared_pool: None,
+            inference_edges: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             provider_observations: None,
             model_override: None,
@@ -6077,6 +6089,14 @@ impl ServerAgenticLoopHostBuilder {
         store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     ) -> Self {
         self.prefix_store = store;
+        self
+    }
+
+    pub fn with_inference_edges(
+        mut self,
+        edges: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    ) -> Self {
+        self.inference_edges = edges;
         self
     }
 
@@ -6630,6 +6650,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
+            inference_edges: self.inference_edges,
             private_reasoning_origins: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             provider_observations: self.provider_observations,
@@ -12226,8 +12247,32 @@ impl ServerAgenticLoopHost {
         // Route and credential placement remain the admitted Offering's
         // contract. Request-local execution does not grant model access.
         execution?;
-        let client =
-            RuntimeSummaryClient::new(config.execution_route(), max_output_tokens, authority);
+        let client = RuntimeSummaryClient::new(
+            config.execution_route(),
+            max_output_tokens,
+            authority.clone(),
+        );
+        let client = if config.device_binding.is_some() {
+            let transport = crate::turn::llm::client::RunDeviceInference::new(
+                self.shared_pool.clone()?,
+                self.inference_edges.clone()?,
+                self.model_service.clone()?,
+                self.user_id.clone(),
+                astra_turn_types::InferenceInvocationScope::Run {
+                    session_id: self.session_id.clone(),
+                    run_id: state.current_run_id.clone()?,
+                    turn: state.session_turn,
+                    round: state.llm_rounds_completed,
+                    operation_id: operation_id.into(),
+                    logical_attempt: 0,
+                },
+                authority,
+            )
+            .ok()?;
+            client.with_device_transport(transport)
+        } else {
+            client
+        };
         #[cfg(any(test, feature = "e2e-hooks"))]
         let client = match self.provider_observations.clone() {
             Some(observations) => client.with_observations(
@@ -21401,7 +21446,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "model dispatch has no admitted Offering material"));
             }
             let operation_id = agent_inference_operation_id(state)?;
-            let provider_observer = crate::turn::llm::run_scoped::RunScopedProviderObserver::new(run_authority);
+            let provider_observer = crate::turn::llm::run_scoped::RunScopedProviderObserver::new(run_authority.clone());
+            let provider_observer = if llm_cfg.device_binding.is_some() {
+                let transport = crate::turn::llm::client::RunDeviceInference::new(
+                    self.shared_pool.clone().ok_or_else(|| astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation,"device inference storage is unavailable"))?,
+                    self.inference_edges.clone().ok_or_else(|| astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation,"device inference transport is unavailable"))?,
+                    self.model_service.clone().ok_or_else(|| astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation,"device model admission owner is unavailable"))?,
+                    self.user_id.clone(),
+                    astra_turn_types::InferenceInvocationScope::Run {
+                        session_id:self.session_id.clone(), run_id:state.current_run_id.clone().expect("Run authority checked above"),
+                        turn:state.session_turn,round:next_provider_request_round(state),operation_id:operation_id.clone(),logical_attempt:attempt_in_round,
+                    },run_authority,
+                )?;
+                provider_observer.with_device_transport(transport)
+            } else {provider_observer};
             #[cfg(any(test, feature = "e2e-hooks"))]
             let provider_observer = match self.provider_observations.clone() {
                 Some(observations) => provider_observer.with_observations(observations,
@@ -30471,6 +30529,7 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            device_binding: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -53502,6 +53561,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                device_binding: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,

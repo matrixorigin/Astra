@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 pub(crate) struct RunScopedProviderObserver {
     authority: DurableInferenceRunAuthority,
+    device: Option<super::client::RunDeviceInference>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     observations: Option<(
         crate::server::provider_test_support::ProviderObservationsFixture,
@@ -38,10 +39,19 @@ impl RunScopedProviderObserver {
     pub(crate) fn new(authority: DurableInferenceRunAuthority) -> Self {
         Self {
             authority,
+            device: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             observations: None,
             attempts: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn with_device_transport(
+        mut self,
+        device: super::client::RunDeviceInference,
+    ) -> Self {
+        self.device = Some(device);
+        self
     }
 
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -155,6 +165,20 @@ impl Drop for RunScopedProviderObserver {
 
 #[async_trait]
 impl ProviderAttemptObserver for RunScopedProviderObserver {
+    fn device_transport(&self) -> Option<&super::client::RunDeviceInference> {
+        self.device.as_ref()
+    }
+
+    fn note_remote_request_id(&self, index: u32, request_id: &str) {
+        if let Some((fact, _, _)) = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&index)
+        {
+            fact.request.request_id = request_id.into();
+        }
+    }
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -319,6 +343,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: super::super::client::LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -587,6 +612,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                device_binding: None,
             inference_protocol: None,
             response_scope: None,
                 subscription: None,

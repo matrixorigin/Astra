@@ -31,8 +31,11 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+#[path = "device.rs"]
+mod device;
 #[path = "responses.rs"]
 mod responses;
+pub(crate) use device::RunDeviceInference;
 
 const INCOMPLETE_TOOL_CONTINUATION_MESSAGE: &str =
     "Some previous tool results could not be verified. Check their effects, then start a new turn.";
@@ -1110,6 +1113,8 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub device_binding:
+        Option<&'a astra_services::runner_model_bindings::ResolvedRunnerModelBinding>,
     pub inference_protocol: Option<LlmProviderProtocol>,
     pub response_scope: Option<&'a str>,
     pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
@@ -1134,6 +1139,7 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            device_binding: execution.device_binding.as_ref(),
             inference_protocol: execution.inference_protocol,
             response_scope: execution.response_scope.as_deref(),
             subscription: execution.subscription.as_ref(),
@@ -1161,6 +1167,7 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub device_binding: Option<astra_services::runner_model_bindings::ResolvedRunnerModelBinding>,
     pub inference_protocol: Option<LlmProviderProtocol>,
     pub response_scope: Option<String>,
     pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
@@ -1186,6 +1193,7 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            device_binding: self.device_binding.as_ref(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.as_deref(),
             subscription: self.subscription.as_ref(),
@@ -1282,6 +1290,11 @@ pub(crate) enum ProviderAttemptAdmission {
 /// by the caller so one invocation can contain multiple physical attempts.
 #[async_trait]
 pub(crate) trait ProviderAttemptObserver: Send + Sync {
+    fn device_transport(&self) -> Option<&RunDeviceInference> {
+        None
+    }
+
+    fn note_remote_request_id(&self, _index: u32, _request_id: &str) {}
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -5646,6 +5659,23 @@ async fn call_prepared_llm_attempts(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if prepared.route.device_binding.is_some() {
+        let observer = attempt_observer.ok_or_else(|| {
+            responses::error(
+                astra_core::ErrorKind::ContractViolation,
+                "device_inference_owner_missing",
+            )
+        })?;
+        let transport = observer.device_transport().ok_or_else(|| {
+            responses::error(
+                astra_core::ErrorKind::ContractViolation,
+                "device_inference_owner_missing",
+            )
+        })?;
+        return transport
+            .execute(prepared, cancel, stream_callback, observer, total_budget)
+            .await;
+    }
     let PreparedStreamingCall {
         purpose,
         route,
@@ -8297,6 +8327,14 @@ async fn call_llm_nonstream_attempts(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if call.route.device_binding.is_some()
+        && call.route.inference_protocol != Some(LlmProviderProtocol::OpenAiResponses)
+    {
+        return Err(responses::error(
+            astra_core::ErrorKind::InvalidRequest,
+            "device_nonstream_unsupported",
+        ));
+    }
     if call
         .route
         .inference_protocol
@@ -8340,6 +8378,7 @@ async fn call_llm_nonstream_attempts(
         temperature
     };
     let LlmExecutionRoute {
+        device_binding: _,
         inference_protocol: _,
         subscription: _,
         response_scope: _,
@@ -9310,6 +9349,7 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -9393,6 +9433,7 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -9493,6 +9534,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                device_binding: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -9576,6 +9618,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -9754,6 +9797,7 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            device_binding: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,
@@ -10005,6 +10049,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10054,6 +10099,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10124,6 +10170,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10226,6 +10273,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -10422,6 +10470,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10486,6 +10535,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10567,6 +10617,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10639,6 +10690,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10708,6 +10760,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10784,6 +10837,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10852,6 +10906,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10899,6 +10954,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10952,6 +11008,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11022,6 +11079,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11117,6 +11175,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11193,6 +11252,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -12464,6 +12524,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                device_binding: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -15832,6 +15893,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -15896,6 +15958,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -16249,6 +16312,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                device_binding: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -16849,6 +16913,7 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -18695,6 +18760,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -18762,6 +18828,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -18817,6 +18884,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -18865,6 +18933,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -18910,6 +18979,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -18960,6 +19030,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -19038,6 +19109,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19073,6 +19145,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19129,6 +19202,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19199,6 +19273,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19251,6 +19326,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19307,6 +19383,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19357,6 +19434,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19412,6 +19490,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19536,6 +19615,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19584,6 +19664,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    device_binding: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19731,6 +19812,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,

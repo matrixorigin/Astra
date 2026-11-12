@@ -21,6 +21,73 @@ pub enum ReasoningHistory {
     CurrentTurn,
     AllTurns,
 }
+
+/// Pure subscription catalog codec shared by Server and device transports.
+/// These are provider facts, never workspace authorization or credentials.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubscriptionCatalogModel {
+    pub slug: String,
+    pub display_name: String,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+}
+
+pub fn subscription_catalog(value: &Value) -> Result<Vec<SubscriptionCatalogModel>, &'static str> {
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 512)
+        .ok_or("Invalid subscription model inventory")?;
+    let mut result = Vec::new();
+    let mut slugs = std::collections::HashSet::new();
+    for model in models.iter().filter(|model| model["visibility"] == "list") {
+        let slug = model["slug"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 255 && !s.chars().any(char::is_control))
+            .ok_or("Invalid subscription model identity")?;
+        if !slugs.insert(slug) {
+            return Err("Duplicate subscription model identity");
+        }
+        let display = model["display_name"].as_str().unwrap_or(slug);
+        if display.len() > 1024 || display.chars().any(char::is_control) {
+            return Err("Invalid subscription model display name");
+        }
+        let mut efforts = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(levels) = model["supported_reasoning_levels"].as_array() {
+            if levels.len() > 16 {
+                return Err("Invalid subscription reasoning inventory");
+            }
+            for level in levels {
+                let effort = level["effort"]
+                    .as_str()
+                    .filter(|s| {
+                        !s.is_empty()
+                            && s.len() <= 32
+                            && s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+                    })
+                    .ok_or("Invalid subscription reasoning effort")?;
+                if !seen.insert(effort) {
+                    return Err("Duplicate subscription reasoning effort");
+                }
+                if super::thinking::ThinkingProtocol::supports_responses_effort(effort) {
+                    efforts.push(effort.to_owned());
+                }
+            }
+        }
+        let default = model["default_reasoning_level"]
+            .as_str()
+            .filter(|effort| efforts.iter().any(|value| value == effort))
+            .map(str::to_owned);
+        result.push(SubscriptionCatalogModel {
+            slug: slug.into(),
+            display_name: display.into(),
+            supported_reasoning_efforts: efforts,
+            default_reasoning_effort: default,
+        });
+    }
+    Ok(result)
+}
 impl ReasoningHistory {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1271,6 +1338,56 @@ pub fn observe_sse_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_catalog_keeps_provider_inventory_and_supported_efforts() {
+        let inventory = json!({"models":[
+            {"slug":"synthetic-model","display_name":"Synthetic","visibility":"list",
+             "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"future"}],
+             "default_reasoning_level":"high"},
+            {"slug":"hidden-model","visibility":"hidden"}
+        ]});
+        let catalog = subscription_catalog(&inventory).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].slug, "synthetic-model");
+        assert_eq!(catalog[0].supported_reasoning_efforts, ["low", "high"]);
+        assert_eq!(catalog[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert!(
+            subscription_catalog(&json!({"models":[]}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subscription_catalog_rejects_ambiguous_or_unbounded_provider_metadata() {
+        let model = json!({"slug":"synthetic","visibility":"list"});
+        assert!(subscription_catalog(&json!({"models":[model.clone(),model.clone()]})).is_err());
+        assert!(subscription_catalog(&json!({"models":vec![model.clone();513]})).is_err());
+        for invalid in [json!(null), json!({}), json!({"models":null})] {
+            assert!(subscription_catalog(&invalid).is_err());
+        }
+        for changes in [
+            json!({"slug":""}),
+            json!({"slug":"a\nb"}),
+            json!({"slug":"a".repeat(256)}),
+            json!({"display_name":"a".repeat(1025)}),
+            json!({"supported_reasoning_levels":[{"effort":"low"},{"effort":"low"}]}),
+            json!({"supported_reasoning_levels":[{"effort":"HIGH"}]}),
+        ] {
+            let mut invalid = model.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(changes.as_object().unwrap().clone());
+            assert!(subscription_catalog(&json!({"models":[invalid]})).is_err());
+        }
+        let catalog =
+            subscription_catalog(&json!({"models":[{"slug":"synthetic", "visibility":"list",
+            "supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"future"}]}))
+            .unwrap();
+        assert_eq!(catalog[0].default_reasoning_effort, None);
+    }
 
     #[test]
     fn endpoint_url_appends_to_the_path_before_query_and_fragment() {
