@@ -2588,11 +2588,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             state.stall.active_policy_feedback = policy_feedback;
         }
 
-        // A question is a synchronization edge, not ordinary progress text. Once
-        // the send has been accepted, do not start another provider round before
-        // the exact responder's answer is observed. Reuse the same bounded
-        // mailbox barrier used by finalization so a reply wakes this run without
-        // adding a second wait state or another storage path.
+        // Message sending is asynchronous. Only an explicit observation asks
+        // this batch to yield; canonical child-result adoption owns completion.
         let run_id = state.current_run_id.as_deref().unwrap_or_default();
         let admitted_wait = round_tool_calls
             .iter()
@@ -2620,19 +2617,15 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 .then_some(receipt)
             })
             .min_by_key(|receipt| receipt.timeout_ms);
-        let reply_pending = state.messaging.reply_obligations.has_pending(run_id);
-        let skip_optional_wait =
-            admitted_wait.is_some() && !reply_pending && settled_round_has_failure;
-        if reply_pending || (admitted_wait.is_some() && !skip_optional_wait) {
-            // Finish the host's PostToolBatch/PostTurn before the shared loop
-            // waits. A correlated question cannot be bypassed by a sibling's
-            // observation timeout.
-            return Ok(TurnToolPhaseControl::WaitForInput(
-                super::host::RuntimeInputWait::from_observation(
-                    admitted_wait.filter(|_| !reply_pending),
-                )
-                .map_err(|error| error.to_string())?,
-            ));
+        if let Some(wait) = admitted_wait {
+            if !settled_round_has_failure {
+                return Ok(TurnToolPhaseControl::WaitForInput(
+                    super::host::RuntimeInputWait::from_observation(Some(wait))
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            state.push_volatile_payload(super::host::VolatileKind::RuntimeInputBoundary,
+                serde_json::json!({"agent_wait":"skipped", "reason":"tool_batch_failed", "children_cancelled":false}));
         }
         Ok(TurnToolPhaseControl::ContinueLoop)
     })

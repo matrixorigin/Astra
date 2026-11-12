@@ -801,6 +801,10 @@ async fn flush_host_event_gap_recovery(
 }
 
 fn record_unforwarded_host_event(gap: &server_loop_host::HostEventGapTracker, event: Value) {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        // No replay authority exists for a disposable execution observation.
+        return;
+    }
     if event.get("type").and_then(Value::as_str) == Some("explain_analyze") {
         gap.record_explain_analyze_drop(event);
     } else {
@@ -829,6 +833,18 @@ async fn send_attached_stream_event(
     event: Value,
     run_id: &str,
 ) {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        if let Some(attached) = delivery.sender.as_ref()
+            && matches!(
+                attached.try_send(event),
+                Err(mpsc::error::TrySendError::Closed(_))
+            )
+        {
+            delivery.sender = None;
+        }
+        // Saturation must not manufacture a repair gap for this lossy hint.
+        return;
+    }
     if attached_stream_event_requires_reliable_delivery(&event) {
         if attached_stream_event_is_terminal(&event) {
             // The terminal snapshot subsumes omitted progress. Never make its
@@ -1022,6 +1038,14 @@ async fn process_ordered_live_fanout_event(
     client_event_tx: &mut AttachedStreamDelivery,
     emitted_tool_terminals: &EmittedToolTerminalTracker,
 ) -> Result<(), LiveFanoutPersistenceError> {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        // Hints may be omitted behind a pending durable batch. Queuing them
+        // would change its flush threshold and create avoidable SQL writes.
+        if pending.is_empty() {
+            deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+        }
+        return Ok(());
+    }
     if let Some(object) = event.as_object_mut() {
         // The live delivery watermark is lifecycle-private, never a durable
         // receipt or public protocol field.
@@ -1759,7 +1783,7 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
-    executor.set_reply_obligations(Arc::clone(&state.messaging.reply_obligations));
+    executor.set_reply_obligations(Arc::clone(&state.messaging.question_correlations));
     let executor = std::sync::Arc::new(executor);
     state.runtime_tool_executor = Some(executor);
 }
@@ -4635,7 +4659,7 @@ struct LoopExecutionFacts {
     charged_iterations: u64,
     stall: crate::turn::agentic_loop::host::StallTrackingState,
     user_intents: crate::turn::agentic_loop::host::UserIntentState,
-    reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     hooks: StopHookState,
     tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
     session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
@@ -4730,7 +4754,7 @@ impl LoopExecutionFacts {
             admitted_tool_policy,
             request_constraints: request_constraints.clone(),
             user_intents: Default::default(),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             hooks,
             tool_event_hooks,
             session_event_hooks,
@@ -4797,7 +4821,7 @@ impl LoopExecutionFacts {
         let astra_pipeline::step_protocol::RunExecutionControl::V4 {
             completion_settlement,
             hook_obligations,
-            reply_obligations,
+            question_correlations,
             budget_wrapup_injected,
             budget_wrapup_ignored_rounds,
         } = payload
@@ -4822,10 +4846,11 @@ impl LoopExecutionFacts {
                 chain,
             ).map_err(|_| invalid("adopted verification frontier cannot be restored"))?;
         hooks.completion_settlement = completion_settlement.clone();
-        let replies = Arc::new(crate::messaging::reply_obligations::ReplyObligations::default());
+        let replies =
+            Arc::new(crate::messaging::question_correlations::QuestionCorrelations::default());
         replies
             .restore(
-                reply_obligations,
+                question_correlations,
                 &receipt.run_id,
                 receipt.producer_generation,
             )
@@ -4894,7 +4919,7 @@ impl LoopExecutionFacts {
                 crate::turn::agentic_loop::host::UserIntentState::from_durable_continuation(
                     payload.user_intents,
                 ),
-            reply_obligations: replies,
+            question_correlations: replies,
             hooks,
             tool_event_hooks,
             session_event_hooks,
@@ -7262,7 +7287,7 @@ impl AgenticRunLifecycleService {
         let agent_context = AgentToolContext {
             parent_delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
             fanout_admission: entry.spawner.fanout_parent(run_id),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id: request
@@ -12494,7 +12519,7 @@ impl AgenticRunLifecycleService {
             hooks: facts.hooks,
             user_intents: facts.user_intents,
             messaging: crate::turn::agentic_loop::host::MessagingState {
-                reply_obligations: facts.reply_obligations,
+                question_correlations: facts.question_correlations,
                 ..Default::default()
             },
             error_recovery: facts.original.error_recovery,
@@ -25160,7 +25185,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None => return Err("admitted child profile authority requires durable run facts".into()),
                     },
                     fanout_admission: spawner.fanout_parent(&config.run_id),
-                    reply_obligations: Arc::clone(&loop_state.messaging.reply_obligations),
+                    question_correlations: Arc::clone(&loop_state.messaging.question_correlations),
                     delegation_model_admission: None,
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),

@@ -768,6 +768,10 @@ pub(crate) fn received_unix_ms() -> u64 {
 pub enum SseRenderEffect {
     /// A visible advisory, independent of assistant output and terminal status.
     SystemWarning(String),
+    /// A transient execution observation, independent of durable run status.
+    RuntimeWait {
+        waiting: bool,
+    },
     /// Exact root-scoped durable guidance disposition for the live client.
     GuidanceDisposition {
         intent: StreamAppliedUserIntent,
@@ -1028,6 +1032,19 @@ fn apply_one_event(
         return;
     }
     match etype {
+        "runtime_wait" => {
+            if accum.run_terminal.is_none()
+                && !accum.server_loop_terminal
+                && accum
+                    .run_id
+                    .as_deref()
+                    .is_some_and(|run_id| event["run_id"] == run_id)
+                && event["reason"] == "agent_input"
+                && let Some(waiting) = event["waiting"].as_bool()
+            {
+                effects.push(SseRenderEffect::RuntimeWait { waiting });
+            }
+        }
         "warning" => {
             if let Some(message) = event
                 .get("message")
@@ -4021,6 +4038,53 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.full_text, "recovered final text");
+    }
+
+    #[test]
+    fn runtime_wait_is_transient_and_bound_to_the_live_root() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        let mut effects = Vec::new();
+        let mut edge_pending = Vec::new();
+        for waiting in [true, false] {
+            let wire = serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":waiting});
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SseRenderEffect::RuntimeWait { waiting: true },
+                SseRenderEffect::RuntimeWait { waiting: false }
+            ]
+        ));
+        let before = effects.len();
+        for wire in [
+            serde_json::json!({"type":"runtime_wait", "run_id":"child", "reason":"agent_input", "waiting":true}),
+            serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":"false"}),
+        ] {
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        accum.server_loop_terminal = true;
+        effects.extend(dispatch_chat_turn_sse_event_block(
+            &sse(
+                "runtime_wait",
+                ",\"run_id\":\"root\",\"reason\":\"agent_input\",\"waiting\":true",
+            ),
+            &mut accum,
+            &mut edge_pending,
+        ));
+        assert_eq!(effects.len(), before);
+        assert!(accum.error_kind.is_none());
     }
 
     #[test]

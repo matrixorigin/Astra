@@ -633,7 +633,8 @@ trace and usage accounting even when another approach answers the question.
 Concrete execution obligations keep their existing owners: permissions and
 provider admission, canonical Work settlement, explicit verification hooks,
 typed workspace completion evidence, unsettled execution ownership, and child
-completion/reply obligations. None can be discharged by assistant prose or an
+completion obligations. Question identities are advisory correlation only and
+never grant waiting or completion authority. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
 Ordinary complete provider responses without an action reach this same completion owner:

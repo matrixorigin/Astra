@@ -262,6 +262,10 @@ pub enum StreamEvent {
     },
     /// Visible, non-terminal advisory; preserved independently of assistant text.
     SystemWarning(String),
+    /// Disposable live observation for the currently bound root run.
+    RuntimeWait {
+        waiting: bool,
+    },
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
     /// A mid-turn input reached the runtime's next safe model boundary.
