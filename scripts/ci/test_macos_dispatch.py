@@ -813,6 +813,29 @@ class EntrypointTests(unittest.TestCase):
         with patch.object(dispatch, "source", side_effect=dispatch.Unavailable("unsupported source event")):
             self.assertEqual(self.invoke(api, "schedule")[0], 1)
 
+    def test_validated_hosted_runner_skips_scheduler_without_dispatch(self):
+        api = ApiFixture()
+        # An actual, valid but non-allowlisted author selects hosted macOS.
+        api.pr["user"]["id"] = 999999999
+        self.assertEqual(
+            dispatch.select_macos_runner("pull_request", {"pull_request": {"user": api.pr["user"]}}),
+            ["macos-15"],
+        )
+        self.assertEqual(self.invoke(api, "schedule")[0], 0)
+        self.assertEqual(api.posts, [])
+        self.assertEqual(self.invoke(api, "admit")[0], 1)
+
+    def test_unknown_pr_author_fails_closed_at_real_source_entrypoint(self):
+        for author in ({}, {"id": None}, {"id": 0}, {"id": -1},
+                       {"id": "52204121"}, {"id": True}):
+            with self.subTest(author=author):
+                api = ApiFixture()
+                api.pr["user"] = author
+                # The source is valid except for unavailable runner identity.
+                self.assertEqual(self.invoke(api, "schedule")[0], 1)
+                self.assertEqual(self.invoke(api, "admit")[0], 1)
+                self.assertEqual(api.posts, [])
+
     def test_unavailable_api_and_missing_controller_fail_without_paid_execution(self):
         api = ApiFixture()
         with patch.object(api, "get", side_effect=RuntimeError("unavailable")):
