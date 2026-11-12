@@ -1672,8 +1672,18 @@ mod tests {
         let url_a = format!("ws://{}/edge/ws", listener_a.local_addr().unwrap());
         let url_b = format!("ws://{}/edge/ws", listener_b.local_addr().unwrap());
         assert_ne!(
-            edge_invocation_journal_path_in_root("runner-abc", &url_a, &workspace, Some(state.clone())),
-            edge_invocation_journal_path_in_root("runner-abc", &url_b, &workspace, Some(state.clone())),
+            edge_invocation_journal_path_in_root(
+                "runner-abc",
+                &url_a,
+                &workspace,
+                Some(state.clone())
+            ),
+            edge_invocation_journal_path_in_root(
+                "runner-abc",
+                &url_b,
+                &workspace,
+                Some(state.clone())
+            ),
         );
         let hold = |listener: tokio::net::TcpListener| async move {
             let mut socket = accept_plain_socket(&listener).await;
@@ -1823,7 +1833,9 @@ mod tests {
             tracestate: None,
         };
         socket
-            .send(Message::Text(serde_json::to_string(&request).unwrap().into()))
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
             .await
             .unwrap();
         tokio::task::spawn_blocking(move || {
@@ -1857,7 +1869,10 @@ mod tests {
         .expect("admitted work did not settle after the starting command disappeared")
         .unwrap()
         .unwrap();
-        assert!(status.success(), "runner exited before settlement: {status}");
+        assert!(
+            status.success(),
+            "runner exited before settlement: {status}"
+        );
         while let Some(frame) = socket.next().await {
             if frame.is_err() {
                 break;
@@ -1907,14 +1922,31 @@ mod tests {
                     ..
                 } = message
                 {
+                    socket
+                        .send(Message::Text(
+                            serde_json::to_string(&EdgeServerMessage::Closing {
+                                reason: "replayed".into(),
+                            })
+                            .unwrap()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    while let Some(frame) = socket.next().await {
+                        if frame.is_err() {
+                            break;
+                        }
+                    }
                     return (is_error, output, tool_result_fields);
                 }
             }
         };
         let ((is_error, output, fields), replayed) =
-            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(replay_server, replay) })
-                .await
-                .expect("replaying the settled invocation timed out");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(replay_server, replay)
+            })
+            .await
+            .expect("replaying the settled invocation timed out");
         replayed.expect("replay connection failed");
         let fields = fields.expect("settled result had no tool fields");
         assert!(is_error);
@@ -1929,7 +1961,10 @@ mod tests {
         );
         let cancelled = fields.get("cancelled").and_then(Value::as_bool) == Some(true)
             || fields.get("exit_semantics").and_then(Value::as_str) == Some("cancelled");
-        assert!(cancelled, "settled result was not cancellation evidence: {fields:?} {output}");
+        assert!(
+            cancelled,
+            "settled result was not cancellation evidence: {fields:?} {output}"
+        );
     }
 
     #[test]
