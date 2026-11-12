@@ -164,14 +164,13 @@ pub fn project_agent_tool_budget_record(
 }
 
 pub fn summarize_agent_tool_budget_result(text: &str) -> String {
-    const MAX_CHARS: usize = 320;
     let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX_CHARS {
+    if trimmed.chars().count() <= 320 {
         trimmed.to_string()
     } else {
-        let mut clipped: String = trimmed.chars().take(MAX_CHARS.saturating_sub(1)).collect();
-        clipped.push('…');
-        clipped
+        let preview =
+            astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(trimmed, 256);
+        format!("{preview}\n[Summary truncated; inspect the full child result if available.]")
     }
 }
 
@@ -284,7 +283,7 @@ mod tests {
         let out = render_completed_agent_result("reviewer-tests", "done", Some("normal"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], AgentToolResultStatusKind::Completed.as_str());
-        assert_eq!(v["incomplete"], false);
+        assert!(v.get("incomplete").is_none());
     }
 
     #[test]
@@ -737,11 +736,13 @@ mod tests {
     }
 
     #[test]
-    fn budget_result_summary_clips_long_text() {
-        let long = "a".repeat(400);
+    fn budget_result_summary_preserves_both_ends_and_marks_truncation() {
+        let long = format!("start {} review incomplete", "a".repeat(400));
         let summarized = summarize_agent_tool_budget_result(&long);
-        assert_eq!(summarized.chars().count(), 320);
-        assert!(summarized.ends_with('…'));
+        assert!(summarized.starts_with("start "));
+        assert!(summarized.contains("review incomplete"));
+        assert!(summarized.contains("Summary truncated"));
+        assert!(summarized.chars().count() < 400);
     }
 
     #[test]

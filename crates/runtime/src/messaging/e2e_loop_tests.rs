@@ -2078,6 +2078,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bounded_edge_result_keeps_unknown_start_in_model_journal_and_step() {
+        for started in [false, true] {
+            let calls = vec![json!({"id":"call-unknown", "type":"function", "function": {
+                "name":"bash", "arguments":r#"{"command":"external-operation"}"#
+            }})];
+            let mut fields = edge_runtime_environment_fields();
+            fields.insert("outcome_certainty".into(), json!("unknown"));
+            fields.insert("error_kind".into(), json!("tool_unavailable"));
+            if started {
+                fields.insert("execution_started".into(), json!(true));
+            }
+            let edge = vec![EdgeToolExecResult {
+                work_attribution: None,
+                execution_completion: None,
+                request_id: "call-unknown".into(),
+                tool: "bash".into(),
+                args: json!({"command":"external-operation"}),
+                output: "x".repeat(20_000),
+                tool_result_fields: Some(fields),
+                status: "failed".into(),
+                duration_ms: 1,
+            }];
+            let mut messages = Vec::new();
+            let mut results = Vec::new();
+            let mut records = Vec::new();
+            let mut restricted = HashSet::new();
+            let mut guard = TurnGuard::new();
+            let mut recorder = StepRecorder::new("test-user", "test-session", "unknown-result");
+            let mut idempotency = InMemoryIdempotencyCache::new();
+            let mut dedup = SemanticDedup::new(0.95);
+            let mut counts = HashMap::new();
+            let mut terminal = NoopHeadlessTerminal;
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let valid = HashSet::from(["bash".to_string()]);
+            let deferred = HashSet::new();
+            let hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+            run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+                provider_continuation: None,
+                canonical_result_budget: 8192,
+                round_records_start: 0,
+                turn_index: 0,
+                session_turn: 1,
+                quiet: true,
+                api: &api,
+                token: "",
+                current_user_id: None,
+                current_session_id: None,
+                current_run_id: None,
+                current_turn_chain_id: None,
+                durable_dispatch_admission: None,
+                delegation_model_admissions: None,
+                physical_tool_calls: &calls,
+                logical_tool_calls: &calls,
+                deferred_activations_by_call_id: &HashMap::new(),
+                runtime_control_calls_by_id: &HashMap::new(),
+                edge_tool_round: &edge,
+                reasoning_content: "",
+                reasoning_signature: "",
+                messages: &mut messages,
+                tool_results: &mut results,
+                valid_tool_names: &valid,
+                deferred_tool_names: &deferred,
+                restricted_tools: &mut restricted,
+                turn_guard: &mut guard,
+                step_recorder: &mut recorder,
+                idempotency_cache: &mut idempotency,
+                semantic_dedup: &mut dedup,
+                call_counts: &mut counts,
+                max_identical_calls: 2,
+                max_tools_per_turn: 15,
+                max_consecutive_empty_name: 3,
+                tool_call_records: &mut records,
+                tool_event_hooks: &hooks,
+                client_skill_execution: None,
+                term: &mut terminal,
+                mailbox: None,
+                permission_context: None,
+                progress_emitter: None,
+                pre_resolved_results: &[],
+                runtime_tool_executor: None,
+                turn_start: None,
+                llm_round: 0,
+                plan_mode_active: false,
+            })
+            .await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].effective_disposition(),
+                if started {
+                    astra_services::session_journal::ToolCallDisposition::Executed
+                } else {
+                    astra_services::session_journal::ToolCallDisposition::Unknown
+                }
+            );
+            let tool_message = messages
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            let mut provider_message = tool_message.clone();
+            astra_turn_core::tool::result::advisory::project_advisories(&mut provider_message);
+            let wire = provider_message["content"].as_str().unwrap();
+            assert!(wire.contains("\"execution\":\"unknown\""), "{wire}");
+            assert!(!wire.contains("The call was not executed"), "{wire}");
+            assert!(
+                recorder.events().iter().any(|event| {
+                    event
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("execution_fact"))
+                        == Some(&json!("unknown"))
+                }),
+                "step history must preserve unknown startup"
+            );
+        }
+    }
+
     async fn plan_tool_round(
         executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
         active: bool,

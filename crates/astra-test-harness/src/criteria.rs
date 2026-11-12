@@ -2749,16 +2749,10 @@ fn child_result_adoption_proven(
                     } else {
                         return false;
                     };
-                    result
-                        .get("result_family")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("child_result")
-                        && result.get("status").and_then(serde_json::Value::as_str)
-                            == Some("completed")
-                        && result
-                            .get("incomplete")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false)
+                    // The shared wire contract identifies a normally ended
+                    // child with an available result, not semantic task success.
+                    astra_turn_core::orchestration::agent_result_wire::agent_tool_structured_result_class(result)
+                        == Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_SUCCESS)
                         && result.get("agent_id").and_then(serde_json::Value::as_str)
                             == Some(child_agent_id)
                         && result.get("run_id").and_then(serde_json::Value::as_str)
@@ -10157,6 +10151,9 @@ all_consumers: true
             ("result", serde_json::json!("WRONG-RESULT")),
             ("status", serde_json::json!("still_running")),
             ("incomplete", serde_json::json!(true)),
+            ("incomplete", serde_json::json!("false")),
+            ("success", serde_json::json!(false)),
+            ("error", serde_json::json!("failed")),
             ("result_family", serde_json::json!("control_receipt")),
         ] {
             let mut wrong_body = body.clone();
@@ -10171,6 +10168,25 @@ all_consumers: true
                 "wrong returned {field} must fail"
             );
         }
+        let partial_text = "Review incomplete; final lead unverified.";
+        let mut partial_body = body.clone();
+        partial_body["result"] = serde_json::json!(partial_text);
+        let partial_capture = foreground("parent-run", arguments.clone(), partial_body, true);
+        let partial_handoff = Criterion::SessionChildResultAdopted {
+            expected_result: Some(partial_text.into()),
+            spawn_match: None,
+            allow_get_result: true,
+        };
+        assert!(
+            evaluate_deterministic_with_session(
+                &[partial_handoff],
+                &outcome,
+                Some(&partial_capture),
+            )[0]
+            .passed,
+            "result handoff is not proof that the assigned work is complete"
+        );
+
         let mut wrong = healthy.clone();
         wrong.events[1].raw["metadata"]["status"] = serde_json::json!("failed");
         assert!(

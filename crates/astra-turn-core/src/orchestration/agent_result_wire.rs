@@ -113,6 +113,7 @@ pub enum AgentControlReceipt {
     Wait(AgentWaitReceipt),
     SendMessage,
     List,
+    ToolOutcomes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +222,15 @@ pub fn decode_agent_tool_result(value: &Value) -> Option<DecodedAgentToolResult>
                         return None;
                     }
                     AgentControlReceipt::List
+                }
+                AgentControlOutcome::ToolOutcomesObserved
+                | AgentControlOutcome::ToolOutcomesUnavailable
+                    if nonempty("parent_run_id")
+                        && nonempty("agent_id")
+                        && nonempty("run_id")
+                        && value.get("tool_outcomes").is_some_and(Value::is_object) =>
+                {
+                    AgentControlReceipt::ToolOutcomes
                 }
                 _ => return None,
             };
@@ -757,9 +767,8 @@ pub fn render_completed_agent_result(
 
 fn completed_agent_result_body(agent_id: &str, result: &str, finish_reason: Option<&str>) -> Value {
     let reason = agent_finish_reason_text(finish_reason);
-    // This wire payload only reports whether the child result is complete.
-    // Resume behavior belongs to the structured InterruptionRecord, where
-    // `resume_mode` can distinguish Continue from Settle.
+    // The runtime can prove an interruption, but a normal process exit does
+    // not prove that the child accomplished the requested work.
     let interrupted = agent_completion_is_interrupted(Some(reason));
     let mut body = json!({
         "status": if interrupted {
@@ -770,11 +779,15 @@ fn completed_agent_result_body(agent_id: &str, result: &str, finish_reason: Opti
         "agent_id": agent_id,
         "result": result,
         "finish_reason": reason,
-        "incomplete": interrupted,
     });
     if interrupted {
+        body["incomplete"] = json!(true);
         body["hint"] = json!(
             "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly."
+        );
+    } else {
+        body["hint"] = json!(
+            "The child process finished; read its result to determine whether the requested work is complete."
         );
     }
     body
@@ -1511,6 +1524,17 @@ mod tests {
     }
 
     #[test]
+    fn normal_child_exit_does_not_certify_the_work_in_its_result() {
+        let partial = "Review is incomplete; the last lead remains unverified.";
+        let rendered = render_completed_agent_result("child", partial, Some("normal"));
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["result"], partial);
+        assert!(parsed.get("incomplete").is_none());
+        assert!(parsed["hint"].as_str().unwrap().contains("read its result"));
+    }
+
+    #[test]
     fn completed_agent_result_only_marks_known_interruptions_incomplete() {
         let warning = render_completed_agent_result(
             "a1",
@@ -1523,7 +1547,7 @@ mod tests {
             AgentToolResultStatusKind::Completed.as_str()
         );
         assert_eq!(parsed["finish_reason"], "completed_with_warnings");
-        assert_eq!(parsed["incomplete"], false);
+        assert!(parsed.get("incomplete").is_none());
 
         let interrupted = render_completed_agent_result("a1", "partial", Some("empty_completion"));
         let parsed: Value = serde_json::from_str(&interrupted).unwrap();
@@ -1548,7 +1572,7 @@ mod tests {
             parsed["finish_reason"],
             crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON
         );
-        assert_eq!(parsed["incomplete"], false);
+        assert!(parsed.get("incomplete").is_none());
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub(crate) async fn apply_turn_success_async(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
     post_commit_tx: Option<&tokio::sync::mpsc::Sender<TurnPostCommitJob>>,
-) {
+) -> bool {
     // A one-shot reconciliation may recover Applied after the primary stream
     // closes. Merge that fact before committing the local turn.
     let active_run_control =
@@ -91,7 +91,8 @@ pub(crate) async fn apply_turn_success_async(
         turn_persisted = commit_outcome.turn_persisted,
         "completed durable primary turn commit"
     );
-    if commit_outcome.turn_persisted {
+    let turn_persisted = commit_outcome.turn_persisted;
+    if turn_persisted {
         let post_commit_started = Instant::now();
         let mut post_commit =
             prepare_turn_post_commit_job(state, api, profile, final_messages, turn_start);
@@ -128,7 +129,10 @@ pub(crate) async fn apply_turn_success_async(
             post_commit_ms = post_commit_started.elapsed().as_millis() as u64,
             "completed non-primary turn post-commit tasks"
         );
+    } else {
+        ui.show_warning("The model responded, but local session history could not be saved. Background updates remain available for the next turn.");
     }
+    turn_persisted
 }
 
 /// The durable primary-turn commit performs just the canonical journal fsync.
@@ -771,7 +775,8 @@ mod tests {
             .map(|(_, assistant)| assistant.as_str())
             .unwrap_or_default();
         assert_eq!(
-            history_text, "Done.\n\n[Turn context: failed: read_file | tool_calls: 1]",
+            history_text,
+            "Done.\n\n[Turn context: failed: read_file | confirmed executed tool calls: 1]",
             "canonical history should contain only the assistant response and the structured tool projection"
         );
         let feedback = state

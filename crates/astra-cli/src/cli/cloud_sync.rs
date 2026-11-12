@@ -18,27 +18,45 @@ use astra_services::{
     SyncOutboxDeliverySettlement, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
     SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
+use astra_sync_protocol::{
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+    SyncOutboxReconcileRequest,
+};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
-use tokio::sync::mpsc;
+use futures_util::{FutureExt, StreamExt};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_side_effects::{
-    enqueue_ingestion_for_immediate_drain_pub, enqueue_ingestion_pub,
-};
+use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+const SYNC_OUTBOX_LOGIN_PROJECTION_WAIT: Duration = Duration::from_secs(2);
+// One full server batch for each concurrent session, still bounded by bytes.
+const SYNC_OUTBOX_BACKGROUND_DRAIN_LIMIT: usize =
+    MAX_SYNC_OUTBOX_BATCH_EVENTS * SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS;
+/// Bound owned record clones retained for one drain, independently of request batches.
+const SYNC_OUTBOX_DRAIN_SERIALIZED_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
-const SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN: Duration = Duration::from_secs(30);
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNC_OUTBOX_SERVICE_RETRY_DELAY: Duration = Duration::from_secs(16);
+/// Stops starting new work well before the 5 minute outbox in-flight lease so
+/// the settlement write still fits inside the lease.
+const SYNC_OUTBOX_DELIVERY_DEADLINE: Duration = Duration::from_secs(180);
+const SYNC_OUTBOX_DEADLINE_ERROR: &str =
+    "sync outbox drain deadline reached before delivery; record stays queued";
+const SYNC_OUTBOX_OWNER_REPLACED_ERROR: &str = "cloud login changed during synchronization";
+const SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS: usize = 8;
+/// Keep the encoded JSON body within the server's global `DefaultBodyLimit`.
+const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
@@ -50,7 +68,61 @@ const SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY: Duration = Duration::from_secs
 const SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 static SYNC_OUTBOX_DRAIN_OWNER: AtomicU64 = AtomicU64::new(0);
 static SYNC_OUTBOX_NEXT_DRAIN_OWNER: AtomicU64 = AtomicU64::new(1);
-static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+static SYNC_OUTBOX_RETRY_WAKE: Mutex<Option<SyncOutboxRetryWake>> = Mutex::new(None);
+static SYNC_OUTBOX_CLOUD_ACCESS: LazyLock<
+    watch::Sender<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>>,
+> = LazyLock::new(|| watch::channel(None).0);
+// Notifications are hints only; the outbox remains the durable source of truth.
+static SYNC_OUTBOX_ISSUE_EVENTS: LazyLock<broadcast::Sender<astra_services::OwnerScope>> =
+    LazyLock::new(|| broadcast::channel(16).0);
+
+pub(crate) fn subscribe_sync_issues() -> broadcast::Receiver<astra_services::OwnerScope> {
+    SYNC_OUTBOX_ISSUE_EVENTS.subscribe()
+}
+
+pub(crate) fn notify_sync_issue(owner: &astra_services::OwnerScope) {
+    let _ = SYNC_OUTBOX_ISSUE_EVENTS.send(owner.clone());
+}
+
+pub(crate) fn subscribe_sync_cloud_access()
+-> watch::Receiver<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>> {
+    SYNC_OUTBOX_CLOUD_ACCESS.subscribe()
+}
+
+pub(crate) fn sync_cloud_access_is_blocked(
+    snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> bool {
+    let blocked = SYNC_OUTBOX_CLOUD_ACCESS.borrow().as_ref() == Some(snapshot);
+    if !blocked {
+        SYNC_OUTBOX_CLOUD_ACCESS.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|old| !old.is_current()) {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    blocked
+}
+
+pub(crate) fn block_sync_cloud_access(
+    snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) {
+    SYNC_OUTBOX_CLOUD_ACCESS.send_if_modified(|blocked| {
+        if !snapshot.is_current() || blocked.as_ref() == Some(snapshot) {
+            return false;
+        }
+        *blocked = Some(snapshot.clone());
+        true
+    });
+}
+
+pub(crate) fn clear_sync_cloud_access() {
+    // A new login must also wake workers using the previous credentials, even
+    // if the old credentials had not yet received an access rejection.
+    let _ = SYNC_OUTBOX_CLOUD_ACCESS.send_replace(None);
+}
 
 /// Process-local hint queue for the durable journal→outbox projector. A hint
 /// can be dropped under pressure because the projector also scans canonical
@@ -185,18 +257,21 @@ impl Drop for SyncOutboxDrainScheduleGuard {
     }
 }
 
-struct SyncOutboxRetryWakeGuard {
+struct SyncOutboxRetryWake {
     deadline: u64,
+    token: u64,
+}
+
+struct SyncOutboxRetryWakeGuard {
+    token: u64,
 }
 
 impl Drop for SyncOutboxRetryWakeGuard {
     fn drop(&mut self) {
-        let _ = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange(
-            self.deadline,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut wake = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+        if wake.as_ref().is_some_and(|wake| wake.token == self.token) {
+            *wake = None;
+        }
     }
 }
 
@@ -512,6 +587,35 @@ async fn reconcile_sync_outbox_journals_for_owner(
     owner_scope: &astra_services::OwnerScope,
     session_ids: &[String],
 ) -> Vec<(String, Result<bool, std::io::Error>)> {
+    let owner = owner_scope.clone();
+    let sessions = session_ids.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        reconcile_sync_outbox_journals_for_owner_blocking(&owner, &sessions)
+    })
+    .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(error) => session_ids
+            .iter()
+            .cloned()
+            .map(|session_id| {
+                (
+                    session_id,
+                    Err(std::io::Error::other(format!(
+                        "journal projection worker failed: {error}"
+                    ))),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Project only durable journal contents, including for callers without a
+/// runtime. Async callers must run this complete operation on the blocking pool.
+pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
+    owner_scope: &astra_services::OwnerScope,
+    session_ids: &[String],
+) -> Vec<(String, Result<bool, std::io::Error>)> {
     const STALE_OFFSET_RETRIES: usize = 3;
     if session_ids.is_empty() {
         return Vec::new();
@@ -539,12 +643,7 @@ async fn reconcile_sync_outbox_journals_for_owner(
         }
         let current_sessions = pending.iter().cloned().collect::<Vec<_>>();
         pending.clear();
-        let offset_sessions = current_sessions.clone();
-        let offsets = match run_sync_outbox_io(store.clone(), move |store| {
-            store.journal_source_offsets(&offset_sessions)
-        })
-        .await
-        {
+        let offsets = match store.journal_source_offsets(&current_sessions) {
             Ok(offsets) => offsets,
             Err(error) => {
                 let message = error.to_string();
@@ -557,40 +656,14 @@ async fn reconcile_sync_outbox_journals_for_owner(
                 break;
             }
         };
-        let read_owner = owner_scope.clone();
-        let read_result = tokio::task::spawn_blocking(move || {
-            current_sessions
-                .into_iter()
-                .map(|session_id| {
-                    let offset = offsets.get(&session_id).copied().unwrap_or(0);
-                    let delta = session_journal::read_durable_journal_append_delta_for_owner(
-                        &read_owner,
-                        &session_id,
-                        offset,
-                    );
-                    (session_id, offset, delta)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        let reads = match read_result {
-            Ok(reads) => reads,
-            Err(error) => {
-                let message = format!("journal delta worker failed: {error}");
-                for session_id in session_ids {
-                    if !outcomes.contains_key(session_id) {
-                        outcomes.insert(
-                            session_id.clone(),
-                            Err(std::io::Error::other(message.clone())),
-                        );
-                    }
-                }
-                break;
-            }
-        };
-
         let mut deltas = Vec::new();
-        for (session_id, offset, delta) in reads {
+        for session_id in current_sessions {
+            let offset = offsets.get(&session_id).copied().unwrap_or(0);
+            let delta = session_journal::read_durable_journal_append_delta_for_owner(
+                owner_scope,
+                &session_id,
+                offset,
+            );
             match delta {
                 Ok(delta) if delta.next_offset == offset => {
                     outcomes.insert(session_id, Ok(false));
@@ -613,15 +686,16 @@ async fn reconcile_sync_outbox_journals_for_owner(
             .iter()
             .map(|delta| delta.source_session_id.clone())
             .collect::<Vec<_>>();
-        let batch_outcome = run_sync_outbox_io(store.clone(), move |store| {
-            store.append_journal_deltas(&deltas)
-        })
-        .await;
+        let batch_outcome = store.append_journal_deltas(&deltas);
         match batch_outcome {
             Ok(batch_outcome) => {
+                let mut terminal = false;
                 for (session_id, outcome) in batch_outcome.outcomes {
                     match outcome {
-                        SyncOutboxJournalDeltaOutcome::Appended { .. } => {
+                        SyncOutboxJournalDeltaOutcome::Appended {
+                            poisoned, skipped, ..
+                        } => {
+                            terminal |= poisoned > 0 || skipped > 0;
                             outcomes.insert(session_id, Ok(true));
                         }
                         SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
@@ -638,6 +712,9 @@ async fn reconcile_sync_outbox_journals_for_owner(
                         }
                     }
                 }
+                if terminal {
+                    notify_sync_issue(owner_scope);
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -650,7 +727,7 @@ async fn reconcile_sync_outbox_journals_for_owner(
             }
         }
         if !pending.is_empty() && attempt + 1 < STALE_OFFSET_RETRIES {
-            tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+            std::thread::sleep(Duration::from_millis(5 * (attempt as u64 + 1)));
         }
     }
     session_ids
@@ -668,18 +745,20 @@ async fn reconcile_sync_outbox_journals_for_owner(
 }
 
 pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
-    run_sync_outbox_io(SyncOutboxStore::local(), |store| store.status()).await
+    read_sync_outbox_status_for_owner(&astra_services::local_owner_scope()).await
 }
 
-pub(crate) async fn retry_deferred_sync_outbox_records() -> std::io::Result<u64> {
-    run_sync_outbox_io(SyncOutboxStore::local(), |store| store.retry_deferred_now()).await
+pub(crate) async fn read_sync_outbox_status_for_owner(
+    owner: &astra_services::OwnerScope,
+) -> std::io::Result<SyncOutboxStatus> {
+    run_sync_outbox_io(SyncOutboxStore::for_owner(owner)?, |store| store.status()).await
 }
 
-pub(crate) async fn repair_retry_exhausted_sync_outbox_records() -> std::io::Result<u64> {
-    run_sync_outbox_io(SyncOutboxStore::local(), |store| {
-        store.repair_retry_exhausted_poison()
-    })
-    .await
+pub(crate) fn terminal_sync_items(status: &SyncOutboxStatus) -> u32 {
+    status
+        .poisoned
+        .saturating_add(status.skipped)
+        .min(u64::from(u32::MAX)) as u32
 }
 
 /// Result from cloud pull attempt at session start.
@@ -698,17 +777,35 @@ pub(crate) struct SyncOutboxDrainReport {
     pub failed: u32,
     pub terminal: u32,
     pub remaining_ready: u32,
-    pub pending_high_watermark_exceeded: bool,
+    pub remaining_unconfirmed: u32,
     pub blocker: Option<SyncOutboxDrainBlocker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncOutboxDrainBlocker {
     MissingAccessToken,
+    CloudAccessRequired,
     InvalidCloudBaseUrl,
     LocalOutboxRead,
     LocalSettlementWrite,
     LocalStatusRead,
+    LocalJournalSync,
+    LocalSyncPending,
+}
+
+impl SyncOutboxDrainBlocker {
+    fn retry_delay(self) -> Option<Duration> {
+        match self {
+            Self::LocalOutboxRead
+            | Self::LocalSettlementWrite
+            | Self::LocalStatusRead
+            | Self::LocalJournalSync
+            | Self::LocalSyncPending => Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY),
+            Self::MissingAccessToken | Self::CloudAccessRequired | Self::InvalidCloudBaseUrl => {
+                None
+            }
+        }
+    }
 }
 
 impl SyncOutboxDrainReport {
@@ -728,6 +825,9 @@ impl SyncOutboxDrainReport {
             Some(SyncOutboxDrainBlocker::MissingAccessToken) => {
                 "no authenticated cloud token was available".to_string()
             }
+            Some(SyncOutboxDrainBlocker::CloudAccessRequired) => {
+                "cloud authentication or access was rejected".to_string()
+            }
             Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl) => {
                 "the configured cloud URL is invalid".to_string()
             }
@@ -740,24 +840,44 @@ impl SyncOutboxDrainReport {
             Some(SyncOutboxDrainBlocker::LocalStatusRead) => {
                 "the remaining local sync status could not be read".to_string()
             }
+            Some(SyncOutboxDrainBlocker::LocalJournalSync) => {
+                "local journal synchronization could not be confirmed".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::LocalSyncPending) => {
+                "recent synchronization is still in progress or unconfirmed".to_string()
+            }
             None if self.failed > 0 && self.terminal > 0 => format!(
-                "{} record(s) remain retryable and {} reached a terminal local state",
+                "{} item(s) will be retried and {} could not be synchronized",
                 self.failed, self.terminal
             ),
             None if self.failed > 0 => format!(
                 "{} queued record(s) could not yet be confirmed by the server",
                 self.failed
             ),
-            None => format!("{} record(s) reached a terminal local state", self.terminal),
+            None => format!("{} item(s) could not be synchronized", self.terminal),
         };
         let recovery = if self.can_retry_automatically() && self.terminal > 0 {
-            "Retryable records remain queued in the background; use /sync repair for terminal records."
+            "Retryable items remain queued. Run `astra doctor` for details about the others."
         } else if self.can_retry_automatically() {
             "They remain queued for background retry."
+        } else if matches!(
+            self.blocker,
+            Some(
+                SyncOutboxDrainBlocker::MissingAccessToken
+                    | SyncOutboxDrainBlocker::CloudAccessRequired
+            )
+        ) {
+            "Check cloud access if needed, then use /login in this session to resume synchronization."
+        } else if self.blocker == Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl) {
+            "Check the configured server address."
+        } else if self.blocker == Some(SyncOutboxDrainBlocker::LocalJournalSync) {
+            "Check local storage or run `astra doctor` for details."
+        } else if self.blocker == Some(SyncOutboxDrainBlocker::LocalSyncPending) {
+            "It may continue in the background; check sync status if needed."
         } else if self.blocker.is_some() {
-            "They remain in the local outbox; use /sync after resolving the issue."
+            "Astra will retry. Run `astra doctor` if the problem continues."
         } else {
-            "Use /sync to inspect or repair the terminal records."
+            "Run `astra doctor` for details."
         };
         Some(format!("Cloud sync is incomplete: {detail}. {recovery}"))
     }
@@ -769,6 +889,10 @@ pub(crate) fn schedule_sync_outbox_drain() {
 
 fn schedule_sync_outbox_drain_after(delay: Duration) {
     if resolve_cloud_base().is_none() {
+        return;
+    }
+    let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    if sync_cloud_access_is_blocked(&auth_snapshot) {
         return;
     }
     if !delay.is_zero() {
@@ -783,15 +907,26 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
         return;
     };
     let Some(schedule_guard) = try_claim_sync_outbox_drain_schedule() else {
+        // A running drain may already have observed an empty outbox. Reuse
+        // the existing coalesced wake so a concurrent enqueue is not lost.
+        schedule_sync_outbox_retry_wake(SYNC_OUTBOX_SERVICE_RETRY_DELAY);
         return;
     };
-    let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     spawn_detached_tracked(&handle, async move {
-        let mut blocked = false;
+        let mut blocker = None;
         for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
-            let report =
-                try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &auth_snapshot).await;
-            blocked = report.blocker.is_some();
+            if !auth_snapshot.is_current() {
+                break;
+            }
+            let report = try_drain_sync_outbox_for_snapshot(
+                SYNC_OUTBOX_BACKGROUND_DRAIN_LIMIT,
+                &auth_snapshot,
+            )
+            .await;
+            blocker = report.blocker;
+            if blocker.is_some_and(|blocker| blocker.retry_delay().is_some()) {
+                notify_sync_issue(&auth_snapshot.owner_scope);
+            }
             if report.attempted > 0 && report.is_incomplete() {
                 tracing::warn!(
                     target: "astra_cli::cloud_sync",
@@ -803,45 +938,40 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
                     "background sync outbox drain did not fully converge"
                 );
             }
-            if !report.cloud_configured || report.remaining_ready == 0 || report.attempted == 0 {
-                break;
-            }
-            if report.pending_high_watermark_exceeded {
-                // A huge monolithic outbox makes every claim/settlement an
-                // O(backlog) transaction. Preserve forward progress, but cap
-                // this wake to one round so sync recovery cannot monopolize
-                // the foreground CLI runtime.
+            if !auth_snapshot.is_current()
+                || blocker.is_some()
+                || !report.cloud_configured
+                || report.remaining_ready == 0
+                || report.attempted == 0
+            {
                 break;
             }
         }
-        if blocked {
-            return;
-        }
-        let status_store = match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_cli::cloud_sync",
-                    ?error,
-                    owner_id = auth_snapshot.owner_scope.id(),
-                    "failed to resolve owner-scoped sync outbox while scheduling the next drain"
-                );
-                return;
-            }
-        };
-        let next_delay = match run_sync_outbox_io(status_store, |store| store.status()).await {
-            Ok(status) => next_sync_outbox_drain_delay(&status),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_cli::cloud_sync",
-                    ?error,
-                    "failed to read sync outbox status while scheduling the next drain"
-                );
-                None
+        let next_delay = if !auth_snapshot.is_current() {
+            None
+        } else if let Some(blocker) = blocker {
+            blocker.retry_delay()
+        } else {
+            match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
+                Ok(store) => match run_sync_outbox_io(store, |store| store.status()).await {
+                    Ok(status) => next_sync_outbox_drain_delay(&status),
+                    Err(error) => {
+                        tracing::warn!(target: "astra_cli::cloud_sync", ?error, "failed to read sync outbox status while scheduling the next drain");
+                        Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY)
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(target: "astra_cli::cloud_sync", ?error, "failed to resolve owner-scoped sync outbox while scheduling the next drain");
+                    None
+                }
             }
         };
         drop(schedule_guard);
-        if let Some(delay) = next_delay {
+        if !auth_snapshot.is_current() {
+            // A newer login may have observed these records while they were
+            // still claimed by this worker. Hand them back to its identity.
+            schedule_sync_outbox_drain();
+        } else if let Some(delay) = next_delay {
             schedule_sync_outbox_drain_after(delay);
         }
     });
@@ -863,28 +993,41 @@ fn schedule_sync_outbox_retry_wake(delay: Duration) {
         return;
     };
     spawn_detached_tracked(&handle, async move {
-        let _wake_guard = wake_guard;
         tokio::time::sleep(delay).await;
-        if SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS
-            .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let wake = {
+            let mut current = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+            if current
+                .as_ref()
+                .is_some_and(|wake| wake.token == wake_guard.token)
+            {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        };
+        drop(wake_guard);
+        if wake {
             schedule_sync_outbox_drain();
         }
     });
 }
 
 fn try_claim_sync_outbox_drain_schedule() -> Option<SyncOutboxDrainScheduleGuard> {
-    let owner = loop {
-        let candidate = SYNC_OUTBOX_NEXT_DRAIN_OWNER.fetch_add(1, Ordering::Relaxed);
-        if candidate != 0 {
-            break candidate;
-        }
-    };
+    let owner = next_sync_outbox_owner();
     SYNC_OUTBOX_DRAIN_OWNER
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .ok()
         .map(|_| SyncOutboxDrainScheduleGuard { owner })
+}
+
+fn next_sync_outbox_owner() -> u64 {
+    loop {
+        let candidate = SYNC_OUTBOX_NEXT_DRAIN_OWNER.fetch_add(1, Ordering::Relaxed);
+        if candidate != 0 {
+            return candidate;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -893,33 +1036,25 @@ fn release_sync_outbox_drain_schedule() {
 }
 
 fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> Option<SyncOutboxRetryWakeGuard> {
-    let mut current = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.load(Ordering::Acquire);
-    loop {
-        if current != 0 && current <= deadline {
-            return None;
-        }
-        match SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange_weak(
-            current,
-            deadline,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(SyncOutboxRetryWakeGuard { deadline }),
-            Err(next) => current = next,
-        }
+    let mut current = recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE);
+    if current
+        .as_ref()
+        .is_some_and(|wake| wake.deadline <= deadline)
+    {
+        return None;
     }
+    let token = next_sync_outbox_owner();
+    *current = Some(SyncOutboxRetryWake { deadline, token });
+    Some(SyncOutboxRetryWakeGuard { token })
 }
 
 #[cfg(test)]
 fn release_sync_outbox_retry_wake_schedule() {
-    SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.store(0, Ordering::Release);
+    *recover_mutex_lock(&SYNC_OUTBOX_RETRY_WAKE) = None;
 }
 
 fn next_sync_outbox_drain_delay(status: &SyncOutboxStatus) -> Option<Duration> {
     if status.claimable > 0 {
-        if status.pending_high_watermark_exceeded {
-            return Some(SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN);
-        }
         return Some(Duration::ZERO);
     }
     let retry_at = status.next_retry_after_unix_ms?;
@@ -1077,6 +1212,10 @@ async fn try_drain_sync_outbox_for_snapshot(
         cloud_configured: true,
         ..Default::default()
     };
+    if sync_cloud_access_is_blocked(auth_snapshot) {
+        report.blocker = Some(SyncOutboxDrainBlocker::CloudAccessRequired);
+        return report;
+    }
     let store = match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
         Ok(store) => store,
         Err(error) => {
@@ -1093,7 +1232,14 @@ async fn try_drain_sync_outbox_for_snapshot(
     match run_sync_outbox_io(store.clone(), |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
-            report.pending_high_watermark_exceeded = status.pending_high_watermark_exceeded;
+            report.remaining_unconfirmed = status
+                .pending
+                .saturating_add(status.in_flight)
+                .min(u64::from(u32::MAX)) as u32;
+            report.terminal = terminal_sync_items(&status);
+            if report.terminal > 0 {
+                notify_sync_issue(&auth_snapshot.owner_scope);
+            }
             if report.remaining_ready == 0 {
                 return report;
             }
@@ -1108,19 +1254,20 @@ async fn try_drain_sync_outbox_for_snapshot(
             return report;
         }
     }
-    let token = if let Some(binding) = &auth_snapshot.native_binding {
-        binding.access_token().await.ok()
-    } else {
-        auth_snapshot.access_token().await
-    };
+    let token = sync_access_token(auth_snapshot).await;
     let Some(token) = token else {
-        report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
-        tracing::debug!(
-            target: "astra_cli::cloud_sync",
-            "sync outbox drain skipped because no access token is available"
-        );
+        if auth_snapshot.is_current() {
+            report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
+            tracing::debug!(
+                target: "astra_cli::cloud_sync",
+                "sync outbox drain skipped because no access token is available"
+            );
+        }
         return report;
     };
+    if !auth_snapshot.is_current() {
+        return report;
+    }
     let client = match astra_thin_client::ThinClient::new(&cloud_base, Some(token.clone())) {
         Ok(client) => match &auth_snapshot.native_binding {
             Some(binding) => client.with_bearer_provider(binding.clone()),
@@ -1137,7 +1284,7 @@ async fn try_drain_sync_outbox_for_snapshot(
         }
     };
     let records = match run_sync_outbox_io(store.clone(), move |store| {
-        store.claim_ready_records(limit)
+        store.claim_ready_records(limit, SYNC_OUTBOX_DRAIN_SERIALIZED_BYTE_BUDGET)
     })
     .await
     {
@@ -1152,51 +1299,50 @@ async fn try_drain_sync_outbox_for_snapshot(
             return report;
         }
     };
-    let mut settlements = Vec::new();
-    for record in records {
-        report.attempted += 1;
-        let body = event_body_from_outbox_record(&record);
-        let delivery = tokio::time::timeout(
-            SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
-            client.post_sync_outbox_event_json(Some(token.as_str()), &body),
+    report.attempted = report
+        .attempted
+        .saturating_add(records.len().min(u32::MAX as usize) as u32);
+    let (settlements, cloud_access_required, service_retry_after) =
+        deliver_sync_outbox_records_within(
+            &client,
+            &token,
+            records,
+            Instant::now() + SYNC_OUTBOX_DELIVERY_DEADLINE,
+            Some(auth_snapshot),
         )
         .await;
-        let delivery_error = match delivery {
-            Ok(Ok(ack)) if ack.confirms(&record.record_id, &record.payload_hash) => None,
-            Ok(Ok(ack)) => Some(format!("cloud returned an uncorrelated sync ack: {ack:?}")),
-            Ok(Err(error)) => Some(error.to_string()),
-            Err(_) => Some(format!(
-                "cloud event delivery timed out after {}ms",
-                SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
-            )),
-        };
-        let delivery_confirmed = delivery_error.is_none()
-            || reconcile_sync_outbox_delivery(&client, &token, &record).await;
-        if delivery_confirmed {
-            settlements.push(SyncOutboxDeliverySettlement::Ack {
-                record_id: record.record_id,
-                payload_hash: record.payload_hash,
-            });
-        } else {
-            settlements.push(SyncOutboxDeliverySettlement::Failed {
-                record_id: record.record_id,
-                error: delivery_error
-                    .unwrap_or_else(|| "cloud delivery could not be reconciled".to_string()),
-            });
-        }
-    }
     if !settlements.is_empty() {
         let attempted_settlements = settlements.len();
         let settlement_result = run_sync_outbox_io(store.clone(), move |store| {
-            store.settle_delivery_batch(&settlements)
+            store.settle_delivery_batch(&settlements, service_retry_after)
         })
         .await;
+        let newly_terminal = settlement_result
+            .as_ref()
+            .is_ok_and(|outcome| outcome.poisoned > 0);
+        let previously_terminal = report.terminal;
         record_settlement_result(&mut report, attempted_settlements, settlement_result);
+        if newly_terminal && previously_terminal == 0 {
+            notify_sync_issue(&auth_snapshot.owner_scope);
+        }
+    }
+    if cloud_access_required {
+        block_sync_cloud_access(auth_snapshot);
+        report
+            .blocker
+            .get_or_insert(SyncOutboxDrainBlocker::CloudAccessRequired);
+    }
+    if !auth_snapshot.is_current() {
+        return report;
     }
     match run_sync_outbox_io(store, |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
-            report.pending_high_watermark_exceeded = status.pending_high_watermark_exceeded;
+            report.remaining_unconfirmed = status
+                .pending
+                .saturating_add(status.in_flight)
+                .min(u64::from(u32::MAX)) as u32;
+            report.terminal = report.terminal.max(terminal_sync_items(&status));
         }
         Err(error) => {
             report
@@ -1210,6 +1356,770 @@ async fn try_drain_sync_outbox_for_snapshot(
         }
     }
     report
+}
+
+struct SyncOutboxDeliveryBatch {
+    records: Vec<SyncOutboxRecord>,
+    request: SyncOutboxEventBatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncOutboxReconciliation {
+    Confirmed,
+    /// The cloud stores this event_id with a different payload. No retry can
+    /// resolve that, so the record must become terminal.
+    Conflict,
+    Missing,
+}
+
+struct SyncOutboxRetryableFailure {
+    error: String,
+    retry_after: Option<Duration>,
+    cloud_access_required: bool,
+}
+
+#[derive(Default)]
+struct SyncOutboxDeliveryControl {
+    access_blocked: AtomicBool,
+    retry_delay_ms: AtomicU64,
+    unresolved_sessions: AtomicUsize,
+}
+
+/// One HTTP batch attempt: per-record verdicts, a missing session, a size or
+/// request rejection, or an unknown commit outcome.
+enum SyncOutboxBatchAttempt {
+    Verdicts(SyncOutboxBatchResponse),
+    SessionUnavailable,
+    PayloadTooLarge(String),
+    RequestRetryable {
+        failure: SyncOutboxRetryableFailure,
+        service_wide: bool,
+    },
+    RequestFailed {
+        error: String,
+        pause_delivery: bool,
+        retry_after: Option<Duration>,
+    },
+}
+
+async fn attempt_sync_outbox_batch(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    request: &SyncOutboxEventBatch,
+) -> SyncOutboxBatchAttempt {
+    match tokio::time::timeout(
+        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
+        client.post_sync_outbox_events_json(Some(token), request),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.schema_version == SYNC_OUTBOX_BATCH_SCHEMA_VERSION => {
+            SyncOutboxBatchAttempt::Verdicts(response)
+        }
+        Ok(Ok(response)) => SyncOutboxBatchAttempt::RequestFailed {
+            error: format!(
+                "cloud returned an unsupported sync batch response version: {}",
+                response.schema_version
+            ),
+            pause_delivery: true,
+            retry_after: None,
+        },
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if status.as_u16() == 409
+                && sync_outbox_error_code(&body).as_deref()
+                    == Some(SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE) =>
+        {
+            SyncOutboxBatchAttempt::SessionUnavailable
+        }
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if sync_outbox_cloud_access_required(status) =>
+        {
+            SyncOutboxBatchAttempt::RequestRetryable {
+                failure: SyncOutboxRetryableFailure {
+                    error: format!("cloud rejected sync batch with HTTP {status}: {body}"),
+                    retry_after: Some(Duration::ZERO),
+                    cloud_access_required: true,
+                },
+                service_wide: true,
+            }
+        }
+        Ok(Err(astra_thin_client::ThinClientError::SyncOutboxBackpressure {
+            status,
+            body,
+            retry_after_seconds,
+        })) => {
+            let error = format!("cloud rejected sync batch with HTTP {status}: {body}");
+            let retry_after = retry_after_seconds.map(Duration::from_secs);
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                SyncOutboxBatchAttempt::RequestRetryable {
+                    failure: SyncOutboxRetryableFailure {
+                        error,
+                        retry_after,
+                        cloud_access_required: false,
+                    },
+                    service_wide: true,
+                }
+            } else {
+                // A server error may follow a committed write, so confirm it first.
+                SyncOutboxBatchAttempt::RequestFailed {
+                    error,
+                    retry_after,
+                    pause_delivery: true,
+                }
+            }
+        }
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE =>
+        {
+            SyncOutboxBatchAttempt::PayloadTooLarge(format!(
+                "cloud rejected sync batch with HTTP {status}: {body}"
+            ))
+        }
+        // A request-level error is not an authoritative verdict on its records.
+        // A route or deployment can be repaired without losing local work.
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if status.is_client_error() && status.as_u16() != 409 =>
+        {
+            SyncOutboxBatchAttempt::RequestRetryable {
+                failure: SyncOutboxRetryableFailure {
+                    error: format!("cloud rejected sync batch with HTTP {status}: {body}"),
+                    retry_after: Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY * 2),
+                    cloud_access_required: false,
+                },
+                service_wide: false,
+            }
+        }
+        Ok(Err(error)) => {
+            let pause_delivery = error.is_transport()
+                || matches!(&error,
+                astra_thin_client::ThinClientError::Api { status, .. } if status.is_server_error());
+            SyncOutboxBatchAttempt::RequestFailed {
+                error: error.to_string(),
+                pause_delivery,
+                retry_after: None,
+            }
+        }
+        Err(_) => SyncOutboxBatchAttempt::RequestFailed {
+            error: format!(
+                "cloud event batch delivery timed out after {}ms",
+                SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
+            ),
+            pause_delivery: true,
+            retry_after: None,
+        },
+    }
+}
+
+fn sync_outbox_cloud_access_required(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
+}
+
+fn sync_outbox_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<astra_core::ErrorResponse>(body)
+        .ok()
+        .and_then(|response| response.error_code)
+}
+
+#[cfg(test)]
+async fn deliver_sync_outbox_records(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+) -> (Vec<SyncOutboxDeliverySettlement>, bool) {
+    let (settlements, access_required, _) = deliver_sync_outbox_records_within(
+        client,
+        token,
+        records,
+        Instant::now() + SYNC_OUTBOX_DELIVERY_DEADLINE,
+        None,
+    )
+    .await;
+    (settlements, access_required)
+}
+
+/// Delivers sessions concurrently within a fixed bound. Batches of one session
+/// stay ordered, and no request starts after `deadline`, so a slow session
+/// cannot make the whole drain outlive the outbox in-flight lease.
+async fn deliver_sync_outbox_records_within(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+    deadline: Instant,
+    auth_snapshot: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+) -> (Vec<SyncOutboxDeliverySettlement>, bool, Option<Duration>) {
+    let control = SyncOutboxDeliveryControl::default();
+    let outcomes = futures_util::stream::iter(
+        sync_outbox_session_batches(records, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES).map(|batches| {
+            let control = &control;
+            async move {
+                if auth_snapshot.is_some_and(|snapshot| !snapshot.is_current()) {
+                    return (
+                        deferred_settlements_with_policy(
+                            batches.into_remaining(),
+                            SYNC_OUTBOX_OWNER_REPLACED_ERROR,
+                            Some(Duration::ZERO),
+                        )
+                        .collect(),
+                        false,
+                    );
+                }
+                let retry_ms = control.retry_delay_ms.load(Ordering::Acquire);
+                if control.access_blocked.load(Ordering::Acquire) || retry_ms > 0 {
+                    let access_required = control.access_blocked.load(Ordering::Acquire);
+                    return (
+                        deferred_settlements_with_policy(
+                            batches.into_remaining(),
+                            if access_required {
+                                "cloud access was rejected"
+                            } else {
+                                "cloud requested a delivery pause"
+                            },
+                            Some(Duration::from_millis(retry_ms)),
+                        )
+                        .collect(),
+                        access_required,
+                    );
+                }
+                deliver_sync_outbox_session(
+                    client,
+                    token,
+                    batches,
+                    deadline,
+                    auth_snapshot,
+                    control,
+                )
+                .await
+            }
+        }),
+    )
+    .buffer_unordered(SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS)
+    .collect::<Vec<_>>()
+    .await;
+    let mut settlements = Vec::new();
+    let mut cloud_access_required = false;
+    for (batch_settlements, blocked) in outcomes {
+        settlements.extend(batch_settlements);
+        cloud_access_required |= blocked;
+    }
+    let retry_ms = control.retry_delay_ms.load(Ordering::Acquire);
+    (
+        settlements,
+        cloud_access_required,
+        (retry_ms > 0).then(|| Duration::from_millis(retry_ms)),
+    )
+}
+
+fn pause_service_delivery(retry_delay_ms: &AtomicU64, delay: Option<Duration>) {
+    let millis = delay
+        .unwrap_or(SYNC_OUTBOX_SERVICE_RETRY_DELAY)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    retry_delay_ms.fetch_max(millis.max(1), Ordering::AcqRel);
+}
+
+async fn sync_access_token(
+    snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Option<String> {
+    tokio::select! {
+        biased;
+        token = async {
+            if let Some(binding) = &snapshot.native_binding {
+                binding.access_token().await.ok()
+            } else {
+                snapshot.access_token().await
+            }
+        } => token,
+        () = wait_for_sync_owner_replacement(Some(snapshot)) => None,
+    }
+}
+
+async fn wait_for_sync_owner_replacement(
+    snapshot: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+) {
+    let Some(snapshot) = snapshot else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let mut changes = subscribe_sync_cloud_access();
+    while snapshot.is_current() {
+        if changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn deliver_sync_outbox_session(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    mut batches: SyncOutboxSessionBatches,
+    deadline: Instant,
+    auth_snapshot: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    control: &SyncOutboxDeliveryControl,
+) -> (Vec<SyncOutboxDeliverySettlement>, bool) {
+    let mut settlements = Vec::new();
+    let mut remaining_error = SYNC_OUTBOX_DEADLINE_ERROR;
+    let mut cloud_access_required = false;
+    let mut owner_replaced = false;
+    let owner_replacement = wait_for_sync_owner_replacement(auth_snapshot);
+    tokio::pin!(owner_replacement);
+    for batch in batches.by_ref() {
+        let retry_ms = control.retry_delay_ms.load(Ordering::Acquire);
+        if control.access_blocked.load(Ordering::Acquire) || retry_ms > 0 {
+            cloud_access_required = control.access_blocked.load(Ordering::Acquire);
+            settlements.extend(deferred_settlements_with_policy(
+                batch.records.into_iter(),
+                "cloud delivery is paused",
+                Some(Duration::from_millis(retry_ms)),
+            ));
+            remaining_error = "cloud delivery is paused";
+            break;
+        }
+        if auth_snapshot.is_some_and(|snapshot| !snapshot.is_current()) {
+            settlements.extend(deferred_settlements_with_policy(
+                batch.records.into_iter(),
+                SYNC_OUTBOX_OWNER_REPLACED_ERROR,
+                Some(Duration::ZERO),
+            ));
+            owner_replaced = true;
+            remaining_error = SYNC_OUTBOX_OWNER_REPLACED_ERROR;
+            break;
+        }
+        if Instant::now() >= deadline {
+            settlements.extend(deferred_settlements(
+                batch.records.into_iter(),
+                SYNC_OUTBOX_DEADLINE_ERROR,
+            ));
+            break;
+        }
+        let previous_len = settlements.len();
+        let batch_ids = batch
+            .records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<Vec<_>>();
+        cloud_access_required = tokio::select! {
+            biased;
+            blocked = deliver_sync_outbox_batch_records(client, token, batch, &mut settlements, deadline, control) => blocked,
+            () = &mut owner_replacement => {
+                settlements.extend(batch_ids.into_iter().map(|record_id| SyncOutboxDeliverySettlement::Deferred {
+                    record_id,
+                    error: SYNC_OUTBOX_OWNER_REPLACED_ERROR.to_string(),
+                    retry_after: Some(Duration::ZERO),
+                }));
+                owner_replaced = true;
+                remaining_error = SYNC_OUTBOX_OWNER_REPLACED_ERROR;
+                break;
+            }
+        };
+        if settlements[previous_len..]
+            .iter()
+            .any(|result| matches!(result, SyncOutboxDeliverySettlement::Deferred { .. }))
+        {
+            remaining_error = "an earlier batch for this session is still pending";
+            break;
+        }
+    }
+    settlements.extend(deferred_settlements_with_policy(
+        batches.into_remaining(),
+        remaining_error,
+        if owner_replaced || cloud_access_required {
+            Some(Duration::ZERO)
+        } else {
+            let retry_ms = control.retry_delay_ms.load(Ordering::Acquire);
+            (retry_ms > 0).then(|| Duration::from_millis(retry_ms))
+        },
+    ));
+    (settlements, cloud_access_required)
+}
+
+/// Settles one batch. Only unknown commit outcomes need reconciliation; request
+/// rejections preserve records, and size rejections split the batch in order.
+async fn deliver_sync_outbox_batch_records(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    SyncOutboxDeliveryBatch { records, request }: SyncOutboxDeliveryBatch,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+    deadline: Instant,
+    control: &SyncOutboxDeliveryControl,
+) -> bool {
+    let mut pending = VecDeque::from([SyncOutboxDeliveryBatch { records, request }]);
+    while let Some(SyncOutboxDeliveryBatch { records, request }) = pending.pop_front() {
+        let retry_ms = control.retry_delay_ms.load(Ordering::Acquire);
+        if control.access_blocked.load(Ordering::Acquire) || retry_ms > 0 {
+            let access_required = control.access_blocked.load(Ordering::Acquire);
+            settlements.extend(deferred_settlements_with_policy(
+                records.into_iter(),
+                "cloud delivery is paused",
+                Some(Duration::from_millis(retry_ms)),
+            ));
+            for batch in pending {
+                settlements.extend(deferred_settlements_with_policy(
+                    batch.records.into_iter(),
+                    "cloud delivery is paused",
+                    Some(Duration::from_millis(retry_ms)),
+                ));
+            }
+            return access_required;
+        }
+        if Instant::now() >= deadline {
+            settlements.extend(deferred_settlements(
+                records.into_iter(),
+                SYNC_OUTBOX_DEADLINE_ERROR,
+            ));
+            break;
+        }
+        // The builder admits an oversized singleton so the record is never lost.
+        // It can never fit the server body limit, so settle it here instead of
+        // sending a request that is guaranteed to fail.
+        if records.len() == 1
+            && serde_json::to_vec(&request)
+                .is_ok_and(|body| body.len() > SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES)
+        {
+            settlements.push(SyncOutboxDeliverySettlement::Rejected {
+            record_id: records[0].record_id.clone(),
+            error: format!(
+                "record exceeds the {SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES} byte sync batch body limit"
+            ),
+        });
+            continue;
+        }
+        let previous_len = settlements.len();
+        match attempt_sync_outbox_batch(client, token, &request).await {
+            SyncOutboxBatchAttempt::Verdicts(response) => {
+                settle_sync_outbox_verdicts(records, response, settlements);
+            }
+            SyncOutboxBatchAttempt::SessionUnavailable => {
+                settlements.extend(records.into_iter().map(|record| {
+                    SyncOutboxDeliverySettlement::Rejected {
+                        record_id: record.record_id,
+                        error: "cloud session is unavailable for event ingestion".to_string(),
+                    }
+                }));
+            }
+            SyncOutboxBatchAttempt::PayloadTooLarge(error) => {
+                if records.len() == 1 {
+                    settlements.extend(deferred_settlements(records.into_iter(), &error));
+                    break;
+                }
+                let mid = records.len() / 2;
+                let mut left_records = records;
+                let right_records = left_records.split_off(mid);
+                let mut left_events = request.events;
+                let right_events = left_events.split_off(mid);
+                pending.push_front(SyncOutboxDeliveryBatch {
+                    records: right_records,
+                    request: SyncOutboxEventBatch::new(right_events),
+                });
+                pending.push_front(SyncOutboxDeliveryBatch {
+                    records: left_records,
+                    request: SyncOutboxEventBatch::new(left_events),
+                });
+            }
+            SyncOutboxBatchAttempt::RequestRetryable {
+                failure,
+                service_wide,
+            } => {
+                if failure.cloud_access_required {
+                    control.access_blocked.store(true, Ordering::Release);
+                } else if service_wide {
+                    pause_service_delivery(&control.retry_delay_ms, failure.retry_after);
+                } else if control.unresolved_sessions.fetch_add(1, Ordering::AcqRel) + 1
+                    >= SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS
+                {
+                    pause_service_delivery(&control.retry_delay_ms, None);
+                }
+                settlements.extend(deferred_settlements_with_policy(
+                    records.into_iter(),
+                    &failure.error,
+                    failure.retry_after,
+                ));
+                for batch in pending {
+                    settlements.extend(deferred_settlements_with_policy(
+                        batch.records.into_iter(),
+                        &failure.error,
+                        failure.retry_after,
+                    ));
+                }
+                return failure.cloud_access_required;
+            }
+            SyncOutboxBatchAttempt::RequestFailed {
+                error,
+                pause_delivery,
+                retry_after,
+            } => {
+                if Instant::now() >= deadline {
+                    settlements.extend(deferred_settlements(
+                        records.into_iter(),
+                        SYNC_OUTBOX_DEADLINE_ERROR,
+                    ));
+                    if pause_delivery {
+                        pause_service_delivery(&control.retry_delay_ms, retry_after);
+                    }
+                    break;
+                }
+                let previous_len = settlements.len();
+                let access = settle_sync_outbox_reconciliation(
+                    client,
+                    token,
+                    records,
+                    error,
+                    settlements,
+                    if pause_delivery {
+                        Some(SYNC_OUTBOX_SERVICE_RETRY_DELAY * 2)
+                    } else {
+                        None
+                    },
+                    control,
+                )
+                .await;
+                let unresolved = settlements[previous_len..]
+                    .iter()
+                    .any(|result| matches!(result, SyncOutboxDeliverySettlement::Deferred { .. }));
+                // A lost response that reconciles successfully is not an outage.
+                if pause_delivery && retry_after.is_some() {
+                    pause_service_delivery(&control.retry_delay_ms, retry_after);
+                } else if pause_delivery
+                    && unresolved
+                    && !access
+                    && control.unresolved_sessions.fetch_add(1, Ordering::AcqRel) + 1
+                        >= SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS
+                {
+                    pause_service_delivery(&control.retry_delay_ms, None);
+                }
+                if access || unresolved {
+                    for batch in pending {
+                        settlements.extend(deferred_settlements(
+                            batch.records.into_iter(),
+                            "an earlier batch for this session is still pending",
+                        ));
+                    }
+                    return access;
+                }
+            }
+        }
+        if settlements[previous_len..]
+            .iter()
+            .any(|result| matches!(result, SyncOutboxDeliverySettlement::Deferred { .. }))
+        {
+            break;
+        }
+    }
+    for batch in pending {
+        settlements.extend(deferred_settlements(
+            batch.records.into_iter(),
+            "an earlier batch for this session is still pending",
+        ));
+    }
+    false
+}
+
+/// Per-record verdicts are authoritative: accepted records are acked and
+/// rejected records terminate, so one bad record never charges its siblings.
+fn settle_sync_outbox_verdicts(
+    records: Vec<SyncOutboxRecord>,
+    response: SyncOutboxBatchResponse,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+) {
+    let expected = records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut acks = BTreeMap::new();
+    let mut rejections = BTreeMap::new();
+    let usable = response.acks.iter().all(|ack| {
+        expected.contains(ack.record_id.as_str())
+            && acks.insert(ack.record_id.clone(), ack).is_none()
+    }) && response.rejections.iter().all(|rejection| {
+        expected.contains(rejection.record_id.as_str())
+            && !acks.contains_key(&rejection.record_id)
+            && rejections
+                .insert(rejection.record_id.clone(), rejection)
+                .is_none()
+    });
+    if !usable {
+        settlements.extend(deferred_settlements(
+            records.into_iter(),
+            "cloud returned an uncorrelated sync batch verdict",
+        ));
+        return;
+    }
+    for record in records {
+        if let Some(ack) = acks.get(&record.record_id) {
+            if ack.matches(&record.record_id, &record.payload_hash) {
+                settlements.push(SyncOutboxDeliverySettlement::Ack {
+                    record_id: record.record_id,
+                    payload_hash: record.payload_hash,
+                });
+            } else {
+                settlements.push(SyncOutboxDeliverySettlement::Rejected {
+                    record_id: record.record_id,
+                    error: "cloud acknowledged a different payload for this record".to_string(),
+                });
+            }
+        } else if let Some(rejection) = rejections.get(&record.record_id) {
+            settlements.push(SyncOutboxDeliverySettlement::Rejected {
+                record_id: record.record_id,
+                error: format!("{}: {}", rejection.error_code, rejection.detail),
+            });
+        } else {
+            settlements.push(SyncOutboxDeliverySettlement::Deferred {
+                record_id: record.record_id,
+                error: "cloud accepted the batch without a verdict for this record".to_string(),
+                retry_after: None,
+            });
+        }
+    }
+}
+
+/// A request-level failure has an unknown commit outcome. One read-only batch
+/// reconciliation settles every record without re-posting healthy siblings.
+async fn settle_sync_outbox_reconciliation(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    records: Vec<SyncOutboxRecord>,
+    delivery_error: String,
+    settlements: &mut Vec<SyncOutboxDeliverySettlement>,
+    unresolved_retry_after: Option<Duration>,
+    control: &SyncOutboxDeliveryControl,
+) -> bool {
+    let reconciliations = match reconcile_sync_outbox_deliveries(client, token, &records).await {
+        Ok(reconciliations) => reconciliations,
+        Err(failure) => {
+            if failure.cloud_access_required {
+                control.access_blocked.store(true, Ordering::Release);
+            } else {
+                pause_service_delivery(&control.retry_delay_ms, failure.retry_after);
+            }
+            let error = format!("{delivery_error}; {}", failure.error);
+            settlements.extend(deferred_settlements_with_policy(
+                records.into_iter(),
+                &error,
+                failure.retry_after,
+            ));
+            return failure.cloud_access_required;
+        }
+    };
+    for (record, reconciliation) in records.into_iter().zip(reconciliations) {
+        match reconciliation {
+            SyncOutboxReconciliation::Confirmed => {
+                settlements.push(SyncOutboxDeliverySettlement::Ack {
+                    record_id: record.record_id,
+                    payload_hash: record.payload_hash,
+                });
+            }
+            SyncOutboxReconciliation::Conflict => {
+                let error = format!(
+                    "cloud stores {} with a different payload; retry cannot reconcile it",
+                    record.record_id
+                );
+                settlements.push(SyncOutboxDeliverySettlement::Rejected {
+                    record_id: record.record_id,
+                    error,
+                });
+            }
+            SyncOutboxReconciliation::Missing => {
+                settlements.push(SyncOutboxDeliverySettlement::Deferred {
+                    record_id: record.record_id,
+                    error: delivery_error.clone(),
+                    retry_after: unresolved_retry_after,
+                });
+            }
+        }
+    }
+    false
+}
+
+/// Records skipped for time remain pending for a later drain.
+fn deferred_settlements(
+    records: impl Iterator<Item = SyncOutboxRecord>,
+    error: &str,
+) -> impl Iterator<Item = SyncOutboxDeliverySettlement> {
+    deferred_settlements_with_policy(records, error, None)
+}
+
+fn deferred_settlements_with_policy(
+    records: impl Iterator<Item = SyncOutboxRecord>,
+    error: &str,
+    retry_after: Option<Duration>,
+) -> impl Iterator<Item = SyncOutboxDeliverySettlement> {
+    let error = error.to_string();
+    records.map(move |record| SyncOutboxDeliverySettlement::Deferred {
+        record_id: record.record_id,
+        error: error.clone(),
+        retry_after,
+    })
+}
+
+/// Splits one drain into per-session units so sessions can be delivered
+/// concurrently while each session keeps its event order.
+fn sync_outbox_session_batches(
+    records: Vec<SyncOutboxRecord>,
+    byte_limit: usize,
+) -> impl Iterator<Item = SyncOutboxSessionBatches> {
+    let mut by_session = BTreeMap::<String, Vec<SyncOutboxRecord>>::new();
+    for record in records {
+        by_session
+            .entry(record.session_id.clone())
+            .or_default()
+            .push(record);
+    }
+    let empty_batch_bytes = serde_json::to_vec(&SyncOutboxEventBatch::new(Vec::new()))
+        .expect("sync outbox batch JSON must serialize")
+        .len();
+    by_session
+        .into_values()
+        .map(move |records| SyncOutboxSessionBatches {
+            records: records.into_iter().peekable(),
+            byte_limit,
+            empty_batch_bytes,
+        })
+}
+
+/// Builds one request at a time. Original outbox records remain bounded by the
+/// drain limit, while derived event JSON is retained only for the active batch.
+struct SyncOutboxSessionBatches {
+    records: std::iter::Peekable<std::vec::IntoIter<SyncOutboxRecord>>,
+    byte_limit: usize,
+    empty_batch_bytes: usize,
+}
+
+impl SyncOutboxSessionBatches {
+    fn into_remaining(self) -> impl Iterator<Item = SyncOutboxRecord> {
+        self.records
+    }
+}
+
+impl Iterator for SyncOutboxSessionBatches {
+    type Item = SyncOutboxDeliveryBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut records = Vec::with_capacity(MAX_SYNC_OUTBOX_BATCH_EVENTS);
+        let mut events = Vec::with_capacity(MAX_SYNC_OUTBOX_BATCH_EVENTS);
+        let mut encoded_bytes = self.empty_batch_bytes;
+        while let Some(record) = self.records.peek() {
+            let event = event_body_from_outbox_record(record);
+            let event_bytes = serde_json::to_vec(&event)
+                .expect("sync outbox event JSON must serialize")
+                .len();
+            let additional_bytes = event_bytes + usize::from(!events.is_empty());
+            if !events.is_empty()
+                && (records.len() == MAX_SYNC_OUTBOX_BATCH_EVENTS
+                    || encoded_bytes + additional_bytes > self.byte_limit)
+            {
+                break;
+            }
+            encoded_bytes += additional_bytes;
+            records.push(self.records.next().expect("peeked sync outbox record"));
+            events.push(event);
+        }
+        (!events.is_empty()).then(|| SyncOutboxDeliveryBatch {
+            records,
+            request: SyncOutboxEventBatch::new(events),
+        })
+    }
 }
 
 fn record_settlement_result(
@@ -1257,22 +2167,6 @@ fn unix_ms() -> Option<u64> {
 }
 
 fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
-    let mut metadata = record
-        .payload
-        .get("metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    metadata.insert(
-        "sync_outbox".to_string(),
-        json!({
-            "schema_version": record.schema_version,
-            "record_id": record.record_id,
-            "sequence": record.sequence,
-            "payload_hash": record.payload_hash,
-            "event_ts": record.event_ts,
-        }),
-    );
     json!({
         "event_id": record.record_id,
         "session_id": record.session_id,
@@ -1280,30 +2174,111 @@ fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
         "content": record.canonical_payload_json(),
         "agent_id": "edge_sync",
         "agent_version": env!("CARGO_PKG_VERSION"),
-        "metadata": Value::Object(metadata),
+        "metadata": {
+            "sync_outbox": {
+                "schema_version": record.schema_version,
+                "record_id": record.record_id,
+                "sequence": record.sequence,
+                "payload_hash": record.payload_hash,
+                "event_ts": record.event_ts,
+            }
+        },
     })
 }
 
-async fn reconcile_sync_outbox_delivery(
+/// Read-only reconciliation for a batch whose commit outcome is unknown.
+/// An error means the response cannot be trusted; callers must defer, using the
+/// server-directed delay when one was provided.
+async fn reconcile_sync_outbox_deliveries(
     client: &astra_thin_client::ThinClient,
     token: &str,
-    record: &SyncOutboxRecord,
-) -> bool {
-    client
-        .get_event_json(Some(token), &record.record_id)
-        .await
-        .ok()
-        .is_some_and(|event| stored_event_matches_outbox_record(record, &event))
-}
-
-fn stored_event_matches_outbox_record(record: &SyncOutboxRecord, response: &Value) -> bool {
-    response.get("event_id").and_then(Value::as_str) == Some(record.record_id.as_str())
-        && response
-            .get("metadata")
-            .and_then(|metadata| metadata.get("sync_outbox"))
-            .and_then(|sync| sync.get("payload_hash"))
-            .and_then(Value::as_str)
-            == Some(record.payload_hash.as_str())
+    records: &[SyncOutboxRecord],
+) -> Result<Vec<SyncOutboxReconciliation>, SyncOutboxRetryableFailure> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let request = SyncOutboxReconcileRequest::new(
+        records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect(),
+    );
+    let response = match tokio::time::timeout(
+        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
+        client.reconcile_sync_outbox_events_json(Some(token), &request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(astra_thin_client::ThinClientError::Api { status, body }))
+            if sync_outbox_cloud_access_required(status) =>
+        {
+            return Err(SyncOutboxRetryableFailure {
+                error: format!("cloud rejected sync reconciliation with HTTP {status}: {body}"),
+                retry_after: Some(Duration::ZERO),
+                cloud_access_required: true,
+            });
+        }
+        Ok(Err(astra_thin_client::ThinClientError::SyncOutboxBackpressure {
+            status,
+            body,
+            retry_after_seconds,
+        })) => {
+            return Err(SyncOutboxRetryableFailure {
+                error: format!("cloud rejected sync reconciliation with HTTP {status}: {body}"),
+                retry_after: retry_after_seconds.map(Duration::from_secs),
+                cloud_access_required: false,
+            });
+        }
+        Ok(Err(error)) => {
+            return Err(SyncOutboxRetryableFailure {
+                error: format!("cloud reconciliation failed: {error}"),
+                retry_after: None,
+                cloud_access_required: false,
+            });
+        }
+        Err(_) => {
+            return Err(SyncOutboxRetryableFailure {
+                error: "cloud reconciliation timed out".to_string(),
+                retry_after: None,
+                cloud_access_required: false,
+            });
+        }
+    };
+    let expected = records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    if response.schema_version != SYNC_OUTBOX_BATCH_SCHEMA_VERSION
+        || !response.rejections.is_empty()
+        || response.acks.len() > records.len()
+        || !response.acks.iter().all(|ack| {
+            expected.contains(ack.record_id.as_str()) && seen.insert(ack.record_id.as_str())
+        })
+    {
+        return Err(SyncOutboxRetryableFailure {
+            error: "cloud returned an uncorrelated sync reconciliation response".to_string(),
+            retry_after: None,
+            cloud_access_required: false,
+        });
+    }
+    Ok(records
+        .iter()
+        .map(|record| {
+            match response
+                .acks
+                .iter()
+                .find(|ack| ack.record_id == record.record_id)
+            {
+                Some(ack) if ack.matches(&record.record_id, &record.payload_hash) => {
+                    SyncOutboxReconciliation::Confirmed
+                }
+                Some(_) => SyncOutboxReconciliation::Conflict,
+                None => SyncOutboxReconciliation::Missing,
+            }
+        })
+        .collect())
 }
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════
@@ -1347,14 +2322,17 @@ pub(crate) fn append_cloud_pull_sync_journal(
     pull: &CloudPullResult,
     pref_keys: &[String],
 ) {
-    append_cloud_pull_sync_journal_with_enqueue(
-        state,
-        profile,
-        source,
-        pull,
-        pref_keys,
-        enqueue_ingestion_pub,
-    );
+    let result = append_cloud_pull_sync_marker(state, profile, source, pull, pref_keys);
+    if let Err(error) = &result {
+        tracing::warn!(?error, "failed to append cloud pull journal marker");
+    }
+    if !matches!(result, Ok(false))
+        && let Some(writer) = matching_session_journal(state)
+    {
+        // An append error can follow a complete write; let the projector
+        // establish what is actually durable before enqueueing anything.
+        schedule_journal_ingestion(writer);
+    }
 }
 
 pub(crate) fn append_cloud_pull_sync_journal_for_immediate_drain(
@@ -1363,67 +2341,71 @@ pub(crate) fn append_cloud_pull_sync_journal_for_immediate_drain(
     source: &str,
     pull: &CloudPullResult,
     pref_keys: &[String],
-) {
-    append_cloud_pull_sync_journal_with_enqueue(
-        state,
-        profile,
-        source,
-        pull,
-        pref_keys,
-        enqueue_ingestion_for_immediate_drain_pub,
-    );
+) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+    let append = append_cloud_pull_sync_marker(state, profile, source, pull, pref_keys);
+    let binding = (!matches!(append, Ok(false)))
+        .then(|| matching_session_journal(state))
+        .flatten()
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    async move {
+        let projection = if let Some((owner, session_id)) = binding {
+            reconcile_sync_outbox_journals_for_owner(&owner, &[session_id])
+                .await
+                .into_iter()
+                .next()
+                .map(|(_, outcome)| outcome.map(|_| ()))
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::other(
+                        "journal projection returned no outcome",
+                    ))
+                })
+        } else {
+            Ok(())
+        };
+        if append.is_err()
+            && let Err(error) = &projection
+        {
+            tracing::warn!(?error, "journal projection also failed after append error");
+        }
+        // An append error can follow a complete write. Reconcile what is
+        // durable, but preserve the original uncertainty for the caller.
+        append.map(|_| ())?;
+        projection
+    }
 }
 
-fn append_cloud_pull_sync_journal_with_enqueue(
+fn matching_session_journal(state: &SessionState) -> Option<&session_journal::JournalWriter> {
+    let writer = state.journal.as_ref()?;
+    (state.session_id.as_deref() == Some(writer.session_id())).then_some(writer)
+}
+
+fn append_cloud_pull_sync_marker(
     state: &SessionState,
     profile: &str,
     source: &str,
     pull: &CloudPullResult,
     pref_keys: &[String],
-    enqueue: fn(&SessionState, &session_journal::JournalEvent),
-) {
+) -> std::io::Result<bool> {
     if !should_append_cloud_pull_journal(pull, pref_keys, source) {
-        return;
+        return Ok(false);
     }
     let Some(sid) = state.session_id.as_deref() else {
-        return;
+        return Ok(false);
     };
+    let writer = matching_session_journal(state).ok_or_else(|| {
+        std::io::Error::other("cloud pull marker has no matching session journal")
+    })?;
     let reachable_empty_ack =
         pull.cloud_reachable && !cloud_pull_warrants_sync_marker(pull, pref_keys);
-    let evt = session_journal::JournalEvent::cloud_pull_sync_marker(
+    let event = session_journal::JournalEvent::cloud_pull_sync_marker(
         Some(sid),
         profile,
         source,
         pref_keys,
         reachable_empty_ack,
     );
-    let Some(writer) = state.journal.as_ref() else {
-        tracing::warn!(
-            session_id = sid,
-            context = "cloud_sync:cloud_pull_sync_marker",
-            "skipping cloud pull sync marker because the live session has no journal"
-        );
-        return;
-    };
-    if writer.session_id() != sid {
-        tracing::error!(
-            session_id = sid,
-            journal_session_id = writer.session_id(),
-            context = "cloud_sync:cloud_pull_sync_marker",
-            "refusing to append a cloud pull marker through another session's journal"
-        );
-        return;
-    }
-    if let Err(error) = writer.append(&evt) {
-        tracing::warn!(
-            session_id = sid,
-            context = "cloud_sync:cloud_pull_sync_marker",
-            ?error,
-            "failed to append session journal event"
-        );
-    } else {
-        enqueue(state, &evt);
-    }
+    writer.append(&event)?;
+    Ok(true)
 }
 
 /// Re-sync preferences and queued edge events after authentication. Login is
@@ -1433,53 +2415,1597 @@ pub(crate) async fn post_auth_cloud_resync(
     profile: Option<&str>,
     state: &mut SessionState,
 ) -> SyncOutboxDrainReport {
+    post_auth_cloud_resync_with_wait(profile, state, SYNC_OUTBOX_LOGIN_PROJECTION_WAIT).await
+}
+
+pub(crate) async fn post_auth_cloud_resync_with_wait(
+    profile: Option<&str>,
+    state: &mut SessionState,
+    wait: Duration,
+) -> SyncOutboxDrainReport {
+    clear_sync_cloud_access();
     let profile_name = profile.unwrap_or("default");
     let pull = try_cloud_pull(profile_name).await;
     let pref_keys = try_cloud_pull_preferences(state).await;
-    append_cloud_pull_sync_journal_for_immediate_drain(
+    let binding = matching_session_journal(state)
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    let projection = append_cloud_pull_sync_journal_for_immediate_drain(
         state,
         profile_name,
         "post_login",
         &pull,
         &pref_keys,
     );
-    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.is_incomplete() {
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            attempted = report.attempted,
-            acked = report.acked,
-            failed = report.failed,
-            terminal = report.terminal,
-            remaining_ready = report.remaining_ready,
-            blocker = ?report.blocker,
-            "post-authentication cloud sync did not fully converge"
-        );
+    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let cloud_configured = snapshot.native_binding.is_some() || resolve_cloud_base().is_some();
+    let mut job = tokio::spawn(run_post_auth_sync(projection, binding, snapshot.clone()));
+    match tokio::time::timeout(wait, &mut job).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "post-login sync task failed");
+            SyncOutboxDrainReport {
+                cloud_configured,
+                blocker: Some(SyncOutboxDrainBlocker::LocalJournalSync),
+                ..Default::default()
+            }
+        }
+        Err(_) => {
+            // The job still owns projection and will drain when it finishes.
+            // Existing independent backlog can proceed while it waits.
+            if snapshot.is_current() {
+                schedule_sync_outbox_drain();
+            }
+            SyncOutboxDrainReport {
+                cloud_configured,
+                blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
+                ..Default::default()
+            }
+        }
     }
-    if report.can_retry_automatically() {
+}
+
+pub(crate) async fn run_post_auth_sync(
+    projection: impl Future<Output = std::io::Result<()>> + Send,
+    binding: Option<(astra_services::OwnerScope, String)>,
+    snapshot: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> SyncOutboxDrainReport {
+    let projection = projection.await;
+    let mut report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &snapshot).await;
+    let can_drain_remaining = report.blocker.is_none();
+    if let Err(error) = projection {
+        tracing::warn!(
+            ?error,
+            "post-login journal synchronization could not be confirmed"
+        );
+        if let Some((owner, session_id)) = &binding {
+            notify_sync_issue(owner);
+            let _ = schedule_sync_outbox_journal_ingestion_for_owner(owner, session_id);
+        }
+        report
+            .blocker
+            .get_or_insert(SyncOutboxDrainBlocker::LocalJournalSync);
+    }
+    let snapshot_current = snapshot.is_current();
+    if !snapshot_current
+        || binding
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &snapshot.owner_scope)
+    {
+        // A new login for the same owner may have observed records while
+        // this task held them in flight. Hand them to the current binding.
+        if astra_services::local_owner_scope() == snapshot.owner_scope
+            && (!snapshot_current || can_drain_remaining)
+        {
+            schedule_sync_outbox_drain();
+        }
+        // A result captured for a prior owner must not describe the
+        // currently attached account or report its token as invalid.
+        return SyncOutboxDrainReport {
+            cloud_configured: report.cloud_configured,
+            blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
+            ..Default::default()
+        };
+    }
+    if report.remaining_unconfirmed > 0 && !report.is_incomplete() {
+        report.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending);
+    }
+    if report.is_incomplete() {
+        tracing::warn!(target: "astra_cli::cloud_sync", attempted = report.attempted,
+                acked = report.acked, failed = report.failed, terminal = report.terminal,
+                remaining_ready = report.remaining_ready, blocker = ?report.blocker,
+                "post-authentication cloud sync did not fully converge");
+    }
+    if can_drain_remaining && snapshot.is_current() {
         schedule_sync_outbox_drain();
+    } else if snapshot.is_current()
+        && let Some(delay) = report.blocker.and_then(SyncOutboxDrainBlocker::retry_delay)
+    {
+        notify_sync_issue(&snapshot.owner_scope);
+        schedule_sync_outbox_drain_after(delay);
     }
     report
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
-        JournalIngestScheduleOutcome, SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES,
+        JournalIngestScheduleOutcome, MAX_SYNC_OUTBOX_BATCH_EVENTS,
+        SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES, SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES,
         SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW, SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY,
-        SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
-        cloud_pull_warrants_sync_marker, defer_journal_ingest_hint, next_sync_outbox_drain_delay,
-        reconcile_sync_outbox_journal, record_settlement_result,
-        release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
-        run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
-        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
+        SyncOutboxDeliveryBatch, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
+        cloud_pull_warrants_sync_marker, defer_journal_ingest_hint, deliver_sync_outbox_records,
+        deliver_sync_outbox_records_within, deliver_sync_outbox_session,
+        event_body_from_outbox_record, next_sync_outbox_drain_delay, reconcile_sync_outbox_journal,
+        record_settlement_result, release_sync_outbox_drain_schedule,
+        release_sync_outbox_retry_wake_schedule, run_sync_outbox_io,
+        schedule_sync_outbox_journal_ingestion, should_append_cloud_pull_journal,
+        sync_outbox_session_batches, try_claim_sync_outbox_drain_schedule,
     };
+
+    fn delivery_batches(
+        records: Vec<SyncOutboxRecord>,
+    ) -> impl Iterator<Item = SyncOutboxDeliveryBatch> {
+        sync_outbox_session_batches(records, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES).flatten()
+    }
+
+    fn delivery_batches_with_limit(
+        records: Vec<SyncOutboxRecord>,
+        byte_limit: usize,
+    ) -> impl Iterator<Item = SyncOutboxDeliveryBatch> {
+        sync_outbox_session_batches(records, byte_limit).flatten()
+    }
     use astra_services::session_journal::{JournalEvent, JournalWriter, ProcessJournalDirGuard};
-    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
+    use astra_services::{
+        SyncDomain, SyncOutboxDeliverySettlement, SyncOutboxRecord, SyncOutboxRecordState,
+        SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
+    };
     use fs2::FileExt;
+
+    fn delivery_record(sequence: u64, session_id: &str) -> SyncOutboxRecord {
+        SyncOutboxRecord {
+            schema_version: 2,
+            sequence,
+            record_id: format!("record-{sequence}"),
+            domain: SyncDomain::Events,
+            session_id: session_id.to_string(),
+            event_type: "journal".to_string(),
+            event_ts: String::new(),
+            payload_hash: format!("sha256:{sequence}"),
+            payload: serde_json::json!({}),
+            state: SyncOutboxRecordState::Pending,
+            next_retry_after_unix_ms: None,
+            last_error: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            acked_at_unix_ms: None,
+        }
+    }
+
+    async fn mount_sync_outbox_reconciliation(
+        server: &wiremock::MockServer,
+        records: &[SyncOutboxRecord],
+        confirmed: &[bool],
+    ) {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxIngestionStatus,
+            SyncOutboxReconcileRequest,
+        };
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        assert_eq!(records.len(), confirmed.len());
+        let request = SyncOutboxReconcileRequest::new(
+            records
+                .iter()
+                .map(|record| record.record_id.clone())
+                .collect(),
+        );
+        let acks = records
+            .iter()
+            .zip(confirmed)
+            .filter(|(_, confirmed)| **confirmed)
+            .map(|(record, _)| {
+                SyncOutboxAck::new(
+                    &record.record_id,
+                    &record.payload_hash,
+                    SyncOutboxIngestionStatus::IdempotentReplay,
+                )
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(SyncOutboxBatchResponse::new(acks, Vec::new())),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn sync_outbox_conflict_response(error_code: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(409).set_body_json(
+            astra_core::ErrorResponse::new("sync outbox request rejected")
+                .with_error_code(error_code),
+        )
+    }
+
+    async fn assert_one_batch_and_reconciliation_request(server: &wiremock::MockServer) {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("received outbox requests");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one batch POST and one reconciliation POST; no per-record calls"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "POST")
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/sync/outbox/events")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/sync/outbox/events/reconcile")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn delivery_batches_are_bounded_and_session_ordered() {
+        let batches = delivery_batches(vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-b"),
+            delivery_record(3, "session-a"),
+        ])
+        .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0]
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(batches.iter().all(|batch| {
+            let session_id = &batch.records[0].session_id;
+            batch
+                .records
+                .iter()
+                .all(|record| &record.session_id == session_id)
+        }));
+
+        let oversized = (0..=MAX_SYNC_OUTBOX_BATCH_EVENTS as u64)
+            .map(|sequence| delivery_record(sequence, "session-a"))
+            .collect();
+        let batches = delivery_batches(oversized).collect::<Vec<_>>();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .collect::<Vec<_>>(),
+            vec![MAX_SYNC_OUTBOX_BATCH_EVENTS, 1]
+        );
+        assert!(
+            batches[0]
+                .records
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+    }
+
+    #[test]
+    fn delivery_batches_also_bound_encoded_body_bytes() {
+        let records = (1..=3)
+            .map(|sequence| {
+                let mut record = delivery_record(sequence, "session-a");
+                record.payload = serde_json::json!({"blob": "x".repeat(900)});
+                record
+            })
+            .collect();
+        let batches = delivery_batches_with_limit(records, 2_048).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| {
+            serde_json::to_vec(&batch.request)
+                .expect("batch JSON")
+                .len()
+                <= 2_048
+        }));
+
+        let mut oversized = delivery_record(4, "session-a");
+        oversized.payload = serde_json::json!({"blob": "x".repeat(3_000)});
+        let batches = delivery_batches_with_limit(vec![oversized], 2_048).collect::<Vec<_>>();
+        assert_eq!(
+            batches.len(),
+            1,
+            "an oversized singleton must not be dropped"
+        );
+        assert_eq!(batches[0].records.len(), 1);
+    }
+
+    #[test]
+    fn sync_notice_describes_available_recovery() {
+        let retry = SyncOutboxDrainReport {
+            failed: 1,
+            ..Default::default()
+        };
+        assert!(retry.user_notice().unwrap().contains("background retry"));
+        let terminal = SyncOutboxDrainReport {
+            terminal: 1,
+            ..Default::default()
+        };
+        let notice = terminal.user_notice().unwrap();
+        assert!(notice.contains("astra doctor"));
+        assert!(!notice.contains("/sync"));
+        let missing_auth = SyncOutboxDrainReport {
+            blocker: Some(super::SyncOutboxDrainBlocker::MissingAccessToken),
+            ..Default::default()
+        };
+        assert!(missing_auth.user_notice().unwrap().contains("/login"));
+        for blocker in [
+            super::SyncOutboxDrainBlocker::LocalOutboxRead,
+            super::SyncOutboxDrainBlocker::LocalSettlementWrite,
+            super::SyncOutboxDrainBlocker::LocalStatusRead,
+        ] {
+            assert!(blocker.retry_delay().is_some());
+            assert!(
+                SyncOutboxDrainReport {
+                    blocker: Some(blocker),
+                    ..Default::default()
+                }
+                .user_notice()
+                .unwrap()
+                .contains("retry")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_session_does_not_block_other_sessions_from_starting() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxIngestionStatus,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let records = (0..9)
+            .map(|index| delivery_record(index, &format!("session-{index:02}")))
+            .collect::<Vec<_>>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        for (index, record) in records.iter().enumerate() {
+            let request = astra_sync_protocol::SyncOutboxEventBatch::new(vec![
+                event_body_from_outbox_record(record),
+            ]);
+            let response = ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
+                vec![SyncOutboxAck::new(
+                    &record.record_id,
+                    &record.payload_hash,
+                    SyncOutboxIngestionStatus::Created,
+                )],
+                Vec::new(),
+            ));
+            let mock = Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .and(body_json(serde_json::to_value(request).unwrap()));
+            if index == 0 {
+                mock.respond_with(response.set_delay(Duration::from_secs(5)))
+                    .mount(&server)
+                    .await;
+            } else if index == 8 {
+                let started_tx = std::sync::Arc::clone(&started_tx);
+                mock.respond_with(move |_: &wiremock::Request| {
+                    if let Some(sender) = started_tx.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                    response.clone()
+                })
+                .mount(&server)
+                .await;
+            } else {
+                mock.respond_with(response).mount(&server).await;
+            }
+        }
+        let delivery =
+            tokio::spawn(
+                async move { deliver_sync_outbox_records(&client, "token", records).await },
+            );
+        let ninth_started = tokio::time::timeout(Duration::from_secs(2), started_rx).await;
+        delivery.abort();
+        let _ = delivery.await;
+        assert!(matches!(ninth_started, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn unresolved_batch_defers_later_batches_for_the_same_session() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let records = (1..=3)
+            .map(|sequence| {
+                let mut record = delivery_record(sequence, "session-a");
+                record.payload = serde_json::json!({"blob": "x".repeat(900)});
+                record
+            })
+            .collect::<Vec<_>>();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records[..1], &[false]).await;
+        let batches = sync_outbox_session_batches(records, 2_048).next().unwrap();
+        let (settlements, _) = deliver_sync_outbox_session(
+            &client,
+            "token",
+            batches,
+            Instant::now() + Duration::from_secs(10),
+            None,
+            &super::SyncOutboxDeliveryControl::default(),
+        )
+        .await;
+        assert_eq!(settlements.len(), 3);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn expired_drain_deadline_defers_without_requests() {
+        use astra_thin_client::ThinClient;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-b"),
+        ];
+
+        let (settlements, _, _) = deliver_sync_outbox_records_within(
+            &client,
+            "token",
+            records.clone(),
+            Instant::now() - Duration::from_millis(1),
+            None,
+        )
+        .await;
+
+        assert_eq!(settlements.len(), records.len());
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an expired drain deadline must not start more requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_conflict_with_different_payload_is_terminal() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let record = delivery_record(1, "session-a");
+        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(&request).unwrap()))
+            .respond_with(sync_outbox_conflict_response(
+                astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "acks": [{
+                    "record_id": record.record_id,
+                    "payload_hash": "sha256:someone-else",
+                    "ingestion_status": "idempotent_replay"
+                }],
+                "rejections": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(
+            matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Rejected { .. }]
+            ),
+            "a permanent payload conflict must be rejected instead of deferred: {settlements:?}"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn request_level_rejection_preserves_records_and_session_order() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = (1..=MAX_SYNC_OUTBOX_BATCH_EVENTS + 1)
+            .map(|sequence| delivery_record(sequence as u64, "session-a"))
+            .collect::<Vec<_>>();
+        let batches = delivery_batches(records.clone()).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(
+                serde_json::to_value(&batches[0].request).unwrap(),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_string("unsupported batch schema"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        let first_batch_len = batches[0].records.len();
+        assert!(settlements[..first_batch_len].iter().all(|settlement| {
+            matches!(
+                settlement,
+                astra_services::SyncOutboxDeliverySettlement::Deferred { error, .. }
+                    if error.contains("HTTP 400")
+            )
+        }));
+        assert!(matches!(
+            &settlements[first_batch_len],
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        ));
+        server.verify().await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .all(|request| request.url.path() == "/sync/outbox/events"),
+            "a request-level rejection must not trigger reconciliation or send later records"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_verdicts_settle_rejections_and_ack_siblings() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+            SyncOutboxIngestionStatus, SyncOutboxRejection,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+            delivery_record(3, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(
+                serde_json::to_value(SyncOutboxEventBatch::new(
+                    records.iter().map(event_body_from_outbox_record).collect(),
+                ))
+                .unwrap(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
+                    vec![
+                        SyncOutboxAck::new(
+                            &records[0].record_id,
+                            &records[0].payload_hash,
+                            SyncOutboxIngestionStatus::Created,
+                        ),
+                        SyncOutboxAck::new(
+                            &records[2].record_id,
+                            &records[2].payload_hash,
+                            SyncOutboxIngestionStatus::Created,
+                        ),
+                    ],
+                    vec![SyncOutboxRejection::new(
+                        &records[1].record_id,
+                        astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+                        "stored payload differs",
+                    )],
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 3);
+        for (index, settlement) in settlements.iter().enumerate() {
+            match settlement {
+                astra_services::SyncOutboxDeliverySettlement::Ack { record_id, .. } => {
+                    assert_ne!(index, 1);
+                    assert_eq!(record_id, &format!("record-{}", index + 1));
+                }
+                astra_services::SyncOutboxDeliverySettlement::Rejected { record_id, .. } => {
+                    assert_eq!(index, 1);
+                    assert_eq!(record_id, "record-2");
+                }
+                astra_services::SyncOutboxDeliverySettlement::Deferred { .. } => {
+                    panic!("a record verdict must not be deferred");
+                }
+            }
+        }
+        server.verify().await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1,
+            "record verdicts must be settled from the single batch response"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_failures_defer_without_record_isolation() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records, &[false, false]).await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_reconciliation_defers_record_rejection() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred { .. }
+        )));
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn lost_batch_ack_reconciles_without_reposting_committed_records() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gateway lost the response"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, &records, &[true, true]).await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records.clone()).await;
+        assert_eq!(settlements.len(), records.len());
+        for (settlement, record) in settlements.iter().zip(&records) {
+            match settlement {
+                astra_services::SyncOutboxDeliverySettlement::Ack { record_id, .. } => {
+                    assert_eq!(record_id, &record.record_id);
+                }
+                astra_services::SyncOutboxDeliverySettlement::Rejected { error, .. }
+                | astra_services::SyncOutboxDeliverySettlement::Deferred { error, .. } => {
+                    panic!("committed record must reconcile after a lost ACK: {error}");
+                }
+            }
+        }
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
+
+    #[tokio::test]
+    async fn session_conflict_does_not_isolate_records() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let records = vec![
+            delivery_record(1, "session-a"),
+            delivery_record(2, "session-a"),
+        ];
+        let request =
+            SyncOutboxEventBatch::new(records.iter().map(event_body_from_outbox_record).collect());
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(sync_outbox_conflict_response(
+                astra_sync_protocol::SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert_eq!(settlements.len(), 2);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Rejected { .. }
+        )));
+        server.verify().await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1,
+            "a deleted session must fail the batch without reconciliation"
+        );
+    }
+
+    #[test]
+    fn event_body_keeps_journal_metadata_only_in_content() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+
+        let mut record = delivery_record(1, "session-a");
+        record.payload = serde_json::json!({
+            "metadata": {"large": "x".repeat(2_200_000)},
+        });
+        let event = event_body_from_outbox_record(&record);
+        assert_eq!(event["metadata"].as_object().unwrap().len(), 1);
+        assert!(event["metadata"].get("large").is_none());
+        let content: serde_json::Value =
+            serde_json::from_str(event["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            content["metadata"]["large"].as_str().unwrap().len(),
+            2_200_000
+        );
+
+        let batch = SyncOutboxEventBatch::new(vec![event]);
+        assert!(
+            serde_json::to_vec(&batch).unwrap().len() < super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+            "metadata should not be duplicated into the outer request envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_client_errors_defer_without_reconciliation() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [401, 402, 403, 407, 408, 423, 425, 429] {
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).expect("thin client");
+            let expected_retry_after = match status {
+                401 | 403 => Some(Duration::ZERO),
+                429 => Some(Duration::from_secs(3_600)),
+                _ => Some(super::SYNC_OUTBOX_SERVICE_RETRY_DELAY * 2),
+            };
+            let mut response = ResponseTemplate::new(status).set_body_string("retry later");
+            if status == 429 {
+                response = response.insert_header("retry-after", "3600");
+            }
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let record = delivery_record(u64::from(status), &format!("session-{status}"));
+            let (settlements, blocked) =
+                deliver_sync_outbox_records(&client, "token", vec![record]).await;
+            assert_eq!(blocked, matches!(status, 401 | 403));
+            assert!(matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Deferred {
+                    error,
+                    retry_after,
+                    ..
+                }] if error.contains(&format!("HTTP {status}"))
+                    && *retry_after == expected_retry_after
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "retryable HTTP {status} must not trigger reconciliation"
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn access_denial_stops_starting_more_session_requests() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let records = (1..=20)
+            .map(|sequence| delivery_record(sequence, &format!("session-{sequence}")))
+            .collect();
+        let (settlements, blocked) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert!(blocked);
+        assert_eq!(settlements.len(), 20);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred {
+                retry_after: Some(delay), ..
+            } if *delay == Duration::ZERO
+        )));
+        let requests = server.received_requests().await.unwrap().len();
+        assert!((1..=8).contains(&requests), "sent {requests} requests");
+    }
+
+    #[tokio::test]
+    async fn access_denial_keeps_later_session_batches_immediately_retryable() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let records = (1..=3)
+            .map(|sequence| {
+                let mut record = delivery_record(sequence, "session-a");
+                record.payload = serde_json::json!({"blob": "x".repeat(900)});
+                record
+            })
+            .collect();
+        let batches = sync_outbox_session_batches(records, 2_048).next().unwrap();
+        let (settlements, blocked) = deliver_sync_outbox_session(
+            &client,
+            "token",
+            batches,
+            Instant::now() + Duration::from_secs(10),
+            None,
+            &super::SyncOutboxDeliveryControl::default(),
+        )
+        .await;
+        assert!(blocked);
+        assert_eq!(settlements.len(), 3);
+        assert!(settlements.iter().all(|settlement| matches!(
+            settlement,
+            astra_services::SyncOutboxDeliverySettlement::Deferred {
+                retry_after: Some(delay), ..
+            } if *delay == Duration::ZERO
+        )));
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn new_login_interrupts_network_wait_without_losing_completed_ack() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        use astra_services::SyncOutboxDeliverySettlement;
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
+        };
+        use astra_thin_client::ThinClient;
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _credentials = crate::tests::isolate_credentials();
+        for waiting_on_reconcile in [false, true] {
+            let _owner = install_cli_profile_identity_for_test("a", Some("account-a")).unwrap();
+            let snapshot = cli_owner_auth_snapshot();
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let records = (1..=3)
+                .map(|sequence| {
+                    let mut record = delivery_record(sequence, "session-a");
+                    record.payload = serde_json::json!({"blob": "x".repeat(900)});
+                    record
+                })
+                .collect::<Vec<_>>();
+            let first_id = records[0].record_id.clone();
+            let body = |record: &SyncOutboxRecord| {
+                serde_json::to_value(SyncOutboxEventBatch::new(vec![
+                    event_body_from_outbox_record(record),
+                ]))
+                .unwrap()
+            };
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .and(body_json(body(&records[0])))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    SyncOutboxBatchResponse::new(
+                        vec![SyncOutboxAck::new(
+                            &records[0].record_id,
+                            &records[0].payload_hash,
+                            SyncOutboxIngestionStatus::Created,
+                        )],
+                        Vec::new(),
+                    ),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+            let waiting = move |_: &wiremock::Request| {
+                if let Some(started) = started_tx.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(30))
+            };
+            let second = Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .and(body_json(body(&records[1])));
+            if waiting_on_reconcile {
+                second
+                    .respond_with(ResponseTemplate::new(503))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/sync/outbox/events/reconcile"))
+                    .respond_with(waiting)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            } else {
+                second.respond_with(waiting).expect(1).mount(&server).await;
+            }
+            let batches = sync_outbox_session_batches(records, 2_048).next().unwrap();
+            let delivery = tokio::spawn(async move {
+                deliver_sync_outbox_session(
+                    &client,
+                    "token",
+                    batches,
+                    Instant::now() + Duration::from_secs(60),
+                    Some(&snapshot),
+                    &super::SyncOutboxDeliveryControl::default(),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let _new_owner = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
+            super::clear_sync_cloud_access();
+            let (settlements, blocked) = tokio::time::timeout(Duration::from_secs(5), delivery)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!blocked);
+            assert!(
+                matches!(&settlements[0], SyncOutboxDeliverySettlement::Ack { record_id, .. } if record_id == &first_id)
+            );
+            assert_eq!(settlements.len(), 3);
+            assert!(settlements[1..].iter().all(|settlement| matches!(
+                settlement,
+                SyncOutboxDeliverySettlement::Deferred { retry_after: Some(delay), .. } if *delay == Duration::ZERO
+            )));
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn new_login_interrupts_wait_for_old_credentials() {
+        use crate::cli::auth_flow::{AuthTokenPayload, save_profile_auth_tokens};
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        use std::future::Future;
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = install_cli_profile_identity_for_test("sync-test", Some("account")).unwrap();
+        let tokens = |access: &str| AuthTokenPayload {
+            user_id: "account".into(),
+            access_token: access.into(),
+            refresh_token: "refresh".into(),
+        };
+        save_profile_auth_tokens(Some("sync-test"), "user", &tokens("old")).unwrap();
+        let snapshot = cli_owner_auth_snapshot();
+        let binding = snapshot.legacy_binding.as_ref().unwrap().clone();
+        let old_pair = binding.pair.lock().await;
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let resolver = tokio::spawn(async move {
+            let mut token = Box::pin(super::sync_access_token(&snapshot));
+            let mut waiting_tx = Some(waiting_tx);
+            std::future::poll_fn(|cx| {
+                let result = token.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(waiting) = waiting_tx.take()
+                {
+                    let _ = waiting.send(());
+                }
+                result
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        save_profile_auth_tokens(Some("sync-test"), "user", &tokens("new")).unwrap();
+        super::clear_sync_cloud_access();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), resolver)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        drop(old_pair);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_access_denial_remains_pending_for_relogin() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(ResponseTemplate::new(502))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events/reconcile"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let (settlements, blocked) =
+                deliver_sync_outbox_records(&client, "token", vec![delivery_record(1, "a")]).await;
+            assert!(blocked);
+            assert!(matches!(settlements.as_slice(), [
+                astra_services::SyncOutboxDeliverySettlement::Deferred {
+                    retry_after: Some(delay), error, ..
+                }
+            ] if *delay == Duration::ZERO && error.contains(&format!("HTTP {status}"))));
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn access_denial_does_not_discard_another_sessions_ack() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxIngestionStatus,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let denied = delivery_record(1, "denied");
+        let accepted = delivery_record(2, "accepted");
+        let request = |record: &SyncOutboxRecord| {
+            serde_json::to_value(astra_sync_protocol::SyncOutboxEventBatch::new(vec![
+                event_body_from_outbox_record(record),
+            ]))
+            .unwrap()
+        };
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(request(&denied)))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(request(&accepted)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
+                    vec![SyncOutboxAck::new(
+                        &accepted.record_id,
+                        &accepted.payload_hash,
+                        SyncOutboxIngestionStatus::Created,
+                    )],
+                    Vec::new(),
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let (settlements, blocked) =
+            deliver_sync_outbox_records(&client, "token", vec![denied, accepted]).await;
+        assert!(blocked);
+        assert!(settlements.iter().any(|result| matches!(
+            result, astra_services::SyncOutboxDeliverySettlement::Ack { record_id, .. } if record_id == "record-2"
+        )));
+        assert!(settlements.iter().any(|result| matches!(
+            result, astra_services::SyncOutboxDeliverySettlement::Deferred { record_id, .. } if record_id == "record-1"
+        )));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rate_limit_preserves_server_retry_delay() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string("slow down")
+                    .insert_header("retry-after", "19"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (settlements, _) =
+            deliver_sync_outbox_records(&client, "token", vec![delivery_record(1, "session-a")])
+                .await;
+        assert!(matches!(
+            settlements.as_slice(),
+            [astra_services::SyncOutboxDeliverySettlement::Deferred {
+                error,
+                retry_after: Some(retry_after),
+                ..
+            }] if error.contains("HTTP 500") && *retry_after == Duration::from_secs(19)
+        ));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn request_level_client_errors_remain_pending_without_reconciliation() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [404, 405, 410, 413, 422] {
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).expect("thin client");
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("invalid request"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let record = delivery_record(u64::from(status), &format!("session-{status}"));
+            let (settlements, _) =
+                deliver_sync_outbox_records(&client, "token", vec![record]).await;
+            assert!(matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Deferred { error, .. }]
+                    if error.contains(&format!("HTTP {status}"))
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "HTTP {status} must not trigger reconciliation"
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_body_limit_splits_batch_without_losing_valid_records() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.body.len() > 3_000 {
+                    return ResponseTemplate::new(413);
+                }
+                let body: SyncOutboxEventBatch = serde_json::from_slice(&request.body).unwrap();
+                let acks = body
+                    .events
+                    .into_iter()
+                    .map(|event| {
+                        SyncOutboxAck::new(
+                            event["event_id"].as_str().unwrap(),
+                            event["metadata"]["sync_outbox"]["payload_hash"]
+                                .as_str()
+                                .unwrap(),
+                            SyncOutboxIngestionStatus::Created,
+                        )
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(acks, vec![]))
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let records = (1..=2)
+            .map(|sequence| {
+                let mut record = delivery_record(sequence, "session-a");
+                record.payload = serde_json::json!({"blob": "x".repeat(2_000)});
+                record
+            })
+            .collect::<Vec<_>>();
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", records).await;
+        assert!(matches!(settlements.as_slice(), [
+            SyncOutboxDeliverySettlement::Ack { record_id: a, .. },
+            SyncOutboxDeliverySettlement::Ack { record_id: b, .. }
+        ] if a == "record-1" && b == "record-2"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn service_failure_stops_other_session_requests_and_preserves_retry_after() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [400, 429, 500, 503] {
+            let server = MockServer::start().await;
+            let response = if matches!(status, 400 | 500) {
+                ResponseTemplate::new(status)
+            } else {
+                ResponseTemplate::new(status).insert_header("retry-after", "60")
+            };
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let reconciliation = if status == 500 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "schema_version": 1, "acks": [], "rejections": []
+                }))
+            } else {
+                ResponseTemplate::new(503).insert_header("retry-after", "90")
+            };
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events/reconcile"))
+                .respond_with(reconciliation)
+                .mount(&server)
+                .await;
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let records = (0..1_000)
+                .map(|sequence| delivery_record(sequence, &format!("s-{sequence:04}")))
+                .collect();
+            let (settlements, access, retry_after) = deliver_sync_outbox_records_within(
+                &client,
+                "token",
+                records,
+                Instant::now() + Duration::from_secs(20),
+                None,
+            )
+            .await;
+            assert!(!access);
+            assert_eq!(
+                retry_after,
+                Some(Duration::from_secs(match status {
+                    400 | 500 => 16,
+                    429 => 60,
+                    _ => 90,
+                }))
+            );
+            assert_eq!(settlements.len(), 1_000);
+            assert!(
+                settlements
+                    .iter()
+                    .all(|result| matches!(result, SyncOutboxDeliverySettlement::Deferred { .. }))
+            );
+            if matches!(status, 400 | 500) {
+                assert!(settlements.iter().any(|result| matches!(result,
+                    SyncOutboxDeliverySettlement::Deferred { retry_after: Some(delay), error, .. }
+                        if *delay == super::SYNC_OUTBOX_SERVICE_RETRY_DELAY * 2 && error.contains(&format!("HTTP {status}"))
+                )));
+            }
+            let requests = server.received_requests().await.unwrap();
+            let writes = requests
+                .iter()
+                .filter(|request| request.url.path() == "/sync/outbox/events")
+                .count();
+            let reads = requests.len() - writes;
+            let max_writes = if matches!(status, 400 | 500) {
+                2 * super::SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS - 1
+            } else {
+                super::SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS
+            };
+            assert!(
+                (1..=max_writes).contains(&writes),
+                "{status}: {writes} writes"
+            );
+            assert!(
+                reads <= writes,
+                "{status}: {reads} reconciliations for {writes} writes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_request_failure_does_not_pause_healthy_sessions() {
+        use astra_sync_protocol::{
+            SyncOutboxAck, SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
+        };
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [400, 500] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let batch: SyncOutboxEventBatch =
+                        serde_json::from_slice(&request.body).unwrap();
+                    let event = &batch.events[0];
+                    if event["session_id"] == "s-0000" {
+                        return ResponseTemplate::new(status);
+                    }
+                    ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
+                        vec![SyncOutboxAck::new(
+                            event["event_id"].as_str().unwrap(),
+                            event["metadata"]["sync_outbox"]["payload_hash"]
+                                .as_str()
+                                .unwrap(),
+                            SyncOutboxIngestionStatus::Created,
+                        )],
+                        vec![],
+                    ))
+                })
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events/reconcile"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "schema_version": 1, "acks": [], "rejections": []
+                })))
+                .expect(if status == 500 { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let records = (0..100)
+                .map(|sequence| delivery_record(sequence, &format!("s-{sequence:04}")))
+                .collect();
+            let (settlements, access, retry) = deliver_sync_outbox_records_within(
+                &client,
+                "token",
+                records,
+                Instant::now() + Duration::from_secs(20),
+                None,
+            )
+            .await;
+            assert!(!access && retry.is_none());
+            assert_eq!(
+                settlements
+                    .iter()
+                    .filter(|result| matches!(result, SyncOutboxDeliverySettlement::Ack { .. }))
+                    .count(),
+                99
+            );
+            assert_eq!(
+                settlements
+                    .iter()
+                    .filter(|result| matches!(
+                        result,
+                        SyncOutboxDeliverySettlement::Deferred { .. }
+                    ))
+                    .count(),
+                1
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciled_server_errors_still_honor_retry_after() {
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [500, 502, 503, 504] {
+            let server = MockServer::start().await;
+            let client = ThinClient::new(&server.uri(), None).unwrap();
+            let records = vec![delivery_record(1, "session-a")];
+            Mock::given(method("POST"))
+                .and(path("/sync/outbox/events"))
+                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "17"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_sync_outbox_reconciliation(&server, &records, &[true]).await;
+            let (settlements, access, retry) = deliver_sync_outbox_records_within(
+                &client,
+                "token",
+                records,
+                Instant::now() + Duration::from_secs(20),
+                None,
+            )
+            .await;
+            assert!(!access);
+            assert_eq!(retry, Some(Duration::from_secs(17)));
+            assert!(matches!(
+                settlements.as_slice(),
+                [SyncOutboxDeliverySettlement::Ack { .. }]
+            ));
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_singleton_is_failed_without_a_request() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let mut record = delivery_record(1, "session-a");
+        record.payload = serde_json::json!({
+            "blob": "x".repeat(super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES),
+        });
+        assert!(
+            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![
+                event_body_from_outbox_record(&record)
+            ]))
+            .unwrap()
+            .len()
+                > super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(matches!(
+            settlements.as_slice(),
+            [astra_services::SyncOutboxDeliverySettlement::Rejected { .. }]
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an oversized record must fail locally instead of sending a doomed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_lost_ack_reconciles_without_repeating_post() {
+        use astra_sync_protocol::SyncOutboxEventBatch;
+        use astra_thin_client::ThinClient;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).expect("thin client");
+        let record = delivery_record(1, "session-a");
+        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(body_json(serde_json::to_value(request).unwrap()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gateway lost the response"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_sync_outbox_reconciliation(&server, std::slice::from_ref(&record), &[true]).await;
+
+        let (settlements, _) = deliver_sync_outbox_records(&client, "token", vec![record]).await;
+        assert!(
+            matches!(
+                settlements.as_slice(),
+                [astra_services::SyncOutboxDeliverySettlement::Ack { .. }]
+            ),
+            "a committed record must reconcile instead of being re-posted: {settlements:?}"
+        );
+        server.verify().await;
+        assert_one_batch_and_reconciliation_request(&server).await;
+    }
 
     #[test]
     fn journal_ingest_retry_budget_quarantines_and_success_resets() {
@@ -1550,6 +4076,119 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn concurrent_drain_hint_eventually_delivers_after_the_guard_releases() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _journal = ProcessJournalDirGuard::new(temp.path());
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "sync-wake-test",
+            Some("account"),
+        )
+        .unwrap();
+        crate::cli::auth_flow::save_profile_auth_tokens(
+            Some("sync-wake-test"),
+            "user",
+            &crate::cli::auth_flow::AuthTokenPayload {
+                user_id: "account".into(),
+                access_token: "test-token".into(),
+                refresh_token: "test-refresh".into(),
+            },
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let server = runtime.block_on(MockServer::start());
+        temp_env::with_var("ASTRA_API_URL", Some(server.uri()), || {
+            runtime.block_on(async {
+                Mock::given(method("POST")).and(path("/sync/outbox/events"))
+                    .respond_with(|request: &wiremock::Request| {
+                        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        let event = &body["events"][0];
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "schema_version": 1,
+                            "acks": [{"record_id": event["event_id"], "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"], "ingestion_status": "created"}],
+                            "rejections": []
+                        }))
+                    }).expect(1).mount(&server).await;
+                super::clear_sync_cloud_access();
+                release_sync_outbox_drain_schedule();
+                release_sync_outbox_retry_wake_schedule();
+                let guard = try_claim_sync_outbox_drain_schedule().unwrap();
+                let store = SyncOutboxStore::local();
+                store.enqueue_journal_event(&JournalEvent::config_change(Some("wake-session"), "model", "test")).unwrap();
+                super::schedule_sync_outbox_drain();
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_some());
+                tokio::task::yield_now().await;
+                tokio::time::advance(super::SYNC_OUTBOX_SERVICE_RETRY_DELAY).await;
+                tokio::task::yield_now().await;
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_some(),
+                    "a busy wake must schedule another wake");
+                drop(guard);
+                tokio::task::yield_now().await;
+                tokio::time::advance(super::SYNC_OUTBOX_SERVICE_RETRY_DELAY).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if store.status().unwrap().acked == 1 { break; }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("busy hint must eventually deliver after the active drain releases");
+                server.verify().await;
+                release_sync_outbox_drain_schedule();
+                release_sync_outbox_retry_wake_schedule();
+            });
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn blocked_access_stops_new_drains_and_an_existing_retry_wake() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = install_cli_profile_identity_for_test("sync-test", Some("account")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        temp_env::with_var("ASTRA_API_URL", Some("http://127.0.0.1:9"), || {
+            runtime.block_on(async {
+                super::clear_sync_cloud_access();
+                release_sync_outbox_drain_schedule();
+                release_sync_outbox_retry_wake_schedule();
+                super::schedule_sync_outbox_retry_wake(Duration::from_secs(30));
+                tokio::task::yield_now().await;
+                let snapshot = cli_owner_auth_snapshot();
+                super::block_sync_cloud_access(&snapshot);
+
+                super::schedule_sync_outbox_drain();
+                drop(
+                    try_claim_sync_outbox_drain_schedule()
+                        .expect("blocked hint must not schedule a drain"),
+                );
+                tokio::time::advance(Duration::from_secs(30)).await;
+                tokio::task::yield_now().await;
+                assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_none());
+                drop(
+                    try_claim_sync_outbox_drain_schedule()
+                        .expect("old wake must not schedule a drain"),
+                );
+                super::clear_sync_cloud_access();
+            });
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn stale_drain_guard_cannot_release_a_new_owner() {
         release_sync_outbox_drain_schedule();
         let stale = try_claim_sync_outbox_drain_schedule().expect("stale drain owner");
@@ -1593,6 +4232,21 @@ mod tests {
         );
         drop(current);
         assert!(claim_sync_outbox_retry_wake_deadline(150).is_some());
+        release_sync_outbox_retry_wake_schedule();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn stale_retry_wake_guard_cannot_clear_a_reused_deadline() {
+        release_sync_outbox_retry_wake_schedule();
+        let stale = claim_sync_outbox_retry_wake_deadline(200).unwrap();
+        let earlier = claim_sync_outbox_retry_wake_deadline(100).unwrap();
+        drop(earlier);
+        let current = claim_sync_outbox_retry_wake_deadline(200).unwrap();
+        drop(stale);
+        assert!(claim_sync_outbox_retry_wake_deadline(300).is_none());
+        drop(current);
+        assert!(claim_sync_outbox_retry_wake_deadline(300).is_some());
         release_sync_outbox_retry_wake_schedule();
     }
 
@@ -1815,8 +4469,8 @@ mod tests {
         status.pending_high_watermark_exceeded = true;
         assert_eq!(
             next_sync_outbox_drain_delay(&status),
-            Some(super::SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN),
-            "a huge ready backlog must make progress without a zero-delay CPU/IO loop"
+            Some(Duration::ZERO),
+            "a healthy service must drain an existing backlog without a fixed cooldown"
         );
     }
 }

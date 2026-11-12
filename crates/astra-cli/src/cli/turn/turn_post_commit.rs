@@ -6,6 +6,7 @@ use super::turn_commit::DeferredTurnSidecarWork;
 use crate::cli::notifications;
 use crate::cli::session::session_projection::build_full_session_state_compact;
 use crate::cli::session::session_state::SessionState;
+use astra_services::SessionArtifactStore;
 
 /// CSL is a local continuation projection of a primary journal turn, not its
 /// durability boundary. It runs on the post-commit worker, so latency must not
@@ -71,13 +72,24 @@ pub(crate) fn prepare_turn_post_commit_job(
     // worker receives a fresh manager and reconciles from durable CSL state,
     // which keeps rapid consecutive turns ordered without leaving a temporary
     // `None` manager that would silently skip later projections.
+    let owner = state
+        .journal
+        .as_ref()
+        .map(|journal| journal.owner_scope().clone())
+        .unwrap_or_else(astra_services::local_owner_scope);
     let csl_manager = state
         .csl_manager
         .as_ref()
         .and(state.session_id.as_deref())
-        .and_then(build_local_csl_manager);
+        .filter(|session_id| {
+            state
+                .journal
+                .as_ref()
+                .is_none_or(|journal| journal.session_id() == *session_id)
+        })
+        .and_then(|session_id| build_local_csl_manager(&owner, session_id));
     TurnPostCommitJob {
-        owner_id: astra_services::local_owner_scope().id().to_string(),
+        owner_id: owner.id().to_string(),
         session_id: state.session_id.clone(),
         attachment_epoch: state.session_attachment_epoch,
         expected_cursor,
@@ -101,13 +113,18 @@ pub(crate) fn account_turn_post_commit_queue(job: &mut TurnPostCommitJob) {
 }
 
 fn build_local_csl_manager(
+    owner: &astra_services::OwnerScope,
     session_id: &str,
 ) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
-    let store = std::sync::Arc::new(
-        astra_turn_core::conversation_log::file_store::FileCslStore::new(
-            astra_services::session_journal::local_owner_sessions_dir(),
-        ),
-    );
+    let root = match astra_services::local_session_artifact_store().owner_sessions_root(owner) {
+        Ok(root) => root,
+        Err(error) => {
+            astra_core::agent_warn!("csl", "owner path for deferred projection failed: {error}");
+            return None;
+        }
+    };
+    let store =
+        std::sync::Arc::new(astra_turn_core::conversation_log::file_store::FileCslStore::new(root));
     match astra_turn_core::conversation_log::manager::CslManager::new(
         store,
         session_id.to_string(),
@@ -418,6 +435,101 @@ mod tests {
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.messages[0]["content"], "不要review啊！");
         assert_eq!(mat.messages[1]["content"], "ok");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_post_commit_keeps_owner_across_account_switch() {
+        use crate::cli::turn::turn_commit::commit_primary_turn;
+        use crate::cli::turn::turn_learning::consume_chat_turn_learning;
+        use astra_services::SessionArtifactStore;
+        use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
+        use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = ProcessJournalDirGuard::new(temp.path());
+        let _identity_a = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "queued-owner-a",
+            Some("queued-account-a"),
+        )
+        .unwrap();
+        let owner_a = astra_services::local_owner_scope();
+        let sid = "queued-owner-bound-session";
+        let root_a = astra_services::local_session_artifact_store()
+            .owner_sessions_root(&owner_a)
+            .unwrap();
+        let store_a = std::sync::Arc::new(FileCslStore::new(root_a));
+        let manager = CslManager::new(store_a.clone(), sid.into(), Default::default()).unwrap();
+        let mut state = SessionState {
+            journal: Some(JournalWriter::new(sid).unwrap()),
+            session_id: Some(sid.into()),
+            csl_manager: Some(manager),
+            model: Some("test-model".into()),
+            turn: 1,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        let learning = consume_chat_turn_learning(&result);
+        let primary = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        );
+        assert!(primary.outcome.turn_persisted);
+
+        let _identity_b = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "queued-owner-b",
+            Some("queued-account-b"),
+        )
+        .unwrap();
+        let owner_b = astra_services::local_owner_scope();
+        let root_b = astra_services::local_session_artifact_store()
+            .owner_sessions_root(&owner_b)
+            .unwrap();
+        let store_b = FileCslStore::new(root_b);
+        let mut job = prepare_turn_post_commit_job(
+            &mut state,
+            &test_api(),
+            None,
+            result.final_messages,
+            Instant::now(),
+        );
+        super::attach_deferred_sidecars(&mut job, primary.deferred_sidecars);
+        let completion = execute_turn_post_commit_job(job).await;
+        assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+        assert!(
+            !store_a
+                .load_from_latest_snapshot(sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store_b
+                .load_from_latest_snapshot(sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            astra_services::session_workspace::read_workspace_optional_for_owner(&owner_a, sid)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            astra_services::session_workspace::read_workspace_optional_for_owner(&owner_b, sid)
+                .unwrap()
+                .is_none()
+        );
+
+        state.csl_manager = None;
+        apply_turn_post_commit_completion(completion, &mut state);
+        assert!(
+            state.csl_manager.is_none(),
+            "a stale completion must not bind to the new owner"
+        );
     }
 
     #[tokio::test]

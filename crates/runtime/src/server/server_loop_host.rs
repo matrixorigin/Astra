@@ -23326,6 +23326,7 @@ fn server_tool_terminal_event(run_id: Option<&str>, record: &ToolCallRecord) -> 
     let status = match disposition {
         ToolCallDisposition::Executed if record.ok => "completed",
         ToolCallDisposition::Executed => "failed",
+        ToolCallDisposition::Unknown => "unknown",
         ToolCallDisposition::Rejected => "rejected",
         ToolCallDisposition::Reused => "completed",
         ToolCallDisposition::Suppressed | ToolCallDisposition::Deferred => "skipped",
@@ -25858,6 +25859,7 @@ mod tests {
                 astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                     fields.get("disposition"),
                     fields.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                     astra_services::session_journal::ToolCallDisposition::Executed,
                 ),
                 astra_services::session_journal::ToolCallDisposition::Rejected,
