@@ -1061,6 +1061,9 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::Api { status, body } => {
             read_api_error(status.as_u16(), &body)
         }
+        astra_thin_client::ThinClientError::SyncOutboxBackpressure { status, body, .. } => {
+            read_api_error(status.as_u16(), &body)
+        }
         astra_thin_client::ThinClientError::Http(error) => {
             if error.is_timeout() {
                 "Request timed out".to_string()

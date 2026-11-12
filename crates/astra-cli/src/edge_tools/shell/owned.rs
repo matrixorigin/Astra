@@ -331,9 +331,9 @@ impl OwnedShellInvocation {
                     if terminal.target_released.is_none() || (started && ownership.is_none()) {
                         if terminal.target_released.is_none() {
                             fields.remove("execution_started");
+                            fields.remove("disposition");
                         }
-                        fields.insert("execution_fact".into(), json!("unknown"));
-                        fields.insert("side_effects_maybe".into(), json!(true));
+                        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
                     }
                     fields.insert("retryable".into(), json!(false));
                     (outcome, false)
@@ -542,7 +542,7 @@ fn delivered_shell_outcome(
             }) {
                 if registry.retain_completed_output(&task.id) {
                     delivered.output = format!(
-                        "[Captured output: task_output(task_id=\"{}\") subject to tool permissions; unusually large or non-UTF-8 output may be unavailable.]\n{}",
+                        "[Captured output: task_output(task_id=\"{}\") while retained; output may expire or be incomplete.]\n{}",
                         task.id, delivered.output
                     );
                     delivered

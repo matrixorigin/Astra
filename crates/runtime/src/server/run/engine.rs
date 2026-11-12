@@ -3402,6 +3402,16 @@ impl RunEngine {
         self.store.load_run_control(user_id, run_id).await
     }
 
+    pub async fn load_tool_callback_run_target(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<Option<astra_services::runs::ToolCallbackRunTarget>, String> {
+        self.store
+            .load_tool_callback_run_target(identity, edge_agent_id)
+            .await
+    }
+
     pub async fn load_run_event_delta(
         &self,
         user_id: &str,

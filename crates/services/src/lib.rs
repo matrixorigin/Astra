@@ -294,13 +294,13 @@ pub use storage::{
 };
 pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,
-    SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_MAX_ATTEMPTS, SYNC_OUTBOX_SCHEMA_VERSION,
+    SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_SCHEMA_VERSION,
     SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncDomain, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
     SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
     SyncOutboxJournalBatchOutcome, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
-    SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport,
-    SyncOutboxSkipKind, SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore,
-    sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
+    SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind,
+    SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
+    sync_outbox_stable_event_id,
 };
 pub use turn_intent_judge::{
     TurnIntentJudgeContext, TurnIntentJudgeError, WORK_ADMISSION_MAX_OUTPUT_TOKENS,

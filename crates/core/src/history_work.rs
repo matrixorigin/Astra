@@ -52,10 +52,8 @@ pub enum HistoryWorkSite {
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
     CslPersistInputClone,
-    CslStateInstallClone,
     CslSnapshotClone,
     CslMessageHash,
-    CslHashIndexClone,
     CslFileRead,
     CslFileAppendSerialization,
     CslFileRewriteSerialization,
@@ -116,7 +114,6 @@ pub enum HistoryWorkSite {
     SyncOutboxPayloadClone,
     SyncOutboxPayloadHash,
     SyncOutboxJournalDeltaClone,
-    SyncOutboxStateClone,
     SyncOutboxDeliveryClone,
     SyncOutboxDeliverySerialization,
     SyncOutboxQueueRead,
@@ -132,7 +129,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 112;
+    const COUNT: usize = 109;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -171,10 +168,8 @@ impl HistoryWorkSite {
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
         Self::CslPersistInputClone,
-        Self::CslStateInstallClone,
         Self::CslSnapshotClone,
         Self::CslMessageHash,
-        Self::CslHashIndexClone,
         Self::CslFileRead,
         Self::CslFileAppendSerialization,
         Self::CslFileRewriteSerialization,
@@ -235,7 +230,6 @@ impl HistoryWorkSite {
         Self::SyncOutboxPayloadClone,
         Self::SyncOutboxPayloadHash,
         Self::SyncOutboxJournalDeltaClone,
-        Self::SyncOutboxStateClone,
         Self::SyncOutboxDeliveryClone,
         Self::SyncOutboxDeliverySerialization,
         Self::SyncOutboxQueueRead,
@@ -295,10 +289,8 @@ impl HistoryWorkSite {
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
             Self::CslPersistInputClone => "csl_persist_input_clone",
-            Self::CslStateInstallClone => "csl_state_install_clone",
             Self::CslSnapshotClone => "csl_snapshot_clone",
             Self::CslMessageHash => "csl_message_hash",
-            Self::CslHashIndexClone => "csl_hash_index_clone",
             Self::CslFileRead => "csl_file_read",
             Self::CslFileAppendSerialization => "csl_file_append_serialization",
             Self::CslFileRewriteSerialization => "csl_file_rewrite_serialization",
@@ -359,7 +351,6 @@ impl HistoryWorkSite {
             Self::SyncOutboxPayloadClone => "sync_outbox_payload_clone",
             Self::SyncOutboxPayloadHash => "sync_outbox_payload_hash",
             Self::SyncOutboxJournalDeltaClone => "sync_outbox_journal_delta_clone",
-            Self::SyncOutboxStateClone => "sync_outbox_state_clone",
             Self::SyncOutboxDeliveryClone => "sync_outbox_delivery_clone",
             Self::SyncOutboxDeliverySerialization => "sync_outbox_delivery_serialization",
             Self::SyncOutboxQueueRead => "sync_outbox_queue_read",
@@ -422,10 +413,8 @@ impl HistoryWorkSite {
             Self::CliTurnUserInputProjection => "cli.stream_settlement",
             Self::CslMaterializedStateClone
             | Self::CslPersistInputClone
-            | Self::CslStateInstallClone
             | Self::CslSnapshotClone
-            | Self::CslMessageHash
-            | Self::CslHashIndexClone => "turn_core.csl_manager",
+            | Self::CslMessageHash => "turn_core.csl_manager",
             Self::CslFileRead
             | Self::CslFileAppendSerialization
             | Self::CslFileRewriteSerialization => "turn_core.csl_file_store",
@@ -489,7 +478,6 @@ impl HistoryWorkSite {
             Self::SyncOutboxPayloadClone
             | Self::SyncOutboxPayloadHash
             | Self::SyncOutboxJournalDeltaClone
-            | Self::SyncOutboxStateClone
             | Self::SyncOutboxDeliveryClone
             | Self::SyncOutboxDeliverySerialization
             | Self::SyncOutboxQueueRead

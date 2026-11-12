@@ -755,6 +755,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "httpdate",
  "percent-encoding",
  "reqwest 0.12.28",
  "serde",

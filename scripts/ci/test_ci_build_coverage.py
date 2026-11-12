@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
@@ -27,6 +28,33 @@ def rust_setup_disk_guard():
 
 
 class BuildCoverageTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux linker setup")
+    def test_bundled_linker_builds_host_scripts_and_target_without_mold(self):
+        action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+        section = action.split("    - name: Configure Linux linker\n", 1)[1].split("\n    - name:", 1)[0]
+        script = textwrap.dedent(section.split("      run: |\n", 1)[1])
+        # Exercise the actual action with mold unavailable and no apt access.
+        script = 'command() { if [[ "$*" == "-v mold" ]]; then return 1; fi; builtin command "$@"; }\nsudo() { return 99; }\n' + script
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            env = {**os.environ, "GITHUB_ENV": str(repo / "env"), "RUSTFLAGS": "",
+                   "RUSTC_WRAPPER": "", "CARGO_ENCODED_RUSTFLAGS": ""}
+            subprocess.run(["bash", "-euc", script], env=env, check=True, capture_output=True)
+            env.update(line.split("=", 1) for line in (repo / "env").read_text().splitlines())
+            env.pop("CARGO_ENCODED_RUSTFLAGS")
+            env["CARGO_TARGET_DIR"] = str(repo / "target")
+            (repo / "Cargo.toml").write_text('[package]\nname="linker-fixture"\nversion="0.0.0"\nedition="2024"\n')
+            (repo / "build.rs").write_text('fn main() { println!("cargo:rustc-env=HOST_BUILD_OK=yes"); }')
+            (repo / "src").mkdir()
+            (repo / "src/lib.rs").write_text('#[test] fn linked() { assert_eq!(env!("HOST_BUILD_OK"), "yes"); }')
+            host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].splitlines()[0]
+            # Explicit targets keep build scripts on the host's default cc.
+            for driver in ("clang", "cc"):
+                with self.subTest(driver=driver):
+                    subprocess.run(["cargo", "test", "--offline", "--target", host,
+                                    "--config", f'target.{host}.linker="{driver}"'],
+                                   cwd=repo, env=env, check=True, capture_output=True)
+
     def test_self_hosted_build_survives_checkout_cleanup_and_rechecks_source(self):
         action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
         self.assertIn("${{ runner.workspace }}/.astra-ci-target", action)

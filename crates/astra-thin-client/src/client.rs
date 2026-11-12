@@ -11,7 +11,8 @@ use astra_server_types::{
     WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
-    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+    SyncOutboxReconcileRequest, sync_outbox_request_signature,
 };
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
@@ -167,13 +168,23 @@ async fn sleep_between_attempts(delay_secs: u64) {
     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
 }
 
-/// Parse the `Retry-After` header value into seconds.
-/// Supports integer seconds format; ignores HTTP-date format.
-/// Clamps to [1, 120] seconds. Returns `None` on missing/unparseable.
-fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+/// Parse Retry-After, rounding dates up so a retry never precedes the deadline.
+fn parse_retry_after(headers: &HeaderMap, now: std::time::SystemTime) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    Some(secs.clamp(1, 120))
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(raw.parse::<u64>().unwrap_or(u64::MAX).max(1));
+    }
+    let delay = httpdate::parse_http_date(raw)
+        .ok()?
+        .duration_since(now)
+        .unwrap_or_default();
+    Some(
+        delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() > 0))
+            .max(1),
+    )
 }
 
 fn http_stream_connect_timeout() -> Duration {
@@ -1752,7 +1763,9 @@ impl ThinClient {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
-                            parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
+                            parse_retry_after(resp.headers(), std::time::SystemTime::now())
+                                .map(|seconds| seconds.min(120))
+                                .unwrap_or(2u64 << attempt);
                         if !quiet {
                             tracing::warn!(
                                 target: "astra.thin_client",
@@ -2453,20 +2466,52 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /sync/outbox/events` — ingest durable edge sync outbox events.
-    pub async fn post_sync_outbox_event_json(
+    /// `POST /sync/outbox/events` — ingest one bounded durable sync batch.
+    pub async fn post_sync_outbox_events_json(
         &self,
         bearer_override: Option<&str>,
-        body: &Value,
-    ) -> Result<SyncOutboxAck, ThinClientError> {
-        let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
+        batch: &SyncOutboxEventBatch,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(batch).map_err(|error| {
+            ThinClientError::InvalidInput(format!("failed to encode sync-outbox batch: {error}"))
+        })?;
+        self.post_signed_sync_outbox_request(bearer_override, paths::SYNC_OUTBOX_EVENTS, body)
+            .await
+    }
+
+    /// Reconcile a bounded set of record IDs with one read-only batch request.
+    pub async fn reconcile_sync_outbox_events_json(
+        &self,
+        bearer_override: Option<&str>,
+        request: &SyncOutboxReconcileRequest,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(request).map_err(|error| {
+            ThinClientError::InvalidInput(format!(
+                "failed to encode sync-outbox reconciliation: {error}"
+            ))
+        })?;
+        self.post_signed_sync_outbox_request(
+            bearer_override,
+            paths::SYNC_OUTBOX_EVENTS_RECONCILE,
+            body,
+        )
+        .await
+    }
+
+    async fn post_signed_sync_outbox_request(
+        &self,
+        bearer_override: Option<&str>,
+        path: &str,
+        body: Value,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let url = self.url(path)?;
         let mut headers = self.auth_headers_for(bearer_override).await?;
         if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         {
-            let signature = sync_outbox_request_signature(token, body);
+            let signature = sync_outbox_request_signature(token, &body);
             let header = HeaderValue::from_str(&signature).map_err(|error| {
                 ThinClientError::InvalidInput(format!(
                     "failed to encode sync-outbox signature header: {error}"
@@ -2478,10 +2523,23 @@ impl ThinClient {
             .http
             .post(url)
             .headers(headers)
-            .json(body)
+            .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || (status.is_server_error() && resp.headers().contains_key(header::RETRY_AFTER))
+        {
+            let retry_after_seconds =
+                parse_retry_after(resp.headers(), std::time::SystemTime::now());
+            let body = resp.text().await?;
+            return Err(ThinClientError::SyncOutboxBackpressure {
+                status,
+                body,
+                retry_after_seconds,
+            });
+        }
         Self::typed_json_or_error(resp).await
     }
 
@@ -4808,9 +4866,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_post_sync_outbox_event_json() {
+    async fn wiremock_post_sync_outbox_events_json() {
         let srv = MockServer::start().await;
-        let body = serde_json::json!({
+        let batch = SyncOutboxEventBatch::new(vec![serde_json::json!({
             "event_id": "sync_evt_1",
             "session_id": "session-1",
             "event_type": "sync_marker",
@@ -4820,7 +4878,8 @@ mod tests {
                     "payload_hash": "sha256:abc"
                 }
             }
-        });
+        })]);
+        let body = serde_json::to_value(&batch).unwrap();
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(header("authorization", "Bearer tok"))
@@ -4828,21 +4887,60 @@ mod tests {
                 "x-astra-sync-outbox-signature",
                 sync_outbox_request_signature("tok", &body),
             ))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "schema_version": 1,
-                "record_id": "sync_evt_1",
-                "payload_hash": "sha256:abc",
-                "ingestion_status": "created"
+                "acks": [{
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "created"
+                }],
+                "rejections": []
             })))
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let v = client
-            .post_sync_outbox_event_json(Some("tok"), &body)
+        let ack = client
+            .post_sync_outbox_events_json(Some("tok"), &batch)
             .await
             .unwrap();
-        assert!(v.confirms("sync_evt_1", "sha256:abc"));
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_reconcile_sync_outbox_events_json() {
+        let srv = MockServer::start().await;
+        let request =
+            SyncOutboxReconcileRequest::new(vec!["sync_evt_1".to_string(), "missing".to_string()]);
+        let body = serde_json::to_value(&request).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header(
+                "x-astra-sync-outbox-signature",
+                sync_outbox_request_signature("tok", &body),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "acks": [{
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "idempotent_replay"
+                }],
+                "rejections": []
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let ack = client
+            .reconcile_sync_outbox_events_json(Some("tok"), &request)
+            .await
+            .unwrap();
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
     }
 
     #[tokio::test]
@@ -5610,45 +5708,72 @@ mod tests {
     fn parse_retry_after_valid_integer() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("5"));
-        assert_eq!(parse_retry_after(&headers), Some(5));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(5));
     }
 
     #[test]
-    fn parse_retry_after_clamps_high() {
+    fn parse_retry_after_preserves_long_delays() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("999"));
-        assert_eq!(parse_retry_after(&headers), Some(120));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(999)
+        );
     }
 
     #[test]
     fn parse_retry_after_clamps_zero_to_one() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("0"));
-        assert_eq!(parse_retry_after(&headers), Some(1));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(1));
     }
 
     #[test]
     fn parse_retry_after_missing_header() {
         let headers = HeaderMap::new();
-        assert_eq!(parse_retry_after(&headers), None);
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_non_numeric() {
         let mut headers = HeaderMap::new();
-        // HTTP-date format not supported — returns None
-        headers.insert(
-            "retry-after",
-            HeaderValue::from_static("Wed, 09 Apr 2026 12:00:00 GMT"),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("not a date"));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_whitespace_trimmed() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("  10  "));
-        assert_eq!(parse_retry_after(&headers), Some(10));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(10));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_rounds_up_and_limits_expired_dates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:01:40 GMT"),
+        );
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(90_500);
+        assert_eq!(parse_retry_after(&headers, now), Some(10));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH + Duration::from_secs(200)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_integer_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("18446744073709551616"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(u64::MAX)
+        );
     }
 
     #[tokio::test]

@@ -48,17 +48,16 @@ pub fn journal_record_edge_tool_result(
     record.execution_completion = result.execution_completion.clone();
     record.work_attribution = result.work_attribution.clone();
     let fields = result.tool_result_fields.as_ref();
-    record.disposition = Some(
+    record.disposition = Some(ToolCallDisposition::from_execution_metadata(
+        fields.and_then(|fields| fields.get("disposition")),
         fields
-            .and_then(|fields| fields.get("disposition"))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or(ToolCallDisposition::Executed),
-    );
-    record.error_kind = fields
-        .and_then(|fields| fields.get("error_kind"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(astra_core::ErrorKind::parse_tag);
+            .and_then(|fields| fields.get("execution_started"))
+            .and_then(serde_json::Value::as_bool),
+        astra_tools::execution_outcome::outcome_is_unknown(fields),
+        ToolCallDisposition::Executed,
+    ));
+    record.error_kind = astra_tools::execution_outcome::execution_error_kind(fields);
+    record.recovery_evidence = astra_tools::execution_outcome::execution_recovery_evidence(fields);
     record.exit_semantics = fields
         .and_then(|fields| fields.get("exit_semantics"))
         .and_then(serde_json::Value::as_str)
@@ -550,6 +549,40 @@ mod tests {
             assert_eq!(local.error, remote.error);
             assert_eq!(local.ok, !failed);
             assert_eq!(local.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
+
+    #[test]
+    fn callback_audit_keeps_unknown_start_and_confirmed_start_distinct() {
+        for started in [None, Some(true)] {
+            let mut fields = serde_json::Map::from_iter([
+                ("error_kind".into(), serde_json::json!("tool_unavailable")),
+                ("execution_fact".into(), serde_json::json!("unknown")),
+            ]);
+            if let Some(started) = started {
+                fields.insert("execution_started".into(), serde_json::json!(started));
+            }
+            let record =
+                journal_record_edge_tool_result(&crate::sse_stream_host::EdgeToolExecResult {
+                    work_attribution: None,
+                    request_id: "call".into(),
+                    tool: "bash".into(),
+                    args: serde_json::json!({}),
+                    output: "unknown".into(),
+                    status: "failed".into(),
+                    duration_ms: 1,
+                    tool_result_fields: Some(fields),
+                    execution_completion: None,
+                });
+            assert_eq!(record.was_executed(), started == Some(true));
+            assert!(record.outcome_is_unknown());
+            assert_eq!(
+                record.error_kind,
+                Some(astra_core::ErrorKind::ToolUnavailable)
+            );
+            let evidence = record.recovery_evidence.unwrap();
+            assert_eq!(evidence.cause, astra_core::ToolFailureCause::OutcomeUnknown);
+            assert!(!evidence.retryable);
         }
     }
 

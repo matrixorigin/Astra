@@ -1888,6 +1888,25 @@ fn fanout_reasoning_schema() -> Value {
     })
 }
 
+fn child_tool_outcomes_schema() -> Value {
+    let key = json!({
+        "type": "object",
+        "properties": {
+            "turn_chain_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "request_id": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "required": ["turn_chain_id", "request_id"],
+        "additionalProperties": false
+    });
+    json!({
+        "type": "object",
+        "description": "For get_result: inspect retained child tool outcomes without executing tools. Omit fields for the first page; use after for the next page or exact to read one result. Use offset and max_bytes to page through an exact result. Oversized or missing results may be unavailable and do not prove nonexecution.",
+        "x-astra-discovery-summary": "get_result: {} lists; after pages the list; exact selects turn_chain_id/request_id. With exact, offset and max_bytes page output. Oversized or missing: unavailable/unknown, not proof of nonexecution.",
+        "properties": {"after": key.clone(), "exact": key, "offset": {"type":"integer", "minimum":0}, "max_bytes": {"type":"integer", "minimum":64, "maximum":4096}},
+        "additionalProperties": false
+    })
+}
+
 fn agent_parameters_schema() -> Value {
     json!({
         "type": "object",
@@ -1967,6 +1986,7 @@ fn agent_parameters_schema() -> Value {
                 "additionalProperties": false
             },
             "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn.", "x-astra-discovery-summary": "get_result/list only."},
+            "tool_outcomes": child_tool_outcomes_schema(),
             "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
             "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
             "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Astra: question/answer/text; answers need request_id. Provider-owned: text only."},
@@ -1984,7 +2004,7 @@ fn agent_parameters_schema() -> Value {
         },
         "x-astra-per-action-allowed": {
             "spawn": crate::agent_tool_contract::AGENT_SPAWN_FIELDS,
-            "get_result": ["action", "agent_id"],
+            "get_result": ["action", "agent_id", "tool_outcomes"],
             "list": ["action", "agent_id"],
             "wait": ["action", "timeout_ms"],
             "run_chain": ["action", "name", "description", "steps", "input"],
@@ -2938,7 +2958,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_list",
-                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
+                "description": "List retained background tasks for this session with kind, status, and ids. Older terminal tasks may expire; absence does not establish whether a task ran or caused effects. Use to discover tasks to inspect or stop.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -4220,6 +4240,12 @@ mod tests {
         }
         validate_tool_arguments("agent", &json!({"action": "get_result"}))
             .expect_err("get_result still requires the returned child identity");
+        validate_tool_arguments("agent", &json!({"action":"get_result", "agent_id":"child", "tool_outcomes": {"exact": {"turn_chain_id":"turn", "request_id":"request"}}}))
+            .expect("child tool outcome inspection is available explicitly");
+        assert!(
+            validate_tool_arguments("agent", &json!({"action":"list", "tool_outcomes": {}}))
+                .is_err()
+        );
     }
 
     #[test]

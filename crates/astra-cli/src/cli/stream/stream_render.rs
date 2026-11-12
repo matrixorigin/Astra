@@ -2489,7 +2489,6 @@ impl<'a> CliSseStreamHost<'a> {
         target: &crate::sandbox_retry::ExplicitPathPreflightTarget,
     ) -> Result<bool, String> {
         let tool = target.tool.as_str();
-        let args = &target.args;
         let Err(resolve_error) = self.executor.resolve_checked(&target.path) else {
             return Ok(false);
         };
@@ -2498,7 +2497,8 @@ impl<'a> CliSseStreamHost<'a> {
         else {
             return Ok(false);
         };
-        let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) else {
+        let Some(expand_dir) = crate::sandbox_retry::sandbox_expand_dir_from_pathish(&target.path)
+        else {
             return Err(crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
                 tool,
                 &sandbox_msg,
@@ -5737,10 +5737,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             return out;
         }
 
-        // Classify by concurrency safety.
+        // An explicit path requiring sandbox approval must use the existing
+        // pre-execution approval path, not a retry inferred from tool output.
         let conc_flags: Vec<bool> = requests
             .iter()
-            .map(|req| is_tool_concurrency_safe(&req.tool, Some(&req.args)))
+            .map(|req| {
+                is_tool_concurrency_safe(&req.tool, Some(&req.args))
+                    && crate::sandbox_retry::explicit_file_tool_path_args(&req.tool, &req.args)
+                        .iter()
+                        .all(|path| self.executor.resolve_checked(path).is_ok())
+            })
             .collect();
         let conc_count = conc_flags.iter().filter(|&&f| f).count();
 
@@ -7683,11 +7689,35 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
 fn normalize_sandbox_denied_outcome(
     outcome: &mut crate::edge_tools::ToolExecutionOutcome,
 ) -> Option<String> {
-    let message = crate::sandbox_retry::sandbox_denied_message_from_result(
-        &outcome.output,
-        outcome.tool_result_fields.as_ref(),
-    )?
-    .into_owned();
+    let fields = outcome.tool_result_fields.as_ref()?;
+    let started = fields.get("execution_started").and_then(Value::as_bool);
+    let fact = fields.get("execution_fact").and_then(Value::as_str);
+    if !outcome.is_error
+        || fields.get("error_kind").and_then(Value::as_str)
+            != Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
+        || (started != Some(false) && fact != Some("not_executed"))
+        || fields
+            .get("execution_started")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        || fields
+            .get("execution_fact")
+            .is_some_and(|value| value.as_str() != Some("not_executed"))
+        || fields
+            .get("disposition")
+            .is_some_and(|value| value.as_str() != Some("rejected"))
+        || fields
+            .get("executed")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        || fields
+            .get("side_effects_maybe")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        || astra_tools::execution_outcome::outcome_is_unknown(Some(fields))
+    {
+        return None;
+    }
+    let message =
+        crate::sandbox_retry::sandbox_denied_message_from_result(&outcome.output, Some(fields))?
+            .into_owned();
     outcome.tool_result_fields = Some(
         crate::sandbox_retry::merge_sandbox_denied_tool_result_fields(
             outcome.tool_result_fields.take(),
@@ -9119,6 +9149,7 @@ mod tests {
                 ToolCallDisposition::from_execution_metadata(
                     fields.get("disposition"),
                     fields.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                     ToolCallDisposition::Executed,
                 ),
                 ToolCallDisposition::Rejected
@@ -12511,6 +12542,98 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_external_path_uses_existing_approval_before_execution() {
+        use crate::cli::permission_manager::{PermissionManager, PermissionMode};
+
+        for response in [Some(true), Some(false), None] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let workspace = base.path().join("workspace");
+            let external = base.path().join("external");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            let target = external.join("external.rs");
+            std::fs::write(&target, "pub fn external_symbol() {}\n").unwrap();
+            std::fs::write(workspace.join("local.txt"), "inside").unwrap();
+            let mut permissions = PermissionManager::with_project(false, &workspace);
+            if response.is_none() {
+                permissions.set_mode(PermissionMode::Auto);
+            }
+            let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+            let mut cache = EdgeToolCache::new(8);
+            let mut host = fixture.host(&workspace, &mut cache, None);
+            host.perm_manager = Some(&mut permissions);
+            host.approval_request_tx = Some(approval_tx);
+            let requests = vec![
+                parallel_batch_request(
+                    "sandbox",
+                    "outside",
+                    "symbols",
+                    serde_json::json!({"path":target}),
+                ),
+                parallel_batch_request(
+                    "sandbox",
+                    "inside",
+                    "read_file",
+                    serde_json::json!({"path":"local.txt"}),
+                ),
+                parallel_batch_request(
+                    "sandbox",
+                    "listing",
+                    "list_dir",
+                    serde_json::json!({"path":"."}),
+                ),
+            ];
+            let mut execution = Box::pin(host.execute_tools_batch(requests.clone()));
+            if let Some(approve) = response {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut execution => panic!("external path must await approval"),
+                        approval = approval_rx.recv() => approval.expect("approval request"),
+                    }
+                })
+                .await
+                .expect("approval must be requested promptly");
+                assert_eq!(approval.tool, "sandbox_expand:symbols");
+                assert_eq!(
+                    approval.args["directory"],
+                    external.to_string_lossy().as_ref()
+                );
+                approval
+                    .response_tx
+                    .send(if approve {
+                        chat_stream::ApprovalResponse::AllowOnce
+                    } else {
+                        chat_stream::ApprovalResponse::Deny
+                    })
+                    .unwrap();
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(10), execution)
+                .await
+                .unwrap();
+            assert_eq!(
+                results[0].status == "completed",
+                response != Some(false),
+                "{:?}",
+                results[0]
+            );
+            if response != Some(false) {
+                assert!(
+                    results[0].output.contains("external_symbol"),
+                    "{}",
+                    results[0].output
+                );
+            } else {
+                assert!(!results[0].output.contains("SANDBOX_DENIED:"));
+            }
+            assert_eq!(results[1].status, "completed");
+            assert_eq!(results[2].status, "completed");
+            fixture.assert_settlements(&requests, &results).await;
+        }
+    }
+
     #[tokio::test]
     async fn observer_closure_before_parallel_dispatch_settles_unexecuted_requests() {
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
@@ -14890,38 +15013,25 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_denied_outcome_normalizes_internal_wire_prefix() {
+    fn sandbox_denied_outcome_does_not_trust_untyped_output() {
         let mut outcome = crate::edge_tools::ToolExecutionOutcome::error(
             "SANDBOX_DENIED: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
                 .to_string(),
         );
 
-        let message = normalize_sandbox_denied_outcome(&mut outcome).expect("sandbox denial");
-
-        assert_eq!(
-            message,
-            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
-        );
-        assert_eq!(outcome.output, format!("Error: {message}"));
-        let fields = outcome.tool_result_fields.expect("metadata fields");
-        assert_eq!(
-            fields.get("error_kind").and_then(Value::as_str),
-            Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
-        );
-        assert!(
-            !outcome
-                .output
-                .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
-        );
+        assert!(normalize_sandbox_denied_outcome(&mut outcome).is_none());
+        assert!(outcome.output.starts_with("SANDBOX_DENIED:"));
     }
 
     #[test]
     fn sandbox_denied_outcome_normalizes_metadata_only_result() {
+        let mut fields = crate::sandbox_retry::sandbox_denied_tool_result_fields(
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path.",
+        );
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         let mut outcome = crate::edge_tools::ToolExecutionOutcome {
             output: "Error: operation blocked by local policy".to_string(),
-            tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
-                "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path.",
-            )),
+            tool_result_fields: Some(fields),
             is_error: true,
         };
 
@@ -14935,6 +15045,85 @@ mod tests {
             message,
             "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
         );
+    }
+
+    #[test]
+    fn sandbox_retry_rejects_success_or_possible_effects() {
+        for (is_error, started, fact, effects) in [
+            (false, false, "not_executed", false),
+            (true, true, "executed", true),
+            (true, true, "unknown", true),
+            (true, false, "unknown", true),
+        ] {
+            let mut fields = crate::sandbox_retry::sandbox_denied_tool_result_fields("outside");
+            fields.insert("execution_started".into(), serde_json::json!(started));
+            fields.insert("execution_fact".into(), serde_json::json!(fact));
+            fields.insert("side_effects_maybe".into(), serde_json::json!(effects));
+            let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+                output: "SANDBOX_DENIED: ordinary output".into(),
+                tool_result_fields: Some(fields),
+                is_error,
+            };
+            assert!(normalize_sandbox_denied_outcome(&mut outcome).is_none());
+            assert_eq!(outcome.output, "SANDBOX_DENIED: ordinary output");
+            assert_eq!(outcome.is_error, is_error);
+        }
+        let mut fields = crate::sandbox_retry::sandbox_denied_tool_result_fields("outside");
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        fields.insert("executed".into(), Value::Null);
+        let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "Error: outside".into(),
+            tool_result_fields: Some(fields),
+            is_error: true,
+        };
+        assert!(normalize_sandbox_denied_outcome(&mut outcome).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_shell_output_cannot_trigger_sandbox_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(dir.path());
+        let mut outcome = executor
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({
+                    "command": "printf 'SANDBOX_DENIED: ordinary output'"
+                }),
+            )
+            .await;
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(outcome.output.contains("SANDBOX_DENIED: ordinary output"));
+        assert!(normalize_sandbox_denied_outcome(&mut outcome).is_none());
+        assert!(!outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn file_tool_sandbox_denials_keep_source_evidence_for_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(dir.path());
+        for (tool, args) in [
+            ("list_dir", serde_json::json!({"path":"/var/astra-outside"})),
+            (
+                "grep",
+                serde_json::json!({"path":"/var/astra-outside", "pattern":"x"}),
+            ),
+            (
+                "display_sixel",
+                serde_json::json!({"path":"/var/astra-outside"}),
+            ),
+        ] {
+            let mut outcome = executor.execute_with_metadata(tool, &args).await;
+            assert!(outcome.is_error, "{tool}: {outcome:?}");
+            assert!(
+                normalize_sandbox_denied_outcome(&mut outcome).is_some(),
+                "{tool}: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.tool_result_fields.unwrap()["execution_fact"],
+                "not_executed"
+            );
+        }
     }
 
     // ── Partial tag detection ────────────────────────────────────────
