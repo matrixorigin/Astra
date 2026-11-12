@@ -14512,6 +14512,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[serial_test::serial]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -14549,8 +14550,13 @@ mod tests {
         let outside = base.path().join("outside");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        let target = outside.join("private.txt");
-        std::fs::write(&target, "must not be read").unwrap();
+        let outside_target = outside.join("private.txt");
+        let inside_target = project.join("inside.txt");
+        std::fs::write(&outside_target, "must not be read").unwrap();
+        std::fs::write(&inside_target, "initially allowed").unwrap();
+        let target = project.join("current.txt");
+        retarget_symlink(&target, &inside_target);
+        let _held_capacity = hold_all_but_one_tool_execution_slot().await;
         let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -14560,13 +14566,13 @@ mod tests {
         host.owner_auth_snapshot = Some(owner);
         let executor = host.executor.clone();
         let requests = vec![
+            parallel_recall("second", "held-memory"),
             parallel_batch_request(
                 "first",
                 "denied-read",
                 "read_file",
-                serde_json::json!({"path": target}),
+                serde_json::json!({"path": &target}),
             ),
-            parallel_recall("second", "held-memory"),
         ];
         let mut batch = Box::pin(host.execute_tools_batch(requests));
         let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -14577,6 +14583,7 @@ mod tests {
         })
         .await
         .unwrap();
+        retarget_symlink(&target, &outside_target);
         assert!(executor.resolve_checked(&target.to_string_lossy()).is_err());
         crate::cli::cli_config::cli_utils::replace_profile_auth(|| {
             creds.profiles.get_mut("test").unwrap().access_token = Some("other-token".into());
@@ -14586,7 +14593,14 @@ mod tests {
         .unwrap();
         release.send(()).unwrap();
         let results = batch.await;
-        assert_eq!(results[0].status, "failed");
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result.request_id == "denied-read")
+                .unwrap()
+                .status,
+            "failed"
+        );
         assert!(executor.resolve_checked(&target.to_string_lossy()).is_err());
         assert!(
             fixture
@@ -14946,6 +14960,7 @@ mod tests {
         fixture.assert_settlements(&requests, &results).await;
     }
 
+    #[cfg(unix)]
     #[serial_test::serial]
     #[tokio::test]
     async fn cancellation_reports_sandbox_denial_without_waiting_for_slow_sibling() {
@@ -14955,8 +14970,13 @@ mod tests {
         let outside = base.path().join("outside");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        let target = outside.join("private.txt");
-        std::fs::write(&target, "outside").unwrap();
+        let outside_target = outside.join("private.txt");
+        let inside_target = project.join("inside.txt");
+        std::fs::write(&outside_target, "outside").unwrap();
+        std::fs::write(&inside_target, "initially allowed").unwrap();
+        let target = project.join("current.txt");
+        retarget_symlink(&target, &inside_target);
+        let mut held_capacity = hold_all_but_one_tool_execution_slot().await;
         let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut pm =
@@ -14968,12 +14988,12 @@ mod tests {
             "first",
             "cancel-denied",
             "read_file",
-            serde_json::json!({"path":target}),
+            serde_json::json!({"path": &target}),
         );
         let mut slow = parallel_recall("first", "cancel-slow");
         slow.run_id = denied.run_id.clone();
         slow.turn_chain_id = denied.turn_chain_id.clone();
-        let requests = vec![denied, slow];
+        let requests = vec![slow, denied];
         let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
         let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
@@ -14983,6 +15003,27 @@ mod tests {
         })
         .await
         .unwrap();
+        retarget_symlink(&target, &outside_target);
+        // Release one additional slot so the denied tool can execute while the
+        // slow sibling remains active. The denied execution queued before this
+        // probe, so acquiring the next permit waits for it to settle without
+        // waiting for the slow sibling.
+        let execution_slot = held_capacity.split(1).unwrap();
+        drop(execution_slot);
+        let tool_permits = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
+        tokio::select! {
+            _ = &mut batch => panic!("slow tool must remain active"),
+            _ = tokio::task::yield_now() => {},
+        }
+        let completed_permit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut batch => panic!("slow tool must remain active"),
+                permit = tool_permits.acquire() => permit.unwrap(),
+            }
+        })
+        .await
+        .expect("sandbox-denied execution must settle");
+        drop(completed_permit);
         cancel.cancel();
         let denied_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
