@@ -19,7 +19,11 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
 
     let mut files = Vec::new();
     let mut failed = Vec::new();
+    let mut unknown = Vec::new();
     for record in records {
+        if record.outcome_is_unknown() && !unknown.contains(&record.name.as_str()) {
+            unknown.push(record.name.as_str());
+        }
         if !record.was_executed() {
             continue;
         }
@@ -29,7 +33,7 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
         {
             files.push(file_path);
         }
-        if !record.ok && !failed.contains(&record.name.as_str()) {
+        if !record.ok && !record.outcome_is_unknown() && !failed.contains(&record.name.as_str()) {
             failed.push(record.name.as_str());
         }
     }
@@ -49,8 +53,14 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     if !failed.is_empty() {
         parts.push(format!("failed: {}", failed.join(", ")));
     }
+    if !unknown.is_empty() {
+        parts.push(format!(
+            "outcome unknown (inspect before retry): {}",
+            unknown.join(", ")
+        ));
+    }
     parts.push(format!(
-        "tool_calls: {}",
+        "confirmed executed tool calls: {}",
         records
             .iter()
             .filter(|record| record.was_executed())
@@ -704,7 +714,7 @@ mod tests {
 
         let summary = build_turn_tool_summary(&records);
         assert!(summary.contains("files: src/main.rs, src/lib.rs"));
-        assert!(summary.contains("tool_calls: 3"));
+        assert!(summary.contains("confirmed executed tool calls: 3"));
         assert!(!summary.contains("failed:"));
     }
 
@@ -726,6 +736,17 @@ mod tests {
             !summary.contains("rust/astra"),
             "failed file paths must not be persisted into prompt-facing history: {summary}"
         );
+    }
+
+    #[test]
+    fn tool_summary_preserves_unknown_start_without_claiming_execution() {
+        let mut unknown = make_record("write_file", false, Some("src/main.rs"));
+        unknown.disposition = Some(session_journal::ToolCallDisposition::Unknown);
+        let summary = build_turn_tool_summary(&[unknown]);
+        assert!(summary.contains("outcome unknown (inspect before retry): write_file"));
+        assert!(summary.contains("confirmed executed tool calls: 0"));
+        assert!(!summary.contains("failed:"));
+        assert!(!summary.contains("src/main.rs"));
     }
 
     #[test]

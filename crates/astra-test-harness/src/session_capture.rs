@@ -63,6 +63,29 @@ pub struct JournalToolCall {
     pub result_artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
 }
 
+impl JournalToolCall {
+    pub(crate) fn outcome_is_unknown(&self) -> bool {
+        self.runtime_metadata
+            .get("outcome_unknown")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }
+}
+
+fn record_outcome_is_unknown(record: &serde_json::Value) -> bool {
+    record
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        == Some("unknown")
+        || record.get("error_kind").and_then(serde_json::Value::as_str)
+            == Some("tool_outcome_unknown")
+        || record
+            .get("recovery_evidence")
+            .and_then(|evidence| evidence.get("cause"))
+            .and_then(serde_json::Value::as_str)
+            == Some("outcome_unknown")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SessionCapture {
@@ -672,7 +695,7 @@ impl SessionCapture {
                     ToolCallDisposition::Reused
                         | ToolCallDisposition::Suppressed
                         | ToolCallDisposition::Deferred
-                ) || call.runtime_metadata["error_kind"] == "tool_outcome_unknown"
+                ) || call.outcome_is_unknown()
                 {
                     call.ok = None;
                 }
@@ -697,7 +720,7 @@ impl SessionCapture {
     pub(crate) fn journal_tool_outcome_count(&self, name: &str, ok: bool) -> usize {
         self.journal_tool_calls()
             .iter()
-            .filter(|call| call.name == name && call.ok == Some(ok))
+            .filter(|call| call.name == name && !call.outcome_is_unknown() && call.ok == Some(ok))
             .count()
     }
 
@@ -780,6 +803,11 @@ impl SessionCapture {
                         if calls[*index].result_artifact.is_none() {
                             calls[*index].result_artifact = result_artifact;
                         }
+                        if record_outcome_is_unknown(record) {
+                            calls[*index].runtime_metadata["outcome_unknown"] =
+                                serde_json::json!(true);
+                            calls[*index].ok = None;
+                        }
                         for field in [
                             "work_attribution",
                             "disposition",
@@ -802,6 +830,7 @@ impl SessionCapture {
                     runtime_metadata: serde_json::json!({
                         "work_attribution": record.get("work_attribution"),
                         "error_kind": record.get("error_kind"),
+                        "outcome_unknown": record_outcome_is_unknown(record),
                         "disposition": record.get("disposition"),
                         "pre_dispatch_rejection": record.get("pre_dispatch_rejection"),
                         "exit_semantics": record.get("exit_semantics"),
@@ -836,7 +865,11 @@ impl SessionCapture {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
                     parallel: record.get("parallel").and_then(serde_json::Value::as_bool),
-                    ok: record.get("ok").and_then(|value| value.as_bool()),
+                    ok: if record_outcome_is_unknown(record) {
+                        None
+                    } else {
+                        record.get("ok").and_then(|value| value.as_bool())
+                    },
                     arguments,
                     result,
                     error: record.get("error").cloned(),

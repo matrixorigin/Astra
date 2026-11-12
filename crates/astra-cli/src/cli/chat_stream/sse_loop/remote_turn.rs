@@ -5,9 +5,8 @@ use super::server_admission_host::CliServerAdmissionHost;
 use astra_pipeline::step_protocol::{StepCheckpoint, WorkspaceObservationQuarantineV1};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::turn::agentic_loop::finalization::{
-    TurnTraceFinalizationInput, UnattributedRecallRunBoundary,
-    commit_session_continuity_checkpoint, finalize_session_turn_trace, journal_writer_for_owner,
-    same_recovery_state,
+    TurnTraceFinalizationInput, commit_session_continuity_checkpoint, finalize_session_turn_trace,
+    journal_writer_for_owner, same_recovery_state,
 };
 use astra_runtime::turn::agentic_loop::host::{VolatileInjection, VolatileKind};
 use astra_runtime::turn::run_control::RunStatusProvider;
@@ -370,7 +369,6 @@ pub(super) async fn consume_remote_turn(
     host: &mut CliServerAdmissionHost<'_>,
     state: &mut RemoteTurnState,
 ) -> Result<(), astra_core::ClassifiedError> {
-    let _recalls = UnattributedRecallRunBoundary::new(host.executor.memory_recall_scope());
     let _channels = InteractionChannels(Arc::clone(&host.executor));
     let result = consume_remote_turn_inner(host, state).await;
     let rejected = super::is_pre_admission_rejection(

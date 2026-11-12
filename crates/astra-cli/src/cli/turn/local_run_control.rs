@@ -7,6 +7,45 @@ use serde_json::Value;
 
 const MAX_USER_INTENT_CHARS: usize = 20_000;
 
+/// A runtime message and, when complete, the shell fact it conveys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeNotification {
+    pub(crate) content: String,
+    pub(crate) complete_shell: Option<String>,
+}
+
+impl RuntimeNotification {
+    pub(crate) fn acknowledge(
+        &self,
+        registry: &crate::edge_tools::background_tasks::BackgroundTaskRegistry,
+    ) {
+        if let Some(id) = &self.complete_shell {
+            registry.acknowledge_terminal(id);
+        }
+    }
+}
+
+impl From<String> for RuntimeNotification {
+    fn from(content: String) -> Self {
+        Self {
+            content,
+            complete_shell: None,
+        }
+    }
+}
+
+impl From<&str> for RuntimeNotification {
+    fn from(content: &str) -> Self {
+        content.to_owned().into()
+    }
+}
+
+impl From<&String> for RuntimeNotification {
+    fn from(content: &String) -> Self {
+        content.as_str().into()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserIntentReceipt {
     pub(crate) run_id: Option<String>,
@@ -49,10 +88,10 @@ impl RemoteDispositionProjectionAck {
 
 #[derive(Default)]
 struct LocalRunControlState {
-    pending_runtime_notifications: Vec<String>,
+    pending_runtime_notifications: Vec<RuntimeNotification>,
     /// Runtime facts that reached a model boundary but are not safe to forget
     /// until the enclosing turn settles successfully.
-    applied_runtime_notifications: Vec<String>,
+    applied_runtime_notifications: Vec<RuntimeNotification>,
     /// Server-owned dispositions recovered after the primary stream closes.
     /// This bridges the stream into final local turn
     /// settlement without treating the guidance as a second model input.
@@ -198,24 +237,28 @@ impl LocalRunControl {
         Ok(input)
     }
 
-    pub(crate) fn accept_runtime_notification(&self, content: &str) -> Result<(), String> {
-        if content.trim().is_empty() {
+    pub(crate) fn accept_runtime_notification(
+        &self,
+        notification: impl Into<RuntimeNotification>,
+    ) -> Result<(), String> {
+        let notification = notification.into();
+        if notification.content.trim().is_empty() {
             return Err("Runtime notification cannot be empty.".to_string());
         }
-        if content.chars().count() > MAX_USER_INTENT_CHARS {
+        if notification.content.chars().count() > MAX_USER_INTENT_CHARS {
             return Err(format!(
                 "Runtime notification is too large. Limit it to {MAX_USER_INTENT_CHARS} characters."
             ));
         }
         recover_mutex_lock(&self.state)
             .pending_runtime_notifications
-            .push(content.to_string());
+            .push(notification);
         Ok(())
     }
 
     /// Return uncommitted request facts and newly queued notifications together.
     /// Failed settlement and the active-to-idle handoff must preserve both.
-    pub(crate) fn take_pending_runtime_notifications(&self) -> Vec<String> {
+    pub(crate) fn take_pending_runtime_notifications(&self) -> Vec<RuntimeNotification> {
         let mut guard = recover_mutex_lock(&self.state);
         let mut pending = std::mem::take(&mut guard.applied_runtime_notifications);
         pending.extend(std::mem::take(&mut guard.pending_runtime_notifications));
@@ -229,17 +272,19 @@ impl LocalRunControl {
         let mut guard = recover_mutex_lock(&self.state);
         let admitted = std::mem::take(&mut guard.pending_runtime_notifications);
         guard.applied_runtime_notifications.extend(admitted);
-        guard.applied_runtime_notifications.clone()
+        guard
+            .applied_runtime_notifications
+            .iter()
+            .map(|notification| notification.content.clone())
+            .collect()
     }
 
     /// Commit runtime facts only after the enclosing turn has produced and
     /// settled a successful answer. Guidance acknowledgements still mean
     /// "applied at a model boundary"; this extra local checkpoint prevents a
     /// later model/persistence failure from losing the background fact.
-    pub(crate) fn commit_applied_runtime_notifications(&self) {
-        recover_mutex_lock(&self.state)
-            .applied_runtime_notifications
-            .clear();
+    pub(crate) fn commit_applied_runtime_notifications(&self) -> Vec<RuntimeNotification> {
+        std::mem::take(&mut recover_mutex_lock(&self.state).applied_runtime_notifications)
     }
 
     pub(crate) fn record_remotely_applied_user_intent(

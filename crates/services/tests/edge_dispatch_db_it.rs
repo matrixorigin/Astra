@@ -1023,6 +1023,23 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
             &serde_json::json!({"identity":{"user_id":user,"session_id":run.session_id,"run_id":run.run_id}}))
         .await
         .unwrap();
+    let sse_identity = EdgeDispatchIdentity::new(
+        &user,
+        &run.session_id,
+        &run.run_id,
+        "cleanup-chain",
+        "sse-cleanup-request",
+    );
+    service
+        .admit_and_claim_direct_dispatch(
+            &sse_identity,
+            "cleanup-edge",
+            &serde_json::json!({"type":"tool_request", "tool":"bash"}),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE edge_pending_dispatch SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
+        .bind(&user).bind(&sse_identity.request_id).execute(pool.get()).await.unwrap();
     sqlx::query("UPDATE edge_pending_dispatch SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
         .bind(&edge_owner).bind(&identity.request_id).execute(pool.get()).await.unwrap();
     for status in ["running", "waiting", "paused"] {
@@ -1046,6 +1063,15 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
         .await
         .unwrap();
         assert_eq!(status, "dispatched");
+        let sse_status: String = sqlx::query_scalar(
+            "SELECT status FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
+        )
+        .bind(&user)
+        .bind(&sse_identity.request_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(sse_status, "dispatched");
     }
     assert!(
         service
@@ -1053,6 +1079,14 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
             .await
             .unwrap()
     );
+    assert!(
+        service
+            .deliver_result(&sse_identity, "cleanup-edge", r#"{"output":"done"}"#)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE edge_pending_dispatch SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
+        .bind(&user).bind(&sse_identity.request_id).execute(pool.get()).await.unwrap();
     sqlx::query("UPDATE edge_pending_dispatch SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
         .bind(&edge_owner).bind(&identity.request_id).execute(pool.get()).await.unwrap();
     service
@@ -1066,14 +1100,39 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
             .unwrap()
             .is_some()
     );
+    assert!(
+        service
+            .wait_result(&sse_identity, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .is_some()
+    );
     run.status = "completed".into();
-    sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
-        .bind(&run.status)
-        .bind(&user)
-        .bind(&run.run_id)
-        .execute(pool.get())
+    sqlx::query(
+        "UPDATE agent_runs SET status = ?, updated_at = NOW(6) WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&run.status)
+    .bind(&user)
+    .bind(&run.run_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    service
+        .cleanup_stale(std::time::Duration::from_secs(86_400))
         .await
         .unwrap();
+    for retained in [&identity, &sse_identity] {
+        assert!(
+            service
+                .wait_result(retained, Some(std::time::Duration::ZERO))
+                .await
+                .unwrap()
+                .is_some(),
+            "recently completed runs retain their old request's results"
+        );
+    }
+    sqlx::query("UPDATE agent_runs SET updated_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run.run_id).execute(pool.get()).await.unwrap();
     service
         .cleanup_stale(std::time::Duration::from_secs(86_400))
         .await
@@ -1081,6 +1140,13 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
     assert!(
         service
             .wait_result(&identity, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        service
+            .wait_result(&sse_identity, Some(std::time::Duration::ZERO))
             .await
             .unwrap()
             .is_none()

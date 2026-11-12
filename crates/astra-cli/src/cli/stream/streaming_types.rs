@@ -841,9 +841,14 @@ pub(crate) fn canonical_tool_outcomes(
     let classes = aggregate.result_classes;
     let outcomes = astra_services::session_journal::ToolOutcomeSummary {
         requested: aggregate.attempted,
-        executed: classes.succeeded.saturating_add(classes.failed),
+        executed: classes
+            .succeeded
+            .saturating_add(classes.failed)
+            .saturating_add(classes.started_unknown),
         succeeded: classes.succeeded,
         failed: classes.failed,
+        started_unknown: classes.started_unknown,
+        unknown: classes.unknown,
         rejected: classes.rejected,
         reused: classes.reused,
         suppressed: classes.suppressed,
@@ -1633,6 +1638,33 @@ impl Default for StreamResult {
 mod tests {
     use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+
+    #[test]
+    fn unknown_receipt_preserves_known_start_and_unknown_outcomes() {
+        let aggregate = astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+            attempted: 3,
+            terminal: 3,
+            unresolved: 0,
+            result_classes: astra_turn_types::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                unknown: 1,
+                started_unknown: 1,
+                succeeded: 1,
+                ..Default::default()
+            },
+            consistent: true,
+        };
+        let summary = super::canonical_tool_outcomes(aggregate, 3).unwrap();
+        assert_eq!(
+            (
+                summary.requested,
+                summary.executed,
+                summary.failed,
+                summary.unknown,
+                summary.started_unknown
+            ),
+            (3, 2, 0, 1, 1)
+        );
+    }
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {

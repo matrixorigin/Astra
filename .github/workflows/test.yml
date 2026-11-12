@@ -634,7 +634,10 @@ jobs:
       - name: Install Chromium for browser session recovery
         if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'
         working-directory: web
-        run: npm exec -- playwright install --with-deps chromium --only-shell
+        # ubuntu-latest already provides Chromium's shared libraries. Installing
+        # Playwright's additional font bundle adds an unrelated apt/mirror gate.
+        # The real browser tests below still validate launch and page behavior.
+        run: npm exec -- playwright install chromium --only-shell
       - name: Run online tests
         if: env.RUN_TESTS == 'true'
         env:

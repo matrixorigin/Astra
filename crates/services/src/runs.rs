@@ -179,6 +179,27 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Authenticate the Edge callback and read only the run facts it needs.
+    async fn get_tool_callback_run_target(
+        &self,
+        identity: &crate::multi_agent::EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<ToolCallbackRunTarget, (StatusCode, Json<ErrorResponse>)> {
+        let run = self
+            .get_run_status(identity.run_id.clone(), identity.user_id.clone())
+            .await?;
+        if run.session_id != identity.session_id {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Tool result request not found in this session",
+            ));
+        }
+        Ok(ToolCallbackRunTarget {
+            session_id: run.session_id,
+            status: run.status,
+        })
+    }
+
     /// Read cancellation settlement without submitting another cancellation.
     async fn get_run_execution_settlement(
         &self,
@@ -1462,6 +1483,13 @@ pub struct RunStatusRecord {
     /// This is absent while the run has not published a terminal accounting
     /// fact; clients must not substitute the most recent provider frame.
     pub accounting: Option<serde_json::Value>,
+}
+
+/// The only durable run facts needed to route an authenticated tool callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallbackRunTarget {
+    pub session_id: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6120,6 +6148,24 @@ fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
 
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
+    /// In-memory and custom stores support same-owner callbacks through the
+    /// existing run-control authority; shared stores can also authenticate a
+    /// cross-owner Edge dispatch in the same durable read.
+    async fn load_tool_callback_run_target(
+        &self,
+        identity: &crate::multi_agent::EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<Option<ToolCallbackRunTarget>, String> {
+        Ok(self
+            .load_run_control(&identity.user_id, &identity.run_id)
+            .await?
+            .filter(|run| run.session_id == identity.session_id)
+            .map(|run| ToolCallbackRunTarget {
+                session_id: run.session_id,
+                status: run.status,
+            }))
+    }
+
     async fn run_user_intent_status(
         &self,
         user_id: &str,
@@ -19177,6 +19223,84 @@ impl RunStateStore for DatabaseRunStateStore {
         run.events
             .sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(Some(run_status_snapshot_from_run(&run)))
+    }
+
+    async fn load_tool_callback_run_target(
+        &self,
+        identity: &crate::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<Option<ToolCallbackRunTarget>, String> {
+        if !identity.is_complete() || edge_agent_id.is_empty() {
+            return Ok(None);
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|error| format!("tool callback run connection: {error}"))?;
+        // Run ID has a unique index and the joined dispatch uses its complete
+        // primary key. Same-owner SSE/local callbacks do not require a row.
+        let row = sqlx::query(
+            "SELECT r.user_id AS run_owner, r.run_id AS matched_run, r.session_id AS run_session, \
+                    r.status AS run_status, d.user_id AS edge_owner, d.edge_agent_id AS matched_edge, \
+                    JSON_UNQUOTE(JSON_EXTRACT(d.payload_json, '$.identity')) AS invocation_identity \
+             FROM agent_runs r FORCE INDEX (uq_agent_runs_run_id) LEFT JOIN edge_pending_dispatch d \
+               ON r.user_id <> ? AND d.session_id = r.session_id AND d.run_id = r.run_id \
+              AND d.turn_chain_id = ? AND d.request_id = ? AND d.user_id = ? AND d.edge_agent_id = ? \
+             WHERE r.run_id = ? AND r.session_id = ? AND (r.user_id = ? OR d.user_id IS NOT NULL)",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(&identity.user_id)
+        .bind(edge_agent_id)
+        .bind(&identity.run_id)
+        .bind(&identity.session_id)
+        .bind(&identity.user_id)
+        .fetch_optional(connection.connection_mut())
+        .await
+        .map_err(|error| format!("tool callback run lookup: {error}"))?;
+        connection.release();
+        let Some(row) = row else { return Ok(None) };
+        let owner: String = row
+            .try_get("run_owner")
+            .map_err(|error| error.to_string())?;
+        let run: String = row
+            .try_get("matched_run")
+            .map_err(|error| error.to_string())?;
+        let session_id: String = row
+            .try_get("run_session")
+            .map_err(|error| error.to_string())?;
+        if run != identity.run_id || session_id != identity.session_id {
+            return Ok(None);
+        }
+        if owner != identity.user_id {
+            let edge_owner: Option<String> = row
+                .try_get("edge_owner")
+                .map_err(|error| error.to_string())?;
+            let edge: Option<String> = row
+                .try_get("matched_edge")
+                .map_err(|error| error.to_string())?;
+            let invocation: Option<String> = row
+                .try_get("invocation_identity")
+                .map_err(|error| error.to_string())?;
+            if edge_owner.as_deref() != Some(identity.user_id.as_str())
+                || edge.as_deref() != Some(edge_agent_id)
+                || crate::multi_agent::edge_dispatch::dispatch_run_owner(
+                    identity,
+                    invocation.as_deref(),
+                )
+                .ok()
+                .as_deref()
+                    != Some(owner.as_str())
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(ToolCallbackRunTarget {
+            session_id,
+            status: row
+                .try_get("run_status")
+                .map_err(|error| error.to_string())?,
+        }))
     }
 
     async fn load_run_control(

@@ -214,9 +214,7 @@ impl ToolResult {
         self.is_error = true;
         self.exit_semantics = Some(exit_semantics::ExitSemantics::ExecutionError);
         let fields = self.metadata.get_or_insert_with(Map::new);
-        fields.insert("execution_fact".into(), json!("unknown"));
-        fields.insert("side_effects_maybe".into(), json!(true));
-        fields.insert("retryable".into(), json!(false));
+        execution_outcome::insert_unknown_execution_fact(fields);
         fields.insert("exit_semantics".into(), json!("execution_error"));
         fields.insert("result_class".into(), json!("execution_error"));
         self

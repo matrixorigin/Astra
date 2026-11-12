@@ -13,6 +13,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::background_task_error::BackgroundTaskError;
+use astra_services::SessionArtifactStore;
 
 pub(crate) fn background_task_rejected_fanout_slot_id(group_id: &str, slot_index: usize) -> String {
     format!("fanout:{group_id}:slot:{slot_index}:spawn_rejected")
@@ -270,8 +271,12 @@ pub(crate) async fn restore_background_task_projections(
         return Vec::new();
     };
     let session_id_owned = session_id.to_string();
+    let owner = background_registry.owner_scope().clone();
     let workspace_result = match tokio::task::spawn_blocking(move || {
-        astra_services::session_workspace::read_workspace_optional(&session_id_owned)
+        astra_services::session_workspace::read_workspace_optional_for_owner(
+            &owner,
+            &session_id_owned,
+        )
     })
     .await
     {
@@ -315,8 +320,18 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     session_id: Option<&str>,
     model: Option<&str>,
     last_persisted: &mut Vec<astra_services::session_workspace::BackgroundShellTaskProjection>,
+    reporter: Option<&super::file_writer::TuiFileWriter>,
 ) {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
+        if background_registry.has_unsettled_shell_tasks()
+            && let Some(reporter) = reporter
+        {
+            reporter.report_failure(
+                "Background task history",
+                std::path::PathBuf::new(),
+                "no session is bound yet; unconfirmed task details may be lost on exit or restart. Record important details before exiting".into(),
+            );
+        }
         return;
     };
     let projections = background_registry.export_shell_task_projections();
@@ -327,8 +342,11 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     let session_id_owned = session_id.to_string();
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
+    let owner = background_registry.owner_scope().clone();
+    let write_owner = owner.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        astra_services::session_workspace::update_workspace(
+        astra_services::session_workspace::update_workspace_for_owner(
+            &write_owner,
             &session_id_owned,
             || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
             |workspace| {
@@ -339,46 +357,104 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     })
     .await;
     match persisted {
-        Ok(Ok(())) => *last_persisted = projections,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to persist background shell projections"
+        Ok(Ok(())) => {
+            *last_persisted = projections;
+            report_workspace_projection_recovery(
+                reporter,
+                super::file_writer::BackgroundProjectionKind::Shell,
+                &owner,
+                session_id,
             );
         }
-        Err(error) => tracing::warn!(
-            session_id = %session_id,
-            error = %error,
-            "background shell projection write task failed"
+        Ok(Err(error)) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Shell,
+            &owner,
+            session_id,
+            error.to_string(),
+        ),
+        Err(error) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Shell,
+            &owner,
+            session_id,
+            error.to_string(),
         ),
     }
 }
 
+fn report_workspace_projection_error(
+    reporter: Option<&super::file_writer::TuiFileWriter>,
+    target: super::file_writer::BackgroundProjectionKind,
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+    error: String,
+) {
+    let message = format!(
+        "{error}; background task results may be lost on restart. Record important details before exiting"
+    );
+    if let Some(reporter) = reporter {
+        reporter.report_projection_failure(
+            target,
+            workspace_projection_path(owner, session_id),
+            message,
+        );
+    } else {
+        tracing::warn!(session_id, %message, "failed to persist background task projections");
+    }
+}
+
+fn workspace_projection_path(
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+) -> std::path::PathBuf {
+    astra_services::local_session_artifact_store()
+        .session_dir_for_owner(owner, session_id)
+        .map(|dir| dir.join("workspace.yaml"))
+        .unwrap_or_else(|_| "workspace.yaml".into())
+}
+
+fn report_workspace_projection_recovery(
+    reporter: Option<&super::file_writer::TuiFileWriter>,
+    target: super::file_writer::BackgroundProjectionKind,
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+) {
+    if let Some(reporter) = reporter {
+        reporter.report_recovery(target, workspace_projection_path(owner, session_id));
+    }
+}
+
 pub(crate) async fn persist_background_local_agent_task_projections_if_changed(
+    owner: &astra_services::OwnerScope,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     session_id: Option<&str>,
     model: Option<&str>,
     last_persisted: &mut Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection>,
+    reporter: Option<&super::file_writer::TuiFileWriter>,
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
     let snapshot = super::local_agent_snapshot::LocalAgentSnapshot::capture(agent_spawner).await;
     persist_background_local_agent_task_projections_from_snapshot_if_changed(
+        owner,
         &snapshot,
         restored_local_agents,
         session_id,
         model,
         last_persisted,
+        reporter,
     )
     .await
 }
 
 pub(crate) async fn persist_background_local_agent_task_projections_from_snapshot_if_changed(
+    owner: &astra_services::OwnerScope,
     snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     session_id: Option<&str>,
     model: Option<&str>,
     last_persisted: &mut Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection>,
+    reporter: Option<&super::file_writer::TuiFileWriter>,
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
     let projections = export_background_local_agent_task_projections_from_snapshot(
         snapshot,
@@ -394,8 +470,10 @@ pub(crate) async fn persist_background_local_agent_task_projections_from_snapsho
     let session_id_owned = session_id.to_string();
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
+    let write_owner = owner.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        astra_services::session_workspace::update_workspace(
+        astra_services::session_workspace::update_workspace_for_owner(
+            &write_owner,
             &session_id_owned,
             || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
             |workspace| {
@@ -406,18 +484,28 @@ pub(crate) async fn persist_background_local_agent_task_projections_from_snapsho
     })
     .await;
     match persisted {
-        Ok(Ok(())) => *last_persisted = projections.clone(),
-        Ok(Err(error)) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to persist background local agent projections"
+        Ok(Ok(())) => {
+            *last_persisted = projections.clone();
+            report_workspace_projection_recovery(
+                reporter,
+                super::file_writer::BackgroundProjectionKind::Agent,
+                owner,
+                session_id,
             );
         }
-        Err(error) => tracing::warn!(
-            session_id = %session_id,
-            error = %error,
-            "background local-agent projection write task failed"
+        Ok(Err(error)) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Agent,
+            owner,
+            session_id,
+            error.to_string(),
+        ),
+        Err(error) => report_workspace_projection_error(
+            reporter,
+            super::file_writer::BackgroundProjectionKind::Agent,
+            owner,
+            session_id,
+            error.to_string(),
         ),
     }
     projections
@@ -790,7 +878,8 @@ pub(crate) fn background_task_event_system_message(
             "Background shell {} was stopped",
             background_shell_notification_label(id, title)
         )),
-        crate::edge_tools::background_tasks::BgTaskEvent::Started { .. } => None,
+        crate::edge_tools::background_tasks::BgTaskEvent::Started { .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Updated { .. } => None,
     }
 }
 
@@ -849,6 +938,198 @@ pub(crate) fn background_task_event_system_messages(
 #[cfg(test)]
 mod tests {
     use super::{background_task_output_dir, background_task_output_search_snapshot};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unbound_uncertain_task_warns_then_persists_after_binding() {
+        use astra_services::session_workspace::{
+            BackgroundShellTaskProjection, BackgroundShellTerminalFacts,
+        };
+        let temp = crate::tests::test_temp_dir();
+        let _guard = astra_services::session_journal::ProcessJournalDirGuard::new(temp.path());
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("tasks"),
+        );
+        let (writer, runtime, mut errors) = super::super::file_writer::spawn();
+        let mut cache = Vec::new();
+        super::persist_background_task_projections_if_changed(
+            &mut registry,
+            None,
+            None,
+            &mut cache,
+            Some(&writer),
+        )
+        .await;
+        assert!(
+            errors.try_recv().is_err(),
+            "ordinary unbound sessions do not warn"
+        );
+        registry
+            .restore_shell_task_projection(BackgroundShellTaskProjection {
+                terminal_facts: Some(BackgroundShellTerminalFacts {
+                    unobserved: true,
+                    outcome_unknown: true,
+                    cleanup_unconfirmed: false,
+                }),
+                id: "unknown-task".into(),
+                status: "failed".into(),
+                title: "command".into(),
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                exit_code: None,
+                terminal_reason: Some("execution unknown".into()),
+            })
+            .unwrap();
+        for _ in 0..2 {
+            super::persist_background_task_projections_if_changed(
+                &mut registry,
+                None,
+                None,
+                &mut cache,
+                Some(&writer),
+            )
+            .await;
+        }
+        let super::super::file_writer::TuiFileWriteEvent::Failed(first) =
+            errors.try_recv().unwrap()
+        else {
+            panic!("expected failure")
+        };
+        let super::super::file_writer::TuiFileWriteEvent::Failed(second) =
+            errors.try_recv().unwrap()
+        else {
+            panic!("expected failure")
+        };
+        assert_eq!(
+            first, second,
+            "the TUI deduplicates repeated identical warnings"
+        );
+        assert!(first.path.as_os_str().is_empty());
+        assert!(first.user_message().contains("no session is bound yet"));
+        super::persist_background_task_projections_if_changed(
+            &mut registry,
+            Some("bound-unknown-task"),
+            None,
+            &mut cache,
+            Some(&writer),
+        )
+        .await;
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(super::super::file_writer::TuiFileWriteEvent::ProjectionRecovered { .. })
+        ));
+        let workspace =
+            astra_services::session_workspace::read_workspace("bound-unknown-task").unwrap();
+        assert_eq!(workspace.background_shell_tasks[0].id, "unknown-task");
+        assert!(
+            workspace.background_shell_tasks[0]
+                .terminal_facts
+                .as_ref()
+                .unwrap()
+                .outcome_unknown
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_workspace_write_warns_user_and_preserves_previous_history() {
+        let temp = crate::tests::test_temp_dir();
+        let _guard = astra_services::session_journal::ProcessJournalDirGuard::new(temp.path());
+        let session_id = "background-projection-full-workspace";
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(session_id, "model");
+        let base_len = serde_yaml_ng::to_string(&workspace).unwrap().len();
+        workspace.summary = Some("x".repeat(1024 * 1024 - base_len - 700));
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("tasks"),
+        );
+        registry
+            .restore_shell_task_projection(
+                astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: Some(
+                        astra_services::session_workspace::BackgroundShellTerminalFacts {
+                            unobserved: true,
+                            outcome_unknown: true,
+                            cleanup_unconfirmed: true,
+                        },
+                    ),
+                    id: "unknown-task".into(),
+                    status: "failed".into(),
+                    title: "t".repeat(500),
+                    started_at_ms: 1,
+                    ended_at_ms: Some(2),
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    exit_code: None,
+                    terminal_reason: Some("r".repeat(1000)),
+                },
+            )
+            .unwrap();
+        let (writer, runtime, mut errors) = super::super::file_writer::spawn();
+        let mut cache = Vec::new();
+        super::persist_background_task_projections_if_changed(
+            &mut registry,
+            Some(session_id),
+            None,
+            &mut cache,
+            Some(&writer),
+        )
+        .await;
+        let super::super::file_writer::TuiFileWriteEvent::ProjectionFailed {
+            error: warning, ..
+        } = errors
+            .try_recv()
+            .expect("failed persistence must reach the TUI")
+        else {
+            panic!("expected a failure")
+        };
+        let warning = warning.user_message();
+        assert!(warning.contains("may be lost on restart"), "{warning}");
+        assert!(warning.contains("Record important details"), "{warning}");
+        assert!(cache.is_empty());
+        let previous = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(previous.summary, workspace.summary);
+        assert!(previous.background_shell_tasks.is_empty());
+
+        astra_services::session_workspace::update_workspace(
+            session_id,
+            || panic!("workspace exists"),
+            |workspace| workspace.summary = None,
+        )
+        .unwrap();
+        super::persist_background_task_projections_if_changed(
+            &mut registry,
+            Some(session_id),
+            None,
+            &mut cache,
+            Some(&writer),
+        )
+        .await;
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(
+                super::super::file_writer::TuiFileWriteEvent::ProjectionRecovered {
+                    kind: super::super::file_writer::BackgroundProjectionKind::Shell,
+                    ..
+                }
+            )
+        ));
+        let saved = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(saved.background_shell_tasks[0].id, "unknown-task");
+        assert!(
+            saved.background_shell_tasks[0]
+                .terminal_facts
+                .as_ref()
+                .unwrap()
+                .outcome_unknown
+        );
+        runtime.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn diagnostic_search_observes_live_output_without_completing_the_task() {

@@ -177,7 +177,7 @@ fn cli_bash_workdir_launch_uses_the_pinned_directory_after_path_retarget() {
     std::fs::rename(root.join("nested"), root.join("original-moved")).unwrap();
     std::fs::create_dir(root.join("nested")).unwrap();
     std::fs::write(root.join("nested/value"), "wrong replacement").unwrap();
-    let output = super::run_shell_output_with_config(config).unwrap();
+    let output = super::run_shell_output_with_config(config, None, None).unwrap();
     assert!(output.output.status.success());
     assert_eq!(
         String::from_utf8(output.output.stdout).unwrap(),
