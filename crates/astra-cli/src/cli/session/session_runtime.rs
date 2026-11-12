@@ -2620,7 +2620,7 @@ mod tests {
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
@@ -2632,6 +2632,8 @@ mod tests {
                 .stderr(Stdio::from(slave))
                 .spawn()
                 .unwrap();
+            // Close the parent's slave descriptors so master EOF observes child exit.
+            drop(command);
             let reader = std::thread::spawn(move || {
                 let mut output = Vec::new();
                 let _ = master.read_to_end(&mut output); // PTY EOF can be EIO.
