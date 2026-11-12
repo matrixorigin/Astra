@@ -1171,6 +1171,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 flag: None,
                 pause_flag: None,
                 token: self.cancel_token.clone(),
+                inference_token: None,
                 execution_lease_lost: self.execution_lease_lost.clone(),
                 resolved_origin: None,
             },

@@ -677,6 +677,22 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         sent_rx.try_recv().is_err(),
         "second message overtook the delayed first acknowledgement"
     );
+    // The disposition can beat the POST response. The queue must settle now
+    // and must not be recreated by the later acceptance receipt.
+    let (intent_id, content, event_index) = received.lock().unwrap()[0].clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    astra.wait_for_screen(
+        "first applied before POST ACK",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› first instruction")
+                && !screen.contains("received · first instruction")
+        },
+    );
     release_first.notify_one();
     let second = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -698,6 +714,31 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
             "Bearer gateway-token".into()
         )
     );
+    astra.wait_for_screen("second POST accepted", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("received · second instruction")
+    });
+    let (intent_id, content, event_index) = received.lock().unwrap()[1].clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    astra.wait_for_screen(
+        "live guidance settled before terminal",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› first instruction")
+                && screen.contains("› second instruction")
+                && !screen.contains("received · first instruction")
+                && !screen.contains("received · second instruction")
+        },
+    );
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "live disposition must not wait for the terminal lookup"
+    );
+    assert_eq!(mock.received_requests().len(), 1, "the turn remains open");
     astra.paste_and_submit("needs correction");
     let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -1146,6 +1187,66 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     mock.release_held_response();
     astra.wait_for("planning request was delivered", UI_TRANSITION_TIMEOUT);
     assert!(astra.current_screen().contains("/plan inspect the failure"));
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes() {
+    use axum::{Json, extract::Path, routing::post};
+    let _journey = pty_journey_lock().lock().await;
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let routes = axum::Router::new().route(
+        "/chat/runs/{run_id}/intents",
+        post(
+            move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(body["input"]["content"].clone()).unwrap();
+                    Json(serde_json::json!({
+                        "run_id": run_id, "intent_id": body["intent_id"],
+                        "status": "accepted_remote", "duplicate": false, "event_index": 1
+                    }))
+                }
+            },
+        ),
+    );
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_routes(
+        astra_cli::cli::mock_llm::MockScenario::ForegroundThenQuestion,
+        routes,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn_with_config(
+        home.path(),
+        &mock.base_url,
+        "mock-model",
+        "gateway-token",
+        &[],
+    );
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Run the gated task.");
+    astra.wait_for("Approval · Bash", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("Running Bash", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("What is the status?");
+    let guidance = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(guidance, "What is the status?");
+    astra.wait_for("Which option should I choose?", UI_TRANSITION_TIMEOUT);
+    assert!(!home.path().join("release-background").exists());
+    assert!(
+        mock.tool_results()
+            .iter()
+            .any(|result| result.to_string().contains("background_task_id")),
+        "the still-running shell must remain available as a managed task"
+    );
+    std::fs::write(home.path().join("release-background"), "go").unwrap();
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }

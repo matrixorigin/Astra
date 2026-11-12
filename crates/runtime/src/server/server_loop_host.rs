@@ -1740,6 +1740,21 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
     }
 }
 
+fn request_llm_cancel(
+    cancellation: &crate::turn::agentic_loop::host::CancellationState,
+) -> LlmCancel<'_> {
+    let token = cancellation
+        .inference_token
+        .as_ref()
+        .or(cancellation.token.as_ref());
+    match (cancellation.flag.as_deref(), token.map(AsRef::as_ref)) {
+        (Some(flag), Some(token)) => LlmCancel::FlagAndToken(flag, token),
+        (Some(flag), None) => LlmCancel::Flag(flag),
+        (None, Some(token)) => LlmCancel::Token(token),
+        (None, None) => LlmCancel::None,
+    }
+}
+
 fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
     // Keep the state-side estimate identical to the final wire estimate. The
     // schemas are already materialized as JSON values; serializing the whole
@@ -9522,6 +9537,26 @@ impl ServerAgenticLoopHost {
             round_index: state.current_round_index,
             source: Some(source),
         });
+    }
+
+    async fn settle_work_admission_for_request(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let cancellation = state.cancellation.clone();
+        let cancelled = tokio::select! {
+            biased;
+            _ = self.resolve_pending_work_admission(Some(state), true) => false,
+            _ = crate::turn::llm::client::wait_llm_cancel(request_llm_cancel(&cancellation)) => true,
+        };
+        if cancelled {
+            self.abort_pending_work_admission().await;
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Execution cancelled while awaiting semantic judgment",
+            ));
+        }
+        Ok(())
     }
 
     /// Reconcile the owned semantic task. Provider preparation waits for its
@@ -18122,6 +18157,28 @@ impl ServerAgenticLoopHost {
         result
     }
 
+    async fn compact_messages_for_request(
+        &self,
+        state: &mut AgenticLoopState,
+        messages: &[Value],
+        system_messages: &[Value],
+        visible_tools: &[Value],
+        tier: CompactionTier,
+        llm_cfg: &ResolvedTurnLlmConfig,
+    ) -> Result<crate::turn::cloud::compaction::CompactResult, astra_core::ClassifiedError> {
+        let cancellation = state.cancellation.clone();
+        tokio::select! {
+            biased;
+            result = self.compact_messages_via_memoria(state, messages, system_messages, visible_tools, tier, llm_cfg) => Ok(result),
+            _ = crate::turn::llm::client::wait_llm_cancel(request_llm_cancel(&cancellation)) => {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "Execution cancelled during context compaction",
+                ))
+            }
+        }
+    }
+
     /// Assemble the final provider wire and perform bounded pure history
     /// recomposition if the complete payload (including late runtime context
     /// and tool schemas) exceeds the hard input budget. Runtime
@@ -20433,25 +20490,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // User feedback must reach WorkingMemory before this request's context
         // is assembled. Settling the semantic owner does not materialize its
         // Work graph; the existing post-response carrier boundary still does.
-        let cancellation = state.cancellation.clone();
-        let cancel = match (&cancellation.flag, &cancellation.token) {
-            (Some(flag), Some(token)) => LlmCancel::FlagAndToken(flag, token),
-            (Some(flag), None) => LlmCancel::Flag(flag),
-            (None, Some(token)) => LlmCancel::Token(token),
-            (None, None) => LlmCancel::None,
-        };
-        let cancelled = tokio::select! {
-            biased;
-            _ = crate::turn::llm::client::wait_llm_cancel(cancel) => true,
-            _ = self.resolve_pending_work_admission(Some(state), true) => false,
-        };
-        if cancelled {
-            self.abort_pending_work_admission().await;
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Cancelled,
-                "Execution cancelled while awaiting semantic judgment",
-            ));
-        }
+        self.settle_work_admission_for_request(state).await?;
         self.flush_completed_work_admission_phase(state);
         let request_preparation_started = Instant::now();
         // This begins after semantic admission has completed in the shared
@@ -20506,7 +20545,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
                 if let Err(error) =
-                    sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await
+                    sleep_ms_or_llm_cancel(delay_ms, request_llm_cancel(&state.cancellation)).await
                 {
                     self.complete_request_preparation_phase(
                         state,
@@ -20715,16 +20754,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let mut compaction_fixed_context = final_system_messages.clone();
         compaction_fixed_context.extend(final_volatile_preamble.iter().cloned());
-        let compact_result = self
-            .compact_messages_via_memoria(
+        let compact_result = self.compact_messages_for_request(
                 state,
                 &pipeline_messages,
                 &compaction_fixed_context,
                 context_tool_surface,
                 tier,
                 &llm_cfg,
-            )
-            .await;
+            ).await;
+        let compact_result = match compact_result {
+            Ok(result) => result,
+            Err(error) => {
+            self.complete_request_preparation_phase(
+                state,
+                request_preparation_started,
+                0,
+                &mut request_preparation_recorded_attempts,
+                TurnPhaseOutcome::Failed,
+            );
+            return Err(error);
+            }
+        };
         // One Server HTTP turn may execute multiple LLM rounds. Keep repeated
         // snapshots stable within a round without conflating later compactions.
         let context_compactions = crate::turn::wire_assembly::observe_context_compaction(
@@ -21135,9 +21185,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // A provider answer is provisional while executed-tool evidence still
         // requires a typed completion action. The runtime may reject that
         // answer after this request returns; streaming it now is irreversible.
-        let direct_children_pending = self.direct_child_completion_owner(state)
-            .is_some_and(|owner| owner.has_pending_direct_children());
-        let completion_action_pending = direct_children_pending || state
+        // A running child does not make its parent's progress or response to
+        // guidance a completion claim. The shared child barrier still owns
+        // terminal settlement; only typed completion obligations buffer prose.
+        let completion_action_pending = state
             .hooks
             .completion_settlement
             .completion_action_window
@@ -21260,6 +21311,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
                 admission_estimated_tokens as u64,
+                request_llm_cancel(&state.cancellation),
             )
             .await
             {
@@ -21655,7 +21707,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
-                    let llm_cancel = llm_cancel_for_state(state);
+                    let llm_cancel = request_llm_cancel(&state.cancellation);
                     call_prepared_llm_and_collect_with_stream_callback(
                         prepared_call,
                         llm_cancel,
@@ -21664,33 +21716,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         dispatch_budget.client_timeout,
                     ).await.map_err(|error| dispatch_budget.classify_deadline(error))
                 };
-                // Root answer text stays provisional while Work admission is
-                // unresolved, but a provider failure closes that admission
-                // path. Preserve the exact prefix already delivered by the
-                // provider as an interrupted result instead of dropping it
-                // with this callback scope. This does not grant the text
-                // success authority and must never trigger a replay.
-                if provider_result.is_err()
-                    && buffer_root_text_for_active_work
-                    && !completion_action_pending
-                    && crate::turn::llm::client::text_has_actionable_content(&attempt_text)
-                {
-                    if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
-                        && !suffix.is_empty()
-                    {
-                        self.emit_progress_event(json!({
-                            "type": "text_delta",
-                            "content": suffix,
-                        }));
-                        streamed_text.push_str(suffix);
-                    } else if streamed_text.is_empty() {
-                        self.emit_progress_event(json!({
-                            "type": "text_delta",
-                            "content": &attempt_text,
-                        }));
-                        streamed_text.push_str(&attempt_text);
-                    }
-                }
+                // A failed or cancelled provider does not validate a Work-
+                // gated answer. Keep that provisional text private even if
+                // run cancellation races with guidance supersession.
                 if !pending_live_reasoning.is_empty() {
                     let pending = std::mem::take(&mut pending_live_reasoning);
                     self.emit_progress_event(json!({
@@ -21938,6 +21966,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "error",
                         llm_capture_error_response(&e),
                     );
+                    if e.kind == astra_core::ErrorKind::Cancelled {
+                        // Only bytes actually projected to the user belong in
+                        // the next model context. Work-gated text and tool
+                        // fragments are still provisional.
+                        if let Some(message) =
+                            astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+                                &state.messages,
+                                &streamed_text,
+                                state.current_model_item_id.as_deref(),
+                            )
+                        {
+                            state.push_prompt_history_message(message);
+                        }
+                        let mut error = e;
+                        if let Some(Value::Object(mut details)) = error
+                            .details_json
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok())
+                        {
+                            details.insert("partial_full_text".into(), json!(streamed_text));
+                            error.details_json = Some(Value::Object(details).to_string());
+                        }
+                        // Cancellation is an ordinary control transition, not
+                        // a provider failure requiring a synchronous full-request
+                        // artifact on the hot path.
+                        return Err(error);
+                    }
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -22428,7 +22483,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.work_admission_execution_topology,
         );
         if admission_must_settle {
-            self.resolve_pending_work_admission(Some(state), true).await;
+            self.settle_work_admission_for_request(state).await?;
             self.flush_completed_work_admission_phase(state);
         } else {
             self.resolve_pending_work_admission(Some(state), false).await;
@@ -23271,6 +23326,7 @@ fn server_tool_terminal_event(run_id: Option<&str>, record: &ToolCallRecord) -> 
     let status = match disposition {
         ToolCallDisposition::Executed if record.ok => "completed",
         ToolCallDisposition::Executed => "failed",
+        ToolCallDisposition::Unknown => "unknown",
         ToolCallDisposition::Rejected => "rejected",
         ToolCallDisposition::Reused => "completed",
         ToolCallDisposition::Suppressed | ToolCallDisposition::Deferred => "skipped",
@@ -25803,6 +25859,7 @@ mod tests {
                 astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                     fields.get("disposition"),
                     fields.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                     astra_services::session_journal::ToolCallDisposition::Executed,
                 ),
                 astra_services::session_journal::ToolCallDisposition::Rejected,
@@ -39328,6 +39385,38 @@ mod tests {
         pending: bool,
     }
 
+    #[tokio::test]
+    async fn request_supersession_cancels_owned_admission_without_cancelling_run() {
+        let mut host = test_host_builder("admission-owner", "admission-session").build();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = started.clone();
+        host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::UserObservation,
+            wait_node_id: None,
+            handle: tokio::spawn(async move {
+                task_started.notify_one();
+                std::future::pending().await
+            }),
+            usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
+            started_at: Instant::now(),
+            round_index: 0,
+            source: None,
+        });
+        let mut state = create_test_state();
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent.clone());
+        state.cancellation.inference_token = Some(request.clone());
+        let cancel = async {
+            started.notified().await;
+            request.cancel();
+        };
+        let (result, ()) = tokio::join!(host.settle_work_admission_for_request(&mut state), cancel);
+        assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+        assert!(host.pending_work_admission_judge.is_none());
+        assert!(!parent.is_cancelled());
+    }
+
     #[async_trait::async_trait]
     impl SummaryLlmClient for InterruptedCompactionSummary {
         async fn summarize(
@@ -39525,6 +39614,54 @@ mod tests {
             );
             assert_ne!(state.messages, original);
         }
+    }
+
+    #[tokio::test]
+    async fn request_supersession_stops_compaction_without_rewriting_history() {
+        let mut host = test_host_builder("compaction-owner", "compaction-session")
+            .with_memoria_client(Some(Arc::new(CompactionMemoryFixture::default())))
+            .build();
+        let started = Arc::new(tokio::sync::Notify::new());
+        host.test_compaction_client = Some(Box::new(InterruptedCompactionSummary {
+            started: started.clone(),
+            pending: true,
+        }));
+        let mut state = create_test_state();
+        state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+        let original = state.messages.clone();
+        state.initialize_canonical_rewrite_proof(
+            &original,
+            &astra_turn_types::canonical_conversation_root(&original),
+            0,
+        );
+        let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+        config.context_window = Some(32_000);
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent.clone());
+        state.cancellation.inference_token = Some(request.clone());
+        let cancel = async {
+            started.notified().await;
+            request.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            host.compact_messages_for_request(
+                &mut state,
+                &original,
+                &[],
+                &[],
+                CompactionTier::AggressivePrune,
+                &config
+            ),
+            cancel,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("compaction must be cancelled"),
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(state.messages, original);
+        assert!(!parent.is_cancelled());
     }
 
     #[tokio::test]
@@ -51136,6 +51273,21 @@ mod tests {
         let mut state = create_durable_execution_test_state(session_id);
         state.message = "answer normally".to_string();
         state.user_intent = state.message.clone();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let executor = runtime_tool_executor_with_agent_context(workspace.path());
+        let owner = executor.direct_child_completion_owner().unwrap();
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "held-child".into(),
+            run_id: "held-child-run".into(),
+            parent_agent_id: "agent1".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        state.current_run_id = Some("run1".into());
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        assert!(owner.has_pending_direct_children());
 
         let observe_first_text = async {
             let mut visible_order = Vec::new();
@@ -51159,6 +51311,10 @@ mod tests {
                 }
                 if event_type == "text_delta" {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        owner.has_pending_direct_children(),
+                        "reply must not wait for the child"
+                    );
                     assert!(
                         saw_llm_call_started,
                         "visible provider output arrived before the LLM start lifecycle event"
@@ -51797,6 +51953,248 @@ mod tests {
         );
         inference_ledger.assert_quiescent();
         provider.assert_complete();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn guidance_supersession_does_not_publish_buffered_work_answer() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        for parent_cancelled in [false, true] {
+            let session_id = format!("work-stream-cancel-{parent_cancelled}");
+            let release = Arc::new(tokio::sync::Notify::new());
+            let chunks = [
+                json!({"choices":[{"delta":{"content":"Work is complete."}}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"provider reached boundary"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+            let provider = ProviderGateway::start(vec![ProviderScript::new(
+                "cancel_buffered_work_answer",
+                |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+                vec![ProviderResponse::Stream {
+                    content_type: "text/event-stream",
+                    chunks,
+                    release_before_chunk: Some((2, release.clone())),
+                }],
+            )])
+            .await;
+            let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+            let mut host = test_host_builder("user-work-cancel", session_id.clone())
+                .with_provider_observations(
+                    crate::server::provider_test_support::ProviderObservationsFixture::default(),
+                )
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    gateway_url,
+                    Some(3000),
+                )))
+                .build();
+            host.terminal_handoff_window.close();
+            host.pending_work_establishment = Some(PendingWorkEstablishment {
+                call: json!({"id":"pending-work","type":"function","function":{"name":"start_work","arguments":"{}"}}),
+                call_id: "pending-work".into(),
+                operation_id: None,
+                activation: astra_services::work::WorkEstablishmentActivation::Start,
+                control: WorkEstablishmentCarrierControl::Establish,
+                attempts: 1,
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            host.set_event_tx(tx);
+            let mut state = create_durable_execution_test_state(&session_id);
+            state.message = "continue".into();
+            state.user_intent = state.message.clone();
+            let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+            let inference = Arc::new(parent.child_token());
+            state.cancellation.token = Some(parent.clone());
+            state.cancellation.inference_token = Some(inference.clone());
+            let execution = host.execute_turn(&mut state);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    result = &mut execution => match result {
+                        Ok(_) => panic!("provider finished before cancellation"),
+                        Err(error) => panic!("provider failed before cancellation: {error:?}"),
+                    },
+                    event = tokio::time::timeout(Duration::from_secs(5), rx.recv()) => {
+                        let event = event.expect("provider progress").expect("event channel");
+                        assert_ne!(event.get("type").and_then(Value::as_str), Some("text_delta"));
+                        if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
+                            break;
+                        }
+                    }
+                }
+            }
+            if parent_cancelled {
+                parent.cancel();
+            } else {
+                inference.cancel();
+            }
+            let result = execution.await;
+            let error = result.err().expect("cancelled");
+            assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                details["partial_full_text"], "",
+                "unpublished Work text stays private"
+            );
+            release.notify_one();
+            let mut text = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                    text.push(event);
+                }
+            }
+            assert!(text.is_empty(), "provisional Work answer leaked: {text:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn superseded_stream_preserves_visible_context_without_database_dumps() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let mut settings = MatrixOneSettings::from_env();
+        settings.db_pool_min_connections = 0;
+        settings.db_pool_max_connections = 1;
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let user = format!("steer-no-dump-user-{nonce}");
+        let session = format!("steer-no-dump-session-{nonce}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let chunks = [
+            json!({"choices":[{"delta":{"content":"Visible partial."}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n").into_bytes())
+        .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+        .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "cancel a visible provider response",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )])
+        .await;
+        let mut host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        host.terminal_handoff_window.close();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(events_tx);
+        let mut state = create_durable_execution_test_state(&session);
+        state.message = "continue".into();
+        state.user_intent = state.message.clone();
+        let parent = Arc::new(tokio_util::sync::CancellationToken::new());
+        let inference = Arc::new(parent.child_token());
+        state.cancellation.token = Some(parent);
+        state.cancellation.inference_token = Some(inference.clone());
+        let error = {
+            let execution = host.execute_turn(&mut state);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    _ = &mut execution => panic!("provider ended before cancellation"),
+                    event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv()) => {
+                        let event = event.unwrap().unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                            assert_eq!(event["content"], "Visible partial.");
+                            break;
+                        }
+                    }
+                }
+            }
+            // The only connection is unavailable. A diagnostic dump would
+            // block here, even though the interrupted inference has settled.
+            let held = pool.get().acquire().await.unwrap();
+            inference.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut execution)
+                .await
+                .expect("cancelled inference must not wait for the database");
+            drop(held);
+            result.err().expect("inference was superseded")
+        };
+        release.notify_one();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(
+            state.messages.iter().any(|message| {
+                message["role"] == "assistant" && message["content"] == "Visible partial."
+            }),
+            "the next request must see the text the user already saw"
+        );
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 0);
+        provider.assert_complete();
+
+        // Real provider failures retain their existing diagnostics.
+        let failing_provider = ProviderGateway::start(vec![ProviderScript::new(
+            "reject a provider request",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::Json {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error": {"message": "invalid request"}}),
+            }],
+        )])
+        .await;
+        let mut failed_host = test_host_builder(&user, &session)
+            .with_pool(pool.clone())
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", failing_provider.base_url),
+                Some(3000),
+            )))
+            .build();
+        let mut failed_state = create_durable_execution_test_state(&session);
+        let error = failed_host
+            .execute_turn(&mut failed_state)
+            .await
+            .err()
+            .expect("provider failure");
+        assert_ne!(error.kind, astra_core::ErrorKind::Cancelled);
+        let dumps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_request_dump'"
+        ).bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(dumps, 1);
+        failing_provider.assert_complete();
+        sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1819,29 +1819,6 @@ struct ParkedToolCell {
     cell_id: u64,
 }
 
-/// `live_tasks` is the multi-slot register for **parallel TaskCells**
-/// (sub-agents spawned via the agent spawn action in a single turn). Each
-/// entry is keyed by its `tool_use_id`. Nested lifecycle events are owned by
-/// the corresponding child run and stay out of these parent rows, so
-/// spawning agent B no longer commits agent A to scrollback — both stay live.
-/// On terminal completion (`ToolCompleted` for the parent), the cell finalises
-/// and moves to `history` with no disruption to its siblings.
-///
-/// **Insertion order matters**: `LiveTaskOrder` records the order
-/// agents were spawned so the renderer can show them deterministically
-/// (oldest-first) regardless of HashMap iteration order.
-enum DeferredStreamEvent {
-    AnswerDelta {
-        model_item_id: Option<String>,
-        text: String,
-    },
-    ReasoningDelta {
-        model_item_id: Option<String>,
-        text: String,
-    },
-    ReasoningDone,
-}
-
 /// A reconnect can replay lifecycle boundaries from an earlier turn. Keep a
 /// bounded identity tombstone so a late end (or a replayed start) cannot
 /// manufacture a second transcript row after the original call was settled.
@@ -1917,11 +1894,6 @@ pub(crate) struct ChatWidget {
     /// uncertain rows remain reconcilable when their authoritative terminal
     /// receipt arrives late; successful/failed terminals stay idempotent.
     settled_tool_cell_ids: std::collections::HashMap<String, u64>,
-    /// Providers may emit answer/reasoning tokens before the preceding tool's
-    /// terminal event. Keep those events ordered until the tool receipt lands
-    /// so the transcript does not manufacture a failed tool and later append
-    /// a duplicate successful one.
-    deferred_stream_events: Vec<DeferredStreamEvent>,
     next_cell_id: u64,
     /// Live parallel TaskCells, keyed by their `tool_use_id`.
     /// Mutating directly (no `Arc`) so each parent can finalize independently.
@@ -1994,7 +1966,6 @@ impl ChatWidget {
             settled_tool_use_ids: std::collections::HashSet::new(),
             settled_tool_use_order: VecDeque::new(),
             settled_tool_cell_ids: std::collections::HashMap::new(),
-            deferred_stream_events: Vec::new(),
             next_cell_id: 1,
             live_tasks: std::collections::HashMap::new(),
             live_task_order: Vec::new(),
@@ -2957,6 +2928,11 @@ impl ChatWidget {
         self.active_cell.as_deref()
     }
 
+    pub(crate) fn latest_parked_tool(&self) -> Option<&dyn HistoryCell> {
+        let id = self.parked_tool_order.last()?;
+        self.parked_tools.get(id).map(|parked| parked.cell.as_ref())
+    }
+
     pub(crate) fn active_cell_id(&self) -> Option<u64> {
         debug_assert_eq!(self.active_cell.is_some(), self.active_cell_id.is_some());
         self.active_cell_id
@@ -3143,12 +3119,8 @@ impl ChatWidget {
         self.history_cell_ids.push(id);
     }
 
-    /// Commit a user message directly into history without opening a new turn
-    /// or draining the current live tool/assistant state.
-    ///
-    /// Used for user intents that become active mid-turn: the transcript
-    /// should show the newest user message as a first-class user row, but the
-    /// current streaming turn should remain live until the runtime yields.
+    /// Preserve the conversational ordering of a mid-turn user message
+    /// without treating any still-running tool as complete.
     pub fn commit_applied_user_intent(
         &mut self,
         _intent_id: impl Into<String>,
@@ -3156,6 +3128,12 @@ impl ChatWidget {
         _status: astra_turn_types::UserIntentStatus,
         text: impl Into<String>,
     ) {
+        if matches!(
+            self.active_cell.as_deref().map(cell_kind),
+            Some(CellKind::Assistant | CellKind::Reasoning)
+        ) {
+            self.commit_active();
+        }
         self.commit_cell(Box::new(UserCell::new(text.into())));
     }
 
@@ -3347,17 +3325,9 @@ impl ChatWidget {
     }
 
     fn on_answer_delta(&mut self, delta: &str, model_item_id: Option<&str>) {
-        if matches!(
-            self.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Tool)
-        ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::AnswerDelta {
-                    model_item_id: model_item_id.map(str::to_owned),
-                    text: delta.to_string(),
-                });
-            return;
-        }
+        // A tool can remain live while the model speaks. Keep its existing
+        // keyed projection rather than hiding the answer or finalizing it.
+        self.park_active_tool();
         // Tokens can begin flowing while another stream-owned cell is still
         // live. The single active-cell slot is type-stable: append to an
         // AssistantCell, or commit the old lane before opening the answer.
@@ -3392,17 +3362,7 @@ impl ChatWidget {
     }
 
     fn on_reasoning_delta(&mut self, delta: &str, model_item_id: Option<&str>) {
-        if matches!(
-            self.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Tool)
-        ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::ReasoningDelta {
-                    model_item_id: model_item_id.map(str::to_owned),
-                    text: delta.to_string(),
-                });
-            return;
-        }
+        self.park_active_tool();
         // Reasoning can resume or arrive after visible answer/tool output from
         // providers that interleave lanes. Keep the active-cell slot type-stable
         // instead of asserting on a legitimate ordering variant.
@@ -3440,8 +3400,6 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Tool)
         ) {
-            self.deferred_stream_events
-                .push(DeferredStreamEvent::ReasoningDone);
             return;
         }
         // Only flips the reasoning cell's live flag; the cell
@@ -3456,6 +3414,7 @@ impl ChatWidget {
             // as its own cell. Keeps the scrollback readable as
             // discrete turns rather than one blob.
             self.commit_active();
+            self.restore_latest_parked_tool();
         }
     }
 
@@ -3541,7 +3500,7 @@ impl ChatWidget {
             // close it only after the tool-specific parking path had a chance
             // to preserve a still-running call.
             if !parked_tool {
-                self.commit_active_and_replay_deferred();
+                self.commit_active();
             }
             let mut cell = ToolCell::new_running(name, description);
             if cell.name == "bash" && self.bash_background_hint_enabled {
@@ -4483,9 +4442,6 @@ impl ChatWidget {
             tc.complete(&status, duration_ms, description, output_summary, output);
             self.commit_active();
             self.restore_latest_parked_tool();
-            if !self.has_live_tool_projection() {
-                self.replay_deferred_stream_events();
-            }
             return;
         }
 
@@ -4496,9 +4452,6 @@ impl ChatWidget {
             }
             self.commit_cell_with_id(parked.cell, parked.cell_id);
             self.remember_settled_tool_use_id(tool_use_id, Some(parked.cell_id));
-            if !self.has_live_tool_projection() {
-                self.replay_deferred_stream_events();
-            }
             return;
         }
 
@@ -4559,10 +4512,11 @@ impl ChatWidget {
     /// its typed completion/cancellation or the terminal turn boundary owns
     /// that lifecycle transition.
     pub(crate) fn finish_stream_projection(&mut self) {
-        if self.has_live_tool_projection() {
+        if self.active_tool_use_id.is_some() {
             return;
         }
-        self.commit_active_and_replay_deferred();
+        self.commit_active();
+        self.restore_latest_parked_tool();
     }
 
     pub(crate) fn has_live_tool_projection(&self) -> bool {
@@ -4754,37 +4708,9 @@ impl ChatWidget {
         }
     }
 
-    fn replay_deferred_stream_events(&mut self) {
-        let deferred = std::mem::take(&mut self.deferred_stream_events);
-        for event in deferred {
-            match event {
-                DeferredStreamEvent::AnswerDelta {
-                    model_item_id,
-                    text,
-                } => self.on_answer_delta(&text, model_item_id.as_deref()),
-                DeferredStreamEvent::ReasoningDelta {
-                    model_item_id,
-                    text,
-                } => self.on_reasoning_delta(&text, model_item_id.as_deref()),
-                DeferredStreamEvent::ReasoningDone => self.on_reasoning_done(),
-            }
-        }
-    }
-
-    /// Close the current lane at a transcript boundary, then materialize any
-    /// answer/reasoning events held behind a running tool and close that lane
-    /// too. The two commits preserve wire order: tool first, deferred text
-    /// second, boundary cell last.
-    fn commit_active_and_replay_deferred(&mut self) {
-        self.commit_active();
-        self.replay_deferred_stream_events();
-        self.commit_active();
-    }
-
     /// Close every top-level live lane at a real transcript boundary. Parallel
     /// tools are first normalized into their start-ordered keyed register, so
-    /// missing terminals cannot reorder siblings or let deferred answer text
-    /// overtake an earlier call.
+    /// missing terminals cannot reorder siblings.
     fn commit_transcript_boundary(&mut self) {
         let active_is_tool = self.active_cell.as_ref().is_some_and(|cell| {
             matches!(cell_kind(cell.as_ref()), CellKind::Tool) && self.active_tool_use_id.is_some()
@@ -4793,7 +4719,7 @@ impl ChatWidget {
             self.park_active_tool();
         }
         self.drain_all_parked_tools();
-        self.commit_active_and_replay_deferred();
+        self.commit_active();
     }
 
     /// Take the currently-live cell, finalise it, append to
@@ -5829,9 +5755,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_applied_user_intent_keeps_live_active_cell() {
+    fn applied_user_intent_follows_prior_answer_and_preserves_live_tool() {
         let mut w = fresh();
-        w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("before".into()),
+            text: "old answer".into(),
+        }));
 
         w.commit_applied_user_intent(
             "intent-1",
@@ -5840,17 +5769,40 @@ mod tests {
             "stop after this tool",
         );
 
-        assert_eq!(w.history.len(), 1, "user intent is committed as history");
-        let persisted = w.history[0].to_persist().expect("user cell persists");
+        assert_eq!(w.history.len(), 2);
+        assert!(matches!(
+            w.history[0].to_persist(),
+            Some(TurnEvent::Assistant { .. })
+        ));
+        let persisted = w.history[1].to_persist().expect("user cell persists");
         assert!(matches!(
             &persisted,
             TurnEvent::User { text, .. } if text == "stop after this tool"
         ));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id: Some("after".into()),
+            text: "new answer".into(),
+        }));
         assert_eq!(
             w.active_cell.as_deref().map(cell_kind),
-            Some(CellKind::Assistant),
-            "user intent must not finalize the live assistant/tool cell"
+            Some(CellKind::Assistant)
         );
+
+        let mut tool = fresh();
+        tool.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "bash".into(),
+            description: "running".into(),
+            tool_use_id: "live".into(),
+            parent_tool_use_id: None,
+        }));
+        tool.commit_applied_user_intent(
+            "intent-2",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "new direction",
+        );
+        assert!(tool.has_live_tool_projection());
+        assert_eq!(tool.active_tool_use_id.as_deref(), Some("live"));
     }
 
     #[test]
@@ -5869,13 +5821,14 @@ mod tests {
             "new guidance",
         );
 
-        assert_eq!(w.active_cell_id(), Some(live_id));
-        assert_ne!(w.history_cell_id(0), live_id);
+        assert!(w.active_cell_id().is_none());
+        assert_eq!(w.history_cell_id(0), live_id);
+        assert_ne!(w.history_cell_id(1), live_id);
 
         w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
         assert!(w.active_cell().is_none());
-        assert_eq!(w.history_cell_id(1), live_id);
+        assert_eq!(w.history_cell_id(0), live_id);
         assert_eq!(w.history.len(), w.history_cell_ids.len());
     }
 
@@ -6100,7 +6053,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_drains_parallel_tools_before_deferred_answer_in_start_order() {
+    fn boundary_drains_parallel_tools_before_live_answer_in_start_order() {
         let mut w = fresh();
         for (id, name) in [("call-a", "bash"), ("call-b", "read_file")] {
             w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
@@ -6262,7 +6215,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_delta_waits_for_live_tool_completion_without_false_failure() {
+    fn answer_is_visible_while_tool_remains_live() {
         let mut w = fresh();
 
         w.handle_event(AppEvent::wire(tool_started("read_file", "Cargo.toml")));
@@ -6273,10 +6226,13 @@ mod tests {
 
         assert!(w.history.is_empty(), "running tool must remain live");
         assert!(matches!(
-            w.active_cell
-                .as_deref()
+            w.latest_parked_tool()
                 .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>()),
             Some(tool) if tool.status == ToolStatus::Running
+        ));
+        assert!(matches!(
+            w.active_cell.as_deref().and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>()),
+            Some(answer) if answer.source() == "answer"
         ));
         w.handle_event(AppEvent::wire(tool_completed(
             "read_file",
@@ -6304,7 +6260,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_reasoning_events_replay_in_order_after_tool_completion() {
+    fn interleaved_reasoning_and_answer_remain_visible_while_tool_runs() {
         let mut w = fresh();
 
         w.handle_event(AppEvent::wire(tool_started("bash", "cargo metadata")));
@@ -6317,6 +6273,11 @@ mod tests {
             model_item_id: None,
             text: "metadata is valid".into(),
         }));
+        assert!(w.has_live_tool_projection());
+        assert!(matches!(
+            w.active_cell.as_deref().and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>()),
+            Some(answer) if answer.source() == "metadata is valid"
+        ));
         w.handle_event(AppEvent::wire(tool_completed(
             "bash",
             "",
@@ -6325,13 +6286,13 @@ mod tests {
             Some("ok"),
         )));
 
-        assert_eq!(w.history.len(), 2, "tool then reasoning should be settled");
+        assert_eq!(w.history.len(), 2, "reasoning and tool should be settled");
         assert!(matches!(
-            w.history[0].as_any_ref().downcast_ref::<ToolCell>(),
+            w.history[1].as_any_ref().downcast_ref::<ToolCell>(),
             Some(tool) if tool.status == ToolStatus::Success
         ));
         assert!(
-            w.history[1]
+            w.history[0]
                 .as_any_ref()
                 .downcast_ref::<ReasoningCell>()
                 .is_some()

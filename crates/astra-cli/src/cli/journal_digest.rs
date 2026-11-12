@@ -163,6 +163,8 @@ pub struct Aggregates {
     /// or pointed back to an already-known result.
     pub total_noop_or_cached_tool_calls: u64,
     pub tool_calls_failed: u64,
+    /// Tool responses whose execution outcomes are unknown.
+    pub tool_calls_unknown: u64,
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
     /// Subset of `tool_calls_failed`. Non-zero means the agent hit safety walls.
     pub safety_guard_blocks: u64,
@@ -310,6 +312,7 @@ pub struct ToolGroupRow {
     pub call_count: usize,
     pub ok_count: usize,
     pub fail_count: usize,
+    pub unknown_count: usize,
     pub tools: Vec<String>,
 }
 
@@ -399,13 +402,14 @@ fn preview(s: Option<&String>, max: usize) -> String {
 struct ToolCallStats {
     ok: u32,
     fail: u32,
+    unknown: u32,
     fresh: u32,
     noop_or_cached: u32,
 }
 
 impl ToolCallStats {
     fn total(self) -> u32 {
-        self.ok + self.fail
+        self.ok + self.fail + self.unknown
     }
 }
 
@@ -415,7 +419,9 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
     };
     let mut stats = ToolCallStats::default();
     for c in calls {
-        if is_effective_failure(c) {
+        if c.outcome_is_unknown() {
+            stats.unknown += 1;
+        } else if is_effective_failure(c) {
             stats.fail += 1;
         } else {
             stats.ok += 1;
@@ -450,6 +456,7 @@ fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolC
             .failed
             .saturating_add(outcomes.rejected)
             .saturating_add(outcomes.deferred),
+        unknown: outcomes.unknown.saturating_add(outcomes.started_unknown),
         fresh: outcomes.succeeded,
         noop_or_cached: outcomes.reused.saturating_add(outcomes.suppressed),
     }
@@ -468,6 +475,9 @@ fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolC
 /// previously hid from `tool_calls_failed` (session
 /// 19ad8393 agent-spawn case).
 pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
+    if c.outcome_is_unknown() {
+        return false;
+    }
     if !c.ok {
         return true;
     }
@@ -680,6 +690,7 @@ fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolG
             call_count: group.calls.len(),
             ok_count: group.ok_count(),
             fail_count: group.fail_count(),
+            unknown_count: group.unknown_count(),
             tools: group
                 .calls
                 .iter()
@@ -1188,6 +1199,7 @@ fn build_digest_with_owners(
     } = root_terminal_usage(&events);
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
+    let mut tool_calls_unknown: u64 = 0;
     let mut total_fresh_tool_calls: u64 = 0;
     let mut total_noop_or_cached_tool_calls: u64 = 0;
     let mut tool_calls_failed: u64 = 0;
@@ -1254,6 +1266,7 @@ fn build_digest_with_owners(
                     root_attempts_with_llm_rounds += 1;
                 }
                 let stats = authoritative_tool_call_stats(ev);
+                tool_calls_unknown += u64::from(stats.unknown);
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if stats.total() > 0 {
@@ -1419,6 +1432,7 @@ fn build_digest_with_owners(
                     root_attempts_with_llm_rounds += 1;
                 }
                 let stats = authoritative_tool_call_stats(ev);
+                tool_calls_unknown += u64::from(stats.unknown);
                 let effective_total = if stats.total() > 0 {
                     u64::from(stats.total())
                 } else {
@@ -1671,6 +1685,7 @@ fn build_digest_with_owners(
             total_fresh_tool_calls,
             total_noop_or_cached_tool_calls,
             tool_calls_failed,
+            tool_calls_unknown,
             safety_guard_blocks,
             avg_tokens_in,
             avg_tokens_out,
@@ -1750,14 +1765,15 @@ pub fn print_text(d: &JournalDigest) {
         a.error_event_count
     );
     stdout_println!(
-        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={}",
+        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={} tool_outcomes_unknown={}",
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
         a.total_tool_calls,
         a.total_fresh_tool_calls,
         a.total_noop_or_cached_tool_calls,
-        a.tool_calls_failed
+        a.tool_calls_failed,
+        a.tool_calls_unknown
     );
     stdout_println!(
         "  known_root_provider_input={} (fresh={} cache_read={} cache_write={})",
@@ -1843,11 +1859,14 @@ pub fn print_text(d: &JournalDigest) {
                 if group.parallel || group.call_count > 1 {
                     scope.push_str(&format!(" · {} calls", group.call_count));
                 }
-                let status = if group.fail_count > 0 {
+                let mut status = if group.fail_count > 0 {
                     format!("{} ok / {} fail", group.ok_count, group.fail_count)
                 } else {
                     format!("{} ok", group.ok_count)
                 };
+                if group.unknown_count > 0 {
+                    status.push_str(&format!(" / {} unknown", group.unknown_count));
+                }
                 stdout_println!(
                     "                          {} {} — {}",
                     scope.as_str().dim(),
@@ -3339,7 +3358,7 @@ mod tests {
 
         let sid = "test-remote-outcomes-00000000-0000-0000-0000-000000000014";
         write_test_journal(journal_path_for_test(sid),
-            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":3,"tool_outcomes":{"requested":4,"executed":3,"succeeded":2,"failed":1,"rejected":1,"reused":0,"suppressed":0,"deferred":0}}"#,
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":3,"tool_outcomes":{"requested":4,"executed":3,"succeeded":2,"failed":1,"started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0}}"#,
         )
         .expect("write journal");
 
@@ -3349,6 +3368,19 @@ mod tests {
         assert_eq!(d.aggregates.tool_calls_failed, 2);
         assert_eq!(d.turns[0].tool_calls_ok, 2);
         assert_eq!(d.turns[0].tool_calls_fail, 2);
+    }
+
+    #[test]
+    fn digest_reports_unknown_outcome_separately_from_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-unknown-outcome";
+        write_test_journal(journal_path_for_test(sid),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":1,"tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,"started_unknown":0,"unknown":1,"rejected":0,"reused":0,"suppressed":0,"deferred":0}}"#).unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert_eq!(digest.aggregates.total_tool_calls, 2);
+        assert_eq!(digest.aggregates.tool_calls_failed, 0);
+        assert_eq!(digest.aggregates.tool_calls_unknown, 1);
     }
 
     #[test]

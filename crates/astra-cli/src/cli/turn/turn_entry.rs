@@ -575,9 +575,6 @@ pub(crate) async fn handle_chat_input_with_ui(
         crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(state, &line);
     }
 
-    let consumed_bg_notifications = state.pending_bg_notifications.clone();
-    let finalized_input = finalize_effective_line(prepare_input(&line, state), line.clone(), state);
-    let turn_start = Instant::now();
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     let auth_owner = match admission
@@ -593,6 +590,9 @@ pub(crate) async fn handle_chat_input_with_ui(
         let _ = ui.restore_input(&line, state.session_id.as_deref());
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
+    let consumed_bg_notifications = state.pending_bg_notifications.clone();
+    let finalized_input = finalize_effective_line(prepare_input(&line, state), line.clone(), state);
+    let turn_start = Instant::now();
     let attempt = run_chat_turn(TurnExecutionRequest {
         state,
         input: TurnExecutionInput {
@@ -645,7 +645,14 @@ pub(crate) async fn handle_chat_input_with_ui(
     if settlement == TurnSettlementOutcome::Succeeded
         && let Some(run_control) = &local_run_control
     {
-        run_control.commit_applied_runtime_notifications();
+        for notification in run_control.commit_applied_runtime_notifications() {
+            notification.acknowledge(&state.background_tasks);
+        }
+    }
+    if settlement == TurnSettlementOutcome::Succeeded {
+        for notification in &consumed_bg_notifications {
+            notification.acknowledge(&state.background_tasks);
+        }
     }
     if settlement != TurnSettlementOutcome::Succeeded && !consumed_bg_notifications.is_empty() {
         let notifications_arriving_during_settlement =
@@ -727,7 +734,12 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
 
     ensure_agent_projection_for_turn(state);
     let notification_count = state.pending_bg_notifications.len();
-    let notifications = state.pending_bg_notifications.join("\n");
+    let notifications = state
+        .pending_bg_notifications
+        .iter()
+        .map(|notification| notification.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let runtime_required_texts = vec![format!(
         "Background task updates since the last model boundary:\n{notifications}\n\
          Reconcile these facts with the latest user goal. Newer user steering always has priority."
@@ -807,9 +819,14 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
     if settlement == TurnSettlementOutcome::Succeeded {
         if let Some(run_control) = &local_run_control {
-            run_control.commit_applied_runtime_notifications();
+            for notification in run_control.commit_applied_runtime_notifications() {
+                notification.acknowledge(&state.background_tasks);
+            }
         }
         let consumed = notification_count.min(state.pending_bg_notifications.len());
+        for notification in &state.pending_bg_notifications[..consumed] {
+            notification.acknowledge(&state.background_tasks);
+        }
         state.pending_bg_notifications.drain(..consumed);
     }
     let usage = turn_usage_sink
@@ -1116,7 +1133,7 @@ mod tests {
             Some("existing diagnostic")
         );
         assert_eq!(state.resume_restricted_tools, ["bash"]);
-        assert_eq!(state.pending_bg_notifications, ["child completed"]);
+        assert_eq!(state.pending_bg_notifications[0].content, "child completed");
         assert!(state.journal.is_none());
         assert!(usage.lock().unwrap().is_none());
         assert_eq!(ui.restored_inputs, ["continue"]);
@@ -1544,6 +1561,111 @@ mod tests {
         };
 
         assert!(TurnUsage::from_partial(&partial).is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_primary_commit_keeps_background_notification_for_retry() {
+        use crate::cli::mock_llm::{MockLlmServer, MockScenario};
+        use crate::cli::turn::local_run_control::RuntimeNotification;
+        use crate::edge_tools::background_tasks::BackgroundTaskRegistry;
+
+        let _home = crate::test_utils::HomeGuard::temp();
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let journal_path = astra_services::session_journal::journal_file_path("mock-session");
+        let server = MockLlmServer::start(MockScenario::Slow).await.unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+        let dir = crate::tests::test_temp_dir();
+        let registry = BackgroundTaskRegistry::new(dir.path().to_path_buf());
+        let mut task = registry
+            .start_shell(
+                "failed work",
+                (dir.path().join("out"), dir.path().join("err"), None),
+                true,
+                false,
+                None,
+                |_, _| async {
+                    astra_tools::execution_outcome::ToolExecutionOutcome::error("failed".into())
+                },
+            )
+            .unwrap();
+        task.wait().await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(
+            crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+        );
+        let (ask_user_tx, _ask_user_rx) = tokio::sync::mpsc::channel(
+            crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+        );
+        let mut state = SessionState {
+            session_id: Some("mock-session".into()),
+            model: Some("gpt-5".into()),
+            background_tasks: registry.clone(),
+            pending_bg_notifications: vec![RuntimeNotification {
+                content: "Background command failed.".into(),
+                complete_shell: Some(task.id.clone()),
+            }],
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
+            tui_approval_request_tx: Some(approval_tx),
+            tui_ask_user_request_tx: Some(ask_user_tx),
+            ..SessionState::default()
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let context = || TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let sabotage = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while server.received_requests().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("model request started after journal admission");
+            if journal_path.is_file() {
+                std::fs::remove_file(&journal_path).unwrap();
+            }
+            std::fs::create_dir(&journal_path).unwrap();
+        };
+        let (first, ()) = tokio::join!(
+            super::handle_runtime_notifications_with_ui(
+                Some("token"),
+                &mut state,
+                context(),
+                &mut ui
+            ),
+            sabotage,
+        );
+        let first = first.unwrap();
+        assert!(matches!(first, super::InteractiveTurnOutcome::Failed(_)));
+        assert_eq!(state.pending_bg_notifications.len(), 1);
+        assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+        assert!(
+            ui.warnings
+                .iter()
+                .any(|warning| warning.contains("could not be saved"))
+        );
+
+        std::fs::remove_dir(&journal_path).unwrap();
+        let second = super::handle_runtime_notifications_with_ui(
+            Some("token"),
+            &mut state,
+            context(),
+            &mut ui,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(second, super::InteractiveTurnOutcome::Completed(_)),
+            "{second:?}: {:?}",
+            ui.errors
+        );
+        assert!(state.pending_bg_notifications.is_empty());
+        assert!(!registry.get(&task.id).unwrap().terminal_unobserved());
     }
 
     #[tokio::test]

@@ -7300,6 +7300,531 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_create_events_batch_contract_live_matrixone() {
+    let (_bootstrap, settings) = setup_pool_and_settings().await;
+    let shared = SharedPool::new(&settings).await.unwrap();
+    let pool = shared.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let service = DatabaseEventService::new(settings).with_pool(shared);
+    let make_request = |sequence: u32| {
+        let journal_event = astra_services::session_journal::JournalEvent::turn(
+            Some(&session),
+            sequence + 1,
+            Some("sync-batch-test"),
+            "question",
+            "answer",
+            0,
+            10,
+            5,
+            1,
+        );
+        let payload = serde_json::to_value(&journal_event).unwrap();
+        let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        let event_id =
+            astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash).unwrap();
+        EventCreateRequestData {
+            ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+            event_id: Some(event_id),
+            session_id: session.clone(),
+            event_type: "turn".into(),
+            content: payload.to_string(),
+            agent_id: None,
+            agent_version: None,
+            parent_event_id: None,
+            parent_event_ids: None,
+            causal_chain_id: None,
+            metadata: Some(serde_json::json!({
+                "sync_outbox": {"payload_hash": payload_hash}
+            })),
+        }
+    };
+    fn accepted(
+        entries: Vec<astra_services::events::EventBatchEntry>,
+    ) -> Vec<astra_services::events::EventCreateOutcome> {
+        entries
+            .into_iter()
+            .map(|entry| match entry {
+                astra_services::events::EventBatchEntry::Accepted(outcome) => outcome,
+                astra_services::events::EventBatchEntry::Rejected(rejection) => {
+                    panic!("unexpected record rejection: {rejection:?}")
+                }
+            })
+            .collect()
+    }
+    let mut requests = (0..3).map(&make_request).collect::<Vec<_>>();
+    requests.sort_by(|left, right| right.event_id.cmp(&left.event_id));
+
+    let invalid_session = Uuid::new_v4().to_string();
+    let invalid = EventCreateRequestData {
+        event_id: Some(" bad-event ".into()),
+        session_id: invalid_session.clone(),
+        content: "not-json".into(),
+        ..make_request(20)
+    };
+    let invalid_result = service
+        .create_events(owner.clone(), vec![invalid])
+        .await
+        .unwrap();
+    match invalid_result.as_slice() {
+        [astra_services::events::EventBatchEntry::Rejected(rejection)] => {
+            assert_eq!(rejection.record_id, " bad-event ");
+        }
+        other => panic!("invalid record must be rejected, got {other:?}"),
+    }
+    for (table, query) in [
+        (
+            "agent_sessions",
+            "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ),
+        (
+            "agent_session_lifecycle_fences",
+            "SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(&owner)
+            .bind(&invalid_session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "invalid input must not create {table}");
+    }
+
+    assert!(
+        service
+            .create_events(owner.clone(), Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let created = accepted(
+        service
+            .create_events(owner.clone(), requests.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(created.len(), 3);
+    assert!(created.iter().all(|outcome| !outcome.idempotent_replay));
+    assert_eq!(
+        created
+            .iter()
+            .map(|outcome| outcome.record.content.as_str())
+            .collect::<Vec<_>>(),
+        requests
+            .iter()
+            .map(|request| request.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        created
+            .iter()
+            .all(|outcome| outcome.record.created_at.len() == 26)
+    );
+    assert!(
+        created.windows(2).all(|pair| {
+            pair[0].record.created_at.as_str() < pair[1].record.created_at.as_str()
+        })
+    );
+    let expected_event_ids = requests
+        .iter()
+        .map(|request| request.event_id.clone().unwrap())
+        .collect::<Vec<_>>();
+    let first_page = service
+        .get_session_events(session.clone(), owner.clone(), 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_event_ids[..2]
+    );
+    let second_page = service
+        .get_session_events(
+            session.clone(),
+            owner.clone(),
+            2,
+            Some(
+                first_page
+                    .next_cursor
+                    .expect("first page must have a cursor"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_event_ids[2..]
+    );
+
+    let replayed = accepted(
+        service
+            .create_events(owner.clone(), requests.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(replayed.iter().all(|outcome| outcome.idempotent_replay));
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|outcome| &outcome.record)
+            .collect::<Vec<_>>(),
+        created
+            .iter()
+            .map(|outcome| &outcome.record)
+            .collect::<Vec<_>>()
+    );
+    let replay_summary = sqlx::query(
+        "SELECT last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        replay_summary
+            .try_get::<Option<String>, _>("last_event_id")
+            .unwrap(),
+        requests.last().unwrap().event_id.clone(),
+        "replaying the session tail must preserve its server-ingest order"
+    );
+    let mut changed_transport = requests[0].clone();
+    changed_transport.agent_version = Some("new-client-version".into());
+    changed_transport.metadata.as_mut().unwrap()["sync_outbox"]["sequence"] = 99.into();
+    let replay = accepted(
+        service
+            .create_events(owner.clone(), vec![changed_transport])
+            .await
+            .unwrap(),
+    );
+    assert!(replay[0].idempotent_replay);
+    assert_eq!(replay[0].record, created[0].record);
+
+    let mut forged_lineage = requests[0].clone();
+    forged_lineage.parent_event_id = Some("unverified-parent".into());
+    assert!(matches!(
+        service
+            .create_events(owner.clone(), vec![forged_lineage])
+            .await
+            .unwrap()
+            .as_slice(),
+        [astra_services::events::EventBatchEntry::Rejected(_)]
+    ));
+    let event_ids = requests
+        .iter()
+        .map(|request| request.event_id.clone().unwrap())
+        .chain(Some("missing-sync-event".to_string()))
+        .collect::<Vec<_>>();
+    let reconciled = service
+        .get_sync_outbox_events(owner.clone(), event_ids.clone())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.len(), requests.len());
+    for request in &requests {
+        let event_id = request.event_id.as_deref().unwrap();
+        let record = reconciled
+            .iter()
+            .find(|record| record.event_id == event_id)
+            .expect("stored sync event");
+        let expected_hash = request
+            .metadata
+            .as_ref()
+            .and_then(astra_services::events::sync_outbox_payload_hash)
+            .unwrap();
+        assert_eq!(record.payload_hash, expected_hash);
+    }
+    assert!(
+        service
+            .get_sync_outbox_events(Uuid::new_v4().to_string(), event_ids)
+            .await
+            .unwrap()
+            .is_empty(),
+        "batch reconciliation must remain tenant-scoped"
+    );
+
+    let same_batch_duplicate = make_request(3);
+    let duplicate_outcomes = accepted(
+        service
+            .create_events(
+                owner.clone(),
+                vec![same_batch_duplicate.clone(), same_batch_duplicate.clone()],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(duplicate_outcomes.len(), 2);
+    assert!(!duplicate_outcomes[0].idempotent_replay);
+    assert!(duplicate_outcomes[1].idempotent_replay);
+    assert_eq!(
+        duplicate_outcomes[0].record.event_id,
+        duplicate_outcomes[1].record.event_id
+    );
+
+    let valid = make_request(4);
+    let invalid = EventCreateRequestData {
+        content: "not-json".into(),
+        ..make_request(5)
+    };
+    let entries = service
+        .create_events(owner.clone(), vec![valid, invalid])
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        entries[0],
+        astra_services::events::EventBatchEntry::Accepted(_)
+    ));
+    match &entries[1] {
+        astra_services::events::EventBatchEntry::Rejected(rejection) => {
+            assert_eq!(rejection.status.as_u16(), 400);
+            assert_eq!(
+                rejection.error_code,
+                astra_sync_protocol::SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE
+            );
+        }
+        other => panic!("invalid record must be rejected, got {other:?}"),
+    }
+
+    let event_count =
+        sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get::<i64, _>("c")
+            .unwrap();
+    assert_eq!(
+        event_count, 5,
+        "a rejected record must not roll back committed siblings"
+    );
+    let session_event_count =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get::<i64, _>("event_count")
+            .unwrap();
+    assert_eq!(
+        session_event_count, 5,
+        "rejections and replays must not change the committed count"
+    );
+
+    let conflict = make_request(6);
+    let stored_content = serde_json::json!({"stored": "client"}).to_string();
+    let stored_conflict = EventCreateRequestData {
+        ingestion_source: astra_services::events::EventIngestionSource::Client,
+        event_id: conflict.event_id.clone(),
+        session_id: session.clone(),
+        event_type: "client_marker".into(),
+        content: stored_content.clone(),
+        agent_id: None,
+        agent_version: None,
+        parent_event_id: None,
+        parent_event_ids: None,
+        causal_chain_id: None,
+        metadata: None,
+    };
+    service
+        .create_event(owner.clone(), stored_conflict)
+        .await
+        .unwrap();
+    // Another producer may write arbitrary metadata; it must not be mistaken
+    // for a server-verified sync receipt.
+    sqlx::query(
+        "UPDATE agent_events SET metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?",
+    )
+    .bind(conflict.metadata.as_ref().unwrap().to_string())
+    .bind(&owner)
+    .bind(conflict.event_id.as_ref().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let forged_receipt = service
+        .get_sync_outbox_events(owner.clone(), vec![conflict.event_id.clone().unwrap()])
+        .await
+        .unwrap();
+    assert_ne!(
+        forged_receipt[0].payload_hash,
+        astra_services::events::sync_outbox_payload_hash(conflict.metadata.as_ref().unwrap())
+            .unwrap(),
+        "untrusted metadata must not authenticate a sync receipt"
+    );
+    let prefix = make_request(7);
+    let later = make_request(8);
+    let entries = service
+        .create_events(
+            owner.clone(),
+            vec![prefix.clone(), conflict.clone(), later.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(
+        entries[0],
+        astra_services::events::EventBatchEntry::Accepted(_)
+    ));
+    match &entries[1] {
+        astra_services::events::EventBatchEntry::Rejected(rejection) => {
+            assert_eq!(rejection.status.as_u16(), 409);
+            assert_eq!(
+                rejection.error_code,
+                astra_sync_protocol::SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE
+            );
+        }
+        other => panic!("conflicting record must be rejected, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            entries[2],
+            astra_services::events::EventBatchEntry::Accepted(_)
+        ),
+        "a rejected record must not block later siblings"
+    );
+
+    let rows = sqlx::query(
+        "SELECT event_id, content FROM agent_events WHERE user_id = ? AND session_id = ? AND event_id IN (?, ?, ?)",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .bind(prefix.event_id.as_ref().unwrap())
+    .bind(conflict.event_id.as_ref().unwrap())
+    .bind(later.event_id.as_ref().unwrap())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let visible_ids = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("event_id").unwrap())
+        .collect::<Vec<_>>();
+    assert!(visible_ids.contains(prefix.event_id.as_ref().unwrap()));
+    assert!(visible_ids.contains(conflict.event_id.as_ref().unwrap()));
+    assert!(
+        visible_ids.contains(later.event_id.as_ref().unwrap()),
+        "a rejected record must not suppress later siblings"
+    );
+    let stored_row = rows
+        .iter()
+        .find(|row| {
+            row.try_get::<String, _>("event_id").unwrap() == *conflict.event_id.as_ref().unwrap()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_row.try_get::<String, _>("content").unwrap(),
+        stored_content,
+        "conflict must not overwrite the stored event"
+    );
+    let session_event_count =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get::<i64, _>("event_count")
+            .unwrap();
+    let actual_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual_event_count, 8);
+    assert_eq!(session_event_count, actual_event_count);
+
+    let mixed_insert = make_request(9);
+    let mixed = accepted(
+        service
+            .create_events(
+                owner.clone(),
+                vec![requests[0].clone(), mixed_insert.clone()],
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(mixed[0].idempotent_replay);
+    assert!(!mixed[1].idempotent_replay);
+    let summary = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(summary.try_get::<i64, _>("event_count").unwrap(), 9);
+    assert_eq!(
+        summary
+            .try_get::<Option<String>, _>("last_event_id")
+            .unwrap(),
+        mixed_insert.event_id,
+        "a replay followed by an insert repairs once and keeps the final insert as the summary pointer"
+    );
+
+    let mut untrusted_metadata = make_request(21);
+    untrusted_metadata.metadata.as_mut().unwrap()["tool_call_id"] = "forged".into();
+    let sanitized = accepted(
+        service
+            .create_events(owner.clone(), vec![untrusted_metadata])
+            .await
+            .unwrap(),
+    );
+    assert!(sanitized[0].record.metadata.get("tool_call_id").is_none());
+
+    let with_tool_id = |sequence, tool_id: String| {
+        let mut request = make_request(sequence);
+        let mut event: astra_services::session_journal::JournalEvent =
+            serde_json::from_str(&request.content).unwrap();
+        event.metadata = Some(serde_json::json!({"tool_call_id": tool_id}));
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        request.event_id =
+            Some(astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap());
+        request.content = payload.to_string();
+        request.metadata = Some(serde_json::json!({"sync_outbox": {"payload_hash": hash}}));
+        request
+    };
+    let boundary = with_tool_id(30, "值".repeat(128));
+    let oversized = with_tool_id(31, "x".repeat(129));
+    let oversized_id = oversized.event_id.clone().unwrap();
+    let entries = service
+        .create_events(owner.clone(), vec![boundary, oversized])
+        .await
+        .unwrap();
+    assert!(matches!(
+        entries[0],
+        astra_services::events::EventBatchEntry::Accepted(_)
+    ));
+    assert!(matches!(
+        entries[1],
+        astra_services::events::EventBatchEntry::Rejected(_)
+    ));
+    let rejected_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(&oversized_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rejected_rows, 0);
+
+    cleanup_session_delete_fixture_for_owner(&pool, &owner, &session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn sync_outbox_projects_verified_journal_columns_without_changing_identity() {
     use astra_services::session_journal::{JournalEvent, JournalProducerScope};
     let (_bootstrap, mut settings) = setup_pool_and_settings().await;
@@ -7369,9 +7894,18 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             .unwrap();
         assert!(!created.idempotent_replay);
         assert_eq!(created.record.content, request.content);
+        let mut expected_metadata = payload
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        expected_metadata.insert(
+            "sync_outbox".to_string(),
+            request.metadata.as_ref().unwrap()["sync_outbox"].clone(),
+        );
         assert_eq!(
             created.record.metadata,
-            request.metadata.as_ref().unwrap().clone()
+            serde_json::Value::Object(expected_metadata)
         );
         let replay = service
             .create_event(

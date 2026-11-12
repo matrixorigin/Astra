@@ -7,8 +7,9 @@ use serde_json::Value;
 /// Accumulates bytes and emits complete SSE events.
 #[derive(Debug, Default, Clone)]
 pub struct SseParser {
-    buf: Vec<u8>,
+    frames: astra_core::sse_blocks::SseBlankLineUtf8Buf,
     max_frame_bytes: Option<usize>,
+    finished: bool,
 }
 
 impl SseParser {
@@ -20,112 +21,88 @@ impl SseParser {
     /// events. Feed slices also bound allocation before delimiter discovery.
     pub fn with_max_frame_bytes(limit: usize) -> Self {
         Self {
-            buf: Vec::new(),
+            frames: astra_core::sse_blocks::SseBlankLineUtf8Buf::new(),
             max_frame_bytes: Some(limit),
+            finished: false,
         }
     }
 
-    /// Push raw HTTP body bytes; returns all complete SSE events decoded so far.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Read one event before inspecting later bytes in the same HTTP chunk.
+    pub fn next_event(
+        &mut self,
+        input: &mut &[u8],
+    ) -> Result<Option<StreamEvent>, ThinClientError> {
+        while !self.finished && !input.is_empty() {
+            let block = self
+                .frames
+                .next_frame(input, self.max_frame_bytes)
+                .map_err(|error| match error {
+                    astra_core::sse_blocks::SseFrameError::TooLarge { limit } => {
+                        ThinClientError::ResponseTooLarge { limit }
+                    }
+                    _ => ThinClientError::SseParse(error.to_string()),
+                })?;
+            let Some(block) = block else { return Ok(None) };
+            if let Some(event) = self.decode_block(&block)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    fn decode_block(&mut self, block: &str) -> Result<Option<StreamEvent>, ThinClientError> {
+        let Some(data) = astra_core::sse_blocks::event_data(block) else {
+            return Ok(None);
+        };
+        if data.trim().is_empty() {
+            return Ok(None);
+        }
+        if data == "[DONE]" {
+            self.finished = true;
+            return Ok(None);
+        }
+        Ok(Some(classify_stream_event(serde_json::from_str::<Value>(
+            &data,
+        )?)?))
+    }
+
+    /// Collect a bounded body atomically. Streaming callers use `next_event`.
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ThinClientError> {
         let mut events = Vec::new();
-        for feed in chunk.chunks(16 * 1024) {
-            self.buf.extend_from_slice(feed);
-            events.extend(self.drain_complete_events()?);
-            self.check_frame_size(self.buf.len())?;
+        let mut input = chunk;
+        while !input.is_empty() {
+            match self.next_event(&mut input)? {
+                Some(event) => events.push(event),
+                None => break,
+            }
         }
         Ok(events)
     }
 
-    fn check_frame_size(&self, size: usize) -> Result<(), ThinClientError> {
-        if let Some(limit) = self.max_frame_bytes
-            && size > limit
-        {
-            return Err(ThinClientError::ResponseTooLarge { limit });
+    /// A clean EOF completes a final Astra control event without a blank line.
+    pub fn finish(&mut self) -> Result<Option<StreamEvent>, ThinClientError> {
+        if self.finished {
+            return Ok(None);
         }
-        Ok(())
+        let tail = self
+            .frames
+            .take_buf()
+            .map_err(|error| ThinClientError::SseParse(error.to_string()))?;
+        self.decode_block(&tail)
     }
-
-    /// Flush after the stream ends (handles final event without trailing blank line if any).
-    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ThinClientError> {
-        if self.buf.is_empty() {
-            return Ok(Vec::new());
-        }
-        // If buffer has content but no trailing `\n\n`, treat remainder as one event block.
-        let mut out = Vec::new();
-        self.check_frame_size(self.buf.len())?;
-        let text = std::str::from_utf8(&self.buf)
-            .map_err(|e| ThinClientError::SseParse(format!("invalid UTF-8 in SSE buffer: {e}")))?;
-        if let Some(ev) = parse_event_block(text) {
-            let v: Value = serde_json::from_str(&ev)?;
-            out.push(classify_stream_event(v)?);
-        }
-        self.buf.clear();
-        Ok(out)
-    }
-
-    fn drain_complete_events(&mut self) -> Result<Vec<StreamEvent>, ThinClientError> {
-        let mut out = Vec::new();
-        while let Some(sep) = find_event_separator(&self.buf) {
-            let (event_bytes, rest_start) = sep;
-            self.check_frame_size(event_bytes)?;
-            let block = &self.buf[..event_bytes];
-            let text = std::str::from_utf8(block)
-                .map_err(|e| ThinClientError::SseParse(format!("invalid UTF-8 in SSE: {e}")))?;
-            if let Some(json) = parse_event_block(text) {
-                let v: Value = serde_json::from_str(&json)?;
-                out.push(classify_stream_event(v)?);
-            }
-            self.buf.drain(..rest_start);
-        }
-        Ok(out)
-    }
-}
-
-/// Returns `(end_of_event_bytes, index_after_separator)` for the first complete SSE event.
-fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
-    if let Some(i) = find_subsequence(buf, b"\n\n") {
-        return Some((i, i + 2));
-    }
-    if let Some(i) = find_subsequence(buf, b"\r\n\r\n") {
-        return Some((i, i + 4));
-    }
-    None
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Concatenate `data:` lines in one SSE event block into a single JSON string.
-fn parse_event_block(block: &str) -> Option<String> {
-    let mut combined: Option<String> = None;
-    for line in block.split_inclusive('\n') {
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = rest.trim_start_matches(' ');
-        match &mut combined {
-            None => {
-                combined = Some(payload.to_string());
-            }
-            Some(s) => {
-                s.push('\n');
-                s.push_str(payload);
-            }
-        }
-    }
-    combined
 }
 
 /// Parse a full SSE body (tests and small responses).
 pub fn parse_sse_body(body: &str) -> Result<Vec<StreamEvent>, ThinClientError> {
     let mut p = SseParser::new();
     let mut v = p.push_bytes(body.as_bytes())?;
-    v.extend(p.finish()?);
+    if let Some(event) = p.finish()? {
+        v.push(event);
+    }
     Ok(v)
 }
 
@@ -227,18 +204,14 @@ mod tests {
     #[test]
     fn finish_empty_buffer() {
         let mut p = SseParser::new();
-        let evs = p.finish().unwrap();
-        assert!(evs.is_empty());
+        assert!(p.finish().is_ok());
     }
 
     #[test]
     fn finish_unterminated_event() {
         let mut p = SseParser::new();
-        // Push event without trailing \n\n
         p.push_bytes(b"data: {\"type\":\"ping\"}").unwrap();
-        let evs = p.finish().unwrap();
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], StreamEvent::Ping));
+        assert!(matches!(p.finish().unwrap(), Some(StreamEvent::Ping)));
     }
 
     #[test]
@@ -250,13 +223,30 @@ mod tests {
     }
 
     #[test]
-    fn finish_clears_buffer() {
+    fn finish_accepts_unterminated_done() {
         let mut p = SseParser::new();
-        p.push_bytes(b"data: {\"type\":\"ping\"}").unwrap();
-        let _ = p.finish().unwrap();
-        // Second finish should be empty (buffer was cleared)
-        let evs = p.finish().unwrap();
-        assert!(evs.is_empty());
+        p.push_bytes(b"data: [DONE]").unwrap();
+        assert!(p.finish().unwrap().is_none());
+        assert!(p.is_finished());
+    }
+
+    #[test]
+    fn streaming_delivers_the_first_event_before_a_later_error() {
+        let mut p = SseParser::new();
+        let mut input = b"data: {\"type\":\"ping\"}\n\ndata: not-json\n\n".as_slice();
+        assert!(matches!(
+            p.next_event(&mut input).unwrap(),
+            Some(StreamEvent::Ping)
+        ));
+        assert!(p.next_event(&mut input).is_err());
+    }
+
+    #[test]
+    fn done_ignores_later_invalid_bytes() {
+        let mut p = SseParser::new();
+        let mut input = b"data: [DONE]\n\ndata: \xff\n\n".as_slice();
+        assert!(p.next_event(&mut input).unwrap().is_none());
+        assert!(p.finish().is_ok());
     }
 
     // --- parse_event_block edge cases ---

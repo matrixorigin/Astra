@@ -14,6 +14,7 @@ mod persistence;
 pub(crate) use persistence::server_input_source_event_id;
 mod projection;
 pub(crate) mod run_state;
+mod tool_outcome_cache;
 
 use admission::*;
 use projection::*;
@@ -4073,6 +4074,7 @@ struct ServerDurableAgentReconciler {
     run_engine: RunEngine,
     user_id: String,
     session_id: String,
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     state: TokioMutex<ServerDurableAgentReconcileState>,
 }
 
@@ -4087,6 +4089,234 @@ struct ServerDurableAgentReconcileState {
 
 #[async_trait]
 impl DurableAgentReconciler for ServerDurableAgentReconciler {
+    async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
+        let service = self
+            .edge_dispatch_service
+            .as_ref()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        let cache_key = exact.map(|(turn, request)| {
+            [
+                self.user_id.clone(),
+                self.session_id.clone(),
+                child_run_id.to_owned(),
+                turn.to_owned(),
+                request.to_owned(),
+            ]
+        });
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
+        // Exact recovery can decode a large retained result. Bound aggregate
+        // memory without making normal dispatch or list operations wait.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let _permit = if exact.is_some() {
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    astra_services::multi_agent::edge_dispatch::EDGE_EXACT_RESULT_READS.acquire(),
+                )
+                .await
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?
+                .map_err(|_| crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)?,
+            )
+        } else {
+            None
+        };
+        // Another reader may have filled the immutable view while we waited.
+        if let Some(view) = cache_key.as_ref().and_then(tool_outcome_cache::lookup) {
+            return Ok(tool_outcome_cache::response(
+                vec![view.page(offset, max_bytes)?],
+                None,
+            ));
+        }
+        if offset > 0 && !tool_outcome_cache::can_load_continuation() {
+            return Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy);
+        }
+        let mut rows = tokio::time::timeout_at(
+            deadline,
+            service.inspect_run_dispatches(
+                &self.user_id,
+                &self.session_id,
+                child_run_id,
+                after,
+                exact,
+            ),
+        )
+        .await
+        .map_err(|_| "tool outcome inspection timed out".to_string())??;
+        let mut has_more = rows.len() > 16;
+        rows.truncate(16);
+        let mut observations = Vec::with_capacity(rows.len());
+        let mut page_size = 0_usize;
+        for row in rows {
+            let mut observation = json!({
+                "turn_chain_id": row.turn_chain_id,
+                "request_id": row.request_id,
+                "dispatch_status": row.status,
+                "tool": row.tool_name.as_deref().map(|name| astra_text_utils::credential_redaction::truncate_redacted_output(astra_text_utils::credential_redaction::redact_credentials_for_display(name).0, 128)),
+            });
+            if let Some(key) = cache_key.as_ref() {
+                if row.result_too_large {
+                    observation["result"] = json!({"status":"unavailable", "reason":"the retained result exceeds the bounded recovery limit; its execution outcome remains unknown"});
+                } else if row.status == "completed"
+                    && let Some(body) = row.result_json.as_deref()
+                {
+                    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                        &row.edge_owner_user_id,
+                        &self.session_id,
+                        child_run_id,
+                        &row.turn_chain_id,
+                        &row.request_id,
+                    );
+                    let mut canonical =
+                        crate::server::tool_execution_service::canonical_edge_completion(
+                            &identity,
+                            &row.edge_agent_id,
+                            body,
+                        )
+                        .map_err(|_| "retained tool result could not be validated".to_string())?;
+                    let mut metadata = canonical.tool_result_fields.take();
+                    if let Some(fields) = metadata.take() {
+                        metadata = Some(astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(fields).metadata);
+                    }
+                    if let Some(fields) = metadata.as_mut() {
+                        for (key, value) in fields.iter_mut() {
+                            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+                        }
+                    }
+                    let metadata_size = serde_json::to_vec(&metadata)
+                        .map_err(|_| "invalid tool result metadata".to_string())?
+                        .len();
+                    let metadata = if metadata_size <= 512 {
+                        metadata
+                    } else {
+                        metadata.map(|mut fields| {
+                            let mut retained = Map::new();
+                            let mut bytes = 2_usize;
+                            // Preserve concise execution facts before optional diagnostics.
+                            for key in [
+                                "execution_fact",
+                                "execution_started",
+                                "outcome_certainty",
+                                "side_effects_maybe",
+                                "cleanup_authoritative",
+                                "cleanup_unsettled",
+                                "disposition",
+                                "retryable",
+                                "error_kind",
+                                "stage",
+                            ] {
+                                let Some(value) = fields.remove(key) else {
+                                    continue;
+                                };
+                                if !value.is_boolean()
+                                    && !value.as_str().is_some_and(|text| text.len() <= 128)
+                                {
+                                    continue;
+                                }
+                                // A JSON tuple is a conservative bound for an object entry.
+                                let entry_bytes = serde_json::to_vec(&(key, &value))
+                                    .map_or(usize::MAX, |encoded| encoded.len() + 1);
+                                if bytes.saturating_add(entry_bytes) <= 512 {
+                                    bytes += entry_bytes;
+                                    retained.insert(key.to_string(), value);
+                                }
+                            }
+                            retained
+                        })
+                    };
+                    let output = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(
+                        &canonical.output,
+                    )
+                    .content;
+                    let output = astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+                        output,
+                        astra_services::multi_agent::edge_dispatch::MAX_INSPECTED_EDGE_RESULT_BYTES as usize,
+                    ).ok();
+                    observation["result"] = json!({
+                        "status": canonical.status, "duration_ms": canonical.duration_ms,
+                        "tool_result_fields": metadata, "metadata_omitted": metadata_size > 512,
+                    });
+                    if output.is_none() {
+                        observation["result"]["output_status"] = json!("unavailable");
+                        observation["result"]["reason"] = json!("The validated result's output exceeds the safe display limit.");
+                    }
+                    observation["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    let view = Arc::new(tool_outcome_cache::ToolOutcomeView { observation, output });
+                    let page = tool_outcome_cache::page(
+                        key.clone(),
+                        view,
+                        offset,
+                        max_bytes,
+                    )?;
+                    observations.push(page);
+                    continue;
+                } else if row.status == "failed"
+                    && let Some(receipt) = row.result_json.as_deref().and_then(|body|
+                        astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
+                            body,
+                            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                &row.edge_owner_user_id,
+                                &self.session_id,
+                                child_run_id,
+                                &row.turn_chain_id,
+                                &row.request_id,
+                            ),
+                            &row.edge_agent_id,
+                        ))
+                {
+                    use astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind;
+                    let (fact, action) = match receipt.kind {
+                        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => ("expired_before_claim", "expired"),
+                        EdgeDispatchServerReceiptKind::Cancelled => ("cancelled_before_claim", "was cancelled"),
+                    };
+                    observation["result"] = json!({
+                        "status": "unknown",
+                        "dispatch_fact": fact,
+                        "execution_fact": "unknown",
+                        "reason": format!("This relay request {action} before it was claimed; execution through another delivery path has not been ruled out.")
+                    });
+                } else {
+                    observation["result"] = json!({"status":"unknown", "reason":"no validated executor result is available"});
+                }
+            }
+            if exact.is_none() {
+                let size = serde_json::to_vec(&observation)
+                    .map_err(|_| "invalid dispatch observation".to_string())?
+                    .len()
+                    + 1;
+                if size > 3500 {
+                    return Err("dispatch identity exceeds the inspection page limit".into());
+                }
+                if page_size + size > 3500 {
+                    has_more = true;
+                    break;
+                }
+                page_size += size;
+            }
+            observations.push(observation);
+        }
+        let next = has_more
+            .then(|| observations.last().cloned())
+            .flatten()
+            .map(|row| {
+                json!({
+                    "turn_chain_id": row["turn_chain_id"], "request_id": row["request_id"]
+                })
+            });
+        Ok(tool_outcome_cache::response(observations, next))
+    }
+
     fn subscribe_remote_child_wake(
         &self,
         parent_run_id: &str,
@@ -5303,6 +5533,7 @@ fn start_active_run_control_watcher(
     cancel_token: Arc<CancellationToken>,
     execution_lease_lost: Arc<AtomicBool>,
     input_wake: tokio::sync::watch::Sender<i64>,
+    guidance_wake: tokio::sync::watch::Sender<i64>,
 ) -> Option<ActiveRunControlWatcher> {
     let run_control = run_control?;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -5354,6 +5585,13 @@ fn start_active_run_control_watcher(
                             pause_flag.store(observation.status == Some(RunControlStatus::Paused), Ordering::SeqCst);
                             if let Some(index) = observation.last_event_idx {
                                 input_wake.send_if_modified(|current| {
+                                    let changed = index > *current;
+                                    *current = (*current).max(index);
+                                    changed
+                                });
+                            }
+                            if let Some(index) = observation.last_guidance_event_idx {
+                                guidance_wake.send_if_modified(|current| {
                                     let changed = index > *current;
                                     *current = (*current).max(index);
                                     changed
@@ -6597,6 +6835,7 @@ impl AgenticRunLifecycleService {
                 run_engine: self.run_engine.clone(),
                 user_id: user_id.to_owned(),
                 session_id: session_id.to_owned(),
+                edge_dispatch_service: self.edge_dispatch_service.clone(),
                 state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
             }))
             .await;
@@ -7491,6 +7730,7 @@ impl AgenticRunLifecycleService {
         let llm_cancel_token = Arc::new(CancellationToken::new());
         let execution_lease_lost = Arc::new(AtomicBool::new(false));
         let (input_wake, _) = tokio::sync::watch::channel(-1);
+        let (guidance_wake, _) = tokio::sync::watch::channel(-1);
         let run_state = RunState {
             run_id,
             user_id,
@@ -7501,6 +7741,7 @@ impl AgenticRunLifecycleService {
             pause_flag: pause_flag.clone(),
             llm_cancel_token: llm_cancel_token.clone(),
             input_wake,
+            guidance_wake,
             live_tx: None,
             attached_event_tx: None,
             waiting_for: None,
@@ -14032,12 +14273,18 @@ impl AgenticRunLifecycleService {
                     bg_run_id.clone(),
                     bg_root_mailbox_agent_id.clone(),
                 );
-                let input_wake = runs
+                let (input_wake, guidance_wake) = runs
                     .read()
                     .await
                     .get(&bg_run_id)
-                    .map(|run| run.input_wake.clone())
-                    .unwrap_or_else(|| tokio::sync::watch::channel(-1).0);
+                    .map(|run| (run.input_wake.clone(), run.guidance_wake.clone()))
+                    .unwrap_or_else(|| {
+                        (
+                            tokio::sync::watch::channel(-1).0,
+                            tokio::sync::watch::channel(-1).0,
+                        )
+                    });
+                state.user_intents.guidance_wake = Some(guidance_wake.subscribe());
                 if let Some(tail) = opening_control_tail {
                     // The fresh opening ACK already covers this prefix. Keep a
                     // newer committed control wake if it raced with preparation.
@@ -14069,6 +14316,7 @@ impl AgenticRunLifecycleService {
                     bg_llm_cancel_token.clone(),
                     bg_execution_lease_lost.clone(),
                     input_wake,
+                    guidance_wake,
                 );
                 state.durable_control_watcher = control_watcher
                     .as_ref()
@@ -16421,6 +16669,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
     }
 
+    async fn get_tool_callback_run_target(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<astra_services::runs::ToolCallbackRunTarget, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .load_tool_callback_run_target(identity, edge_agent_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("tool callback run lookup", error))?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "Tool result request not found in this session",
+                )
+            })
+    }
+
     async fn get_run_status(
         &self,
         run_id: String,
@@ -17476,6 +17742,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     *current = (*current).max(event_index);
                     changed
                 });
+                run.guidance_wake.send_if_modified(|current| {
+                    let changed = event_index > *current;
+                    *current = (*current).max(event_index);
+                    changed
+                });
                 run.live_tx.clone()
             } else {
                 None
@@ -17492,6 +17763,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
             }
+        } else if let Some(run) = self.runs.read().await.get(&run_id) {
+            // A retry can repair a lost local notification without creating a
+            // second durable source or replaying the input.
+            run.guidance_wake.send_if_modified(|current| {
+                let changed = event_index > *current;
+                *current = (*current).max(event_index);
+                changed
+            });
         }
         Ok(RunUserIntentRecord {
             run_id,
@@ -18024,6 +18303,20 @@ async fn wait_native_guidance(
     tokio::time::sleep_until(deadline).await;
 }
 
+// A completed invocation only needs to wait for guidance that already owns
+// a transport or durable disposition. A stalled read has nothing to settle.
+async fn drain_started_native_guidance<F: std::future::Future>(
+    guidance: std::pin::Pin<&mut F>,
+    delivery_unconfirmed: &AtomicBool,
+) -> Option<F::Output> {
+    if !delivery_unconfirmed.load(Ordering::Acquire) {
+        return None;
+    }
+    tokio::time::timeout(astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT, guidance)
+        .await
+        .ok()
+}
+
 async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHost>(
     pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
     host: &mut H,
@@ -18032,6 +18325,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
     binding: astra_server_types::edge_connection_pool::ProviderStageDispatchBinding,
     edge_agent_id: &str,
     cursor: &mut usize,
+    delivery_unconfirmed: &AtomicBool,
 ) -> Result<NativeGuidanceProgress, astra_core::ClassifiedError> {
     use crate::turn::agentic_loop::execution_phase::{
         ProviderBoundaryGate, apply_acknowledged_user_intents, apply_pending_user_intents_once,
@@ -18043,6 +18337,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
     let now = tokio::time::Instant::now();
     let pending = state.user_intents.pending_apply_event_indices();
     if state.user_intents.should_retry_apply_ack(now) {
+        delivery_unconfirmed.store(true, Ordering::Release);
         apply_pending_user_intents_once(
             host,
             state,
@@ -18059,9 +18354,10 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
             }),
         )
         .await?;
+        delivery_unconfirmed.store(false, Ordering::Release);
     }
-    // No later source can overtake a provider-accepted but unacknowledged
-    // source. Retrying this owner is persistence-only, never another steer.
+    // Do not let a later steer overtake an accepted input whose durable
+    // disposition still needs acknowledgement, including after owner loss.
     if !state.user_intents.pending_apply_event_indices().is_empty() {
         return Ok(NativeGuidanceProgress::Continue {
             retry_at: state.user_intents.pending_apply_ack_deadline(),
@@ -18126,6 +18422,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 ),
             });
         }
+        delivery_unconfirmed.store(true, Ordering::Release);
         match pool
             .deliver_provider_stage_input(
                 identity,
@@ -18167,6 +18464,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                     }),
                 )
                 .await?;
+                delivery_unconfirmed.store(false, Ordering::Release);
                 // Yield to result/cancellation settlement after one physical
                 // input. A full page must not monopolize the native waiter.
                 return Ok(NativeGuidanceProgress::Continue {
@@ -18212,6 +18510,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                     }),
                 )
                 .await?;
+                delivery_unconfirmed.store(false, Ordering::Release);
                 return Ok(NativeGuidanceProgress::Continue {
                     retry_at: Some(
                         state
@@ -18222,6 +18521,7 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
                 });
             }
             Err(error) if !error.may_have_reached_provider => {
+                delivery_unconfirmed.store(false, Ordering::Release);
                 return Ok(NativeGuidanceProgress::Continue {
                     retry_at: Some(
                         tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
@@ -18235,10 +18535,14 @@ async fn pump_native_guidance<H: crate::turn::agentic_loop::host::AgenticLoopHos
             }
         }
     }
+    let apply_retry_at = state.user_intents.pending_apply_ack_deadline();
+    let poll_retry_at = poll.snapshot_has_more.then(tokio::time::Instant::now);
+    let retry_at = match (apply_retry_at, poll_retry_at) {
+        (Some(apply), Some(poll)) => Some(apply.min(poll)),
+        (apply, poll) => apply.or(poll),
+    };
     *cursor = (*cursor).max(poll.next_cursor);
-    Ok(NativeGuidanceProgress::Continue {
-        retry_at: poll.snapshot_has_more.then(tokio::time::Instant::now),
-    })
+    Ok(NativeGuidanceProgress::Continue { retry_at })
 }
 
 impl AgenticRunLifecycleService {
@@ -22250,44 +22554,42 @@ impl ServerSubRunExecutor {
                         // Poll physical completion while control I/O is in
                         // progress. A slow poll or persistence call must not
                         // keep the invocation future from observing cancel.
-                        let guidance_deadline = tokio::time::Instant::now()
-                            + astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT;
+                        let delivery_unconfirmed = AtomicBool::new(false);
                         let guidance = pump_native_guidance(pool, host, state,
                             &identity, dispatch_binding.expect("this dispatch enabled guidance"),
-                            &edge_agent_id, &mut guidance_cursor);
-                        let mut guidance = Box::pin(tokio::time::timeout_at(guidance_deadline, guidance));
-                        tokio::select! {
+                            &edge_agent_id, &mut guidance_cursor, &delivery_unconfirmed);
+                        let mut guidance = Box::pin(guidance);
+                        let mut completed_invocation = None;
+                        let progress = tokio::select! {
+                            biased;
+                            result = &mut guidance => Some(result),
                             result = &mut invocation => {
-                                // Keep deferred completion custody alive while
-                                // an already-started ACK resolves. Completion
-                                // does not renew the control-operation budget.
-                                guidance_disposition_unconfirmed |=
-                                    !matches!(guidance.await, Ok(Ok(NativeGuidanceProgress::Continue { .. } | NativeGuidanceProgress::StoppedConfirmed)));
-                                break result;
+                                completed_invocation = Some(result);
+                                // Result and input ACK use independent Edge
+                                // frames. Give the original waiter a bounded
+                                // drain so frame order cannot discard an ACK;
+                                // this never sends another input.
+                                drain_started_native_guidance(
+                                    guidance.as_mut(), &delivery_unconfirmed,
+                                ).await
                             },
-                            result = &mut guidance => {
-                                guidance_enabled = match result {
-                                    Ok(result) => {
-                                        let progress = result?;
-                                        match progress {
-                                            NativeGuidanceProgress::Continue { retry_at } => {
-                                                next_guidance_poll = retry_at;
-                                                true
-                                            }
-                                            NativeGuidanceProgress::StoppedConfirmed => false,
-                                            NativeGuidanceProgress::StoppedUnconfirmed => {
-                                                guidance_disposition_unconfirmed = true;
-                                                false
-                                            }
-                                        }
-                                    },
-                                    Err(_) => {
-                                        guidance_disposition_unconfirmed = true;
-                                        false
-                                    },
-                                };
-                            },
+                        };
+                        drop(guidance);
+                        if let Some(result) = completed_invocation {
+                            guidance_disposition_unconfirmed |= delivery_unconfirmed.load(Ordering::Acquire);
+                            break result;
                         }
+                        guidance_enabled = match progress.expect("one branch completed")? {
+                            NativeGuidanceProgress::Continue { retry_at } => {
+                                next_guidance_poll = retry_at;
+                                true
+                            }
+                            NativeGuidanceProgress::StoppedConfirmed => false,
+                            NativeGuidanceProgress::StoppedUnconfirmed => {
+                                guidance_disposition_unconfirmed = true;
+                                false
+                            }
+                        };
                         if !guidance_enabled {
                             mailbox_enabled = false;
                         }
@@ -22823,6 +23125,15 @@ impl ServerSubRunExecutor {
             Ok(())
         };
         check_admission()?;
+        let execution_binding_generation = config
+            .execution_contract
+            .as_ref()
+            .and_then(|(binding, _)| binding.execution_binding_generation);
+        if let Some(native) = self.native_execution.as_ref()
+            && execution_binding_generation != Some(native.identity.execution_binding_generation)
+        {
+            return Err("native sub-run execution binding changed before admission".into());
+        }
         let Some(run_engine) = self.durable_run_engine() else {
             if config.work_item.is_some() {
                 return Err("WorkItem execution requires durable run admission".into());
@@ -23044,6 +23355,15 @@ impl ServerSubRunExecutor {
                         .map(|native| native.stage_admission.clone()),
                     delegation_authority: config.delegation_authority,
                     interaction_mode: config.interaction_mode,
+                    // A child must retain the same admitted binding generation as
+                    // its provider dispatch; input acknowledgements validate it
+                    // against this immutable opening and the current binding.
+                    execution_metadata: execution_binding_generation.map(|generation| {
+                        serde_json::Map::from_iter([(
+                            "execution_binding_generation".into(),
+                            serde_json::json!(generation),
+                        )])
+                    }),
                     child_runtime_id: Some(config.agent_profile.agent_id.clone()),
                     execution_restrictions: Some(execution_restrictions),
                     requested_model_policy: config.requested_model_policy.clone(),
@@ -24121,7 +24441,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .await?;
             let execution_authority = durable_admission.as_ref().map(|admission| {
                 crate::server::run::engine::RunExecutionAuthority {
-                    opening_control_tail: None,
+                    opening_control_tail: admission.initial_authority.and_then(|authority| authority.opening_control_tail),
                     owner_generation: admission.owner_generation,
                     owner_lease_expires_at: None,
                 }
@@ -24653,6 +24973,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             flag: Some(local_cancel_flag.clone()),
             pause_flag: Some(local_pause_flag.clone()),
             token: Some(local_cancel_token.clone()),
+            inference_token: None,
             execution_lease_lost: Some(local_execution_lease_lost.clone()),
             resolved_origin: None,
         };
@@ -24893,7 +25214,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .await;
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
+        let (guidance_wake, guidance_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
+        loop_state.user_intents.guidance_wake = Some(guidance_ready);
         loop_state.run_settings_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
@@ -24906,6 +25229,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             local_cancel_token,
             local_execution_lease_lost.clone(),
             input_wake,
+            guidance_wake,
         );
 
         loop_state.durable_control_watcher = durable_control_watcher.as_ref().map(|watcher| watcher.alive.clone());

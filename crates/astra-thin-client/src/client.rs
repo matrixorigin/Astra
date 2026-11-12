@@ -11,7 +11,8 @@ use astra_server_types::{
     WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
-    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxBatchResponse, SyncOutboxEventBatch,
+    SyncOutboxReconcileRequest, sync_outbox_request_signature,
 };
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
@@ -65,58 +66,66 @@ fn stream_event_is_terminal(event: &StreamEvent) -> bool {
     )
 }
 
-/// Decode one already-admitted SSE response with the same terminal-event
-/// semantics for every streaming endpoint. A transport close after a
-/// terminal event is considered a clean end; EOF before a terminal event is
-/// surfaced as an error so callers cannot report a partial Work turn as
-/// completed.
-fn classified_sse_response(
+/// Decode Astra control events through clean EOF or the explicit terminator.
+fn sse_response_events(
     resp: Response,
+    max_frame_bytes: Option<usize>,
 ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
     stream! {
-        let mut parser = SseParser::new();
+        let mut parser = max_frame_bytes.map_or_else(SseParser::new, SseParser::with_max_frame_bytes);
         let mut byte_stream = resp.bytes_stream();
-        let mut saw_terminal = false;
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    if saw_terminal {
-                        return;
-                    }
                     yield Err(e.into());
                     return;
                 }
             };
-            match parser.push_bytes(&chunk) {
-                Ok(events) => {
-                    for event in events {
-                        saw_terminal |= stream_event_is_terminal(&event);
+            let mut input = chunk.as_ref();
+            while !input.is_empty() {
+                match parser.next_event(&mut input) {
+                    Ok(Some(event)) => {
                         yield Ok(event);
                     }
-                }
-                Err(error) => {
-                    if saw_terminal {
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield Err(error);
                         return;
                     }
-                    yield Err(error);
-                    return;
                 }
+            }
+            if parser.is_finished() {
+                break;
             }
         }
         match parser.finish() {
-            Ok(events) => {
-                for event in events {
+            Ok(Some(event)) => yield Ok(event),
+            Ok(None) => {},
+            Err(error) => yield Err(error),
+        }
+    }
+    .boxed()
+}
+
+/// Require a semantic terminal so a partial turn cannot look successful.
+fn classified_sse_response(
+    resp: Response,
+) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
+    stream! {
+        let mut events = sse_response_events(resp, None);
+        let mut saw_terminal = false;
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(event) => {
                     saw_terminal |= stream_event_is_terminal(&event);
                     yield Ok(event);
                 }
-            }
-            Err(error) => {
-                if saw_terminal {
+                Err(_) if saw_terminal => return,
+                Err(error) => {
+                    yield Err(error);
                     return;
                 }
-                yield Err(error);
-                return;
             }
         }
         if !saw_terminal {
@@ -159,13 +168,23 @@ async fn sleep_between_attempts(delay_secs: u64) {
     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
 }
 
-/// Parse the `Retry-After` header value into seconds.
-/// Supports integer seconds format; ignores HTTP-date format.
-/// Clamps to [1, 120] seconds. Returns `None` on missing/unparseable.
-fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+/// Parse Retry-After, rounding dates up so a retry never precedes the deadline.
+fn parse_retry_after(headers: &HeaderMap, now: std::time::SystemTime) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    Some(secs.clamp(1, 120))
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(raw.parse::<u64>().unwrap_or(u64::MAX).max(1));
+    }
+    let delay = httpdate::parse_http_date(raw)
+        .ok()?
+        .duration_since(now)
+        .unwrap_or_default();
+    Some(
+        delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() > 0))
+            .max(1),
+    )
 }
 
 fn http_stream_connect_timeout() -> Duration {
@@ -1744,7 +1763,9 @@ impl ThinClient {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
-                            parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
+                            parse_retry_after(resp.headers(), std::time::SystemTime::now())
+                                .map(|seconds| seconds.min(120))
+                                .unwrap_or(2u64 << attempt);
                         if !quiet {
                             tracing::warn!(
                                 target: "astra.thin_client",
@@ -2319,35 +2340,9 @@ impl ThinClient {
                     return;
                 }
             };
-            let mut parser = SseParser::new();
-            let mut byte_stream = resp.bytes_stream();
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(e.into());
-                        return;
-                    }
-                };
-                match parser.push_bytes(&chunk) {
-                    Ok(evs) => {
-                        for ev in evs {
-                            yield Ok(ev);
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        return;
-                    }
-                }
-            }
-            match parser.finish() {
-                Ok(evs) => {
-                    for ev in evs {
-                        yield Ok(ev);
-                    }
-                }
-                Err(e) => yield Err(e),
+            let mut events = sse_response_events(resp, None);
+            while let Some(event) = events.next().await {
+                yield event;
             }
         }
         .boxed()
@@ -2471,20 +2466,52 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /sync/outbox/events` — ingest durable edge sync outbox events.
-    pub async fn post_sync_outbox_event_json(
+    /// `POST /sync/outbox/events` — ingest one bounded durable sync batch.
+    pub async fn post_sync_outbox_events_json(
         &self,
         bearer_override: Option<&str>,
-        body: &Value,
-    ) -> Result<SyncOutboxAck, ThinClientError> {
-        let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
+        batch: &SyncOutboxEventBatch,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(batch).map_err(|error| {
+            ThinClientError::InvalidInput(format!("failed to encode sync-outbox batch: {error}"))
+        })?;
+        self.post_signed_sync_outbox_request(bearer_override, paths::SYNC_OUTBOX_EVENTS, body)
+            .await
+    }
+
+    /// Reconcile a bounded set of record IDs with one read-only batch request.
+    pub async fn reconcile_sync_outbox_events_json(
+        &self,
+        bearer_override: Option<&str>,
+        request: &SyncOutboxReconcileRequest,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let body = serde_json::to_value(request).map_err(|error| {
+            ThinClientError::InvalidInput(format!(
+                "failed to encode sync-outbox reconciliation: {error}"
+            ))
+        })?;
+        self.post_signed_sync_outbox_request(
+            bearer_override,
+            paths::SYNC_OUTBOX_EVENTS_RECONCILE,
+            body,
+        )
+        .await
+    }
+
+    async fn post_signed_sync_outbox_request(
+        &self,
+        bearer_override: Option<&str>,
+        path: &str,
+        body: Value,
+    ) -> Result<SyncOutboxBatchResponse, ThinClientError> {
+        let url = self.url(path)?;
         let mut headers = self.auth_headers_for(bearer_override).await?;
         if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         {
-            let signature = sync_outbox_request_signature(token, body);
+            let signature = sync_outbox_request_signature(token, &body);
             let header = HeaderValue::from_str(&signature).map_err(|error| {
                 ThinClientError::InvalidInput(format!(
                     "failed to encode sync-outbox signature header: {error}"
@@ -2496,10 +2523,23 @@ impl ThinClient {
             .http
             .post(url)
             .headers(headers)
-            .json(body)
+            .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || (status.is_server_error() && resp.headers().contains_key(header::RETRY_AFTER))
+        {
+            let retry_after_seconds =
+                parse_retry_after(resp.headers(), std::time::SystemTime::now());
+            let body = resp.text().await?;
+            return Err(ThinClientError::SyncOutboxBackpressure {
+                status,
+                body,
+                retry_after_seconds,
+            });
+        }
         Self::typed_json_or_error(resp).await
     }
 
@@ -2689,110 +2729,97 @@ impl ThinClient {
             return Self::typed_json_or_error(response).await;
         }
         let receive = async {
-            let mut parser = SseParser::with_max_frame_bytes(256 * 1024);
-            let mut chunks = response.bytes_stream();
+            let mut events = sse_response_events(response, Some(256 * 1024));
             let mut required_index = None;
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
-                for feed in chunk.chunks(16 * 1024) {
-                    for event in parser.push_bytes(feed)? {
-                        let (event_type, raw) = match event {
-                            StreamEvent::Other { event_type, raw } => (event_type, raw),
-                            StreamEvent::Error { raw, .. } => {
-                                let status = raw
-                                    .get("status")
-                                    .and_then(Value::as_u64)
-                                    .and_then(|status| u16::try_from(status).ok())
-                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
-                                    .filter(|status| {
-                                        status.is_client_error() || status.is_server_error()
-                                    })
-                                    .unwrap_or(reqwest::StatusCode::CONFLICT);
-                                return Err(ThinClientError::Api {
-                                    status,
-                                    body: "native interaction request rejected".into(),
-                                });
-                            }
-                            _ => {
-                                return Err(ThinClientError::InvalidProviderInteractionResponse(
-                                    "unexpected interaction stream event".into(),
-                                ));
-                            }
-                        };
-                        match event_type.as_str() {
-                            "provider_interaction_required" => {
-                                let identity: astra_turn_types::ToolInvocationIdentity =
-                                    serde_json::from_value(
-                                        raw.pointer("/tool_invocation_origin/identity")
-                                            .cloned()
-                                            .ok_or_else(|| {
-                                                ThinClientError::InvalidProviderInteractionResponse(
-                                                    "required event has no invocation origin"
-                                                        .into(),
-                                                )
-                                            })?,
-                                    )?;
-                                let interaction: astra_turn_types::ProviderInteractionRequest =
-                                    serde_json::from_value(
-                                        raw.get("interaction").cloned().ok_or_else(|| {
-                                            ThinClientError::InvalidProviderInteractionResponse(
-                                                "required event has no interaction".into(),
-                                            )
-                                        })?,
-                                    )?;
-                                let index =
-                                    raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+            while let Some(event) = events.next().await {
+                let event = event?;
+                let (event_type, raw) = match event {
+                    StreamEvent::Other { event_type, raw } => (event_type, raw),
+                    StreamEvent::Error { raw, .. } => {
+                        let status = raw
+                            .get("status")
+                            .and_then(Value::as_u64)
+                            .and_then(|status| u16::try_from(status).ok())
+                            .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                            .filter(|status| status.is_client_error() || status.is_server_error())
+                            .unwrap_or(reqwest::StatusCode::CONFLICT);
+                        return Err(ThinClientError::Api {
+                            status,
+                            body: "native interaction request rejected".into(),
+                        });
+                    }
+                    _ => {
+                        return Err(ThinClientError::InvalidProviderInteractionResponse(
+                            "unexpected interaction stream event".into(),
+                        ));
+                    }
+                };
+                match event_type.as_str() {
+                    "provider_interaction_required" => {
+                        let identity: astra_turn_types::ToolInvocationIdentity =
+                            serde_json::from_value(
+                                raw.pointer("/tool_invocation_origin/identity")
+                                    .cloned()
+                                    .ok_or_else(|| {
                                         ThinClientError::InvalidProviderInteractionResponse(
-                                            "required event has no durable index".into(),
+                                            "required event has no invocation origin".into(),
                                         )
-                                    })?;
-                                if identity != body.identity
-                                    || interaction != body.interaction
-                                    || raw.get("run_id").and_then(Value::as_str)
-                                        != Some(body.identity.run_id.as_str())
-                                    || raw
-                                        .pointer("/tool_invocation_origin/edge_agent_id")
-                                        .and_then(Value::as_str)
-                                        != Some(body.edge_agent_id.as_str())
-                                    || required_index.is_some_and(|previous| previous != index)
-                                {
-                                    return Err(
-                                        ThinClientError::InvalidProviderInteractionResponse(
-                                            "required event changed interaction identity".into(),
-                                        ),
-                                    );
-                                }
-                                if required_index.is_none() {
-                                    required_events.send(raw).await.map_err(|_| {
-                                        ThinClientError::InvalidProviderInteractionResponse(
-                                            "interaction consumer closed".into(),
-                                        )
-                                    })?;
-                                    required_index = Some(index);
-                                }
-                            }
-                            "tool_interaction_response" => {
-                                let response: astra_turn_types::ProviderInteractionResponse =
-                                    serde_json::from_value(
-                                        raw.get("response").cloned().ok_or_else(|| {
-                                            ThinClientError::InvalidProviderInteractionResponse(
-                                                "missing terminal interaction response".into(),
-                                            )
-                                        })?,
-                                    )?;
-                                response.validate_for(&body.interaction).map_err(|error| {
+                                    })?,
+                            )?;
+                        let interaction: astra_turn_types::ProviderInteractionRequest =
+                            serde_json::from_value(raw.get("interaction").cloned().ok_or_else(
+                                || {
                                     ThinClientError::InvalidProviderInteractionResponse(
-                                        error.to_string(),
+                                        "required event has no interaction".into(),
                                     )
-                                })?;
-                                return Ok(response);
-                            }
-                            _ => {
-                                return Err(ThinClientError::InvalidProviderInteractionResponse(
-                                    "unexpected interaction stream event".into(),
-                                ));
-                            }
+                                },
+                            )?)?;
+                        let index = raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                            ThinClientError::InvalidProviderInteractionResponse(
+                                "required event has no durable index".into(),
+                            )
+                        })?;
+                        if identity != body.identity
+                            || interaction != body.interaction
+                            || raw.get("run_id").and_then(Value::as_str)
+                                != Some(body.identity.run_id.as_str())
+                            || raw
+                                .pointer("/tool_invocation_origin/edge_agent_id")
+                                .and_then(Value::as_str)
+                                != Some(body.edge_agent_id.as_str())
+                            || required_index.is_some_and(|previous| previous != index)
+                        {
+                            return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                "required event changed interaction identity".into(),
+                            ));
                         }
+                        if required_index.is_none() {
+                            required_events.send(raw).await.map_err(|_| {
+                                ThinClientError::InvalidProviderInteractionResponse(
+                                    "interaction consumer closed".into(),
+                                )
+                            })?;
+                            required_index = Some(index);
+                        }
+                    }
+                    "tool_interaction_response" => {
+                        let response: astra_turn_types::ProviderInteractionResponse =
+                            serde_json::from_value(raw.get("response").cloned().ok_or_else(
+                                || {
+                                    ThinClientError::InvalidProviderInteractionResponse(
+                                        "missing terminal interaction response".into(),
+                                    )
+                                },
+                            )?)?;
+                        response.validate_for(&body.interaction).map_err(|error| {
+                            ThinClientError::InvalidProviderInteractionResponse(error.to_string())
+                        })?;
+                        return Ok(response);
+                    }
+                    _ => {
+                        return Err(ThinClientError::InvalidProviderInteractionResponse(
+                            "unexpected interaction stream event".into(),
+                        ));
                     }
                 }
             }
@@ -4839,9 +4866,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_post_sync_outbox_event_json() {
+    async fn wiremock_post_sync_outbox_events_json() {
         let srv = MockServer::start().await;
-        let body = serde_json::json!({
+        let batch = SyncOutboxEventBatch::new(vec![serde_json::json!({
             "event_id": "sync_evt_1",
             "session_id": "session-1",
             "event_type": "sync_marker",
@@ -4851,7 +4878,8 @@ mod tests {
                     "payload_hash": "sha256:abc"
                 }
             }
-        });
+        })]);
+        let body = serde_json::to_value(&batch).unwrap();
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(header("authorization", "Bearer tok"))
@@ -4859,21 +4887,60 @@ mod tests {
                 "x-astra-sync-outbox-signature",
                 sync_outbox_request_signature("tok", &body),
             ))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "schema_version": 1,
-                "record_id": "sync_evt_1",
-                "payload_hash": "sha256:abc",
-                "ingestion_status": "created"
+                "acks": [{
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "created"
+                }],
+                "rejections": []
             })))
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let v = client
-            .post_sync_outbox_event_json(Some("tok"), &body)
+        let ack = client
+            .post_sync_outbox_events_json(Some("tok"), &batch)
             .await
             .unwrap();
-        assert!(v.confirms("sync_evt_1", "sha256:abc"));
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_reconcile_sync_outbox_events_json() {
+        let srv = MockServer::start().await;
+        let request =
+            SyncOutboxReconcileRequest::new(vec!["sync_evt_1".to_string(), "missing".to_string()]);
+        let body = serde_json::to_value(&request).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events/reconcile"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header(
+                "x-astra-sync-outbox-signature",
+                sync_outbox_request_signature("tok", &body),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "acks": [{
+                    "record_id": "sync_evt_1",
+                    "payload_hash": "sha256:abc",
+                    "ingestion_status": "idempotent_replay"
+                }],
+                "rejections": []
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let ack = client
+            .reconcile_sync_outbox_events_json(Some("tok"), &request)
+            .await
+            .unwrap();
+        assert_eq!(ack.acks.len(), 1);
+        assert!(ack.acks[0].matches("sync_evt_1", "sha256:abc"));
     }
 
     #[tokio::test]
@@ -5423,6 +5490,85 @@ mod tests {
         assert!(error.to_string().contains("terminal event"));
     }
 
+    #[tokio::test]
+    async fn chat_stream_preserves_valid_eof_terminal_and_rejects_malformed_tail() {
+        for (tail, expected) in [
+            (
+                "\u{feff}data: {\"type\":\"run_finished\",\"run_id\":\"r\",\"status\":\"failed\"}",
+                true,
+            ),
+            ("data: {\"type\":\"run_finished\"", false),
+        ] {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/stream"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(tail))
+                .mount(&srv)
+                .await;
+            let client = ThinClient::new(&srv.uri(), None).unwrap();
+            let result = client
+                .chat_stream_collect(&ChatStreamRequest::new("hi", "m"), None)
+                .await;
+            if expected {
+                assert!(
+                    matches!(result.unwrap().as_slice(), [StreamEvent::RunFinished { status: Some(status), .. }] if status == "failed")
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn done_finishes_control_stream_without_waiting_for_transport_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for terminal in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = if terminal {
+                    "data: {\"type\":\"turn_complete\"}\n\ndata: [DONE]\n\n"
+                } else {
+                    "data: [DONE]\n\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let mut events = classified_sse_response(response);
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut collected = Vec::new();
+                while let Some(event) = events.next().await {
+                    collected.push(event);
+                }
+                collected
+            })
+            .await
+            .expect("DONE must not wait for the server to close");
+            if terminal {
+                assert!(matches!(
+                    result.as_slice(),
+                    [Ok(StreamEvent::TurnComplete { .. })]
+                ));
+            } else {
+                assert!(matches!(
+                    result.as_slice(),
+                    [Err(ThinClientError::SseParse(_))]
+                ));
+            }
+            server.abort();
+        }
+    }
+
     // ── 429 retry logic ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -5562,45 +5708,72 @@ mod tests {
     fn parse_retry_after_valid_integer() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("5"));
-        assert_eq!(parse_retry_after(&headers), Some(5));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(5));
     }
 
     #[test]
-    fn parse_retry_after_clamps_high() {
+    fn parse_retry_after_preserves_long_delays() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("999"));
-        assert_eq!(parse_retry_after(&headers), Some(120));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(999)
+        );
     }
 
     #[test]
     fn parse_retry_after_clamps_zero_to_one() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("0"));
-        assert_eq!(parse_retry_after(&headers), Some(1));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(1));
     }
 
     #[test]
     fn parse_retry_after_missing_header() {
         let headers = HeaderMap::new();
-        assert_eq!(parse_retry_after(&headers), None);
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_non_numeric() {
         let mut headers = HeaderMap::new();
-        // HTTP-date format not supported — returns None
-        headers.insert(
-            "retry-after",
-            HeaderValue::from_static("Wed, 09 Apr 2026 12:00:00 GMT"),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("not a date"));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), None);
     }
 
     #[test]
     fn parse_retry_after_whitespace_trimmed() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("  10  "));
-        assert_eq!(parse_retry_after(&headers), Some(10));
+        assert_eq!(parse_retry_after(&headers, std::time::UNIX_EPOCH), Some(10));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_rounds_up_and_limits_expired_dates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:01:40 GMT"),
+        );
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(90_500);
+        assert_eq!(parse_retry_after(&headers, now), Some(10));
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH + Duration::from_secs(200)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_integer_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("18446744073709551616"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers, std::time::UNIX_EPOCH),
+            Some(u64::MAX)
+        );
     }
 
     #[tokio::test]

@@ -2269,6 +2269,7 @@ impl RunEngine {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
+            last_guidance_event_idx: -1,
             current_checkpoint: None,
             error_code: None,
             error_message: None,
@@ -3401,6 +3402,16 @@ impl RunEngine {
         self.store.load_run_control(user_id, run_id).await
     }
 
+    pub async fn load_tool_callback_run_target(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<Option<astra_services::runs::ToolCallbackRunTarget>, String> {
+        self.store
+            .load_tool_callback_run_target(identity, edge_agent_id)
+            .await
+    }
+
     pub async fn load_run_event_delta(
         &self,
         user_id: &str,
@@ -3453,7 +3464,8 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
-        let record = match self.control_reads.get(user_id, run_id).await {
+        let read = self.control_reads.get(user_id, run_id).await;
+        let record = match read {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record
@@ -3470,6 +3482,7 @@ impl RunEngine {
         let mut observation = RunControlObservation {
             status: None,
             last_event_idx: Some(record.last_event_idx),
+            last_guidance_event_idx: Some(record.last_guidance_event_idx),
             session_id: Some(record.session_id.clone()),
             run_generation: Some(record.run_generation),
         };
@@ -10698,32 +10711,30 @@ mod tests {
             .start_run("run-gapped", "user-1", "sess-gapped")
             .await
             .unwrap();
+        // The run starts at 0. Ordinary events occupy 1..=6 and 8;
+        // the filtered control page must retain durable gaps.
+        let mut events = vec![serde_json::json!({"event_type":"agent_progress"}); 6];
+        events.extend([
+            serde_json::json!({
+                "event_type": "user_intent",
+                "data": {
+                    "intent_id": "intent-7",
+                    "delivery": "guide_current_run",
+                    "input": {"content": "first"}
+                }
+            }),
+            serde_json::json!({"event_type":"agent_progress"}),
+            serde_json::json!({
+                "event_type": "user_intent",
+                "data": {
+                    "intent_id": "intent-9",
+                    "delivery": "guide_current_run",
+                    "input": {"content": "second"}
+                }
+            }),
+        ]);
         engine
-            .append_events_batch(
-                "user-1",
-                "sess-gapped",
-                "run-gapped",
-                &[
-                    serde_json::json!({
-                        "index": 7,
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": "intent-7",
-                            "delivery": "guide_current_run",
-                            "input": {"content": "first"}
-                        }
-                    }),
-                    serde_json::json!({
-                        "index": 9,
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": "intent-9",
-                            "delivery": "guide_current_run",
-                            "input": {"content": "second"}
-                        }
-                    }),
-                ],
-            )
+            .append_events_batch("user-1", "sess-gapped", "run-gapped", &events)
             .await
             .unwrap();
 
@@ -10808,9 +10819,8 @@ mod tests {
                         .start_run("run-input", "user-1", "sess-input")
                         .await
                         .unwrap();
-                    let events = [7, 9].map(|index| {
+                    let controls = [7, 9].map(|index| {
                         serde_json::json!({
-                            "index": index,
                             "event_type": event_type,
                             "data": {
                                 "event_index": index,
@@ -10820,6 +10830,10 @@ mod tests {
                             }
                         })
                     });
+                    let mut events = vec![serde_json::json!({"event_type":"agent_progress"}); 6];
+                    events.push(controls[0].clone());
+                    events.push(serde_json::json!({"event_type":"agent_progress"}));
+                    events.push(controls[1].clone());
                     engine
                         .append_events_batch("user-1", "sess-input", "run-input", &events)
                         .await

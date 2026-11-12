@@ -2061,6 +2061,11 @@ Metrics include resolution latency/errors, active/queued inference, provider 401
 
 Audit covers instance registration, binding/link/revoke, Offering publication, policy change, emergency revoke, route/fallback reason, and billing-owner changes. It references secret IDs but never secret values.
 
+SSE decoders join an event's `data` fields before JSON decoding. At clean EOF,
+a final valid payload is processed through the same validation as a framed
+event; a provider response still requires its semantic terminal. The Astra
+control stream also uses terminal evidence to settle already-running Edge work.
+
 ## Test obligations
 
 Tests validate behavior, persisted facts, wire payloads, streams, and product projections. Source-text matching and assertions that a helper was called are not substitutes for behavior tests.

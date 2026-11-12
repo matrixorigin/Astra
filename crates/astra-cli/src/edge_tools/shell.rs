@@ -780,25 +780,6 @@ fn check_bash_path_boundary_in_context(
     None
 }
 
-fn find_powershell_program() -> Option<&'static str> {
-    for candidate in ["pwsh", "powershell"] {
-        let status = Command::new(candidate)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-Command",
-                "$PSVersionTable.PSVersion.Major",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.is_ok() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Check if a PowerShell command references file paths outside the sandbox boundary.
 ///
 /// This is intentionally conservative and only inspects common cmdlets whose
@@ -3005,11 +2986,6 @@ fn destructive_command_warning(command: &str) -> Option<&'static str> {
         ("git branch -D", "⚠️ Warning: may force-delete a branch"),
         // Git — safety bypass
         ("--no-verify", "⚠️ Warning: skipping safety hooks"),
-        // File deletion
-        (
-            "rm -rf /",
-            "⚠️ Warning: recursive force-remove from root — extremely dangerous",
-        ),
         // Database
         ("DROP TABLE", "⚠️ Warning: may drop database table"),
         ("DROP DATABASE", "⚠️ Warning: may drop entire database"),
@@ -3312,9 +3288,10 @@ fn prepare_shell_process(
         .as_ref()
         .is_some_and(|token| token.is_cancelled())
     {
-        return Err(ShellRunError::new(
-            "Error: command cancelled before execution",
-        ));
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::Cancelled,
+            ..ShellRunError::new("Error: command cancelled before execution")
+        });
     }
 
     Ok((child_cmd, invocation_owner))
@@ -3322,7 +3299,17 @@ fn prepare_shell_process(
 
 fn run_shell_output_with_config(
     config: ShellRunConfig,
+    admission_deadline: Option<std::time::Instant>,
+    execution_deadline: Option<std::time::Instant>,
 ) -> Result<ScopedShellOutput, ShellRunError> {
+    let deadline = Duration::try_from_secs_f64(config.timeout_secs)
+        .ok()
+        .and_then(|timeout| std::time::Instant::now().checked_add(timeout))
+        .ok_or_else(|| ShellRunError {
+            kind: astra_core::ErrorKind::ToolInvalidArgs,
+            ..ShellRunError::new("Error: invalid shell timeout; no process was started")
+        })?;
+    let deadline = execution_deadline.map_or(deadline, |outer| deadline.min(outer));
     #[cfg(all(test, target_os = "linux"))]
     let uses_supervisor_test_helper = config.supervisor_test_helper.is_some();
     let (mut child_cmd, mut invocation_owner) = prepare_shell_process(&config)?;
@@ -3331,9 +3318,36 @@ fn run_shell_output_with_config(
             "Error: unable to install Bash invocation owner: {error}"
         )));
     }
-    let mut child = child_cmd
-        .spawn()
-        .map_err(|e| ShellRunError::new(format!("Error: {e}")))?;
+    if astra_tools::dispatch_deadline_result(admission_deadline, false).is_some() {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::BudgetExhausted,
+            ..ShellRunError::new("Error: the admission deadline expired; no process was started")
+        });
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::ToolTimeout,
+            ..ShellRunError::new("Error: the command timeout expired; no process was started")
+        });
+    }
+    if config
+        .cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::Cancelled,
+            ..ShellRunError::new("Error: command cancelled before execution")
+        });
+    }
+    let mut child = child_cmd.spawn().map_err(|error| ShellRunError {
+        kind: if error.kind() == std::io::ErrorKind::NotFound {
+            astra_core::ErrorKind::ToolNotFound
+        } else {
+            astra_core::ErrorKind::ToolUnavailable
+        },
+        ..ShellRunError::new(format!("Error: {error}"))
+    })?;
     let child_pid = child.id();
     if let Err(error) = invocation_owner.started(child_pid) {
         let ownership = settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
@@ -3360,7 +3374,6 @@ fn run_shell_output_with_config(
 
     let progress_sink = config.progress_sink;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
     let (mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new());
     let completion = loop {
         let leader_pid = child.id();
@@ -3786,7 +3799,7 @@ impl ToolExecutor {
             harden_command,
             cancel_token,
         );
-        run_shell_output_with_config(config)
+        run_shell_output_with_config(config, None, None)
             .map(|scoped| scoped.output)
             .map_err(|error| error.message)
     }
@@ -3812,26 +3825,6 @@ impl ToolExecutor {
             return Err(READ_ONLY_SHELL_UNAVAILABLE.to_string());
         }
         self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, cancel_token)
-    }
-
-    fn run_powershell_output(
-        &self,
-        command: &str,
-        timeout_secs: f64,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<std::process::Output, String> {
-        let program = find_powershell_program().ok_or_else(|| {
-            "Error: PowerShell not available. Install 'pwsh' (PowerShell 7+) or 'powershell'."
-                .to_string()
-        })?;
-        self.run_shell_output_with_program(
-            program,
-            "-Command",
-            command,
-            timeout_secs,
-            false,
-            cancel_token,
-        )
     }
 
     /// Register file paths that were read by a successful bash command so
@@ -4003,7 +3996,7 @@ impl ToolExecutor {
         }
         if !environment_background_authorized() {
             let mut outcome = super::ToolExecutionOutcome::ok(
-                "Managed background services are unavailable in this execution environment. No process was started. Run bounded work and its checks in one foreground call.".to_string(),
+                "Environment-lifetime services are unavailable. No process was started. When task controls are available, run the command in the foreground and use yield_time_ms to retain and inspect it while the executor remains active.".to_string(),
             );
             mark_bash_capture_unavailable(&mut outcome);
             let fields = outcome.tool_result_fields.get_or_insert_default();
@@ -4233,7 +4226,7 @@ impl ToolExecutor {
                 let probe_guard = self.worktree_transition.clone().read_owned().await;
                 let probe = tokio::task::spawn_blocking(move || {
                     let _guard = probe_guard;
-                    run_shell_output_with_config(probe_config)
+                    run_shell_output_with_config(probe_config, None, None)
                 }).await;
                 if probe.as_ref().is_ok_and(|result| result.as_ref().is_ok_and(|output| output.output.status.success())) {
                     let mut fields = serde_json::Map::new();
@@ -4566,28 +4559,46 @@ impl ToolExecutor {
         outcome
     }
 
-    pub(crate) fn powershell(&self, args: &Value) -> String {
-        self.powershell_with_cancel(args, None)
-    }
-
     pub(crate) fn powershell_with_cancel(
         &self,
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> String {
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+    ) -> super::ToolExecutionOutcome {
         if self.read_only_execution {
-            return READ_ONLY_SHELL_UNAVAILABLE.to_string();
+            return read_only_shell_rejection();
+        }
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return super::cancelled_tool_execution_outcome("powershell", false);
+        }
+        if let Some(outcome) = bash_admission_deadline_outcome(invocation.admission_deadline) {
+            return outcome;
         }
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
             _ => {
-                return "Error: missing required field `command` for powershell. \
+                let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                    "Error: missing required field `command` for powershell. \
                         Origin: model_argument_error; no command was run. \
                         Next: retry with a JSON object like {\"command\":\"Get-Location\"}."
-                    .to_string();
+                        .to_string(),
+                    astra_core::ToolFailureEvidence::from_error_kind(
+                        astra_core::ErrorKind::ToolInvalidArgs,
+                    ),
+                );
+                astra_tools::execution_outcome::insert_not_executed_fact(
+                    outcome.tool_result_fields.get_or_insert_default(),
+                );
+                return outcome;
             }
         };
-        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+        let requested_timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(120.0);
+        let timeout_secs = invocation
+            .command_timeout_cap_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .map_or(requested_timeout_secs, |cap| {
+                requested_timeout_secs.min(cap as f64 / 1_000.0)
+            });
 
         {
             let sp_guard = self
@@ -4596,60 +4607,147 @@ impl ToolExecutor {
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
-                    return msg;
-                }
-            }
-        }
-
-        match self.run_powershell_output(command, timeout_secs, cancel_token) {
-            Err(error) => error,
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-
-                if let Some(warning) = destructive_powershell_warning(command) {
-                    result.push_str(warning);
-                    result.push('\n');
-                }
-
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(&stderr);
-                }
-
-                let exit_code = out.status.code().unwrap_or(-1);
-                if result.is_empty() || result.trim().is_empty() {
-                    return if out.status.success() {
-                        "(no output)".to_string()
-                    } else {
-                        empty_nonzero_exit_output(command, exit_code)
+                    let message = msg.strip_prefix(SANDBOX_DENIED_PREFIX).unwrap_or(&msg);
+                    let mut fields =
+                        crate::sandbox_retry::sandbox_denied_tool_result_fields(message);
+                    astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+                    fields.insert("side_effects_maybe".into(), json!(false));
+                    return super::ToolExecutionOutcome {
+                        output: format!("Error: {message}"),
+                        tool_result_fields: Some(fields),
+                        is_error: true,
                     };
                 }
-
-                result =
-                    astra_text_utils::credential_redaction::redact_credentials_for_display(&result)
-                        .0;
-
-                let limit = self.scaled_output_limit();
-                if result.len() > limit {
-                    result = astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result, limit,
-                    );
-                }
-
-                if !out.status.success() {
-                    result.push_str(&format!("\n(exit code {exit_code})"));
-                }
-
-                result
             }
         }
+
+        let Some(deadline) = Duration::try_from_secs_f64(timeout_secs)
+            .ok()
+            .and_then(|timeout| std::time::Instant::now().checked_add(timeout))
+        else {
+            return powershell_execution_error(ShellRunError {
+                kind: astra_core::ErrorKind::ToolInvalidArgs,
+                ..ShellRunError::new("Error: invalid shell timeout; no process was started")
+            });
+        };
+        let mut last_missing = None;
+        for program in ["pwsh", "powershell"] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return powershell_execution_error(ShellRunError {
+                    kind: astra_core::ErrorKind::ToolTimeout,
+                    ..ShellRunError::new(
+                        "Error: the command timeout expired; no process was started",
+                    )
+                });
+            }
+            let config = self.shell_run_config(
+                program,
+                "-Command",
+                command,
+                timeout_secs,
+                false,
+                cancel_token,
+            );
+            match run_shell_output_with_config(
+                config,
+                invocation.admission_deadline,
+                Some(deadline),
+            ) {
+                Ok(scoped) => return self.render_powershell_output(command, scoped),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::ToolNotFound
+                        && !error.execution_started =>
+                {
+                    last_missing = Some(error.message);
+                    continue;
+                }
+                Err(error) => {
+                    if error.kind == astra_core::ErrorKind::BudgetExhausted
+                        && let Some(outcome) =
+                            bash_admission_deadline_outcome(invocation.admission_deadline)
+                    {
+                        return outcome;
+                    }
+                    return powershell_execution_error(error);
+                }
+            }
+        }
+        powershell_execution_error(ShellRunError::new(format!(
+            "Error: unable to start PowerShell. Check that 'pwsh' or 'powershell' and the working directory are available. {}",
+            last_missing.unwrap_or_default()
+        )))
+    }
+
+    fn render_powershell_output(
+        &self,
+        command: &str,
+        scoped: ScopedShellOutput,
+    ) -> super::ToolExecutionOutcome {
+        let out = scoped.output;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut result = String::new();
+
+        if let Some(warning) = destructive_powershell_warning(command) {
+            result.push_str(warning);
+            result.push('\n');
+        }
+
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+
+        let exit_code = out.status.code().unwrap_or(-1);
+        if result.is_empty() || result.trim().is_empty() {
+            result = if out.status.success() {
+                "(no output)".to_string()
+            } else {
+                empty_nonzero_exit_output(command, exit_code)
+            };
+        } else {
+            result =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
+
+            let limit = self.scaled_output_limit();
+            if result.len() > limit {
+                result =
+                    astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
+            }
+
+            if !out.status.success() {
+                result.push_str(&format!("\n(exit code {exit_code})"));
+            }
+        }
+        let mut outcome = if out.status.success() {
+            super::ToolExecutionOutcome::ok(result)
+        } else {
+            super::ToolExecutionOutcome::error(result)
+        };
+        let fields = outcome.tool_result_fields.get_or_insert_default();
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        fields.insert("exit_code".into(), json!(exit_code));
+        fields.insert(
+            "cleanup_authoritative".into(),
+            json!(
+                scoped
+                    .scope_ownership
+                    .is_some_and(|owner| owner.is_authoritative())
+            ),
+        );
+        if outcome.is_error {
+            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
+            fields.insert("retryable".into(), json!(evidence.retryable));
+            fields.insert("recovery_evidence".into(), json!(evidence));
+        }
+        outcome
     }
 
     pub(crate) async fn grep(
@@ -4658,11 +4756,9 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> astra_tools::ToolResult {
         let requested = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = match self.resolve_checked(requested) {
+        let path = match self.resolve_checked_result(requested) {
             Ok(path) => path,
-            Err(error) => {
-                return astra_tools::ToolResult::error(error).with_execution_not_started();
-            }
+            Err(error) => return error.into_tool_result().with_execution_not_started(),
         };
         let mut context = self.default_executor.context().clone();
         let root = self.effective_project_root();
@@ -4675,6 +4771,40 @@ impl ToolExecutor {
     }
 }
 
+fn powershell_execution_error(error: ShellRunError) -> super::ToolExecutionOutcome {
+    let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(error.kind);
+    if error.execution_started {
+        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
+        evidence.retryable = false;
+        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
+    }
+    let mut outcome = super::ToolExecutionOutcome::error_with_evidence(error.message, evidence);
+    let fields = outcome.tool_result_fields.get_or_insert_default();
+    if error.execution_started {
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
+        fields.insert("cleanup_unsettled".into(), json!(error.ownership_unsettled));
+        fields.insert(
+            "cleanup_authoritative".into(),
+            json!(
+                error
+                    .scope_ownership
+                    .is_some_and(|owner| owner.is_authoritative())
+            ),
+        );
+    } else {
+        astra_tools::execution_outcome::insert_not_executed_fact(fields);
+        fields.insert("side_effects_maybe".into(), json!(false));
+    }
+    if error.kind == astra_core::ErrorKind::Cancelled {
+        fields.insert("cancelled".into(), json!(true));
+    }
+    if error.kind == astra_core::ErrorKind::ToolTimeout {
+        fields.insert("timed_out".into(), json!(true));
+    }
+    outcome
+}
+
 fn finish_bash_ownership(
     mut outcome: super::ToolExecutionOutcome,
     ownership_unsettled: bool,
@@ -4685,10 +4815,8 @@ fn finish_bash_ownership(
         let fields = outcome
             .tool_result_fields
             .get_or_insert_with(Default::default);
-        fields.insert("execution_fact".into(), json!("unknown"));
+        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
         fields.insert("cleanup_unsettled".into(), json!(true));
-        fields.insert("side_effects_maybe".into(), json!(true));
-        fields.insert("retryable".into(), json!(false));
     }
     outcome
 }
@@ -4809,7 +4937,7 @@ impl BashOutputRenderer {
                 );
             } else {
                 outcome.output.push_str(
-                    " Managed background services are unavailable. Keep bounded work and its dependent checks in the same foreground call.",
+                    " Environment-lifetime services are unavailable. For future commands, when task controls are available, run the service in the foreground and use yield_time_ms; inspect or stop the retained task with task_output or task_stop while the executor remains active.",
                 );
             }
         }
@@ -4856,7 +4984,7 @@ mod tests {
     use super::{
         check_bash_path_boundary, check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
-        destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
+        destructive_powershell_warning, forbidden_name_based_process_kill,
     };
     use std::time::Duration;
 
@@ -4902,7 +5030,9 @@ mod tests {
         let mut config =
             executor.shell_run_config("bash", "-c", "head -c 8388608 /dev/zero", 5.0, true, None);
         config.discard_output = true;
-        let output = super::run_shell_output_with_config(config).unwrap().output;
+        let output = super::run_shell_output_with_config(config, None, None)
+            .unwrap()
+            .output;
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
@@ -6795,13 +6925,165 @@ mod tests {
     fn powershell_missing_command_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.powershell(&serde_json::json!({}));
-        assert!(result.contains("Error"), "got: {result}");
+        let result =
+            executor.powershell_with_cancel(&serde_json::json!({}), None, Default::default());
+        assert!(result.is_error, "got: {result:?}");
+        assert!(result.output.contains("Error"), "got: {result:?}");
         assert!(
-            result.contains("Origin: model_argument_error"),
-            "got: {result}"
+            result.output.contains("Origin: model_argument_error"),
+            "got: {result:?}"
         );
-        assert!(result.contains("no command was run"), "got: {result}");
+        assert!(
+            result.output.contains("no command was run"),
+            "got: {result:?}"
+        );
+        assert_eq!(
+            result.tool_result_fields.unwrap()["execution_fact"],
+            "not_executed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_status_uses_process_exit_instead_of_stdout_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        for (script, expected_error, expected_code) in [
+            ("printf 'Error: ordinary data'; exit 0", false, 0),
+            ("printf 'ordinary data'; exit 7", true, 7),
+        ] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", script])
+                .output()
+                .unwrap();
+            let result = executor.render_powershell_output(
+                "test",
+                super::ScopedShellOutput {
+                    output,
+                    scope_ownership: None,
+                    descendants_terminated: false,
+                },
+            );
+            assert_eq!(result.is_error, expected_error, "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["execution_fact"], "executed");
+            assert_eq!(fields["exit_code"], expected_code);
+            assert_eq!(fields["cleanup_authoritative"], false);
+        }
+    }
+
+    #[test]
+    fn powershell_interrupted_execution_retains_unknown_effects() {
+        for kind in [
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::ToolTimeout,
+        ] {
+            let outcome =
+                super::powershell_execution_error(super::ShellRunError::after_process_started(
+                    "interrupted after execution started",
+                    kind,
+                    None,
+                ));
+            assert!(outcome.is_error);
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], kind.as_str());
+            assert_eq!(fields["execution_started"], true);
+            assert_eq!(fields["execution_fact"], "unknown");
+            assert_eq!(fields["side_effects_maybe"], true);
+            assert_eq!(fields["retryable"], false);
+            assert_eq!(fields["cleanup_authoritative"], false);
+            assert_eq!(fields["recovery_evidence"]["cause"], "outcome_unknown");
+            assert_eq!(
+                fields["recovery_evidence"]["recovery_actions"],
+                serde_json::json!(["reconcile_outcome"])
+            );
+        }
+    }
+
+    #[test]
+    fn shell_cancellation_before_spawn_is_not_an_unavailable_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let config = executor.shell_run_config("bash", "-c", "echo test", 1.0, true, Some(&cancel));
+        let error = match super::prepare_shell_process(&config) {
+            Ok(_) => panic!("cancelled execution must not start"),
+            Err(error) => error,
+        };
+        let outcome = super::powershell_execution_error(error);
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["side_effects_maybe"], false);
+
+        let outcome = executor.powershell_with_cancel(
+            &serde_json::json!({"command":"Write-Output test"}),
+            Some(&cancel),
+            Default::default(),
+        );
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["execution_fact"], "not_executed");
+    }
+
+    #[test]
+    fn powershell_checks_admission_deadline_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let outcome = executor.powershell_with_cancel(
+            &serde_json::json!({"command":"Write-Output test"}),
+            None,
+            astra_tools::tool_engine::ToolInvocationMetadata {
+                admission_deadline: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        assert!(outcome.is_error);
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "budget_exhausted");
+        assert_eq!(fields["execution_started"], false);
+    }
+
+    #[test]
+    fn shell_invalid_timeout_is_rejected_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let config = executor.shell_run_config("bash", "-c", "echo test", -1.0, true, None);
+        let error = match super::run_shell_output_with_config(config, None, None) {
+            Ok(_) => panic!("negative timeout must be rejected"),
+            Err(error) => error,
+        };
+        let result = super::powershell_execution_error(error);
+        let fields = result.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "tool_invalid_args");
+        assert_eq!(fields["execution_fact"], "not_executed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_missing_program_is_known_not_to_have_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let missing = dir.path().join("nonexistent-program");
+        let mut config = executor.shell_run_config(
+            missing.to_str().unwrap(),
+            "-c",
+            "echo test",
+            5.0,
+            true,
+            None,
+        );
+        #[cfg(target_os = "linux")]
+        {
+            config.supervisor_test_helper = None;
+        }
+        let error = match super::run_shell_output_with_config(config, None, None) {
+            Ok(_) => panic!("missing program must not start"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ToolNotFound);
+        assert!(!error.execution_started);
     }
 
     #[test]
@@ -6819,30 +7101,41 @@ mod tests {
         assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
     }
 
+    #[cfg(windows)]
     #[test]
     fn powershell_echo_returns_output_when_available() {
-        let Some(_) = find_powershell_program() else {
-            return;
-        };
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.powershell(&serde_json::json!({
-            "command": "Write-Output hello"
-        }));
-        assert!(result.contains("hello"), "got: {result}");
+        let result = executor.powershell_with_cancel(
+            &serde_json::json!({
+                "command": "Write-Output hello"
+            }),
+            None,
+            Default::default(),
+        );
+        if result.is_error
+            && result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                == Some(&serde_json::json!("tool_unavailable"))
+        {
+            return;
+        }
+        assert!(!result.is_error, "got: {result:?}");
+        assert!(result.output.contains("hello"), "got: {result:?}");
     }
 
     #[test]
     fn list_dir_outside_project_sandbox_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.list_dir(&serde_json::json!({"path": "/etc"}));
+        let result =
+            executor.list_dir(&serde_json::json!({"path": "/var/astra-sandbox-test-nonexistent"}));
         assert!(result.is_error);
-        assert!(
-            result.output.contains("SANDBOX_DENIED") || result.output.contains("Sandbox"),
-            "list_dir outside project should be blocked: {result:?}"
-        );
-        assert_eq!(result.metadata.unwrap()["disposition"], "rejected");
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["error_kind"], "sandbox_denied");
+        assert_eq!(fields["execution_fact"], "not_executed");
     }
 
     // ── str_replace diff preview ─────────────────────────────────────────────
@@ -8433,9 +8726,39 @@ mod tests {
             );
         }
         // safe commands
-        for cmd in ["git status", "ls -la", "cargo test"] {
+        for cmd in [
+            "git status",
+            "ls -la",
+            "cargo test",
+            "rm -rf /tmp/test-data",
+        ] {
             assert!(destructive_command_warning(cmd).is_none(), "safe: {cmd}");
         }
+        assert!(check_dangerous_command("rm -rf /").is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reaped_children_hint_distinguishes_retained_tasks_from_services() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let renderer = super::BashOutputRenderer {
+            output_limit: 4096,
+            read_only_execution: false,
+        };
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let (result, _) = renderer.render_bash_outcome("true", output, true);
+        assert!(
+            result
+                .output
+                .contains("Environment-lifetime services are unavailable")
+        );
+        assert!(result.output.contains("yield_time_ms"));
+        assert!(result.output.contains("task_output or task_stop"));
     }
 
     #[test]

@@ -60,6 +60,7 @@ const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const CLOUD_SYNC_WARNING_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
 const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
@@ -3496,10 +3497,79 @@ fn recover_queued_followups_after_cancelled_read(
 
 fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Option<TuiAppEvent> {
     match event {
+        TuiAppEvent::CloudSyncAccessBlocked(snapshot) => {
+            if snapshot.is_current()
+                && crate::cli::cloud_sync::sync_cloud_access_is_blocked(&snapshot)
+            {
+                let report = crate::cli::cloud_sync::SyncOutboxDrainReport {
+                    blocker: Some(
+                        crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired,
+                    ),
+                    ..Default::default()
+                };
+                report.user_notice().map(TuiAppEvent::SystemWarning)
+            } else {
+                None
+            }
+        }
+        TuiAppEvent::CloudSyncIssue(owner) => {
+            (owner == astra_services::local_owner_scope()).then(|| {
+                TuiAppEvent::SystemWarning(
+                    "Cloud sync needs attention. Run `astra doctor` for details.".to_string(),
+                )
+            })
+        }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
         }
         event => Some(event),
+    }
+}
+
+async fn forward_sync_warnings(
+    mut source: tokio::sync::watch::Receiver<
+        Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    >,
+    mut terminal: tokio::sync::broadcast::Receiver<astra_services::OwnerScope>,
+    output: tokio::sync::mpsc::Sender<TuiAppEvent>,
+) {
+    let mut last_terminal = None;
+    loop {
+        let blocked = source.borrow_and_update().clone();
+        if let Some(snapshot) = blocked
+            && output
+                .send(TuiAppEvent::CloudSyncAccessBlocked(snapshot))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        loop {
+            tokio::select! {
+                changed = source.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                event = terminal.recv() => match event {
+                    Ok(owner) => {
+                        let now = tokio::time::Instant::now();
+                        if last_terminal.as_ref().is_none_or(|(previous, at)| {
+                            previous != &owner || now.duration_since(*at) >= CLOUD_SYNC_WARNING_REPEAT_INTERVAL
+                        }) {
+                            last_terminal = Some((owner.clone(), now));
+                            if output.send(TuiAppEvent::CloudSyncIssue(owner)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                _ = output.closed() => return,
+            }
+        }
     }
 }
 
@@ -3976,6 +4046,9 @@ impl GuidanceSubmissionError {
             {
                 Self::Rejected(astra_thin_client::ThinClientError::Api { status, body }.to_string())
             }
+            error @ astra_thin_client::ThinClientError::SyncOutboxBackpressure {
+                status, ..
+            } if status.is_client_error() => Self::Rejected(error.to_string()),
             astra_thin_client::ThinClientError::InvalidBaseUrl(_)
             | astra_thin_client::ThinClientError::InvalidAuthHeader
             | astra_thin_client::ThinClientError::InvalidInput(_)
@@ -3987,6 +4060,7 @@ impl GuidanceSubmissionError {
             // idempotent durable insert. Conservatively retain ownership
             // ambiguity and reconcile by intent_id.
             astra_thin_client::ThinClientError::Http(_)
+            | astra_thin_client::ThinClientError::SyncOutboxBackpressure { .. }
             | astra_thin_client::ThinClientError::Api { .. }
             | astra_thin_client::ThinClientError::Json(_)
             | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
@@ -4008,23 +4082,61 @@ async fn submit_active_runtime_notification(
             Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
         >,
     >,
-    content: &str,
+    notification: &crate::cli::turn::local_run_control::RuntimeNotification,
 ) -> Result<(), String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| "active run control is settling".to_string())?;
-    provider.accept_runtime_notification(content)
+    provider.accept_runtime_notification(notification.clone())
 }
 
-fn background_task_event_requires_model_attention(
+fn background_task_notification(
+    registry: &crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     event: &crate::edge_tools::background_tasks::BgTaskEvent,
-) -> bool {
-    matches!(
-        event,
-        crate::edge_tools::background_tasks::BgTaskEvent::Completed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Failed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Killed { .. }
-    )
+) -> Option<crate::cli::turn::local_run_control::RuntimeNotification> {
+    let mut content = crate::edge_tools::background_tasks::format_notification_xml(event);
+    if content.is_empty() {
+        return None;
+    }
+    let terminal_id = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Killed { id, .. } => Some(id),
+        _ => None,
+    };
+    if let Some(execution) = terminal_id
+        .and_then(|id| registry.model_context(id))
+        .and_then(|context| {
+            context
+                .get("execution")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+        })
+    {
+        if astra_tools::execution_outcome::outcome_is_unknown(Some(&execution)) {
+            content.push_str("\nExecution outcome is unknown and may have side effects; inspect state before retrying.");
+        }
+        if execution
+            .get("cleanup_unconfirmed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            content.push_str("\nProcess cleanup is unconfirmed.");
+        }
+    }
+    let complete_shell = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+            if registry.terminal_notification_is_complete(id) =>
+        {
+            Some(id.clone())
+        }
+        _ => None,
+    };
+    Some(crate::cli::turn::local_run_control::RuntimeNotification {
+        content,
+        complete_shell,
+    })
 }
 
 /// Service tool-to-workbench background commands in every event-loop phase.
@@ -8601,15 +8713,35 @@ fn enqueue_approval_request(
 }
 
 fn surface_tui_file_write_errors(
-    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteError>,
+    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteEvent>,
     reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
     state: &mut crate::cli::session::session_state::SessionState,
     chat_widget: &mut chat_widget::ChatWidget,
     frame_requester: &FrameRequester,
 ) {
-    while let Ok(error) = errors.try_recv() {
+    while let Ok(event) = errors.try_recv() {
+        let error = match event {
+            super::file_writer::TuiFileWriteEvent::Failed(error) => {
+                if !error.path.as_os_str().is_empty() {
+                    state.session_persistence_error = Some(error.user_message());
+                }
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionFailed { kind, error } => {
+                state
+                    .background_persistence_errors
+                    .insert((kind.label(), error.path.clone()), error.user_message());
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionRecovered { kind, path } => {
+                state
+                    .background_persistence_errors
+                    .remove(&(kind.label(), path.clone()));
+                reported.retain(|error| error.target != kind.label() || error.path != path);
+                continue;
+            }
+        };
         let detail = error.user_message();
-        state.session_persistence_error = Some(detail.clone());
         if reported.insert(error) {
             chat_widget.commit_ephemeral_warning(format!(
                 "Local persistence degraded · {detail}. Conversation continues; resume/history may be stale."
@@ -8617,6 +8749,12 @@ fn surface_tui_file_write_errors(
             frame_requester.schedule_frame();
         }
     }
+}
+
+fn reset_unbound_persistence_warnings(
+    reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
+) {
+    reported.retain(|error| !error.path.as_os_str().is_empty());
 }
 
 /// Replay a session's canonical root journal transcript into a fresh
@@ -8803,6 +8941,11 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    let sync_access_observer = tokio::spawn(forward_sync_warnings(
+        crate::cli::cloud_sync::subscribe_sync_cloud_access(),
+        crate::cli::cloud_sync::subscribe_sync_issues(),
+        tui_tx.clone(),
+    ));
     if let Ok(executable) = std::env::current_exe() {
         let update_tx = tui_tx.clone();
         astra_core::client_installation::startup_notice(&executable, move |notice| {
@@ -8859,6 +9002,15 @@ pub(crate) async fn run_tui_session(
     let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
+    {
+        let owner = astra_services::local_owner_scope();
+        startup_observation_tasks.push(tokio::spawn(async move {
+            match crate::cli::cloud_sync::read_sync_outbox_status_for_owner(&owner).await {
+                Ok(status) if crate::cli::cloud_sync::terminal_sync_items(&status) == 0 => {}
+                _ => crate::cli::cloud_sync::notify_sync_issue(&owner),
+            }
+        }));
+    }
     {
         let startup_effect_tx = startup_effect_tx.clone();
         startup_observation_tasks.push(tokio::spawn(async move {
@@ -9394,7 +9546,11 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        loop_try!(auth_flow::begin_browser_session_login(&mut state).await);
+                        if let Err(error) = auth_flow::begin_browser_session_login(&mut state).await {
+                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                            frame_requester.schedule_frame();
+                            continue 'main;
+                        }
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -9470,7 +9626,8 @@ pub(crate) async fn run_tui_session(
                                 plan_task_projection_sequence = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Signed in. Use /model to select or configure your model."));
                                 let report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                if let Some(notice) = report.user_notice() {
+                                if report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                    && let Some(notice) = report.user_notice() {
                                     chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
                                 }
                                 if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane, &mut chat_widget).await {
@@ -9664,7 +9821,7 @@ pub(crate) async fn run_tui_session(
                                     "work_id": work_id,
                                     "action": "inspect the canonical Work plan, establish a useful task graph when the goal has multiple verifiable steps, and continue the Work"
                                 })
-                                .to_string(),
+                                .to_string().into(),
                             );
                             schedule_runtime_notification_wake(
                                 &mut runtime_notification_wake_at,
@@ -9853,6 +10010,36 @@ pub(crate) async fn run_tui_session(
                     ),
                     event => event,
                 };
+                // Retry only after a user submission, and only when a
+                // previous background projection write failed. Do not turn
+                // persistence recovery into per-session polling.
+                let retry_background_write = !runtime_notification_event
+                    && !state.background_persistence_errors.is_empty()
+                    && state.session_id == background_registry_session_id
+                    && *background_registry.owner_scope() == astra_services::local_owner_scope()
+                    && (matches!(&ev, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Enter)
+                        || matches!(&ev, TuiEvent::QueuedSubmission(_)));
+                if retry_background_write {
+                    persist_background_task_projections_if_changed(
+                        &mut background_registry,
+                        background_registry_session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_task_projection_cache,
+                        Some(&file_writer),
+                    )
+                    .await;
+                    restored_local_agent_task_projections =
+                        persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
+                        )
+                        .await;
+                }
                 match ev {
                     event @ (TuiEvent::Key(_) | TuiEvent::QueuedSubmission(_)) => {
                         let runtime_notification_submission =
@@ -11073,12 +11260,6 @@ pub(crate) async fn run_tui_session(
                                                                     );
                                                                 }
                                                             }
-                                                            chat_widget.commit_concurrent_system(
-                                                                history_cell::system::SystemCell::runtime_control(
-                                                                    "Message received · waiting to take effect."
-                                                                        .to_string(),
-                                                                ),
-                                                            );
                                                         }
                                                         Err(GuidanceSubmissionError::Rejected(error)) => {
                                                             preinstalled_run_control.release_remote_user_intent_submission(
@@ -12284,26 +12465,30 @@ pub(crate) async fn run_tui_session(
                                                                     update.receipt,
                                                                 ),
                                                             );
-                                                            if let Some(notification) = update.notification
-                                                                && submit_active_runtime_notification(
+                                                            if let Some(notification) = update.notification {
+                                                                let notification = notification.into();
+                                                                if submit_active_runtime_notification(
                                                                     &active_turn_local_run_control,
                                                                     &notification,
                                                                 )
                                                                 .await
                                                                 .is_err()
-                                                            {
-                                                                deferred_active_bg_notifications
-                                                                    .push(notification);
+                                                                {
+                                                                    deferred_active_bg_notifications
+                                                                        .push(notification);
+                                                                }
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
                                                         restored_local_agent_task_projections =
                                                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                                                background_registry.owner_scope(),
                                                                 &local_agent_snapshot,
                                                                 &restored_local_agent_task_projections,
                                                                 background_registry_turn_session_id.as_deref(),
                                                                 background_registry_turn_model.as_deref(),
                                                                 &mut background_local_agent_projection_cache,
+                                                                Some(&file_writer),
                                                             )
                                                             .await;
                                                         let changed = chat_widget
@@ -12330,14 +12515,9 @@ pub(crate) async fn run_tui_session(
                                                     // the next turn instead of fabricating user input.
                                                     let bg_events = background_registry.poll_completions();
                                                     for event in &bg_events {
-                                                        if !background_task_event_requires_model_attention(event) {
+                                                        let Some(notification) = background_task_notification(&background_registry, event) else {
                                                             continue;
-                                                        }
-                                                        let notification =
-                                                            crate::edge_tools::background_tasks::format_notification_xml(event);
-                                                        if notification.is_empty() {
-                                                            continue;
-                                                        }
+                                                        };
                                                         let delivered = output_settled_at.is_none()
                                                             && submit_active_runtime_notification(
                                                                 &active_turn_local_run_control,
@@ -12363,6 +12543,7 @@ pub(crate) async fn run_tui_session(
                                                             background_registry_turn_session_id.as_deref(),
                                                             background_registry_turn_model.as_deref(),
                                                             &mut background_task_projection_cache,
+                                                            Some(&file_writer),
                                                         )
                                                         .await;
                                                     }
@@ -12458,7 +12639,7 @@ pub(crate) async fn run_tui_session(
                                             pending_runtime_notifications.retain(|notification| {
                                                 settled_agent_snapshot
                                                     .notification_still_requires_reconciliation(
-                                                        notification,
+                                                        &notification.content,
                                                     )
                                             });
                                         }
@@ -12932,7 +13113,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -12987,7 +13169,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -13716,9 +13899,12 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                if state.session_id != background_registry_session_id {
+                let background_owner_changed =
+                    *background_registry.owner_scope() != astra_services::local_owner_scope();
+                if state.session_id != background_registry_session_id || background_owner_changed {
+                    reset_unbound_persistence_warnings(&mut reported_file_write_errors);
                     next_background_surface_refresh = std::time::Instant::now();
-                    let first_session_binding = is_initial_session_binding(
+                    let first_session_binding = !background_owner_changed && is_initial_session_binding(
                         background_registry_session_id.as_deref(),
                         state.session_id.as_deref(),
                     );
@@ -13752,15 +13938,18 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         restored_local_agent_task_projections =
                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &local_agent_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                     } else {
@@ -13769,14 +13958,17 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         if reset_agent_scope
@@ -13788,11 +13980,13 @@ pub(crate) async fn run_tui_session(
                                 .await
                         {
                             let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &retired_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                         }
@@ -13807,6 +14001,7 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         state.background_tasks = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(background_task_output_dir(state.session_id.as_deref()));
@@ -13947,16 +14142,18 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                     if !agent_notifications.is_empty() {
-                        state.pending_bg_notifications.extend(agent_notifications);
+                        state.pending_bg_notifications.extend(agent_notifications.into_iter().map(Into::into));
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
                     restored_local_agent_task_projections =
                         persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             state.session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
@@ -13975,11 +14172,7 @@ pub(crate) async fn run_tui_session(
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
-                    if !background_task_event_requires_model_attention(ev) {
-                        continue;
-                    }
-                    let notification = crate::edge_tools::background_tasks::format_notification_xml(ev);
-                    if !notification.is_empty() {
+                    if let Some(notification) = background_task_notification(&background_registry, ev) {
                         state.pending_bg_notifications.push(notification);
                     }
                 }
@@ -14021,6 +14214,7 @@ pub(crate) async fn run_tui_session(
                         state.session_id.as_deref(),
                         state.model.as_deref(),
                         &mut background_task_projection_cache,
+                        Some(&file_writer),
                     )
                     .await;
                 }
@@ -14193,6 +14387,8 @@ pub(crate) async fn run_tui_session(
     while model_setup_tasks.join_next().await.is_some() {}
     login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
+    sync_access_observer.abort();
+    let _ = sync_access_observer.await;
     for task in startup_observation_tasks {
         task.abort();
         let _ = task.await;
@@ -14208,6 +14404,7 @@ pub(crate) async fn run_tui_session(
         state.session_id.as_deref(),
         state.model.as_deref(),
         &mut background_task_projection_cache,
+        Some(&file_writer),
     )
     .await;
     match tokio::time::timeout(Duration::from_secs(2), file_writer_runtime.shutdown()).await {
@@ -14405,6 +14602,8 @@ fn handle_app_event(
         | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
+        | TuiAppEvent::CloudSyncAccessBlocked(_)
+        | TuiAppEvent::CloudSyncIssue(_)
         | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
@@ -14480,6 +14679,82 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn background_failure_acknowledges_only_a_complete_settled_notification() {
+        use crate::cli::turn::local_run_control::LocalRunControl;
+        use crate::edge_tools::background_tasks::{BackgroundTaskRegistry, BgTaskEvent};
+        use astra_tools::execution_outcome::ToolExecutionOutcome;
+
+        for (output, unknown, complete) in [
+            ("short failure".to_string(), false, true),
+            ("x".repeat(4096), false, false),
+            ("outcome unavailable".to_string(), true, false),
+        ] {
+            let dir = crate::tests::test_temp_dir();
+            let mut registry = BackgroundTaskRegistry::new(dir.path().to_path_buf());
+            let mut task = registry
+                .start_shell(
+                    "test command",
+                    (dir.path().join("out"), dir.path().join("err"), None),
+                    true,
+                    false,
+                    None,
+                    move |_, _| async move {
+                        let mut result = ToolExecutionOutcome::error(output);
+                        if unknown {
+                            result.tool_result_fields = Some(serde_json::Map::from_iter([(
+                                "execution_fact".into(),
+                                serde_json::json!("unknown"),
+                            )]));
+                        }
+                        result
+                    },
+                )
+                .unwrap();
+            task.wait().await.unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(event) = registry
+                        .poll_completions()
+                        .into_iter()
+                        .find(|event| matches!(event, BgTaskEvent::Failed { .. }))
+                    {
+                        break event;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let notification = super::background_task_notification(&registry, &event).unwrap();
+            assert_eq!(notification.complete_shell.is_some(), complete);
+            if unknown {
+                assert!(notification.content.contains("outcome is unknown"));
+                assert!(notification.content.contains("cleanup is unconfirmed"));
+            }
+            let control = LocalRunControl::shared();
+            control.accept_runtime_notification(notification).unwrap();
+            assert_eq!(control.runtime_notifications_for_request().len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+
+            // A failed turn returns its request facts to the next turn.
+            let pending = control.take_pending_runtime_notifications();
+            assert_eq!(pending.len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+            control
+                .accept_runtime_notification(pending[0].clone())
+                .unwrap();
+            control.runtime_notifications_for_request();
+            for settled in control.commit_applied_runtime_notifications() {
+                settled.acknowledge(&registry);
+            }
+            assert_eq!(
+                registry.get(&task.id).unwrap().terminal_unobserved(),
+                !complete
+            );
+        }
+    }
+
     #[test]
     fn runtime_dependency_approval_uses_live_attachment_after_turn_binding() {
         use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse};
@@ -21229,6 +21504,7 @@ mod tests {
             registry
                 .restore_shell_task_projection(
                     astra_services::session_workspace::BackgroundShellTaskProjection {
+                        terminal_facts: None,
                         id: "bg-shell-missing".into(),
                         status: "completed".into(),
                         title: "restored output".into(),
@@ -21271,6 +21547,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),
@@ -21328,6 +21605,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-persist".into(),
                     status: "completed".into(),
                     title: "cargo test".into(),
@@ -21347,6 +21625,7 @@ mod tests {
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
         workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
@@ -21372,6 +21651,7 @@ mod tests {
             Some("main"),
         );
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
+        let captured_owner = astra_services::OwnerScope::user("captured-agent-owner").unwrap();
 
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let input = SpawnAgentInput {
@@ -21387,14 +21667,27 @@ mod tests {
 
         let mut cache = Vec::new();
         let projections = persist_background_local_agent_task_projections_if_changed(
+            &captured_owner,
             Some(&spawner),
             &[],
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
-        let workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        let workspace = astra_services::session_workspace::read_workspace_optional_for_owner(
+            &captured_owner,
+            session_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            astra_services::session_workspace::read_workspace(session_id)
+                .unwrap()
+                .background_local_agent_tasks
+                .is_empty()
+        );
 
         assert_eq!(workspace.background_local_agent_tasks.len(), 1);
         assert_eq!(workspace.background_local_agent_tasks[0].id, agent_id);
@@ -21530,6 +21823,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),
@@ -21554,7 +21848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
+    async fn background_task_switcher_can_open_after_failure_event_is_polled() {
         let temp = crate::tests::test_temp_dir();
         let mut completed_registry =
             crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
@@ -21602,7 +21896,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            open_background_task_view(
+            !open_background_task_view(
                 &mut failed_registry,
                 None,
                 &[],
@@ -21610,7 +21904,18 @@ mod tests {
                 &FrameRequester::test_dummy(),
             )
             .await,
-            "failed background tasks must remain reachable from the background-task surface"
+            "a polled failure event no longer counts as pending UI attention"
+        );
+        assert!(
+            force_open_background_task_view(
+                &mut failed_registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "the user's task-panel action must still open retained failures"
         );
         assert!(bottom_pane.has_active_view());
     }
@@ -25102,8 +25407,12 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/transcript.jsonl"),
             message: "disk full".into(),
         };
-        tx.send(error.clone()).unwrap();
-        tx.send(error).unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            error.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(error))
+            .unwrap();
         let mut reported = std::collections::HashSet::new();
         let mut state = crate::cli::session::session_state::SessionState::default();
         let mut widget = chat_widget::ChatWidget::new("session-with-id");
@@ -25128,6 +25437,152 @@ mod tests {
         assert!(
             transcript.contains("Local persistence degraded"),
             "{transcript:?}"
+        );
+
+        let previous_error = state.session_persistence_error.clone();
+        let unbound = crate::tui::file_writer::TuiFileWriteError {
+            target: "Background task history",
+            path: std::path::PathBuf::new(),
+            message: "no session is bound yet".into(),
+        };
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            unbound.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(unbound))
+            .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
+        assert_eq!(
+            widget.history().len(),
+            2,
+            "provisional warnings are also deduplicated"
+        );
+        reset_unbound_persistence_warnings(&mut reported);
+        assert_eq!(reported.len(), 1, "real file errors stay deduplicated");
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            crate::tui::file_writer::TuiFileWriteError {
+                target: "Background task history",
+                path: std::path::PathBuf::new(),
+                message: "no session is bound yet".into(),
+            },
+        ))
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(
+            widget.history().len(),
+            3,
+            "a new unbound session must warn again"
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
+    }
+
+    #[test]
+    fn background_projection_errors_survive_other_turns_until_their_own_recovery() {
+        use crate::tui::file_writer::{
+            BackgroundProjectionKind, TuiFileWriteError, TuiFileWriteEvent,
+        };
+        use crate::tui::inspection::{InspectorFactStatus, inspect_workbench};
+        use astra_services::SessionArtifactStore;
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.session_id = Some("projection-recovery-test".into());
+        let path = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                state.background_tasks.owner_scope(),
+                state.session_id.as_deref().unwrap(),
+            )
+            .unwrap()
+            .join("workspace.yaml");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for kind in [
+            BackgroundProjectionKind::Shell,
+            BackgroundProjectionKind::Agent,
+        ] {
+            tx.send(TuiFileWriteEvent::ProjectionFailed {
+                kind,
+                error: TuiFileWriteError {
+                    target: kind.label(),
+                    path: path.clone(),
+                    message: "disk full".into(),
+                },
+            })
+            .unwrap();
+        }
+        let mut reported = std::collections::HashSet::new();
+        let mut widget = chat_widget::ChatWidget::new("projection-recovery-test");
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        state.session_persistence_error = None; // a later turn journal succeeds
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Shell,
+            path: path.clone(),
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Degraded);
+        assert!(fact.value.contains("Background agent history"));
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Background agent history"))
+        );
+
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Agent,
+            path,
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Observed);
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .is_none()
         );
     }
 
@@ -25518,7 +25973,6 @@ mod tests {
     fn startup_observations_update_presentation_without_creating_user_input() {
         let mut bottom_pane = BottomPane::new();
         let widget = chat_widget::ChatWidget::new("session-1");
-
         apply_startup_ui_effect(StartupUiEffect::GitBranch(None), &mut bottom_pane);
         apply_startup_ui_effect(
             StartupUiEffect::GitBranch(Some("feature/fast-start".into())),
@@ -25529,8 +25983,111 @@ mod tests {
             Some("feature/fast-start")
         );
         assert!(widget.history().is_empty());
+    }
 
-        assert!(widget.history().is_empty());
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_access_warning_is_checked_when_consumed_and_observer_exits_when_tui_closes() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = install_cli_profile_identity_for_test("a", Some("account-a")).unwrap();
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        let source = crate::cli::cloud_sync::subscribe_sync_cloud_access();
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
+        let (output, mut events) = tokio::sync::mpsc::channel(2);
+        let observer = tokio::spawn(forward_sync_warnings(source, terminal_rx, output));
+        let snapshot = cli_owner_auth_snapshot();
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accept_owned_tui_event(event, None),
+            Some(TuiAppEvent::SystemWarning(text)) if text.contains("/login")
+        ));
+        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accept_owned_tui_event(event, None),
+            Some(TuiAppEvent::SystemWarning(text)) if text.contains("astra doctor")
+        ));
+        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
+        let other_owner = astra_services::OwnerScope::user("different-owner").unwrap();
+        terminal_tx.send(other_owner.clone()).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next, TuiAppEvent::CloudSyncIssue(owner) if owner == other_owner));
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot.clone()), None)
+                .is_none()
+        );
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let _other = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
+        assert!(
+            accept_owned_tui_event(
+                TuiAppEvent::CloudSyncIssue(snapshot.owner_scope.clone()),
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot), None).is_none()
+        );
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        observer.abort();
+        let _ = observer.await;
+
+        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
+        let (output, events) = tokio::sync::mpsc::channel(1);
+        let observer = tokio::spawn(forward_sync_warnings(
+            access_rx,
+            crate::cli::cloud_sync::subscribe_sync_issues(),
+            output,
+        ));
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(2), observer)
+            .await
+            .expect("observer exits when the TUI is dropped")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_issue_warnings_do_not_stay_suppressed() {
+        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
+        let (output, mut events) = tokio::sync::mpsc::channel(2);
+        let observer = tokio::spawn(forward_sync_warnings(access_rx, terminal_rx, output));
+        let owner = astra_services::OwnerScope::user("account").unwrap();
+
+        terminal_tx.send(owner.clone()).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TuiAppEvent::CloudSyncIssue(_))
+        ));
+        terminal_tx.send(owner.clone()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .is_err()
+        );
+        tokio::time::advance(CLOUD_SYNC_WARNING_REPEAT_INTERVAL).await;
+        terminal_tx.send(owner).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TuiAppEvent::CloudSyncIssue(_))
+        ));
+
+        drop(events);
+        observer.await.unwrap();
     }
 
     #[test]

@@ -11,9 +11,10 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Settled reply bodies indent prose rows with plain spaces and carry no
-//! glyph marker; code-block rows stay verbatim at column 0, so text selected
-//! from native scrollback copies as written.
+//! Settled reply bodies indent every rendered row with the same two-column
+//! plain-space gutter the tool and summary cells use, and carry no glyph marker.
+//! Fenced code keeps its source line boundaries and indentation after that
+//! prefix; the native-scrollback rows themselves include the two gutter spaces.
 //! Live cells still use the active-slot wrapper for structure.
 //! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
@@ -675,13 +676,10 @@ impl AssistantCell {
     }
 }
 
-/// Decorate prose while retaining code-row semantics for the final writer.
-/// Settled code starts at column zero and uses terminal soft wrapping; live
-/// responses keep their distinct focus gutter supplied by `LiveFramedCell`.
+/// Add the plain two-column gutter to every settled row, including fenced code.
+/// Keep `verbatim` attached so code rows retain their source line boundaries.
 fn prefix_settled_row(mut row: MarkdownRow) -> MarkdownRow {
-    if !row.verbatim {
-        row.line.spans.insert(0, Span::raw("  "));
-    }
+    row.line.spans.insert(0, Span::raw("  "));
     row
 }
 
@@ -1271,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_single_line_command_reply_copies_without_glyphs() {
+    fn settled_single_line_command_reply_uses_spaces_not_glyphs() {
         for source in ["`git status`", "git status"] {
             let c = AssistantCell::from_markdown(source);
             let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
@@ -1286,11 +1284,38 @@ mod tests {
     }
 
     #[test]
-    fn settled_code_blocks_copy_verbatim_from_scrollback() {
-        // A heredoc terminator and indentation only survive a copy when the
-        // selected rows match the source exactly, so compare the whole block
-        // rather than trimmed rows.
+    fn settled_prose_and_fenced_code_share_the_plain_transcript_gutter() {
+        // Every settled row, including code, gets the two plain-space columns.
+        // Source indentation and code-row boundaries remain after that gutter.
+        let source = "Result:\n\n```sh\ncat <<'EOF'\n  indented\nEOF\n```\n\nDone.";
+        let c = AssistantCell::from_markdown(source);
+        let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
+        assert!(complete);
+        for lines in [
+            c.display_lines(80),
+            scrollback.into_iter().map(|row| row.line).collect(),
+        ] {
+            let text = line_text(&lines);
+            assert!(text.starts_with("  Result:"), "{text:?}");
+            assert!(
+                text.contains("\n  cat <<'EOF'\n    indented\n  EOF\n"),
+                "{text:?}"
+            );
+            assert!(text.ends_with("  Done."), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn settled_code_blocks_keep_source_after_the_plain_gutter() {
+        // Rendered scrollback includes the two-column gutter on each code row.
+        // After that prefix, source text, indentation, and row boundaries remain
+        // unchanged, including the heredoc terminator.
         let block = "cat <<'EOF'\n  indented\nEOF\ngit status";
+        let guttered_block = block
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for source in [
             format!("Run these:\n\n```\n{block}\n```\n\nThen `make lint`."),
             format!("```\n{block}\n```"),
@@ -1304,7 +1329,8 @@ mod tests {
             ] {
                 let text = line_text(&lines);
                 assert!(
-                    text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
+                    text.contains(&format!("\n{guttered_block}\n"))
+                        || text.ends_with(&format!("\n{guttered_block}")),
                     "{source:?} rendered {text:?}"
                 );
                 assert!(!text.contains('●'), "{text}");
@@ -1333,6 +1359,8 @@ mod tests {
 
         c.finalize();
         let settled = c.display_lines(80);
+        let text = line_text(&settled);
+        assert!(text.starts_with("  Result"), "{text:?}");
         assert!(settled.iter().all(|line| !line.spans.is_empty()));
         let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
         assert!(matches!(

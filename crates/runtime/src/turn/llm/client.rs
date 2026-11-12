@@ -44,10 +44,7 @@ use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
-use astra_turn_core::sse_data_lines::{
-    json_events_from_sse_event_block, validate_sse_event_block_json,
-    validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
-};
+use astra_turn_core::sse_data_lines::validated_sse_event;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_call_shape::tool_call_name;
@@ -1340,11 +1337,18 @@ async fn begin_observed_provider_attempt(
     };
     let mut retained_attempt = None;
     loop {
-        match observer.begin_attempt(wire, retained_attempt).await? {
+        match observer
+            .begin_attempt(wire, retained_attempt)
+            .await
+            .inspect_err(LlmAttemptSpan::note_error)?
+        {
             ProviderAttemptAdmission::Admitted(index) => return Ok(Some(index)),
             ProviderAttemptAdmission::Paused(index) => {
                 retained_attempt = Some(index);
-                observer.wait_for_retained_pause().await?;
+                observer
+                    .wait_for_retained_pause()
+                    .await
+                    .inspect_err(LlmAttemptSpan::note_error)?;
             }
         }
     }
@@ -1649,7 +1653,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     observer
         .finish_attempt(attempt_index, terminal)
         .await
-        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
+        .map_err(|error| {
+            crate::server::run_trace::note_attempt_settlement_error(error.kind.as_str());
+            attach_provider_terminal_evidence(error, terminal)
+        })
 }
 
 fn note_observed_provider_usage_presence(
@@ -1860,6 +1867,33 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PREPARATION_ERROR: Option<astra_core::ErrorKind>;
+}
+
+async fn await_subscription_credential<T>(
+    acquire: impl std::future::Future<
+        Output = Result<
+            T,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        >,
+    >,
+    remaining: std::time::Duration,
+    cancel: LlmCancel<'_>,
+) -> Result<T, astra_core::ClassifiedError> {
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(responses::error(astra_core::ErrorKind::Cancelled, "cancelled")),
+        value = tokio::time::timeout(remaining, acquire) => value
+            .map_err(|_| responses::error(astra_core::ErrorKind::ProviderDeadline, "credential_deadline"))
+            .and_then(|value| value.map_err(responses::credential_error)),
+    }.inspect_err(LlmAttemptSpan::note_error)
+}
+
 async fn prepare_compatible_endpoint(
     url: &str,
     remaining: std::time::Duration,
@@ -1875,7 +1909,13 @@ async fn prepare_compatible_endpoint(
         biased;
         _ = wait_llm_cancel(cancel) => Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::Cancelled, "LLM call cancelled")),
-        result = tokio::time::timeout(remaining, astra_services::byok_endpoint::endpoint_client(url)) => {
+        result = tokio::time::timeout(remaining, async {
+            #[cfg(test)]
+            if let Some(kind) = TEST_PREPARATION_ERROR.try_with(|kind| *kind).ok().flatten() {
+                return Err(astra_core::ClassifiedError::new(kind, "private fixture preparation failure"));
+            }
+            astra_services::byok_endpoint::endpoint_client(url).await
+        }) => {
             result.map_err(|_| astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ProviderDeadline, "LLM provider deadline reached while preparing the connection"))?
         }
@@ -5476,16 +5516,45 @@ async fn read_provider_error_body(
 struct LlmAttemptSpan {
     span: tracing::Span,
     failed: bool,
+    phase: &'static str,
+    reason: Option<&'static str>,
 }
 
 impl LlmAttemptSpan {
-    fn start() -> Self {
+    fn start(retry_attempt: u32) -> Self {
         crate::server::run_trace::clear_attempt_code();
-        let span = tracing::info_span!(target: "astra.llm", "llm.call");
+        let span = astra_logging::trace_context::llm_span(retry_attempt);
         crate::server::run_trace::parent_to_active_run(&span);
-        let entered = span.clone();
-        let _entered = entered.enter();
-        Self { span, failed: true }
+        Self {
+            span,
+            failed: true,
+            phase: "request",
+            reason: None,
+        }
+    }
+
+    fn received_response(&mut self, response: &reqwest::Response) {
+        self.span
+            .record("http.response.status_code", response.status().as_u16());
+        self.phase = "response_body";
+    }
+
+    fn begin_request(&mut self) {
+        crate::server::run_trace::clear_attempt_code();
+        self.phase = "request";
+    }
+
+    fn begin_admission(&mut self) {
+        crate::server::run_trace::clear_attempt_code();
+        self.phase = "admission";
+    }
+
+    fn note_error(error: &astra_core::ClassifiedError) {
+        crate::server::run_trace::note_attempt_code(error.kind.as_str());
+    }
+
+    fn transport_error(&mut self, error: &reqwest::Error) {
+        self.reason = Some(llm_transport_error_reason(error));
     }
 
     fn succeed(&mut self) {
@@ -5498,12 +5567,79 @@ impl Drop for LlmAttemptSpan {
     fn drop(&mut self) {
         if self.failed {
             let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            let (phase, reason) = match crate::server::run_trace::attempt_settlement_error() {
+                Some(code) => ("settlement", code),
+                None => (self.phase, self.reason.unwrap_or(code)),
+            };
+            self.span.record("error.phase", phase);
+            self.span.record("error.reason", reason);
             astra_logging::trace_context::mark_error(&self.span, code);
         }
     }
 }
 
-async fn call_prepared_llm_with_total_budget(
+// Inspect typed causes only. Error strings can contain credentials, URLs or
+// provider content, and are not a stable DNS/TLS classification contract.
+fn llm_transport_error_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "timeout";
+    }
+    if let Some(reason) = llm_io_error_reason(error) {
+        return reason;
+    }
+    if error.is_connect() {
+        "connect_error"
+    } else if error.is_builder() {
+        "request_build"
+    } else if error.is_decode() {
+        "decode_error"
+    } else if error.is_body() {
+        "body_error"
+    } else {
+        "transport_error"
+    }
+}
+
+fn llm_io_error_reason(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            let reason = match error.kind() {
+                ErrorKind::ConnectionRefused => Some("connection_refused"),
+                ErrorKind::ConnectionReset => Some("connection_reset"),
+                ErrorKind::ConnectionAborted => Some("connection_aborted"),
+                ErrorKind::BrokenPipe => Some("broken_pipe"),
+                ErrorKind::TimedOut => Some("timeout"),
+                ErrorKind::UnexpectedEof => Some("unexpected_eof"),
+                _ => None,
+            };
+            if reason.is_some() {
+                return reason;
+            }
+        }
+        cause = error.source();
+    }
+    None
+}
+
+fn call_prepared_llm_with_total_budget(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> impl std::future::Future<Output = Result<LlmCallResult, astra_core::ClassifiedError>> {
+    crate::server::run_trace::in_llm_call(call_prepared_llm_attempts(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    ))
+}
+
+async fn call_prepared_llm_attempts(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
@@ -5538,8 +5674,15 @@ async fn call_prepared_llm_with_total_budget(
             "subscription_route_mismatch",
         ));
     }
+    // Admission precedes the retry loop, but belongs to the first diagnostic
+    // span. Transfer that span into the loop without releasing the call's permit.
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
     let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
+    llm_attempt.phase = "preparation";
+    let mut first_span = Some(llm_attempt);
     let model_key = model_name;
     let cooldown = rate_limit_cooldown();
     let logical_total_budget = total_budget;
@@ -5566,7 +5709,8 @@ async fn call_prepared_llm_with_total_budget(
     let subscription_client = subscription
         .map(|binding| binding.http_client())
         .transpose()
-        .map_err(responses::credential_error)?;
+        .map_err(responses::credential_error)
+        .inspect_err(LlmAttemptSpan::note_error)?;
     let client = subscription_client
         .as_ref()
         .unwrap_or_else(|| global_llm_client());
@@ -5591,7 +5735,8 @@ async fn call_prepared_llm_with_total_budget(
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Cancelled,
                 "LLM call cancelled",
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         // Provider work deadline guard: abort if we've already spent too long across retries.
         if started.elapsed() >= total_budget {
@@ -5601,7 +5746,8 @@ async fn call_prepared_llm_with_total_budget(
                     "LLM provider work deadline reached ({:.0}s): {last_err}",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         if attempt > 0 {
             // A provider/cooldown hint owns the next delay when present.
@@ -5652,13 +5798,18 @@ async fn call_prepared_llm_with_total_budget(
                     "LLM provider work deadline reached ({:.0}s) before provider retry request",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
 
         // Every configured observer is wrapped by
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let mut llm_attempt = first_span
+            .take()
+            .unwrap_or_else(|| LlmAttemptSpan::start(attempt));
+        llm_attempt.phase = "preparation";
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
             match prepare_compatible_endpoint(
                 &url,
@@ -5666,6 +5817,7 @@ async fn call_prepared_llm_with_total_budget(
                 cancel,
             )
             .await
+            .inspect_err(LlmAttemptSpan::note_error)
             {
                 Ok(client) => Some(client),
                 Err(error)
@@ -5683,18 +5835,21 @@ async fn call_prepared_llm_with_total_budget(
         let client = compatible_client.as_deref().unwrap_or(client);
         let lease = if let Some(binding) = subscription {
             let remaining = total_budget.saturating_sub(started.elapsed());
-            Some(tokio::select! {
-                biased;
-                _ = wait_llm_cancel(cancel) => return Err(responses::error(astra_core::ErrorKind::Cancelled, "cancelled")),
-                value = tokio::time::timeout(remaining, binding.acquire(rejected_version.take())) => value
-                    .map_err(|_| responses::error(astra_core::ErrorKind::ProviderDeadline, "credential_deadline"))?
-                    .map_err(responses::credential_error)?,
-            })
+            Some(
+                await_subscription_credential(
+                    binding.acquire(rejected_version.take()),
+                    remaining,
+                    cancel,
+                )
+                .await?,
+            )
         } else {
             None
         };
+        llm_attempt.begin_admission();
         let observed_attempt =
             begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
+        llm_attempt.phase = "preparation";
         let mut req = client.post(&url).header("content-type", "application/json");
         req = if let Some(lease) = &lease {
             req.bearer_auth(lease.bearer())
@@ -5741,7 +5896,9 @@ async fn call_prepared_llm_with_total_budget(
         // Keep the dispatch marker inside the future selected below. If a
         // cancellation branch wins before the send future is ever polled,
         // diagnostics must not claim that transport execution started.
+        let send_span = llm_attempt.span.clone();
         let send_request = async {
+            llm_attempt.begin_request();
             if let Some(attempt_index) = observed_attempt {
                 attempt_observer
                     .expect("observed attempt requires observer")
@@ -5751,8 +5908,7 @@ async fn call_prepared_llm_with_total_budget(
             crate::server::outbound_trace::rewrite(&mut request);
             client.execute(request).await
         };
-        let mut llm_attempt = LlmAttemptSpan::start();
-        let send_request = send_request.instrument(llm_attempt.span.clone());
+        let send_request = send_request.instrument(send_span);
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5777,6 +5933,7 @@ async fn call_prepared_llm_with_total_budget(
         };
         let response = match send_result {
             Err(_) => {
+                llm_attempt.reason = Some("timeout");
                 let (kind, message) = if total_budget_owns_deadline {
                     (
                         astra_core::ErrorKind::ProviderDeadline,
@@ -5813,6 +5970,7 @@ async fn call_prepared_llm_with_total_budget(
                 r
             }
             Ok(Err(e)) => {
+                llm_attempt.transport_error(&e);
                 tracing::warn!(
                     target: "astra_runtime::llm_client",
                     url = %url,
@@ -5862,6 +6020,7 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
+        llm_attempt.received_response(&response);
         let status = response.status().as_u16();
         if response.status().is_success() {
             if subscription.is_none() {
@@ -5889,6 +6048,7 @@ async fn call_prepared_llm_with_total_budget(
                             observed_attempt,
                             result.usage_presence,
                         );
+                        llm_attempt.phase = "settlement";
                         if let Err(error) = finish_observed_provider_attempt(
                             attempt_observer,
                             observed_attempt,
@@ -5946,6 +6106,7 @@ async fn call_prepared_llm_with_total_budget(
                         made_semantic_progress,
                         partial,
                     }) => {
+                        llm_attempt.reason = Some("semantic_progress_timeout");
                         let details = serde_json::json!({
                             "deadline": {
                                 "scope": "provider_attempt",
@@ -6182,6 +6343,7 @@ async fn call_prepared_llm_with_total_budget(
                         observed_attempt,
                         result.usage_presence,
                     );
+                    llm_attempt.phase = "settlement";
                     if let Err(error) = finish_observed_provider_attempt(
                         attempt_observer,
                         observed_attempt,
@@ -6215,6 +6377,7 @@ async fn call_prepared_llm_with_total_budget(
                     elapsed_ms,
                     partial,
                 }) => {
+                    llm_attempt.reason = Some("deadline_exceeded");
                     let error = provider_deadline_from_transport(
                         "consuming the provider stream",
                         "stream exceeded the invocation-wide provider work budget",
@@ -6266,6 +6429,7 @@ async fn call_prepared_llm_with_total_budget(
                     partial,
                     ..
                 }) => {
+                    llm_attempt.reason = Some("idle_timeout");
                     let observed_error = attach_partial_details(
                         astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::StreamIdle,
@@ -6287,6 +6451,7 @@ async fn call_prepared_llm_with_total_budget(
                     made_semantic_progress,
                     partial,
                 }) => {
+                    llm_attempt.reason = Some("semantic_progress_timeout");
                     let details = serde_json::json!({
                         "deadline": {
                             "scope": "provider_attempt",
@@ -6402,6 +6567,7 @@ async fn call_prepared_llm_with_total_budget(
                 return Err(error);
             }
             Err(ProviderErrorBody::Transport(error)) => {
+                llm_attempt.transport_error(&error);
                 let kind = if started.elapsed() >= total_budget {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if error.is_timeout() {
@@ -6427,6 +6593,8 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
+        llm_attempt.phase = "response_status";
+        llm_attempt.reason = Some("http_status");
         let direct_access_error = (subscription.is_none()
             && !uses_moi_model_gateway_error_contract(header_overrides)
             && model_gateway_error_contract.is_none())
@@ -8106,7 +8274,23 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     .await
 }
 
-pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+pub(crate) fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+) -> impl std::future::Future<Output = Result<LlmCallResult, astra_core::ClassifiedError>> {
+    crate::server::run_trace::in_llm_call(call_llm_nonstream_attempts(
+        client,
+        call,
+        timeout,
+        attempt_observer,
+        tool_choice,
+    ))
+}
+
+async fn call_llm_nonstream_attempts(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
@@ -8277,13 +8461,20 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     } else {
         url
     };
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
     let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
+    llm_attempt.phase = "preparation";
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
         let mut attempt = 0;
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
-            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None).await {
+            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None)
+                .await
+                .inspect_err(LlmAttemptSpan::note_error)
+            {
                 Ok(client) => break Some(client),
                 Err(error)
                     if error.kind == astra_core::ErrorKind::Network
@@ -8293,6 +8484,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                     let delay = std::time::Duration::from_millis(retry_backoff_ms(attempt));
                     let remaining = timeout.saturating_sub(started.elapsed());
                     if delay >= remaining {
+                        crate::server::run_trace::note_attempt_code(
+                            astra_core::ErrorKind::ProviderDeadline.as_str(),
+                        );
                         return Err(astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ProviderDeadline,
                             "LLM non-stream total budget exhausted while preparing the connection",
@@ -8307,8 +8501,10 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         None
     };
     let client = compatible_client.as_deref().unwrap_or(client);
+    llm_attempt.begin_admission();
     let observed_attempt =
         begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
+    llm_attempt.phase = "preparation";
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
@@ -8335,7 +8531,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         model_name,
         "LLM non-stream request sending"
     );
+    let send_span = llm_attempt.span.clone();
     let send_request = async {
+        llm_attempt.begin_request();
         if let Some(attempt_index) = observed_attempt {
             attempt_observer
                 .expect("observed attempt requires observer")
@@ -8348,11 +8546,11 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         crate::server::outbound_trace::rewrite(&mut request);
         client.execute(request).await
     };
-    let mut llm_attempt = LlmAttemptSpan::start();
-    let send_request = send_request.instrument(llm_attempt.span.clone());
+    let send_request = send_request.instrument(send_span);
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
+            llm_attempt.transport_error(&e);
             let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
@@ -8400,6 +8598,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             return Err(error);
         }
     };
+    llm_attempt.received_response(&resp);
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let response_contract_version = resp
@@ -8410,6 +8609,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         let text = match resp.text().await {
             Ok(text) => text,
             Err(body_error) => {
+                llm_attempt.transport_error(&body_error);
                 let kind = if body_error.is_timeout() && total_budget_owns_deadline {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if body_error.is_timeout() {
@@ -8434,6 +8634,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
+        llm_attempt.phase = "response_status";
+        llm_attempt.reason = Some("http_status");
         if let Some(rejection) = moi_model_gateway_error(
             status,
             &text,
@@ -8483,6 +8685,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let response_bytes = match resp.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
+            llm_attempt.transport_error(&error);
             let kind = if error.is_timeout() && total_budget_owns_deadline {
                 astra_core::ErrorKind::ProviderDeadline
             } else if error.is_timeout() {
@@ -8514,12 +8717,14 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             return Err(error);
         }
     };
+    llm_attempt.phase = "response_decode";
     let v = if provider == "typesafe" {
         None
     } else {
         match serde_json::from_slice::<Value>(&response_bytes) {
             Ok(value) => Some(value),
             Err(error) => {
+                llm_attempt.reason = Some("decode_error");
                 let error = astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::StreamTransport,
                     error.to_string(),
@@ -8584,6 +8789,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         observed_attempt,
         result.usage_presence,
     );
+    llm_attempt.phase = "settlement";
     if let Err(error) = finish_observed_provider_attempt(
         attempt_observer,
         observed_attempt,
@@ -8930,19 +9136,23 @@ pub(crate) fn parse_openai_sse_json_stream(
                     return;
                 }
             };
-            let blocks = match sse_in.push_bytes(&bytes) {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                    return;
-                }
-            };
-            for block in blocks {
-                if let Err(error) = validate_sse_event_block_json(&block) {
-                    yield Err(error);
-                    return;
-                }
-                let d = json_events_from_sse_event_block(&block);
+            let mut input = bytes.as_ref();
+            while !input.is_empty() {
+                let block = match sse_in.next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES)) {
+                    Ok(Some(block)) => block,
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield Err(format!("invalid model SSE response: {error}"));
+                        return;
+                    }
+                };
+                let d = match validated_sse_event(&block) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 for v in d.events {
                     yield Ok(ParsedSseEvent::Data(v));
                 }
@@ -8952,39 +9162,20 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             }
         }
-        let mut buf = match sse_in.into_inner() {
-            Ok(buf) => buf,
-            Err(error) => {
-                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                return;
-            }
-        };
-        let tail = match validated_drain_sse_data_lines(&mut buf, "") {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in tail.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if tail.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
-            return;
-        }
-        let fin = match validated_finish_sse_data_buffer(&mut buf) {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in fin.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if fin.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
+        match sse_in.finish() {
+            Ok(Some(block)) => match validated_sse_event(&block) {
+                Ok(event) => {
+                    for value in event.events {
+                        yield Ok(ParsedSseEvent::Data(value));
+                    }
+                    if event.stream_finished {
+                        yield Ok(ParsedSseEvent::Done);
+                    }
+                }
+                Err(error) => yield Err(error),
+            },
+            Ok(None) => {},
+            Err(error) => yield Err(format!("invalid model SSE response: {error}")),
         }
     }
 }
@@ -12260,6 +12451,627 @@ mod tests {
             .expect_err("provider that accepts but never responds should time out")
     }
 
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    fn trace_fixture_call<'a>(
+        messages: &'a [Value],
+        base: &'a str,
+        provider: &'a str,
+    ) -> LlmCall<'a> {
+        LlmCall {
+            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            messages,
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
+                subscription: None,
+                fixed_temperature: None,
+                supported_reasoning_efforts: None,
+                thinking_protocol: None,
+                model_name: "trace-fixture-model",
+                wire_model_name: None,
+                api_key: "private-key",
+                base_url: base,
+                provider,
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: None,
+            temperature: None,
+            thinking: &ThinkingConfig::Off,
+        }
+    }
+
+    async fn call_trace_fixture(
+        call: LlmCall<'_>,
+        streaming: bool,
+        observer: Option<&dyn ProviderAttemptObserver>,
+    ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+        if streaming {
+            call_llm_and_collect_with_stream_callback(
+                call,
+                LlmCancel::None,
+                None,
+                observer,
+                RuntimeToolChoice::Auto,
+                None,
+            )
+            .await
+        } else {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            call_llm_nonstream_with_attempt_observer(
+                &client,
+                call,
+                std::time::Duration::from_secs(2),
+                observer,
+            )
+            .await
+        }
+    }
+
+    type CapturedLlmSpans = HashMap<u64, HashMap<String, String>>;
+    #[derive(Clone, Default)]
+    struct LlmTraceCapture(Arc<Mutex<CapturedLlmSpans>>);
+    struct LlmTraceFields<'a>(&'a mut HashMap<String, String>);
+    impl tracing::field::Visit for LlmTraceFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for LlmTraceCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::Id,
+            _: Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "llm.call" {
+                attrs.record(&mut LlmTraceFields(
+                    self.0.lock().unwrap().entry(id.into_u64()).or_default(),
+                ));
+            }
+        }
+        fn on_record(
+            &self,
+            id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _: Context<'_, S>,
+        ) {
+            if let Some(fields) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut LlmTraceFields(fields));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_fields_follow_real_streaming_and_nonstream_responses() {
+        use tracing::instrument::WithSubscriber;
+
+        for (streaming, status, malformed, settlement_failure, expected_phase, expected_reason) in [
+            (false, 200u16, false, false, None, None),
+            (true, 200, false, false, None, None),
+            (
+                false,
+                403,
+                false,
+                false,
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (
+                true,
+                403,
+                false,
+                false,
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (
+                false,
+                200,
+                true,
+                false,
+                Some("response_decode"),
+                Some("decode_error"),
+            ),
+            (false, 200, false, true, Some("settlement"), Some("network")),
+            (true, 200, false, true, Some("settlement"), Some("network")),
+            (false, 403, false, true, Some("settlement"), Some("network")),
+            (true, 403, false, true, Some("settlement"), Some("network")),
+            (false, 200, true, true, Some("settlement"), Some("network")),
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    let body = if malformed || status != 200 {
+                        "private provider body".to_string()
+                    } else if streaming {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                            .to_string()
+                    } else {
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string()
+                    };
+                    Response::builder()
+                        .status(status)
+                        .header(
+                            "content-type",
+                            if streaming {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let call = trace_fixture_call(&messages, &base, "openai");
+            let capture = LlmTraceCapture::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let carrier = astra_logging::trace_context::Carrier::default();
+            let failing_observer = FailingFinishAttemptObserver(astra_core::ErrorKind::Network);
+            let observer =
+                settlement_failure.then_some(&failing_observer as &dyn ProviderAttemptObserver);
+            let result = astra_logging::trace_context::bind_run(
+                &carrier,
+                call_trace_fixture(call, streaming, observer),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(result.is_err(), expected_phase.is_some());
+            if settlement_failure {
+                assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Network);
+            }
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(
+                fields.get("http.response.status_code").unwrap(),
+                &status.to_string()
+            );
+            assert_eq!(fields.get("retry.attempt").unwrap(), "0");
+            assert_eq!(
+                fields.get("error.phase").map(String::as_str),
+                expected_phase
+            );
+            assert_eq!(
+                fields.get("error.reason").map(String::as_str),
+                expected_reason
+            );
+            let rendered = format!("{fields:?}");
+            for private in [
+                &base,
+                "private-key",
+                "private prompt",
+                "private provider body",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_preparation_failures_cover_both_call_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        let _retry_guard = set_test_retry_backoff_ms(0);
+        for streaming in [false, true] {
+            for (base, kind) in [
+                (
+                    "https://astra-trace-test.invalid/v1",
+                    astra_core::ErrorKind::Network,
+                ),
+                (
+                    "http://provider.example/v1",
+                    astra_core::ErrorKind::InvalidRequest,
+                ),
+            ] {
+                let messages = [json!({"role":"user","content":"private prompt"})];
+                let call = trace_fixture_call(
+                    &messages,
+                    base,
+                    astra_services::byok_endpoint::COMPATIBLE_PROVIDER,
+                );
+                let capture = LlmTraceCapture::default();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let carrier = astra_logging::trace_context::Carrier::default();
+                // Preparation fails before durable admission or HTTP dispatch.
+                let observer = RecordingAttemptObserver::default();
+                let fixture = (kind == astra_core::ErrorKind::Network).then_some(kind);
+                let result = TEST_PREPARATION_ERROR
+                    .scope(
+                        fixture,
+                        astra_logging::trace_context::bind_run(
+                            &carrier,
+                            call_trace_fixture(call, streaming, Some(&observer)),
+                        ),
+                    )
+                    .with_subscriber(subscriber)
+                    .await;
+                assert_eq!(result.unwrap_err().kind, kind);
+                assert!(observer.began.lock().unwrap().is_empty());
+                let spans = capture.0.lock().unwrap();
+                let count = if streaming && kind == astra_core::ErrorKind::Network {
+                    LLM_MAX_RETRIES as usize + 1
+                } else {
+                    1
+                };
+                assert_eq!(spans.len(), count);
+                for fields in spans.values() {
+                    assert_eq!(fields.get("error.phase").unwrap(), "preparation");
+                    assert_eq!(fields.get("error.reason").unwrap(), kind.as_str());
+                    assert!(!fields.contains_key("http.response.status_code"));
+                    let rendered = format!("{fields:?}");
+                    for private in [base, "private-key", "private prompt"] {
+                        assert!(!rendered.contains(private));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_endpoint_saturation_is_admission_without_dispatch() {
+        use tracing::instrument::WithSubscriber;
+
+        for streaming in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let requests = hits.clone();
+            let base = spawn_local_http_server(Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let body = if streaming {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                        } else {
+                            r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                        };
+                        Response::builder().status(200)
+                            .header("content-type", if streaming { "text/event-stream" } else { "application/json" })
+                            .body(Body::from(body)).unwrap()
+                    }
+                }),
+            )).await;
+            let endpoint = format!("{base}/chat/completions");
+            let mut permits = Vec::new();
+            while let Ok(Some(permit)) =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+            {
+                permits.push(permit);
+            }
+            assert!(!permits.is_empty());
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let make_call = || {
+                let mut call = trace_fixture_call(&messages, &base, "openai");
+                call.route.completions_url_override = Some(&endpoint);
+                call
+            };
+            let capture = LlmTraceCapture::default();
+            let observer = RecordingAttemptObserver::default();
+            let error = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::ResourceLimit);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert!(observer.began.lock().unwrap().is_empty());
+            assert!(observer.finished.lock().unwrap().is_empty());
+            {
+                let spans = capture.0.lock().unwrap();
+                assert_eq!(spans.len(), 1);
+                let fields = spans.values().next().unwrap();
+                assert_eq!(fields["retry.attempt"], "0");
+                assert_eq!(fields["error.phase"], "admission");
+                assert_eq!(fields["error.reason"], "resource_limit");
+                assert!(!fields.contains_key("http.response.status_code"));
+                let rendered = format!("{fields:?}");
+                for private in [&endpoint, &base, "private"] {
+                    assert!(!rendered.contains(private));
+                }
+            }
+            // Releasing one slot allows the unchanged request path to run;
+            // the early diagnostic span must be reused instead of duplicated.
+            drop(permits.pop().unwrap());
+            let capture = LlmTraceCapture::default();
+            let result = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "ok");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            assert_eq!(observer.finished.lock().unwrap().len(), 1);
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["http.response.status_code"], "200");
+            assert!(!fields.contains_key("error.phase"));
+            let _released_permit =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+                    .expect("the successful call releases its endpoint permit");
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_admission_failures_are_not_dispatched_requests() {
+        use tracing::instrument::WithSubscriber;
+
+        struct FailedAdmission;
+        #[async_trait]
+        impl ProviderAttemptObserver for FailedAdmission {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::DatabaseError,
+                    "private admission failure",
+                ))
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                panic!("failed admission cannot be settled")
+            }
+        }
+        let hits = Arc::new(AtomicU32::new(0));
+        let requests = hits.clone();
+        let base = spawn_local_http_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async { "unexpected dispatch" }
+            }),
+        ))
+        .await;
+        for streaming in [false, true] {
+            let capture = LlmTraceCapture::default();
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let result = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(
+                    trace_fixture_call(&messages, &base, "openai"),
+                    streaming,
+                    Some(&FailedAdmission),
+                ),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert_eq!(
+                result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.phase"], "admission");
+            assert_eq!(fields["error.reason"], "database_error");
+            assert!(!fields.contains_key("http.response.status_code"));
+            assert!(!format!("{fields:?}").contains("private"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn llm_trace_credential_failures_keep_preparation_outcomes() {
+        use tracing::instrument::WithSubscriber;
+
+        for kind in [
+            astra_core::ErrorKind::Auth,
+            astra_core::ErrorKind::ProviderDeadline,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let capture = LlmTraceCapture::default();
+            let token = CancellationToken::new();
+            if kind == astra_core::ErrorKind::Cancelled {
+                token.cancel();
+            }
+            let result = crate::server::run_trace::in_llm_call(async {
+                let mut attempt = LlmAttemptSpan::start(0);
+                attempt.phase = "preparation";
+                await_subscription_credential::<()>(
+                    async {
+                        if kind == astra_core::ErrorKind::Auth {
+                            Err(astra_core::error_response_coded(
+                                axum::http::StatusCode::CONFLICT,
+                                "private credential error",
+                                "model_connection_expired",
+                            ))
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
+                    Duration::from_millis(5),
+                    LlmCancel::Token(&token),
+                )
+                .await
+            })
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert_eq!(result.unwrap_err().kind, kind);
+            let spans = capture.0.lock().unwrap();
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.phase"], "preparation");
+            assert_eq!(fields["error.reason"], kind.as_str());
+            assert!(!fields.contains_key("http.response.status_code"));
+            assert!(!format!("{fields:?}").contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_joined_calls_do_not_share_settlement_outcomes() {
+        use tracing::instrument::WithSubscriber;
+
+        struct SettlementGate {
+            entered: Arc<tokio::sync::Barrier>,
+            release: tokio::sync::Notify,
+            fail: bool,
+        }
+        #[async_trait]
+        impl ProviderAttemptObserver for SettlementGate {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                Ok(ProviderAttemptAdmission::Admitted(0))
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                self.entered.wait().await;
+                self.release.notified().await;
+                if self.fail {
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::DatabaseError,
+                        "private settlement error",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (streaming, other_status) in [(false, 429u16), (true, 404)] {
+            let base = spawn_local_http_server(
+                Router::new()
+                    .route(
+                        "/failed/chat/completions",
+                        post(|| async {
+                            (axum::http::StatusCode::FORBIDDEN, "private provider error")
+                        }),
+                    )
+                    .route(
+                        "/other/chat/completions",
+                        post(move || async move {
+                            (
+                                axum::http::StatusCode::from_u16(other_status).unwrap(),
+                                "private provider error",
+                            )
+                        }),
+                    ),
+            )
+            .await;
+            let entered = Arc::new(tokio::sync::Barrier::new(3));
+            let failed = SettlementGate {
+                entered: entered.clone(),
+                release: Default::default(),
+                fail: true,
+            };
+            let other = SettlementGate {
+                entered: entered.clone(),
+                release: Default::default(),
+                fail: false,
+            };
+            let failed_done = tokio::sync::Notify::new();
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let failed_base = format!("{base}/failed");
+            let other_base = format!("{base}/other");
+            let capture = LlmTraceCapture::default();
+            let (failed_result, other_result, ()) =
+                crate::server::run_trace::bind(Default::default(), async {
+                    tokio::join!(
+                        async {
+                            let result = call_trace_fixture(
+                                trace_fixture_call(&messages, &failed_base, "openai"),
+                                streaming,
+                                Some(&failed),
+                            )
+                            .await;
+                            failed_done.notify_one();
+                            result
+                        },
+                        call_trace_fixture(
+                            trace_fixture_call(&messages, &other_base, "openai"),
+                            streaming,
+                            Some(&other)
+                        ),
+                        async {
+                            entered.wait().await;
+                            failed.release.notify_one();
+                            failed_done.notified().await;
+                            other.release.notify_one();
+                        },
+                    )
+                })
+                .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+                .await;
+            assert_eq!(
+                failed_result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            assert_ne!(
+                other_result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 2);
+            for fields in spans.values() {
+                let failed = fields["http.response.status_code"] == "403";
+                assert_eq!(
+                    fields["error.phase"],
+                    if failed {
+                        "settlement"
+                    } else {
+                        "response_status"
+                    }
+                );
+                assert_eq!(
+                    fields["error.reason"],
+                    if failed {
+                        "database_error"
+                    } else {
+                        "http_status"
+                    }
+                );
+                assert!(!format!("{fields:?}").contains("private"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_transport_diagnostics_use_typed_causes() {
+        let refused = sample_reqwest_stream_error().await;
+        assert_eq!(llm_transport_error_reason(&refused), "connection_refused");
+        let timeout = sample_reqwest_response_timeout_error().await;
+        assert_eq!(llm_transport_error_reason(&timeout), "timeout");
+        let builder = reqwest::Client::new().get("not a URL").build().unwrap_err();
+        assert_eq!(llm_transport_error_reason(&builder), "request_build");
+
+        for (kind, expected) in [
+            (std::io::ErrorKind::ConnectionReset, "connection_reset"),
+            (std::io::ErrorKind::ConnectionAborted, "connection_aborted"),
+            (std::io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (std::io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+        ] {
+            let error = std::io::Error::new(kind, "private URL and credentials");
+            assert_eq!(llm_io_error_reason(&error), Some(expected));
+        }
+        // Do not infer DNS/TLS or other causes from strings.
+        let unknown = std::io::Error::other("DNS TLS connection refused secret");
+        assert_eq!(llm_io_error_reason(&unknown), None);
+    }
+
     #[tokio::test]
     async fn provider_send_error_retries_only_connect_before_delivery() {
         let connect_error = sample_reqwest_stream_error().await;
@@ -12372,7 +13184,7 @@ mod tests {
             .await
             .expect("invalid block item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
@@ -12386,17 +13198,55 @@ mod tests {
             .await
             .expect("invalid tail item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
+    async fn parse_openai_sse_json_stream_decodes_valid_clean_eof_tail() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
         let st = parse_openai_sse_json_stream(stream::iter(parts));
         tokio::pin!(st);
-        let ev = st.next().await.unwrap().unwrap();
-        assert_eq!(ev, ParsedSseEvent::Data(json!({"z": 9})));
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"z":9}))
+        );
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_joins_data_fields_across_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from("data:{\"text\":\"hello\",\r\n")),
+            Ok(Bytes::from("data: \"n\":2}\r\n\r\ndata:[DONE]\r\n\r\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"text": "hello", "n": 2}))
+        );
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_preserves_prefix_and_done_order() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"a\":1}\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"a": 1}))
+        );
+        assert!(st.next().await.unwrap().is_err());
+
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
         assert!(st.next().await.is_none());
     }
 
@@ -12510,6 +13360,25 @@ mod tests {
             }
             other => panic!("expected transport error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_accepts_semantic_terminal_at_clean_eof() {
+        let terminal = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(format!("data: {terminal}\n")))]);
+        let result = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -22503,6 +23372,13 @@ mod tests {
             .find(|tool| tool["function"]["name"] == "agent")
             .unwrap();
         let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("tool_outcomes").is_none());
+        assert!(
+            agent["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Child tool outcomes: tool_search select:agent")
+        );
         assert!(properties["reasoning"]["oneOf"].is_array());
         let reasoning = properties["reasoning"]["description"].as_str().unwrap();
         for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {

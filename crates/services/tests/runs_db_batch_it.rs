@@ -90,6 +90,7 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
+        last_guidance_event_idx: -1,
         current_checkpoint: None,
         error_code: None,
         error_message: None,
@@ -1823,6 +1824,95 @@ async fn session_deletion_competes_safely_with_run_admission() {
             .await
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn control_batch_reads_guidance_watermarks_without_event_queries() {
+    let (pool, store) = setup().await;
+    let nonce = uuid::Uuid::new_v4();
+    let (user_a, user_b) = (format!("guide-a-{nonce}"), format!("guide-b-{nonce}"));
+    let (run_a, run_b) = (format!("run-a-{nonce}"), format!("run-b-{nonce}"));
+    let (session_a, session_b) = (format!("session-a-{nonce}"), format!("session-b-{nonce}"));
+    for (user, run, session) in [(&user_a, &run_a, &session_a), (&user_b, &run_b, &session_b)] {
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(run.clone(), user.clone(), session.clone()),
+        )
+        .await;
+    }
+    let initial_a = store
+        .load_run_control(&user_a, &run_a)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let initial_b = store
+        .load_run_control(&user_b, &run_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    for kind in ["progress", "user_intent", "progress", "user_intent"] {
+        store
+            .append_event(&user_a, &session_a, &run_a, make_event(kind, json!({})))
+            .await
+            .unwrap();
+    }
+    store
+        .append_event(
+            &user_b,
+            &session_b,
+            &run_b,
+            make_event("user_intent", json!({})),
+        )
+        .await
+        .unwrap();
+    let key = |user: &str, run: &str| RunControlReadKey {
+        user_id: user.into(),
+        run_id: run.into(),
+    };
+    let keys = vec![
+        key(&user_a, &run_a),
+        key(&user_b, &run_b),
+        key(&user_a, &run_a),
+        key(&user_b, &run_a),
+    ];
+    let queries = Queries::default();
+    let results = store
+        .load_run_control_batch(&keys)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        results[0].as_ref().unwrap().last_guidance_event_idx,
+        initial_a + 4
+    );
+    assert_eq!(
+        results[1].as_ref().unwrap().last_guidance_event_idx,
+        initial_b + 1
+    );
+    assert_eq!(
+        results[2].as_ref().unwrap().last_guidance_event_idx,
+        initial_a + 4
+    );
+    assert!(
+        results[3].is_none(),
+        "a different owner cannot observe this run"
+    );
+    let sql = queries.0.lock().unwrap();
+    assert_eq!(
+        sql.iter().filter(|sql| sql.contains("agent_runs")).count(),
+        1
+    );
+    assert!(
+        sql.iter().all(|sql| !sql.contains("agent_run_events")),
+        "control reads must not query event history"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

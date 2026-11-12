@@ -17,6 +17,13 @@ pub enum ThinClientError {
         status: reqwest::StatusCode,
         body: String,
     },
+    /// Retry advice from rate limiting or a server error.
+    #[error("HTTP {status}: {body}")]
+    SyncOutboxBackpressure {
+        status: reqwest::StatusCode,
+        body: String,
+        retry_after_seconds: Option<u64>,
+    },
     #[error("SSE parse error: {0}")]
     SseParse(String),
     #[error(

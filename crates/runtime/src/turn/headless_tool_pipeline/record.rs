@@ -121,6 +121,7 @@ fn tool_call_disposition_from_result_fields(
     astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
         fields.get("disposition"),
         fields.get("execution_started").and_then(Value::as_bool),
+        astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
         fallback,
     )
 }
@@ -1250,6 +1251,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     executed_ms,
                     false,
                     &execution.result_str,
+                    if astra_tools::execution_outcome::outcome_is_unknown(
+                        execution.tool_result_fields.as_ref(),
+                    ) {
+                        Some("unknown")
+                    } else {
+                        execution
+                            .tool_result_fields
+                            .as_ref()
+                            .and_then(|fields| fields.get("execution_fact"))
+                            .and_then(Value::as_str)
+                    },
                 );
         }
         self.executed_this_turn += 1;
@@ -1268,11 +1280,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // reads observed. Invalidation is conservative; it does not claim the
         // operation succeeded or attribute a particular change to it.
         if observed_workspace_mutation
-            || (disposition == Some(ToolCallDisposition::Executed)
-                && crate::turn::tool_side_effects::tool_call_invalidates_read_cache(
-                    &execution.name,
-                    Some(&execution.args),
-                ))
+            || (matches!(
+                disposition,
+                Some(ToolCallDisposition::Executed | ToolCallDisposition::Unknown)
+            ) && crate::turn::tool_side_effects::tool_call_invalidates_read_cache(
+                &execution.name,
+                Some(&execution.args),
+            ))
         {
             self.ctx.turn_guard.record_workspace_mutation();
             self.ctx.semantic_dedup.clear_observation_cache();
@@ -2456,6 +2470,24 @@ mod tests {
         assert_eq!(
             tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
             ToolCallDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn unknown_start_is_not_projected_as_rejected_or_executed() {
+        let mut fields = json!({"execution_started": false, "disposition": "rejected"})
+            .as_object()
+            .unwrap()
+            .clone();
+        astra_tools::execution_outcome::insert_unknown_execution_fact(&mut fields);
+        assert_eq!(
+            tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
+            ToolCallDisposition::Unknown
+        );
+        fields.insert("execution_started".into(), json!(true));
+        assert_eq!(
+            tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
+            ToolCallDisposition::Executed
         );
     }
 

@@ -213,6 +213,7 @@ async fn capture_session_execution(
             "session_id": session_id,
             "owner": owner,
             "run_tree": tree,
+            "run_tree_note": "Tool-call totals are persisted aggregates and may lag while a run is active.",
             "reflection": reflection,
         });
         if include_run_events {
@@ -1413,6 +1414,12 @@ mod token_refresh_error_tests {
                 assert_eq!(capture["transcript"]["items"][1]["item_seq"], 2);
                 assert_eq!(capture["owner"]["api_origin"], api.api_origin());
                 assert_eq!(capture["run_tree"]["session_id"], "session");
+                assert!(
+                    capture["run_tree_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("may lag")
+                );
                 assert_eq!(capture["reflection"]["schema_version"], 2);
             }
             server.verify().await;
@@ -2034,6 +2041,7 @@ async fn execute_cli_command_impl(
         Some(Command::Logout) => {
             if crate::cli::native_auth::active().is_some() {
                 crate::cli::native_auth::logout().await?;
+                crate::cli::cloud_sync::clear_sync_cloud_access();
                 stdout_println!("Logged out of MOI");
                 return Ok(ExitCode::Success);
             }
@@ -2052,6 +2060,7 @@ async fn execute_cli_command_impl(
                 .await
                 .map_err(map_thin_err)?;
             clear_profile_auth(profile.as_deref())?;
+            crate::cli::cloud_sync::clear_sync_cloud_access();
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -2758,7 +2767,7 @@ async fn execute_cli_command_impl(
             let shell_shutdown = settle_one_shot_cleanup_observing_interrupt(
                 async {
                     let report = background_tasks.kill_all_and_wait(std::time::Duration::from_secs(2)).await;
-                    let unsettled = report.unsettled.len().saturating_add(report.evicted_unsettled);
+                    let unsettled = report.unsettled.len();
                     let unknown = report.unknown.len();
                     shell_settlement_confirmed = unsettled == 0 && unknown == 0;
                     if !shell_settlement_confirmed {
@@ -4528,7 +4537,50 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 4. Project config
+    // 4. Cloud synchronization
+    stdout_println!("{}", "Cloud Sync".bold().magenta());
+    match crate::cli::cloud_sync::read_sync_outbox_status().await {
+        Ok(status) => {
+            if status.poisoned > 0 {
+                let summary = format!(
+                    "{} item(s) could not be synchronized and remain on this device",
+                    status.poisoned
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                issues.push(summary);
+            }
+            if status.skipped > 0 {
+                let summary = format!(
+                    "{} item(s) could not be prepared for synchronization",
+                    status.skipped
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                if let Some(reason) = status.last_skipped_reason {
+                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                }
+                issues.push(summary);
+            }
+            if status.pending > 0 || status.in_flight > 0 {
+                stdout_println!("  {}", "Local changes are waiting to sync".yellow());
+            } else if status.poisoned == 0 && status.skipped == 0 {
+                stdout_println!("  {}", "No pending local changes".green());
+            }
+            if let Some(reason) = status.last_error.as_deref() {
+                stdout_println!("  {} {}", "Last sync error:".dim(), reason);
+            }
+        }
+        Err(error) => {
+            stdout_println!(
+                "  {} {}",
+                theme::icon_warn(),
+                "Unable to read sync status".yellow()
+            );
+            issues.push(format!("Unable to read sync status: {error}"));
+        }
+    }
+    stdout_println!();
+
+    // 5. Project config
     stdout_println!("{}", "Project Configuration".bold().magenta());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
@@ -4545,7 +4597,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     stdout_println!("  {} {}", "Working dir:".dim(), cwd.display());
     stdout_println!();
 
-    // 5. MCP configuration
+    // 6. MCP configuration
     stdout_println!("{}", "MCP Configuration".bold().magenta());
     for (scope, path_fn) in &[
         (
@@ -4602,7 +4654,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 6. Environment
+    // 7. Environment
     stdout_println!("{}", "Environment".bold().magenta());
     stdout_println!("  {} {}", "OS:".dim(), std::env::consts::OS);
     stdout_println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
@@ -6123,6 +6175,8 @@ mod final_json_output_tests {
             serde_json::json!({
                 "succeeded": 2,
                 "failed": 0,
+                "started_unknown": 0,
+                "unknown": 0,
                 "rejected": 0,
                 "reused": 0,
                 "suppressed": 0,

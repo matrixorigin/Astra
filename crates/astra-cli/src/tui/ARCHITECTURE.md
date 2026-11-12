@@ -10,8 +10,8 @@
 │                                                                 │
 │  › user message                                                 │  ← UserCell
 │                                                                 │
-│    assistant response, streamed word by word, markdown-rendered │  ← AssistantCell
-│    prose indented with plain spaces; code blocks verbatim       │
+│  assistant response, streamed word by word, markdown-rendered   │  ← AssistantCell
+│  settled prose and code share a plain two-space gutter; no bar     │
 │                                                                 │
 │  • Ran bash (52ms)                                              │  ← ToolCell
 │    │ $ echo hello                                               │
@@ -104,7 +104,7 @@ All cells live in `history_cell/` and implement the `HistoryCell` trait
 | Cell | File | Role |
 |------|------|------|
 | **UserCell** | `user.rs` | `›` accent-bold prefix + user message text |
-| **AssistantCell** | `assistant.rs` | Streaming markdown; settled prose rows are space-indented with no glyph marker and code-block rows retain logical line boundaries through the final writer without a gutter or width-generated hard breaks; blinking cursor while live |
+| **AssistantCell** | `assistant.rs` | Streaming markdown; settled prose and code share a plain two-space gutter without a glyph; code-block rows retain logical line boundaries and source indentation without width-generated hard breaks; blinking cursor while live |
 | **ReasoningCell** | `reasoning.rs` | `💭 Thinking` header + compact body; committed on `ReasoningDone` or first answer delta |
 | **ToolCell** | `tool.rs` | `• Ran tool (Nms)` header + `│` args + `└` output; diff-aware coloring |
 | **SystemCell** | `system.rs` | info / warning / error; error text is humanized (strips `<tool_use_error>` wrappers) |
@@ -260,18 +260,21 @@ The current product contract and phased implementation plan live in
 
 ### Settled code in native scrollback
 
-The Markdown renderer marks code rows and the immutable cached rows retain that
+The Markdown renderer marks code rows, and the immutable cached rows retain that
 classification through lazy history batching and the final terminal writer.
-Code rows start at column zero and use terminal soft wrapping; ordinary prose
-keeps its existing layout. Final writes count physical rows at the current
-terminal width without inserting hard line breaks into the code itself.
-Sanitization and structured-link trust remain independent of this layout hint.
-Zellij lets content flow before reserving space for the input area, preserving
-multi-screen code across input redraws and later replies. A full-height input
-area uses the same operation to move output into native scrollback.
+Every settled assistant row gets a plain two-space prefix, including fenced
+code. Code rows retain their source line boundaries and source indentation, and
+the terminal soft-wraps them without inserting hard line breaks. A terminal
+selection includes the two gutter spaces on each code row. Final writes count
+physical rows at the current terminal width. Sanitization and structured-link
+trust remain independent of this layout hint. Zellij lets content flow before
+reserving space for the input area, preserving multi-screen code across input
+redraws and later replies. A full-height input area uses the same operation to
+move output into native scrollback.
 
-This guarantees that Astra adds neither a gutter nor width-generated hard breaks
-to sanitized code rows. Native clipboard selection still depends on the terminal
-and multiplexer; tabs, Unicode width policy, and Markdown newline normalization
+Astra adds no vertical-bar glyph or width-generated hard breaks to code rows;
+the two-column prefix is plain text. Native clipboard selection still depends
+on the terminal and multiplexer; tabs, Unicode width policy, and Markdown
+newline normalization
 are not a portable byte-for-byte clipboard contract. The live streaming gutter
 is a separate presentation path and is unchanged here.

@@ -2,6 +2,27 @@
 
 use std::fmt;
 
+/// Return the data of one framed SSE event. Multiple data fields belong to
+/// the same event, and only one optional space after the colon is discarded.
+pub fn event_data(block: &str) -> Option<String> {
+    let mut data: Option<String> = None;
+    for line in block.split(['\r', '\n']) {
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field != "data" {
+            continue;
+        }
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match &mut data {
+            Some(data) => {
+                data.push('\n');
+                data.push_str(value);
+            }
+            None => data = Some(value.to_owned()),
+        }
+    }
+    data
+}
+
 /// A complete SSE event contained invalid UTF-8.
 ///
 /// HTTP chunk boundaries are arbitrary and may split a multi-byte UTF-8 character.
@@ -40,41 +61,34 @@ impl fmt::Display for SseUtf8Error {
 
 impl std::error::Error for SseUtf8Error {}
 
-/// Returns `(byte_index_before_separator, separator_width)` for the first complete block in `bytes`.
-fn next_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes.windows(2).position(|window| window == b"\n\n");
-    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
+#[derive(Debug)]
+pub enum SseFrameError {
+    InvalidUtf8(SseUtf8Error),
+    TooLarge { limit: usize },
+}
+
+impl fmt::Display for SseFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8(error) => error.fmt(f),
+            Self::TooLarge { limit } => write!(f, "SSE event exceeds {limit} bytes"),
+        }
     }
 }
 
-/// Remove every **complete** UTF-8 event from `buf` (bytes before the first blank line, excluding the blank line).
-/// Leaves a trailing partial event in `buf` for the next chunk or final flush.
-pub fn drain_complete_sse_event_blocks(buf: &mut Vec<u8>) -> Result<Vec<String>, SseUtf8Error> {
-    let mut out = Vec::new();
-    while let Some((end, sep_len)) = next_event_boundary(buf) {
-        let block = std::str::from_utf8(&buf[..end])
-            .map_err(SseUtf8Error::from_utf8_error)?
-            .to_owned();
-        buf.drain(..end + sep_len);
-        out.push(block);
-    }
-    Ok(out)
-}
+impl std::error::Error for SseFrameError {}
 
 /// Incremental SSE byte buffer for HTTP streams.
 ///
 /// Decoding happens only after an event's blank-line boundary is complete. This
 /// preserves UTF-8 characters split across arbitrary HTTP chunks and rejects
 /// malformed upstream bytes instead of replacing them with `U+FFFD`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SseBlankLineUtf8Buf {
     buf: Vec<u8>,
+    line_start: usize,
+    after_cr: bool,
+    first_frame_seen: bool,
 }
 
 impl SseBlankLineUtf8Buf {
@@ -82,20 +96,119 @@ impl SseBlankLineUtf8Buf {
         Self::default()
     }
 
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<String>, SseUtf8Error> {
-        self.buf.extend_from_slice(bytes);
-        drain_complete_sse_event_blocks(&mut self.buf)
+    /// Consume through at most one complete event, leaving later bytes for the
+    /// caller. This preserves event ordering when a later frame is malformed.
+    pub fn next_frame(
+        &mut self,
+        input: &mut &[u8],
+        max_frame_bytes: Option<usize>,
+    ) -> Result<Option<String>, SseFrameError> {
+        while !input.is_empty() {
+            if self.after_cr {
+                self.after_cr = false;
+                if input[0] == b'\n' {
+                    *input = &input[1..];
+                    if !self.buf.is_empty() {
+                        self.append(b"\n", max_frame_bytes.map(|limit| limit.saturating_add(2)))?;
+                        self.line_start = self.buf.len();
+                    }
+                    continue;
+                }
+            }
+            let end = input
+                .iter()
+                .position(|&byte| byte == b'\r' || byte == b'\n')
+                .unwrap_or(input.len());
+            self.append(&input[..end], max_frame_bytes)?;
+            *input = &input[end..];
+            if input.is_empty() {
+                return Ok(None);
+            }
+            let newline = input[0];
+            *input = &input[1..];
+            self.after_cr = newline == b'\r';
+            if self.line_start == self.buf.len() {
+                if self.buf.ends_with(b"\r\n") {
+                    self.buf.truncate(self.buf.len() - 2);
+                } else if self.buf.ends_with(b"\r") || self.buf.ends_with(b"\n") {
+                    self.buf.pop();
+                }
+                let mut bytes = std::mem::take(&mut self.buf);
+                self.line_start = 0;
+                if !self.first_frame_seen {
+                    self.first_frame_seen = true;
+                    if bytes.starts_with(b"\xef\xbb\xbf") {
+                        bytes.drain(..3);
+                    }
+                }
+                return String::from_utf8(bytes).map(Some).map_err(|error| {
+                    SseFrameError::InvalidUtf8(SseUtf8Error::from_utf8_error(error.utf8_error()))
+                });
+            }
+            // This terminator may be the first half of the final blank-line
+            // separator. Count it only if another data line follows.
+            self.append(
+                &[newline],
+                max_frame_bytes.map(|limit| limit.saturating_add(1)),
+            )?;
+            self.line_start = self.buf.len();
+        }
+        Ok(None)
     }
 
-    /// Transfer an incomplete event without decoding it. A second reader may
-    /// receive the remaining bytes while an Edge callback is in progress.
-    pub fn take_pending_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buf)
+    fn append(&mut self, bytes: &[u8], limit: Option<usize>) -> Result<(), SseFrameError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if let Some(limit) = limit
+            && self.buf.len().saturating_add(bytes.len()) > limit
+        {
+            return Err(SseFrameError::TooLarge { limit });
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The caller has already consumed a prefix of this stream.
+    pub fn mark_stream_started(&mut self) {
+        self.first_frame_seen = true;
+    }
+
+    /// Return the last block at a clean EOF. Consumers must validate its
+    /// payload and their own semantic terminal before accepting a response.
+    pub fn finish(&mut self) -> Result<Option<String>, SseUtf8Error> {
+        let tail = self.take_buf()?;
+        Ok((!tail.is_empty()).then_some(tail))
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<String>, SseUtf8Error> {
+        let mut input = bytes;
+        let mut blocks = Vec::new();
+        loop {
+            match self.next_frame(&mut input, None) {
+                Ok(Some(block)) => blocks.push(block),
+                Ok(None) => return Ok(blocks),
+                Err(SseFrameError::InvalidUtf8(error)) => return Err(error),
+                Err(_) => unreachable!("unbounded framing has no size limit"),
+            }
+        }
     }
 
     /// Replace the inner buffer with empty and return the previous UTF-8 text (trailing partial SSE event).
     pub fn take_buf(&mut self) -> Result<String, SseUtf8Error> {
-        let bytes = std::mem::take(&mut self.buf);
+        self.line_start = 0;
+        self.after_cr = false;
+        let mut bytes = std::mem::take(&mut self.buf);
+        if !self.first_frame_seen && !bytes.is_empty() {
+            self.first_frame_seen = true;
+            if bytes.starts_with(b"\xef\xbb\xbf") {
+                bytes.drain(..3);
+            }
+        }
         String::from_utf8(bytes).map_err(|error| SseUtf8Error::from_utf8_error(error.utf8_error()))
     }
 
@@ -110,6 +223,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frames_survive_every_chunk_boundary_and_line_ending() {
+        for body in [
+            "data: {\"text\":\"我\"}\n\n",
+            "data: {\"text\":\"我\"}\r\n\r\n",
+            "data: {\"text\":\"我\"}\r\r",
+            "data: {\"text\":\"我\"}\n\r\n",
+            "data: {\"text\":\"我\"}\r\n\n",
+        ] {
+            for split in 0..=body.len() {
+                let mut frames = SseBlankLineUtf8Buf::new();
+                let mut out = Vec::new();
+                for chunk in [&body.as_bytes()[..split], &body.as_bytes()[split..]] {
+                    let mut input = chunk;
+                    while !input.is_empty() {
+                        match frames.next_frame(&mut input, Some(1024)).unwrap() {
+                            Some(frame) => out.push(frame),
+                            None => break,
+                        }
+                    }
+                }
+                assert_eq!(
+                    out,
+                    vec!["data: {\"text\":\"我\"}"],
+                    "{body:?} split={split}"
+                );
+                frames.finish().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn frame_errors_follow_earlier_complete_events() {
+        let mut frames = SseBlankLineUtf8Buf::new();
+        let mut input = b"data: {}\n\ndata: \xff\n\n".as_slice();
+        assert_eq!(
+            frames.next_frame(&mut input, None).unwrap().unwrap(),
+            "data: {}"
+        );
+        assert!(matches!(
+            frames.next_frame(&mut input, None),
+            Err(SseFrameError::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn frame_limit_applies_before_growing_the_buffer() {
+        let mut frames = SseBlankLineUtf8Buf::new();
+        let mut input = b"data: 123456789".as_slice();
+        assert!(matches!(
+            frames.next_frame(&mut input, Some(8)),
+            Err(SseFrameError::TooLarge { limit: 8 })
+        ));
+        assert!(frames.buffered_bytes() <= 8);
+    }
+
+    #[test]
+    fn frame_limit_excludes_the_final_line_separator() {
+        for ending in ["\n\n", "\r\r", "\r\n\r\n", "\n\r\n"] {
+            for block in ["data: {}", "data: {\ndata: }"] {
+                let wire = format!("{block}{ending}");
+                let mut frames = SseBlankLineUtf8Buf::new();
+                let mut input = wire.as_bytes();
+                assert_eq!(
+                    frames
+                        .next_frame(&mut input, Some(block.len()))
+                        .unwrap()
+                        .unwrap(),
+                    block
+                );
+                let mut frames = SseBlankLineUtf8Buf::new();
+                let mut input = wire.as_bytes();
+                assert!(matches!(
+                    frames.next_frame(&mut input, Some(block.len() - 1)),
+                    Err(SseFrameError::TooLarge { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn blank_line_buf_chunks_match_single_drain() {
         let mut b = SseBlankLineUtf8Buf::new();
         assert!(b.push_bytes(b"data: ").unwrap().is_empty());
@@ -117,57 +310,6 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].contains("\"z\""));
         assert!(b.into_inner().unwrap().is_empty());
-    }
-
-    #[test]
-    fn drain_two_lf_blocks_in_one_buffer() {
-        let mut buf = b"data: {\"x\":1}\n\ndata: {\"y\":2}\n\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 2);
-        assert!(v[0].contains("\"x\""));
-        assert!(v[1].contains("\"y\""));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn drain_crlf_boundary() {
-        let mut buf = b"data: {}\r\n\r\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn partial_block_stays_until_separator_arrives() {
-        let mut buf = b"data: {\"a\":1}\n".to_vec();
-        assert!(
-            drain_complete_sse_event_blocks(&mut buf)
-                .unwrap()
-                .is_empty()
-        );
-        buf.push(b'\n');
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("\"a\""));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn empty_block_yields_empty_string() {
-        let mut buf = b"\n\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(v[0].is_empty());
-    }
-
-    #[test]
-    fn lf_separator_splits_before_crlf_terminated_block() {
-        let mut buf = b"event: x\n\ndata: {}\r\n\r\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0], "event: x");
-        assert_eq!(v[1], "data: {}");
-        assert!(buf.is_empty());
     }
 
     #[test]

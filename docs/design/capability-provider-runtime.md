@@ -843,9 +843,13 @@ source is returned through the existing input settlement owner before later
 guidance is delivered. Persistence retries settle that source without another
 physical steer; only applied sources enter model context. Refusal does not close
 the stage's guidance or mailbox lanes. Internal
-or unknown error codes and lost/timed-out ACKs leave delivery unknown, disable
+or unknown error codes and lost ACKs leave delivery unknown, disable
 further steering for that stage, and do not interrupt a healthy task. Malformed
 frames or conflicting request/turn identities use ordinary protocol cleanup.
+After socket delivery, the invocation retains its original input waiter until
+the matching ACK, cancellation, or invocation settlement. A slow ACK alone does
+not release that waiter or permit another send. Adapter loss of the ACK channel
+is reported explicitly through the same connection and delivery generation.
 
 The native JSON-RPC envelope budget is independent of the retained answer:
 up to 4 MiB per frame with one queued frame; the presentation remains at most
@@ -919,7 +923,7 @@ objective, or authorize another provider action. Completion retains the existing
 dispatch custody for a bounded final application drain. If settlement is still
 unconfirmed, existing invocation facts prevent the source from being returned as
 safe to resend. The active task itself has no implicit five-minute deadline.
-Protocol negotiation, input acknowledgements and socket delivery remain bounded;
+Protocol negotiation and socket queue admission remain bounded;
 physical Edge disconnection cancels and settles its owned processes before a new
 attachment can admit work. Session context and durable results remain available
 for subsequent stages and replay.

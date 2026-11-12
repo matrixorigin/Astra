@@ -424,6 +424,33 @@ its scheme, for example `http://127.0.0.1:4317`.
 enable export. A failure to initialize or flush the exporter does not change
 the HTTP result, command result, or process exit code.
 
+Tool execution spans appear as `tool.exec <tool name>` in Jaeger. They carry
+`tool.name`, the resolved `tool.route` (such as `edge_bound` or
+`request_scoped_mcp`), and `tool.call.id` when available, so an individual
+call can be matched to runtime logs. Tool arguments, shell commands and result
+bodies are not included. This metadata does not change execution timeouts.
+
+LLM spans retain the `llm.call` operation name and existing `error.code`.
+Failures also carry `error.phase` (`preparation`, `admission`, `request`, `response_body`,
+`response_status`, `response_decode`, or `settlement`) and a fixed
+`error.reason`. Typed transport causes can identify `connection_refused`,
+`connection_reset`, `connection_aborted`, `broken_pipe`, `unexpected_eof`, or
+`timeout`; otherwise the reason remains a safe category such as `connect_error`
+or the existing error code. DNS/TLS details are not guessed from error text.
+Collectors that have already erased the transport type retain their existing
+category. Connection preparation failures are included before HTTP dispatch,
+without inventing an HTTP response or a durable provider attempt.
+`http.response.status_code` is recorded only after a response arrives. If
+settlement fails after a provider failure, the phase/reason describe settlement
+while preserving the observed HTTP status.
+Registered-endpoint concurrency admission, credential acquisition and durable
+admission failures record their actual classified error without an HTTP status.
+Outcomes are scoped to each call future, so joined concurrent calls on the same
+Run task remain independent.
+`retry.attempt` is the zero-based client retry-loop index; non-streaming calls
+use zero. These fields do not export raw error messages, provider URLs, prompts
+or response bodies, and do not change retry, timeout or request-result behavior.
+
 ### CLI overrides (optional)
 
 - `ASTRA_CLI_SESSION_ID`, `ASTRA_CLI_SESSION_NAME`

@@ -710,6 +710,8 @@ pub struct RunState {
     pub llm_cancel_token: Arc<CancellationToken>,
     /// Process-local wake hint for newly committed current-run guidance.
     pub input_wake: watch::Sender<i64>,
+    /// Advisory notification for a committed user-intent source event.
+    pub guidance_wake: watch::Sender<i64>,
     /// Live fanout for clients that reattach to an active run after navigating away.
     pub live_tx: Option<broadcast::Sender<Value>>,
     /// Weak reference to the original POST stream's delivery lane.

@@ -71,7 +71,7 @@ pub(crate) struct WorkbenchInspection {
 /// not-yet-recorded data is shown as such instead of being rewritten as an
 /// empty/healthy result.
 pub(crate) fn inspect_workbench(state: &SessionState) -> WorkbenchInspection {
-    let persistence = match state.session_persistence_error.as_deref() {
+    let persistence = match state.current_persistence_error() {
         Some(error) => InspectorFact::degraded("Persistence", error),
         None => InspectorFact::observed("Persistence", "no local error recorded"),
     };
