@@ -5312,6 +5312,9 @@ impl SseStreamObserver for CliSseObserver<'_> {
                     SseRenderEffect::SystemWarning(message) => {
                         Some(StreamEvent::SystemWarning(message.clone()))
                     }
+                    SseRenderEffect::RuntimeWait { waiting } => {
+                        Some(StreamEvent::RuntimeWait { waiting: *waiting })
+                    }
                     SseRenderEffect::GuidanceDisposition { intent, status } => {
                         let intent_id = intent.intent_id.clone();
                         let delivery = intent.delivery;
@@ -5376,6 +5379,11 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let policy = self.render_policy;
         if !policy.is_silent() {
             for effect in &effects {
+                if let SseRenderEffect::RuntimeWait { waiting } = effect {
+                    render_runtime_wait_observation(*waiting);
+                }
+            }
+            for effect in &effects {
                 if let SseRenderEffect::SystemWarning(message) = effect {
                     eprintln!("{}", message.as_str().yellow());
                 }
@@ -5395,6 +5403,7 @@ impl SseStreamObserver for CliSseObserver<'_> {
                         }
                         SseRenderEffect::StreamText { .. }
                         | SseRenderEffect::SystemWarning(_)
+                        | SseRenderEffect::RuntimeWait { .. }
                         | SseRenderEffect::GuidanceDisposition { .. } => {} // suppressed or already rendered
                     }
                 }
@@ -5406,7 +5415,9 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
-                SseRenderEffect::SystemWarning(_) | SseRenderEffect::GuidanceDisposition { .. } => {
+                SseRenderEffect::SystemWarning(_)
+                | SseRenderEffect::RuntimeWait { .. }
+                | SseRenderEffect::GuidanceDisposition { .. } => {
                     i += 1;
                 }
                 SseRenderEffect::StopThinkingSpinner => {
@@ -9223,6 +9234,16 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
     }
 }
 
+/// An optional observation must never stall the execution owner on terminal IO.
+fn render_runtime_wait_observation(waiting: bool) {
+    let message = if waiting {
+        "Agent input wait started (last report)."
+    } else {
+        "Agent input wait ended."
+    };
+    let _ = crate::cli::stream::output_sink::try_write_stderr_line(message);
+}
+
 fn apply_sse_render_effects(
     effects: Vec<SseRenderEffect>,
     render: &mut StreamRenderState,
@@ -9235,6 +9256,7 @@ fn apply_sse_render_effects(
         match effect {
             SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
             SseRenderEffect::GuidanceDisposition { .. } => {}
+            SseRenderEffect::RuntimeWait { waiting } => render_runtime_wait_observation(waiting),
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);

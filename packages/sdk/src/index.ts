@@ -68,6 +68,7 @@ export type {
   StreamGapEvent,
   AgentWaitingEvent,
   AgentProgressEvent,
+  RuntimeWaitEvent,
   AgentCompletedEvent,
   AgentFailedEvent,
   AgentCancelledEvent,

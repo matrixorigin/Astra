@@ -3162,12 +3162,12 @@ impl RuntimeToolExecutor {
 
     pub fn set_reply_obligations(
         &self,
-        obligations: std::sync::Arc<crate::messaging::reply_obligations::ReplyObligations>,
+        obligations: std::sync::Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     ) {
         if let Some(context) =
             astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context).as_mut()
         {
-            context.reply_obligations = obligations;
+            context.question_correlations = obligations;
         }
     }
 
@@ -10902,7 +10902,7 @@ pub(crate) mod tests {
             parent_delegation_authority:
                 crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("test-run"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "test-run".into(),
             agent_id: "test-agent".into(),

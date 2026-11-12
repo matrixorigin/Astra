@@ -185,6 +185,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
+        | TuiAppEvent::RuntimeWait { .. }
         | TuiAppEvent::StatusLine(_)
         | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::CloudSyncAccessBlocked(_)

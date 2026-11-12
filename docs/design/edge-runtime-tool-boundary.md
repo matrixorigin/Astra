@@ -497,8 +497,14 @@ credentials are never implicitly copied into a local shell.
 
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
 on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
-owner under the workspace writer lease. It has no legacy `git(action=worktree)`
-alias. Ordinary worktree Git commands remain shell operations. Generic Server
+owner under the workspace writer lease. `enter` creates and selects a new
+worktree; it does not adopt a separately created worktree. To use an existing
+worktree outside the selected root, start or select a CLI/User Runner session
+rooted there under the normal trust and policy checks. Bash `workdir` selects
+an invocation directory inside that root and rejects outside paths before
+execution. This directory selection guard does not replace the shell provider's
+policy and sandbox controls over commands that change directory.
+It has no legacy `git(action=worktree)` alias. Ordinary worktree Git commands remain shell operations. Generic Server
 executors cannot silently create a local session owner. Typed commit/stash tool
 journals and their automatic compensation are removed along with their producers;
 shell side effects retain the existing shell observation and recovery contract.

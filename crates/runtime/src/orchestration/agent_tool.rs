@@ -396,7 +396,7 @@ pub struct AgentToolContext {
     /// Keeps this parent admission fence alive across projection eviction.
     pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
     /// The current run's question obligations, shared with its receive loop.
-    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    pub question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -724,7 +724,7 @@ async fn handle_agent_send_message_action(
         router.as_ref(),
         &ctx.run_id,
         &ctx.agent_id,
-        ctx.reply_obligations.as_ref(),
+        ctx.question_correlations.as_ref(),
     )
     .await
 }
@@ -738,14 +738,14 @@ pub async fn handle_agent_send_message_with_router(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> String {
     handle_agent_send_message_with_router_observed(
         args,
         router,
         run_id,
         agent_id,
-        reply_obligations,
+        question_correlations,
     )
     .await
     .output
@@ -756,7 +756,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> AgentToolOutcome {
     let content = match agent_message_content(args) {
         Ok(content) => content,
@@ -823,7 +823,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         message = message.with_correlation(request_id);
     }
     let message_id = message.id.clone();
-    let reply_obligation = if message_type == "question" {
+    let correlation = if message_type == "question" {
         let responder = match &message.to {
             MessageTarget::Direct { address } => address.clone(),
             MessageTarget::Broadcast { .. } | MessageTarget::Parent => {
@@ -833,10 +833,10 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 .into();
             }
         };
-        if let Err(error) = reply_obligations.reserve(run_id, &message_id, responder.clone()) {
+        if let Err(error) = question_correlations.reserve(run_id, &message_id, responder.clone()) {
             return rejected_agent_message(error).into();
         }
-        Some(astra_turn_types::PendingReply {
+        Some(astra_turn_types::QuestionCorrelation {
             request_id: message_id.clone(),
             expected_responder: astra_turn_types::AgentCommunicationParty {
                 run_id: responder.run_id,
@@ -864,7 +864,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 | astra_messaging::types::MailboxError::DeliveryRejected(_)
         );
         if message_type == "question" && definitely_rejected {
-            reply_obligations.reject(run_id, &message_id);
+            question_correlations.reject(run_id, &message_id);
         }
         return (if definitely_rejected {
             rejected_delivery_message(error.to_string())
@@ -879,7 +879,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 "message_id": message_id,
                 "target": target_display,
                 "message_type": message_type,
-                "reply_obligation": reply_obligation,
+                "reply_obligation": correlation,
                 "reason": error.to_string(),
                 "instruction": "Do not resend this message with a new identity; delivery may already have occurred.",
             })
@@ -897,9 +897,13 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         "target": target_display,
         "recipients": recipients,
         "message_type": message_type,
-        "reply_obligation": reply_obligation,
+        "reply_obligation": correlation,
     });
-    if message_type == "answer" {
+    if message_type == "question" {
+        result["instruction"] = json!(
+            "The question is queued asynchronously. Continue independent work, or call agent action wait for bounded observation when the answer is needed. A send does not suspend or prevent completion; transport acceptance does not prove observation, and a response still in transit may not reach a finished run."
+        );
+    } else if message_type == "answer" {
         result["instruction"] = json!(format!(
             "The answer is queued, not applied or completed. {CHILD_OUTCOME_GUIDANCE}"
         ));
@@ -3860,7 +3864,7 @@ pub(crate) mod tests {
                 MessagePayload::Request { .. }
             ));
         }
-        assert!(obligations.has_pending("parent-run"));
+        assert!(!obligations.pending("parent-run").is_empty());
     }
 
     #[tokio::test]
@@ -3884,7 +3888,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let obligations = crate::messaging::reply_obligations::ReplyObligations::default();
+        let obligations = crate::messaging::question_correlations::QuestionCorrelations::default();
 
         for message_type in ["question", "shutdown_request"] {
             let outcome = handle_agent_send_message_with_router_observed(
@@ -3899,7 +3903,7 @@ pub(crate) mod tests {
             assert_eq!(receipt["status"], "rejected", "{receipt}");
             assert_eq!(receipt["executed"], false, "{receipt}");
             assert!(outcome.accepted_send.is_none());
-            assert!(!obligations.has_pending("parent-run"));
+            assert!(obligations.pending("parent-run").is_empty());
             assert!(receiver.try_recv().is_none());
         }
         let outcome = handle_agent_send_message_with_router_observed(
@@ -5006,7 +5010,7 @@ pub(crate) mod tests {
         AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             parent_model_reasoning: None,
             run_id: "run-parent".into(),

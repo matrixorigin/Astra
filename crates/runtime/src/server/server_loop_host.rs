@@ -13337,6 +13337,9 @@ impl ServerAgenticLoopHost {
     }
 
     fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
+        if event["type"] == "runtime_wait" {
+            return;
+        }
         // Streaming deltas are already delivered on the live lane. Retaining
         // every tiny text/reasoning fragment in the bounded settlement buffer
         // lets a verbose provider evict tool and lifecycle evidence before
@@ -19345,6 +19348,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         child_count: usize,
         started_at: Instant,
     ) {
+        if matches!(outcome, "wait_started" | "wait_finished")
+            && let Some(sender) = &self.event_tx
+        {
+            // Display-only facts never enter retained events, delivery-gap
+            // repair or durable SQL. A dropped hint carries no authority.
+            let _ = sender.tx.try_send(json!({
+                "type":"runtime_wait", "run_id":state.current_run_id,
+                "reason":"agent_input", "waiting":outcome == "wait_started",
+            }));
+        }
         use astra_turn_types::{
             ExplainAnalyzeNodeKindV1 as Kind, ExplainAnalyzeOutcomeV1 as Outcome,
         };
@@ -34698,7 +34711,7 @@ mod tests {
             parent_delegation_authority:
                 crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run1"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "run1".into(),
             agent_id: "agent1".into(),
@@ -54140,6 +54153,51 @@ mod tests {
     }
 
     // ── progress_event_to_sse tests ──
+
+    #[test]
+    fn agent_input_wait_hint_is_live_only_and_does_not_create_repair_work() {
+        let mut host = test_host_builder("user1", "sess1").build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        let recovery_before = host
+            .event_tx
+            .as_ref()
+            .unwrap()
+            .gap
+            .pending_recovery_snapshot();
+        let mut state = create_test_state();
+        state.current_run_id = Some("root".into());
+        for outcome in ["wait_started", "wait_finished"] {
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_direct_child_completion_boundary(
+                &mut host, &state, outcome, 0, Instant::now());
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event["type"], "runtime_wait");
+            assert_eq!(event["run_id"], "root");
+            assert_eq!(event["waiting"], outcome == "wait_started");
+            assert!(
+                !crate::server::run::lifecycle::run_state::live_delta_event_for_persistence(&event)
+            );
+        }
+        // A saturated display channel must neither block execution nor queue
+        // a durable repair for this disposable observation.
+        for outcome in ["wait_started", "wait_finished"] {
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_direct_child_completion_boundary(
+                &mut host, &state, outcome, 0, Instant::now());
+        }
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| event["type"] != "runtime_wait")
+        );
+        assert_eq!(
+            host.event_tx
+                .as_ref()
+                .unwrap()
+                .gap
+                .pending_recovery_snapshot(),
+            recovery_before
+        );
+    }
 
     #[test]
     fn set_event_tx_disables_host_progress_subscription() {

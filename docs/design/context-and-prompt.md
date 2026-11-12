@@ -95,8 +95,13 @@ retirement for the current human turn. They use the existing typed canonical
 runtime history, deduplication, checkpoint and compaction path independently of
 provider cache placement. Other layouts re-home those frames into their required
 context lane; they do not turn them into human requests. Transport acceptance
-and model observation remain distinct, and retries do not consume an unanswered
-question's obligation before the matching answer is observed.
+and model observation remain distinct. Questions are asynchronous advisory
+messages. Bounded exact request/responder correlation survives recovery and is
+updated only after a successful provider observation; it never suspends or vetoes
+completion. Mismatched, unverified and non-adoption responses remain attributed
+context. A failed provider attempt retains staged input. An envelope still in
+transport when its recipient finishes follows the existing mailbox retirement
+rules; an answer needed for the task calls for explicit bounded observation.
 
 The explicitly selected append-only layout keeps its existing runtime-owned
 user frames, lifetimes, and durable history protocol. It is already a single-
