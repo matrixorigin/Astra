@@ -222,6 +222,31 @@ async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'
     }
 }
 
+/// A conflicting durable result is different from an unavailable dispatch.
+#[derive(Debug, thiserror::Error)]
+pub enum EdgeDispatchDeliveryError {
+    #[error("a different result is already recorded for this tool request")]
+    PayloadConflict,
+    #[error("edge dispatch service is not configured")]
+    Unconfigured,
+    #[error("edge dispatch database failure: {0}")]
+    Database(#[source] sqlx::Error),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<String> for EdgeDispatchDeliveryError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for EdgeDispatchDeliveryError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
 #[async_trait]
 pub trait EdgeDispatchService: Send + Sync {
     /// Atomically admit a durable request, preserving its serialized payload.
@@ -294,7 +319,7 @@ pub trait EdgeDispatchService: Send + Sync {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String>;
+    ) -> Result<bool, EdgeDispatchDeliveryError>;
 
     /// Terminal runs may settle only a previously claimed dispatch or replay
     /// the same completed result. An unclaimed pending request was not sent.
@@ -303,7 +328,7 @@ pub trait EdgeDispatchService: Send + Sync {
         _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
         Err("terminal dispatch settlement is unavailable".into())
     }
 
@@ -1611,7 +1636,7 @@ impl DatabaseEdgeDispatchService {
         edge_agent_id: &str,
         result_json: &str,
         allow_pending: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
         let start = std::time::Instant::now();
         let sql = if allow_pending {
             "UPDATE edge_pending_dispatch \
@@ -1634,7 +1659,7 @@ impl DatabaseEdgeDispatchService {
             .bind(edge_agent_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
+            .map_err(EdgeDispatchDeliveryError::Database)?;
         let updated = n.rows_affected() > 0;
         // A reconnect may replay a result whose first delivery committed but
         // whose ACK was lost. MatrixOne's JSON column may normalize object key
@@ -1657,26 +1682,27 @@ impl DatabaseEdgeDispatchService {
             .bind(edge_agent_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
+            .map_err(EdgeDispatchDeliveryError::Database)?;
             match row {
                 None => false,
                 Some(row) => {
-                    let status = row.try_get::<String, _>("status").map_err(|error| {
-                        format!("edge_dispatch replay status decode failed: {error}")
-                    })?;
+                    let status = row
+                        .try_get::<String, _>("status")
+                        .map_err(EdgeDispatchDeliveryError::Database)?;
                     if status != "completed" {
                         false
                     } else {
                         let body = row
                             .try_get::<Option<String>, _>("result_json")
-                            .map_err(|error| {
-                                format!("edge_dispatch replay result_json decode failed: {error}")
-                            })?
+                            .map_err(EdgeDispatchDeliveryError::Database)?
                             .ok_or_else(|| {
                                 "edge_dispatch completed replay row is missing result_json"
                                     .to_string()
                             })?;
-                        json_payloads_match(&body, result_json)?
+                        if !json_payloads_match(&body, result_json)? {
+                            return Err(EdgeDispatchDeliveryError::PayloadConflict);
+                        }
+                        true
                     }
                 }
             }
@@ -1963,7 +1989,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
         self.deliver_result_matching(identity, edge_agent_id, result_json, true)
             .await
     }
@@ -1973,7 +1999,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
         self.deliver_result_matching(identity, edge_agent_id, result_json, false)
             .await
     }
@@ -2311,8 +2337,16 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
         _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
-    ) -> Result<bool, String> {
-        Err("edge dispatch service not configured".to_string())
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
+        Ok(false)
+    }
+    async fn deliver_terminal_result(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+        _result_json: &str,
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
+        Err(EdgeDispatchDeliveryError::Unconfigured)
     }
     async fn fail_dispatch(
         &self,
@@ -2338,6 +2372,20 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn closed_dispatch_pool_reports_database_delivery_error() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://localhost/test")
+            .unwrap();
+        pool.close().await;
+        let dispatch = DatabaseEdgeDispatchService::new(pool);
+        let identity = EdgeDispatchIdentity::new("user", "session", "run", "turn", "request");
+        assert!(matches!(
+            dispatch.deliver_result(&identity, "edge", "{}").await,
+            Err(EdgeDispatchDeliveryError::Database(sqlx::Error::PoolClosed))
+        ));
+    }
 
     fn parse_dispatch_payload(json: &str) -> serde_json::Value {
         serde_json::from_str(json).expect("valid dispatch fixture")
@@ -4066,24 +4114,22 @@ mod tests {
         );
         let mut changed: serde_json::Value = serde_json::from_str(&result_json).unwrap();
         changed["tool_result_fields"]["nested"]["fraction"] = json!(0.25);
-        assert!(
-            !pod_c
+        assert!(matches!(
+            pod_c
                 .deliver_result(&identity, &edge_agent_id, &changed.to_string())
-                .await
-                .unwrap(),
-            "a different execution fact cannot replace an accepted receipt"
-        );
-        assert!(
-            !pod_c
+                .await,
+            Err(EdgeDispatchDeliveryError::PayloadConflict)
+        ));
+        assert!(matches!(
+            pod_c
                 .deliver_result(
                     &identity,
                     &edge_agent_id,
                     r#"{"status":"completed","output":"duplicate"}"#,
                 )
-                .await
-                .expect("duplicate terminal deliver should not error"),
-            "terminal result must not be overwritten"
-        );
+                .await,
+            Err(EdgeDispatchDeliveryError::PayloadConflict)
+        ));
 
         let row = sqlx::query(
             "SELECT status, result_json

@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
@@ -16631,6 +16632,12 @@ impl ServerAgenticLoopHost {
                 delivered_calls.push((tc, execution_deadline, frozen_work_attribution));
             }
 
+            // Consume each result as it arrives; the final model-facing batch
+            // is already assembled in request order below.
+            let mut waits = FuturesUnordered::new();
+            // Retain the existing per-batch fallback concurrency while local
+            // waiters continue to be polled during a slow durable lookup.
+            let fallback_limit = Arc::new(tokio::sync::Semaphore::new(1));
             for (tc, execution_deadline, work_attribution) in delivered_calls {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
@@ -16640,19 +16647,40 @@ impl ServerAgenticLoopHost {
                     turn_chain_id,
                     &id,
                 );
-                let started = std::time::Instant::now();
-                let delivery = self
-                    .wait_tool_result_with_dispatch_fallback(
+                let ledger = Arc::clone(&self.edge_callback_ledger);
+                let cancel = self.client_cancel_token.clone();
+                let edge_agent_id = selected_edge_agent_id.clone();
+                let dispatch_service = self.edge_dispatch_service.clone();
+                let fallback_limit = fallback_limit.clone();
+                waits.push(async move {
+                    let started = std::time::Instant::now();
+                    let delivery = Self::wait_tool_result_with_dispatch(
+                        (dispatch_service.as_deref(), &fallback_limit),
+                        &ledger,
                         tc,
                         &identity,
-                        &selected_edge_agent_id,
+                        &edge_agent_id,
                         execution_deadline
-                            .saturating_duration_since(Instant::now())
-                            .saturating_add(Duration::from_secs(10)),
+                            .checked_add(astra_turn_core::edge_ledger::TOOL_RESULT_DELIVERY_GRACE)
+                            .unwrap_or(execution_deadline)
+                            .saturating_duration_since(Instant::now()),
+                        cancel.as_deref(),
                     )
                     .await;
-
-                let duration_ms = started.elapsed().as_millis() as u64;
+                    (
+                        work_attribution,
+                        id,
+                        tool_name,
+                        args,
+                        delivery,
+                        started.elapsed(),
+                    )
+                });
+            }
+            while let Some((work_attribution, id, tool_name, args, delivery, elapsed)) =
+                waits.next().await
+            {
+                let duration_ms = elapsed.as_millis() as u64;
                 let delivery_sse_maps = delivery.sse_maps.clone();
                 // Preserve the raw edge observation until the canonical
                 // headless record/model boundary. `tool_messages` is already
@@ -16881,25 +16909,49 @@ impl ServerAgenticLoopHost {
             .filter(|milliseconds| *milliseconds > 0)
     }
 
-    async fn wait_tool_result_with_dispatch_fallback(
-        &self,
+    /// Wait on local callback custody without recurring database observation.
+    /// An unresolved callback gets the existing exact durable recovery read
+    /// after its receipt deadline or uncertain cancellation.
+    async fn wait_tool_result_with_dispatch(
+        dispatch: (Option<&dyn EdgeDispatchService>, &tokio::sync::Semaphore),
+        edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
         tc: &Value,
         identity: &astra_services::multi_agent::EdgeDispatchIdentity,
         edge_agent_id: &str,
-        ledger_wait: Duration,
+        budget: Duration,
+        cancel: Option<&CancellationToken>,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
-        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
-        use astra_turn_core::edge_ledger::tool_callback_key;
-
-        let delivery = wait_tool_result_ledger_for_tool_with_cancel(
-            &self.edge_callback_ledger,
-            edge_agent_id,
-            identity,
+        let delivery =
+            astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                edge_callback_ledger,
+                edge_agent_id,
+                identity,
+                tc,
+                budget,
+                cancel,
+            )
+            .await;
+        Self::resolve_tool_result_dispatch_fallback(
+            dispatch.0,
+            edge_callback_ledger,
+            (dispatch.1, cancel),
             tc,
-            ledger_wait,
-            self.client_cancel_token.as_deref(),
+            identity,
+            edge_agent_id,
+            delivery,
         )
-        .await;
+        .await
+    }
+
+    async fn resolve_tool_result_dispatch_fallback(
+        dispatch_service: Option<&dyn EdgeDispatchService>,
+        edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
+        wait_control: (&tokio::sync::Semaphore, Option<&CancellationToken>),
+        tc: &Value,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        delivery: astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+    ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
         let cancelled_unknown = delivery.tool_results.iter().any(|result| {
             result.status == "cancelled"
                 && result
@@ -16913,22 +16965,62 @@ impl ServerAgenticLoopHost {
             return delivery;
         }
 
-        let Some(dispatch_service) = &self.edge_dispatch_service else {
+        let Some(dispatch_service) = dispatch_service else {
             return delivery;
         };
-        let result_json = match tokio::time::timeout(
-            Duration::from_secs(1),
+        // On cancellation, bound both queueing and the lookup so a batch of
+        // stuck lookups cannot keep a stopped run alive. A normal timeout must
+        // still get its own chance to recover an already durable result.
+        let (fallback_limit, cancel) = wait_control;
+        let cancellation = async {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(cancellation);
+        let lookup_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let permit = if cancelled_unknown {
+            match tokio::time::timeout_at(lookup_deadline, fallback_limit.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                _ => return delivery,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut cancellation => return delivery,
+                permit = fallback_limit.acquire() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return delivery,
+                },
+            }
+        };
+        let lookup_deadline = if cancelled_unknown {
+            lookup_deadline
+        } else {
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        };
+        let lookup = tokio::time::timeout_at(
+            lookup_deadline,
             dispatch_service.wait_result(identity, Some(Duration::ZERO)),
-        )
-        .await
-        {
+        );
+        let lookup = if cancelled_unknown {
+            lookup.await
+        } else {
+            tokio::select! {
+                biased;
+                result = lookup => result,
+                _ = &mut cancellation => return delivery,
+            }
+        };
+        let result_json = match lookup {
             Ok(Ok(Some(result_json))) => result_json,
             Ok(Ok(None)) | Err(_) => return delivery,
             Ok(Err(error)) => {
                 tracing::warn!(
                     target: "astra_runtime::server_loop_host",
-                    user_id = %self.user_id,
-                    session_id = %self.session_id,
+                    user_id = %identity.user_id,
+                    session_id = %identity.session_id,
                     run_id = %identity.run_id,
                     turn_chain_id = %identity.turn_chain_id,
                     request_id = %identity.request_id,
@@ -16939,31 +17031,55 @@ impl ServerAgenticLoopHost {
             }
         };
 
+        drop(permit);
+        Self::project_tool_result_dispatch(
+            edge_callback_ledger,
+            tc,
+            identity,
+            edge_agent_id,
+            &result_json,
+        )
+        .await
+        .unwrap_or(delivery)
+    }
+
+    /// Project an authenticated durable result through the same canonical
+    /// validation and local-ledger consumer used by the final recovery read.
+    async fn project_tool_result_dispatch(
+        edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
+        tc: &Value,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Option<astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery> {
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
+        use astra_turn_core::edge_ledger::tool_callback_key;
+
         let (body, execution_completion) =
-            match canonical_edge_dispatch_result(identity, edge_agent_id, &result_json) {
+            match canonical_edge_dispatch_result(identity, edge_agent_id, result_json) {
                 Ok(body) => body,
                 Err(error) => {
                     tracing::warn!(
                         target: "astra_runtime::server_loop_host",
-                        user_id = %self.user_id,
-                        session_id = %self.session_id,
+                        user_id = %identity.user_id,
+                        session_id = %identity.session_id,
                         run_id = %identity.run_id,
                         turn_chain_id = %identity.turn_chain_id,
                         request_id = %identity.request_id,
                         error = %error,
-                        "edge dispatch fallback rejected a non-canonical durable result"
+                        "edge dispatch result rejected non-canonical durable evidence"
                     );
-                    return delivery;
+                    return None;
                 }
             };
         let key = tool_callback_key(identity);
         {
-            let mut ledger = self.edge_callback_ledger.lock().await;
+            let mut ledger = edge_callback_ledger.lock().await;
             ledger.entry(key).or_insert_with(|| {
                 json!({
                     "kind": "tool_result",
-                    "user_id": self.user_id.as_str(),
-                    "session_id": self.session_id.as_str(),
+                    "user_id": identity.user_id.as_str(),
+                    "session_id": identity.session_id.as_str(),
                     "run_id": identity.run_id.as_str(),
                     "turn_chain_id": identity.turn_chain_id.as_str(),
                     "body": body,
@@ -16972,17 +17088,19 @@ impl ServerAgenticLoopHost {
             });
         }
 
-        wait_tool_result_ledger_for_tool_with_cancel(
-            &self.edge_callback_ledger,
-            edge_agent_id,
-            identity,
-            tc,
-            Duration::from_millis(0),
-            // The authenticated durable result is already available; do not
-            // replace it with a synthetic cancellation in this second read.
-            None,
+        Some(
+            wait_tool_result_ledger_for_tool_with_cancel(
+                edge_callback_ledger,
+                edge_agent_id,
+                identity,
+                tc,
+                Duration::ZERO,
+                // The authenticated durable result is already available; do
+                // not replace it with a synthetic cancellation in this read.
+                None,
+            )
+            .await,
         )
-        .await
     }
 
     /// Prove that an already-committed Edge request still has process-local
@@ -30899,8 +31017,13 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct StaticWaitResultEdgeDispatch {
         result_json: Option<String>,
+        results_by_request: HashMap<String, String>,
+        wait_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        wait_count: AtomicU64,
+        wait_delay: Duration,
     }
 
     #[derive(Clone, Copy)]
@@ -30975,7 +31098,7 @@ mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             assert!(
                 self.admitted.load(Ordering::SeqCst),
                 "durable delivery requires prior admission"
@@ -31043,7 +31166,8 @@ mod tests {
             if let Some((dispatch, identity, edge_agent_id, result_json)) = &self.durable_delivery {
                 dispatch
                     .deliver_result(identity, edge_agent_id, result_json)
-                    .await?;
+                    .await
+                    .map_err(|error| error.to_string())?;
                 // Model the HTTP callback's durable write followed by its
                 // exact local result projection. Durable fallback has separate tests.
                 let (body, execution_completion) =
@@ -31077,8 +31201,8 @@ mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
-            Err("not used".to_string())
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+            Err("not used".into())
         }
 
         async fn fail_dispatch(
@@ -31092,10 +31216,22 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: Option<Duration>,
         ) -> Result<Option<String>, String> {
-            Ok(self.result_json.clone())
+            self.wait_count.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, resume)) = &self.wait_gate {
+                entered.notify_one();
+                resume.notified().await;
+            }
+            if !self.wait_delay.is_zero() {
+                tokio::time::sleep(self.wait_delay).await;
+            }
+            Ok(self
+                .results_by_request
+                .get(&identity.request_id)
+                .cloned()
+                .or_else(|| self.result_json.clone()))
         }
 
         async fn cleanup_stale(&self, _older_than: Duration) -> Result<u64, String> {
@@ -41680,10 +41816,24 @@ mod tests {
                         if all_dispatched { break; }
                         tokio::task::yield_now().await;
                     }
-                    for id in actor_ids.iter().rev() {
+                    for id in actor_ids.iter().skip(1).rev() {
                         actor_ledger.lock().await.insert(tool_callback_key("u-parallel", "s-parallel", id), json!({"body":{"request_id":id,"status":"ok","output":format!("file-{id}")}}));
                         tokio::task::yield_now().await;
                     }
+                    // Later results must be consumed even while the first
+                    // request is still running; this also bounds ledger use.
+                    loop {
+                        let consumed = {
+                            let entries = actor_ledger.lock().await;
+                            actor_ids.iter().skip(1).all(|id| {
+                                !entries.contains_key(&tool_callback_key("u-parallel", "s-parallel", id))
+                            })
+                        };
+                        if consumed { break; }
+                        tokio::task::yield_now().await;
+                    }
+                    let first = actor_ids[0];
+                    actor_ledger.lock().await.insert(tool_callback_key("u-parallel", "s-parallel", first), json!({"body":{"request_id":first,"status":"ok","output":format!("file-{first}")}}));
                 }).await.expect("all requests dispatched before callbacks");
             });
             let context = test_edge_action_context("u-parallel", "test-run").await;
@@ -41706,6 +41856,17 @@ mod tests {
                     .map(|call| call["id"].as_str().unwrap())
                     .collect::<Vec<_>>()
             );
+            let r1_end = host
+                .emitted_events
+                .iter()
+                .position(|event| event["type"] == "tool_call_end" && event["call_id"] == "r1")
+                .unwrap();
+            let r2_end = host
+                .emitted_events
+                .iter()
+                .position(|event| event["type"] == "tool_call_end" && event["call_id"] == "r2")
+                .unwrap();
+            assert!(r2_end < r1_end, "completion events follow actual delivery");
             let committed = sink.committed.lock().expect("interactions");
             // Admission emits the observer tool call once; dispatch and
             // completion retain their own exact request identity.
@@ -42359,6 +42520,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_wait_has_no_durable_reads_until_receipt_deadline() {
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-dispatch",
+            "s-dispatch",
+            "test-run",
+            "test-chain",
+            "r1",
+        );
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-1".into(),
+                status: "completed".into(),
+                output: "from another server instance".into(),
+                duration_ms: 17,
+                tool_result_fields: None,
+            },
+        );
+        let dispatch = StaticWaitResultEdgeDispatch {
+            result_json: Some(serde_json::to_string(&body).unwrap()),
+            ..Default::default()
+        };
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let fallback_limit = tokio::sync::Semaphore::new(1);
+        let tool_call = json!({
+            "id": identity.request_id,
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        });
+        // A local result must finish without any durable read.
+        let local_ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        local_ledger.lock().await.insert(
+            astra_turn_core::edge_ledger::tool_callback_key(&identity),
+            json!({"kind": "tool_result", "body": &body}),
+        );
+        let local = ServerAgenticLoopHost::wait_tool_result_with_dispatch(
+            (Some(&dispatch), &fallback_limit),
+            &local_ledger,
+            &tool_call,
+            &identity,
+            "edge-1",
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        assert_eq!(local.tool_results[0].status, "completed");
+        assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 0);
+
+        let wait = ServerAgenticLoopHost::wait_tool_result_with_dispatch(
+            (Some(&dispatch), &fallback_limit),
+            &ledger,
+            &tool_call,
+            &identity,
+            "edge-1",
+            Duration::from_secs(1),
+            None,
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(40)) => {},
+            _ = &mut wait => panic!("remote result must wait until the receipt deadline"),
+        }
+        assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 0);
+        let delivery = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("the receipt deadline and recovery read are bounded");
+        assert_eq!(delivery.tool_results[0].status, "completed");
+        assert_eq!(
+            delivery.raw_tool_output(0),
+            Some("from another server instance")
+        );
+        assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn wait_tool_result_dispatch_fallback_preserves_durable_result_after_timeout_or_cancel() {
         let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
             "u-dispatch",
@@ -42396,6 +42636,7 @@ mod tests {
             )
             .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
                 result_json: Some(result_json.clone()),
+                ..Default::default()
             }))
             .build();
             if cancelled {
@@ -42403,14 +42644,26 @@ mod tests {
                 cancel.cancel();
                 host.set_client_cancel(cancel);
             }
-            let delivery = host
-                .wait_tool_result_with_dispatch_fallback(
-                    &tool_call,
-                    &identity,
+            let local =
+                astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                    &host.edge_callback_ledger,
                     "edge-1",
+                    &identity,
+                    &tool_call,
                     Duration::from_millis(1),
+                    host.client_cancel_token.as_deref(),
                 )
                 .await;
+            let delivery = ServerAgenticLoopHost::resolve_tool_result_dispatch_fallback(
+                host.edge_dispatch_service.as_deref(),
+                &host.edge_callback_ledger,
+                (&tokio::sync::Semaphore::new(1), None),
+                &tool_call,
+                &identity,
+                "edge-1",
+                local,
+            )
+            .await;
 
             let tool_message = delivery
                 .tool_messages
@@ -42434,6 +42687,227 @@ mod tests {
                 "dispatch fallback should consume the synthesized ledger entry"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_a_batch_waiting_for_blocked_dispatch_fallback() {
+        for initially_cancelled in [false, true] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let dispatch = StaticWaitResultEdgeDispatch {
+                wait_gate: Some((entered.clone(), resume)),
+                ..Default::default()
+            };
+            let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-fallback",
+                "s-fallback",
+                "run-fallback",
+                "chain-fallback",
+                "r1",
+            );
+            let call = json!({
+                "id": "r1", "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            });
+            let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+            let cancel = CancellationToken::new();
+            if initially_cancelled {
+                cancel.cancel();
+            }
+            let local =
+                astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                    &ledger,
+                    "edge-1",
+                    &identity,
+                    &call,
+                    if initially_cancelled {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::ZERO
+                    },
+                    Some(&cancel),
+                )
+                .await;
+            let limit = tokio::sync::Semaphore::new(1);
+            let batch = futures_util::future::join_all((0..12).map(|_| {
+                ServerAgenticLoopHost::resolve_tool_result_dispatch_fallback(
+                    Some(&dispatch),
+                    &ledger,
+                    (&limit, Some(&cancel)),
+                    &call,
+                    &identity,
+                    "edge-1",
+                    local.clone(),
+                )
+            }));
+            tokio::pin!(batch);
+            tokio::select! {
+                _ = entered.notified() => {},
+                _ = &mut batch => panic!("the first durable lookup should still be blocked"),
+            }
+            assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 1);
+            if initially_cancelled {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            } else {
+                cancel.cancel();
+            }
+            let results = batch.await;
+            assert_eq!(results.len(), 12);
+            let expected = if initially_cancelled {
+                "cancelled"
+            } else {
+                "timed_out"
+            };
+            assert!(
+                results
+                    .iter()
+                    .all(|delivery| delivery.tool_results[0].status == expected)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_timed_out_result_can_recover_its_durable_fallback() {
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let mut identities = Vec::new();
+        let mut calls = Vec::new();
+        let mut local_results = Vec::new();
+        let mut durable_results = HashMap::new();
+        for index in 0..12 {
+            let request_id = format!("r{index}");
+            let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-fallback",
+                "s-fallback",
+                "run-fallback",
+                "chain-fallback",
+                &request_id,
+            );
+            let call = json!({
+                "id": request_id, "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            });
+            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: identity.session_id.clone(),
+                    run_id: identity.run_id.clone(),
+                    turn_chain_id: identity.turn_chain_id.clone(),
+                    request_id: identity.request_id.clone(),
+                    edge_agent_id: "edge-1".into(),
+                    status: "completed".into(),
+                    output: format!("result-{index}"),
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            );
+            durable_results.insert(
+                identity.request_id.clone(),
+                serde_json::to_string(&body).unwrap(),
+            );
+            let local =
+                astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                    &ledger,
+                    "edge-1",
+                    &identity,
+                    &call,
+                    Duration::ZERO,
+                    None,
+                )
+                .await;
+            identities.push(identity);
+            calls.push(call);
+            local_results.push(local);
+        }
+        let dispatch = StaticWaitResultEdgeDispatch {
+            results_by_request: durable_results,
+            wait_delay: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let limit = tokio::sync::Semaphore::new(1);
+        let results = futures_util::future::join_all((0..12).map(|index| {
+            ServerAgenticLoopHost::resolve_tool_result_dispatch_fallback(
+                Some(&dispatch),
+                &ledger,
+                (&limit, None),
+                &calls[index],
+                &identities[index],
+                "edge-1",
+                local_results[index].clone(),
+            )
+        }))
+        .await;
+        assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 12);
+        for (index, delivery) in results.iter().enumerate() {
+            assert_eq!(delivery.tool_results[0].status, "completed");
+            assert_eq!(
+                delivery.raw_tool_output(0),
+                Some(format!("result-{index}").as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_durable_result_wins_a_simultaneous_cancellation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-fallback",
+            "s-fallback",
+            "run-fallback",
+            "chain-fallback",
+            "r1",
+        );
+        let call = json!({
+            "id": "r1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        });
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-1".into(),
+                status: "completed".into(),
+                output: "known".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let dispatch = StaticWaitResultEdgeDispatch {
+            result_json: Some(serde_json::to_string(&body).unwrap()),
+            wait_gate: Some((entered.clone(), resume.clone())),
+            ..Default::default()
+        };
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let local =
+            astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                &ledger,
+                "edge-1",
+                &identity,
+                &call,
+                Duration::ZERO,
+                None,
+            )
+            .await;
+        let limit = tokio::sync::Semaphore::new(1);
+        let cancel = CancellationToken::new();
+        let fallback = ServerAgenticLoopHost::resolve_tool_result_dispatch_fallback(
+            Some(&dispatch),
+            &ledger,
+            (&limit, Some(&cancel)),
+            &call,
+            &identity,
+            "edge-1",
+            local,
+        );
+        tokio::pin!(fallback);
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = &mut fallback => panic!("durable lookup should be blocked"),
+        }
+        resume.notify_one();
+        cancel.cancel();
+        assert_eq!(fallback.await.tool_results[0].status, "completed");
     }
 
     #[tokio::test]
@@ -42480,6 +42954,7 @@ mod tests {
                 )
                 .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
                     result_json: Some(result_json.clone()),
+                    ..Default::default()
                 }))
                 .build();
                 if cancelled {
@@ -42492,14 +42967,20 @@ mod tests {
                     !host.edge_request_has_custody_or_result(&identity).await,
                     "invalid durable result must not prove callback custody"
                 );
-                let delivery = host
-                    .wait_tool_result_with_dispatch_fallback(
-                        &tool_call,
-                        &identity,
-                        "edge-1",
-                        Duration::from_millis(1),
-                    )
-                    .await;
+                let local = astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
+                    &host.edge_callback_ledger, "edge-1", &identity, &tool_call,
+                    Duration::from_millis(1), host.client_cancel_token.as_deref(),
+                ).await;
+                let delivery = ServerAgenticLoopHost::resolve_tool_result_dispatch_fallback(
+                    host.edge_dispatch_service.as_deref(),
+                    &host.edge_callback_ledger,
+                    (&tokio::sync::Semaphore::new(1), None),
+                    &tool_call,
+                    &identity,
+                    "edge-1",
+                    local,
+                )
+                .await;
                 assert_eq!(
                     delivery.tool_results[0].status,
                     if cancelled { "cancelled" } else { "timed_out" },

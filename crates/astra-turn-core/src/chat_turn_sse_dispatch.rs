@@ -366,13 +366,20 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// An owner-stamped terminal observed for this physical stream's root.
+    /// This is an observation, not proof of complete client-side settlement.
+    pub fn observed_root_terminal(&self) -> Option<&DurableRunTerminal> {
+        self.run_terminal.as_ref().filter(|terminal| {
+            terminal.owner_generation.is_some()
+                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+        })
+    }
+
     /// A classified failure accepted by the physical root terminal dispatcher.
     /// This proves failure closure, never successful completion or tool authority.
     pub fn has_authoritative_failed_terminal(&self) -> bool {
-        self.run_terminal.as_ref().is_some_and(|terminal| {
+        self.observed_root_terminal().is_some_and(|terminal| {
             terminal.status == DurableRunTerminalStatus::Failed
-                && terminal.owner_generation.is_some()
-                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                 && (self.has_authoritative_interrupted_terminal()
                     || terminal.error_kind.is_some_and(|kind| {
                         kind != astra_core::ErrorKind::ContractViolation
@@ -385,10 +392,8 @@ impl ChatTurnSseAccum {
     /// failure. Only the owner-stamped, validated terminal grants this closure.
     pub fn has_authoritative_interrupted_terminal(&self) -> bool {
         self.error_kind.is_none()
-            && self.run_terminal.as_ref().is_some_and(|terminal| {
+            && self.observed_root_terminal().is_some_and(|terminal| {
                 terminal.status == DurableRunTerminalStatus::Failed
-                    && terminal.owner_generation.is_some()
-                    && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                     && terminal.error_kind.is_none()
                     && terminal.interruption.is_some()
             })
@@ -692,6 +697,9 @@ pub struct EdgeApprovalRequest {
 }
 
 /// Deferred edge work from `tool_request` / approval SSE events.
+// Tool requests are the hot path and already own heap-backed data; avoid an
+// additional allocation for every request solely to shrink approval variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
@@ -711,6 +719,8 @@ pub enum ChatTurnEdgePending {
         /// across batching, local queueing, and SSE replay.
         execution_deadline_unix_ms: u64,
         execution_timeout_ms: u64,
+        /// Local monotonic deadline anchored when this request was received.
+        execution_deadline_at: tokio::time::Instant,
         command_timeout_cap_ms: Option<u64>,
         tool: String,
         args: Value,
@@ -729,6 +739,28 @@ pub enum ChatTurnEdgePending {
         run_id: Option<String>,
         requests: Vec<EdgeApprovalRequest>,
     },
+}
+
+/// Anchor the issued execution budget once; wall-clock skew can only shorten it.
+pub(crate) fn tool_request_execution_deadline(
+    timeout_ms: u64,
+    deadline_unix_ms: u64,
+    received_at: tokio::time::Instant,
+    received_unix_ms: u64,
+) -> tokio::time::Instant {
+    let max_ms = crate::edge_ledger::MAX_LEDGER_ENTRY_AGE.as_millis() as u64;
+    let remaining_ms = timeout_ms
+        .min(deadline_unix_ms.saturating_sub(received_unix_ms))
+        .min(max_ms);
+    received_at + std::time::Duration::from_millis(remaining_ms)
+}
+
+pub(crate) fn received_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// Validated live presentation and control updates for stream consumers.
@@ -946,6 +978,7 @@ fn apply_one_event(
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
     effects: &mut Vec<SseRenderEffect>,
+    pending_cleared: &mut bool,
 ) {
     let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if accum.root_identity.run_id().is_none()
@@ -984,7 +1017,9 @@ fn apply_one_event(
         }
     }
     if (accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
-        || accum.has_final_error())
+        || accum.has_final_error()
+        || accum.run_terminal.is_some()
+        || accum.server_loop_terminal)
         && matches!(
             etype,
             "tool_request" | "approval_required" | "approval_batch_required"
@@ -1381,6 +1416,12 @@ fn apply_one_event(
                         .unwrap_or(false),
                     execution_deadline_unix_ms,
                     execution_timeout_ms,
+                    execution_deadline_at: tool_request_execution_deadline(
+                        execution_timeout_ms,
+                        execution_deadline_unix_ms,
+                        tokio::time::Instant::now(),
+                        received_unix_ms(),
+                    ),
                     command_timeout_cap_ms,
                     tool,
                     args,
@@ -1469,6 +1510,8 @@ fn apply_one_event(
             accum.server_loop_terminal =
                 event.get("continuation_owner").and_then(Value::as_str) == Some("server");
             if accum.server_loop_terminal {
+                edge_pending.clear();
+                *pending_cleared = true;
                 if accum.thinking_active {
                     accum.thinking_active = false;
                     effects.push(SseRenderEffect::StopThinkingSpinner);
@@ -1810,6 +1853,7 @@ fn apply_one_event(
             accum.attempt_error_supersession_eligible = false;
             accum.explain_analyze_degraded = true;
             edge_pending.clear();
+            *pending_cleared = true;
         }
         "error" => {
             // Indexed errors are durable historical events. An error without
@@ -2050,6 +2094,8 @@ fn apply_one_event(
                                     | DurableRunTerminalStatus::Paused
                             );
                         accum.run_terminal = Some(terminal);
+                        edge_pending.clear();
+                        *pending_cleared = true;
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -2257,7 +2303,7 @@ fn dispatch_one_sse_event(
     edge_pending: &mut Vec<ChatTurnEdgePending>,
 ) -> Vec<SseRenderEffect> {
     match crate::sse::data_lines::validated_sse_event(block) {
-        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending),
+        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending).0,
         Err(_) => {
             accum.thinking_active = false;
             if accum.error_message.is_none() {
@@ -2272,13 +2318,20 @@ pub(crate) fn dispatch_decoded_sse_event(
     parsed: &crate::sse::data_lines::SseJsonDrain,
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
-) -> Vec<SseRenderEffect> {
+) -> (Vec<SseRenderEffect>, bool) {
     if accum.stream_complete {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut effects = Vec::new();
+    let mut pending_cleared = false;
     for event in &parsed.events {
-        apply_one_event(event, accum, edge_pending, &mut effects);
+        apply_one_event(
+            event,
+            accum,
+            edge_pending,
+            &mut effects,
+            &mut pending_cleared,
+        );
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             accum.turn_evaluation = None;
         }
@@ -2290,7 +2343,7 @@ pub(crate) fn dispatch_decoded_sse_event(
         }
         accum.stream_complete = true;
     }
-    effects
+    (effects, pending_cleared)
 }
 
 /// Buffers lossy UTF-8 from a `/chat/turn` body stream, yields complete blank-line SSE blocks, and
@@ -2350,19 +2403,6 @@ impl ChatTurnSseFramer {
             self.note_ttft_from_raw_event_text(block);
         }
         Ok(block)
-    }
-
-    /// Move the parser, including CRLF and UTF-8 boundary state, between the
-    /// main reader and the Edge read-ahead lane.
-    pub(crate) fn take_framing(&mut self) -> SseBlankLineUtf8Buf {
-        let mut replacement = SseBlankLineUtf8Buf::new();
-        replacement.mark_stream_started();
-        std::mem::replace(&mut self.sse, replacement)
-    }
-
-    pub(crate) fn restore_framing(&mut self, framing: SseBlankLineUtf8Buf) {
-        debug_assert_eq!(self.sse.buffered_bytes(), 0);
-        self.sse = framing;
     }
 
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
@@ -2426,6 +2466,24 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_tool_deadline_is_capped_by_the_issued_relative_budget() {
+        let received = tokio::time::Instant::now();
+        let wall_ms = 1_000_000;
+        assert_eq!(
+            tool_request_execution_deadline(500, wall_ms + 60_000, received, wall_ms),
+            received + std::time::Duration::from_millis(500),
+        );
+        assert_eq!(
+            tool_request_execution_deadline(500, wall_ms - 1, received, wall_ms),
+            received
+        );
+        assert_eq!(
+            tool_request_execution_deadline(u64::MAX, u64::MAX, received, wall_ms),
+            received + crate::edge_ledger::MAX_LEDGER_ENTRY_AGE,
+        );
+    }
 
     #[test]
     fn hook_config_diagnostics_are_advisory_render_effects() {
