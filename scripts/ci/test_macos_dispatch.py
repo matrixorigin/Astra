@@ -802,6 +802,17 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(self.invoke(main, "admit", pool="pr", sha=HEAD)[0], 1)
         self.assertEqual(self.invoke(main, "admit", pool="main", sha=MERGE)[0], 1)
 
+    def test_nonpreferred_mini_source_skips_without_failing_scheduler(self):
+        api = ApiFixture()
+        with patch.object(dispatch, "source", side_effect=dispatch.Unavailable("source does not prefer mini")):
+            self.assertEqual(self.invoke(api, "schedule")[0], 0)
+            self.assertEqual(self.invoke(api, "admit")[0], 1)
+
+    def test_other_unavailable_sources_still_fail_scheduler(self):
+        api = ApiFixture()
+        with patch.object(dispatch, "source", side_effect=dispatch.Unavailable("unsupported source event")):
+            self.assertEqual(self.invoke(api, "schedule")[0], 1)
+
     def test_unavailable_api_and_missing_controller_fail_without_paid_execution(self):
         api = ApiFixture()
         with patch.object(api, "get", side_effect=RuntimeError("unavailable")):
