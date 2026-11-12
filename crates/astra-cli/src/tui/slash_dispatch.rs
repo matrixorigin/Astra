@@ -883,7 +883,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
             };
             if let Some(mode) = command.mode {
-                ctx.state.explain = mode;
+                ctx.state.set_explain_mode(mode);
                 ctx.chat_widget
                     .set_explain_verbose(matches!(mode, ExplainMode::Verbose));
             }

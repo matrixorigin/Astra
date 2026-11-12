@@ -78,6 +78,29 @@ pub(crate) fn report_admission_rejection(
 ) {
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
+    if !is_llm_provider_auth_error(&failure.error)
+        && (failure.partial.failure_kind == Some(astra_core::ErrorKind::Auth)
+            || is_auth_error(&failure.error))
+    {
+        let mut message = String::from("Session expired. Run /login to refresh.\n");
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        }
+        message.push_str("  No model or tool ran.");
+        ui.show_error(&message);
+        return;
+    }
+    if failure.partial.error_code.as_deref() == Some("execution_binding_provider_required") {
+        let mut message = String::from(
+            "[execution_binding_provider_required] Execution provider registration or selection is required\n",
+        );
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        }
+        message.push_str("  For this checkout, run /login again or restart Astra to register local execution.\n  If using another provider, reconnect or select that provider before retrying.\n  No model or tool ran.");
+        ui.show_error(&message);
+        return;
+    }
     if failure.partial.error_code.as_deref() == Some("session_unavailable") {
         let mut message = String::from("Session is unavailable\n");
         if draft_restored {
@@ -130,17 +153,18 @@ pub(crate) fn report_admission_rejection(
         ui.show_error(&message);
         return;
     }
-    let mut message = admission_rejection_message(draft_restored);
+    let mut message = format!("{}\n", failure.error);
+    message.push_str(&admission_rejection_message(draft_restored));
     message.push_str("  No model or tool ran.");
     ui.show_error(&message);
 }
 
 fn admission_rejection_message(draft_restored: bool) -> String {
-    let mut message = String::from("Session execution is busy\n");
+    let mut message = String::from("Request rejected before execution\n");
     if draft_restored {
         message.push_str("  Your message was not sent; the draft is back in the composer.\n");
     } else {
-        message.push_str("  Your message was not sent; retry it after the conflict clears.\n");
+        message.push_str("  Your message was not sent; review the error before retrying.\n");
     }
     message
 }
@@ -153,7 +177,9 @@ pub(crate) fn report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    if is_llm_provider_auth_error(&failure.error) {
+    if failure.partial.prior_admission_ambiguous {
+        ui.show_error("  Server execution state is unknown: a dispatched request may have run without a confirmed outcome. Inspect the session before retrying; do not resend the message until its execution state is confirmed.");
+    } else if is_llm_provider_auth_error(&failure.error) {
         ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
     } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
@@ -330,7 +356,7 @@ mod tests {
             Some("session-current"),
         ));
         let message = admission_rejection_message(false);
-        assert!(message.contains("retry it after the conflict clears"));
+        assert!(message.contains("review the error before retrying"));
         assert!(!message.contains("back in the composer"));
     }
 
@@ -828,6 +854,58 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_prior_admission_never_claims_no_execution_or_restores_a_draft() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "last physical attempt rejected".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("execution_binding_provider_required".into()),
+                error_metadata: Some(serde_json::json!({"admission_state":"rejected"})),
+                prior_admission_ambiguous: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        super::report_turn_failure(
+            &mut state,
+            None,
+            "possibly executed message",
+            &failure,
+            Instant::now(),
+            &mut ui,
+        );
+        assert!(ui.restored_inputs.is_empty());
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("unknown") && shown.contains("do not resend"));
+        assert!(!shown.contains("No model or tool ran"));
+    }
+
+    #[test]
+    fn missing_execution_registration_restores_input_with_login_recovery() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "legacy generic invalid_request text".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("execution_binding_provider_required".into()),
+                error_metadata: Some(serde_json::json!({"admission_state":"rejected"})),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "my first message", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["my first message"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("execution_binding_provider_required"));
+        assert!(shown.contains("/login"));
+        assert!(shown.contains("No model or tool ran"));
+        assert!(!shown.contains("busy") && !shown.contains("session cancel"));
     }
 
     #[test]

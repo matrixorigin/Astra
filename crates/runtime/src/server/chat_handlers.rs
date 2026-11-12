@@ -277,7 +277,8 @@ pub(super) async fn chat_stream_handler(
         .await
     {
         Ok(principal) => principal,
-        Err((status, error)) => {
+        Err((status, mut error)) => {
+            mark_attempt_rejected(&mut error.0);
             return sse_error_response_from_error_with_request_id(
                 status,
                 error.0,
@@ -287,7 +288,8 @@ pub(super) async fn chat_stream_handler(
     };
     let request = match parse_chat_request_body(&body) {
         Ok(request) => request,
-        Err((status, error)) => {
+        Err((status, mut error)) => {
+            mark_attempt_rejected(&mut error.0);
             return sse_error_response_from_error_with_request_id(
                 status,
                 error.0,
@@ -327,7 +329,8 @@ pub(super) async fn chat_stream_handler(
     );
     let resolved = match resolved {
         Ok(resolved) => resolved,
-        Err((status, error)) => {
+        Err((status, mut error)) => {
+            mark_attempt_rejected(&mut error.0);
             return sse_error_response_from_error_with_context(
                 status,
                 error.0,
@@ -342,7 +345,8 @@ pub(super) async fn chat_stream_handler(
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
     chat_data.session_admission_facts = resolved.session_admission_facts;
-    if let Err((status, error)) = runtime_context {
+    if let Err((status, mut error)) = runtime_context {
+        mark_attempt_rejected(&mut error.0);
         return sse_error_response_from_error_with_context(
             status,
             error.0,
@@ -846,6 +850,46 @@ mod chat_stream_lifecycle_tests {
             .filter(|data| *data != "[DONE]")
             .map(|data| serde_json::from_str(data).expect("SSE data must be JSON"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn chat_stream_early_rejections_prove_only_this_attempt_was_not_admitted() {
+        for (authorization, payload, kind) in [
+            ("Bearer revoked-token", r#"{"message":"hi"}"#, "auth"),
+            ("Bearer good-token", "not JSON", "invalid_request"),
+        ] {
+            let lifecycle = RecordingStreamChatLifecycle::default();
+            let app = build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(StubAuthService))
+                    .with_session_service(Arc::new(StubSessionService))
+                    .with_run_lifecycle_service(Arc::new(lifecycle.clone())),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/chat/stream")
+                        .header("authorization", authorization)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let events = sse_json_events(std::str::from_utf8(&bytes).unwrap());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["type"], "error");
+            assert_eq!(events[0]["error_kind"], kind);
+            assert_eq!(events[0]["metadata"]["attempt_admission_state"], "rejected");
+            assert!(events[0]["metadata"].get("admission_state").is_none());
+            assert!(events[0].get("run_id").is_none());
+            assert!(lifecycle.recorded_requests().await.is_empty());
+        }
     }
 
     #[derive(Clone)]

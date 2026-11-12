@@ -247,11 +247,8 @@ mod tests {
             };
             let error_code = Some(rejected_code.to_string());
             let error_metadata = Some(serde_json::json!({"admission_state": "rejected"}));
-            let admission_rejected = crate::cli::chat_stream::is_pre_admission_rejection(
-                error_code.as_deref(),
-                error_metadata.as_ref(),
-                None,
-            );
+            let admission_rejected =
+                crate::cli::chat_stream::is_pre_admission_rejection(error_metadata.as_ref(), None);
             assert!(
                 admission_rejected,
                 "server_admission_host's own classifier must agree this is pre-admission"

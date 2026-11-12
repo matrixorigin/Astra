@@ -292,9 +292,9 @@ pub(crate) async fn do_login(
     username: &str,
     password: &str,
 ) -> Result<String, String> {
-    let tokens = request_login_tokens(api, username, password).await?;
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    let authentication = request_password_authentication(api, username, password, None).await?;
+    save_profile_auth_tokens(profile, username, &authentication.tokens)?;
+    Ok(authentication.execution_token)
 }
 
 pub(crate) async fn do_memoria_login_with_key(
@@ -302,7 +302,9 @@ pub(crate) async fn do_memoria_login_with_key(
     profile: Option<&str>,
     connection_key: &str,
 ) -> Result<String, String> {
+    require_legacy_login()?;
     let tokens = request_memoria_tokens(api, connection_key).await?;
+    let execution_token = execution_token_for_login(api, &tokens).await?;
     save_profile_auth_tokens(profile, "memoria", &tokens)?;
     credential_store()
         .mutate(|creds| {
@@ -316,17 +318,62 @@ pub(crate) async fn do_memoria_login_with_key(
             }
         })
         .map_err(|error| error.to_string())?;
-    Ok(tokens.access_token)
+    Ok(execution_token)
+}
+
+fn require_legacy_login() -> Result<(), String> {
+    if crate::cli::native_auth::active().is_some() {
+        return Err("Use browser sign-in for the current authenticated connection.".into());
+    }
+    Ok(())
+}
+
+/// Every legacy login must bind local identity to the bearer used by turns.
+/// Validate an environment override before any credential/identity publication.
+async fn execution_token_for_login(
+    api: &astra_thin_client::ThinClient,
+    tokens: &AuthTokenPayload,
+) -> Result<String, String> {
+    let Some(token) = crate::cli::session::session_runtime::active_env_access_token(
+        chrono::Utc::now().timestamp(),
+    ) else {
+        return Ok(tokens.access_token.clone());
+    };
+    #[derive(Deserialize)]
+    struct AuthMe {
+        user_id: String,
+    }
+    // This is an explicit credential check, not a request under the old
+    // generation's bearer provider. Bound headers and body together.
+    let explicit_api = api.clone().without_bearer_provider();
+    let me = tokio::time::timeout(
+        Duration::from_secs(15),
+        explicit_api.get_auth_me_text(&token),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|body| serde_json::from_str::<AuthMe>(&body).ok())
+    .ok_or("Cannot verify ASTRA_ACCESS_TOKEN. Unset it and restart Astra before signing in.")?;
+    if me.user_id != tokens.user_id {
+        return Err("ASTRA_ACCESS_TOKEN selects a different account. Unset it and restart Astra before signing in.".into());
+    }
+    Ok(token)
 }
 
 async fn request_memoria_tokens(
     api: &astra_thin_client::ThinClient,
     connection_key: &str,
 ) -> Result<AuthTokenPayload, String> {
-    let body = api
-        .post_auth_memoria_json(&serde_json::json!({ "connection_key": connection_key }))
-        .await
-        .map_err(map_thin_err)?;
+    // Bound the network exchange itself, before credential publication. Dropping
+    // this wait never detaches a credential writer or replays a consumed key.
+    let body = tokio::time::timeout(
+        Duration::from_secs(15),
+        api.post_auth_memoria_json(&serde_json::json!({ "connection_key": connection_key })),
+    )
+    .await
+    .map_err(|_| "Sign-in response was not confirmed. Run astra login again; the connection key will not be replayed.".to_string())?
+    .map_err(map_thin_err)?;
     parse_auth_tokens(&body)
 }
 
@@ -826,10 +873,13 @@ pub(crate) async fn do_register(
     email: &str,
     password: &str,
 ) -> Result<String, String> {
-    let tokens = request_register_tokens(api, username, email, password).await?;
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    let authentication =
+        request_password_authentication(api, username, password, Some(email)).await?;
+    save_profile_auth_tokens(profile, username, &authentication.tokens)?;
+    Ok(authentication.execution_token)
 }
+
+const REGISTRATION_OUTCOME_UNKNOWN: &str = "Registration outcome is unknown: the account may have been created. Try /login with the chosen credentials before registering again.";
 
 async fn request_register_tokens(
     api: &astra_thin_client::ThinClient,
@@ -844,14 +894,35 @@ async fn request_register_tokens(
             "password": password,
         }))
         .await
-        .map_err(map_thin_err)?;
-    parse_auth_tokens(&body)
+        .map_err(|error| {
+            use astra_thin_client::ThinClientError;
+            match &error {
+                ThinClientError::Http(cause) if !cause.is_connect() && !cause.is_builder() => {
+                    REGISTRATION_OUTCOME_UNKNOWN.to_string()
+                }
+                ThinClientError::Api { status, .. }
+                    if !status.is_client_error()
+                        || *status == reqwest::StatusCode::REQUEST_TIMEOUT =>
+                {
+                    REGISTRATION_OUTCOME_UNKNOWN.to_string()
+                }
+                _ => format!("Register failed: {}", map_thin_err(error)),
+            }
+        })?;
+    parse_auth_tokens(&body).map_err(|_| REGISTRATION_OUTCOME_UNKNOWN.to_string())
 }
 
 const AUTH_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
 
-fn ensure_shells_can_rebind(state: &SessionState) -> Result<(), String> {
+pub(crate) fn ensure_authentication_can_rebind(state: &SessionState) -> Result<(), String> {
+    if !state
+        .active_work_registry
+        .active_work_observations()
+        .is_empty()
+    {
+        return Err("Local agent work is still active or awaiting settlement. Wait for it to finish or stop it before changing authentication.".into());
+    }
     if state.background_tasks.running_count() > 0 {
         return Err("Local shell tasks are still running. Wait for them to finish or stop them before switching accounts.".into());
     }
@@ -861,12 +932,72 @@ fn ensure_shells_can_rebind(state: &SessionState) -> Result<(), String> {
     Ok(())
 }
 
-async fn retire_auth_runtime(state: &mut SessionState) {
-    if let Some(spawner) = state.agent_spawner.take() {
-        spawner
-            .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
-            .await;
+pub(crate) struct SessionAuthRetirement {
+    runtime: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    finalization: Option<crate::cli::session::session_cleanup::SessionFinalization>,
+}
+
+impl SessionAuthRetirement {
+    pub(crate) async fn retire_runtime(&mut self) {
+        if let Some(spawner) = self.runtime.take() {
+            spawner
+                .shutdown_and_wait_with_reason(
+                    AUTH_RUNTIME_SHUTDOWN_WAIT,
+                    AUTH_RUNTIME_REPLACED_REASON,
+                )
+                .await;
+        }
     }
+
+    pub(crate) async fn run(mut self) -> Result<(), String> {
+        self.retire_runtime().await;
+        if let Some(finalization) = self.finalization {
+            finalization.run(Duration::from_secs(5)).await?;
+        }
+        Ok(())
+    }
+
+    /// Browser publication is the first point at which a changed owner is known.
+    /// Merely opening or cancelling the browser must not end the live Session.
+    pub(crate) async fn finish_browser(
+        self,
+        previous_owner: &astra_services::OwnerScope,
+        uc: bool,
+        api: &astra_thin_client::ThinClient,
+    ) -> Result<BrowserIdentity, String> {
+        let (owner, user_id) = if uc {
+            crate::cli::native_auth::published_owner_identity().await?
+        } else {
+            (
+                astra_services::local_owner_scope(),
+                crate::cli::cli_config::cli_utils::cli_account_id()
+                    .ok_or("Login completed without an authenticated account")?,
+            )
+        };
+        let owner_changed = &owner != previous_owner;
+        if uc && owner_changed {
+            crate::cli::native_auth::bind_after_login(api)?;
+        }
+        let retirement_notice = if owner_changed && let Some(finalization) = self.finalization {
+            finalization.run(Duration::from_secs(5)).await.and_then(|outcome| outcome.memory_maintenance).err().map(|_| {
+                tracing::warn!(reason = "old_session_finalization_unconfirmed", "previous session finalization was not confirmed after sign-in");
+                "Signed in, but the previous session could not finish finalization. Its local data was retained. Sign in to the previous account, resume that session and exit to retry finalization.".to_string()
+            })
+        } else {
+            None
+        };
+        Ok(BrowserIdentity {
+            owner_changed,
+            user_id,
+            retirement_notice,
+        })
+    }
+}
+
+pub(crate) struct BrowserIdentity {
+    pub(crate) owner_changed: bool,
+    pub(crate) user_id: String,
+    pub(crate) retirement_notice: Option<String>,
 }
 
 #[derive(Debug)]
@@ -876,11 +1007,11 @@ struct PreparedAuthTransition {
     runtime_config: Option<(astra_config::RuntimeConfig, String)>,
 }
 
-async fn prepare_session_auth_transition(
+fn prepare_session_auth_transition(
     profile: Option<&str>,
     account_id: &str,
     state: &mut SessionState,
-) -> Result<PreparedAuthTransition, String> {
+) -> Result<(PreparedAuthTransition, SessionAuthRetirement), String> {
     let credentials = load_credentials();
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
@@ -888,29 +1019,33 @@ async fn prepare_session_auth_transition(
     let runtime_needs_initialization = state.agent_spawner.is_none();
 
     let runtime_config = if owner_changed {
-        ensure_shells_can_rebind(state)?;
+        ensure_authentication_can_rebind(state)?;
         let prepared =
             crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
-        retire_auth_runtime(state).await;
-        crate::cli::session::session_cleanup::finalize_session(state).await?;
         Some(prepared)
     } else {
-        if runtime_needs_initialization {
-            // A same-owner login after `/logout`, or a partially initialized
-            // runtime, is not a session boundary. Retire any incomplete half and
-            // rebuild it after the new credentials have been saved.
-            retire_auth_runtime(state).await;
-        }
         None
     };
-    Ok(PreparedAuthTransition {
-        owner_changed,
-        runtime_needs_initialization: owner_changed || runtime_needs_initialization,
-        runtime_config,
-    })
+    let retirement = SessionAuthRetirement {
+        runtime: if owner_changed || runtime_needs_initialization {
+            state.agent_spawner.take()
+        } else {
+            None
+        },
+        finalization: owner_changed
+            .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
+    };
+    Ok((
+        PreparedAuthTransition {
+            owner_changed,
+            runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+            runtime_config,
+        },
+        retirement,
+    ))
 }
 
 fn commit_session_auth_transition(
@@ -931,28 +1066,113 @@ fn commit_session_auth_transition(
 }
 
 /// End the old owner's runtime before browser login can publish new credentials.
-/// Cancellation retains credentials, but starts a fresh local conversation.
+/// Cancellation retains the active attachment, model and conversation context.
+pub(crate) fn prepare_browser_session_retirement(
+    state: &mut SessionState,
+) -> Result<SessionAuthRetirement, String> {
+    ensure_authentication_can_rebind(state)?;
+    let retirement = SessionAuthRetirement {
+        runtime: state.agent_spawner.take(),
+        finalization: state
+            .session_id
+            .is_some()
+            .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
+    };
+    state.session_memory_port = None;
+    Ok(retirement)
+}
+
+#[cfg(test)]
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
-    ensure_shells_can_rebind(state)?;
+    prepare_browser_session_retirement(state)?
+        .retire_runtime()
+        .await;
+    Ok(())
+}
+
+pub(crate) struct PreparedBrowserLogin {
+    api: astra_thin_client::ThinClient,
+    token: String,
+    services: IdentityServices,
+    registration: Result<(), String>,
+}
+
+pub(crate) struct BrowserLoginCompletion {
+    pub(crate) api: astra_thin_client::ThinClient,
+    pub(crate) token: String,
+    pub(crate) modules: crate::cli::session::session_runtime::PipelineModules,
+    pub(crate) registration: Result<(), String>,
+}
+
+pub(crate) async fn prepare_browser_session_login(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    uc: bool,
+) -> Result<PreparedBrowserLogin, String> {
+    let api = if uc {
+        crate::cli::native_auth::bind_after_login(api)?
+    } else {
+        api.clone().without_bearer_provider()
+    };
+    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
+        .await
+        .ok_or("Login completed but no usable session credential is available")?;
+    let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
+        .ok_or("Login completed but no authenticated account identity is available")?;
+    let registration = crate::cli::edge_lifecycle::register_after_login(&api, &token).await;
+    let services = build_identity_services(&api, profile, &user_id).await;
+    Ok(PreparedBrowserLogin {
+        api,
+        token,
+        services,
+        registration,
+    })
+}
+
+pub(crate) fn commit_browser_session_login(
+    prepared: PreparedBrowserLogin,
+    state: &mut SessionState,
+) -> BrowserLoginCompletion {
+    let modules = prepared.services.apply(state);
+    let registration = finish_authenticated_session_login(true, prepared.registration, state);
+    BrowserLoginCompletion {
+        api: prepared.api,
+        token: prepared.token,
+        modules,
+        registration,
+    }
+}
+
+/// Credentials have committed. Replace credential-owned services in every case,
+/// but retire the conversation only when its account or environment changed.
+pub(crate) fn commit_browser_session_identity(
+    state: &mut SessionState,
+    owner_changed: bool,
+    user_id: &str,
+) -> Result<(), String> {
+    if owner_changed {
+        state.reset_for_new_session();
+        state.clear_session_id();
+        state.model = None;
+    }
+    state.ingestion_user_id = Some(user_id.to_owned());
+    invalidate_identity_services(state);
+    if !owner_changed {
+        return Ok(());
+    }
     let (config, version) =
         crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
-    retire_auth_runtime(state).await;
-    if state.session_id.is_some() {
-        crate::cli::session::session_cleanup::finalize_session(state).await?;
-    }
-    state.session_memory_port = None;
-    state.reset_for_new_session();
-    state.clear_session_id();
-    state.model = None;
     crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
     Ok(())
 }
 
-pub(crate) async fn finish_browser_session_login(
+#[cfg(test)]
+async fn finish_browser_session_login(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     uc: bool,
     state: &mut SessionState,
+    edge_heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<
     (
         astra_thin_client::ThinClient,
@@ -961,74 +1181,247 @@ pub(crate) async fn finish_browser_session_login(
     ),
     String,
 > {
-    let api = if uc {
-        crate::cli::native_auth::bind_after_login(api)?
-    } else {
-        api.clone()
-    };
-    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
-        .await
-        .ok_or("Login completed but no usable session credential is available")?;
-    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    let (config, version) =
-        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
-    state.ingestion_user_id = Some(user_id);
-    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
-    // A workbench started while signed out skipped startup registration. Publish
-    // its stable checkout binding under the new identity before admitting chat.
-    crate::cli::edge_lifecycle::register_edge_once(&api, &token)
-        .await
-        .map_err(|_| {
-            "Signed in, but local execution registration failed. Retry /login before chatting."
-                .to_string()
-        })?;
-    let modules = rebuild_browser_identity_services(&api, profile, state).await;
-    crate::cli::agent_runtime::initialize_agent_projection(state);
+    crate::cli::edge_lifecycle::stop_heartbeat(edge_heartbeat).await;
+    commit_browser_session_identity(
+        state,
+        true,
+        &crate::cli::cli_config::cli_utils::cli_user_id(),
+    )?;
+    let prepared = prepare_browser_session_login(api, profile, uc).await?;
+    let BrowserLoginCompletion {
+        api,
+        token,
+        modules,
+        registration,
+    } = commit_browser_session_login(prepared, state);
+    registration?;
+    crate::cli::edge_lifecycle::complete_login_rebind(&api, &token, profile, edge_heartbeat).await;
     Ok((api, token, modules))
 }
 
-async fn rebuild_browser_identity_services(
+/// Publishing credentials retires identity-owned caches even if completing
+/// local execution later fails. No subsequent lazy runtime may inherit them.
+pub(crate) fn invalidate_identity_services(state: &mut SessionState) {
+    state.session_memory_port = None;
+    state.unified_skill_registry =
+        std::sync::Arc::new(astra_runtime::skills::UnifiedSkillRegistry::new());
+    state.mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+        crate::mcp_client::McpClientManager::new(),
+    ));
+}
+
+pub(crate) struct IdentityServices {
+    modules: crate::cli::session::session_runtime::PipelineModules,
+    memory: Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
+}
+
+impl IdentityServices {
+    pub(crate) fn apply(
+        self,
+        state: &mut SessionState,
+    ) -> crate::cli::session::session_runtime::PipelineModules {
+        state.unified_skill_registry = self.modules.unified_skill_registry.clone();
+        state.mcp_manager = self.modules.mcp_manager.clone();
+        state.session_memory_port = self.memory;
+        self.modules
+    }
+}
+
+/// Reuse startup composition for every sign-in method. Build without borrowing
+/// the workbench so authenticated HTTP I/O remains on its supervised task.
+pub(crate) async fn build_identity_services(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut SessionState,
-) -> crate::cli::session::session_runtime::PipelineModules {
-    // A new identity/generation must not inherit cached private skills or a
-    // provider pinned to the preceding login. Reuse the startup composition.
+    authenticated_user_id: &str,
+) -> IdentityServices {
     let modules = crate::cli::session::session_runtime::create_tui_pipeline_modules(
         api,
         profile,
         crate::cli::session::session_runtime::resolved_session_project_root().as_deref(),
     )
     .await;
-    state.unified_skill_registry = modules.unified_skill_registry.clone();
-    state.mcp_manager = modules.mcp_manager.clone();
-    state.session_memory_port =
-        crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
-    modules
+    let memory = Some(
+        crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+            api,
+            profile,
+            authenticated_user_id,
+        )
+        .await,
+    );
+    IdentityServices { modules, memory }
 }
 
+pub(crate) struct PasswordAuthentication {
+    tokens: AuthTokenPayload,
+    execution_token: String,
+}
+
+pub(crate) struct PreparedPasswordLogin {
+    pub(crate) user_id: String,
+    pub(crate) token: String,
+    pub(crate) owner_changed: bool,
+    initialize_runtime: bool,
+}
+
+pub(crate) struct PreparedPasswordPublication {
+    authentication: PasswordAuthentication,
+    transition: PreparedAuthTransition,
+}
+
+/// Network-only authentication phase, owned by the TUI's existing login task.
+/// Do not publish credentials until the active environment identity is checked.
+pub(crate) async fn request_password_authentication(
+    api: &astra_thin_client::ThinClient,
+    username: &str,
+    password: &str,
+    email: Option<&str>,
+) -> Result<PasswordAuthentication, String> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        require_legacy_login()?;
+        if email.is_some() && crate::cli::session::session_runtime::active_env_access_token(chrono::Utc::now().timestamp()).is_some() {
+            return Err("Unset ASTRA_ACCESS_TOKEN and restart Astra before creating a new account. Use /login to sign in to an existing account.".into());
+        }
+        let tokens = if let Some(email) = email {
+            request_register_tokens(api, username, email, password).await?
+        } else {
+            request_login_tokens(api, username, password).await.map_err(|error| format!("Login failed: {error}"))?
+        };
+        let execution_token = execution_token_for_login(api, &tokens).await?;
+        Ok(PasswordAuthentication { tokens, execution_token })
+    }).await.map_err(|_| if email.is_some() {
+        REGISTRATION_OUTCOME_UNKNOWN.to_string()
+    } else { "Login failed: authentication timed out; retry sign-in.".to_string() })?
+}
+
+pub(crate) async fn prepare_password_session_login(
+    profile: Option<&str>,
+    username: &str,
+    authentication: PasswordAuthentication,
+    state: &mut SessionState,
+) -> Result<PreparedPasswordLogin, String> {
+    let publication = prepare_password_session_login_task(profile, authentication, state)?.await?;
+    publish_password_session_login(profile, username, publication, state)
+}
+
+pub(crate) fn prepare_password_session_login_task(
+    profile: Option<&str>,
+    authentication: PasswordAuthentication,
+    state: &mut SessionState,
+) -> Result<
+    impl std::future::Future<Output = Result<PreparedPasswordPublication, String>>
+    + Send
+    + 'static
+    + use<>,
+    String,
+> {
+    let (transition, retirement) =
+        prepare_session_auth_transition(profile, &authentication.tokens.user_id, state)?;
+    Ok(async move {
+        retirement.run().await?;
+        Ok(PreparedPasswordPublication {
+            authentication,
+            transition,
+        })
+    })
+}
+
+pub(crate) fn publish_password_session_login(
+    profile: Option<&str>,
+    username: &str,
+    publication: PreparedPasswordPublication,
+    state: &mut SessionState,
+) -> Result<PreparedPasswordLogin, String> {
+    let PreparedPasswordPublication {
+        authentication,
+        transition,
+    } = publication;
+    tracing::debug!(
+        owner_changed = transition.owner_changed,
+        runtime_needs_initialization = transition.runtime_needs_initialization,
+        "prepared authenticated session transition"
+    );
+    save_profile_auth_tokens(profile, username, &authentication.tokens)?;
+    invalidate_identity_services(state);
+    let owner_changed = transition.owner_changed;
+    let initialize_runtime =
+        commit_session_auth_transition(transition, &authentication.tokens.user_id, state);
+    Ok(PreparedPasswordLogin {
+        user_id: authentication.tokens.user_id,
+        token: authentication.execution_token,
+        owner_changed,
+        initialize_runtime,
+    })
+}
+
+/// Native mode never sends a generic advertisement. Ask its existing owner to
+/// republish after credential changes; turn preparation awaits that publication.
+pub(crate) fn finish_password_session_login(
+    prepared: &PreparedPasswordLogin,
+    registration: Result<(), String>,
+    state: &mut SessionState,
+) -> Result<(), String> {
+    finish_authenticated_session_login(prepared.initialize_runtime, registration, state)
+}
+
+fn finish_authenticated_session_login(
+    initialize_runtime: bool,
+    registration: Result<(), String>,
+    state: &mut SessionState,
+) -> Result<(), String> {
+    state.native_delivery_refresh.request();
+    registration?;
+    if initialize_runtime {
+        crate::cli::agent_runtime::initialize_agent_projection(state);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn do_password_for_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    username: &str,
+    password: &str,
+    email: Option<&str>,
+    state: &mut SessionState,
+    edge_heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<String, String> {
+    let authentication = request_password_authentication(api, username, password, email).await?;
+    let prepared = prepare_password_session_login(profile, username, authentication, state).await?;
+    let registration = crate::cli::edge_lifecycle::rebind_after_login(
+        api,
+        &prepared.token,
+        profile,
+        edge_heartbeat,
+        prepared.owner_changed,
+    )
+    .await;
+    finish_password_session_login(&prepared, registration, state)?;
+    Ok(prepared.token)
+}
+
+#[cfg(test)]
 pub(crate) async fn do_login_for_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     username: &str,
     password: &str,
     state: &mut SessionState,
+    edge_heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<String, String> {
-    let tokens = request_login_tokens(api, username, password).await?;
-    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
-    tracing::debug!(
-        owner_changed = transition.owner_changed,
-        runtime_needs_initialization = transition.runtime_needs_initialization,
-        "prepared authenticated session transition"
-    );
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    let access_token = tokens.access_token.clone();
-    if commit_session_auth_transition(transition, &tokens.user_id, state) {
-        crate::cli::agent_runtime::initialize_agent_projection(state);
-    }
-    Ok(access_token)
+    do_password_for_session(
+        api,
+        profile,
+        username,
+        password,
+        None,
+        state,
+        edge_heartbeat,
+    )
+    .await
 }
 
+#[cfg(test)]
 pub(crate) async fn do_register_for_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -1036,29 +1429,117 @@ pub(crate) async fn do_register_for_session(
     email: &str,
     password: &str,
     state: &mut SessionState,
+    edge_heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<String, String> {
-    // Account creation has an external side effect; check local task ownership
-    // before creating an account that we may be unable to bind.
-    ensure_shells_can_rebind(state)?;
-    let tokens = request_register_tokens(api, username, email, password).await?;
-    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
-    tracing::debug!(
-        owner_changed = transition.owner_changed,
-        runtime_needs_initialization = transition.runtime_needs_initialization,
-        "prepared authenticated session transition"
-    );
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    let access_token = tokens.access_token;
-    if commit_session_auth_transition(transition, &tokens.user_id, state) {
-        crate::cli::agent_runtime::initialize_agent_projection(state);
-    }
-    Ok(access_token)
+    do_password_for_session(
+        api,
+        profile,
+        username,
+        password,
+        Some(email),
+        state,
+        edge_heartbeat,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::session::session_state::SessionState;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn invalidated_login_registry_cannot_share_mcp_instructions_with_another_identity() {
+        let mut state = SessionState::default();
+        super::invalidate_identity_services(&mut state);
+        let first = state.unified_skill_registry.clone();
+        first.register_mcp_skill("synthetic-owner-a", "---\nname: identity-private-probe\ndescription: Synthetic private skill\n---\nOwner A only instructions.")
+            .await.unwrap();
+        assert!(
+            first
+                .load("identity-private-probe")
+                .await
+                .unwrap()
+                .instructions
+                .contains("Owner A only")
+        );
+
+        super::invalidate_identity_services(&mut state);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first,
+            &state.unified_skill_registry
+        ));
+        // No replacement MCP server is available to overwrite the old cache.
+        state.unified_skill_registry.discover_all().await.unwrap();
+        assert!(
+            state
+                .unified_skill_registry
+                .load("identity-private-probe")
+                .await
+                .is_err()
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &state.unified_skill_registry,
+            astra_runtime::skills::empty_unified_registry()
+        ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_login_completion_replaces_the_previous_transport_generation() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        super::save_profile_auth_tokens(
+            None,
+            "current",
+            &super::AuthTokenPayload {
+                user_id: "current-owner".into(),
+                access_token: "current-token".into(),
+                refresh_token: "refresh".into(),
+            },
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .and(header("authorization", "Bearer current-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/skills"))
+            .and(header("authorization", "Bearer current-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "skills":[],"limit":100,"total":0,"next_cursor":null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(GenerationBearer("obsolete-token")));
+        let mut state = SessionState::default();
+        let mut heartbeat = None;
+        let (_, _, modules) =
+            super::finish_browser_session_login(&api, None, false, &mut state, &mut heartbeat)
+                .await
+                .unwrap();
+        modules.unified_skill_registry.discover_all().await.unwrap();
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+    }
 
     #[derive(Debug)]
     struct GenerationBearer(&'static str);
@@ -1100,7 +1581,7 @@ mod tests {
                 .and(path("/auth/me"))
                 .and(header("authorization", bearer.as_str()))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id": owner})))
-                .expect(1)
+                .expect(0)
                 .mount(&server)
                 .await;
             let name = format!("private-{generation}");
@@ -1130,12 +1611,16 @@ mod tests {
                 .await
                 .unwrap();
             assert!(state.session_memory_port.is_none());
+            assert_eq!(state.runtime_config.memory.retrieval_top_k, 42);
+            super::commit_browser_session_identity(&mut state, true, owner).unwrap();
             assert_eq!(
                 state.runtime_config.memory.retrieval_top_k,
                 astra_config::RuntimeConfig::load().memory.retrieval_top_k
             );
             assert!(state.config_version_id.is_some());
-            let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
+            let _modules = super::build_identity_services(&api, None, owner)
+                .await
+                .apply(&mut state);
             let memory = state.session_memory_port.as_ref().unwrap();
             Mock::given(method("POST"))
                 .and(path("/sessions/identity-test-session/memory/finalize"))
@@ -1713,13 +2198,675 @@ mod tests {
 
     use super::{
         AuthTokenPayload, clear_profile_auth, do_login, do_login_for_session,
-        do_memoria_login_with_key, is_auth_error, is_llm_provider_auth_error, parse_auth_tokens,
-        read_callback_request, save_refreshed_profile_tokens,
+        do_memoria_login_with_key, do_register_for_session, is_auth_error,
+        is_llm_provider_auth_error, parse_auth_tokens, read_callback_request,
+        save_refreshed_profile_tokens,
     };
     use crate::cli::cli_config::cli_utils::{Profile, load_credentials, save_credentials};
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mount_edge_registration(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn assert_password_onboarding_registers_edge(register: bool) {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _creds = crate::tests::isolate_credentials();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _period = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_HEARTBEAT_SECS");
+        // SAFETY: callers hold the serial test lock; the guard restores the value.
+        unsafe { crate::test_utils::set_var_serial("ASTRA_EDGE_HEARTBEAT_SECS", "1") };
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        let auth_path = if register {
+            "/auth/register"
+        } else {
+            "/auth/login"
+        };
+        Mock::given(method("POST"))
+            .and(path(auth_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id":"onboarding-account", "access_token":"onboarding-access",
+                "refresh_token":"onboarding-refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_edge_registration(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge/heartbeat"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer onboarding-access",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok":true, "user_id":"onboarding-account", "edge_id":"registered-edge",
+                "edge_agent_id":crate::cli::chat_stream::try_edge_executor_instance_id().unwrap(),
+                "unresolved_request_ids":[], "replay_policy":"durable_result_reconciliation_required"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut heartbeat = None;
+        let token = if register {
+            do_register_for_session(
+                &api,
+                None,
+                "new-user",
+                "new-user@example.test",
+                "password",
+                &mut state,
+                &mut heartbeat,
+            )
+            .await
+        } else {
+            do_login_for_session(
+                &api,
+                None,
+                "existing-user",
+                "password",
+                &mut state,
+                &mut heartbeat,
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(token, "onboarding-access");
+        assert!(state.agent_spawner.is_some());
+        assert!(heartbeat.is_some());
+
+        let requests = server.received_requests().await.unwrap();
+        let registration = requests
+            .iter()
+            .find(|request| request.url.path() == "/agents/edge")
+            .expect("login completion must publish registration before returning chat readiness");
+        assert_eq!(
+            registration.headers["authorization"],
+            "Bearer onboarding-access"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&registration.body).unwrap();
+        let root = std::env::current_dir().unwrap();
+        assert_eq!(body["worktree_path"], root.to_str().unwrap());
+        assert_eq!(
+            body["materialization_id"],
+            astra_runtime_env::load_or_create_materialization_id(&root).unwrap()
+        );
+        assert_eq!(
+            body["edge_agent_id"],
+            crate::cli::chat_stream::try_edge_executor_instance_id().unwrap()
+        );
+        assert_eq!(
+            registration.headers[astra_thin_client::ASTRA_EDGE_ID_HEADER],
+            body["edge_agent_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            body["capabilities"]["binding"]["executor"]["executor_id"],
+            body["edge_agent_id"]
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/agents/edge/heartbeat")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the newly authenticated registration must be maintained");
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn password_login_onboarding_publishes_materialization_and_starts_heartbeat() {
+        assert_password_onboarding_registers_edge(false).await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn password_registration_onboarding_publishes_materialization_and_starts_heartbeat() {
+        assert_password_onboarding_registers_edge(true).await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_failure_keeps_login_and_allows_same_process_recovery() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _creds = crate::tests::isolate_credentials();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id":"account-a", "access_token":"saved-access", "refresh_token":"saved-refresh"
+            }))).expect(2).mount(&server).await;
+        let failed_registration = Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(json!({"detail":"registry unavailable"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("selected-model".to_string().into());
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let old_task = heartbeat.as_ref().unwrap().abort_handle();
+        let error =
+            do_login_for_session(&api, None, "user-a", "password", &mut state, &mut heartbeat)
+                .await
+                .expect_err("registration failure must not report execution readiness");
+        assert!(error.contains("Your login is saved"), "{error}");
+        assert!(
+            old_task.is_finished(),
+            "the preceding heartbeat must be joined"
+        );
+        assert!(heartbeat.is_none());
+        assert!(state.agent_spawner.is_none());
+        assert_eq!(state.model.as_deref(), Some("selected-model"));
+        assert_eq!(
+            load_credentials().profiles["default"]
+                .access_token
+                .as_deref(),
+            Some("saved-access")
+        );
+        assert_eq!(
+            load_credentials().profiles["default"].account_id.as_deref(),
+            Some("account-a")
+        );
+        drop(failed_registration);
+        mount_edge_registration(&server).await;
+        do_login_for_session(&api, None, "user-a", "password", &mut state, &mut heartbeat)
+            .await
+            .expect("re-login must recover the missing registration without a restart");
+        assert!(state.agent_spawner.is_some());
+        assert_eq!(state.model.as_deref(), Some("selected-model"));
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn environment_bearer_must_match_password_account_before_publication() {
+        let _creds = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_ACCESS_TOKEN", "environment-access") };
+        let server = MockServer::start().await;
+        for endpoint in ["/auth/login", "/auth/register"] {
+            Mock::given(method("POST")).and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"account-b","access_token":"password-access","refresh_token":"password-refresh"
+                }))).expect(if endpoint == "/auth/register" {0} else {1}).mount(&server).await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer environment-access",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id":"account-a"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let original = serde_json::to_value(load_credentials()).unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        for email in [None, Some("user@example.test")] {
+            let mut state = SessionState::default();
+            let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+            let previous = heartbeat.as_ref().unwrap().id();
+            let error = super::do_password_for_session(
+                &api,
+                None,
+                "user",
+                "password",
+                email,
+                &mut state,
+                &mut heartbeat,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains(if email.is_some() {
+                "before creating a new account"
+            } else {
+                "different account"
+            }));
+            assert!(!error.contains("environment-access") && !error.contains("password-access"));
+            assert_eq!(serde_json::to_value(load_credentials()).unwrap(), original);
+            assert_eq!(heartbeat.as_ref().unwrap().id(), previous);
+            assert!(!heartbeat.as_ref().unwrap().is_finished());
+            assert_eq!(
+                crate::cli::session::session_runtime::fresh_access_token(&api, None)
+                    .await
+                    .as_deref(),
+                Some("environment-access")
+            );
+            crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+        }
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/agents/edge")
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn memoria_key_login_cannot_replace_an_active_native_identity() {
+        let _creds = crate::tests::isolate_credentials();
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("auth"));
+        let (session, _) = store
+            .publish(crate::cli::native_auth::test_session())
+            .unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, session);
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        let original = serde_json::to_value(super::credential_store().load().unwrap()).unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::do_memoria_login_with_key(&api, None, "synthetic-key")
+            .await
+            .unwrap_err();
+        assert!(error.contains("Use browser sign-in"));
+        assert!(std::sync::Arc::ptr_eq(
+            &binding,
+            &crate::cli::native_auth::active().unwrap()
+        ));
+        assert_eq!(
+            serde_json::to_value(super::credential_store().load().unwrap()).unwrap(),
+            original
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_lost_or_invalid_response_reports_unknown_outcome() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        for reply in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..end]);
+                assert!(headers.starts_with("POST /auth/register"));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while request.len() < end + length {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                // The complete creation request reached the peer. Its outcome
+                // cannot be inferred from the response being absent or invalid.
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let api =
+                astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+            let error = super::request_password_authentication(
+                &api,
+                "new-user",
+                "synthetic-password",
+                Some("user@example.test"),
+            )
+            .await
+            .err()
+            .expect("missing/invalid credentials cannot complete login");
+            peer.await.unwrap();
+            assert_eq!(error, super::REGISTRATION_OUTCOME_UNKNOWN);
+            assert!(!error.contains("Register failed") && !error.contains("synthetic-password"));
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_authoritative_rejection_or_refused_connection_is_not_unknown() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/register"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "account already exists"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "existing-user",
+            "synthetic-password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Register failed"));
+        assert!(!error.contains("outcome is unknown"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "new-user",
+            "synthetic-password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Register failed"));
+        assert!(!error.contains("outcome is unknown"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_override_conflict_precedes_committed_account_creation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_ACCESS_TOKEN", "environment-access") };
+        let server = MockServer::start().await;
+        let created = Arc::new(AtomicBool::new(false));
+        let committed = created.clone();
+        Mock::given(method("POST")).and(path("/auth/register"))
+            .respond_with(move |_: &wiremock::Request| {
+                committed.store(true,Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"new-account","access_token":"new-access","refresh_token":"new-refresh"
+                }))
+            }).expect(0).mount(&server).await;
+        // Identity lookup can be unavailable; it must not happen after creation.
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "new-user",
+            "password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .expect("environment override prevents new-account creation");
+        assert!(error.contains("before creating a new account"));
+        assert!(!created.load(Ordering::SeqCst));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn same_account_environment_bearer_is_used_for_registration_and_turns() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_ACCESS_TOKEN", "environment-access") };
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id":"account-a","access_token":"profile-access","refresh_token":"profile-refresh"
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer environment-access",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id":"account-a"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer environment-access",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        let mut heartbeat = None;
+        let token =
+            do_login_for_session(&api, None, "user", "password", &mut state, &mut heartbeat)
+                .await
+                .unwrap();
+        assert_eq!(token, "environment-access");
+        assert_eq!(
+            crate::cli::session::session_runtime::fresh_access_token(&api, None)
+                .await
+                .as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(
+            load_credentials().profiles["default"]
+                .access_token
+                .as_deref(),
+            Some("profile-access")
+        );
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn same_owner_registration_failure_preserves_running_runtime_and_heartbeat() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _creds = crate::tests::isolate_credentials();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _period = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_HEARTBEAT_SECS");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_EDGE_HEARTBEAT_SECS", "1") };
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id":"same-owner", "access_token":"saved-access", "refresh_token":"saved-refresh"
+            }))).expect(2).mount(&server).await;
+        let initial = Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok":true,"user_id":"same-owner","edge_id":"edge", "edge_agent_id":"edge",
+                "unresolved_request_ids":[],"replay_policy":"durable_result_reconciliation_required"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut heartbeat = None;
+        do_login_for_session(&api, None, "user", "password", &mut state, &mut heartbeat)
+            .await
+            .unwrap();
+        assert!(state.agent_spawner.is_some());
+        let old_task = heartbeat.as_ref().unwrap().id();
+        drop(initial);
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error =
+            do_login_for_session(&api, None, "user", "password", &mut state, &mut heartbeat)
+                .await
+                .unwrap_err();
+        assert!(error.starts_with("Signed in, but"));
+        assert!(state.agent_spawner.is_some());
+        assert_eq!(heartbeat.as_ref().unwrap().id(), old_task);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/agents/edge/heartbeat")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same-owner registration failure must not stop heartbeats");
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn rejected_password_registration_keeps_failure_context_and_heartbeat() {
+        let _creds = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/register"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(json!({"detail":"account exists"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let old_id = heartbeat.as_ref().unwrap().id();
+        let error = do_register_for_session(
+            &api,
+            None,
+            "user",
+            "user@example.test",
+            "password",
+            &mut state,
+            &mut heartbeat,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("Register failed:"));
+        assert_eq!(heartbeat.as_ref().unwrap().id(), old_id);
+        assert!(!heartbeat.as_ref().unwrap().is_finished());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn rejected_password_login_preserves_existing_heartbeat() {
+        let _creds = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"detail":"invalid login"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let old_id = heartbeat.as_ref().unwrap().id();
+        let error = do_login_for_session(
+            &api,
+            None,
+            "user-a",
+            "wrong-password",
+            &mut state,
+            &mut heartbeat,
+        )
+        .await
+        .expect_err("rejected authentication must retain the existing owner");
+        assert!(error.starts_with("Login failed:"));
+        assert_eq!(heartbeat.as_ref().unwrap().id(), old_id);
+        assert!(!heartbeat.as_ref().unwrap().is_finished());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+    }
 
     #[tokio::test]
     async fn loopback_callback_parser_reads_origin_content_type_and_secret_body() {
@@ -1810,6 +2957,114 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn browser_account_switch_converges_new_services_when_old_finalization_is_unconfirmed() {
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        unsafe {
+            std::env::set_var("ASTRA_EDGE_REGISTRY", "off");
+        }
+        for broken_journal in [false, true] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            super::save_profile_auth_tokens(
+                None,
+                "alice",
+                &AuthTokenPayload {
+                    user_id: "alice".into(),
+                    access_token: "alice-token".into(),
+                    refresh_token: "alice-refresh".into(),
+                },
+            )
+            .unwrap();
+            let previous_owner = astra_services::local_owner_scope();
+            let mut state = crate::SessionState::default();
+            let sid = if broken_journal {
+                "old-session-io-failure"
+            } else {
+                "old-session-memory-unconfirmed"
+            };
+            state.set_session_id(sid);
+            state.journal = Some(astra_services::session_journal::JournalWriter::new(sid).unwrap());
+            let journal_path = state.journal.as_ref().unwrap().path().clone();
+            state.session_memory_port = Some(
+                crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+                    &api, None, "alice",
+                )
+                .await,
+            );
+            assert!(state.session_memory_port.is_some());
+            let retirement = super::prepare_browser_session_retirement(&mut state).unwrap();
+            if broken_journal {
+                std::fs::create_dir_all(&journal_path).unwrap();
+            }
+            Mock::given(method("POST"))
+                .and(path("/auth/memoria"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"bob", "access_token":"bob-token", "refresh_token":"bob-refresh"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            super::do_memoria_login_with_key(&api, None, "synthetic-key")
+                .await
+                .unwrap();
+            let identity = retirement
+                .finish_browser(&previous_owner, false, &api)
+                .await
+                .unwrap();
+            assert!(identity.owner_changed);
+            let notice = identity
+                .retirement_notice
+                .as_deref()
+                .expect("unconfirmed old finalization must be visible");
+            assert!(
+                notice.contains("previous account") && notice.contains("resume"),
+                "{notice}"
+            );
+            assert!(
+                journal_path.exists(),
+                "old session data must remain recoverable"
+            );
+            super::commit_browser_session_identity(
+                &mut state,
+                identity.owner_changed,
+                &identity.user_id,
+            )
+            .unwrap();
+            let prepared = super::prepare_browser_session_login(&api, None, false)
+                .await
+                .unwrap();
+            let completed = super::commit_browser_session_login(prepared, &mut state);
+            completed.registration.unwrap();
+            assert_eq!(
+                crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                Some("bob")
+            );
+            assert_eq!(state.ingestion_user_id.as_deref(), Some("bob"));
+            assert!(state.session_memory_port.is_some());
+            assert!(state.agent_spawner.is_some());
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| !r.url.path().ends_with("/memory/finalize")),
+                "B's bearer must never finalize A's session"
+            );
+            if broken_journal {
+                std::fs::remove_dir(&journal_path).unwrap();
+            }
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn browser_login_does_not_stop_a_running_local_shell() {
         let temp = crate::tests::test_temp_dir();
         let mut state = crate::cli::session::session_state::SessionState::default();
@@ -1830,7 +3085,7 @@ mod tests {
             .background_tasks
             .kill_all_and_wait(Duration::from_secs(3))
             .await;
-        assert!(super::ensure_shells_can_rebind(&state).is_ok());
+        assert!(super::ensure_authentication_can_rebind(&state).is_ok());
     }
 
     #[serial_test::serial]
@@ -1841,6 +3096,7 @@ mod tests {
         let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let _home = crate::test_utils::HomeGuard::temp();
         let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
         let _identity_guard =
             crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                 "default", None,
@@ -1902,9 +3158,21 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let token = do_login_for_session(&api, None, "user-b", "password", &mut state)
-            .await
+        mount_edge_registration(&server).await;
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let old_heartbeat = heartbeat.as_ref().unwrap().abort_handle();
+        let token =
+            do_login_for_session(&api, None, "user-b", "password", &mut state, &mut heartbeat)
+                .await
+                .unwrap();
+        assert!(old_heartbeat.is_finished());
+        let requests = server.received_requests().await.unwrap();
+        let registration = requests
+            .iter()
+            .find(|request| request.url.path() == "/agents/edge")
             .unwrap();
+        assert_eq!(registration.headers["authorization"], "Bearer access-b");
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
 
         assert_eq!(token, "access-b");
         assert_eq!(state.ingestion_user_id.as_deref(), Some("account-b"));
@@ -2078,6 +3346,10 @@ mod tests {
     #[tokio::test]
     async fn same_owner_login_rebuilds_missing_runtime_without_resetting_session() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
         let _identity_guard =
             crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                 "default",
@@ -2105,9 +3377,13 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let token = do_login_for_session(&api, None, "user-a", "password", &mut state)
-            .await
-            .unwrap();
+        mount_edge_registration(&server).await;
+        let mut heartbeat = None;
+        let token =
+            do_login_for_session(&api, None, "user-a", "password", &mut state, &mut heartbeat)
+                .await
+                .unwrap();
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
 
         assert_eq!(token, "access-new");
         assert_eq!(serde_json::to_value(&state.runtime_config).unwrap(), saved);

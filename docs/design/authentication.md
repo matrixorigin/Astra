@@ -198,20 +198,150 @@ not a local password form. Discovery errors never select password authentication
 The workbench remains responsive during discovery and browser waiting. Escape
 can cancel before credential exchange starts; once exchange starts it awaits
 the bounded result instead of claiming cancellation after a possible commit.
-Browser authentication closes the previous local conversation before credentials
-are replaced. Successful login binds the identity and refreshing transport,
+Browser authentication retires the old execution authority before credentials
+are replaced, while retaining the active attachment, model and local history
+through cancellation. The workbench resets only after credentials commit.
+Successful login binds the identity and refreshing transport,
 resynchronizes capabilities and resolves the server default model in the current
 workbench, without requiring a manual restart. Browser waiting and cancellation
 retain the previous identity-pinned Edge heartbeat. On completion, the workbench
 stops and joins it before rebinding local execution. Login completion registers
 the current checkout with the new identity before reporting chat readiness,
 then starts its heartbeat; registration failure is reported explicitly and does
-not initialize a ready runtime. Existing transports retain their old generation
+not complete runtime initialization. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
-changes are refused while local background tasks are running.
+changes are refused while local shell tasks or registered agent work are running
+or awaiting settlement. The active-work owner is checked before discovery and
+again before browser retirement, so a cancelled or same-account login cannot
+interrupt a running local agent.
 
-At browser re-login the CLI drains and retires its old session-memory service
-before credential publication. Successful completion rebuilds that service with
+In-TUI password login and registration establish the same Edge registration
+and heartbeat boundary after saving credentials. Rejected authentication retains
+the previous heartbeat. An account change stops and joins it before registering
+the new account's checkout. Same-account login retains the working heartbeat
+until registration succeeds, then joins it and starts the replacement. The
+registration request has a 15-second deadline, including response-body reads.
+Password authentication and registration use the existing workbench login task
+queue, so network waiting does not block keyboard handling or redraw. Password
+authentication (including any environment-identity check) also has a 15-second
+deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
+instead of claiming cancellation after credentials may have committed.
+Runtime retirement and session finalization also run on this supervised owner
+from an owned snapshot of the canonical finalizer's inputs. The terminal does
+not await optional memory maintenance. Password account replacement keeps
+credentials unpublished until the old owner's durable boundary settles.
+Browser login stops the execution runtime first, but finalizes the captured
+Session only after publication proves that the account or environment changed.
+Same-owner browser reauthentication preserves the Session, transcript and model;
+cancellation never writes a SessionEnd or completes its workspace. Old-session
+journal or optional memory-finalization failures are reported separately from
+committed authentication: the new account still rebuilds its services and
+registers execution. If the old credential generation no longer admits memory
+finalization, the CLI retains the old session data and explicitly asks the user
+to sign in to that account, resume its session and exit to retry. It never borrows
+the new account's credentials or silently claims that memory was finalized.
+Graceful shutdown settles the resulting
+prepared publication through the same credential owner.
+Both password and browser completion rebuild identity-owned Skill/MCP services
+and the session-memory port before runtime initialization. Credential publication
+invalidates the preceding private cache with a fresh registry, never the writable
+process-wide empty registry. Password completion rebuilds these identity services
+even when execution registration fails; a same-account runtime and heartbeat can
+continue with the current memory and Skill providers. The
+event loop replaces its own registry, MCP and observer references and restarts
+discovery; signed-out onboarding installs the memory port for the first time.
+The memory service uses the canonical account ID already returned by password
+authentication or UC binding. Credential settlement does not repeat `/auth/me`;
+optional startup identity discovery has a ten-second overall deadline. Cancelling
+browser waiting reattaches the exact retired memory service only while its
+original credential binding remains current, without another network request.
+Post-login preference reads, model discovery and outbox wakeups use the existing
+catalog task owner independently of Edge registration success. Registration
+failure remains visible and does not automatically submit queued input.
+Account preferences are fenced by the originating identity,
+not the Session attachment epoch: first-session binding and same-account `/new`
+must not discard them. Model completion additionally retains its Session scope
+and cannot replace a newer explicit model selection. Preference
+seeding compares local edit versions (including changes back to the starting
+value) and merges only settings unchanged since the read began. Earlier edits
+do not permanently suppress a later resync.
+Automatic model discovery never opens a picker over an active form, pending
+explicit model request, or composer draft; it leaves an actionable `/model` hint.
+An already resolved concrete model can still enable a waiting first message.
+Preference results are published immediately after the read. Existing queued
+uploads and the new local journal marker are delivered independently by the
+canonical supervised outbox owner. Slow sync neither holds terminal borrows nor
+delays model selection. Read-task cancellation/shutdown does not wait for
+background delivery; pending writes remain durable for normal outbox recovery.
+If registration fails, the saved login and model preference remain available;
+queued messages return to the composer for manual review and are not sent
+automatically. Local-state failures ask users to check workspace/state write
+access; transport, timeout and server failures provide the relevant recovery.
+Diagnostics record only failure category and HTTP status, not private paths,
+URLs or response bodies. Retrying `/login` or restarting retries registration
+without repeating model-provider authorization.
+
+Registration rejects an active `ASTRA_ACCESS_TOKEN` before the non-idempotent
+account-creation POST. Users must unset it and restart before creating a new
+account; no later identity lookup can turn a remotely created account into an
+apparent registration failure. A registration timeout, lost/truncated response,
+invalid successful credential response, or server-side failure reports an unknown
+outcome and directs users to try `/login` before registering again. Known
+connector failures and authoritative client-error rejections remain failures.
+
+When a valid `ASTRA_ACCESS_TOKEN` controls legacy turn authentication, password
+and Memoria sign-in share one account/bearer check before saving credentials or
+changing identity. This applies to terminal, manual-key and both browser callback
+transports. A conflicting or unverifiable identity is rejected with instructions
+to unset the environment override and restart. Browser rejection retains the old
+credential binding and restores its retired identity services; it does not
+publish the incompatible account or report successful sign-in.
+Same-account sign-in uses the environment bearer for registration and heartbeat,
+matching subsequent turn admission; the new profile credentials are still saved.
+With `ASTRA_NATIVE_COLLABORATORS` selected, the interactive lifecycle does not
+send generic HTTP advertisements during startup or re-login. Native
+delivery is the only capability publisher: a timed-out generic POST cannot be
+buffered and forwarded later to erase a newer native advertisement. Credential
+completion requests a refresh through the existing native-delivery handle;
+the first selected native turn establishes or refreshes that owner and waits for
+publication before admission. A local runtime projection is not capacity-ready
+proof. No second delivery owner or publication generation scheme is added. Direct
+registration callers such as app-server keep their existing noninteractive policy.
+
+Graceful shutdown drains an in-flight password exchange before retiring the
+previous identity's runtime. A successful delayed response is published through
+the same credential/session transition reducer used by ordinary completion;
+teardown does not discard newly issued tokens or start a new runtime/heartbeat.
+
+An absent agent projection is not a registration-readiness gate: the first turn
+can initialize it lazily. The Server remains the execution admission authority.
+Authentication, request parsing, Session resolution and runtime-context failures
+before the handler calls the Run lifecycle carry the same explicit per-attempt
+rejection evidence, including errors without a domain `error_code`. The CLI uses
+the evidence, not an auth/error-name allowlist, to settle the unsent draft and
+retain `/login` recovery for expired credentials.
+When execution selection rejects a new turn with
+`execution_binding_provider_required` before durable run creation, it includes
+`metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
+draft and suggests `/login` or restarting only when no earlier dispatched
+attempt remains ambiguous. The thin transport publishes dispatch evidence
+immediately before sending. Non-idempotent starts retry only after an HTTP 429
+rejection or a proven connector failure before sending; a potentially committed
+request is never replayed just because response headers were lost. Receipt of
+successful HTTP headers alone leaves the outcome unknown until the canonical
+stream identifies the Run or proves rejection. Headers followed by EOF or a
+truncated body without that evidence retain recovery state and explicit
+unknown-execution guidance, without restoring a draft or claiming no model/tool
+ran. Connector failures cannot clear an earlier uncertain dispatch. Older clients
+ignore the new attempt-only field rather than interpreting it as the legacy
+`admission_state: rejected` guarantee. An admitted run or resume failure is never
+relabeled as an unexecuted turn.
+
+At browser re-login the CLI detaches its old session-memory service while waiting
+for authentication. Actual account replacement finalizes only the captured old
+owner's journal and workspace; optional memory maintenance uses that service's
+captured bearer or verified refresh authority, never replacement credentials.
+Successful completion rebuilds that service with
 the authenticated identity, including when the process started signed out. It
 also replaces the remote skill registry and its private cache, restarts external
 discovery, and attaches both the workbench and runtime to the new registry.
@@ -318,7 +448,11 @@ exchange does not follow redirects, bounds response size and duration, and is
 not automatically replayed after failure: consumption may already have
 succeeded. Invalid/mismatched GET callbacks do not trigger token exchange.
 The five-minute local listener deadline remains in effect, including response
-writes and both exchange paths. Each response write/shutdown is additionally
+writes and both exchange paths. The Memoria-to-Astra credential exchange has its
+own 15-second network deadline before local publication. An unconfirmed exchange
+is not replayed; graceful shutdown joins that bounded task instead of waiting
+for the listener's five-minute deadline. Credential publication remains owned
+and settled separately from that network wait. Each response write/shutdown is additionally
 bounded to two seconds; delivery errors are reported without sensitive contents
 and never undo a persisted login. Three invalid callback attempts end the login;
 favicon, OPTIONS and unknown GET paths do not consume that rejection allowance,

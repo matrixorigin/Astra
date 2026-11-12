@@ -781,6 +781,8 @@ mod exact_model_resolution_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn one_shot_edge_registration_requires_server_admission_and_honors_deadline() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         assert!(crate::cli::edge_lifecycle::edge_cloud_registry_enabled());
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");

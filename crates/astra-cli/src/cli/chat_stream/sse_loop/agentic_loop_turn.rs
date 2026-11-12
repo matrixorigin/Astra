@@ -1287,6 +1287,7 @@ fn inject_runtime_turn_overrides(
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub server_admission_dispatched: &'a mut bool,
+    pub prior_admission_ambiguous: &'a mut bool,
     pub completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
     pub tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     pub api: &'a astra_thin_client::ThinClient,
@@ -1415,6 +1416,7 @@ fn chat_turn_sse_fetch_ui(
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
 struct ChatTurnPostPayloadRequest<'a> {
     server_admission_dispatched: &'a mut bool,
+    prior_admission_ambiguous: &'a mut bool,
     api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     quiet: bool,
@@ -1485,6 +1487,7 @@ async fn chat_turn_post_payload_after_prepare(
 > {
     let ChatTurnPostPayloadRequest {
         server_admission_dispatched,
+        prior_admission_ambiguous,
         api,
         token,
         quiet,
@@ -1538,6 +1541,7 @@ async fn chat_turn_post_payload_after_prepare(
         token,
         CHAT_TURN_POST_MAX_RETRIES,
         quiet,
+        prior_admission_ambiguous,
         || {
             // The thin client invokes this after asynchronous credential
             // preparation, immediately before sending. Retain an already-issued
@@ -1605,6 +1609,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 ) -> Result<TurnResult, astra_core::ClassifiedError> {
     let ChatTurnSseFetchRequest {
         server_admission_dispatched,
+        prior_admission_ambiguous,
         completion_checks,
         tool_surface_config,
         api,
@@ -1668,6 +1673,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     let (resp, prep_line, stream_json_exchange) =
         chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
             server_admission_dispatched,
+            prior_admission_ambiguous,
             api,
             token,
             quiet: render_policy.is_silent(),
@@ -1779,6 +1785,20 @@ pub(crate) async fn fetch_chat_turn_sse(
         stream_json_exchange,
     )
     .await;
+    // Headers alone cannot identify a durable Run. Settle dispatch evidence
+    // only from the canonical stream identity or an explicit rejection proof.
+    if turn
+        .core
+        .run_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || super::server_admission_host::is_pre_admission_rejection(
+            turn.core.error_metadata.as_ref(),
+            turn.core.run_id.as_deref(),
+        )
+    {
+        *prior_admission_ambiguous = false;
+    }
     if ui.timing {
         eprintln!(
             "{}",

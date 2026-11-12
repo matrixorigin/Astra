@@ -39,6 +39,7 @@ use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+#[cfg(test)]
 const SYNC_OUTBOX_LOGIN_PROJECTION_WAIT: Duration = Duration::from_secs(2);
 // One full server batch for each concurrent session, still bounded by bytes.
 const SYNC_OUTBOX_BACKGROUND_DRAIN_LIMIT: usize =
@@ -947,6 +948,7 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
                 break;
             }
         }
+        drop(schedule_guard);
         let next_delay = if !auth_snapshot.is_current() {
             None
         } else if let Some(blocker) = blocker {
@@ -966,7 +968,6 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
                 }
             }
         };
-        drop(schedule_guard);
         if !auth_snapshot.is_current() {
             // A newer login may have observed these records while they were
             // still claimed by this worker. Hand them back to its identity.
@@ -1119,11 +1120,12 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                 return Vec::new();
             }
         };
-    if prefs.is_empty() {
-        return Vec::new();
-    }
+    apply_cloud_preferences(state, &prefs)
+}
+
+fn apply_cloud_preferences(state: &mut SessionState, prefs: &[(String, String)]) -> Vec<String> {
     let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
-    for (key, value) in &prefs {
+    for (key, value) in prefs {
         match key.as_str() {
             pref_keys::EXPLAIN_MODE => {
                 state.explain = match value.as_str() {
@@ -1184,6 +1186,7 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     keys
 }
 
+#[cfg(test)]
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
     let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     try_drain_sync_outbox_for_snapshot(limit, &auth_snapshot).await
@@ -2411,6 +2414,7 @@ fn append_cloud_pull_sync_marker(
 /// Re-sync preferences and queued edge events after authentication. Login is
 /// still successful when sync is delayed, but the structured report makes the
 /// partial outcome visible to every UI path.
+#[cfg(test)]
 pub(crate) async fn post_auth_cloud_resync(
     profile: Option<&str>,
     state: &mut SessionState,
@@ -2418,6 +2422,7 @@ pub(crate) async fn post_auth_cloud_resync(
     post_auth_cloud_resync_with_wait(profile, state, SYNC_OUTBOX_LOGIN_PROJECTION_WAIT).await
 }
 
+#[cfg(test)]
 pub(crate) async fn post_auth_cloud_resync_with_wait(
     profile: Option<&str>,
     state: &mut SessionState,
@@ -2524,6 +2529,117 @@ pub(crate) async fn run_post_auth_sync(
         schedule_sync_outbox_drain_after(delay);
     }
     report
+}
+
+/// Network result owned by the initiating identity. Applying it never waits
+/// for HTTP; the TUI can redraw, handle input and shut down during sync.
+pub(crate) struct PostAuthCloudResync {
+    pull: CloudPullResult,
+    preferences: Vec<(String, String)>,
+}
+
+pub(crate) async fn prepare_post_auth_cloud_resync(
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> PostAuthCloudResync {
+    if owner.is_current() {
+        // Reuse the canonical login wake: it clears access rejection and also
+        // releases delivery workers waiting on the previous credential owner.
+        clear_sync_cloud_access();
+        schedule_sync_outbox_drain();
+    }
+    let preferences = match owner
+        .native_binding
+        .as_ref()
+        .map(|binding| binding.endpoint().to_owned())
+        .or_else(resolve_cloud_base)
+    {
+        Some(base) => {
+            crate::cli::preferences_client::pull_all_preferences_for_owner(&base, owner).await
+        }
+        None => Err("cloud unconfigured".into()),
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: preferences.is_ok(),
+    };
+    let preferences = preferences.unwrap_or_else(|_| {
+        tracing::warn!(target: "astra_cli::cloud_sync", operation = "post_auth_resync", error = "preference_pull_unavailable", "post-authentication preference pull skipped");
+        Vec::new()
+    });
+    PostAuthCloudResync { pull, preferences }
+}
+
+pub(crate) struct CloudPreferenceSnapshot {
+    values: BTreeMap<&'static str, String>,
+    local_revisions: BTreeMap<&'static str, u64>,
+}
+
+/// Capture the initiating values. Explicit local commands also version their key,
+/// so an on/off/on sequence cannot look unchanged and lose the newer intent.
+pub(crate) fn cloud_preference_snapshot(state: &SessionState) -> CloudPreferenceSnapshot {
+    let values = [
+        (pref_keys::EXPLAIN_MODE, format!("{:?}", state.explain)),
+        (
+            pref_keys::AUTO_MEMORY_ENABLED,
+            state.auto_memory_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATIONS_ENABLED,
+            state.notifications_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATION_METHOD,
+            format!("{:?}", state.notification_method),
+        ),
+        (
+            pref_keys::NOTIFICATION_THRESHOLD_SECS,
+            state.notification_threshold_secs.to_string(),
+        ),
+        (
+            pref_keys::BLOCKED_TOOLS,
+            serde_json::to_string(
+                &state
+                    .tool_health_entries
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("string list serialization"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    CloudPreferenceSnapshot {
+        values,
+        local_revisions: state.local_preference_revisions.clone(),
+    }
+}
+
+pub(crate) fn apply_post_auth_cloud_resync(
+    profile: Option<&str>,
+    state: &mut SessionState,
+    mut result: PostAuthCloudResync,
+    baseline: &CloudPreferenceSnapshot,
+) {
+    let current = cloud_preference_snapshot(state);
+    result.preferences.retain(|(key, _)| {
+        baseline.local_revisions.get(key.as_str()) == current.local_revisions.get(key.as_str())
+            && baseline
+                .values
+                .get(key.as_str())
+                .is_some_and(|value| current.values.get(key.as_str()) == Some(value))
+    });
+    let keys = apply_cloud_preferences(state, &result.preferences);
+    let binding = matching_session_journal(state)
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    let projection = append_cloud_pull_sync_journal_for_immediate_drain(
+        state,
+        profile.unwrap_or("default"),
+        "post_login",
+        &result.pull,
+        &keys,
+    );
+    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    tokio::spawn(run_post_auth_sync(projection, binding, snapshot));
 }
 
 #[cfg(test)]

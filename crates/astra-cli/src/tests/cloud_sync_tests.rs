@@ -127,6 +127,101 @@ fn install_test_cloud_auth(access_token: Option<&str>) -> TestCloudAuth {
 }
 
 // ── Cloud sync regression tests ─────────────────────────────────────
+
+#[serial_test::serial]
+#[tokio::test]
+async fn successful_old_owner_upload_hands_the_occupied_drain_to_the_new_owner() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let _journal = ProcessJournalDirGuard::new(root.path());
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = isolate_credentials();
+    let _identity = install_cli_profile_identity_for_test("default", None).unwrap();
+    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/sync/outbox/events",
+        axum::routing::post({
+            let reached = reached.clone();
+            let release = release.clone();
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let reached = reached.clone();
+                let release = release.clone();
+                async move {
+                    if headers.get("authorization").unwrap() == "Bearer access-a" {
+                        reached.notify_one();
+                        release.notified().await;
+                    } else {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer access-b");
+                    }
+                    (
+                        axum::http::StatusCode::CREATED,
+                        axum::Json(crate::test_utils::mock_sync_outbox_batch_ack(&body)),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _url = EnvVarGuard::set(
+        "ASTRA_API_URL",
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut stores = Vec::new();
+    for account in ["a", "b"] {
+        crate::cli::auth_flow::save_profile_auth_tokens(
+            None,
+            account,
+            &crate::cli::auth_flow::AuthTokenPayload {
+                user_id: account.into(),
+                access_token: format!("access-{account}"),
+                refresh_token: format!("refresh-{account}"),
+            },
+        )
+        .unwrap();
+        let state = session_state_with_journal(format!("held-drain-{account}"));
+        stores.push(SyncOutboxStore::local());
+        append_cloud_pull_sync_journal_for_immediate_drain(
+            &state,
+            "default",
+            "post_login",
+            &CloudPullResult {
+                cloud_reachable: true,
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        cloud_sync::schedule_sync_outbox_drain();
+        if account == "a" {
+            tokio::time::timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .unwrap();
+        }
+    }
+    // B's only wake arrives while the process-wide claim still belongs to A.
+    cloud_sync::schedule_sync_outbox_drain();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if stores
+                .iter()
+                .all(|store| store.status().unwrap().acked == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both owners settle without a second user action");
+    peer.abort();
+    let _ = peer.await;
+}
+
 // These tests verify the async cloud sync functions don't panic when
 // called from within a tokio runtime. We unset ASTRA_API_URL so they
 // take the graceful-fallback path (CLI is now HTTP-only).
@@ -720,7 +815,7 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
 
 #[serial_test::serial]
 #[tokio::test]
-async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
+async fn post_auth_sync_schedules_its_marker_without_waiting_for_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -734,7 +829,7 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
     Mock::given(method("GET"))
         .and(path("/preferences"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "preferences": [] })))
-        .expect(2)
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -763,14 +858,21 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
         .mount(&server)
         .await;
 
-    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
-    assert_eq!(report.attempted, 2);
-    assert_eq!(report.acked, 2);
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.terminal, 0);
-    assert_eq!(report.blocker, None);
-    assert!(!report.is_incomplete());
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let baseline = cloud_sync::cloud_preference_snapshot(&state);
+    let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if SyncOutboxStore::local().status().unwrap().acked == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background marker delivery");
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.acked, 2);
     assert_eq!(status.pending, 0);
@@ -1387,7 +1489,7 @@ async fn relogin_hands_post_auth_claims_to_the_new_authentication() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
+async fn post_auth_preferences_without_a_token_preserve_ready_records() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -1405,16 +1507,10 @@ async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
         .await
         .unwrap();
 
-    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
-    assert!(report.cloud_configured);
-    assert_eq!(report.attempted, 0);
-    assert_eq!(report.acked, 0);
-    assert_eq!(report.failed, 0);
-    assert_eq!(
-        report.blocker,
-        Some(cloud_sync::SyncOutboxDrainBlocker::MissingAccessToken)
-    );
-    assert!(report.user_notice().is_some());
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let baseline = cloud_sync::cloud_preference_snapshot(&state);
+    let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
 
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.pending, 2);
@@ -1423,6 +1519,133 @@ async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
     assert_eq!(status.retry_deferred, 0);
     assert_eq!(status.poisoned, 0);
     assert_eq!(status.ack_watermark, 0);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_preferences() {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let first = Arc::new(AtomicBool::new(true));
+    let app = Router::new()
+        .route(
+            "/preferences",
+            get(|| async {
+                Json(json!({"preferences":[
+                    {"key":"explain_mode","value":"verbose"},
+                    {"key":"auto_memory_enabled","value":"true"},
+                    {"key":"notifications_enabled","value":"true"},
+                    {"key":"notification_method","value":"auto"},
+                    {"key":"notification_threshold_secs","value":"99"}
+                ]}))
+            }),
+        )
+        .route(
+            "/sync/outbox/events",
+            post({
+                let reached = reached.clone();
+                let release = release.clone();
+                let first = first.clone();
+                move |Json(body): Json<Value>| {
+                    let reached = reached.clone();
+                    let release = release.clone();
+                    let first = first.clone();
+                    async move {
+                        if first.swap(false, Ordering::SeqCst) {
+                            reached.notify_one();
+                            release.notified().await;
+                        }
+                        (
+                            axum::http::StatusCode::CREATED,
+                            Json(crate::test_utils::mock_sync_outbox_batch_ack(&body)),
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _api = EnvVarGuard::set(
+        "ASTRA_API_URL",
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut state = session_state_with_journal("delayed-preferences".into());
+    state.set_explain_mode(crate::ExplainMode::Off);
+    append_cloud_pull_sync_journal_for_immediate_drain(
+        &state,
+        "default",
+        "post_login",
+        &CloudPullResult {
+            cloud_reachable: true,
+        },
+        &[],
+    )
+    .await
+    .unwrap();
+    let baseline = cloud_sync::cloud_preference_snapshot(&state);
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cloud_sync::prepare_post_auth_cloud_resync(&owner),
+    )
+    .await
+    .expect("preferences must arrive independently of queued uploads");
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached.notified())
+        .await
+        .expect("outbox dispatch barrier");
+    // The same setter is used by `/explain`. Return to the initial value to
+    // exercise ABA: value equality alone must not erase explicit local intent.
+    state.set_explain_mode(crate::ExplainMode::On);
+    state.set_explain_mode(crate::ExplainMode::Off);
+    state.auto_memory_enabled = false;
+    state.notifications_enabled = false;
+    state.notification_method = crate::cli::notifications::NotificationMethod::Bell;
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, result, &baseline);
+    assert_eq!(state.explain, crate::ExplainMode::Off);
+    assert!(!state.auto_memory_enabled && !state.notifications_enabled);
+    assert_eq!(
+        state.notification_method,
+        crate::cli::notifications::NotificationMethod::Bell
+    );
+    assert_eq!(
+        state.notification_threshold_secs, 99,
+        "untouched settings still synchronize"
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while SyncOutboxStore::local().status().unwrap().acked < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // A later explicit resync may seed this setting when no local edit occurs
+    // during that read. The previous edit is not a permanent cloud override.
+    let baseline = cloud_sync::cloud_preference_snapshot(&state);
+    let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
+    assert_eq!(state.explain, crate::ExplainMode::Verbose);
+    assert!(state.auto_memory_enabled && state.notifications_enabled);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while SyncOutboxStore::local().status().unwrap().acked < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    peer.abort();
+    let _ = peer.await;
 }
 
 #[serial_test::serial]
