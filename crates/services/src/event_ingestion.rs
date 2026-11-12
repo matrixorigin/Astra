@@ -706,6 +706,11 @@ impl IngestionEvent {
                 let tc_event_id =
                     stable_event_id(&[event_type, &main_event_id, &index, &tool_name]);
                 let raw_content = match disposition {
+                    crate::session_journal::ToolCallDisposition::Executed
+                        if tc.outcome_is_unknown() =>
+                    {
+                        format!("{} started; outcome is unknown", tool_name)
+                    }
                     crate::session_journal::ToolCallDisposition::Executed if tc.ok => {
                         format!("{} completed in {}ms", tool_name, tc.ms)
                     }
@@ -715,6 +720,9 @@ impl IngestionEvent {
                         tc.ms,
                         tc.error.as_deref().unwrap_or("unknown error")
                     ),
+                    crate::session_journal::ToolCallDisposition::Unknown => {
+                        format!("{} outcome is unknown", tool_name)
+                    }
                     crate::session_journal::ToolCallDisposition::Rejected => {
                         format!("{} was rejected before execution", tool_name)
                     }
@@ -750,6 +758,9 @@ impl IngestionEvent {
                     metadata.insert("tool_call_id_is_synthetic".into(), Value::Bool(true));
                 }
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
+                if tc.outcome_is_unknown() {
+                    metadata.insert("outcome_unknown".into(), Value::Bool(true));
+                }
                 metadata.insert("duration_ms".into(), Value::from(tc.ms));
                 metadata.insert(
                     "disposition".into(),
@@ -4475,6 +4486,49 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("before execution")
+        );
+    }
+
+    #[test]
+    fn unknown_outcomes_are_not_reported_as_operation_failures() {
+        use crate::session_journal::{ToolCallDisposition, ToolCallRecord};
+        let journal = make_turn_event().with_tool_calls(vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                disposition: Some(ToolCallDisposition::Executed),
+                error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "write_file".into(),
+                ok: false,
+                disposition: Some(ToolCallDisposition::Unknown),
+                ..Default::default()
+            },
+        ]);
+        let events = IngestionEvent::expand_journal_event(&journal, "u1").unwrap();
+        let counts = &events[0].metadata.as_ref().unwrap()["tool_outcomes"];
+        assert_eq!(counts["started_unknown"], 1);
+        assert_eq!(counts["unknown"], 1);
+        assert_eq!(counts["failed"], 0);
+        assert!(
+            events[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("started; outcome is unknown")
+        );
+        assert_eq!(
+            events[1].metadata.as_ref().unwrap()["outcome_unknown"],
+            true
+        );
+        assert!(
+            events[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("outcome is unknown")
         );
     }
 

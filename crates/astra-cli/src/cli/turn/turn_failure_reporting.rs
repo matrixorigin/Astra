@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::cli::auth_flow::{is_auth_error, is_llm_provider_auth_error};
 use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
-use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::cli::session::session_startup;
 use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
@@ -279,7 +279,7 @@ pub(crate) fn report_turn_failure(
             &err_event,
             "turn_failure_reporting:report_turn_failure",
         );
-        enqueue_ingestion_pub(state, &err_event);
+        schedule_journal_ingestion(journal);
         state.last_turn_event = Some(err_event.clone());
 
         let transcript_events = crate::cli::stream::streaming_types::root_run_transcript_events(
@@ -297,11 +297,9 @@ pub(crate) fn report_turn_failure(
                         Some(existing) => format!("{existing}; {message}"),
                         None => message,
                     });
-            } else {
-                for event in &transcript_events {
-                    enqueue_ingestion_pub(state, event);
-                }
             }
+            // The append may have written complete records before failing.
+            schedule_journal_ingestion(journal);
         }
     }
 

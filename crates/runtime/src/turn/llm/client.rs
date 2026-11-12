@@ -23372,6 +23372,13 @@ mod tests {
             .find(|tool| tool["function"]["name"] == "agent")
             .unwrap();
         let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("tool_outcomes").is_none());
+        assert!(
+            agent["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Child tool outcomes: tool_search select:agent")
+        );
         assert!(properties["reasoning"]["oneOf"].is_array());
         let reasoning = properties["reasoning"]["description"].as_str().unwrap();
         for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {

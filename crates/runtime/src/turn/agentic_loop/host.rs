@@ -624,30 +624,6 @@ pub trait AgenticLoopHost: Send {
     ) {
     }
 
-    /// Exact process-local recall ledger scope owned by this loop.
-    ///
-    /// The default covers ordinary CLI and server runs. Hosts whose tool
-    /// executor intentionally uses a different session (for example an
-    /// isolated skill sub-run) override this rather than making finalization
-    /// infer tool ownership from prompt or transcript state.
-    fn memory_recall_scope(&self, state: &AgenticLoopState) -> Option<(String, String)> {
-        if let Some(executor) = state.runtime_tool_executor.as_deref() {
-            return Some(executor.memory_recall_scope(state.current_run_id.as_deref()));
-        }
-        let session_id = state
-            .current_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())?;
-        let producer_id = state
-            .current_run_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|producer_id| !producer_id.is_empty())
-            .unwrap_or("session");
-        Some((session_id.to_string(), producer_id.to_string()))
-    }
-
     /// Reconcile host-owned durable history after lifecycle restoration and
     /// before any first-round preparation may rewrite the admitted prefix.
     /// Implementations must be idempotent because a resumed loop can re-enter
@@ -3213,6 +3189,8 @@ const TOOL_LEDGER_LIVE_WINDOW: usize = 256;
 enum ToolLedgerResultClass {
     Succeeded,
     Failed,
+    StartedUnknown,
+    Unknown,
     Rejected,
     Reused,
     Suppressed,
@@ -3220,7 +3198,13 @@ enum ToolLedgerResultClass {
 
 impl ToolLedgerResultClass {
     fn from_record(record: &ToolCallRecord) -> Option<Self> {
+        if record.effective_disposition() == ToolCallDisposition::Deferred {
+            return None;
+        }
         match record.effective_disposition() {
+            ToolCallDisposition::Executed if record.outcome_is_unknown() => {
+                Some(Self::StartedUnknown)
+            }
             ToolCallDisposition::Executed if record.ok => Some(Self::Succeeded),
             ToolCallDisposition::Executed => Some(Self::Failed),
             ToolCallDisposition::Rejected => Some(Self::Rejected),
@@ -3229,6 +3213,7 @@ impl ToolLedgerResultClass {
             // Deferred is explicitly not a terminal result. A later exact
             // callback may close the same attempt inside the live window.
             ToolCallDisposition::Deferred => None,
+            ToolCallDisposition::Unknown => Some(Self::Unknown),
         }
     }
 
@@ -3236,6 +3221,8 @@ impl ToolLedgerResultClass {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::StartedUnknown => "started_unknown",
+            Self::Unknown => "unknown",
             Self::Rejected => "rejected",
             Self::Reused => "reused",
             Self::Suppressed => "suppressed",
@@ -3249,6 +3236,8 @@ impl ToolLedgerResultClass {
         let slot = match self {
             Self::Succeeded => &mut counts.succeeded,
             Self::Failed => &mut counts.failed,
+            Self::StartedUnknown => &mut counts.started_unknown,
+            Self::Unknown => &mut counts.unknown,
             Self::Rejected => &mut counts.rejected,
             Self::Reused => &mut counts.reused,
             Self::Suppressed => &mut counts.suppressed,
@@ -3361,6 +3350,8 @@ impl ToolLedgerHandoff {
         let total = receipt.result_classes;
         if counts.succeeded > total.succeeded
             || counts.failed > total.failed
+            || counts.started_unknown > total.started_unknown
+            || counts.unknown > total.unknown
             || counts.rejected > total.rejected
             || counts.reused > total.reused
             || counts.suppressed > total.suppressed
@@ -6000,6 +5991,50 @@ pub(crate) mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": "{}"},
         })
+    }
+
+    #[test]
+    fn delivered_unknown_is_terminal_without_claiming_execution() {
+        let mut accumulator = ToolLedgerReceiptAccumulator::default();
+        let mut deferred = receipt_test_record("deferred", false, ToolCallDisposition::Deferred);
+        deferred.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(ToolLedgerResultClass::from_record(&deferred), None);
+        for (id, disposition) in [
+            ("unknown-start", ToolCallDisposition::Unknown),
+            ("known-start", ToolCallDisposition::Executed),
+        ] {
+            let mut record = receipt_test_record(id, false, disposition);
+            record.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+            accumulator.observe_round(
+                &ToolLedgerAttemptBatch::from_validated_provider_calls(&[receipt_test_call(id)]),
+                &[record],
+            );
+        }
+        // One uncertain response must not pin the bounded ledger window.
+        for index in 0..300 {
+            let id = format!("later-{index}");
+            accumulator.observe_round(
+                &ToolLedgerAttemptBatch::from_validated_provider_calls(&[receipt_test_call(&id)]),
+                &[receipt_test_record(
+                    &id,
+                    true,
+                    ToolCallDisposition::Executed,
+                )],
+            );
+        }
+        let receipt = accumulator.receipt("run", 1);
+        assert!(receipt.is_complete());
+        assert_eq!(receipt.result_classes.unknown, 1);
+        assert_eq!(receipt.result_classes.started_unknown, 1);
+        assert_eq!(receipt.result_classes.failed, 0);
+        assert_eq!(receipt.result_classes.succeeded, 300);
+        assert!(
+            accumulator
+                .handoff("run", 1)
+                .unwrap()
+                .restore("run", 1)
+                .is_ok()
+        );
     }
 
     #[test]

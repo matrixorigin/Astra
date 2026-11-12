@@ -56,6 +56,19 @@ acked -> compacted
 
 Poisoned records must not block later independent records forever. They must be visible through sync status and repair tooling.
 
+CLI journal projection uses the captured journal owner and source session. Both
+the normal asynchronous path and the no-runtime path read complete records
+behind the journal's file sync barrier; they do not enqueue a separate in-memory
+copy of an event. A post-login sync waits briefly for projection and one drain.
+If that wait expires, it reports an unconfirmed result while the owned task
+continues; cancellation of the wait does not cancel that work.
+
+The existing recovery scan currently enumerates uncompressed journals, while
+session maintenance may compress or delete old files concurrently. Recovery of
+an unprojected old tail is therefore not guaranteed until those lifecycles are
+coordinated. The outbox also still reads and rewrites its complete retained file
+on mutation; neither behavior establishes a distributed-client capacity limit.
+
 ## Cloud ingestion contract
 
 Cloud ingestion must be idempotent:
@@ -66,6 +79,54 @@ Cloud ingestion must be idempotent:
 - redaction failure fails closed;
 - accepted events advance ack watermark;
 - ingestion emits trace facts for degraded sync and repair.
+
+The sync batch endpoint validates each journal event before admitting its
+session. Valid records share the existing session write fence and transaction;
+an invalid record receives its own rejection and does not create a session.
+The stored event hash for a sync record is the verified canonical journal
+payload hash. Other event producers use their own domain-tagged full-event hash,
+so reconciliation can identify both committed sync records and ID collisions
+without trusting request metadata or reading full event content. Sync projection
+metadata comes from the journal event; outer request lineage is rejected.
+Event reads, keyset cursors, and session summaries share the `(created_at,
+event_id)` order; writes preserve the database's microsecond timestamp precision.
+
+The batch protocol and hash ownership require a fresh sync-data cutover from
+the former single-record protocol; pre-cutover event rows are not silently
+reinterpreted as verified sync receipts. A lost response remains retryable until
+an owner-scoped reconciliation proves the result. Only authoritative permanent
+record-level rejections are quarantined; request-level failures leave records
+pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
+oversized singleton pending for the deployment to be corrected. Newly terminal
+sync failures are reported to an active TUI after they are persisted. Local
+outbox I/O failures also produce a warning and remain eligible for bounded
+background retry.
+HTTP 401/403 pause background delivery for the current login;
+the TUI reports the access problem, and records remain pending and immediately
+claimable after a new login. This pause is process-local: restart probes once
+again, while changes made by another process or silent permission changes do
+not wake an already-running client. A token rotation within the same login also
+needs an explicit sign-in to resume a blocked sync. Payment, request-timeout, locking, and
+rate-limit responses remain pending for automatic retry; `Retry-After` on a
+rate-limit or server error becomes an owner-scoped durable delivery deadline, also respected by newly
+queued records and other processes. Gateway and transport outages use the same
+bounded delivery pause while dispatched requests still reconcile their unknown
+outcomes. Without explicit server advice, one unresolved session does not stall
+healthy sessions; repeated independent failures pause delivery, and failed records
+retry later than unattempted sessions. A healthy service drains existing backlogs without a fixed high-water
+cooldown. The explicit session-unavailable conflict is
+terminal; other 409 responses, HTTP 5xx, and transport failures use owner-scoped
+reconciliation because the commit outcome may be unknown. On ACK, the local
+outbox releases the payload already owned by the canonical journal and retains
+only the identity, hash, and receipt metadata needed for deduplication. Pending
+records retain their payload for delivery. Batched enqueue and settlement index
+the submitted IDs once per durable transaction instead of rescanning the retained
+outbox for every record. The outbox stores one error reason
+and no retry-attempt counter. Older clients cannot read the
+rewritten outbox format; previously quarantined records remain quarantined for
+diagnosis rather than being retried automatically. Independent sessions may make
+progress concurrently, while a session's later batches wait for the earlier batch
+to reach a known outcome.
 
 ## Retention
 
