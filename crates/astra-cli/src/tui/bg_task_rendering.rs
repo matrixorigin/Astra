@@ -17,84 +17,46 @@ use crate::background_task_error::BackgroundTaskError;
 pub(crate) fn background_task_rows(
     background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
-    let snapshots: Vec<_> = background_registry
+    background_registry
         .attention_snapshot()
         .into_iter()
         .map(|(handle, pending_failure)| {
-            let input_available = handle.stdin_available();
-            (
+            let output_error = handle
+                .output_error()
+                .map(format_background_task_output_read_error);
+            let total_bytes = output_error
+                .is_none()
+                .then(|| handle.observed_output_bytes());
+            let output_tail = handle
+                .output_tail()
+                .filter(|tail| !tail.is_empty())
+                .map(str::to_string)
+                .or(output_error);
+            let local_capture_paths = (handle.live_control
+                == crate::edge_tools::background_tasks::BgTaskLiveControl::Available
+                && !handle.status().is_terminal())
+            .then(|| (handle.stdout_path.clone(), handle.stderr_path.clone()));
+            let outcome_unsettled = handle.outcome_unsettled();
+            let mut row = super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
                 handle.id.clone(),
-                handle.projected_status().to_string(),
-                handle.live_control,
+                handle.projected_status(),
                 handle.elapsed_ms(),
-                handle.no_recent_output_ms(),
-                handle.started_at_ms,
-                handle.ended_at_ms,
                 handle.description.clone(),
-                handle.exit_code,
-                handle.terminal_reason.clone(),
-                handle.output_tail().map(str::to_string),
-                (handle.live_control
-                    == crate::edge_tools::background_tasks::BgTaskLiveControl::Available
-                    && !handle.status().is_terminal())
-                .then(|| (handle.stdout_path.clone(), handle.stderr_path.clone())),
-                handle.output_error().cloned(),
-                handle.observed_output_bytes(),
-                input_available,
-                handle.output_reference(),
-                pending_failure || handle.outcome_unsettled(),
-                handle.outcome_unsettled(),
-            )
-        })
-        .collect();
-
-    snapshots
-        .into_iter()
-        .map(
-            |(
-                id,
-                status,
-                live_control,
-                elapsed_ms,
-                no_recent_output_ms,
-                started_at_ms,
-                ended_at_ms,
-                description,
-                exit_code,
-                terminal_reason,
+                Some(handle.output_reference()),
                 output_tail,
-                local_capture_paths,
-                output_error,
                 total_bytes,
-                input_available,
-                output_ref,
-                needs_attention,
-                outcome_unsettled,
-            )| {
-                let output_error = output_error
-                    .as_ref()
-                    .map(format_background_task_output_read_error);
-                let total_bytes = output_error.is_none().then_some(total_bytes);
-                let output_tail = output_tail.filter(|tail| !tail.is_empty()).or(output_error);
-                super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
-                    id,
-                    status,
-                    elapsed_ms,
-                    description,
-                    Some(output_ref),
-                    output_tail,
-                    total_bytes,
-                )
-                .with_live_control(background_task_live_control_state(live_control))
-                .with_no_recent_output(no_recent_output_ms)
-                .with_output_stats(None, None)
-                .with_terminal(exit_code, terminal_reason)
-                .with_timing(Some(started_at_ms), ended_at_ms)
-                .with_input_available(input_available)
-                .with_terminal_attention(needs_attention, outcome_unsettled)
-                .with_local_capture_paths(local_capture_paths)
-            },
-        )
+            )
+            .with_live_control(background_task_live_control_state(handle.live_control))
+            .with_no_recent_output(handle.no_recent_output_ms())
+            .with_output_stats(None, None)
+            .with_terminal(handle.exit_code, handle.terminal_reason.clone())
+            .with_timing(Some(handle.started_at_ms), handle.ended_at_ms)
+            .with_input_available(handle.stdin_available())
+            .with_terminal_attention(pending_failure || outcome_unsettled, outcome_unsettled)
+            .with_local_capture_paths(local_capture_paths);
+            row.terminal_unobserved = handle.terminal_unobserved();
+            row
+        })
         .collect()
 }
 
@@ -1087,6 +1049,13 @@ mod tests {
         assert!(
             registry.get(&id).unwrap().terminal_unobserved(),
             "displaying a notification is not model delivery"
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .terminal_unobserved,
+            "the task view must preserve the independent delivery cursor"
         );
 
         let projections = registry.export_shell_task_projections();

@@ -50,6 +50,7 @@ export type StreamEventType =
   | "stream_gap"
   | "agent_waiting"
   | "agent_progress"
+  | "runtime_wait"
   | "agent_completed"
   | "agent_failed"
   | "agent_cancelled"
@@ -1004,6 +1005,7 @@ export type StreamEvent = (
   | StreamGapEvent
   | AgentWaitingEvent
   | AgentProgressEvent
+  | RuntimeWaitEvent
   | AgentCompletedEvent
   | AgentFailedEvent
   | AgentCancelledEvent
@@ -1369,6 +1371,7 @@ export type RunProjectionResponse = {
   latest_event_type?: string | null;
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  /** Last persisted aggregate, not an exact live execution count. */
   total_tool_calls: number;
   latest_checkpoint?: {
     checkpoint_id: string;
@@ -3375,3 +3378,11 @@ export type ArtifactPublicationV1 = {
   recorded: boolean;
 } & ({ status: "published"; handle: string } |
      { status: "unavailable"; reason_code: string; message: string });
+
+/** Live-only observation. Absence after reconnect does not prove no wait. */
+export type RuntimeWaitEvent = {
+  type: "runtime_wait";
+  run_id: string;
+  reason: "agent_input";
+  waiting: boolean;
+};

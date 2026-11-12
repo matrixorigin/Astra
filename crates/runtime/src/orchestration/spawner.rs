@@ -259,7 +259,7 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
         "{}\n\n## Parent coordination\n\
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
          Stay within the delegated task boundary. Parent communication is a typed protocol: whenever the brief requires a parent answer, your next action MUST be `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", message=...)`; `ask_user` addresses the human, not your parent. Never put a question to the parent in ordinary text or in the terminal result: plain text cannot create a request ID and cannot be answered. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
-         A parent question is control flow, never terminal output. After the question tool returns `queued`, use `agent(action=\"wait\")` and wait for the correlated answer; do not finish the run until that answer is observed and the delegated brief is complete. \
+         A question is asynchronous coordination, never proof of completion. After `queued`, continue independent work or use `agent(action=\"wait\")` for bounded observation if the answer is needed. Use the exact request ID and actual sender identity; report unanswered questions and incomplete delegated work truthfully. \
          Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs. Honor the brief's requested output format exactly; persona and summary defaults must not add explanation or formatting. Otherwise keep a one-shot result to one line when sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
@@ -13890,7 +13890,7 @@ pub(crate) mod tests {
             let ctx = AgentToolContext {
                 parent_delegation_authority: DelegationAuthority::Allowed,
                 fanout_admission: admission,
-                reply_obligations: Arc::new(Default::default()),
+                question_correlations: Arc::new(Default::default()),
                 delegation_model_admission: None,
                 run_id: "result-parent-0".into(),
                 agent_id: "root-agent".into(),
@@ -14061,7 +14061,7 @@ pub(crate) mod tests {
         let ctx = AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("mixed-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "mixed-parent".into(),
             agent_id: "root-agent".into(),
@@ -14183,7 +14183,7 @@ pub(crate) mod tests {
         let ctx = AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("next-turn"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "next-turn".into(),
             agent_id: "root-agent".into(),

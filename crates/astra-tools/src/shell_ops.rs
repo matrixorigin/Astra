@@ -852,7 +852,7 @@ pub fn resolve_bash_workdir(
     }
     if !resolved.starts_with(&canonical_root) {
         return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. If this is the intended workspace, omit `workdir` or use a directory inside it. Otherwise explicitly select the intended workspace or leave the selected worktree before retrying.",
+            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
             workspace_root.display()
         ));
     }
@@ -876,7 +876,7 @@ pub fn resolve_bash_workdir(
             })?;
         let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. If this is the intended workspace, omit `workdir` or use a directory inside it. Otherwise explicitly select the intended workspace or leave the selected worktree before retrying.",
+                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
                 workspace_root.display()
             )
         })?;

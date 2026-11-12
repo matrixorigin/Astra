@@ -196,6 +196,7 @@ describe("WorkSurfacePanel", () => {
       screen.getByText("Review the concurrency boundary."),
     ).toBeInTheDocument();
     expect(screen.getByText("The boundary is race-safe.")).toBeInTheDocument();
+    expect(screen.getByText("Tools (reported)").nextElementSibling).toHaveTextContent("unknown");
     expect(
       screen.getByText("Checked the durable CAS path."),
     ).toBeInTheDocument();

@@ -14480,6 +14480,7 @@ fn handle_app_event(
             | TuiAppEvent::ThinkingStarted
             | TuiAppEvent::ThinkingChunk { .. }
             | TuiAppEvent::ThinkingStopped
+            | TuiAppEvent::RuntimeWait { .. }
             | TuiAppEvent::WaitingForModel
             | TuiAppEvent::ModelResponding
             | TuiAppEvent::ToolStarted { .. }
@@ -14537,13 +14538,27 @@ fn handle_app_event(
                 .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ThinkingChunk { .. } => {
-            // ChatWidget handles the cell update; nothing to do
-            // in the bottom pane. The indicator stays `Thinking`.
+            // Reasoning is actual provider activity even without a separate
+            // start event; it supersedes a disposable wait observation.
+            status_indicator
+                .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ThinkingStopped => {
             // Keep the indicator active — the model may still be
             // generating the answer body. It flips to `Idle` on
             // TurnComplete / TurnError.
+        }
+        TuiAppEvent::RuntimeWait { waiting } => {
+            if *waiting {
+                status_indicator
+                    .set_state(status_indicator::IndicatorState::WaitingInput { started_at: now });
+            } else if matches!(
+                status_indicator.state(),
+                status_indicator::IndicatorState::WaitingInput { .. }
+            ) {
+                status_indicator
+                    .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
+            }
         }
         TuiAppEvent::WaitingForModel => {
             bottom_pane.set_task_status(TaskStatus::WaitingModel);
@@ -21931,12 +21946,12 @@ mod tests {
     #[test]
     fn active_run_guidance_preserves_typed_runtime_context() {
         let input = LocalRunControl::guidance_input(
-            "现在什么情况？",
+            "停停停",
             Some("<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"),
             &[],
         )
         .expect("valid guidance input");
-        assert_eq!(input["content"], "现在什么情况？");
+        assert_eq!(input["content"], "停停停");
         assert_eq!(
             input["astra_runtime_context"]["schema"],
             "active_work_snapshot.v1"
@@ -25348,6 +25363,68 @@ mod tests {
         assert!(
             !after_late_progress.contains("Enter queues follow-up"),
             "late progress resurrected a terminal turn: {after_late_progress:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_wait_reaches_the_indicator_and_cannot_outlive_activity_or_settlement() {
+        use astra_turn_core::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+        };
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        let effects = dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"runtime_wait\",\"run_id\":\"root\",\"reason\":\"agent_input\",\"waiting\":true}\n\n",
+            &mut accum,
+            &mut Vec::new(),
+        );
+        let [SseRenderEffect::RuntimeWait { waiting }] = effects.as_slice() else {
+            panic!("missing typed wait observation")
+        };
+        let event = crate::tui::stream_bridge::map_stream_event(
+            crate::cli::chat_stream::StreamEvent::RuntimeWait { waiting: *waiting },
+        )
+        .unwrap();
+        let mut pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        let at = std::time::Instant::now();
+        begin_submission_dispatch_feedback(&mut pane, &mut indicator, at);
+        let fr = FrameRequester::test_dummy();
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        let text = |line: ratatui::text::Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text(indicator.render().unwrap()).contains("Agent input (last report)"));
+        // Missing end event expires in the existing render clock, with no timer/IO.
+        assert!(
+            !text(
+                indicator
+                    .render_at(at + std::time::Duration::from_secs(6))
+                    .unwrap()
+            )
+            .contains("Agent input")
+        );
+        handle_app_event(
+            &TuiAppEvent::ModelResponding,
+            &mut pane,
+            &mut indicator,
+            &fr,
+        );
+        assert!(!text(indicator.render().unwrap()).contains("Agent input"));
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: at });
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        assert!(text(indicator.render().unwrap()).contains("Stopping"));
+        handle_app_event(&TuiAppEvent::TurnComplete, &mut pane, &mut indicator, &fr);
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        assert!(
+            indicator.render().is_none(),
+            "late hints cannot resurrect a turn"
         );
     }
 
