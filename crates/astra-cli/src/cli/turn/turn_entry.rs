@@ -1692,6 +1692,8 @@ mod tests {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             tui_approval_request_tx: Some(approval_tx),
             tui_ask_user_request_tx: Some(ask_user_tx),
+            // Do not inherit workspace trust from the developer checkout.
+            perm_manager: crate::cli::permission_manager::PermissionManager::new(false),
             model: Some("gpt-5".into()),
             resume_guidance: Some("verify the unfinished result".into()),
             diagnostics_context: Some("existing diagnostic".into()),

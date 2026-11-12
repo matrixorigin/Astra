@@ -9377,7 +9377,7 @@ mod tests {
                 _: &EdgeDispatchIdentity,
                 _: &str,
                 _: &str,
-            ) -> Result<bool, String> {
+            ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
                 Ok(false)
             }
             async fn fail_dispatch(
