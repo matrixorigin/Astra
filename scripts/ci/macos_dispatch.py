@@ -500,7 +500,9 @@ def main():
         if args.mode in {"admit", "cleanup"}:
             return 1
         if args.mode == "schedule":
-            status = 1
+            # A validated hosted-runner source does not require a mini attempt.
+            # Keep real API/dispatch failures fail-closed.
+            status = 0 if isinstance(error, Unavailable) and reason == "source does not prefer mini" else 1
     finally:
         if args.mode == "schedule" and src is not None:
             # One owner for cleanup, including obsolescence during admission.
