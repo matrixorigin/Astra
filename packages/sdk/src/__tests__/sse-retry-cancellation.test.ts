@@ -4,6 +4,25 @@ import type { ConnectionState } from '../types';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+test.each(['close', 'external-abort'])('%s stops delivery of already buffered events', async (cancel) => {
+  const controller = new AbortController();
+  const received: unknown[] = [];
+  const transport = vi.fn().mockResolvedValue(new Response(
+    'data: {"type":"text_delta","content":"first"}\n\n' +
+    'data: {"type":"text_delta","content":"stale"}\n\n' +
+    'data: {"type":"run_finished"}',
+  ));
+  const client = new SSEClient({
+    url: 'https://example.test/stream', signal: controller.signal, transport,
+    onEvent: (event) => {
+      received.push(event);
+      if (cancel === 'close') client.close(); else controller.abort();
+    },
+  });
+  await client.connect();
+  expect(received).toEqual([{ type: 'text_delta', content: 'first' }]);
+});
+
 for (const cancel of ['external-abort', 'close']) {
   test(`${cancel} settles connect during backoff without reconnecting`, async () => {
     vi.useFakeTimers();

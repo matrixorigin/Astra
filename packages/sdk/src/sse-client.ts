@@ -288,6 +288,9 @@ export class SSEClient {
   }
 
   private processSSEData(data: string): void {
+    // Cancellation can occur in a callback while the parser still holds more
+    // events from the same network chunk, including its final buffered event.
+    if (this.closed || this.options.signal?.aborted) return;
     const event = parseSseEvent(data);
     if (event === undefined) return;
     try {
