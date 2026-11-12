@@ -22,6 +22,9 @@ pub fn truncate_str(s: &str, max: usize) -> String {
 /// char budget — `max_chars=5` on "hello world" returns "hell…".
 /// Multi-line input is reduced to the first line first.
 pub fn truncate_line(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let line = s.lines().next().unwrap_or(s);
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -32,6 +35,9 @@ pub fn truncate_line(s: &str, max_chars: usize) -> String {
 }
 
 fn truncate_to_width(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -40,18 +46,26 @@ fn truncate_to_width(s: &str, max_chars: usize) -> String {
 }
 
 /// Shorten a path by keeping the filename and truncating the directory prefix with "...".
+/// Budgets narrower than the four-character `".../"` marker preview the
+/// filename itself, falling back to a bounded whole-path prefix when
+/// the path has no final component.
 #[must_use]
 pub fn shorten_path(path: &str, max_chars: usize) -> String {
     if path.chars().count() <= max_chars {
         return path.to_string();
     }
-
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.is_empty() {
-        return truncate_to_width(path, max_chars);
-    }
-
     let filename = parts.last().copied().unwrap_or("");
+    // The shortest directory marker is four chars (".../"), so narrower
+    // previews cannot carry a directory prefix: keep the filename so
+    // distinct paths stay distinguishable, and fall back to a path
+    // prefix only when the final component is empty.
+    if max_chars < 4 {
+        if filename.is_empty() {
+            return truncate_to_width(path, max_chars);
+        }
+        return truncate_to_width(filename, max_chars);
+    }
     // Use `>` not `>=`: when max_chars is tight (e.g. 10) and the filename is short (6 chars),
     // `>=` wrongly skips the `.../parent/file` branch and returns a bare filename — breaks
     // tool lines that expect a `.../` prefix for long directory paths.
@@ -120,6 +134,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_budget_never_emits_an_ellipsis() {
+        for text in ["hello", "数据—flow", "hello\nworld"] {
+            assert_eq!(truncate_line(text, 0), "");
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "文件/路径/", ""] {
+            assert_eq!(shorten_path(path, 0), "");
+        }
+    }
+
+    #[test]
+    fn previews_respect_every_small_unicode_budget() {
+        for text in ["hello world", "数据—flow", "hello\nworld", ""] {
+            for budget in 0..=10 {
+                let preview = truncate_line(text, budget);
+                assert!(
+                    preview.chars().count() <= budget,
+                    "truncate_line over budget {budget}: {preview}"
+                );
+            }
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "数据/路径/", "", "filename.txt"] {
+            for budget in 0..=10 {
+                let preview = shorten_path(path, budget);
+                assert!(
+                    preview.chars().count() <= budget,
+                    "shorten_path over budget {budget}: {preview}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn github_repo_display_prefers_owner_repo_pair() {
         assert_eq!(
             github_repo_display(Some("matrixorigin"), Some("astra")).as_deref(),
@@ -130,5 +176,27 @@ mod tests {
             Some("matrixorigin/Astra")
         );
         assert_eq!(github_repo_display(Some("matrixorigin"), None), None);
+    }
+
+    #[test]
+    fn narrow_budgets_keep_the_filename_distinguishable() {
+        // Two distinct service files must not collapse into the same whole-path
+        // prefix when the budget is narrower than the ".../" directory marker.
+        assert_eq!(shorten_path("/home/x/src/service.rs", 2), "s…");
+        assert_eq!(shorten_path("/home/x/src/worker.rs", 2), "w…");
+        assert_eq!(shorten_path("/home/x/src/service.rs", 3), "se…");
+        assert_eq!(shorten_path("/home/x/src/worker.rs", 3), "wo…");
+        assert_ne!(
+            shorten_path("/home/x/src/service.rs", 2),
+            shorten_path("/home/x/src/worker.rs", 2)
+        );
+        assert_ne!(
+            shorten_path("/home/x/src/service.rs", 3),
+            shorten_path("/home/x/src/worker.rs", 3)
+        );
+        // Trailing-slash paths have no final component, so they keep the
+        // bounded whole-path fallback.
+        assert_eq!(shorten_path("/home/x/src/", 2), "/…");
+        assert_eq!(shorten_path("/home/x/src/", 3), "/h…");
     }
 }
