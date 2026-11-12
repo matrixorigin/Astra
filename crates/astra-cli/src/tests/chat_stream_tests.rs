@@ -1980,65 +1980,85 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     struct StreamingMockState {
         call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         tool_results: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        callback_done: std::sync::Arc<tokio::sync::Notify>,
     }
 
     let state = StreamingMockState {
         call_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         tool_results: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        callback_done: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
-    let app = Router::new()
-        .route(
-            "/chat/stream",
-            post({
-                let state = state.clone();
-                move || {
+    let app =
+        Router::new()
+            .route(
+                "/chat/stream",
+                post({
                     let state = state.clone();
-                    async move {
-                        state
-                            .call_count
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let body = format!(
-                                "data: {{\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\",\"run_id\":\"run-sess-tx-e2e\"}}\n\n\
-                                 data: {}\n\n\
-                                 {}",
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            state
+                                .call_count
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let prefix = format!(
+                                "data: {}\n\ndata: {}\n\n",
                                 serde_json::json!({
-                                    "type": "tool_request",
-                                    "session_id": "sess-tx-e2e",
-                                    "run_id": "run-sess-tx-e2e",
-                                    "turn_chain_id": "chain-tx-e2e",
-                                    "request_id": "tr-tx-1",
-                                    "schema_admitted_by_server": true,
-                                    "execution_timeout_ms": 300_000, "command_timeout_cap_ms": 30_000,
-                                    "execution_deadline_unix_ms": 4_102_444_800_000_u64,
-                                    "tool": "bash",
-                                    "args": {
-                                        "command": "echo hi",
-                                        "transaction_id": "tx-e2e",
-                                        "rollback_on_failure": true
-                                    }
+                                    "type":"session_info","session_id":"sess-tx-e2e",
+                                    "run_id":"run-sess-tx-e2e"
                                 }),
-                                sse_text_response_with_execution_summary(
-                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1, ("run-sess-tx-e2e", 1),
-                                ),
+                                serde_json::json!({
+                                    "type":"tool_request","session_id":"sess-tx-e2e",
+                                    "run_id":"run-sess-tx-e2e","turn_chain_id":"chain-tx-e2e",
+                                    "request_id":"tr-tx-1","schema_admitted_by_server":true,
+                                    "execution_timeout_ms":300_000,"command_timeout_cap_ms":30_000,
+                                    "execution_deadline_unix_ms":4_102_444_800_000_u64,
+                                    "tool":"bash","args":{
+                                        "command":"echo hi","transaction_id":"tx-e2e",
+                                        "rollback_on_failure":true
+                                    }
+                                })
                             );
-                        (TEST_SSE_HEADERS, body)
+                            let suffix = sse_text_response_with_execution_summary(
+                                "Done!",
+                                "sess-tx-e2e",
+                                1,
+                                0,
+                                &["bash"],
+                                1,
+                                ("run-sess-tx-e2e", 1),
+                            );
+                            use futures_util::StreamExt;
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(prefix)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    state.callback_done.notified(),
+                                )
+                                .await
+                                .expect("tool result must arrive before terminal");
+                                Ok::<_, std::io::Error>(suffix)
+                            }));
+                            (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                        }
                     }
-                }
-            }),
-        )
-        .route(
-            "/tools/result",
-            post({
-                let state = state.clone();
-                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                }),
+            )
+            .route(
+                "/tools/result",
+                post({
                     let state = state.clone();
-                    async move {
-                        state.tool_results.lock().await.push(body);
-                        axum::Json(serde_json::json!({ "ok": true }))
+                    move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let state = state.clone();
+                        async move {
+                            state.tool_results.lock().await.push(body);
+                            state.callback_done.notify_one();
+                            axum::Json(serde_json::json!({ "ok": true }))
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
@@ -2480,6 +2500,8 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let callbacks = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let captured_callbacks = callbacks.clone();
+        let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stream_callback_done = callback_done.clone();
         let cc = call_count.clone();
         let tool_name_clone = mcp_tool_name.clone();
         let app = axum::Router::new().route(
@@ -2487,41 +2509,58 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
         axum::routing::post(move || {
             let cc = cc.clone();
             let tn = tool_name_clone.clone();
+            let callback_done = stream_callback_done.clone();
             async move {
                 cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = if callback_admitted {
+                let (prefix, mut suffix) = if callback_admitted {
                     let request = serde_json::json!({
-                        "type": "tool_request", "session_id": "sess-mcp",
-                        "run_id": "run-sess-mcp", "turn_chain_id": "chain-mcp",
-                        "request_id": "mcp-1", "schema_admitted_by_server": true,
-                        "execution_timeout_ms": 300000, "command_timeout_cap_ms": 30_000,
-                        "execution_deadline_unix_ms": 4102444800000u64,
-                        "tool": tn, "args": {"message": "hello from test"}
+                        "type":"tool_request","session_id":"sess-mcp",
+                        "run_id":"run-sess-mcp","turn_chain_id":"chain-mcp",
+                        "request_id":"mcp-1","schema_admitted_by_server":true,
+                        "execution_timeout_ms":300000,"command_timeout_cap_ms":30_000,
+                        "execution_deadline_unix_ms":4102444800000u64,
+                        "tool":tn,"args":{"message":"hello from test"}
                     });
-                    format!(
-                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\ndata: {request}\n\n{}",
+                    (
+                        format!("data: {}\n\ndata: {request}\n\n",
+                            serde_json::json!({"type":"session_info","session_id":"sess-mcp","run_id":"run-sess-mcp"})),
                         sse_text_response_with_execution_summary(
                             "MCP done!", "sess-mcp", 1, 1, &[&tn], 1, ("run-sess-mcp", 1),
                         ),
                     )
-                } else { format!(
+                } else {
+                    (format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\n\
                          data: {{\"type\":\"tool_call\",\"id\":\"mcp-1\",\"name\":\"{}\",\"arguments\":{{\"message\":\"hello from test\"}}}}\n\n\
                          data: {{\"type\":\"turn_complete\",\"has_tool_calls\":true}}\n\n\
-                         data: [DONE]\n\n",
-                        tn
-                    ) };
-                let body = if mode == "missing_terminal" {
-                    let end = body.find("data: {\"type\":\"run_finished\"").unwrap();
-                    format!("{}data: [DONE]\n\n", &body[..end])
-                } else { body };
-                (TEST_SSE_HEADERS, body)
+                         data: [DONE]\n\n", tn
+                    ), String::new())
+                };
+                if mode == "missing_terminal" {
+                    let end = suffix.find("data: {\"type\":\"run_finished\"").unwrap();
+                    suffix = format!("{}data: [DONE]\n\n", &suffix[..end]);
+                }
+                use futures_util::StreamExt;
+                let chunks = futures_util::stream::once(async move {
+                    Ok::<_, std::io::Error>(prefix)
+                }).chain(futures_util::stream::once(async move {
+                    if callback_admitted {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            callback_done.notified(),
+                        ).await.expect("MCP result must arrive before terminal");
+                    }
+                    Ok::<_, std::io::Error>(suffix)
+                }));
+                (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
             }
         }),
     ).route("/tools/result", post(move |Json(body): Json<serde_json::Value>| {
         let callbacks = captured_callbacks.clone();
+        let callback_done = callback_done.clone();
         async move {
             callbacks.lock().await.push(body);
+            callback_done.notify_one();
             Json(serde_json::json!({"ok": true}))
         }
     }));

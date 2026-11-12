@@ -1660,6 +1660,11 @@ async fn flush_work_batch_via_host<H: SseEdgeWork>(
                     continue;
                 }
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
+                    // A conflicting request identity invalidates the batch.
+                    // Do not synthesize or publish results under an untrusted owner.
+                    if host.should_abort_edge_work() {
+                        return;
+                    }
                     let result = request.rejected_result(&request.args, error);
                     host.on_tool_result(&result);
                     tool_results.push(result);
