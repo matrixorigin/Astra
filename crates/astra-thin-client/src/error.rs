@@ -54,6 +54,10 @@ pub enum ThinClientError {
     },
     #[error("the original authenticated owner could not be confirmed before tool-result delivery")]
     CallbackOwnerUnconfirmed,
+    #[error(
+        "the original authenticated owner could not be confirmed for further delivery; previous callback: {0}"
+    )]
+    CallbackOwnerUnconfirmedAfterAttempt(#[source] Box<ThinClientError>),
     #[error("tool-result delivery task failed: {0}")]
     CallbackTaskFailed(String),
     #[error("server acknowledged the tool result, but local bookkeeping failed: {0}")]
@@ -73,6 +77,14 @@ pub enum ThinClientError {
 }
 
 impl ThinClientError {
+    /// Keep a previous delivery failure when the original owner can no longer be confirmed.
+    pub fn callback_owner_unconfirmed(previous: Option<Self>) -> Self {
+        match previous {
+            Some(previous) => Self::CallbackOwnerUnconfirmedAfterAttempt(Box::new(previous)),
+            None => Self::CallbackOwnerUnconfirmed,
+        }
+    }
+
     /// A read-only cancellation observation found an expired execution owner.
     /// Recovery must use the existing mutation command, never a hidden GET write.
     pub fn cancellation_recovery_required(&self) -> bool {

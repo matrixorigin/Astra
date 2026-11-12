@@ -1083,6 +1083,7 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
         | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
         | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+        | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(_)
         | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
         | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
         | astra_thin_client::ThinClientError::CallbackRetryCancelled

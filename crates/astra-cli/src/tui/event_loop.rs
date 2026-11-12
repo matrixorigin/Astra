@@ -4064,6 +4064,7 @@ impl GuidanceSubmissionError {
             | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
             | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
             | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+            | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(_)
             | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
             | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
             | astra_thin_client::ThinClientError::CallbackRetryCancelled

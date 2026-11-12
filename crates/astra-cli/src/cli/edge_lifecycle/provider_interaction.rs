@@ -209,6 +209,7 @@ fn native_interaction_error(
         E::Http(_) => "network",
         E::InvalidAuthHeader
         | E::CallbackOwnerUnconfirmed
+        | E::CallbackOwnerUnconfirmedAfterAttempt(_)
         | E::CallbackAuthRefreshUnconfirmed(_)
         | E::CallbackRetryAuthFailed { .. } => "authentication",
         E::CallbackTaskFailed(_) | E::CallbackBookkeepingFailed(_) => "protocol",

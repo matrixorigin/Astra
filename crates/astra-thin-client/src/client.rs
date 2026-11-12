@@ -2651,7 +2651,9 @@ impl ThinClient {
                     .unwrap_or(ThinClientError::CallbackRetryCancelled));
             }
             if !(delivery.owner_current)() {
-                return Err(ThinClientError::CallbackOwnerUnconfirmed);
+                return Err(ThinClientError::callback_owner_unconfirmed(
+                    previous_error.take(),
+                ));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -2703,7 +2705,9 @@ impl ThinClient {
                 req = req.header(ASTRA_EDGE_ID_HEADER, v);
             }
             if !(delivery.owner_current)() {
-                return Err(ThinClientError::CallbackOwnerUnconfirmed);
+                return Err(ThinClientError::callback_owner_unconfirmed(
+                    previous_error.take(),
+                ));
             }
             if is_retry && delivery.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
                 return Err(previous_error
@@ -5510,7 +5514,14 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, ThinClientError::CallbackOwnerUnconfirmed));
+        match error {
+            ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(previous) => {
+                assert!(
+                    matches!(*previous, ThinClientError::Api { status, .. } if status.as_u16() == 500)
+                );
+            }
+            error => panic!("owner change must retain the observed callback failure: {error:?}"),
+        }
         server.verify().await;
     }
 
