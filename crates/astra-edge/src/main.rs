@@ -310,11 +310,14 @@ use astra_runtime_env::{
 
 fn edge_invocation_journal_path_in_root(
     edge_id: &str,
+    server_url: &str,
     workspace_dir: &Path,
     state_root: Option<PathBuf>,
 ) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(edge_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(server_url.as_bytes());
     hasher.update([0]);
     hasher.update(workspace_dir.to_string_lossy().as_bytes());
     let key = format!("{:x}", hasher.finalize());
@@ -860,6 +863,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             workspace_dir: workspace.clone(),
             journal_path: edge_invocation_journal_path_in_root(
                 &config.edge_id,
+                &config.server_url,
                 &workspace,
                 config.invocation_journal_root.clone(),
             ),
@@ -1116,16 +1120,25 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        let connect_result = tokio::select! {
-            biased;
-            _ = managed_background::until_starting_command_lost() => {
-                eprintln!(
-                    "Error: the starting command is gone; runner startup was not accepted."
-                );
-                return true;
+        let connection = run_edge_connection(config).instrument(edge_span);
+        tokio::pin!(connection);
+        let mut startup_lost = false;
+        let connect_result = loop {
+            tokio::select! {
+                biased;
+                // Keep polling the connection after this fires. Dropping it
+                // abandons admitted work instead of letting its owner settle.
+                _ = managed_background::until_starting_command_lost(), if !startup_lost => {
+                    startup_lost = true;
+                    managed_background::shutdown_token().cancel();
+                }
+                result = &mut connection => break result,
             }
-            result = run_edge_connection(config).instrument(edge_span) => result,
         };
+        if startup_lost {
+            eprintln!("Error: the starting command is gone; runner startup was not accepted.");
+            return true;
+        }
         match connect_result {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
@@ -1597,8 +1610,12 @@ mod tests {
     fn invocation_journal_honors_the_explicit_local_state_root() {
         let root = std::env::temp_dir().join("astra-edge-isolated-state");
         let workspace = std::env::temp_dir().join("astra-edge-workspace");
-        let path =
-            edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root.clone()));
+        let path = edge_invocation_journal_path_in_root(
+            "edge-test",
+            "wss://example.test",
+            &workspace,
+            Some(root.clone()),
+        );
 
         assert_eq!(path.parent().and_then(Path::parent), Some(root.as_path()));
         assert_eq!(
@@ -1606,6 +1623,310 @@ mod tests {
             Some(std::ffi::OsStr::new("edge-invocations"))
         );
         assert_eq!(path.extension(), Some(std::ffi::OsStr::new("json")));
+        let other_server = edge_invocation_journal_path_in_root(
+            "edge-test",
+            "wss://other.example.test",
+            &workspace,
+            Some(root),
+        );
+        assert_ne!(path, other_server);
+    }
+
+    fn edge_config(
+        server_url: String,
+        edge_id: &str,
+        workspace: &Path,
+        state: &Path,
+        token_name: &str,
+    ) -> EdgeConfig {
+        EdgeConfig {
+            capacity_providers: Vec::new(),
+            server_url,
+            token_manager: token_manager::TokenManager::new(
+                "test-token".into(),
+                None,
+                state.join(token_name),
+            ),
+            workspace_dir: workspace.to_path_buf(),
+            edge_id: edge_id.to_string(),
+            materialization_id: format!("{edge_id}-materialization"),
+            reconnect: false,
+            invocation_journal_root: Some(state.to_path_buf()),
+        }
+    }
+
+    async fn accept_edge(listener: &tokio::net::TcpListener) -> WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_servers_with_one_edge_id_open_distinct_journals() {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let workspace = workspace.canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap().keep();
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url_a = format!("ws://{}/edge/ws", listener_a.local_addr().unwrap());
+        let url_b = format!("ws://{}/edge/ws", listener_b.local_addr().unwrap());
+        assert_ne!(
+            edge_invocation_journal_path_in_root("runner-abc", &url_a, &workspace, Some(state.clone())),
+            edge_invocation_journal_path_in_root("runner-abc", &url_b, &workspace, Some(state.clone())),
+        );
+        let hold = |listener: tokio::net::TcpListener| async move {
+            let mut socket = accept_edge(&listener).await;
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::AuthOk {
+                        user_id: "user".into(),
+                        edge_id: "runner-abc".into(),
+                        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR
+                            .into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
+        };
+        let config_a = edge_config(url_a, "runner-abc", &workspace, &state, "server-a.token");
+        let config_b = edge_config(url_b, "runner-abc", &workspace, &state, "server-b.token");
+        let ((), (), first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                hold(listener_a),
+                hold(listener_b),
+                run_edge_connection(&config_a),
+                run_edge_connection(&config_b),
+            )
+        })
+        .await
+        .expect("the two servers did not both open their journals");
+        for result in [first, second] {
+            if let Err(error) = result {
+                let message = error.to_string();
+                assert!(
+                    !message.contains("json.lock"),
+                    "two servers opened one journal: {message}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_loss_after_tool_admission_replays_cancellation() {
+        if std::env::var("ASTRA_EDGE_TEST_PARENT_LOSS").ok().as_deref() == Some("1") {
+            let workspace = PathBuf::from(std::env::var("ASTRA_EDGE_TEST_WORKSPACE").unwrap());
+            let state = PathBuf::from(std::env::var("ASTRA_EDGE_TEST_STATE").unwrap());
+            let config = edge_config(
+                std::env::var("ASTRA_EDGE_TEST_SERVER").unwrap(),
+                "runner-parent-loss",
+                &workspace,
+                &state,
+                "parent-loss.token",
+            );
+            let handoff = managed_background::credential_handoff_dir();
+            let _ = run_connection_loop(&config, handoff.as_deref()).await;
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let workspace = workspace.canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap().keep();
+        let state = state.canonicalize().unwrap();
+        let runner_dir = state.join("runner");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
+        let journal = edge_invocation_journal_path_in_root(
+            "runner-parent-loss",
+            &server_url,
+            &workspace,
+            Some(state.clone()),
+        );
+        let (parent_ready, child_ready) = std::os::unix::net::UnixStream::pair().unwrap();
+        parent_ready
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let child_fd = std::os::fd::AsRawFd::as_raw_fd(&child_ready);
+        nix::fcntl::fcntl(
+            child_fd,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::parent_loss_after_tool_admission_replays_cancellation",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRA_EDGE_TEST_PARENT_LOSS", "1")
+            .env("ASTRA_EDGE_MANAGED", "1")
+            .env("ASTRA_EDGE_STATE_DIR", &runner_dir)
+            .env("ASTRA_EDGE_READY_FD", child_fd.to_string())
+            .env("ASTRA_EDGE_TEST_SERVER", &server_url)
+            .env("ASTRA_EDGE_TEST_WORKSPACE", &workspace)
+            .env("ASTRA_EDGE_TEST_STATE", &state)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        drop(child_ready);
+
+        let mut socket = accept_edge(&listener).await;
+        assert!(socket.next().await.unwrap().unwrap().is_text());
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::AuthOk {
+                    user_id: "user".into(),
+                    edge_id: "runner-parent-loss".into(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "chain",
+            "parent-loss-call",
+        )
+        .unwrap();
+        let request = EdgeServerMessage::ToolRequest {
+            request_id: identity.storage_key(),
+            identity: Box::new(identity),
+            delivery_generation: 1,
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "sleep 30"}),
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: Some(30),
+            execution_deadline_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 120_000,
+            ),
+            execution_timeout_ms: Some(120_000),
+            command_timeout_cap_ms: None,
+            execution_ceiling: None,
+            traceparent: None,
+            tracestate: None,
+        };
+        socket
+            .send(Message::Text(serde_json::to_string(&request).unwrap().into()))
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut ready = [0u8; 1];
+            parent_ready.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"1");
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                let recorded = [&journal, &journal.with_extension("json.wal")]
+                    .iter()
+                    .any(|path| {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .is_some_and(|body| body.contains("\"state\":\"running\""))
+                    });
+                if recorded {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("admitted bash was not durable before the starting command disappeared");
+        })
+        .await
+        .unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .expect("admitted work did not settle after the starting command disappeared")
+        .unwrap()
+        .unwrap();
+        assert!(status.success(), "runner exited before settlement: {status}");
+        while let Some(frame) = socket.next().await {
+            if frame.is_err() {
+                break;
+            }
+        }
+
+        let replay = run_edge_connection(&edge_config(
+            server_url,
+            "runner-parent-loss",
+            &workspace,
+            &state,
+            "replay.token",
+        ));
+        let replay_server = async {
+            let mut socket = accept_edge(&listener).await;
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::AuthOk {
+                        user_id: "user".into(),
+                        edge_id: "runner-parent-loss".into(),
+                        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR
+                            .into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = tokio::time::timeout_at(deadline, socket.next())
+                    .await
+                    .expect("replay did not deliver the settled result")
+                    .unwrap()
+                    .unwrap();
+                if !frame.is_text() {
+                    continue;
+                }
+                let message: EdgeClientMessage =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if let EdgeClientMessage::ToolResult {
+                    is_error,
+                    output,
+                    tool_result_fields,
+                    ..
+                } = message
+                {
+                    return (is_error, output, tool_result_fields);
+                }
+            }
+        };
+        let ((is_error, output, fields), replayed) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(replay_server, replay) })
+                .await
+                .expect("replaying the settled invocation timed out");
+        replayed.expect("replay connection failed");
+        let fields = fields.expect("settled result had no tool fields");
+        assert!(is_error);
+        assert_ne!(
+            fields.get("outcome_certainty").and_then(Value::as_str),
+            Some("unknown"),
+            "parent loss was replayed as an unknown outcome: {output}"
+        );
+        assert!(
+            !output.contains("dispatched without a durable completion"),
+            "{output}"
+        );
+        let cancelled = fields.get("cancelled").and_then(Value::as_bool) == Some(true)
+            || fields.get("exit_semantics").and_then(Value::as_str) == Some("cancelled");
+        assert!(cancelled, "settled result was not cancellation evidence: {fields:?} {output}");
     }
 
     #[test]

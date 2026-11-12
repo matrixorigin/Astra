@@ -92,7 +92,8 @@ not recorded its metadata yet. Once the runner process exists, `stop` stops it
 without waiting for authentication. The runner stays up only after the starting
 command accepts a connection that is still up. Closing the terminal, or losing
 that command before it accepts, cancels the startup, including while the runner
-is still trying to reach the server. The token is not written to the runner
-metadata. Each background runner keeps the credential it last authenticated
-for its own identity, so another runner in the same workspace does not
-replace it.
+is still trying to reach the server. Work the runner has already started is
+cancelled and its result is kept for the next connection. The token is not
+written to the runner metadata. Each background runner keeps the credential it
+last authenticated for its own identity, and the execution record for its own
+server, so another runner in the same workspace does not replace either.

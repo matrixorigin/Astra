@@ -190,7 +190,11 @@ pub fn signal_ready_for_epoch(epoch: u64) {
     let ready_fd = ready_fd_from_env();
     if let Err(error) = signal_ready_for_epoch_with(&PHASE_STATE, epoch, dir.as_deref(), ready_fd) {
         eprintln!("Error: {error}.");
-        std::process::exit(1);
+        // The connection is still the execution owner. Exiting here abandons
+        // admitted work; parent loss asks that owner to cancel and settle.
+        if matches!(error, StartupAcceptError::ParentGone) {
+            shutdown_token().cancel();
+        }
     }
 }
 
@@ -842,7 +846,9 @@ fn spawn_and_wait(
         Some(dir),
         release_start,
     ) {
-        kill_child(&mut child);
+        // SIGTERM is the runner's existing shutdown signal. It settles
+        // admitted work and exits; SIGKILL would leave that work unknown.
+        stop_unaccepted_child(&mut child);
         return Err(error);
     }
     Ok(())
@@ -1050,9 +1056,18 @@ impl Drop for StartupCancel {
     }
 }
 
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop_unaccepted_child(child: &mut Child) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let started = Instant::now();
+    while started.elapsed() < STOP_TIMEOUT {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
