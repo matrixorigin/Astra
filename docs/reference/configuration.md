@@ -437,8 +437,13 @@ Failures also carry `error.phase` (`preparation`, `admission`, `request`, `respo
 `connection_reset`, `connection_aborted`, `broken_pipe`, `unexpected_eof`, or
 `timeout`; otherwise the reason remains a safe category such as `connect_error`
 or the existing error code. DNS/TLS details are not guessed from error text.
-Collectors that have already erased the transport type retain their existing
-category. Connection preparation failures are included before HTTP dispatch,
+The OpenAI-compatible and Anthropic SSE collectors retain a fixed diagnostic
+before erasing typed body-read errors. A clean EOF without the protocol terminal
+records `eof_before_terminal`; an already recognized Anthropic error event records
+`provider_error_event`; invalid SSE framing or JSON records `invalid_sse`.
+Other collectors retain their existing category when no safe cause is available.
+These observations do not identify which upstream service closed a connection.
+Connection preparation failures are included before HTTP dispatch,
 without inventing an HTTP response or a durable provider attempt.
 `http.response.status_code` is recorded only after a response arrives. If
 settlement fails after a provider failure, the phase/reason describe settlement
@@ -450,6 +455,9 @@ Run task remain independent.
 `retry.attempt` is the zero-based client retry-loop index; non-streaming calls
 use zero. These fields do not export raw error messages, provider URLs, prompts
 or response bodies, and do not change retry, timeout or request-result behavior.
+The exported attempt interval ends when the attempt guard is released, including
+response-body consumption and settlement, rather than stopping at response
+headers. Cancellation also closes the interval without waiting for export.
 
 ### CLI overrides (optional)
 
