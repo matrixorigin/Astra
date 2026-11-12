@@ -74,7 +74,7 @@ async fn wait_for_chat_observers(
 /// build_app fixtures have no server timer owner. Run the same production
 /// recovery operation for this exact Session, never a parallel mock worker or
 /// a scan over other fixtures. Its acknowledgement must finish before capture
-/// ends: the worker's success metric precedes the head checkpoint SQL.
+/// ends: success requires the head checkpoint receipt.
 async fn drain_chat_observers(
     ctx: &MatrixE2eCtx,
     owner: &astra_runtime::server::provider_test_support::ObservationRecoveryForTest,
@@ -419,6 +419,73 @@ fn assert_scoped_sql_budget(statements: &[String], core_limit: usize, elapsed_ms
     );
 }
 
+// Exact SQL shapes: additional windows may add one fresh authority lookup
+// and one fenced progress UPDATE/read-back, never arbitrary business SQL.
+const OBSERVATION_PROGRESS_SQL: &str = "UPDATE session_context_heads SET observation_json = ? WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main' AND observation_lease_token = ? AND observation_due_at > NOW(6) AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?";
+const OBSERVATION_RECEIPT_SQL: &str = "SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id')) FROM session_context_heads WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'";
+const OBSERVATION_AUTHORITY_SQL: &str = "SELECT current_token.token_id, current_token.encrypted_value, CAST(current_token.metadata AS CHAR), CAST(u.password_hash <> '' AS SIGNED), CAST((EXISTS (SELECT 1 FROM auth_tokens retained WHERE retained.scope_user_id = u.user_id AND retained.scope_user_id = ? AND retained.type = 'memoria_connection' AND retained.provider = 'memoria') OR EXISTS (SELECT 1 FROM auth_external_identities retained WHERE retained.astra_user_id = u.user_id AND retained.astra_user_id = ? AND retained.provider_id LIKE 'memoria:%')) AS SIGNED), CAST(COALESCE(uc.subject_count, 0) AS SIGNED), uc.subject FROM auth_users u LEFT JOIN auth_tokens current_token ON current_token.token_id = ? AND current_token.scope_user_id = u.user_id AND current_token.type = 'memoria_connection' AND current_token.provider = 'memoria' AND current_token.is_active = 1 LEFT JOIN ( SELECT astra_user_id, COUNT(*) AS subject_count, MIN(external_subject) AS subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = ? GROUP BY astra_user_id ) uc ON uc.astra_user_id = u.user_id WHERE u.user_id = ? AND u.is_active = 1";
+
+fn additional_observation_window_sql(statements: &[String], windows: usize) -> usize {
+    assert!(
+        (1..=8).contains(&windows),
+        "one attempt has at most eight windows"
+    );
+    for (sql, expected) in [
+        (OBSERVATION_AUTHORITY_SQL, windows + 1),
+        (OBSERVATION_PROGRESS_SQL, windows - 1),
+        (OBSERVATION_RECEIPT_SQL, windows),
+    ] {
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.as_str() == sql)
+                .count(),
+            expected,
+            "window accounting must match exact fresh-authority and fenced-receipt work"
+        );
+    }
+    3 * (windows - 1)
+}
+
+fn assert_windowed_chat_sql_budget(
+    statements: &[String],
+    windows: usize,
+    core_limit: usize,
+    elapsed_ms: f64,
+) {
+    let extra = additional_observation_window_sql(statements, windows);
+    assert_scoped_sql_budget(statements, core_limit + extra, elapsed_ms);
+}
+
+#[test]
+fn window_sql_accounting_rejects_unpaired_or_extra_business_work() {
+    let mut statements = vec!["synthetic business query".to_owned(); 20];
+    statements.extend(std::iter::repeat_n(OBSERVATION_AUTHORITY_SQL.to_owned(), 3));
+    statements.extend(std::iter::repeat_n(OBSERVATION_RECEIPT_SQL.to_owned(), 2));
+    statements.push(OBSERVATION_PROGRESS_SQL.to_owned());
+    assert_windowed_chat_sql_budget(&statements, 2, 23, 0.0);
+    let mut extra = statements.clone();
+    extra.push("unexpected business query".into());
+    assert!(
+        std::panic::catch_unwind(|| assert_windowed_chat_sql_budget(&extra, 2, 23, 0.0)).is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_windowed_chat_sql_budget(&statements, 1, 23, 0.0))
+            .is_err()
+    );
+    let mut malformed = statements.clone();
+    *malformed.last_mut().unwrap() = format!("{OBSERVATION_PROGRESS_SQL} UNION ALL SELECT 1");
+    assert!(
+        std::panic::catch_unwind(|| assert_windowed_chat_sql_budget(&malformed, 2, 23, 0.0))
+            .is_err()
+    );
+    statements.remove(20);
+    assert!(
+        std::panic::catch_unwind(|| assert_windowed_chat_sql_budget(&statements, 2, 23, 0.0))
+            .is_err()
+    );
+}
+
 #[test]
 fn sql_budget_accepts_elapsed_ticks_without_allowing_extra_business_queries() {
     let mut sql = vec!["synthetic business query".to_owned(); 23];
@@ -611,23 +678,47 @@ async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
 async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, false, false),
+        ("discovery", 1, false, false),
+        ("discovery", 3, false, false),
+        ("agent_list", 1, false, false),
+        ("agent_list", 3, false, false),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn warm_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, true, false),
+        ("agent_list", 3, true, false),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn held_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, false, true),
+        ("agent_list", 3, false, true),
+    ])
+    .await;
+}
+
+// Each group retains its ordinary baseline and exact SQL comparison. Separate
+// test processes keep nine schema/fixture lifecycles from sharing one timeout;
+// each group retains the strict-online-ci 60-second limit.
+async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)]) {
     require_system_e2e_env();
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .expect("this integration binary owns its SQL subscriber");
 
     let mut budgets = Vec::new();
-    for (scenario, readonly_rounds, warm_context, held_for_control) in [
-        ("ordinary", 0, false, false),
-        ("discovery", 1, false, false),
-        ("discovery", 3, false, false),
-        ("agent_list", 1, false, false),
-        ("agent_list", 3, false, false),
-        ("ordinary", 0, true, false),
-        ("agent_list", 3, true, false),
-        ("ordinary", 0, false, true),
-        ("agent_list", 3, false, true),
-    ] {
+    for &(scenario, readonly_rounds, warm_context, held_for_control) in scenarios {
         let executes_agent = scenario == "agent_list";
         let tool_call_count = readonly_rounds + usize::from(executes_agent);
         let b = bootstrap().await;
@@ -766,6 +857,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             // response settles the warm-up turn; separately await its observer.
             drain_chat_observers(&b.ctx, &observer, 1).await;
         }
+        b.ctx.memoria.observations.lock().await.clear();
         prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
             "List agent status."
@@ -862,6 +954,26 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         drain_chat_observers(&b.ctx, &observer, 1 + u64::from(warm_context)).await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
+        // Count real authenticated HTTP deliveries, independently of SQL and
+        // planner internals. Warm-up observations were cleared before capture.
+        let payloads = b.ctx.memoria.observations.lock().await.clone();
+        let windows = payloads.len();
+        assert!((1..=8).contains(&windows));
+        for payload in &payloads {
+            let messages = payload["messages"].as_array().unwrap();
+            assert!(!messages.is_empty() && messages.len() <= 20);
+            let mut rendered = String::new();
+            for message in messages {
+                let text = message["content"].as_str().unwrap();
+                assert!(text.chars().count() <= 500);
+                rendered.push_str(&format!(
+                    "[{}]: {text}\n",
+                    message["role"].as_str().unwrap()
+                ));
+            }
+            assert!(rendered.len() <= 6000);
+            assert_eq!(bounded_extractor_input(messages), rendered);
+        }
         assert_observer_acknowledged(&b.ctx, 1 + i64::from(warm_context)).await;
         // Explicit cold-replay verification follows the ordinary request's
         // complete drain and stopped SQL capture; it is not ordinary execution.
@@ -1081,7 +1193,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         }
         b.ctx.close().await;
         eprintln!(
-            "chat_sql_budget scenario={scenario} warm_context={warm_context} readonly_rounds={readonly_rounds} tool_calls={tool_call_count} held_for_control={held_for_control} control_polls={control_observation_sql} total_sql={}",
+            "chat_sql_budget scenario={scenario} warm_context={warm_context} readonly_rounds={readonly_rounds} tool_calls={tool_call_count} held_for_control={held_for_control} control_polls={control_observation_sql} windows={windows} total_sql={}",
             statements.len()
         );
         if let Some(path) = std::env::var_os("ASTRA_TEST_SQL_BUDGET_REPORT") {
@@ -1094,7 +1206,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                     })
                 })
                 .collect::<Vec<_>>();
-            let record = json!({"scenario":scenario, "warm_context":warm_context, "readonly_rounds": readonly_rounds, "tool_calls":tool_call_count, "total_sql": statements.len(), "control_observation_sql":control_observation_sql, "held_for_control":held_for_control, "execution_ms":execution_ms, "statements": statements, "statement_timings":statement_timings, "transactions":transactions, "after_response_sql":after_response_sql});
+            let record = json!({"scenario":scenario, "warm_context":warm_context, "readonly_rounds": readonly_rounds, "tool_calls":tool_call_count, "total_sql": statements.len(), "control_observation_sql":control_observation_sql, "observation_windows":windows, "held_for_control":held_for_control, "execution_ms":execution_ms, "statements": statements, "statement_timings":statement_timings, "transactions":transactions, "after_response_sql":after_response_sql});
             use std::io::Write as _;
             let mut report = std::fs::OpenOptions::new()
                 .create(true)
@@ -1111,9 +1223,10 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             control_observation_sql,
             statements,
             execution_ms,
+            windows,
         ));
     }
-    for (scenario, rounds, warm_context, held, polls, statements, elapsed_ms) in &budgets {
+    for (scenario, rounds, warm_context, held, polls, statements, elapsed_ms, windows) in &budgets {
         // A warm request restores its prior canonical Context once before
         // execution, in addition to the observer's captured-head materialization.
         // This is required history work, independent of readonly tool rounds.
@@ -1124,14 +1237,19 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             })
             .count();
         assert_eq!(context_reads, 1 + usize::from(*warm_context));
-        assert_scoped_sql_budget(statements, 23 + usize::from(*warm_context), *elapsed_ms);
+        assert_windowed_chat_sql_budget(
+            statements,
+            *windows,
+            23 + usize::from(*warm_context),
+            *elapsed_ms,
+        );
         let authentication_reads = authentication_snapshot_count(statements);
         if *scenario == "ordinary" {
             continue;
         }
         let baseline = budgets
             .iter()
-            .find(|(name, _, warm, baseline_held, _, _, _)| {
+            .find(|(name, _, warm, baseline_held, _, _, _, _)| {
                 *name == "ordinary" && warm == warm_context && baseline_held == held
             })
             .unwrap();
@@ -1139,11 +1257,13 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         // miss. Every query remains in the separately bounded raw total.
         let expected = baseline.5.len() as i64 + *polls as i64 - baseline.4 as i64
             + authentication_reads as i64
-            - authentication_snapshot_count(&baseline.5) as i64;
+            - authentication_snapshot_count(&baseline.5) as i64
+            + additional_observation_window_sql(statements, *windows) as i64
+            - additional_observation_window_sql(&baseline.5, baseline.7) as i64;
         assert_eq!(
             statements.len() as i64,
             expected,
-            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond exact periodic controls and one request-auth cache miss"
+            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond exact window receipts/authority, periodic controls and one request-auth cache miss"
         );
     }
 }

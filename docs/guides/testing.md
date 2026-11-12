@@ -639,15 +639,18 @@ EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ### Ordinary-chat SQL budget
 
-`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
-uses the same isolated MatrixOne setup and scripted loopback provider as the
-system HTTP journeys. Run this test by exact name in its own process because
-it owns the global SQL tracing subscriber:
+The `ordinary`, `warm`, and `held` variants of
+`chat_sql_budget::*_chat_and_readonly_rounds_have_bounded_total_sql` use the
+same isolated MatrixOne setup and scripted loopback provider as the system HTTP
+journeys. All nine scenarios remain covered, with a paired ordinary baseline in
+each group. Nextest gives each group its own SQL subscriber and unchanged
+60-second test budget, avoiding nine fixture lifecycles in one timed process:
 
 ```bash
 MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
-cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
-  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+cargo nextest run --locked --profile strict-online-ci -p astra-runtime \
+  --features e2e-hooks --test chat_sql_budget -j 1 --run-ignored only \
+  -E 'test(/(ordinary|warm|held)_chat_and_readonly_rounds_have_bounded_total_sql/)'
 ```
 
 The scoped nonperiodic limits are 23 statements for a cold ordinary chat, 24
@@ -656,8 +659,13 @@ restores prior canonical Context once in addition to the observer's captured-hea
 read; the test asserts those reads explicitly. Every SQL statement remains in the raw
 total. At most one exact account/session authentication snapshot is allowed;
 exact control reads have a separate bound of `ceil(measured_elapsed_ms / 2000)`.
-Thus the raw envelope is the core limit plus that snapshot and the elapsed timer
-allowance. Extra business SQL, duplicate authentication reads or polling faster
+These core limits describe one-window observation. Longer canonical text/tool
+results add exactly three statements per extra window: fresh authority plus the
+fenced progress UPDATE/read-back. The test independently counts authenticated
+HTTP windows (at most eight), validates extraction limits and matches exact SQL
+shapes/cardinalities. The raw envelope includes this explicit window cost, the
+core limit, the authentication snapshot and the elapsed timer allowance. Extra
+business SQL, duplicate authentication reads or polling faster
 than the two-second contract still fail. This avoids assuming a loaded CI host
 will always finish before the second control tick.
 

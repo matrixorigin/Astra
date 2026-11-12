@@ -501,6 +501,13 @@ MatrixOne affected-row counts alone cannot establish either receipt. Every
 intermediate accepted-window receipt adds cost: each progress receipt
 uses a fenced UPDATE plus read-back, and each window resolves authority afresh.
 The five-statement minimum applies only to an ordinary one-window attempt.
+The local-account request budget retains a single-window baseline of 23 cold /
+24 warm statements. A longer text/tool-result observation adds exactly three
+statements per intermediate window: a fresh authority read and a fenced progress
+UPDATE/read-back. The cost test counts authenticated HTTP windows independently,
+checks the exact SQL shapes/cardinalities, and includes every statement in the
+raw total. These required window costs do not excuse extra readonly-tool business
+queries; the one-window baseline and control/auth allowances remain unchanged.
 Discovery and losing claims across replicas add fleet cost. Background execution reduces
 response-path coupling, not total database work; the revised scoped SQL ceilings
 must not be described as an improvement over the former 20-statement raw budget.
