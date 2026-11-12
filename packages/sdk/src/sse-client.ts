@@ -32,7 +32,12 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
   const events: StreamEvent[] = [];
   const parser = new SseDataParser((data) => {
     const event = parseSseEvent(data);
-    if (event !== undefined) events.push(event);
+    if (event === undefined) return;
+    // Buffered callers advance their source cursor by the returned event count.
+    // Reject invalid envelopes rather than silently shortening that count.
+    if (!event || typeof event !== 'object' || Array.isArray(event) ||
+        typeof event.type !== 'string') throw new TypeError('Invalid SSE event envelope');
+    events.push(event);
   });
   parser.push(raw);
   parser.finish();
@@ -41,10 +46,7 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
 
 function parseSseEvent(data: string): StreamEvent | undefined {
   try {
-    const event: unknown = JSON.parse(data);
-    if (!event || typeof event !== 'object' || Array.isArray(event) ||
-        typeof (event as { type?: unknown }).type !== 'string') return undefined;
-    return event as StreamEvent;
+    return JSON.parse(data) as StreamEvent;
   } catch {
     // Ignore malformed JSON.
     return undefined;
