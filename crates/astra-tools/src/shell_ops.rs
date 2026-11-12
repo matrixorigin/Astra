@@ -7598,8 +7598,9 @@ mod workdir_tests {
         assert!(error.contains(&original.path().display().to_string()));
         assert!(error.contains(&workspace.path().display().to_string()));
         assert!(error.contains("no command was run"));
-        assert!(error.contains("omit `workdir`"));
-        assert!(error.contains("leave the selected worktree"));
+        assert!(error.contains("inside the selected workspace"));
+        assert!(error.contains("session rooted there"));
+        assert!(error.contains("creates and selects a new worktree"));
     }
 
     #[cfg(unix)]

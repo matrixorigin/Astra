@@ -12109,9 +12109,10 @@ pub(crate) mod tests {
         assert!(first.contains("message_type=\"question\""));
         assert!(first.contains("next action MUST be"));
         assert!(first.contains("Never put a question to the parent in ordinary text"));
-        assert!(first.contains("A parent question is control flow, never terminal output"));
-        assert!(first.contains("returns `queued`"));
-        assert!(first.contains("wait for the correlated answer"));
+        assert!(first.contains("A question is asynchronous coordination"));
+        assert!(first.contains("After `queued`, continue independent work"));
+        assert!(first.contains("`agent(action=\"wait\")` for bounded observation"));
+        assert!(first.contains("exact request ID and actual sender identity"));
         assert!(first.contains("`ask_user` addresses the human"));
         assert!(first.contains("Return only the answer, evidence, or decision"));
         assert!(first.contains("Honor the brief's requested output format exactly"));

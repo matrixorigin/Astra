@@ -6304,8 +6304,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn admitted_wait_parks_main_loop_without_provider_calls() {
+    #[tokio::test(start_paused = true)]
+    async fn admitted_wait_observes_timeout_without_bypassing_child_results() {
         for reply_pending in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let context =
@@ -6347,21 +6347,33 @@ mod tests {
             state.canonical_turn_chain_id = Some("test-chain".into());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let wait_started = Arc::new(tokio::sync::Notify::new());
-            let mut host = MockHost::new(vec![
-            server_tool_result(
-                vec![serde_json::json!({
-                    "id":"wait-call", "type":"function", "function":{
-                        "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1} else {10000}}).to_string(),
+            let mut turns = vec![
+                server_tool_result(
+                    vec![serde_json::json!({
+                        "id":"wait-call", "type":"function", "function":{
+                            "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1000} else {10000}}).to_string(),
+                        },
+                    })],
+                    vec![],
+                    10,
+                    5,
+                    None,
+                ),
+                text_result(
+                    if reply_pending {
+                        "child still running"
+                    } else {
+                        "42"
                     },
-                })],
-                vec![],
-                10,
-                5,
-                None,
-            ),
-            text_result("42", 10, 5, None),
-        ])
-        .with_valid_tools(&["agent"]);
+                    10,
+                    5,
+                    None,
+                ),
+            ];
+            if reply_pending {
+                turns.push(text_result("42", 10, 5, None));
+            }
+            let mut host = MockHost::new(turns).with_valid_tools(&["agent"]);
             host.provider_call_counter = Some(Arc::clone(&counter));
             host.child_wait_started = Some(Arc::clone(&wait_started));
             let task = tokio::spawn(async move {
@@ -6383,24 +6395,19 @@ mod tests {
                 "parked execution must not call provider"
             );
             if reply_pending {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::time::timeout(Duration::from_secs(2), wait_started.notified()).await
+                    .expect("the observation timeout resumes the model, then child custody parks it again");
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
+                assert!(
+                    !task.is_finished(),
+                    "an unanswered question does not replace the child-result fence"
+                );
+                assert!(owner.has_pending_direct_children());
                 assert!(
                     !replies.pending("test-run").is_empty(),
-                    "observation timeout cannot settle question"
+                    "timeout cannot settle question correlation"
                 );
-                assert!(replies.observe_response(
-                    "test-run",
-                    &astra_messaging::AgentMessage::new(
-                        responder,
-                        astra_messaging::MessageTarget::Direct {
-                            address: astra_messaging::AgentAddress::new("test-run", "test-agent")
-                        },
-                        astra_messaging::MessagePayload::Response {
-                            request_id: "question".into(),
-                            accepted: true,
-                            data: None
-                        },
-                    )
-                ));
             }
             owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
                 applied_user_intents: Vec::new(),
@@ -6426,8 +6433,16 @@ mod tests {
                 matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
                 "{outcome:?}"
             );
-            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                if reply_pending { 3 } else { 2 }
+            );
             assert_eq!(state.final_text, "42");
+            assert_eq!(
+                !replies.pending("test-run").is_empty(),
+                reply_pending,
+                "completion does not require manufacturing an answer"
+            );
             assert_eq!(
                 astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(
                     &state.stall.tool_call_records
@@ -6436,9 +6451,16 @@ mod tests {
                 "accepted waiting must not introduce a child execution failure"
             );
             assert!(
-                serde_json::to_string(&host.executed_volatile[1])
-                    .unwrap()
-                    .contains("42"),
+                host.executed_volatile.last().unwrap().iter().any(|entry| {
+                    entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                        && entry.payload["children"]
+                            .as_array()
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child["run_id"] == "child-run" && child["result"] == "42"
+                                })
+                            })
+                }),
                 "continuation must consume the canonical child result"
             );
             assert!(

@@ -21289,10 +21289,19 @@ mod tests {
             .lines()
             .find(|line| line.contains("› "))
             .expect("task panel should render a selected row");
-        assert!(
-            selected_line_before.contains("second active task"),
-            "End should select the last active task: {selected_before}"
+        let titles = ["first active task", "second active task"];
+        let last_task_row = selected_before
+            .lines()
+            .rfind(|line| titles.iter().any(|title| line.contains(title)))
+            .expect("both spawned tasks should be visible");
+        assert_eq!(
+            selected_line_before, last_task_row,
+            "End selects the last visible task"
         );
+        let selected_title = titles
+            .into_iter()
+            .find(|title| selected_line_before.contains(title))
+            .expect("the selected row belongs to a spawned task");
 
         // These are the observable active-run invariants: opening a
         // navigation surface cannot cancel/pause ownership, submit guidance,
@@ -21340,7 +21349,7 @@ mod tests {
             .find(|line| line.contains("› "))
             .expect("task panel should keep a selected row after refresh");
         assert!(
-            selected_line_after.contains("second active task"),
+            selected_line_after.contains(selected_title),
             "refreshing `/tasks` must preserve the selected identity: {selected_after}"
         );
 
