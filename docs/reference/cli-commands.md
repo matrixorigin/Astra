@@ -9,6 +9,8 @@ Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 uses the same permission manager as the terminal. When a tool needs approval,
 `approval/requested` carries its approval ID; answer with `approval/respond`
 using `approvalId` and `decision` (`allow_once`, `always`, or `deny`).
+If the approval has already closed, `approval/respond` returns an error rather
+than confirming a decision that was not received.
 `turn/interrupt` closes pending approvals without authorizing execution.
 The approval transport does not provide the `ask_user` question interface.
 Prompt execution without an approval transport or terminal prompt sink fails

@@ -153,7 +153,13 @@ pub(crate) fn report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    if is_llm_provider_auth_error(&failure.error) {
+    if failure.partial.callback_client_detached {
+        ui.show_error(&format!(
+            "  {} {}",
+            crate::cli::theme::icon_err(),
+            failure.error
+        ));
+    } else if is_llm_provider_auth_error(&failure.error) {
         ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
     } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
@@ -320,6 +326,30 @@ mod tests {
     use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_services::session_journal;
     use std::time::Instant;
+
+    #[test]
+    #[serial_test::serial]
+    fn callback_auth_failure_keeps_scoped_details_in_user_output() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let failure = crate::TurnFailure {
+            error: "HTTP 401: callback request=req-a was not confirmed".into(),
+            partial: crate::PartialTurnData {
+                callback_client_detached: true,
+                ..Default::default()
+            },
+        };
+        report_turn_failure(
+            &mut state,
+            None,
+            "request",
+            &failure,
+            Instant::now(),
+            &mut ui,
+        );
+        assert!(ui.errors.join("\n").contains("request=req-a"));
+    }
 
     #[test]
     fn line_surface_does_not_claim_a_composer_restore() {

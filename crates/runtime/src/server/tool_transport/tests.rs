@@ -312,13 +312,13 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
         self.delivered_receipts.lock().unwrap().push((
             identity.clone(),
             edge_agent_id.to_owned(),
             result_json.to_owned(),
         ));
-        self.receipt_result.map_err(str::to_owned)
+        self.receipt_result.map_err(Into::into)
     }
 
     async fn fail_dispatch(
@@ -487,7 +487,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
         Ok(true)
     }
 
@@ -618,7 +618,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
         let Some(row) = rows.get_mut(identity) else {
             return Ok(false);

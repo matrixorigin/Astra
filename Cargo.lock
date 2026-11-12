@@ -766,6 +766,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "wiremock",
 ]
@@ -833,6 +834,7 @@ dependencies = [
  "astra-prompts",
  "astra-runtime-env",
  "astra-sandbox",
+ "astra-server-types",
  "astra-services",
  "astra-text-utils",
  "astra-thin-client",
@@ -847,6 +849,7 @@ dependencies = [
  "fastrand",
  "fnv",
  "futures-util",
+ "lru",
  "proptest",
  "pulldown-cmark",
  "regex",
