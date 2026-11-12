@@ -194,6 +194,57 @@ fn classify_stdout_error(error: io::Error) -> io::Result<OutputWriteStatus> {
     }
 }
 
+/// Best-effort diagnostic without waiting for a pipe or changing the
+/// process-wide stderr flags. The final typed error remains authoritative.
+#[cfg(target_os = "linux")]
+pub(crate) fn try_write_stderr_line(text: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let mut end = text.len().min(2047);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut line = String::with_capacity(end + 1);
+    line.push_str(&text[..end]);
+    line.push('\n');
+    // Socket stderr can use a per-call nonblocking send without changing its
+    // shared open-file flags. Other kinds return ENOTSOCK and use the path below.
+    // SAFETY: line remains valid for the call, and stderr is only borrowed.
+    let sent = unsafe {
+        libc::send(
+            libc::STDERR_FILENO,
+            line.as_ptr().cast(),
+            line.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent >= 0 {
+        return sent as usize == line.len();
+    }
+    let path = "/proc/self/fd/2";
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let kind = metadata.file_type();
+    // O_NONBLOCK does not make regular-file I/O nonblocking.
+    if !kind.is_fifo() && !kind.is_char_device() {
+        return false;
+    }
+    let Ok(mut stderr) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    stderr.write(line.as_bytes()).is_ok_and(|n| n == line.len())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn try_write_stderr_line(_text: &str) -> bool {
+    false
+}
+
 pub fn write_stderr_line(text: &str) -> io::Result<OutputWriteStatus> {
     let stderr = io::stderr();
     let mut lock = stderr.lock();

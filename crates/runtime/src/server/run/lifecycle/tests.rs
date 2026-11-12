@@ -178,7 +178,7 @@ async fn retained_tool_output_pages_are_bounded_and_preserve_execution_facts() {
             _: &EdgeDispatchIdentity,
             _: &str,
             _: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             Ok(false)
         }
         async fn fail_dispatch(

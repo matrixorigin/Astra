@@ -116,8 +116,37 @@ impl StreamJsonEmitter {
         &self,
         record_type: &str,
         identity: &ExchangeIdentity,
-        mut fields: Map<String, Value>,
+        fields: Map<String, Value>,
     ) -> Result<(), String> {
+        self.emit(self.exchange_record(record_type, identity, fields))
+    }
+
+    // A pipe consumer can stop reading while edge callbacks still need to
+    // settle. Keep exactly one ordered write in flight, but do not block the
+    // task driving those callbacks on the process stdout lock.
+    async fn emit_exchange_record_async(
+        &self,
+        record_type: &str,
+        identity: &ExchangeIdentity,
+        fields: Map<String, Value>,
+    ) -> Result<(), String> {
+        let record = self.exchange_record(record_type, identity, fields);
+        let sink = Arc::clone(&self.sink);
+        tokio::task::spawn_blocking(move || {
+            let line = serde_json::to_string(&Value::Object(record))
+                .map_err(|error| format!("failed to serialize stream-json record: {error}"))?;
+            sink.write_line(&line)
+        })
+        .await
+        .map_err(|error| format!("stream-json output task failed: {error}"))?
+    }
+
+    fn exchange_record(
+        &self,
+        record_type: &str,
+        identity: &ExchangeIdentity,
+        mut fields: Map<String, Value>,
+    ) -> Map<String, Value> {
         let mut record =
             self.execution_envelope(identity.session_id.clone(), identity.session_turn);
         record.insert("type".to_string(), json!(record_type));
@@ -128,7 +157,7 @@ impl StreamJsonEmitter {
         );
         record.insert("round_index".to_string(), json!(identity.round_index));
         record.append(&mut fields);
-        self.emit(record)
+        record
     }
 
     fn execution_envelope(
@@ -179,7 +208,7 @@ pub(crate) struct StreamJsonExchange {
 }
 
 impl StreamJsonExchange {
-    pub(crate) fn accepted_event(&mut self, event: &Value) -> Result<(), String> {
+    pub(crate) async fn accepted_event(&mut self, event: &Value) -> Result<(), String> {
         if self.finished {
             return Err("stream-json received an event after exchange_finished".to_string());
         }
@@ -226,7 +255,8 @@ impl StreamJsonExchange {
         fields.insert("event_seq".to_string(), json!(self.event_seq));
         fields.insert("event".to_string(), event.clone());
         self.emitter
-            .emit_exchange_record("sse_event", &self.identity, fields)
+            .emit_exchange_record_async("sse_event", &self.identity, fields)
+            .await
     }
 
     pub(crate) fn finish(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
@@ -359,8 +389,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn emits_strict_ordered_exchange_and_result_records() {
+    #[tokio::test]
+    async fn emits_strict_ordered_exchange_and_result_records() {
         let sink = Arc::new(MemorySink::default());
         let emitter = emitter(Arc::clone(&sink));
         let mut exchange = emitter.start_exchange(None, 3, 0).unwrap();
@@ -370,6 +400,7 @@ mod tests {
                 "session_id": "session-canonical",
                 "run_id": "server-run"
             }))
+            .await
             .unwrap();
         exchange
             .accepted_event(&json!({
@@ -377,6 +408,7 @@ mod tests {
                 "input_tokens": 7,
                 "output_tokens": 2
             }))
+            .await
             .unwrap();
         let accum = ChatTurnSseAccum {
             session_id: Some("session-canonical".to_string()),
@@ -425,8 +457,8 @@ mod tests {
         assert!(records.iter().all(|record| record["session_turn"] == 3));
     }
 
-    #[test]
-    fn malformed_typed_event_and_finish_before_done_fail_closed() {
+    #[tokio::test]
+    async fn malformed_typed_event_and_finish_before_done_fail_closed() {
         let sink = Arc::new(MemorySink::default());
         let emitter = emitter(Arc::clone(&sink));
         let mut exchange = emitter.start_exchange(None, 1, 0).unwrap();
@@ -434,15 +466,89 @@ mod tests {
         assert!(
             exchange
                 .accepted_event(&json!({"content": "missing type"}))
+                .await
                 .is_err()
         );
         assert!(
             exchange
                 .accepted_event(&json!({"type": "   ", "content": "empty type"}))
+                .await
                 .is_err()
         );
         assert!(exchange.finish(&ChatTurnSseAccum::default()).is_err());
         assert_eq!(parsed_lines(&sink).len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_output_does_not_block_other_owned_work() {
+        #[derive(Debug)]
+        struct GatedSink {
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl JsonLineSink for GatedSink {
+            fn write_line(&self, line: &str) -> Result<(), String> {
+                if line.contains("\"sse_event\"") {
+                    self.entered
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    let (lock, ready) = &*self.gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+                Ok(())
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let sink = Arc::new(GatedSink {
+            gate: gate.clone(),
+            entered: Mutex::new(Some(entered_tx)),
+        });
+        let emitter = Arc::new(StreamJsonEmitter {
+            sink,
+            execution_id: "execution".into(),
+            user_query_event_id: "query".into(),
+            next_request_ordinal: AtomicU32::new(0),
+            latest_session_turn: AtomicU32::new(0),
+        });
+        // Release even a regressed synchronous writer so this test fails rather
+        // than hanging the whole test process.
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let watchdog_gate = gate.clone();
+        let watchdog = std::thread::spawn(move || {
+            if finished_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                let (lock, ready) = &*watchdog_gate;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+            }
+        });
+        let mut exchange = emitter.start_exchange(None, 1, 0).unwrap();
+        let event = json!({"type":"usage","input_tokens":1});
+        let write = exchange.accepted_event(&event);
+        tokio::pin!(write);
+        tokio::select! {
+            result = &mut write => panic!("write returned before release: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        entered_rx
+            .try_recv()
+            .expect("blocking write must be in flight");
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        write.await.unwrap();
+        finished_tx.send(()).unwrap();
+        watchdog.join().unwrap();
     }
 
     #[test]
@@ -457,8 +563,8 @@ mod tests {
         assert_eq!(records[0]["type"], "exchange_started");
     }
 
-    #[test]
-    fn identity_and_event_type_boundaries_reject_non_exact_values() {
+    #[tokio::test]
+    async fn identity_and_event_type_boundaries_reject_non_exact_values() {
         let sink = Arc::new(MemorySink::default());
         let emitter = emitter(Arc::clone(&sink));
         assert!(emitter.start_exchange(Some(" session "), 1, 0).is_err());
@@ -469,17 +575,23 @@ mod tests {
         );
 
         let mut exchange = emitter.start_exchange(Some("session"), 1, 0).unwrap();
-        assert!(exchange.accepted_event(&json!({"type": " usage"})).is_err());
+        assert!(
+            exchange
+                .accepted_event(&json!({"type": " usage"}))
+                .await
+                .is_err()
+        );
         assert!(
             exchange
                 .accepted_event(&json!({"type": "usage\n"}))
+                .await
                 .is_err()
         );
         assert_eq!(parsed_lines(&sink).len(), 1);
     }
 
-    #[test]
-    fn session_and_bridge_identity_changes_fail_closed() {
+    #[tokio::test]
+    async fn session_and_bridge_identity_changes_fail_closed() {
         let sink = Arc::new(MemorySink::default());
         let emitter = emitter(Arc::clone(&sink));
         let mut exchange = emitter.start_exchange(Some("session-a"), 1, 0).unwrap();
@@ -490,6 +602,7 @@ mod tests {
                     "session_id": "session-b",
                     "run_id": "run-execution"
                 }))
+                .await
                 .is_err()
         );
         exchange
@@ -498,6 +611,7 @@ mod tests {
                 "session_id": "session-a",
                 "run_id": "server-run"
             }))
+            .await
             .unwrap();
         assert!(
             exchange
@@ -506,6 +620,7 @@ mod tests {
                     "session_id": "session-a",
                     "run_id": "different-run"
                 }))
+                .await
                 .is_err()
         );
         assert!(
@@ -525,14 +640,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserves_all_exchange_ordinals_without_latest_only_collapse() {
+    #[tokio::test]
+    async fn preserves_all_exchange_ordinals_without_latest_only_collapse() {
         let sink = Arc::new(MemorySink::default());
         let emitter = emitter(Arc::clone(&sink));
         for round in 0..3 {
             let mut exchange = emitter.start_exchange(Some("session"), 2, round).unwrap();
             exchange
                 .accepted_event(&json!({"type": "context_meta", "round": round}))
+                .await
                 .unwrap();
             exchange
                 .finish(&ChatTurnSseAccum {

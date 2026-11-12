@@ -474,9 +474,9 @@ pub(crate) struct PartialTurnData {
     /// Preserved in conversation history so the next turn has context.
     pub partial_text: String,
     pub partial_text_model_item_id: Option<String>,
-    /// Already accepted physical-root failure, moved from the shared SSE owner.
+    /// Already accepted physical-root terminal from the shared SSE owner.
     /// This observation is not another execution or resume authority.
-    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
+    pub observed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     /// Exact prompt-history items captured before the failed runtime loop
     /// returned. This survives independently of `partial_text`, which is only
     /// a user-facing suffix and cannot represent tools or reasoning.
@@ -485,10 +485,12 @@ pub(crate) struct PartialTurnData {
     /// run. The outer lifecycle decides whether exact-owner cancellation is
     /// appropriate; a clean internal stream detach preserves server recovery.
     pub remote_cancel_required: bool,
-    /// An edge callback acknowledgement failed and this client detached.
-    /// The sentence in `TurnFailure::error` states that fact only. The outer
+    /// An edge callback or its local bookkeeping failed and this client detached.
+    /// The sentence in `TurnFailure::error` states the observed fact. The outer
     /// lifecycle owner adds whether the server run is still active.
     pub callback_client_detached: bool,
+    /// Original callback category when another failure owns the turn outcome.
+    pub callback_error_kind: Option<astra_core::ErrorKind>,
     /// Exact durable owner: a callback-producer child when callback delivery
     /// failed, otherwise the immutable physical SSE root.
     pub remote_cancel_run_id: Option<String>,
@@ -563,7 +565,7 @@ impl TurnFailure {
     /// A local cancellation may recover its observed prefix only when no
     /// harder admission, callback, output or remote-cleanup failure survived.
     pub(crate) fn is_clean_local_cancel(&self) -> bool {
-        self.partial.failed_run_terminal.is_none()
+        self.partial.observed_run_terminal.is_none()
             && self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
             && self.partial.error_code.is_none()
             && !self.partial.remote_cancel_required
@@ -576,7 +578,7 @@ impl TurnFailure {
     /// cancel the durable run. This only classifies the failure; callers must
     /// still enforce their own identity/lease boundary before releasing it.
     pub(crate) fn is_clean_internal_stream_detach(&self) -> bool {
-        self.partial.failed_run_terminal.is_none()
+        self.partial.observed_run_terminal.is_none()
             && self.partial.remote_cancel_required
             && !self.partial.callback_client_detached
             && self.partial.output_transport_failure.is_none()

@@ -1606,7 +1606,7 @@ mod tests {
                     let mut source = futures_util::stream::iter(chunks);
                     let (result, abort) = consume_sse_stream(
                         &mut source,
-                        &mut NoopSseStreamHost,
+                        &mut NoopSseStreamHost::default(),
                         std::time::Duration::from_secs(1),
                     )
                     .await;
