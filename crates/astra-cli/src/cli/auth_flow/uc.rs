@@ -758,7 +758,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn explicit_profile_keeps_memoria_and_password_discovery() {
+        let _credentials = crate::tests::isolate_credentials();
+        crate::cli::cli_config::cli_utils::credential_store()
+            .mutate(|file| {
+                file.profiles.insert(
+                    "personal".into(),
+                    astra_credentials::Profile {
+                        account_id: Some("synthetic-standalone-account".into()),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
         use serde_json::json;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
         for memoria in [None, Some("https://memoria.example.test")] {

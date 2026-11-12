@@ -10,6 +10,14 @@ use astra_services::models::UserModelCreateRequestData;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Sources,
+    DeviceCreate {
+        connection_id: String,
+        model: String,
+        name: String,
+        context_window: u32,
+        output_limit: u32,
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    },
     ApiKey(String),
     Connect(Option<String>),
     Models(String),
@@ -62,6 +70,28 @@ pub(crate) fn sources(pane: &mut BottomPane) {
 pub(crate) fn open(pane: &mut BottomPane, action: Action) {
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     if owner.server_account_id.is_none() {
+        // Only navigation intent survives authentication. Never replay a
+        // credential-bearing form or a connection mutation under a new owner.
+        pane.model_setup_after_login = Some(match action {
+            Action::Manage => Action::Manage,
+            _ => Action::Sources,
+        });
+        if crate::cli::native_auth::active().is_some() {
+            pane.push_view(Box::new(
+                ListSelectionView::new(
+                    vec![SelectionItem {
+                        name: "Sign in with MOI".into(),
+                        description: Some(
+                            "Sign in to your platform account, then choose a model source".into(),
+                        ),
+                        is_current: false,
+                    }],
+                    Some("MOI sign-in required".into()),
+                )
+                .with_results(vec![ViewResult::InsertCommand("/login".into())]),
+            ));
+            return;
+        }
         let items = vec![
             SelectionItem {
                 name: "Create a local account".into(),
@@ -83,15 +113,24 @@ pub(crate) fn open(pane: &mut BottomPane, action: Action) {
         ));
         return;
     }
-    if owner.native_binding.is_some() {
-        pane.push_view(Box::new(super::bottom_pane::info_view::InfoView::from_plain("Model access", vec!["Your models are managed by this deployment. Use /model to select an available model.".into()])));
-        return;
-    }
-
     pane.pending_model_setup_read = Some(action);
 }
 
+pub(crate) fn resume_after_login(pane: &mut BottomPane) {
+    if let Some(action) = pane.model_setup_after_login.take() {
+        open(pane, action);
+    }
+}
+
 pub(crate) fn show_sources(pane: &mut BottomPane, chatgpt_available: bool) {
+    if crate::cli::native_auth::active().is_some() {
+        choices(pane, "MOI models · personal device source", vec![
+            ("Continue with ChatGPT · this device".into(), Some("Uses your ChatGPT plan. OpenAI credentials and traffic stay on this computer; keep Astra open.".into()), Action::Connect(None)),
+            ("Manage my device ChatGPT".into(), Some("Choose a saved account or model, reconnect, or disconnect".into()), Action::Manage),
+        ]);
+        return;
+    }
+
     let mut rows = vec![(
         "Use my API key".into(),
         Some("Personal credentials, encrypted on this Astra deployment".into()),
@@ -297,6 +336,16 @@ pub(crate) enum Outcome {
         slugs: Vec<String>,
         existing: Vec<(String, String)>,
     },
+    DeviceConnections {
+        connections: Vec<astra_credentials::chatgpt::Connection>,
+        models: Vec<(String, String)>,
+    },
+    #[cfg(unix)]
+    DeviceSaved {
+        offering_id: String,
+        catalog: Result<Vec<astra_services::ModelListItemResponse>, String>,
+        runner: crate::cli::device_models::DeviceRunner,
+    },
     Saved {
         model_id: String,
         catalog: Result<Vec<astra_services::ModelListItemResponse>, String>,
@@ -306,6 +355,9 @@ pub(crate) enum Outcome {
         message: String,
     },
     Disconnected,
+    DeviceDisconnected {
+        revocation_confirmed: bool,
+    },
     Removed,
 }
 
@@ -348,7 +400,17 @@ pub(crate) async fn run(
         return Err("Account changed; reopen /model".into());
     }
     if owner.native_binding.is_some() {
-        return Err("This deployment manages your model access through MOI. Your existing model choices are unchanged.".into());
+        #[cfg(unix)]
+        {
+            return run_native(action, api, owner, cancel, phase, progress).await;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(
+                "Device ChatGPT requires Linux or macOS; organizational models remain available."
+                    .into(),
+            );
+        }
     }
     let api = api.without_bearer_provider();
     let preflight: Result<(String, Value), String> = async {
@@ -399,6 +461,7 @@ pub(crate) async fn run(
         phase.begin_exchange()
     };
     let model_id = match action {
+        Action::DeviceCreate { .. } => return Err("Device ChatGPT requires a MOI login".into()),
         Action::Connect(connection) => {
             let linked = model_connections::connect_with_progress(
                 &api,
@@ -733,4 +796,200 @@ mod tests {
             assert_eq!(pane.composer.text(), "unsent draft");
         }
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_model_setup_preserves_moi_login_intent_and_never_replays_a_mutation() {
+        // ACTIVE is process-wide production identity. Match existing native
+        // auth tests by isolating this case in its own test process.
+        const CHILD: &str = "ASTRA_TEST_NATIVE_DEVICE_MODEL_UI";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tui::model_setup::tests::native_model_setup_preserves_moi_login_intent_and_never_replays_a_mutation", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::cli::native_auth::{binding_for_test, install_active_for_test, test_session};
+        let directory = tempfile::tempdir().unwrap();
+        let _credentials =
+            astra_credentials::set_test_credentials_dir(directory.path().join("credentials"));
+        let store =
+            astra_credentials::native::NativeStore::with_directory(directory.path().join("native"));
+        let session = store.publish(test_session()).unwrap().0;
+        let _active = install_active_for_test(binding_for_test(store.clone(), session));
+        crate::cli::cli_config::cli_utils::configure_cli_profile_identity(
+            None,
+            crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission::RequireBoundAccount,
+        )
+        .unwrap();
+        let mut pane = BottomPane::new();
+        pane.replace_composer_text("unsent draft");
+        show_sources(&mut pane, false);
+        assert!(matches!(
+            key(&mut pane, KeyCode::Enter),
+            BottomPaneAction::ViewCompleted {
+                result: Some(ViewResult::ModelSetup(Action::Connect(None))),
+                ..
+            }
+        ));
+        assert_eq!(pane.composer.text(), "unsent draft");
+        store.logout().unwrap();
+        open(&mut pane, Action::Disconnect("old-connection".into()));
+        assert!(matches!(
+            pane.model_setup_after_login,
+            Some(Action::Sources)
+        ));
+        assert!(
+            matches!(key(&mut pane, KeyCode::Enter), BottomPaneAction::ViewCompleted {
+            result: Some(ViewResult::InsertCommand(command)), ..
+        } if command == "/login")
+        );
+        let next = store.publish(test_session()).unwrap().0;
+        let _next = install_active_for_test(binding_for_test(store, next));
+        resume_after_login(&mut pane);
+        assert!(pane.model_setup_after_login.is_none());
+        assert!(matches!(
+            pane.pending_model_setup_read,
+            Some(Action::Sources)
+        ));
+        assert_eq!(pane.composer.text(), "unsent draft");
+    }
+}
+
+#[cfg(unix)]
+async fn run_native(
+    action: Action,
+    api: astra_thin_client::ThinClient,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    cancel: tokio_util::sync::CancellationToken,
+    phase: std::sync::Arc<super::login_control::LoginControl>,
+    progress: tokio::sync::mpsc::UnboundedSender<crate::cli::model_connections::ConnectProgress>,
+) -> Result<Outcome, String> {
+    use crate::cli::{device_models::DeviceModels, model_connections::ConnectProgress};
+    if !owner.is_current() {
+        return Err("MOI account changed; reopen /model".into());
+    }
+    let binding = owner
+        .native_binding
+        .clone()
+        .ok_or("Sign in to MOI before choosing device ChatGPT")?;
+    let device = tokio::select! {
+        _ = cancel.cancelled() => return Err("Device model setup cancelled".into()),
+        result = DeviceModels::current(binding) => result?,
+    };
+    match action {
+        Action::Sources => Ok(Outcome::Sources(serde_json::json!({"available":true,"execution":"device"}))),
+        Action::Connect(existing) => {
+            let linked = device.connect(existing, None, cancel, |event| {
+                if matches!(event, ConnectProgress::Completing) { phase.begin_exchange()?; }
+                let _ = progress.send(event); Ok(())
+            }).await?;
+            Ok(Outcome::Connected { connection_id: linked.connection_ref.to_string(),
+                status: if linked.enabled {"connected"} else {"plan_permission_required"}.into() })
+        },
+        Action::Models(connection_id) => {
+            let slugs = device.models(&connection_id).await?;
+            let existing = device.saved().await?.into_iter().filter(|(_, model)| model.connection_ref.to_string() == connection_id)
+                .map(|(name, _)| (name.clone(), name)).collect();
+            Ok(Outcome::Models { connection_id, slugs, existing })
+        },
+        Action::Manage => Ok(Outcome::DeviceConnections { connections: device.connections().await?,
+            models: device.saved().await?.into_iter().map(|(name, model)| (name, model.model)).collect() }),
+        Action::DeviceCreate { connection_id, model, name, context_window, output_limit, owner: form_owner } => {
+            if form_owner != owner || !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
+            phase.begin_exchange()?;
+            let (offering_id, runner) = device.save(name, connection_id, model, context_window, output_limit, false).await?;
+            let catalog = wait_for_device_catalog(&api, &owner, &offering_id).await;
+            Ok(Outcome::DeviceSaved { offering_id, catalog, runner })
+        },
+        Action::Activate(name) => {
+            let (_, model) = device.saved().await?.into_iter().find(|(candidate, _)| *candidate == name).ok_or("Device model no longer exists")?;
+            phase.begin_exchange()?;
+            let (offering_id, runner) = device.save(name, model.connection_ref.to_string(), model.model, model.context_window, model.max_output_tokens, true).await?;
+            let catalog = wait_for_device_catalog(&api, &owner, &offering_id).await;
+            Ok(Outcome::DeviceSaved { offering_id, catalog, runner })
+        },
+        Action::Disconnect(id) => {
+            phase.begin_exchange()?;
+            let revocation_confirmed = device.disconnect(&id).await?;
+            Ok(Outcome::DeviceDisconnected { revocation_confirmed })
+        },
+        Action::Remove(name) => { phase.begin_exchange()?; device.remove(name).await?; Ok(Outcome::Removed) },
+        _ => Err("Use the MOI device ChatGPT source or select an organizational model. Server credential configuration is unchanged.".into()),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_device_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    offering: &str,
+) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
+            let catalog = crate::cli::session::session_runtime::fetch_owner_model_catalog(api, owner).await
+                .map_err(|error| error.to_string())?;
+            if catalog.iter().any(|row| row.offering_id == offering && row.is_active) { return Ok(catalog); }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }).await.map_err(|_| "Model saved on this device; Server admission is not ready. Reopen /model to retry without reconnecting ChatGPT".to_string())?
+}
+
+pub(crate) fn device_model_form(pane: &mut BottomPane, connection_id: String, model: String) {
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let form_owner = owner.clone();
+    let model_id = model.clone();
+    pane.push_view(Box::new(
+        FormView::new(
+            "My ChatGPT · credentials stay on this computer",
+            vec![
+                FieldSpec {
+                    label: "Name",
+                    kind: FieldKind::Plain,
+                },
+                FieldSpec {
+                    label: "Context limit (tokens)",
+                    kind: FieldKind::Plain,
+                },
+                FieldSpec {
+                    label: "Output budget (tokens)",
+                    kind: FieldKind::Plain,
+                },
+            ],
+            move |values| {
+                if !owner.is_current() {
+                    return Err("MOI account changed; reopen /model".into());
+                }
+                let context_window = values[1]
+                    .parse::<u32>()
+                    .map_err(|_| "Context limit must be a positive number")?;
+                let output_limit = values[2]
+                    .parse::<u32>()
+                    .map_err(|_| "Output budget must be a positive number")?;
+                if values[0].is_empty()
+                    || context_window == 0
+                    || context_window > i32::MAX as u32
+                    || output_limit == 0
+                    || output_limit > context_window
+                {
+                    return Err(
+                        "Choose a name and positive token budgets; output must fit the context"
+                            .into(),
+                    );
+                }
+                Ok(ViewResult::ModelSetup(Action::DeviceCreate {
+                    connection_id: connection_id.clone(),
+                    model: model_id.clone(),
+                    name: values[0].clone(),
+                    context_window,
+                    output_limit,
+                    owner: owner.clone(),
+                }))
+            },
+        )
+        .with_initial_values(vec![model, "128000".into(), "4096".into()])
+        .while_valid(move || form_owner.is_current()),
+    ));
 }

@@ -33,6 +33,11 @@ pub(crate) async fn discover_login_method(
         }
         Err(error) => return Err(map_thin_err(error)),
     };
+    if methods.get("uc").is_some_and(|value| !value.is_null()) {
+        // A profile label is not evidence that the user chose the standalone
+        // account system. Existing legacy identities keep their login path.
+        crate::cli::native_auth::require_known_profile_intent(profile)?;
+    }
     if profile.is_none()
         && let Some(uc) = methods.get("uc").filter(|value| !value.is_null())
     {

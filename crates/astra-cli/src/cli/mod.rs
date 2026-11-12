@@ -16,6 +16,8 @@ pub mod command_registry;
 pub mod command_router;
 pub mod config_manager;
 pub mod context_dump;
+#[cfg(unix)]
+pub(crate) mod device_models;
 pub mod diagnostic_log;
 pub mod diff_presenter;
 pub mod edge_lifecycle;

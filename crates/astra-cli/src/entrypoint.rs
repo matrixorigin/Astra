@@ -227,6 +227,14 @@ async fn run_async() -> i32 {
             return 2;
         }
     };
+    if matches!(
+        &cli.command,
+        None | Some(cli::cli_config::cli_args::Command::Interactive)
+    ) && let Err(error) = cli::native_auth::require_known_profile_intent(cli.profile.as_deref())
+    {
+        eprintln!("Error: {error}");
+        return 2;
+    }
     let native_binding = match cli::native_auth::bind_process(
         &mut base,
         cli.api_url.is_some() || std::env::var_os("ASTRA_API_URL").is_some(),
@@ -264,6 +272,15 @@ async fn run_async() -> i32 {
     if let Some(binding) = native_binding {
         api = api.with_bearer_provider(binding);
     }
+
+    #[cfg(unix)]
+    let _device_host_lease = match cli::device_models::start_if_configured().await {
+        Ok(runner) => runner,
+        Err(error) => {
+            eprintln!("Device ChatGPT unavailable: {error}");
+            None
+        }
+    };
 
     let Cli {
         api_url: _,

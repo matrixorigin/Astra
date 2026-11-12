@@ -2,6 +2,7 @@
 //! profiles because rotation intent, account CAS and logout tombstones are
 //! part of this protocol, not optional legacy profile attributes.
 use fs2::FileExt;
+mod device_models;
 mod diagnostics;
 #[cfg(all(test, unix))]
 mod publication_tests;
@@ -129,6 +130,13 @@ pub struct NativeStore {
     root: PathBuf,
 }
 
+/// Short local publication/fence lease, never a workspace authorization grant.
+/// Drop it before provider I/O. Logout and account/workspace changes serialize
+/// against this lease through the existing native credential lock.
+pub struct NativeSessionLease {
+    _lock: File,
+}
+
 /// Cancellation wins only before the atomic rename is admitted. Callers must
 /// join publication after requesting cancellation; never detach a writer.
 #[derive(Clone)]
@@ -227,6 +235,11 @@ impl NativeStore {
         Self { root }
     }
 
+    /// Private local IPC may refer to this owner, never copy its credentials.
+    pub fn directory(&self) -> &Path {
+        &self.root
+    }
+
     pub fn configured(&self) -> Result<bool, String> {
         match fs::symlink_metadata(&self.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -254,6 +267,17 @@ impl NativeStore {
             .get(&key)
             .and_then(Clone::clone)
             .ok_or_else(|| MOI_LOGGED_OUT.into())
+    }
+
+    pub fn device_model_lease(
+        &self,
+        expected: &NativeSession,
+    ) -> Result<NativeSessionLease, String> {
+        self.check_dir()?;
+        let lock = private_open(&self.root.join("auth.lock"), true)?;
+        FileExt::lock_shared(&lock).map_err(|_| "cannot lock MOI credentials")?;
+        validate_device_session(&self.read_locked()?, expected)?;
+        Ok(NativeSessionLease { _lock: lock })
     }
 
     pub fn selected_environment(&self) -> Result<Option<Environment>, String> {
@@ -383,6 +407,11 @@ impl NativeStore {
             return Err("invalid workspace identity".into());
         }
         self.update_with_control(expected, control, |session| {
+            if session.workspace_id.as_deref() != workspace || session.role_id.is_some() {
+                // The auth lock is held. Invalidate consent before publishing
+                // the new selection, so A -> B -> A cannot revive old consent.
+                self.clear_device_consent_locked()?;
+            }
             session.workspace_id = workspace.map(str::to_owned);
             session.role_id = None;
             Ok(())
@@ -557,6 +586,43 @@ impl NativeStore {
             directory_synced,
         })
     }
+}
+
+fn validate_device_identity<'a>(
+    state: &'a State,
+    expected: &NativeSession,
+) -> Result<&'a NativeSession, String> {
+    let key = expected.environment.key();
+    let session = state
+        .sessions
+        .get(&key)
+        .and_then(Option::as_ref)
+        .ok_or("MOI session logged out during device model operation")?;
+    if state.active.as_deref() != Some(key.as_str())
+        || session.environment != expected.environment
+        || session.generation != expected.generation
+        || session.subject != expected.subject
+        || session.session_id != expected.session_id
+        || session.astra_user_id != expected.astra_user_id
+        || session.moi_principal_id != expected.moi_principal_id
+        || session.catalog_user_id != expected.catalog_user_id
+        || session.workspace_id != expected.workspace_id
+        || session.role_id != expected.role_id
+    {
+        return Err("MOI sign-in or workspace changed during device model operation".into());
+    }
+    Ok(session)
+}
+
+fn validate_device_session(state: &State, expected: &NativeSession) -> Result<(), String> {
+    let session = validate_device_identity(state, expected)?;
+    if session.refresh_pending
+        || session.access_token.is_empty()
+        || session.expires_at <= unix_now()?
+    {
+        return Err("MOI sign-in must be renewed before executing a device model".into());
+    }
+    Ok(())
 }
 
 fn sync_auth_directory(root: &Path) -> std::io::Result<()> {
@@ -1755,6 +1821,32 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let store = NativeStore::with_directory(directory.path().to_path_buf());
         (directory, store)
+    }
+
+    #[test]
+    fn device_fence_lease_serializes_logout_and_rejects_a_changed_login_or_workspace() {
+        let (directory, store) = store();
+        let current = store.publish(session("A")).unwrap().0;
+        let lease = store.device_model_lease(&current).unwrap();
+        let writer = private_open(&directory.path().join("auth.lock"), true).unwrap();
+        assert_eq!(
+            FileExt::try_lock_exclusive(&writer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(lease);
+        FileExt::try_lock_exclusive(&writer).unwrap();
+        drop(writer);
+        store
+            .select_workspace(&current, Some("workspace-next"))
+            .unwrap();
+        assert!(store.device_model_lease(&current).is_err());
+        let changed = store.current().unwrap();
+        assert!(store.device_model_lease(&changed).is_ok());
+        store.publish(session("B")).unwrap();
+        assert!(store.device_model_lease(&changed).is_err());
+        let latest = store.current().unwrap();
+        store.logout().unwrap();
+        assert!(store.device_model_lease(&latest).is_err());
     }
 
     #[test]
