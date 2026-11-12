@@ -17750,7 +17750,6 @@ mod tests {
         for command in [
             "/session",
             "  /model",
-            "/unknown-command",
             "/plan inspect it",
             "/agent",
             "/work status",
@@ -17759,6 +17758,13 @@ mod tests {
             assert!(
                 active_submission_belongs_to_next_turn(command, false),
                 "active slash command must be queued for local dispatch: {command:?}"
+            );
+        }
+        // Unregistered slash input is conversation, including pasted paths.
+        for text in ["/unknown-command", "/Users/example/Library/screenshot.jpg"] {
+            assert!(
+                !active_submission_belongs_to_next_turn(text, false),
+                "unregistered slash input must enter model guidance: {text:?}"
             );
         }
         assert!(!active_submission_belongs_to_next_turn(
@@ -18284,7 +18290,7 @@ mod tests {
         assert_eq!(text, "older fallback");
         assert!(!admit_idle_followup(&text, true, &mut followups, &mut pane));
         assert!(!admit_idle_followup(
-            "/status",
+            "/stop",
             false,
             &mut followups,
             &mut pane
@@ -27239,12 +27245,20 @@ mod tests {
                 crate::tui::turn_event::TurnEvent::User { text, .. } if text == effective
             ));
         }
-        for command in ["/stop", "/login", "/hlep", "/he"] {
-            assert!(matches!(
-                submission_projection(command),
-                SubmissionProjection::LocalAction(_)
-            ));
+        for command in ["/stop", "/login", "/he"] {
+            assert!(
+                matches!(
+                    submission_projection(command),
+                    SubmissionProjection::LocalAction(_)
+                ),
+                "{command}"
+            );
         }
+        // A typo that misses the registry is conversation, not a local action.
+        assert_eq!(
+            submission_projection("/hlep"),
+            SubmissionProjection::Conversation("/hlep")
+        );
     }
 
     #[test]
@@ -27275,7 +27289,6 @@ mod tests {
             "/help",
             "/model chosen",
             "/he",
-            "/unknown",
             "/plan inspect",
             "!echo held",
         ] {
