@@ -1747,7 +1747,7 @@ mod tests {
             &workspace,
             Some(state.clone()),
         );
-        let (parent_ready, child_ready) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut parent_ready, child_ready) = std::os::unix::net::UnixStream::pair().unwrap();
         parent_ready
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -1864,13 +1864,14 @@ mod tests {
             }
         }
 
-        let replay = run_edge_connection(&edge_config(
+        let replay_config = edge_config(
             server_url,
             "runner-parent-loss",
             &workspace,
             &state,
             "replay.token",
-        ));
+        );
+        let replay = run_edge_connection(&replay_config);
         let replay_server = async {
             let mut socket = accept_plain_socket(&listener).await;
             assert!(socket.next().await.unwrap().unwrap().is_text());
