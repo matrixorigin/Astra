@@ -6,6 +6,28 @@ import {
 } from '../http';
 
 describe('http helpers', () => {
+  test.each(['用户-张旭', 'café', 'user-🚀'])('preserves UTF-8 JWT subject %s', (subject) => {
+    const payload = Buffer.from(JSON.stringify({ sub: subject })).toString('base64url');
+    expect(extractJwtSubject(`e30.${payload}.`)).toBe(subject);
+  });
+
+  test('decodes UTF-8 without browser atob', () => {
+    const payload = Buffer.from(JSON.stringify({ sub: '用户-🚀' })).toString('base64url');
+    vi.stubGlobal('atob', undefined);
+    try {
+      expect(extractJwtSubject(`e30.${payload}.`)).toBe('用户-🚀');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test('rejects invalid UTF-8 payload bytes', () => {
+    const payload = Buffer.concat([
+      Buffer.from('{"sub":"'), Buffer.from([0xff]), Buffer.from('"}'),
+    ]).toString('base64url');
+    expect(extractJwtSubject(`e30.${payload}.`)).toBeNull();
+  });
+
   test('headersInitToRecord merges plain records and Headers instances', () => {
     expect(headersInitToRecord({ a: '1' }, { b: '2' })).toEqual({ a: '1', b: '2' });
 

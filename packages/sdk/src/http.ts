@@ -115,9 +115,10 @@ export function extractJwtSubject(token: string): string | null {
     }
     const normalized = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
     const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
-    const decoded = typeof atob === 'function'
-      ? atob(padded)
-      : Buffer.from(padded, 'base64').toString('utf8');
+    const bytes = typeof atob === 'function'
+      ? Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
+      : Buffer.from(padded, 'base64');
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const payload = JSON.parse(decoded) as {
       sub?: unknown;
     };
