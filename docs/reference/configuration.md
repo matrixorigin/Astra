@@ -440,7 +440,8 @@ or the existing error code. DNS/TLS details are not guessed from error text.
 The OpenAI-compatible and Anthropic SSE collectors retain a fixed diagnostic
 before erasing typed body-read errors. A clean EOF without the protocol terminal
 records `eof_before_terminal`; an already recognized Anthropic error event records
-`provider_error_event`; invalid SSE framing or JSON records `invalid_sse`.
+`provider_error_event`; invalid UTF-8 or JSON records `invalid_sse`, while a
+frame rejected by the existing size cap records `stream_size_limit`.
 Other collectors retain their existing category when no safe cause is available.
 These observations do not identify which upstream service closed a connection.
 Connection preparation failures are included before HTTP dispatch,

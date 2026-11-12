@@ -43,7 +43,7 @@ use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
-use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
+use astra_turn_core::sse_blocks::{SseBlankLineUtf8Buf, SseFrameError};
 use astra_turn_core::sse_data_lines::validated_sse_event;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -9156,7 +9156,10 @@ pub(crate) fn parse_openai_sse_json_stream(
                     Ok(Some(block)) => block,
                     Ok(None) => break,
                     Err(error) => {
-                        crate::server::run_trace::note_attempt_reason("invalid_sse");
+                        crate::server::run_trace::note_attempt_reason(match &error {
+                            SseFrameError::TooLarge { .. } => "stream_size_limit",
+                            SseFrameError::InvalidUtf8(_) => "invalid_sse",
+                        });
                         yield Err(format!("invalid model SSE response: {error}"));
                         return;
                     }
@@ -12696,32 +12699,42 @@ mod tests {
     async fn llm_trace_stream_reasons_preserve_business_errors() {
         use tracing::instrument::WithSubscriber;
 
+        // This is valid JSON/SSE rejected only by the existing frame-size cap.
+        let oversized_event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"x".repeat(MAX_STREAM_ACCUMULATION_BYTES)}}]})
+        );
         for (provider, body, reason, message) in [
             (
                 "openai",
-                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
                 "eof_before_terminal",
                 "without a terminal marker",
             ),
-            ("openai", "data: {invalid}\n\n", "invalid_sse", "invalid"),
+            ("openai", Bytes::from_static(b"data: {invalid}\n\n"), "invalid_sse", "invalid"),
+            ("openai", Bytes::from_static(b"data: {\"x\":\"\xff\"}\n\n"), "invalid_sse", "invalid UTF-8"),
+            ("openai", Bytes::from(oversized_event), "stream_size_limit", "SSE event exceeds"),
             (
                 "anthropic",
-                "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"private provider error\"}}\n\n",
+                Bytes::from_static(b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"private provider error\"}}\n\n"),
                 "provider_error_event",
                 "private provider error",
             ),
             (
                 "anthropic",
-                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
+                Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n"),
                 "eof_before_terminal",
                 "without message_stop",
             ),
         ] {
-            let base = spawn_local_http_server(Router::new().fallback(move || async move {
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from(body))
-                    .unwrap()
+            let base = spawn_local_http_server(Router::new().fallback(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
             }))
             .await;
             let messages = [json!({"role":"user","content":"private prompt"})];
@@ -12807,18 +12820,79 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "otel")]
     #[tokio::test]
-    async fn llm_trace_parser_retains_typed_reason_without_changing_error_text() {
-        let error = sample_reqwest_stream_error().await.without_url();
-        let reason = llm_transport_error_reason(&error);
-        let expected = redact_provider_secrets(&format!("{error:?}"));
-        crate::server::run_trace::in_llm_call(async {
-            let parsed = parse_openai_sse_json_stream(stream::iter(vec![Err(error)]));
-            tokio::pin!(parsed);
-            assert_eq!(parsed.next().await.unwrap().unwrap_err(), expected);
-            assert_eq!(crate::server::run_trace::attempt_reason(), Some(reason));
-        })
+    async fn llm_trace_truncated_http_body_exports_typed_reason() {
+        use opentelemetry::trace::TracerProvider;
+        use tracing::instrument::WithSubscriber;
+
+        let (base, server) = spawn_truncated_sse_server(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"private body marker\"}}]}\n\n",
+            2,
+        )
         .await;
+        let capture = LlmExportCapture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(tracing_subscriber::EnvFilter::new("astra.llm=info")),
+        );
+        let messages = [json!({"role":"user","content":"private prompt"})];
+        let url = format!("{base}/private-route?key=private-query-marker");
+        let make_call = || {
+            let mut call = trace_fixture_call(&messages, &base, "openai");
+            call.route.completions_url_override = Some(&url);
+            call
+        };
+        let error = call_trace_fixture(make_call(), true, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        let without_subscriber = call_trace_fixture(make_call(), true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+        assert!(error.message.contains("IncompleteBody"));
+        assert_eq!(error.kind, without_subscriber.kind);
+        assert_eq!(error.message, without_subscriber.message);
+        assert_eq!(error.details_json, without_subscriber.details_json);
+        server.await.unwrap();
+
+        let spans = capture.0.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "llm.call");
+        let fields: HashMap<_, _> = span
+            .attributes
+            .iter()
+            .map(|attr| (attr.key.as_str(), attr.value.to_string()))
+            .collect();
+        assert_eq!(fields["error.code"], "stream_transport");
+        assert_eq!(fields["error.phase"], "response_body");
+        assert_eq!(fields["error.reason"], "unexpected_eof");
+        assert_eq!(fields["http.response.status_code"], "200");
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        let rendered = format!("{:?}", span.attributes);
+        for private in [
+            &base,
+            "private-route",
+            "private-query-marker",
+            "private prompt",
+            "private-key",
+            "private body marker",
+            "IncompleteBody",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "export must not include raw diagnostics"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13404,37 +13478,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    async fn spawn_truncated_sse_server(
+        body: &'static [u8],
+        request_count: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            let mut used = 0;
-            while !request[..used].ends_with(b"\r\n\r\n") {
-                let read = socket.read(&mut request[used..]).await.unwrap();
-                assert!(
-                    read > 0,
-                    "complete request headers must precede the response"
+            for _ in 0..request_count {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut request = tokio::io::BufReader::new(socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(request.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                // Drain POST bodies before closing so this fixture produces
+                // HTTP premature EOF, not an OS-dependent TCP reset.
+                let mut request_body = vec![0; content_length];
+                request.read_exact(&mut request_body).await.unwrap();
+                let mut socket = request.into_inner();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() + 64
                 );
-                used += read;
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
             }
-            socket.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 256\r\nConnection: close\r\n\r\ndata: {\"x\":1}\n\n",
-            ).await.unwrap();
-            socket.shutdown().await.unwrap();
         });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
+        let (base, server) = spawn_truncated_sse_server(b"data: {\"x\":1}\n\n", 1).await;
         let response = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap()
-            .get(format!(
-                "http://{address}/private-route?key=private-query-marker"
-            ))
+            .get(format!("{base}/private-route?key=private-query-marker"))
             .send()
             .await
             .unwrap();
