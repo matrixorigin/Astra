@@ -1953,7 +1953,8 @@ pub(crate) async fn finalize_session_memory_handler(
     let mut port = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
         resolver,
         user.user_id.clone(),
-    );
+    )
+    .with_session(&session_id);
     if state.memoria_self_hosted_fallback_enabled
         && let Some(key) = state.memoria_master_key.clone()
     {
@@ -2603,14 +2604,15 @@ fn fork_provider_scope(
 ) -> Result<Option<astra_services::runs::ProviderRunOwner>, (StatusCode, Json<ErrorResponse>)> {
     match &auth.principal.origin {
         astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
+            let owner = astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            };
             match auth.mechanism {
-                astra_services::RequestAuthMechanism::RequestBoundHmac => {
-                    Ok(Some(astra_services::runs::ProviderRunOwner {
-                        provider_id: context.provider_id.clone(),
-                        provider_scope_id: context.provider_scope_id.clone(),
-                    }))
+                astra_services::RequestAuthMechanism::RequestBoundHmac => Ok(Some(owner)),
+                astra_services::RequestAuthMechanism::KnownLegacy if allow_legacy => {
+                    Ok((context.provider_id == "moi").then_some(owner))
                 }
-                astra_services::RequestAuthMechanism::KnownLegacy if allow_legacy => Ok(None),
                 _ => Err(session_fork_http_error(
                     astra_services::SessionForkCoordinatorError::Forbidden,
                 )),

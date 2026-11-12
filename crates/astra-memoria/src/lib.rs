@@ -387,6 +387,16 @@ pub trait MemoriaPort: Send + Sync {
         Err("Memoria transport does not support authenticated owner rebinding".to_string())
     }
 
+    /// Bind the canonical Session identity as well as its authenticated user.
+    /// User-scoped providers resolve any retained workspace binding afresh.
+    fn bind_session(
+        &self,
+        user_id: &str,
+        _session_id: &str,
+    ) -> Result<Arc<dyn MemoriaPort>, String> {
+        self.bind_owner(user_id)
+    }
+
     /// Resolve the authority used by a prompt-facing memory tool operation.
     /// Runtime-only ports may leave this unsupported; concrete HTTP and
     /// user-scoped ports return an owner-bound transport.

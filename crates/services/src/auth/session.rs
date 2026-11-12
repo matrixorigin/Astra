@@ -17,6 +17,19 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const PROVIDER_SCOPE_PROOF_KEY: &str = "__astra_provider_scope_proof_v1";
+pub const PROVIDER_SCOPE_OWNER_KEY: &str = "__astra_provider_scope_owner_v1";
+pub const PROVIDER_MEMORY_SCOPE_PROOF_KEY: &str = "__astra_provider_memory_scope_proof_v1";
+const PROVIDER_SCOPE_METADATA_KEYS: [&str; 3] = [
+    PROVIDER_SCOPE_PROOF_KEY,
+    PROVIDER_SCOPE_OWNER_KEY,
+    PROVIDER_MEMORY_SCOPE_PROOF_KEY,
+];
+
+fn has_provider_scope_metadata(metadata: &serde_json::Map<String, serde_json::Value>) -> bool {
+    PROVIDER_SCOPE_METADATA_KEYS
+        .iter()
+        .any(|key| metadata.contains_key(*key))
+}
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
 const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
 const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
@@ -653,7 +666,7 @@ impl DatabaseSessionService {
             .title
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
         let mut metadata = request.metadata.unwrap_or_default();
-        if metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY) {
+        if has_provider_scope_metadata(&metadata) {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "reserved session metadata key",
@@ -671,6 +684,19 @@ impl DatabaseSessionService {
             metadata.insert(
                 PROVIDER_SCOPE_PROOF_KEY.to_string(),
                 serde_json::Value::String(encryptor.sign_provider_session_scope(
+                    &user_id,
+                    &session_id,
+                    &scope.provider_id,
+                    &scope.provider_scope_id,
+                )),
+            );
+            metadata.insert(
+                PROVIDER_SCOPE_OWNER_KEY.to_string(),
+                serde_json::to_value(scope).map_err(internal_error)?,
+            );
+            metadata.insert(
+                PROVIDER_MEMORY_SCOPE_PROOF_KEY.to_string(),
+                serde_json::Value::String(encryptor.sign_provider_memory_scope(
                     &user_id,
                     &session_id,
                     &scope.provider_id,
@@ -1196,12 +1222,10 @@ impl SessionService for DatabaseSessionService {
             ));
         }
 
-        if metadata
-            .as_ref()
-            .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+        if metadata.as_ref().is_some_and(has_provider_scope_metadata)
             || metadata_patch
                 .as_ref()
-                .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+                .is_some_and(has_provider_scope_metadata)
         {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -1269,8 +1293,10 @@ impl SessionService for DatabaseSessionService {
         let metadata_patch_for_audit = metadata_patch.clone();
         let metadata = match (metadata, metadata_patch) {
             (Some(mut metadata), None) => {
-                if let Some(proof) = locked_metadata.get(PROVIDER_SCOPE_PROOF_KEY) {
-                    metadata.insert(PROVIDER_SCOPE_PROOF_KEY.to_string(), proof.clone());
+                for key in PROVIDER_SCOPE_METADATA_KEYS {
+                    if let Some(value) = locked_metadata.get(key) {
+                        metadata.insert(key.to_string(), value.clone());
+                    }
                 }
                 Some(metadata)
             }

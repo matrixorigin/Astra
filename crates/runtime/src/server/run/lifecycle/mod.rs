@@ -11929,7 +11929,7 @@ impl AgenticRunLifecycleService {
         builder = builder.with_memoria_client(
             self.memory_extraction_service
                 .as_ref()
-                .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
+                .and_then(|svc| svc.memoria_client_for_session(user_id, session_id).ok()),
         );
 
         if let Some(pool) = &self.shared_pool {
@@ -12081,7 +12081,7 @@ impl AgenticRunLifecycleService {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
         let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(user_id) {
+            match svc.scoped_to_session(user_id, session_id) {
                 Ok(scoped) => Some(scoped),
                 Err(error) => {
                     tracing::error!(
@@ -12576,7 +12576,7 @@ impl AgenticRunLifecycleService {
         if let Some(memoria_port) = self
             .memory_extraction_service
             .as_ref()
-            .and_then(|service| service.memoria_client_for_owner(user_id).ok())
+            .and_then(|service| service.memoria_client_for_session(user_id, session_id).ok())
         {
             executor = executor.with_memoria_port(memoria_port);
         }
@@ -24643,7 +24643,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // makes direct pause/resume admission truthful even when the parent
         // lives in a different process-local run map.
         let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(&config.user_id) {
+            match svc.scoped_to_session(&config.user_id, &config.session_id) {
                 Ok(scoped) => Some(scoped),
                 Err(error) => {
                     tracing::error!(
@@ -24786,7 +24786,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_interaction_mode(Some(config.interaction_mode));
 
         builder = builder.with_memoria_client(self.memory_extraction_service.as_ref()
-            .and_then(|svc| svc.memoria_client_for_owner(&config.user_id).ok()));
+            .and_then(|svc| svc.memoria_client_for_session(&config.user_id, &config.session_id).ok()));
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -25034,7 +25034,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(memoria_port) = self
                 .memory_extraction_service
                 .as_ref()
-                .and_then(|service| service.memoria_client_for_owner(&config.user_id).ok())
+                .and_then(|service| service.memoria_client_for_session(&config.user_id, &config.session_id).ok())
             {
                 executor = executor.with_memoria_port(memoria_port);
             }

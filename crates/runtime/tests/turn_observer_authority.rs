@@ -437,7 +437,12 @@ async fn observer_rechecks_authority_after_transcript_admission() {
     let grant = Arc::new(AtomicU8::new(2));
     authority.changing_grant = Some(grant.clone());
     let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
-    assert!(worker.admits_observation("astra-a").await.unwrap());
+    assert!(
+        worker
+            .admits_observation("astra-a", "session-a")
+            .await
+            .unwrap()
+    );
     grant.store(1, Ordering::SeqCst);
     assert_eq!(
         worker.run(request("astra-a")).await.unwrap(),

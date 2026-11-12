@@ -264,58 +264,97 @@ and use its invocation carrier for operations such as forget or update.
 
 ## MOI request identity bridge
 
-With UC built-in memory explicitly enabled, MOI HMAC and MOI edge-token
-principals resolve their IAM subject through the configured `moi` external
-provider callback using action `resolve_memory_identity`. The pinned service
-credential is required. Its response binds `external_subject`, `issuer`,
-`uc_subject` and a required `memory_access` decision (`none`, `read_only` or
-`read_write`); the issuer must exactly equal the configured UC issuer. An
-identity-only response or unknown access value is an authority error, never an
-implicit read/write grant. `none` denies access without contacting UC or Memoria;
-`read_only` preserves recall but denies observation and other writes through the
-existing canonical policy. MOI must obtain this decision from its memory
-authorization policy; an active identity or permission to chat is insufficient.
-This change does not establish an all-or-nothing MOI product policy. Each
-operation resolves identity/access anew; an allowed grant also requires the
-existing live UC account-status check. The existing UC built-in policy,
-bounded owner derivation and owner-scoped
-Memoria transport apply; a provider request signature is not itself the grant.
-This is account-scoped personal memory and grants no workspace resource access.
-The same UC account uses the same personal-memory owner across MOI workspaces
-and native UC login; this bridge does not provide workspace-isolated memory.
+MOI memory is workspace-isolated personal memory. The same user in different
+MOI workspaces has different memory owners; different users in the same
+workspace remain isolated. Native UC login retains its separate account-level
+namespace. This does not introduce shared workspace memory.
 
-The bridge does not provision local password users, rename run/session owners,
-copy historical memories or alter native UC, local-account and scoped-key login
-paths. A missing mapping, unavailable callback, mismatched identity or revoked UC
-account never falls back to the deployment master under the request owner.
-The existing observer, explicit memory tools and session-end maintenance use
-this same resolver. Observer acceptance proves that an observation was accepted,
-not that memory was recalled or injected into a subsequent conversation.
-This change does not wire automatic prompt recall: the retained memory-prefetch
-helpers have no production caller. Verify cross-session recall with an explicit
-memory-tool invocation and verify account isolation separately.
-Close, memory-status and finalize accept request-bound HMAC authentication using
-exact method/path/body verification and the retained provider Session scope proof,
-just like conversation admission. The caller must sign a fresh request for each
-lifecycle operation; pre-upgrade HMAC Sessions without retained scope evidence
-are rejected rather than assigned a guessed workspace. Edge tokens retain their
-own owner namespace and cannot control an HMAC-created Session, even with the same IAM subject. The memory proxy
-retains its existing user-token authentication contract. The MOI caller must
-invoke close/finalize to trigger session-end maintenance.
-The MOI callback must be deployed before enabling this path in Astra.
-Compare its effective issuer with Astra's configured issuer byte for byte before
-deployment, including any trailing slash. Each admitted authority resolution
-performs one MOI identity request and one UC account-status request. Recovery
-checks admission before loading and resolves fresh dispatch authority afterward:
-an allowed attempt normally makes two MOI and two UC requests. Fetching an
-uncached UC service token can add another request.
-The identity callback has a two-second request deadline, including response-body
-reads, and an 8 KiB response limit for both successful and error responses,
-including chunked bodies. External-provider clients are reused per configured
-endpoint, preserving target-specific proxy and no-redirect policies; service
-credentials are attached per request, and identity/access decisions are not
-cached. Other provider actions retain their 30-second deadline with an 8 MiB
-response limit.
+With UC built-in memory explicitly enabled, MOI HMAC and MOI Edge-token
+principals resolve memory authority through the configured `moi` provider's
+authenticated `resolve_memory_identity` callback. The request carries the IAM
+`external_subject` and `provider_scope_id`. The response must bind the same
+subject and workspace, the exact configured UC `issuer`, the mapped `uc_subject`
+and an explicit `memory_access` decision. An omitted or mismatched identity,
+workspace or grant fails closed before UC/Memoria access.
+
+MOI decides `memory.read` and `memory.write` independently through current
+workspace IAM. The grant is `none`, `read_only`, `write_only` or `read_write`;
+write permission alone never enables reads, and read permission alone never
+enables observation or maintenance. An active account, permission to chat,
+a provider signature or an old UI capability projection is insufficient.
+Ordinary Roles do not receive these grants by default. Every operation resolves
+fresh authority; an admitted grant also requires the existing live UC
+account-status check. No decision is retained as a background capability, and
+no denial or dependency failure selects unrestricted deployment credentials.
+
+The workspace comes from the canonical Session's immutable provider binding,
+created from verified HMAC or MOI runtime-token context. Edge registration
+tokens retain their existing prohibition on provider Session creation; they
+may access only a compatible same-owner, same-workspace bound Session.
+Session creation stores its `ProviderRunOwner` and a server-keyed memory proof binding
+user, Session, provider and workspace. Its signing domain is separate from the
+older provider Session proof: historical client-supplied metadata plus an old
+signature cannot prove a new memory boundary. Public metadata creation and updates
+cannot supply or remove these reserved fields. The resolver verifies the proof
+on every memory authority lookup. Chat admission must also verify the retained
+workspace, including the Edge-token path, so transcript content cannot cross
+workspace boundaries. A tool argument or the user's latest request cannot
+select this workspace.
+
+Fork creation retains the workspace identity only after verifying the parent's
+binding and signs the child's own binding. Recovery verifies the child identity
+and active canonical fork manifest; a legacy manifest alone is insufficient.
+Old Sessions without the new binding remain ineligible for workspace memory,
+and a new fork cannot turn their historical transcript into authorized memory.
+Existing conversation access is distinct from eligibility to extract memory.
+There is no implicit backfill, history copy or migration from account-level
+memory. Requests that need workspace memory must use a newly bound Session.
+
+Memory owners use the `mws_` prefix and a base64url SHA-256 digest of the ordered
+JSON tuple `["astra.workspace-memory.v1", provider_id, workspace_id, issuer,
+uc_subject]`. The 47-byte owner is stable, bounded and distinct from native UC's
+`uc_` namespace. Session/Run user IDs are unchanged. Owner-scoped Memoria
+transport is reused; the callback returns no long-lived user credential.
+
+Observation, explicit memory tools and session-end maintenance use the same
+Session-bound resolver. Per-process extraction services are cached by both
+user and Session, retaining separate bound transports and rejecting extraction
+requests for another Session. A new operation or recovery attempt rechecks the
+current grant. Native UC, local-account and scoped-key login paths retain their
+existing selection contracts.
+
+The companion MOI callback must be deployed before this path is used. An older
+MOI endpoint does not implement `resolve_memory_identity` and rejects it with
+HTTP 400; adding a workspace parameter alone does not make that endpoint
+compatible. Compare the two services' effective UC issuers byte for byte,
+including any trailing slash. Cross-project acceptance must exercise the actual
+MOI product path, user/workspace isolation and revocation, rather than treating
+fixtures or passing CI as end-to-end readiness.
+
+Observation acceptance proves that an observation was accepted, not that memory
+was recalled or injected into a subsequent conversation. This change does not
+wire automatic prompt recall: retained prefetch helpers have no production
+caller. Explicit memory-tool recall verifies that narrower operation only.
+The broader cross-session-memory issue remains open until a new conversation
+recalls nonempty memory into model context.
+
+Close, memory-status and finalize retain request-bound HMAC verification of
+method/path/body and the Session's provider scope. Each lifecycle operation
+requires a fresh signature. Edge tokens retain their own owner namespace and
+cannot control an HMAC-created Session merely by sharing its IAM subject.
+The memory proxy retains its existing user-token authentication contract.
+The MOI caller must invoke close/finalize for session-end maintenance.
+
+The identity callback has a two-second request deadline including response-body
+reads, and an 8 KiB response limit for success/error and chunked bodies.
+Endpoint-specific pools preserve proxy and no-redirect policies; credentials
+remain request-local and identity/grant decisions are not cached. Other
+provider actions retain their 30-second deadline and 8 MiB response limit.
+An admitted authority lookup adds a Session-binding SQL read, one MOI callback
+and one UC status request. Admission and dispatch recheck authority separately;
+a normal admitted observation therefore adds two binding reads, two MOI calls
+and two UC calls, plus any uncached UC service-token request. These costs are
+additional to the non-MOI recovery SQL accounting below.
 
 The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.

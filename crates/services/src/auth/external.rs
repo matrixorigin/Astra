@@ -459,6 +459,7 @@ pub trait ExternalProviderClient: Send + Sync {
     async fn resolve_memory_identity(
         &self,
         _provider: &ExternalAuthProviderConfig,
+        _provider_scope_id: &str,
         _external_subject: &str,
     ) -> Result<ExternalMemoryIdentity, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
@@ -576,6 +577,7 @@ pub async fn check_edge_token_revocation(
 #[serde(deny_unknown_fields)]
 pub struct ExternalMemoryIdentity {
     pub external_subject: String,
+    pub provider_scope_id: String,
     pub issuer: String,
     pub uc_subject: String,
     // Required: old identity-only responses must not silently grant read/write.
@@ -773,12 +775,13 @@ impl ExternalProviderClient for HttpExternalProviderClient {
     async fn resolve_memory_identity(
         &self,
         provider: &ExternalAuthProviderConfig,
+        provider_scope_id: &str,
         external_subject: &str,
     ) -> Result<ExternalMemoryIdentity, (StatusCode, Json<ErrorResponse>)> {
         self.post_action_with_limits(
             provider,
             "resolve_memory_identity",
-            serde_json::json!({"external_subject": external_subject}),
+            serde_json::json!({"provider_scope_id": provider_scope_id, "external_subject": external_subject}),
             MEMORY_IDENTITY_TIMEOUT,
             MEMORY_IDENTITY_RESPONSE_LIMIT,
         )
@@ -1196,6 +1199,7 @@ mod tests {
                         peers.push(peer);
                         Json(json!({"code":0,"data":{
                             "external_subject":body["external_subject"],
+                            "provider_scope_id":body["provider_scope_id"],
                             "issuer":"https://uc.example.test/realm",
                             "uc_subject":"uc-1", "memory_access":access
                         }}))
@@ -1231,7 +1235,7 @@ mod tests {
         ] {
             provider.auth_key = key.into();
             let identity = client
-                .resolve_memory_identity(&provider, subject)
+                .resolve_memory_identity(&provider, "ws-1", subject)
                 .await
                 .unwrap();
             assert_eq!(identity.external_subject, subject);
@@ -1275,7 +1279,7 @@ mod tests {
         let client = HttpExternalProviderClient::default();
         for kind in ["success", "error", "chunked"] {
             let error = client
-                .resolve_memory_identity(&provider(format!("{origin}/{kind}")), "iam-1")
+                .resolve_memory_identity(&provider(format!("{origin}/{kind}")), "ws-1", "iam-1")
                 .await
                 .err()
                 .unwrap();
@@ -1311,7 +1315,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = HttpExternalProviderClient::default();
-        let calls = (0..4).map(|_| client.resolve_memory_identity(&provider, "iam-1"));
+        let calls = (0..4).map(|_| client.resolve_memory_identity(&provider, "ws-1", "iam-1"));
         let results = tokio::time::timeout(
             Duration::from_secs(5),
             futures_util::future::join_all(calls),

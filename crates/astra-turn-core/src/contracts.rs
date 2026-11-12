@@ -27,7 +27,7 @@ pub trait TurnObserverWorker: Send + Sync {
 
     /// Gate optional transcript loading. A positive result is not a reusable
     /// write grant: run must resolve current authority again before dispatch.
-    async fn admits_observation(&self, _user_id: &str) -> Result<bool, String> {
+    async fn admits_observation(&self, _user_id: &str, _session_id: &str) -> Result<bool, String> {
         Ok(self.is_configured())
     }
 

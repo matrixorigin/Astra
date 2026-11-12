@@ -2879,7 +2879,7 @@ impl Drop for ActiveProbeCall {
 }
 #[async_trait::async_trait]
 impl astra_runtime::TurnObserverWorker for SchedulerObserver {
-    async fn admits_observation(&self, _: &str) -> Result<bool, String> {
+    async fn admits_observation(&self, _: &str, _: &str) -> Result<bool, String> {
         self.probe
             .admissions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -73,7 +73,7 @@ pub(crate) async fn drive_session_memory_work(
             .auth_service
             .memoria_credentials()
             .ok_or("memory authority is unavailable")?;
-        let mut client = UserScopedMemoriaPort::new(resolver, user.into());
+        let mut client = UserScopedMemoriaPort::new(resolver, user.into()).with_session(session);
         if state.memoria_self_hosted_fallback_enabled
             && let Some(key) = state.memoria_master_key.clone()
         {
@@ -137,7 +137,7 @@ pub(crate) async fn drive_session_memory_work(
                 .and_then(|runtime| runtime.clone_memory_extraction_service())
                 .ok_or("memory extraction owner is unavailable")?;
             return service
-                .scoped_to_owner(user)?
+                .scoped_to_session(user, session)?
                 .run_durable_claim(current_claim)
                 .await;
         }
@@ -411,7 +411,7 @@ impl SessionObservationRecovery {
                 .state
                 .turn_persistence
                 .observer_worker
-                .admits_observation(&candidate.key.owner_user_id)
+                .admits_observation(&candidate.key.owner_user_id, &candidate.key.session_id)
                 .await?
             {
                 crate::server::run::lifecycle::record_turn_observer_run_metrics(

@@ -13,6 +13,7 @@ pub const ACCESS_TTL_SECONDS: u32 = 900;
 pub enum MemoryAccess {
     None,
     ReadOnly,
+    WriteOnly,
     ReadWrite,
 }
 impl MemoryAccess {
@@ -25,16 +26,22 @@ impl MemoryAccess {
             (Self::ReadOnly, true) => Some(
                 "Memory sharing is read-only. Reading memories is allowed, but saving or modifying them requires read/write access. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings to change access.",
             ),
+            (Self::WriteOnly, false) => Some(
+                "Memory access is write-only. Reading memories requires a separate memory read grant.",
+            ),
             _ => None,
         }
     }
     pub fn allows(self, write: bool) -> bool {
-        self == Self::ReadWrite || (!write && self == Self::ReadOnly)
+        self == Self::ReadWrite
+            || (!write && self == Self::ReadOnly)
+            || (write && self == Self::WriteOnly)
     }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::ReadOnly => "read_only",
+            Self::WriteOnly => "write_only",
             Self::ReadWrite => "read_write",
         }
     }
@@ -444,6 +451,7 @@ impl MemoriaCredentialResolver {
         external_providers: &[super::ExternalAuthProviderConfig],
         external_client: &dyn super::ExternalProviderClient,
         subject: &str,
+        workspace: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
         let Some(uc) = uc.filter(|uc| uc.settings.builtin_memory) else {
             return Ok(MemoriaCredentialResolution::Denied);
@@ -457,7 +465,7 @@ impl MemoriaCredentialResolver {
             .filter(|p| !p.auth_key.is_empty())
             .ok_or("MOI memory identity service is not configured")?;
         let identity = match external_client
-            .resolve_memory_identity(provider, subject)
+            .resolve_memory_identity(provider, workspace, subject)
             .await
         {
             Ok(identity) => identity,
@@ -490,6 +498,7 @@ impl MemoriaCredentialResolver {
             }
         };
         if identity.external_subject != subject
+            || identity.provider_scope_id != workspace
             || identity.issuer != uc.settings.issuer
             || identity.uc_subject.is_empty()
             || identity.uc_subject.len() > 128
@@ -498,7 +507,15 @@ impl MemoriaCredentialResolver {
         {
             return Err("MOI memory identity mismatch".into());
         }
-        Self::uc_builtin_credential(memoria, uc, &identity.uc_subject, identity.memory_access).await
+        let mut resolution =
+            Self::uc_builtin_credential(memoria, uc, &identity.uc_subject, identity.memory_access)
+                .await?;
+        if let MemoriaCredentialResolution::Scoped(credential) = &mut resolution {
+            credential.owner =
+                uc.workspace_memory_owner(&provider.id, workspace, &identity.uc_subject);
+            credential.generation = format!("moi-workspace:{}", credential.owner);
+        }
+        Ok(resolution)
     }
 
     /// Resolve both the current credential and whether an absent credential
@@ -508,15 +525,48 @@ impl MemoriaCredentialResolver {
         &self,
         user: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        self.resolve_runtime_for_session(user, None).await
+    }
+
+    pub async fn resolve_runtime_for_session(
+        &self,
+        user: &str,
+        session_id: Option<&str>,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
         // MOI request principals have no local account row. Resolve through the
         // pinned provider's authenticated identity service, never by guessing UC IDs.
         if let Some(subject) = moi_request_subject(user) {
+            if self
+                .uc_provider
+                .as_ref()
+                .is_none_or(|uc| !uc.settings.builtin_memory)
+            {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
+            let Some(session) = session_id.filter(|id| !id.is_empty()) else {
+                return Ok(MemoriaCredentialResolution::Denied);
+            };
+            let Some(scope) = crate::session_fork_coordinator::retained_provider_session_owner(
+                self.pool.get(),
+                user,
+                session,
+                &self.encryptor,
+            )
+            .await
+            .map_err(|_| "MOI memory workspace binding cannot be verified")?
+            else {
+                return Ok(MemoriaCredentialResolution::Denied);
+            };
+            if scope.provider_id != "moi" || scope.provider_scope_id.is_empty() {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
             return Self::resolve_moi_builtin(
                 &self.provider,
                 self.uc_provider.as_ref(),
                 &self.external_providers,
                 self.external_client.as_ref(),
                 subject,
+                &scope.provider_scope_id,
             )
             .await;
         }
@@ -1180,6 +1230,8 @@ mod provider_contract_tests {
         assert!(!MemoryAccess::None.allows(true));
         assert!(MemoryAccess::ReadOnly.allows(false));
         assert!(!MemoryAccess::ReadOnly.allows(true));
+        assert!(!MemoryAccess::WriteOnly.allows(false));
+        assert!(MemoryAccess::WriteOnly.allows(true));
         assert!(MemoryAccess::ReadWrite.allows(true));
         for scopes in [
             vec![],
@@ -1260,7 +1312,7 @@ mod moi_memory_tests {
                 async move {
                     if mode == 21 { tokio::time::sleep(std::time::Duration::from_secs(3)).await; }
                     assert_eq!(headers["authorization"], "Bearer test-callback-key");
-                    assert_eq!(body, serde_json::json!({"action":"resolve_memory_identity", "provider_id":"moi", "external_subject":"iam-1"}));
+                    assert_eq!(body, serde_json::json!({"action":"resolve_memory_identity", "provider_id":"moi", "provider_scope_id":"ws-1", "external_subject":"iam-1"}));
                     let status = match mode {
                         4 => StatusCode::SERVICE_UNAVAILABLE,
                         6 | 7 => StatusCode::FORBIDDEN,
@@ -1273,7 +1325,8 @@ mod moi_memory_tests {
                         8 => serde_json::json!({"code":401,"message":"invalid service credential"}),
                         9 => serde_json::json!({"code":0,"data":null}),
                         _ => serde_json::json!({"code":0,"data":{
-                            "memory_access": match mode { 17 => "read_only", 18 => "none", 19 => "invalid", _ => "read_write" },
+                            "provider_scope_id": if mode == 22 { "ws-other" } else { "ws-1" },
+                            "memory_access": match mode { 17 => "read_only", 18 => "none", 19 => "invalid", 24 => "write_only", _ => "read_write" },
                             "external_subject": if mode == 3 { "another-user" } else { "iam-1" },
                             "issuer": match mode {
                                 2 => "https://wrong.example/realm".to_string(),
@@ -1290,6 +1343,7 @@ mod moi_memory_tests {
                             }
                         }}),
                     };
+                    if mode == 23 { body["data"].as_object_mut().unwrap().remove("provider_scope_id"); }
                     if mode == 20 {
                         body["data"].as_object_mut().unwrap().remove("memory_access");
                     }
@@ -1347,13 +1401,17 @@ mod moi_memory_tests {
                 &providers,
                 &client,
                 moi_request_subject(id).unwrap(),
+                "ws-1",
             )
             .await
             .unwrap();
             let MemoriaCredentialResolution::Scoped(credential) = resolved else {
                 panic!("expected scoped credential")
             };
-            assert_eq!(credential.owner, uc.memory_owner("uc-1"));
+            assert_eq!(
+                credential.owner,
+                uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+            );
             assert_eq!(credential.access, MemoryAccess::ReadWrite);
             assert!(credential.owner_scoped_master);
         }
@@ -1365,14 +1423,21 @@ mod moi_memory_tests {
                 &providers,
                 &client,
                 "iam-1",
+                "ws-1",
             )
             .await
             .unwrap()
         else {
             panic!("expected scoped credential for the changed UC mapping")
         };
-        assert_eq!(other.owner, uc.memory_owner("uc-2"));
-        assert_ne!(other.owner, uc.memory_owner("uc-1"));
+        assert_eq!(
+            other.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-2")
+        );
+        assert_ne!(
+            other.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+        );
         mode.store(17, Ordering::SeqCst);
         let MemoriaCredentialResolution::Scoped(read_only) =
             MemoriaCredentialResolver::resolve_moi_builtin(
@@ -1381,6 +1446,7 @@ mod moi_memory_tests {
                 &providers,
                 &client,
                 "iam-1",
+                "ws-1",
             )
             .await
             .unwrap()
@@ -1388,7 +1454,28 @@ mod moi_memory_tests {
             panic!("expected an explicit read-only grant")
         };
         assert_eq!(read_only.access, MemoryAccess::ReadOnly);
-        assert_eq!(read_only.owner, uc.memory_owner("uc-1"));
+        assert_eq!(
+            read_only.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+        );
+        mode.store(24, Ordering::SeqCst);
+        let MemoriaCredentialResolution::Scoped(write_only) =
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected explicit write-only access")
+        };
+        assert!(!write_only.access.allows(false));
+        assert!(write_only.access.allows(true));
+        assert_eq!(write_only.owner, read_only.owner);
         mode.store(18, Ordering::SeqCst);
         status_called.store(false, Ordering::SeqCst);
         assert!(matches!(
@@ -1398,6 +1485,7 @@ mod moi_memory_tests {
                 &providers,
                 &client,
                 "iam-1",
+                "ws-1",
             )
             .await
             .unwrap(),
@@ -1411,7 +1499,8 @@ mod moi_memory_tests {
                 Some(&uc),
                 &providers,
                 &client,
-                "iam-1"
+                "iam-1",
+                "ws-1",
             )
             .await
             .unwrap(),
@@ -1427,7 +1516,8 @@ mod moi_memory_tests {
                 Some(&uc),
                 &providers,
                 &client,
-                "iam-1"
+                "iam-1",
+                "ws-1",
             )
             .await
             .unwrap(),
@@ -1437,7 +1527,7 @@ mod moi_memory_tests {
             !status_called.load(Ordering::SeqCst),
             "explicit MOI denial must stop before UC access"
         );
-        for invalid in [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20] {
+        for invalid in [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 22, 23] {
             mode.store(invalid, Ordering::SeqCst);
             status_called.store(false, Ordering::SeqCst);
             assert!(
@@ -1446,7 +1536,8 @@ mod moi_memory_tests {
                     Some(&uc),
                     &providers,
                     &client,
-                    "iam-1"
+                    "iam-1",
+                    "ws-1",
                 )
                 .await
                 .is_err(),
@@ -1473,6 +1564,7 @@ mod moi_memory_tests {
                 &providers,
                 &client,
                 "iam-1",
+                "ws-1",
             )
             .await
             .err()
@@ -1495,6 +1587,7 @@ mod moi_memory_tests {
             &unavailable_providers,
             &client,
             "iam-1",
+            "ws-1",
         )
         .await
         .err()
@@ -1506,7 +1599,8 @@ mod moi_memory_tests {
                 Some(&uc),
                 &[],
                 &client,
-                "iam-1"
+                "iam-1",
+                "ws-1",
             )
             .await
             .is_err(),
@@ -1514,7 +1608,7 @@ mod moi_memory_tests {
         );
         assert!(matches!(
             MemoriaCredentialResolver::resolve_moi_builtin(
-                &memoria, None, &providers, &client, "iam-1"
+                &memoria, None, &providers, &client, "iam-1", "ws-1",
             )
             .await
             .unwrap(),
@@ -1527,7 +1621,8 @@ mod moi_memory_tests {
                 Some(&uc),
                 &[],
                 &client,
-                "iam-1"
+                "iam-1",
+                "ws-1",
             )
             .await
             .unwrap(),

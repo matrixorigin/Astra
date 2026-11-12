@@ -1715,7 +1715,7 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
             async move {
                 assert_eq!(headers["authorization"], "Bearer lifecycle-callback-key");
                 assert_eq!(body["action"], "resolve_memory_identity");
-                Json(json!({"code":0,"data":{"external_subject":body["external_subject"],
+                Json(json!({"code":0,"data":{"external_subject":body["external_subject"],"provider_scope_id":body["provider_scope_id"],
                     "issuer":issuer,"uc_subject":"lifecycle-uc-owner",
                     "memory_access":if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
             }
@@ -1730,10 +1730,12 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let bridge = tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
     let mut settings = AppSettings::from_explicit_env().unwrap();
     settings.matrixone.database = fixture.database.clone();
+    let encryptor =
+        FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref()).unwrap();
     let auth = Arc::new(
         DatabaseAuthService::new(settings.matrixone, settings.jwt)
             .with_pool(fixture.state.shared_pool.clone().unwrap())
-            .with_encryptor(FernetTokenEncryptor::new("lifecycle-test-encryption").unwrap())
+            .with_encryptor(encryptor)
             .with_provider_request_auth(vec![ProviderRequestAuthConfig {
                 provider: "moi".into(),
                 auth_type: "hmac".into(),
@@ -1771,7 +1773,216 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     );
     let app = build_app(fixture.state.clone().with_auth_service(auth.clone()));
     let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
-    let port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into());
+    let port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into())
+        .with_session(&fixture.parent);
+    let first_owner = port
+        .resolve_tool_transport(false)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_user_id;
+    let other_payload = json!({"client_session_ref":"workspace-memory-other"}).to_string();
+    let (status, other_session) = response(
+        &app,
+        signed_in_scope(
+            "POST",
+            "/sessions",
+            "/sessions",
+            &other_payload,
+            "other-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{other_session}");
+    let other_session = other_session["session_id"].as_str().unwrap();
+    let other_port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into())
+        .with_session(other_session);
+    let other_owner = other_port
+        .resolve_tool_transport(false)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_user_id;
+    assert_ne!(
+        first_owner, other_owner,
+        "one IAM/UC account must have separate workspace memory owners"
+    );
+    // Edge and HMAC logins share memory only after proving the same workspace.
+    let edge_request = |method: &str, path: &str, body: &str, workspace: &str| {
+        let now = chrono::Utc::now().timestamp();
+        let subject = owner.strip_prefix("provider_authorized:moi:").unwrap();
+        let token = super::fork_auth_compat::token(json!({
+            "sub": subject, "workspace_id": workspace, "iss": "moi-backend",
+            "iat": now, "exp": now + 300, "purpose": "edge_registration",
+            "edge_agent_id": "workspace-memory-edge", "jti": Uuid::new_v4().to_string()
+        }));
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, denied_edge_creation) = response(
+        &app,
+        edge_request(
+            "POST",
+            "/sessions",
+            r#"{"client_session_ref":"workspace-memory-edge"}"#,
+            "moi-contract-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied_edge_creation}");
+    assert_eq!(
+        denied_edge_creation["error_code"],
+        "provider_session_creation_forbidden"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let runtime_token = super::fork_auth_compat::token(json!({
+        "sub": owner.strip_prefix("provider_authorized:moi:").unwrap(),
+        "workspace_id": "moi-contract-workspace", "iss": "moi-core",
+        "iat": now, "exp": now + 300, "purpose": "runtime"
+    }));
+    let (status, edge_session) = response(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("authorization", format!("Bearer {runtime_token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"client_session_ref":"workspace-memory-runtime"}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{edge_session}");
+    let edge_session_id = edge_session["session_id"].as_str().unwrap();
+    let edge_owner = format!(
+        "external_authorized:moi:{}",
+        owner.strip_prefix("provider_authorized:moi:").unwrap()
+    );
+    let edge_port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), edge_owner)
+        .with_session(edge_session_id);
+    assert_eq!(
+        first_owner,
+        edge_port
+            .resolve_tool_transport(false)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_user_id
+    );
+    let edge_status_path = format!("/sessions/{edge_session_id}/memory/status");
+    let (status, result) = response(
+        &app,
+        edge_request("GET", &edge_status_path, "", "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (status, _) = response(
+        &app,
+        edge_request("GET", &edge_status_path, "", "other-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let other_metadata: String = sqlx::query_scalar(
+        "SELECT CAST(metadata AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(owner)
+    .bind(other_session)
+    .fetch_one(fixture.state.shared_pool.as_ref().unwrap().get())
+    .await
+    .unwrap();
+    let mut tampered_scope: Value = serde_json::from_str(&other_metadata).unwrap();
+    tampered_scope["__astra_provider_scope_owner_v1"]["provider_scope_id"] =
+        json!("moi-contract-workspace");
+    sqlx::query("UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?")
+        .bind(tampered_scope.to_string())
+        .bind(owner)
+        .bind(other_session)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    assert!(
+        other_port.resolve_tool_transport(false).await.is_err(),
+        "changing stored workspace without its Session signature must fail closed"
+    );
+    assert_eq!(
+        first_owner,
+        port.resolve_tool_transport(false)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_user_id
+    );
+    let unbound = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into());
+    assert!(
+        !unbound.admits_operation(false).await.unwrap(),
+        "an account-only binding must not select workspace memory"
+    );
+
+    // A legacy Session/fork cannot gain memory authority from a manifest alone.
+    let original_metadata: String = sqlx::query_scalar(
+        "SELECT CAST(metadata AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(owner)
+    .bind(&fixture.parent)
+    .fetch_one(fixture.state.shared_pool.as_ref().unwrap().get())
+    .await
+    .unwrap();
+    let mut legacy_metadata: Value = serde_json::from_str(&original_metadata).unwrap();
+    legacy_metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("__astra_provider_memory_scope_proof_v1");
+    sqlx::query("UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?")
+        .bind(legacy_metadata.to_string())
+        .bind(owner)
+        .bind(&fixture.parent)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    assert!(!port.admits_operation(false).await.unwrap());
+    let (_, legacy_child) = fork(
+        &app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "legacy-memory-scope",
+    )
+    .await;
+    let legacy_child_port =
+        UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into())
+            .with_session(&legacy_child);
+    assert!(!legacy_child_port.admits_operation(false).await.unwrap());
+    sqlx::query("UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?")
+        .bind(original_metadata)
+        .bind(owner)
+        .bind(&fixture.parent)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    let (_, child) = fork(
+        &app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "bound-memory-scope",
+    )
+    .await;
+    let child_port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into())
+        .with_session(&child);
+    assert_eq!(
+        first_owner,
+        child_port
+            .resolve_tool_transport(false)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_user_id,
+        "a new fork retains the proved workspace identity, never a cached grant"
+    );
     // Actual explicit-port failure, before contacting Memoria, not just an enum assertion.
     let denied = port
         .store("test memory", "semantic", None, None)
@@ -1784,7 +1995,7 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     assert!(!denied.contains("Connected apps") && !denied.contains("Memoria Settings"));
     let gateway = astra_tools::memoria::MemoriaToolGateway::new(None, None)
         .require_composition_port()
-        .with_memoria_port(Arc::new(port));
+        .with_memoria_port(Arc::new(port.clone()));
     let tool_error = gateway
         .call(
             "remember",
@@ -1808,6 +2019,11 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let (status, accepted) = control(&app, "POST", &finalize_path, finalize_route, "").await;
     assert_eq!(status, StatusCode::OK, "{accepted}");
     assert_eq!(accepted["accepted"], true);
+    read_only.store(true, Ordering::SeqCst);
+    assert!(
+        port.resolve_observer_transport().await.unwrap().is_none(),
+        "revoking memory.write must stop an already constructed observer port"
+    );
     let close_path = format!("/sessions/{}/close", fixture.parent);
     let close_route = "/sessions/{session_id}/close";
     for (path, route) in [(&finalize_path, finalize_route), (&close_path, close_route)] {

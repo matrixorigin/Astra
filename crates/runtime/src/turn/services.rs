@@ -289,11 +289,11 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         self.memoria_port.is_some()
     }
 
-    async fn admits_observation(&self, user_id: &str) -> Result<bool, String> {
+    async fn admits_observation(&self, user_id: &str, session_id: &str) -> Result<bool, String> {
         let Some(template) = &self.memoria_port else {
             return Ok(false);
         };
-        let port = template.bind_owner(user_id)?;
+        let port = template.bind_session(user_id, session_id)?;
         tokio::time::timeout(OBSERVER_AUTHORITY_TIMEOUT, port.admits_operation(true))
             .await
             .map_err(|_| "memoria observer admission timed out".to_string())?
@@ -306,7 +306,7 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let Some(template) = self.memoria_port.as_ref() else {
             return Ok(TurnObserverOutcome::NotConfigured);
         };
-        let port = template.bind_owner(&request.user_id)?;
+        let port = template.bind_session(&request.user_id, &request.session_id)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))

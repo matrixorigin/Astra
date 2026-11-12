@@ -452,7 +452,7 @@ impl DatabaseSessionForkCoordinator {
         manifest
             .validate()
             .map_err(|error| SessionForkCoordinatorError::Invalid(error.to_string()))?;
-        insert_fork_child_session(&mut tx, &manifest).await?;
+        insert_fork_child_session(&mut tx, &manifest, self.scope_encryptor.as_deref()).await?;
 
         sqlx::query(
             "INSERT INTO session_forks
@@ -1075,7 +1075,68 @@ pub fn authorize_manifest_provider(
 }
 
 fn provider_session_namespace(user_id: &str) -> bool {
-    user_id.starts_with("provider_authorized:")
+    user_id.starts_with("provider_authorized:") || user_id.starts_with("external_authorized:moi:")
+}
+
+/// Read the immutable provider binding used by memory recovery and tools.
+/// This is identity evidence only; every memory operation still resolves IAM.
+pub(crate) async fn retained_provider_session_owner<'e, E>(
+    executor: E,
+    user_id: &str,
+    session_id: &str,
+    encryptor: &crate::auth::FernetTokenEncryptor,
+) -> Result<Option<crate::runs::ProviderRunOwner>, SessionForkCoordinatorError>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let key = SessionKeyV1::owner_session("server", user_id, session_id, "main");
+    let row = sqlx::query(
+        "SELECT CAST(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_owner_v1') AS CHAR) AS scope_owner,
+                JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_memory_scope_proof_v1')) AS memory_proof,
+                CAST(f.manifest_json AS CHAR) AS scope_manifest
+         FROM agent_sessions s LEFT JOIN session_forks f
+           ON f.isolation_domain = ? AND f.owner_user_id = s.user_id
+          AND f.child_session_id = s.session_id AND f.child_branch_id = ?
+         WHERE s.user_id = ? AND s.session_id = ?",
+    ).bind(&key.isolation_domain).bind(&key.branch_id).bind(user_id).bind(session_id)
+        .fetch_optional(executor).await.map_err(|source| database_error("load_memory_session_scope", source))?;
+    let Some(row) = row else { return Ok(None) };
+    let proof: Option<String> = row
+        .try_get("memory_proof")
+        .map_err(|source| database_error("decode_memory_session_scope", source))?;
+    let Some(proof) = proof else { return Ok(None) };
+    let raw_owner: Option<String> = row
+        .try_get("scope_owner")
+        .map_err(|source| database_error("decode_memory_session_scope", source))?;
+    let Some(raw_owner) = raw_owner else {
+        return Ok(None);
+    };
+    let owner: crate::runs::ProviderRunOwner =
+        serde_json::from_str(&raw_owner).map_err(|_| SessionForkCoordinatorError::Forbidden)?;
+    let raw_manifest: Option<String> = row
+        .try_get("scope_manifest")
+        .map_err(|source| database_error("decode_memory_session_scope", source))?;
+    if let Some(raw) = raw_manifest {
+        let manifest: SessionForkManifestV1 =
+            serde_json::from_str(&raw).map_err(|_| SessionForkCoordinatorError::Forbidden)?;
+        validate_stored_manifest(&manifest, &manifest.parent_key)?;
+        if manifest.child_key != key
+            || manifest.state != SessionForkStateV1::Active
+            || manifest.provider_owner.as_ref() != Some(&owner)
+        {
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+    }
+    if !encryptor.verify_provider_memory_scope(
+        user_id,
+        session_id,
+        &owner.provider_id,
+        &owner.provider_scope_id,
+        &proof,
+    ) {
+        return Err(SessionForkCoordinatorError::Forbidden);
+    }
+    Ok(Some(owner))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1099,13 +1160,6 @@ pub async fn authorize_provider_fork_session<'e, E>(
 where
     E: sqlx::Executor<'e, Database = MySql>,
 {
-    // Legacy user tokens have a distinct owner namespace and retain the
-    // existing subject-owned Session contract. MOI's request-signed Sessions
-    // cannot be reached through it, and new provider fork control requires
-    // request-bound authentication rather than legacy credentials.
-    if user_id.starts_with("external_authorized:moi:") {
-        return Ok(());
-    }
     // Local identities cannot address request-signed provider Sessions. Their
     // ordinary admission already validates Session ownership and lifecycle.
     if required.is_none() && !provider_session_namespace(user_id) {
@@ -1114,6 +1168,7 @@ where
     let key = SessionKeyV1::owner_session("server", user_id, session_id, "main");
     let row = sqlx::query(
         "SELECT JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1') IS NOT NULL AS has_scope_binding,
+                JSON_EXTRACT(s.`metadata`, '$.__astra_provider_memory_scope_proof_v1') IS NOT NULL AS has_memory_scope_binding,
                 JSON_EXTRACT(s.`metadata`, '$.fork_id') IS NOT NULL AS has_fork_metadata,
                 CASE WHEN OCTET_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))) = 43
                      THEN JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))
@@ -1132,12 +1187,25 @@ where
     .await
     .map_err(|source| database_error("load_provider_session_scope", source))?;
     let Some(row) = row else {
+        if user_id.starts_with("external_authorized:moi:") {
+            return Ok(());
+        }
         return if required.is_some() || provider_session_namespace(user_id) {
             Err(SessionForkCoordinatorError::Forbidden)
         } else {
             Ok(())
         };
     };
+    // Retain the subject-owned contract of old Edge Sessions and forks. They
+    // remain ineligible for workspace memory. New memory-bound Sessions must
+    // also prove the calling token's workspace before reading/writing Context.
+    if user_id.starts_with("external_authorized:moi:")
+        && !row
+            .try_get::<bool, _>("has_memory_scope_binding")
+            .map_err(|source| database_error("decode_provider_session_scope", source))?
+    {
+        return Ok(());
+    }
     let raw_manifest: Option<String> = row
         .try_get("scope_manifest")
         .map_err(|source| database_error("decode_provider_session_scope", source))?;
@@ -1202,13 +1270,45 @@ where
 async fn insert_fork_child_session(
     tx: &mut Transaction<'_, MySql>,
     manifest: &SessionForkManifestV1,
+    encryptor: Option<&crate::auth::FernetTokenEncryptor>,
 ) -> Result<(), SessionForkCoordinatorError> {
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "fork_id": manifest.fork_id,
         "fork_parent_session_id": manifest.parent_key.session_id,
         "fork_parent_branch_id": manifest.parent_key.branch_id,
         "fork_parent_manifest_root": manifest.parent_head.latest_manifest_root,
     });
+    if let (Some(required), Some(encryptor)) = (manifest.provider_owner.as_ref(), encryptor)
+        && let Some(owner) = retained_provider_session_owner(
+            &mut **tx,
+            &manifest.parent_key.owner_user_id,
+            &manifest.parent_key.session_id,
+            encryptor,
+        )
+        .await?
+    {
+        if &owner != required {
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+        // Retain identity only after proving the parent's workspace boundary.
+        // Legacy manifests alone cannot authorize historical memory extraction.
+        metadata[crate::auth::session::PROVIDER_SCOPE_OWNER_KEY] =
+            serde_json::to_value(&owner).map_err(|_| SessionForkCoordinatorError::Forbidden)?;
+        metadata[crate::auth::session::PROVIDER_SCOPE_PROOF_KEY] =
+            serde_json::Value::String(encryptor.sign_provider_session_scope(
+                &manifest.child_key.owner_user_id,
+                &manifest.child_key.session_id,
+                &owner.provider_id,
+                &owner.provider_scope_id,
+            ));
+        metadata[crate::auth::session::PROVIDER_MEMORY_SCOPE_PROOF_KEY] =
+            serde_json::Value::String(encryptor.sign_provider_memory_scope(
+                &manifest.child_key.owner_user_id,
+                &manifest.child_key.session_id,
+                &owner.provider_id,
+                &owner.provider_scope_id,
+            ));
+    }
     let result = sqlx::query(
         "INSERT IGNORE INTO agent_sessions
          (session_id, user_id, agent_id, title, status, event_count, metadata,
