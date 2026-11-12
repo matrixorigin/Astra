@@ -1430,7 +1430,8 @@ pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool 
         // A later tool's success template cannot replace the model's chance to
         // interpret that result after an earlier invocation went unconfirmed.
         || state.stall.tool_call_records.iter().any(|record| {
-            record.was_executed()
+            record.outcome_is_unknown()
+                || (record.was_executed()
                 && !record.ok
                 && matches!(
                     record.error_kind,
@@ -1439,7 +1440,7 @@ pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool 
                             | astra_core::ErrorKind::ToolTimeout
                             | astra_core::ErrorKind::ToolOutcomeUnknown
                     )
-                )
+                ))
         })
         || missing_explicit_verification_hooks(state)
             .map(|missing| missing.is_some_and(|labels| !labels.is_empty()))

@@ -111,7 +111,7 @@ pub(crate) async fn apply_user_cancelled_turn(
             {
                 ui.show_warning(notice);
             }
-            apply_turn_success_async(
+            let turn_persisted = apply_turn_success_async(
                 state,
                 api,
                 profile,
@@ -122,7 +122,11 @@ pub(crate) async fn apply_user_cancelled_turn(
                 post_commit_tx,
             )
             .await;
-            state.last_turn_interrupted = false;
+            if turn_persisted {
+                state.last_turn_interrupted = false;
+            } else {
+                ui.show_warning("The cancelled turn's local session history could not be saved.");
+            }
         }
         Err(mut failure) => {
             failure.error = "[cancelled] user_interrupted (Ctrl+C)".to_string();

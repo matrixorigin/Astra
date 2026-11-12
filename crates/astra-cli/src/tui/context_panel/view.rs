@@ -1468,10 +1468,13 @@ fn append_read_activity(
             out.push(Line::from(vec![
                 Span::raw("    └ "),
                 Span::styled(
-                    format!(
-                        "read_file activity · {} requests · {} executed · {} files",
-                        summary.requested, summary.executed, summary.distinct_files
-                    ),
+                    if summary.unknown_start > 0 {
+                        format!("read_file activity · {} requests · {} confirmed executed · {} start unknown · {} files",
+                            summary.requested, summary.executed, summary.unknown_start, summary.distinct_files)
+                    } else {
+                        format!("read_file activity · {} requests · {} executed · {} files",
+                            summary.requested, summary.executed, summary.distinct_files)
+                    },
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ]));

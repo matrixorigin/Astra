@@ -136,6 +136,366 @@ async fn terminal(
     .unwrap()
 }
 
+#[tokio::test]
+async fn delivered_terminal_output_clears_known_failure_attention() {
+    let (_root, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf 'failed check\\n' >&2; exit 1",
+        false,
+        10.0,
+    )
+    .await;
+    terminal(&executor, &id).await;
+    let before = executor.background_tasks.get(&id).unwrap();
+    assert!(before.terminal_unobserved());
+
+    let result = call(&executor, "task_output", json!({"task_id": id})).await;
+    assert!(result.output.contains("failed check"), "{result:?}");
+    assert!(
+        executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+    let mut source = executor.background_tasks.clone();
+    let projections = source.export_shell_task_projections();
+    let restored_dir = tempfile::tempdir().unwrap();
+    let mut restored = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        restored_dir.path().to_path_buf(),
+    );
+    restored
+        .restore_shell_task_projections(projections)
+        .unwrap();
+    let history = restored.get(&id).expect("failed task remains inspectable");
+    assert!(!history.terminal_unobserved());
+    assert!(!history.outcome_unsettled());
+}
+
+#[tokio::test]
+async fn partial_output_reports_its_window_and_acknowledges_the_terminal_fact() {
+    let (_root, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf '%01024d' 0; printf 'compiler error at end\\n' >&2; exit 1",
+        false,
+        10.0,
+    )
+    .await;
+    terminal(&executor, &id).await;
+    let first = call(
+        &executor,
+        "task_output",
+        json!({"task_id": id, "offset": 0, "max_bytes": 32}),
+    )
+    .await;
+    assert!(first.output.contains("only part"), "{first:?}");
+    let mut timeout = first.tool_result_fields.clone().unwrap();
+    timeout.insert("wait_result".into(), json!("timeout"));
+    executor.acknowledge_delivered_task_result("task_output", Some(&timeout));
+    let mut different_task = first.tool_result_fields.clone().unwrap();
+    different_task.get_mut("task").unwrap()["task_id"] = json!("another-task");
+    executor.acknowledge_delivered_task_result("task_output", Some(&different_task));
+    assert!(
+        executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+    executor.acknowledge_delivered_task_result("task_output", first.tool_result_fields.as_ref());
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+    let last = call(&executor, "task_output", json!({"task_id": id})).await;
+    assert!(last.output.contains("compiler error at end"), "{last:?}");
+    executor.acknowledge_delivered_task_result("task_output", last.tool_result_fields.as_ref());
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+}
+
+#[tokio::test]
+async fn interrupted_task_can_acknowledge_all_retained_output_without_claiming_complete_execution()
+{
+    let (_root, executor) = fixture();
+    let id = launch(&executor, "printf ready; sleep 60", false, 60.0).await;
+    executor.background_tasks.clone().kill(&id).unwrap();
+    terminal(&executor, &id).await;
+    let result = call(
+        &executor,
+        "task_output",
+        json!({"task_id": id, "offset": 0, "max_bytes": 8192}),
+    )
+    .await;
+    let snapshot: Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(snapshot["output_complete"], false);
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .terminal_unobserved()
+    );
+}
+
+#[tokio::test]
+async fn reading_failed_task_does_not_erase_its_pending_notification() {
+    let (_root, executor) = fixture();
+    let _consumer =
+        executor
+            .background_tasks
+            .clone()
+            .with_active_work_registry(std::sync::Arc::new(
+                astra_core::work_unit::ActiveWorkRegistry::default(),
+            ));
+    let id = launch(
+        &executor,
+        "printf 'compile failed\\n' >&2; exit 1",
+        false,
+        10.0,
+    )
+    .await;
+    terminal(&executor, &id).await;
+    let mut registry = executor.background_tasks.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            registry.drain_join_set();
+            if registry
+                .get(&id)
+                .is_some_and(|task| task.ended_at_ms.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal event must be queued");
+    let result = call(&executor, "task_output", json!({"task_id": id})).await;
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    let events = registry.poll_completions();
+    let failures: Vec<_> = events.iter().filter(|event| matches!(event,
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id: task, .. } if task == &id
+    )).collect();
+    assert_eq!(failures.len(), 1, "{events:?}");
+    assert!(registry.poll_completions().is_empty());
+}
+
+#[tokio::test]
+async fn delivered_unknowns_do_not_fill_a_registry_without_notification_consumer() {
+    let (root, executor) = fixture();
+    let mut registry = executor.background_tasks.clone();
+    for _ in 0..100 {
+        let mut task = registry
+            .start_shell(
+                "foreground operation",
+                (root.path().join("out"), root.path().join("err"), None),
+                false,
+                false,
+                None,
+                |_, _| async {
+                    let mut result =
+                        astra_tools::execution_outcome::ToolExecutionOutcome::error_with_evidence(
+                            "outcome unknown".into(),
+                            astra_core::ToolFailureEvidence::from_error_kind(
+                                astra_core::ErrorKind::ToolOutcomeUnknown,
+                            ),
+                        );
+                    result
+                        .tool_result_fields
+                        .as_mut()
+                        .unwrap()
+                        .insert("cleanup_authoritative".into(), json!(true));
+                    result
+                },
+            )
+            .expect("delivered notifications must not exhaust a headless registry");
+        let result = task.wait().await.unwrap();
+        registry.abandon_foreground(&task.id);
+        executor.acknowledge_delivered_task_result("bash", result.tool_result_fields.as_ref());
+    }
+    assert!(registry.poll_completions().is_empty());
+}
+
+#[tokio::test]
+async fn real_long_shell_failure_notification_includes_the_error_tail() {
+    let (_root, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf '%020000d' 0 >&2; printf '\\nunique compiler error at end\\n' >&2; exit 1",
+        false,
+        10.0,
+    )
+    .await;
+    terminal(&executor, &id).await;
+    let mut registry = executor.background_tasks.clone();
+    let events = registry.poll_completions();
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            crate::edge_tools::background_tasks::BgTaskEvent::Failed {
+                id: task, error, ..
+            } if task == &id => Some(error),
+            _ => None,
+        })
+        .expect("real shell failure notification");
+    assert!(error.contains("unique compiler error at end"), "{error}");
+    assert!(error.contains("truncated"), "{error}");
+    assert!(error.contains("task_output"), "{error}");
+}
+
+#[tokio::test]
+async fn restored_failure_is_observed_when_terminal_output_is_inspected() {
+    use astra_services::session_workspace::{
+        BackgroundShellTaskProjection, BackgroundShellTerminalFacts,
+    };
+    let (root, _) = fixture();
+    let stdout = root.path().join("saved-stdout");
+    let stderr = root.path().join("saved-stderr");
+    std::fs::write(&stdout, "").unwrap();
+    std::fs::write(&stderr, "compiler error\n").unwrap();
+    let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        root.root.path().join("restore"),
+    )
+    .with_active_work_registry(std::sync::Arc::new(
+        astra_core::work_unit::ActiveWorkRegistry::default(),
+    ));
+    registry
+        .restore_shell_task_projection(BackgroundShellTaskProjection {
+            id: "restored-failure".into(),
+            status: "failed".into(),
+            title: "compile".into(),
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            stdout_path: stdout.display().to_string(),
+            stderr_path: stderr.display().to_string(),
+            exit_code: Some(1),
+            terminal_reason: Some("compiler error".into()),
+            terminal_facts: Some(BackgroundShellTerminalFacts {
+                unobserved: true,
+                outcome_unknown: false,
+                cleanup_unconfirmed: false,
+            }),
+        })
+        .unwrap();
+    let executor = ToolExecutor::new(root.path()).with_background_tasks(registry.clone());
+    let result = call(
+        &executor,
+        "task_output",
+        json!({"task_id":"restored-failure"}),
+    )
+    .await;
+    assert!(result.output.contains("compiler error"), "{result:?}");
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    assert!(
+        !registry
+            .get("restored-failure")
+            .unwrap()
+            .terminal_unobserved()
+    );
+    assert!(registry.poll_completions().iter().any(|event| matches!(event, crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. } if id == "restored-failure")));
+    let persisted = registry.export_shell_task_projections();
+    let mut reopened = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        root.root.path().join("reopen"),
+    );
+    reopened.restore_shell_task_projections(persisted).unwrap();
+    assert!(
+        !reopened
+            .get("restored-failure")
+            .unwrap()
+            .terminal_unobserved()
+    );
+}
+
+#[tokio::test]
+async fn restored_failure_with_missing_output_delivers_available_facts_once() {
+    use astra_services::session_workspace::{
+        BackgroundShellTaskProjection, BackgroundShellTerminalFacts,
+    };
+    let (root, _) = fixture();
+    let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        root.root.path().join("restore-missing"),
+    );
+    registry
+        .restore_shell_task_projection(BackgroundShellTaskProjection {
+            id: "restored-missing".into(),
+            status: "failed".into(),
+            title: "compile".into(),
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            exit_code: Some(1),
+            terminal_reason: Some("compiler error".into()),
+            terminal_facts: Some(BackgroundShellTerminalFacts {
+                unobserved: true,
+                outcome_unknown: false,
+                cleanup_unconfirmed: false,
+            }),
+        })
+        .unwrap();
+    let executor = ToolExecutor::new(root.path()).with_background_tasks(registry.clone());
+    let result = call(
+        &executor,
+        "task_output",
+        json!({"task_id":"restored-missing"}),
+    )
+    .await;
+    let output: Value = serde_json::from_str(&result.output).unwrap();
+    assert!(
+        matches!(
+            output["status"].as_str(),
+            Some("output_missing" | "output_unavailable")
+        ),
+        "{output}"
+    );
+    assert_eq!(output["task"]["status"], "failed");
+    assert_eq!(output["task"]["terminal_reason"], "compiler error");
+    assert!(
+        output["output_notice"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable")
+    );
+    executor.acknowledge_delivered_task_result("task_output", result.tool_result_fields.as_ref());
+    assert!(
+        !registry
+            .get("restored-missing")
+            .unwrap()
+            .terminal_unobserved()
+    );
+    let persisted = registry.export_shell_task_projections();
+    let mut reopened = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        root.root.path().join("reopen-missing"),
+    );
+    reopened.restore_shell_task_projections(persisted).unwrap();
+    assert!(
+        !reopened
+            .get("restored-missing")
+            .unwrap()
+            .terminal_unobserved()
+    );
+}
+
 async fn recorded(executor: &ToolExecutor, id: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1866,6 +2226,7 @@ async fn restored_task_wait_distinguishes_completion_from_lost_ownership() {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: id.into(),
                     status: status.into(),
                     title: "restored shell".into(),

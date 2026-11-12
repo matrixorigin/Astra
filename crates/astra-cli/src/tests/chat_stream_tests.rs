@@ -2772,7 +2772,7 @@ async fn stream_chat_sse_preserves_runtime_notifications_across_admission_and_fa
                     1
                 );
                 // This is the enclosing successful settlement's existing commit.
-                control.commit_applied_runtime_notifications();
+                let _ = control.commit_applied_runtime_notifications();
             } else {
                 let failure = result.unwrap_err();
                 assert_eq!(
@@ -2883,7 +2883,14 @@ async fn stream_chat_sse_preserves_runtime_notifications_across_admission_and_fa
             ],
             _ => vec!["first child finished", "second child finished"],
         };
-        assert_eq!(pending, expected, "input ownership after {outcome}");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|notification| notification.content.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "input ownership after {outcome}"
+        );
     }
 }
 

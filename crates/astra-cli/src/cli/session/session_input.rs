@@ -44,6 +44,7 @@ pub(crate) fn finalize_effective_line(
         let notifications = state
             .pending_bg_notifications
             .drain(..)
+            .map(|notification| notification.content)
             .collect::<Vec<_>>()
             .join("\n");
         runtime_required_texts.push(format!(
