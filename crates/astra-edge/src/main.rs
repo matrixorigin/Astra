@@ -1655,7 +1655,9 @@ mod tests {
         }
     }
 
-    async fn accept_edge(listener: &tokio::net::TcpListener) -> WebSocketStream<tokio::net::TcpStream> {
+    async fn accept_plain_socket(
+        listener: &tokio::net::TcpListener,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
         let (stream, _) = listener.accept().await.unwrap();
         tokio_tungstenite::accept_async(stream).await.unwrap()
     }
@@ -1674,7 +1676,7 @@ mod tests {
             edge_invocation_journal_path_in_root("runner-abc", &url_b, &workspace, Some(state.clone())),
         );
         let hold = |listener: tokio::net::TcpListener| async move {
-            let mut socket = accept_edge(&listener).await;
+            let mut socket = accept_plain_socket(&listener).await;
             assert!(socket.next().await.unwrap().unwrap().is_text());
             socket
                 .send(Message::Text(
@@ -1751,7 +1753,7 @@ mod tests {
             .unwrap();
         let child_fd = std::os::fd::AsRawFd::as_raw_fd(&child_ready);
         nix::fcntl::fcntl(
-            child_fd,
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(child_fd) },
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
         )
         .unwrap();
@@ -1776,7 +1778,7 @@ mod tests {
             .unwrap();
         drop(child_ready);
 
-        let mut socket = accept_edge(&listener).await;
+        let mut socket = accept_plain_socket(&listener).await;
         assert!(socket.next().await.unwrap().unwrap().is_text());
         socket
             .send(Message::Text(
@@ -1870,7 +1872,7 @@ mod tests {
             "replay.token",
         ));
         let replay_server = async {
-            let mut socket = accept_edge(&listener).await;
+            let mut socket = accept_plain_socket(&listener).await;
             assert!(socket.next().await.unwrap().unwrap().is_text());
             socket
                 .send(Message::Text(

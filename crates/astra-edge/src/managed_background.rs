@@ -1056,6 +1056,12 @@ impl Drop for StartupCancel {
     }
 }
 
+#[cfg(all(test, unix))]
+fn kill_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn stop_unaccepted_child(child: &mut Child) {
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),
