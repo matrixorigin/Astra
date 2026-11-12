@@ -2071,28 +2071,11 @@ impl ToolExecutor {
         self.parent_model_reasoning.lock_recover().clone()
     }
 
-    /// Bind memory lifecycle events to one host-owned producer identity. Tool
-    /// execution and the loop run boundary then close the same queue.
+    /// Bind memory calls to one host-owned producer identity.
     pub fn with_memory_attribution_id(mut self, producer_id: impl Into<String>) -> Self {
         let producer_id = producer_id.into();
         self.memory_attribution_id = (!producer_id.trim().is_empty()).then_some(producer_id);
         self
-    }
-
-    /// Return the exact recall ledger scope used by this executor.
-    pub(crate) fn memory_recall_scope(&self) -> Option<(String, String)> {
-        let session_id = self.active_session_id()?.trim().to_string();
-        if session_id.is_empty() {
-            return None;
-        }
-        let producer_id = self
-            .memory_attribution_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|producer_id| !producer_id.is_empty())
-            .unwrap_or("session")
-            .to_string();
-        Some((session_id, producer_id))
     }
 
     /// Install schemas declared by CLI-side providers so
@@ -4017,11 +4000,6 @@ impl ToolExecutor {
 
     // ── Env tool: environment variable management ─────────────────────────────
 
-    /// Environment variable management tool — delegated to `env_tools` module.
-    fn env_tool(&self, args: &Value) -> String {
-        env_tools::env_tool(args)
-    }
-
     fn handle_introspect(&self, args: &Value) -> String {
         if args.get("explain").is_some() {
             return "Error: Explain selectors require the server capacity; use an existing local artifact handle for CLI/Edge snapshots".to_string();
@@ -4729,10 +4707,10 @@ impl ToolExecutor {
     ) -> Option<ToolExecutionOutcome> {
         #[cfg(windows)]
         if name == "powershell" {
-            let output =
-                self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
-            self.record_output_size(output.len());
-            return Some(tool_execution_outcome_from_output(output));
+            let mut outcome = self.powershell_with_cancel(args, cancel_token, invocation);
+            outcome.output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(outcome.output.len());
+            return Some(outcome);
         }
         let _ = invocation; // PowerShell does not consume invocation metadata.
         #[cfg(not(windows))]
@@ -5708,7 +5686,12 @@ impl ToolExecutor {
                     outcome.output
                 }
                 #[cfg(windows)]
-                "powershell" => self.powershell(args),
+                "powershell" => {
+                    let outcome = self.powershell_with_cancel(args, cancel_token, invocation);
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
+                }
                 // Activation primitive for the deferred tool layer.
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
@@ -5898,14 +5881,16 @@ impl ToolExecutor {
                 "display_sixel" => {
                     let mut resolved = args.clone();
                     if let Some(path) = args.get("path").and_then(Value::as_str) {
-                        match self.resolve_checked(path) {
+                        match self.resolve_checked_result(path) {
                             Ok(path) => {
                                 resolved["path"] =
                                     Value::String(path.to_string_lossy().into_owned())
                             }
                             Err(error) => {
-                                *source_is_error = Some(true);
-                                return error;
+                                let result = error.into_tool_result().with_execution_not_started();
+                                *source_is_error = Some(result.is_error);
+                                *tool_result_fields = result.metadata;
+                                return result.output;
                             }
                         }
                     }
@@ -6261,7 +6246,7 @@ impl ToolExecutor {
                     unavailable_page(error, "unbound").to_json()
                 }
                 "lsp" => self.lsp_with_facts(args, facts),
-                "env" => self.env_tool(args),
+                "env" => facts.absorb_tool_result(env_tools::env_tool(args)),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
                     let outcome = if let Some((manager, prepared)) = mcp_prepared.as_ref() {
                         self.execute_prepared_mcp_tool(manager, name, prepared, args)
@@ -6278,45 +6263,6 @@ impl ToolExecutor {
         };
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
-        if name != "memory"
-            // Feedback must follow the executor's terminal fact, not prose
-            // that can contain error examples or conceal a failed execution.
-            // Legacy handlers without a typed outcome supply no success proof.
-            && facts.is_error == Some(false)
-            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
-        {
-            let producer_id = self
-                .memory_attribution_id
-                .clone()
-                .unwrap_or_else(|| "session".to_string());
-            let snapshots = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
-                &session_id,
-                &producer_id,
-                None,
-            );
-            if !snapshots.is_empty() {
-                let client = astra_tools::memoria::MemoriaToolGateway::new(
-                    self.cloud_base.clone(),
-                    self.cloud_token(),
-                );
-                let ctx = format!("cli-tool:{name}");
-                tokio::spawn(async move {
-                    let report = client
-                        .feedback_recall_snapshots(snapshots, "useful", &ctx)
-                        .await;
-                    if report.attempted > 0 {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            context = %ctx,
-                            attempted = report.attempted,
-                            succeeded = report.succeeded,
-                            failed = report.failed,
-                            "closed recall feedback after successful cli tool"
-                        );
-                    }
-                });
-            }
-        }
         self.record_output_size(output.len());
         output
     }
@@ -8283,10 +8229,18 @@ pub(crate) mod tests {
         restricted.allowed_paths.clear();
         *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
         let denied = executor.execute_with_metadata("grep", &args).await;
-        assert!(
-            denied.is_error && denied.output.contains(super::SANDBOX_DENIED_PREFIX),
-            "{denied:?}"
+        let denial = denied.tool_result_fields.as_ref().expect("denial facts");
+        assert!(denied.is_error, "{denied:?}");
+        assert!(crate::sandbox_retry::is_sandbox_denied_result(
+            &denied.output,
+            Some(denial)
+        ));
+        assert_eq!(
+            denial["error_kind"],
+            crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND
         );
+        assert_eq!(denial["execution_fact"], "not_executed");
+        assert_eq!(denial["execution_started"], false);
         executor
             .expand_sandbox_path(external.path().canonicalize().unwrap())
             .unwrap();
@@ -8516,6 +8470,61 @@ pub(crate) mod tests {
             let outcome = super::EdgeToolRun::ok(content).into_outcome();
             assert!(!outcome.is_error, "content was reclassified: {outcome:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn cli_env_dispatch_keeps_producer_execution_facts() {
+        let executor = test_executor();
+        let invalid = executor
+            .execute_with_metadata("env", &json!({"operation":"get"}))
+            .await;
+        assert!(invalid.is_error);
+        assert_eq!(
+            invalid.tool_result_fields.unwrap()["execution_fact"],
+            "not_executed"
+        );
+        let absent = format!("ASTRA_1260_ABSENT_{}", uuid::Uuid::new_v4().simple());
+        let missing = executor
+            .execute_with_metadata("env", &json!({"operation":"get", "name":absent}))
+            .await;
+        assert!(!missing.is_error, "{}", missing.output);
+        assert_eq!(
+            serde_json::from_str::<Value>(&missing.output).unwrap()["exists"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_tool_success_keeps_selection_without_automatic_feedback() {
+        let server = wiremock::MockServer::start().await;
+        let session_id = format!("memory-feedback-{}", uuid::Uuid::new_v4());
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            &session_id,
+            None,
+            "run-1",
+            1,
+            vec!["memory-1".into()],
+        );
+        let selection_id = astra_tools::memoria::MemoriaToolGateway::latest_recall(&session_id)
+            .unwrap()
+            .selection_id();
+        let executor = test_executor()
+            .with_cloud(server.uri(), "test-token")
+            .with_active_session_id(&session_id)
+            .with_memory_attribution_id("run-1");
+        let result = executor
+            .execute_with_metadata("env", &json!({"operation":"list"}))
+            .await;
+        assert!(!result.is_error);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            astra_tools::memoria::MemoriaToolGateway::latest_recall(&session_id)
+                .unwrap()
+                .selection_id(),
+            selection_id
+        );
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }
 
     #[test]
@@ -10962,10 +10971,6 @@ pub(crate) mod tests {
         assert_eq!(args["session_id"].as_str(), Some("mem-session"));
         assert_eq!(args["turn"].as_u64(), Some(9));
         assert_eq!(args["_attribution_id"].as_str(), Some("run-memory-9"));
-        assert_eq!(
-            executor.memory_recall_scope(),
-            Some(("mem-session".to_string(), "run-memory-9".to_string()))
-        );
     }
 
     #[tokio::test]

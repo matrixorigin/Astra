@@ -16,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1223,27 +1223,37 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("json.tmp.{}", fastrand::u64(..)));
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        let bytes = serde_json::to_vec(state).map_err(invalid_data)?;
-        record_existing_history(
-            astra_core::history_work::HistoryWorkSite::SyncOutboxQueueRewrite,
-            bytes.len().saturating_add(1),
-            state.records.len(),
-        );
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
+    let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        write_state_json(&mut writer, state)?;
+        if astra_core::history_work::instrumentation_enabled() {
+            match writer.get_ref().metadata() {
+                Ok(metadata) => record_existing_history(
+                    astra_core::history_work::HistoryWorkSite::SyncOutboxQueueRewrite,
+                    usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+                    state.records.len(),
+                ),
+                Err(error) => tracing::debug!(?error, "outbox write size unavailable"),
+            }
+        }
+        writer.get_ref().sync_data()
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
     Ok(())
+}
+
+fn write_state_json(writer: &mut impl Write, state: &SyncOutboxFile) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, state).map_err(std::io::Error::from)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 /// Sync the directory after a write. Callers hold the exclusive outbox lock so
@@ -1519,6 +1529,158 @@ mod tests {
         let mut event = JournalEvent::config_change(Some("sess-1"), "model", value);
         event.ts = "2026-07-08T00:00:00Z".to_string();
         event
+    }
+
+    #[test]
+    fn streamed_state_keeps_json_bytes_and_propagates_writer_errors() {
+        struct TestWriter {
+            bytes: Vec<u8>,
+            fail_after: Option<usize>,
+            fail_flush: bool,
+        }
+        impl Write for TestWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self
+                    .fail_after
+                    .is_some_and(|limit| self.bytes.len() >= limit)
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                let remaining = self
+                    .fail_after
+                    .map_or(bytes.len(), |limit| limit - self.bytes.len());
+                let count = bytes.len().min(remaining).min(7);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut state = SyncOutboxFile::default();
+        state
+            .records
+            .push(build_record(&event("模型🙂"), 1, 10).unwrap());
+        let mut expected = serde_json::to_vec(&state).unwrap();
+        expected.push(b'\n');
+        let mut writer = TestWriter {
+            bytes: Vec::new(),
+            fail_after: None,
+            fail_flush: false,
+        };
+        write_state_json(&mut writer, &state).unwrap();
+        assert_eq!(writer.bytes, expected);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outbox.json");
+        write_state(&path, &state).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(read_state(&path).unwrap(), state);
+
+        writer.fail_after = Some(writer.bytes.len());
+        let error = write_state_json(&mut writer, &state).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        writer.fail_after = None;
+        writer.fail_flush = true;
+        let error = write_state_json(&mut writer, &state).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn failed_rename_keeps_destination_and_removes_own_temporary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outbox.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_state(&path, &SyncOutboxFile::default()).is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_processes_keep_outbox_records_and_claims_distinct() {
+        fn wait_for(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        const ROOT_ENV: &str = "ASTRA_TEST_OUTBOX_PROCESS_ROOT";
+        const WORKER_ENV: &str = "ASTRA_TEST_OUTBOX_PROCESS_WORKER";
+        if let (Some(root), Some(worker)) =
+            (std::env::var_os(ROOT_ENV), std::env::var_os(WORKER_ENV))
+        {
+            let root = PathBuf::from(root);
+            let worker = worker.to_string_lossy();
+            let store = SyncOutboxStore::new(root.join("sync"));
+            std::fs::write(root.join(format!("ready-{worker}")), b"").unwrap();
+            wait_for(&root.join("enqueue"));
+            let events = (0..8)
+                .map(|index| event(&format!("worker-{worker}-{index}")))
+                .collect::<Vec<_>>();
+            let outcomes = store.enqueue_journal_events(&events).unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, SyncOutboxEnqueueOutcome::Inserted { .. }))
+            );
+            std::fs::write(root.join(format!("enqueued-{worker}")), b"").unwrap();
+            wait_for(&root.join("claim"));
+            let claimed = store.claim_ready_records(16, usize::MAX).unwrap();
+            let ids = claimed
+                .into_iter()
+                .map(|record| record.record_id)
+                .collect::<Vec<_>>();
+            std::fs::write(
+                root.join(format!("claimed-{worker}")),
+                serde_json::to_vec(&ids).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut children = (0..2)
+            .map(|worker| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "sync_outbox::tests::concurrent_processes_keep_outbox_records_and_claims_distinct"])
+                    .env(ROOT_ENV, root.path())
+                    .env(WORKER_ENV, worker.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for worker in 0..2 {
+            wait_for(&root.path().join(format!("ready-{worker}")));
+        }
+        std::fs::write(root.path().join("enqueue"), b"").unwrap();
+        for worker in 0..2 {
+            wait_for(&root.path().join(format!("enqueued-{worker}")));
+        }
+        std::fs::write(root.path().join("claim"), b"").unwrap();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        let ids = (0..2)
+            .flat_map(|worker| {
+                serde_json::from_slice::<Vec<String>>(
+                    &std::fs::read(root.path().join(format!("claimed-{worker}"))).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 16);
+        let status = SyncOutboxStore::new(root.path().join("sync"))
+            .status()
+            .unwrap();
+        assert_eq!(status.total, 16);
+        assert_eq!(status.in_flight, 16);
     }
 
     #[test]

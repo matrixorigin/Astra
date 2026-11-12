@@ -1078,16 +1078,6 @@ impl RuntimeToolExecutor {
         self
     }
 
-    /// Return the exact ledger scope used by server-local memory calls.
-    /// Agentic-loop cleanup asks the executor instead of reconstructing the
-    /// session or fallback producer from unrelated loop state.
-    pub(crate) fn memory_recall_scope(&self, run_id: Option<&str>) -> (String, String) {
-        (
-            self.session_id.clone(),
-            memory_producer_id(run_id).to_string(),
-        )
-    }
-
     /// Access the canonical transport-aware execution service and its
     /// current provider policy. Edge transport configuration is supplied
     /// through the shared service builder.
@@ -5152,10 +5142,7 @@ impl RuntimeToolExecutor {
         }
 
         let lifecycle = LocalToolExecutionLifecycle {
-            session_id: &self.session_id,
-            producer_id: memory_producer_id(Some(&request.run_id)),
             aggregate_output_bytes: &self.aggregate_output_bytes,
-            memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),
         };
         let call_id = lifecycle.start(name, args).await;

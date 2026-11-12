@@ -56,6 +56,19 @@ acked -> compacted
 
 Poisoned records must not block later independent records forever. They must be visible through sync status and repair tooling.
 
+CLI journal projection uses the captured journal owner and source session. Both
+the normal asynchronous path and the no-runtime path read complete records
+behind the journal's file sync barrier; they do not enqueue a separate in-memory
+copy of an event. A post-login sync waits briefly for projection and one drain.
+If that wait expires, it reports an unconfirmed result while the owned task
+continues; cancellation of the wait does not cancel that work.
+
+The existing recovery scan currently enumerates uncompressed journals, while
+session maintenance may compress or delete old files concurrently. Recovery of
+an unprojected old tail is therefore not guaranteed until those lifecycles are
+coordinated. The outbox also still reads and rewrites its complete retained file
+on mutation; neither behavior establishes a distributed-client capacity limit.
+
 ## Cloud ingestion contract
 
 Cloud ingestion must be idempotent:

@@ -52,10 +52,8 @@ pub enum HistoryWorkSite {
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
     CslPersistInputClone,
-    CslStateInstallClone,
     CslSnapshotClone,
     CslMessageHash,
-    CslHashIndexClone,
     CslFileRead,
     CslFileAppendSerialization,
     CslFileRewriteSerialization,
@@ -130,7 +128,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 110;
+    const COUNT: usize = 108;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -169,10 +167,8 @@ impl HistoryWorkSite {
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
         Self::CslPersistInputClone,
-        Self::CslStateInstallClone,
         Self::CslSnapshotClone,
         Self::CslMessageHash,
-        Self::CslHashIndexClone,
         Self::CslFileRead,
         Self::CslFileAppendSerialization,
         Self::CslFileRewriteSerialization,
@@ -291,10 +287,8 @@ impl HistoryWorkSite {
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
             Self::CslPersistInputClone => "csl_persist_input_clone",
-            Self::CslStateInstallClone => "csl_state_install_clone",
             Self::CslSnapshotClone => "csl_snapshot_clone",
             Self::CslMessageHash => "csl_message_hash",
-            Self::CslHashIndexClone => "csl_hash_index_clone",
             Self::CslFileRead => "csl_file_read",
             Self::CslFileAppendSerialization => "csl_file_append_serialization",
             Self::CslFileRewriteSerialization => "csl_file_rewrite_serialization",
@@ -416,10 +410,8 @@ impl HistoryWorkSite {
             Self::CliTurnUserInputProjection => "cli.stream_settlement",
             Self::CslMaterializedStateClone
             | Self::CslPersistInputClone
-            | Self::CslStateInstallClone
             | Self::CslSnapshotClone
-            | Self::CslMessageHash
-            | Self::CslHashIndexClone => "turn_core.csl_manager",
+            | Self::CslMessageHash => "turn_core.csl_manager",
             Self::CslFileRead
             | Self::CslFileAppendSerialization
             | Self::CslFileRewriteSerialization => "turn_core.csl_file_store",
