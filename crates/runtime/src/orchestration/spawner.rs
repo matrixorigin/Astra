@@ -3135,6 +3135,31 @@ pub trait SpawnAgentExecutor: Send + Sync {
     fn bind_parent_session(&self, _session_id: &str) {}
 }
 
+/// Errors at the durable tool-outcome inspection boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolOutcomeInspectionError {
+    #[error("tool result offset is beyond the retained output")]
+    InvalidOffset,
+    #[error("tool result page would skip an atomic redaction marker or UTF-8 boundary")]
+    UnsafePageBoundary,
+    #[error("tool outcome inspection is busy")]
+    Busy,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<String> for ToolOutcomeInspectionError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for ToolOutcomeInspectionError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_owned())
+    }
+}
+
 /// Loads a bounded authoritative session snapshot for agents observed from a
 /// different executor. Implementations own coalescing/backoff so fanout reads
 /// never degrade into per-agent database polling.
@@ -3153,6 +3178,18 @@ pub trait DurableAgentReconciler: Send + Sync {
         _run_ids: &[String],
     ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
         self.load_agent_recovery().await
+    }
+
+    /// On-demand inspection only; absence does not prove non-execution.
+    async fn inspect_child_tool_outcomes(
+        &self,
+        _child_run_id: &str,
+        _after: Option<(&str, &str)>,
+        _exact: Option<(&str, &str)>,
+        _offset: usize,
+        _max_bytes: usize,
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
+        Err("durable tool outcome inspection is unavailable".into())
     }
 
     /// Subscribe to a process-wide durable wake hint for remote direct children.
@@ -3616,6 +3653,25 @@ impl DynamicAgentSpawner {
 
     pub async fn set_durable_agent_reconciler(&self, reconciler: Arc<dyn DurableAgentReconciler>) {
         *self.durable_reconciler.write().await = Some(reconciler);
+    }
+
+    pub async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
+        let reconciler = self
+            .durable_reconciler
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        reconciler
+            .inspect_child_tool_outcomes(child_run_id, after, exact, offset, max_bytes)
+            .await
     }
 
     pub fn retained_child_result(

@@ -241,7 +241,11 @@ async fn callback_through_pipeline(
     let record = records.pop().unwrap();
     assert_eq!(
         record.effective_disposition(),
-        ToolCallDisposition::Executed
+        if lost_ack {
+            ToolCallDisposition::Unknown
+        } else {
+            ToolCallDisposition::Executed
+        }
     );
     assert_eq!(record.ok, callback.status == "completed");
     assert_eq!(

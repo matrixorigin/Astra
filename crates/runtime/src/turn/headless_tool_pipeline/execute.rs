@@ -3,10 +3,11 @@ use std::time::Instant;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
+use astra_services::session_journal::ToolCallDisposition;
 use astra_turn_core::headless_tool_postprocess::{
-    HeadlessExecutionDisposition, HeadlessOutputEnrichCtx, HeadlessOutputEnrichRequest,
-    HeadlessOutputEnrichSignal, HeadlessResultQualityRequest,
-    append_headless_result_quality_feedback, enrich_headless_tool_output_for_errors_and_limits,
+    HeadlessOutputEnrichCtx, HeadlessOutputEnrichRequest, HeadlessOutputEnrichSignal,
+    HeadlessResultQualityRequest, append_headless_result_quality_feedback,
+    enrich_headless_tool_output_for_errors_and_limits,
 };
 use astra_turn_core::headless_tool_stderr_lines::headless_stderr_resource_limit_observed;
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
@@ -352,62 +353,9 @@ fn structured_command_is_error(fields: &Map<String, Value>) -> Option<bool> {
         .map(astra_tools::exit_semantics::CommandResultClass::is_tool_error)
 }
 
-pub(super) fn execution_error_kind(
-    tool_result_fields: Option<&Map<String, Value>>,
-) -> Option<astra_core::ErrorKind> {
-    tool_result_fields
-        .and_then(|fields| fields.get("error_kind"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(parse_execution_error_kind_tag)
-        .or_else(|| {
-            astra_tools::execution_outcome::outcome_is_unknown(tool_result_fields)
-                .then_some(astra_core::ErrorKind::ToolOutcomeUnknown)
-        })
-}
-
-pub(super) fn execution_recovery_evidence(
-    tool_result_fields: Option<&Map<String, Value>>,
-) -> Option<astra_core::ToolFailureEvidence> {
-    let fields = tool_result_fields?;
-    let mut evidence = fields
-        .get("recovery_evidence")
-        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
-        .cloned()
-        .and_then(|value| serde_json::from_value::<astra_core::ToolFailureEvidence>(value).ok())
-        .or_else(|| {
-            // Compact transport facts use the same evidence type as local
-            // tools, without classifying rendered banners.
-            let kind = execution_error_kind(Some(fields))?;
-            let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
-            evidence.retryable = fields
-                .get("retryable")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(|| kind.is_retryable());
-            Some(evidence)
-        })?;
-    if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) {
-        // Keep the source timeout/cancellation kind; uncertainty describes the
-        // outcome, not its transport cause. Both survive result compaction.
-        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
-        evidence.retryable = false;
-        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
-    }
-    Some(evidence)
-}
-
-fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
-    astra_core::ErrorKind::parse_tag(tag).or(match tag {
-        // These aliases are part of the existing Edge/Server wire contract;
-        // normalize them at the boundary instead of scattering string checks
-        // through recovery and turn-guard code.
-        "capability_denied" | "approval_denied" | "sandbox_denied" => {
-            Some(astra_core::ErrorKind::PolicyDenied)
-        }
-        "approval_timeout" => Some(astra_core::ErrorKind::ToolTimeout),
-        "transport_unavailable" => Some(astra_core::ErrorKind::ToolUnavailable),
-        _ => None,
-    })
-}
+pub(super) use astra_tools::execution_outcome::{
+    execution_error_kind, execution_recovery_evidence,
+};
 
 #[cfg(test)]
 mod tests {
@@ -610,7 +558,8 @@ mod tests {
                 source_error_kind: Some(kind),
                 source_recovery_evidence: Some(&evidence),
                 tool_already_restricted: false,
-                execution_disposition: HeadlessExecutionDisposition::Executed,
+                execution_disposition: ToolCallDisposition::Executed,
+                outcome_unknown: false,
             },
             &mut HeadlessOutputEnrichCtx {
                 turn_guard: &mut turn_guard,
@@ -746,17 +695,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let source_error_kind = execution_error_kind(execution.tool_result_fields.as_ref());
         let source_recovery_evidence =
             execution_recovery_evidence(execution.tool_result_fields.as_ref());
-        let execution_disposition = if execution.tool_result_fields.as_ref().is_some_and(|fields| {
-            astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
-                fields.get("disposition"),
-                fields.get("execution_started").and_then(Value::as_bool),
-                astra_services::session_journal::ToolCallDisposition::Executed,
-            ) == astra_services::session_journal::ToolCallDisposition::Rejected
-        }) {
-            HeadlessExecutionDisposition::RejectedBeforeExecution
-        } else {
-            HeadlessExecutionDisposition::Executed
-        };
+        let outcome_unknown = astra_tools::execution_outcome::outcome_is_unknown(
+            execution.tool_result_fields.as_ref(),
+        );
+        let execution_disposition =
+            execution
+                .tool_result_fields
+                .as_ref()
+                .map_or(ToolCallDisposition::Executed, |fields| {
+                    ToolCallDisposition::from_execution_metadata(
+                        fields.get("disposition"),
+                        fields.get("execution_started").and_then(Value::as_bool),
+                        outcome_unknown,
+                        ToolCallDisposition::Executed,
+                    )
+                });
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
@@ -774,6 +727,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 source_recovery_evidence: source_recovery_evidence.as_ref(),
                 tool_already_restricted,
                 execution_disposition,
+                outcome_unknown,
             },
             &mut enrich_ctx,
             |sig| {
@@ -797,6 +751,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 source_error_kind,
                 execution_failed: is_err,
                 execution_disposition,
+                outcome_unknown,
                 resource_limit_recorded,
             },
             self.ctx.turn_guard,
@@ -825,7 +780,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.name,
             &execution.args,
         );
-        if execution_disposition == HeadlessExecutionDisposition::Executed {
+        if execution_disposition == ToolCallDisposition::Executed && !outcome_unknown {
             self.ctx.turn_guard.record_tool_outcome(
                 &outcome_sig,
                 result_quality,

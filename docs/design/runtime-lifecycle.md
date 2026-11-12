@@ -366,6 +366,10 @@ that cache independently from workspace repair, so a delayed sidecar cannot
 replace newer live evidence; display trace IDs and the current session head do
 not determine trace freshness. The Server head must not suppress
 subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
+Deferred local journal, workspace, checkpoint and CSL projections use the
+owner captured by the turn's journal; switching accounts before a worker runs
+does not redirect those writes. A completion for a detached owner or session
+is not reattached to the current client state.
 Ordinary local and fresh attachments do not perform this additional request.
 
 The shared CLI stream entrypoint heap-pins its execution future for all callers.

@@ -74,8 +74,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Like mold in rust-setup, musl-tools comes from Ubuntu. Unrelated
-          # runner repositories (e.g. Chrome) must not block release builds.
+          # musl-tools comes from Ubuntu; unrelated runner repositories
+          # (e.g. Chrome) must not block release builds.
           ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
           if [[ ! -s "${ubuntu_sources}" ]]; then
             ubuntu_sources=/etc/apt/sources.list

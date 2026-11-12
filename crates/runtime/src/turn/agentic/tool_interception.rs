@@ -100,6 +100,7 @@ pub(crate) fn record_pre_execution_rejections(
             0,
             false,
             &rejected.result,
+            None,
         );
         let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
             Some(buffer) => (Some(buffer.current_round()), Some(buffer.offset_ms())),

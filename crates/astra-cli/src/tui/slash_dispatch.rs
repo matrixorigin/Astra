@@ -3560,7 +3560,7 @@ pub(crate) struct SessionHubSnapshot {
     run_id: Option<String>,
     compactions: usize,
     journal_path: Option<String>,
-    persistence_error: Option<String>,
+    pub(crate) persistence_error: Option<String>,
     cwd_fallback: String,
 }
 
@@ -3605,7 +3605,7 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
             .journal
             .as_ref()
             .map(|journal| tilde_session_path(&journal.path().display().to_string())),
-        persistence_error: state.session_persistence_error.clone(),
+        persistence_error: state.current_persistence_error().map(str::to_owned),
         cwd_fallback,
     }
 }
