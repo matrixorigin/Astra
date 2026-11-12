@@ -271,6 +271,8 @@ fn streaming_http_client(base: &Url) -> Result<Client, reqwest::Error> {
 }
 
 /// Stateless façade over the astra HTTP API (thin client).
+/// Credential providers must retain settlement of any rotation they start even
+/// if a request stops waiting and drops the token future.
 pub trait BearerProvider: std::fmt::Debug + Send + Sync {
     fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>>;
 }
@@ -2651,21 +2653,50 @@ impl ThinClient {
             if !(delivery.owner_current)() {
                 return Err(ThinClientError::CallbackOwnerUnconfirmed);
             }
-            // Each result owns an independent delivery budget. Do not serialize
-            // callbacks behind a sibling whose response is stalled.
-            if !(delivery.owner_current)() {
-                return Err(ThinClientError::CallbackOwnerUnconfirmed);
-            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(ThinClientError::CallbackDeadlineExpired);
+                return Err(previous_error
+                    .take()
+                    .unwrap_or(ThinClientError::CallbackDeadlineExpired));
             }
-            let mut req = self
-                .http
-                .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override).await?)
-                .timeout(attempt_timeout.min(remaining))
-                .json(body);
+            // Credential acquisition is part of the same delivery budget.
+            // Providers own settlement of any credential rotation they start.
+            let headers = tokio::time::timeout_at(deadline, self.auth_headers_for(bearer_override));
+            let headers = if is_retry && let Some(cancel) = delivery.cancel {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(previous_error
+                        .take()
+                        .unwrap_or(ThinClientError::CallbackRetryCancelled)),
+                    result = headers => result,
+                }
+            } else {
+                headers.await
+            };
+            let headers = match headers {
+                Ok(Ok(headers)) => headers,
+                Ok(Err(auth)) => {
+                    return Err(match previous_error.take() {
+                        Some(previous) => ThinClientError::CallbackRetryAuthFailed {
+                            previous: Box::new(previous),
+                            auth: Box::new(auth),
+                        },
+                        None => auth,
+                    });
+                }
+                Err(_) => {
+                    return Err(previous_error
+                        .take()
+                        .unwrap_or(ThinClientError::CallbackDeadlineExpired));
+                }
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(previous_error
+                    .take()
+                    .unwrap_or(ThinClientError::CallbackDeadlineExpired));
+            }
+            let mut req = self.http.post(url.clone()).headers(headers).json(body);
             if let Some(id) = edge_executor_id
                 && let Ok(v) = HeaderValue::from_str(id)
             {
@@ -2679,7 +2710,13 @@ impl ThinClient {
                     .take()
                     .unwrap_or(ThinClientError::CallbackRetryCancelled));
             }
-            let response = req.send().await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(previous_error
+                    .take()
+                    .unwrap_or(ThinClientError::CallbackDeadlineExpired));
+            }
+            let response = req.timeout(attempt_timeout.min(remaining)).send().await;
             let (error, retry_after) = match response {
                 Ok(resp) => {
                     let status = resp.status();
@@ -5101,6 +5138,164 @@ mod tests {
             .await
             .unwrap();
         assert!(v.is_null(), "callbacks acknowledge by successful status");
+    }
+
+    #[derive(Debug)]
+    struct DelayedCallbackBearer(Option<Duration>);
+
+    impl BearerProvider for DelayedCallbackBearer {
+        fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>> {
+            Box::pin(async move {
+                match self.0 {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+                Ok("synthetic-token".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_delivery_budget_includes_bearer_provider() {
+        let server = MockServer::start().await;
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "turn".into(),
+            request_id: "request".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "result".into(),
+            duration_ms: 1,
+            tool_result_fields: None,
+        });
+        for delay in [None, Some(Duration::from_millis(150))] {
+            let client = ThinClient::new(&server.uri(), None)
+                .unwrap()
+                .with_bearer_provider(std::sync::Arc::new(DelayedCallbackBearer(delay)));
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.post_tool_result(
+                    None,
+                    Some("edge"),
+                    &body,
+                    ToolResultDelivery {
+                        budget: Duration::from_millis(30),
+                        owner_current: &|| true,
+                        cancel: None,
+                        previous_attempt: false,
+                    },
+                ),
+            )
+            .await
+            .expect("credential acquisition must obey the delivery deadline");
+            assert!(matches!(
+                result,
+                Err(ThinClientError::CallbackDeadlineExpired)
+            ));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_result_retry_bearer_failure_preserves_previous_error() {
+        #[derive(Debug)]
+        struct RetryBearer {
+            calls: std::sync::atomic::AtomicUsize,
+            waiting: tokio::sync::Notify,
+            fail: bool,
+        }
+        impl BearerProvider for RetryBearer {
+            fn token(
+                &self,
+            ) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>> {
+                Box::pin(async move {
+                    if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return Ok("synthetic-token".into());
+                    }
+                    self.waiting.notify_one();
+                    if self.fail {
+                        Err(ThinClientError::InvalidAuthHeader)
+                    } else {
+                        std::future::pending().await
+                    }
+                })
+            }
+        }
+        for fail in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/tools/result"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = std::sync::Arc::new(RetryBearer {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                waiting: tokio::sync::Notify::new(),
+                fail,
+            });
+            let client = ThinClient::new(&server.uri(), None)
+                .unwrap()
+                .with_bearer_provider(provider.clone());
+            let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: "request".into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            });
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let post = client.post_tool_result_with_policy(
+                None,
+                Some("edge"),
+                &body,
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                ToolResultDelivery {
+                    budget: Duration::from_secs(5),
+                    owner_current: &|| true,
+                    cancel: Some(&cancel),
+                    previous_attempt: false,
+                },
+            );
+            tokio::pin!(post);
+            if !fail {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::select! {
+                        _ = provider.waiting.notified() => {},
+                        result = &mut post => panic!("retry must wait for credentials: {result:?}"),
+                    }
+                })
+                .await
+                .expect("retry must reach the credential provider");
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(2), post)
+                .await
+                .unwrap()
+                .unwrap_err();
+            if fail {
+                match error {
+                    ThinClientError::CallbackRetryAuthFailed { previous, auth } => {
+                        assert!(
+                            matches!(*previous, ThinClientError::Api { status, .. } if status.as_u16() == 503)
+                        );
+                        assert!(matches!(*auth, ThinClientError::InvalidAuthHeader));
+                    }
+                    error => panic!("both observed causes must survive: {error:?}"),
+                }
+            } else {
+                assert!(
+                    matches!(error, ThinClientError::Api { status, .. } if status.as_u16() == 503)
+                );
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

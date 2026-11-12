@@ -229,6 +229,8 @@ pub enum EdgeDispatchDeliveryError {
     PayloadConflict,
     #[error("edge dispatch service is not configured")]
     Unconfigured,
+    #[error("edge dispatch database failure: {0}")]
+    Database(#[source] sqlx::Error),
     #[error("{0}")]
     Unavailable(String),
 }
@@ -1657,7 +1659,7 @@ impl DatabaseEdgeDispatchService {
             .bind(edge_agent_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
+            .map_err(EdgeDispatchDeliveryError::Database)?;
         let updated = n.rows_affected() > 0;
         // A reconnect may replay a result whose first delivery committed but
         // whose ACK was lost. MatrixOne's JSON column may normalize object key
@@ -1680,21 +1682,19 @@ impl DatabaseEdgeDispatchService {
             .bind(edge_agent_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
+            .map_err(EdgeDispatchDeliveryError::Database)?;
             match row {
                 None => false,
                 Some(row) => {
-                    let status = row.try_get::<String, _>("status").map_err(|error| {
-                        format!("edge_dispatch replay status decode failed: {error}")
-                    })?;
+                    let status = row
+                        .try_get::<String, _>("status")
+                        .map_err(EdgeDispatchDeliveryError::Database)?;
                     if status != "completed" {
                         false
                     } else {
                         let body = row
                             .try_get::<Option<String>, _>("result_json")
-                            .map_err(|error| {
-                                format!("edge_dispatch replay result_json decode failed: {error}")
-                            })?
+                            .map_err(EdgeDispatchDeliveryError::Database)?
                             .ok_or_else(|| {
                                 "edge_dispatch completed replay row is missing result_json"
                                     .to_string()
@@ -2372,6 +2372,20 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn closed_dispatch_pool_reports_database_delivery_error() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://localhost/test")
+            .unwrap();
+        pool.close().await;
+        let dispatch = DatabaseEdgeDispatchService::new(pool);
+        let identity = EdgeDispatchIdentity::new("user", "session", "run", "turn", "request");
+        assert!(matches!(
+            dispatch.deliver_result(&identity, "edge", "{}").await,
+            Err(EdgeDispatchDeliveryError::Database(sqlx::Error::PoolClosed))
+        ));
+    }
 
     fn parse_dispatch_payload(json: &str) -> serde_json::Value {
         serde_json::from_str(json).expect("valid dispatch fixture")

@@ -31,6 +31,27 @@ use astra_turn_core::edge_ledger::{
 /// report them again on the next heartbeat cycle.
 const MAX_LAST_SEEN_REQUEST_IDS: usize = 256;
 
+fn dispatch_delivery_failure_response(
+    error: &astra_services::multi_agent::EdgeDispatchDeliveryError,
+    detail: &'static str,
+) -> (
+    axum::http::StatusCode,
+    axum::Json<astra_core::ErrorResponse>,
+) {
+    if matches!(
+        error,
+        astra_services::multi_agent::EdgeDispatchDeliveryError::Database(_)
+    ) {
+        astra_core::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            detail,
+            astra_core::ErrorKind::DatabaseError.as_str(),
+        )
+    } else {
+        error_response(StatusCode::SERVICE_UNAVAILABLE, detail)
+    }
+}
+
 fn recorded_approval_conflict_response(
     request_id: &str,
     run_id: &str,
@@ -440,9 +461,9 @@ pub(crate) async fn post_tool_result_handler(
                     LedgerInsertError::DuplicateKey,
                 ));
             }
-            Err(_) => {
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+            Err(error) => {
+                return Err(dispatch_delivery_failure_response(
+                    &error,
                     "Cannot retain the late tool result",
                 ));
             }
@@ -495,8 +516,8 @@ pub(crate) async fn post_tool_result_handler(
                 error = %e,
                 "Edge: failed to cross-pod deliver tool result"
             );
-            return Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
+            return Err(dispatch_delivery_failure_response(
+                &e,
                 "Cannot retain the tool result; retry the callback",
             ));
         }
@@ -4620,17 +4641,24 @@ mod edge_callback_insert_tests {
     async fn local_waiter_is_not_released_when_durable_delivery_is_uncertain_or_conflicts() {
         use astra_services::multi_agent::EdgeDispatchDeliveryError;
 
-        let failures: [(fn() -> EdgeDispatchDeliveryError, StatusCode); 2] = [
+        let failures: [(fn() -> EdgeDispatchDeliveryError, StatusCode, Option<&str>); 3] = [
             (
                 || EdgeDispatchDeliveryError::PayloadConflict,
                 StatusCode::CONFLICT,
+                Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE),
             ),
             (
                 || EdgeDispatchDeliveryError::Unavailable("lost acknowledgement".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
+                None,
+            ),
+            (
+                || EdgeDispatchDeliveryError::Database(sqlx::Error::PoolClosed),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(astra_core::ErrorKind::DatabaseError.as_str()),
             ),
         ];
-        for (failure, status) in failures {
+        for (failure, status, code) in failures {
             let lifecycle = Arc::new(
                 ApprovalTargetRunLifecycle::new("run-durable", "sess-durable")
                     .with_running_edge_wait(),
@@ -4680,6 +4708,7 @@ mod edge_callback_insert_tests {
             .await
             .expect_err("an uncertain or conflicting durable receipt cannot release a waiter");
             assert_eq!(error.0, status);
+            assert_eq!(error.1.0.error_code.as_deref(), code);
             assert!(state.edge_callback_ledger.lock().await.is_empty());
             assert!(astra_turn_core::edge_ledger::ledger_entry_is_expected(
                 &state.edge_callback_ledger,

@@ -207,8 +207,11 @@ fn native_interaction_error(
         E::Http(error) if error.is_timeout() => return D::Timeout,
         E::Http(error) if error.is_decode() => "protocol",
         E::Http(_) => "network",
-        E::InvalidAuthHeader | E::CallbackOwnerUnconfirmed => "authentication",
-        E::CallbackTaskFailed(_) => "protocol",
+        E::InvalidAuthHeader
+        | E::CallbackOwnerUnconfirmed
+        | E::CallbackAuthRefreshUnconfirmed(_)
+        | E::CallbackRetryAuthFailed { .. } => "authentication",
+        E::CallbackTaskFailed(_) | E::CallbackBookkeepingFailed(_) => "protocol",
         E::CallbackRetryCancelled => return D::Cancelled,
         E::Api { status, .. } => {
             let category = match status.as_u16() {

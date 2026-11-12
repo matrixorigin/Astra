@@ -1080,8 +1080,11 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
         | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
         | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+        | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+        | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
         | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
         | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+        | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
         | astra_thin_client::ThinClientError::CallbackRetryCancelled
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
         | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)

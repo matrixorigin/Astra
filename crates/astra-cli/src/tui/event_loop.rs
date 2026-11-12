@@ -4061,8 +4061,11 @@ impl GuidanceSubmissionError {
             // ambiguity and reconcile by intent_id.
             astra_thin_client::ThinClientError::Http(_)
             | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+            | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+            | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
             | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
             | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+            | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
             | astra_thin_client::ThinClientError::CallbackRetryCancelled
             | astra_thin_client::ThinClientError::SyncOutboxBackpressure { .. }
             | astra_thin_client::ThinClientError::Api { .. }

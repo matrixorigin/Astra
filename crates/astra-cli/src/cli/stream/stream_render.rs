@@ -1459,17 +1459,11 @@ fn is_edge_auth_failure(e: &astra_thin_client::ThinClientError) -> bool {
     matches!(
         e,
         astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+            | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
     ) || matches!(
         e,
         astra_thin_client::ThinClientError::Api { status, .. } if status.as_u16() == 401
     )
-}
-
-fn apply_edge_auth_failure_result(accum: &mut ChatTurnSseAccum, auth_failure: bool) {
-    if auth_failure {
-        accum.error_message = Some(EDGE_AUTH_FAILURE_MESSAGE.to_string());
-        accum.error_kind = Some(astra_core::ErrorKind::Auth);
-    }
 }
 
 fn apply_edge_callback_failure_result(
@@ -1477,18 +1471,22 @@ fn apply_edge_callback_failure_result(
     callback_failure: Option<EdgeCallbackFailure>,
 ) {
     if let Some(failure) = callback_failure {
-        accum.error_message = Some(failure.message);
-        accum.error_kind = Some(failure.kind);
-    }
-}
-
-fn apply_request_session_lease_failure_result(
-    accum: &mut ChatTurnSseAccum,
-    failure: Option<crate::cli::session::session_execution_lease::RequestSessionLeaseFailure>,
-) {
-    if let Some(failure) = failure {
-        accum.error_message = Some(failure.message);
-        accum.error_kind = Some(failure.kind);
+        let preserve_existing_kind = accum
+            .error_kind
+            .is_some_and(|kind| kind != astra_core::ErrorKind::Cancelled)
+            || accum.has_authoritative_failed_terminal()
+            || accum.has_authoritative_interrupted_terminal();
+        if preserve_existing_kind {
+            if let Some(message) = accum.error_message.as_mut() {
+                message.push('\n');
+                message.push_str(&failure.message);
+            } else {
+                accum.error_message = Some(failure.message);
+            }
+        } else {
+            accum.error_message = Some(failure.message);
+            accum.error_kind = Some(failure.kind);
+        }
     }
 }
 
@@ -1509,12 +1507,24 @@ pub(crate) fn edge_callback_detach_message(
 }
 
 fn edge_callback_error_details(error: &astra_thin_client::ThinClientError) -> String {
-    match error {
+    let details = match error {
         astra_thin_client::ThinClientError::Api { status, body } => {
             crate::cli::cli_config::cli_utils::read_api_error(status.as_u16(), body)
         }
+        astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(source) => format!(
+            "{}; credential refresh did not settle before the callback stopped waiting and may still complete",
+            edge_callback_error_details(source)
+        ),
         _ => error.to_string(),
-    }
+    };
+    // API diagnostics may be truncated mid-token; use the conservative
+    // projection that also redacts short and incomplete credential prefixes.
+    astra_text_utils::credential_redaction::redact_credentials_for_display_streaming(
+        &details,
+        usize::MAX,
+    )
+    .expect("unbounded callback diagnostic projection")
+    .0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1578,6 +1588,9 @@ fn durable_allow_was_acknowledged(result: &Result<(), PostApprovalError>) -> boo
 // Both callback handlers route 401 through mark_edge_auth_failure before this classifier.
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
+        astra_thin_client::ThinClientError::CallbackRetryAuthFailed { previous, .. } => {
+            edge_callback_error_kind(previous)
+        }
         astra_thin_client::ThinClientError::Api { status, body }
             if *status == reqwest::StatusCode::CONFLICT
                 && serde_json::from_str::<Value>(body).is_ok_and(|value| {
@@ -1601,6 +1614,7 @@ fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra
         error if error.is_transport() => astra_core::ErrorKind::Unknown,
         astra_thin_client::ThinClientError::CallbackDeadlineExpired
         | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+        | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
         | astra_thin_client::ThinClientError::CallbackRetryCancelled => {
             astra_core::ErrorKind::Unknown
         }
@@ -1712,7 +1726,6 @@ enum PostToolResultError {
     AuthRefreshFailed,
     TerminalAuthFailure(String),
     RequestFailed(String),
-    Cancelled,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1777,15 +1790,62 @@ struct EdgeCallbackTarget {
     owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     cancel: Option<tokio_util::sync::CancellationToken>,
     status_tx: Option<chat_stream::StreamEventTx>,
+    status_reported: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-type ParallelCallbackResult = (
-    String,
-    Option<(
-        Result<Value, astra_thin_client::ThinClientError>,
-        Option<String>,
-    )>,
+type ParallelCallbackOutcome = (
+    Result<Value, astra_thin_client::ThinClientError>,
+    Option<String>,
 );
+type ParallelCallbackResult = (String, ParallelCallbackOutcome, String);
+
+async fn settle_parallel_callback<F, A>(delivery: F, acknowledge: A) -> ParallelCallbackOutcome
+where
+    F: Future<Output = Option<ParallelCallbackOutcome>>,
+    A: FnOnce(),
+{
+    let result = match AssertUnwindSafe(delivery).catch_unwind().await {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            return (
+                Err(astra_thin_client::ThinClientError::CallbackTaskFailed(
+                    "callback did not settle after interruption; server acknowledgement is unknown"
+                        .into(),
+                )),
+                None,
+            );
+        }
+        Err(payload) => {
+            return (
+                Err(astra_thin_client::ThinClientError::CallbackTaskFailed(
+                    format!(
+                        "callback panicked before acknowledgement; delivery outcome is unknown: {}",
+                        panic_payload_summary(payload.as_ref())
+                    ),
+                )),
+                None,
+            );
+        }
+    };
+    if result.0.is_ok()
+        && let Err(error) = acknowledge_callback(acknowledge)
+    {
+        return (Err(error), result.1);
+    }
+    result
+}
+
+fn acknowledge_callback(
+    acknowledge: impl FnOnce(),
+) -> Result<(), astra_thin_client::ThinClientError> {
+    std::panic::catch_unwind(AssertUnwindSafe(acknowledge)).map_err(|payload| {
+        astra_thin_client::ThinClientError::CallbackBookkeepingFailed(panic_payload_summary(
+            payload.as_ref(),
+        ))
+    })
+}
+
+type ParallelCallbackFailures = Vec<(String, String, astra_thin_client::ThinClientError)>;
 
 impl EdgeCallbackTarget {
     async fn bound_token(
@@ -1834,13 +1894,18 @@ impl EdgeCallbackTarget {
     ) {
         let target = self.clone();
         tasks.spawn(async move {
-            let result =
-                settle_after_cancel(target.post(&body, deadline), target.cancel.as_ref()).await;
-            if matches!(&result, Some((Ok(_), _))) {
-                executor.acknowledge_delivered_task_result(&tool, body.tool_result_fields.as_ref());
-                crate::cli::edge_lifecycle::record_completed_request(body.request_id);
-            }
-            (body.run_id, result)
+            let run_id = body.run_id.clone();
+            let request_id = body.request_id.clone();
+            let result = settle_parallel_callback(
+                settle_after_cancel(target.post(&body, deadline), target.cancel.as_ref()),
+                || {
+                    crate::cli::edge_lifecycle::record_completed_request(body.request_id.clone());
+                    executor
+                        .acknowledge_delivered_task_result(&tool, body.tool_result_fields.as_ref());
+                },
+            )
+            .await;
+            (run_id, result, request_id)
         });
     }
 
@@ -1864,18 +1929,42 @@ impl EdgeCallbackTarget {
             },
         );
         tokio::pin!(post);
-        if let Some(status_tx) = &self.status_tx {
+        if self.status_tx.is_some() {
             tokio::select! {
                 result = &mut post => result,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                    let _ = status_tx.try_send(chat_stream::StreamEvent::StatusLine(
-                        "Waiting for the server to confirm the tool result…".into(),
-                    ));
+                    self.report_wait_status();
                     post.await
                 }
             }
         } else {
             post.await
+        }
+    }
+
+    fn report_wait_status(&self) {
+        let Some(status_tx) = &self.status_tx else {
+            return;
+        };
+        let claimed = self.status_reported.as_ref().is_none_or(|reported| {
+            reported
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        });
+        if claimed
+            && status_tx
+                .try_send(chat_stream::StreamEvent::StatusLine(
+                    "Waiting for the server to confirm the tool result…".into(),
+                ))
+                .is_err()
+            && let Some(reported) = &self.status_reported
+        {
+            reported.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1935,12 +2024,30 @@ impl EdgeCallbackTarget {
                 None,
             );
         }
-        let token = match tokio::time::timeout_at(
+        let refresh = tokio::time::timeout_at(
             deadline,
             session_runtime::owner_access_token(&self.api, owner, Some(&token)),
-        )
-        .await
-        {
+        );
+        // Credential owners settle an already-started rotation independently.
+        // Stop waiting on stream cancellation while retaining the observed 401.
+        let refreshed = if let Some(cancel) = self.cancel.as_ref() {
+            tokio::select! {
+                biased;
+                refreshed = refresh => refreshed,
+                _ = cancel.cancelled() => {
+                    let Err(error) = result else {
+                        unreachable!("refresh follows an observed 401");
+                    };
+                    return (
+                        Err(astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(Box::new(error))),
+                        updated_token,
+                    );
+                },
+            }
+        } else {
+            refresh.await
+        };
+        let token = match refreshed {
             Ok(Some(token)) if owner.is_current() => token,
             Ok(_) if !owner.is_current() => {
                 return (
@@ -1949,9 +2056,17 @@ impl EdgeCallbackTarget {
                 );
             }
             Ok(_) => return (result, updated_token),
+            // Preserve the observed 401 and the unsettled refresh separately.
             Err(_) => {
+                let Err(error) = result else {
+                    unreachable!("refresh follows an observed 401");
+                };
                 return (
-                    Err(astra_thin_client::ThinClientError::CallbackDeadlineExpired),
+                    Err(
+                        astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(
+                            Box::new(error),
+                        ),
+                    ),
                     None,
                 );
             }
@@ -1963,8 +2078,16 @@ impl EdgeCallbackTarget {
         {
             return (result, Some(token));
         }
-        let result = self.post_with_token(body, deadline, &token, true).await;
-        (result, Some(token))
+        let retry = self.post_with_token(body, deadline, &token, true).await;
+        if matches!(
+            &retry,
+            Err(astra_thin_client::ThinClientError::CallbackRetryCancelled
+                | astra_thin_client::ThinClientError::CallbackDeadlineExpired)
+        ) {
+            // No retry was submitted; retain the response already observed.
+            return (result, Some(token));
+        }
+        (retry, Some(token))
     }
 }
 
@@ -2146,14 +2269,19 @@ impl<'a> CliSseStreamHost<'a> {
             } else {
                 "because the callback response could not be validated"
             };
-            self.callback_failure = Some(EdgeCallbackFailure {
-                message: edge_callback_detach_message(
+            let message = if matches!(
+                error,
+                astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
+            ) {
+                edge_callback_error_details(error)
+            } else {
+                edge_callback_detach_message(
                     operation,
                     delivery,
                     &edge_callback_error_details(error),
-                ),
-                kind,
-            });
+                )
+            };
+            self.callback_failure = Some(EdgeCallbackFailure { message, kind });
             self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
         }
         if let Some(token) = self.cancel_token {
@@ -2165,20 +2293,91 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         run_id: &str,
         e: &astra_thin_client::ThinClientError,
-    ) -> bool {
+    ) {
         if is_edge_auth_failure(e) {
             self.mark_edge_auth_failure(run_id);
-            true
-        } else if !self.render_policy.suppress_tool_ui() {
+            return;
+        }
+        if !self.render_policy.suppress_tool_ui() {
             eprintln!(
                 "{}",
                 edge_sse_post_tool_result_fail_line(edge_callback_error_details(e)).yellow()
             );
-            self.mark_edge_callback_failure("tool-result", run_id, e);
-            false
+        }
+        self.mark_edge_callback_failure("tool-result", run_id, e);
+    }
+
+    fn record_tool_result_callback_failures(
+        &mut self,
+        failures: &[(String, String, astra_thin_client::ThinClientError)],
+    ) {
+        let Some(primary) = failures
+            .iter()
+            .find(|(_, _, error)| is_edge_auth_failure(error))
+            .or_else(|| {
+                failures.iter().find(|(_, _, error)| {
+                    edge_callback_error_kind(error) == astra_core::ErrorKind::ContractViolation
+                })
+            })
+            .or_else(|| {
+                failures.iter().find(|(_, _, error)| {
+                    edge_callback_error_kind(error) == astra_core::ErrorKind::DatabaseError
+                })
+            })
+            .or_else(|| failures.first())
+        else {
+            return;
+        };
+        let auth_failure = is_edge_auth_failure(&primary.2);
+        let kind = if auth_failure {
+            astra_core::ErrorKind::Auth
         } else {
-            self.mark_edge_callback_failure("tool-result", run_id, e);
-            false
+            edge_callback_error_kind(&primary.2)
+        };
+        self.handle_post_tool_result_error(&primary.0, &primary.2);
+        let failure = self
+            .callback_failure
+            .get_or_insert_with(|| EdgeCallbackFailure {
+                message: EDGE_AUTH_FAILURE_MESSAGE.to_string(),
+                kind: astra_core::ErrorKind::Auth,
+            });
+        let priority = |kind| match kind {
+            astra_core::ErrorKind::Auth => 3,
+            astra_core::ErrorKind::ContractViolation => 2,
+            astra_core::ErrorKind::DatabaseError => 1,
+            _ => 0,
+        };
+        if priority(kind) > priority(failure.kind) {
+            failure.kind = kind;
+            if auth_failure {
+                failure
+                    .message
+                    .insert_str(0, &format!("{}\n", EDGE_AUTH_FAILURE_MESSAGE));
+            }
+            if !primary.0.trim().is_empty() {
+                self.callback_failure_run_id = Some(primary.0.clone());
+            }
+        }
+        failure.message.push_str("\nTool-result callback issues:");
+        for (run_id, request_id, error) in failures {
+            let safe_run =
+                astra_text_utils::credential_redaction::redact_credentials_for_display_streaming(
+                    run_id,
+                    usize::MAX,
+                )
+                .expect("unbounded callback identity projection")
+                .0;
+            let safe_request =
+                astra_text_utils::credential_redaction::redact_credentials_for_display_streaming(
+                    request_id,
+                    usize::MAX,
+                )
+                .expect("unbounded callback identity projection")
+                .0;
+            let details = edge_callback_error_details(error);
+            failure.message.push_str(&format!(
+                "\nrun={safe_run:?}, request={safe_request:?}: {details}"
+            ));
         }
     }
 
@@ -2292,9 +2491,31 @@ impl<'a> CliSseStreamHost<'a> {
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
         let cancel = self.cancel_token.cloned();
-        settle_after_cancel(self.post_tool_result_inner(body), cancel.as_ref())
-            .await
-            .unwrap_or(Err(PostToolResultError::Cancelled))
+        let outcome = AssertUnwindSafe(settle_after_cancel(
+            self.post_tool_result_inner(body),
+            cancel.as_ref(),
+        ))
+        .catch_unwind()
+        .await;
+        let reason = match outcome {
+            Ok(Some(result)) => return result,
+            Ok(None) => {
+                "callback did not settle after interruption; server acknowledgement is unknown"
+                    .into()
+            }
+            Err(payload) => format!(
+                "callback panicked before acknowledgement; delivery outcome is unknown: {}",
+                panic_payload_summary(payload.as_ref()),
+            ),
+        };
+        let error = astra_thin_client::ThinClientError::CallbackTaskFailed(reason);
+        let details = edge_callback_error_details(&error);
+        self.record_tool_result_callback_failures(&[(
+            body.run_id.clone(),
+            body.request_id.clone(),
+            error,
+        )]);
+        Err(PostToolResultError::RequestFailed(details))
     }
 
     async fn post_tool_result_inner(
@@ -2302,7 +2523,6 @@ impl<'a> CliSseStreamHost<'a> {
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
         let deadline = self.tool_result_delivery_deadline(&body.request_id);
-        let cancel = self.cancel_token.cloned();
         // Detach any inherited bearer provider so the explicitly admitted owner
         // token is the only credential source for owned callback posts.
         let api = self.api.clone().without_bearer_provider();
@@ -2313,6 +2533,7 @@ impl<'a> CliSseStreamHost<'a> {
             owner: self.owner_auth_snapshot.clone(),
             cancel: self.cancel_token.cloned(),
             status_tx: self.stream_event_tx.clone(),
+            status_reported: None,
         }
         .post(body, deadline)
         .await;
@@ -2325,24 +2546,26 @@ impl<'a> CliSseStreamHost<'a> {
         {
             self.token = token;
         }
-        if result.is_err() && cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
-            return Err(PostToolResultError::Cancelled);
-        }
         match result {
             Ok(_) => Ok(()),
-            Err(e) => {
-                if self.handle_post_tool_result_error(&body.run_id, &e) {
-                    if refreshed {
-                        Err(PostToolResultError::TerminalAuthFailure(
-                            edge_callback_error_details(&e),
-                        ))
-                    } else {
-                        Err(PostToolResultError::AuthRefreshFailed)
-                    }
+            Err(error) => {
+                let auth_failure = is_edge_auth_failure(&error);
+                let refresh_unconfirmed = matches!(
+                    &error,
+                    astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+                );
+                let details = edge_callback_error_details(&error);
+                self.record_tool_result_callback_failures(&[(
+                    body.run_id.clone(),
+                    body.request_id.clone(),
+                    error,
+                )]);
+                if auth_failure && (refreshed || refresh_unconfirmed) {
+                    Err(PostToolResultError::TerminalAuthFailure(details))
+                } else if auth_failure {
+                    Err(PostToolResultError::AuthRefreshFailed)
                 } else {
-                    Err(PostToolResultError::RequestFailed(
-                        edge_callback_error_details(&e),
-                    ))
+                    Err(PostToolResultError::RequestFailed(details))
                 }
             }
         }
@@ -2355,7 +2578,6 @@ impl<'a> CliSseStreamHost<'a> {
         req: &ToolBatchRequest,
         outcome: &mut crate::edge_tools::ToolExecutionOutcome,
         duration_ms: u64,
-        report_status: bool,
     ) {
         let fields = Self::tool_result_fields_with_cli_runtime(
             &self.executor,
@@ -2374,10 +2596,6 @@ impl<'a> CliSseStreamHost<'a> {
             return;
         };
         let deadline = self.tool_result_delivery_deadline(&body.request_id);
-        let mut target = target.clone();
-        if !report_status {
-            target.status_tx = None;
-        }
         target.spawn_result(
             tasks,
             Arc::clone(&self.executor),
@@ -2391,10 +2609,10 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         result: Result<ParallelCallbackResult, tokio::task::JoinError>,
         original_token: &str,
-        failure: &mut Option<(String, astra_thin_client::ThinClientError)>,
+        failures: &mut ParallelCallbackFailures,
     ) {
         match result {
-            Ok((run_id, Some((result, refreshed_token)))) => {
+            Ok((run_id, (result, refreshed_token), request_id)) => {
                 if let Some(refreshed_token) = refreshed_token
                     && self.token == original_token
                     && self
@@ -2404,20 +2622,17 @@ impl<'a> CliSseStreamHost<'a> {
                 {
                     self.token = refreshed_token;
                 }
-                if let Err(error) = result
-                    && failure.is_none()
-                {
-                    *failure = Some((run_id, error));
+                if let Err(error) = result {
+                    failures.push((run_id, request_id, error));
                 }
             }
-            Ok((_, None)) => {}
-            Err(error) if failure.is_none() => {
-                *failure = Some((
+            Err(error) => {
+                failures.push((
+                    String::new(),
                     String::new(),
                     astra_thin_client::ThinClientError::CallbackTaskFailed(error.to_string()),
                 ));
             }
-            Err(_) => {}
         }
     }
 
@@ -2425,10 +2640,10 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         tasks: &mut tokio::task::JoinSet<ParallelCallbackResult>,
         original_token: &str,
-        failure: &mut Option<(String, astra_thin_client::ThinClientError)>,
+        failures: &mut ParallelCallbackFailures,
     ) {
         while let Some(result) = tasks.try_join_next() {
-            self.observe_parallel_callback(result, original_token, failure);
+            self.observe_parallel_callback(result, original_token, failures);
         }
     }
 
@@ -2438,8 +2653,19 @@ impl<'a> CliSseStreamHost<'a> {
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
         self.post_tool_result_with_auth_retry(body).await?;
-        self.executor
-            .acknowledge_delivered_task_result(tool, body.tool_result_fields.as_ref());
+        if let Err(error) = acknowledge_callback(|| {
+            crate::cli::edge_lifecycle::record_completed_request(body.request_id.clone());
+            self.executor
+                .acknowledge_delivered_task_result(tool, body.tool_result_fields.as_ref());
+        }) {
+            let details = edge_callback_error_details(&error);
+            self.record_tool_result_callback_failures(&[(
+                body.run_id.clone(),
+                body.request_id.clone(),
+                error,
+            )]);
+            return Err(PostToolResultError::RequestFailed(details));
+        }
         Ok(())
     }
 
@@ -2803,10 +3029,7 @@ impl<'a> CliSseStreamHost<'a> {
             duration_ms,
             Some(tool_result_fields),
         ) {
-            // ── Reconnection dedup: only record when server acked the result ──
-            if self.deliver_tool_result(tool, &body).await.is_ok() {
-                crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
-            }
+            let _ = self.deliver_tool_result(tool, &body).await;
         } else {
             tracing::error!(
                 request_id,
@@ -5813,10 +6036,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             duration_ms,
             Some(tool_result_fields),
         ) {
-            // ── Reconnection dedup: only record when server acked the result ──
-            if self.deliver_tool_result(tool, &body).await.is_ok() {
-                crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
-            }
+            let _ = self.deliver_tool_result(tool, &body).await;
         } else {
             tracing::error!(
                 request_id,
@@ -6394,9 +6614,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             owner: self.owner_auth_snapshot.clone(),
             cancel: self.cancel_token.cloned(),
             status_tx: self.stream_event_tx.clone(),
+            status_reported: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         };
         let mut callback_tasks = tokio::task::JoinSet::new();
-        let mut callback_failure = None;
+        let mut callback_failure = ParallelCallbackFailures::new();
         // A sandbox denial may need an approval after the other tools settle.
         // Reuse each invocation's cancellation token to avoid holding a denied
         // result past its deadline while another execution is still running.
@@ -6419,7 +6640,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
                         self.spawn_parallel_tool_result(
                             &mut callback_tasks, &callback_target, conc_reqs[pos].1,
-                            outcome, *duration_ms, pos == 0,
+                            outcome, *duration_ms,
                         );
                     }
                 }
@@ -6437,7 +6658,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         }
                         self.spawn_parallel_tool_result(
                             &mut callback_tasks, &callback_target, conc_reqs[pos].1,
-                            &mut outcome, duration_ms, pos == 0,
+                            &mut outcome, duration_ms,
                         );
                     }
                     output_slots[pos] = Some((outcome, duration_ms));
@@ -6503,7 +6724,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     &callback_target.token,
                     &mut callback_failure,
                 );
-                if callback_failure.is_some() {
+                if !callback_failure.is_empty() {
                     outputs[pos].0.output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
@@ -6524,7 +6745,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     &callback_target.token,
                     &mut callback_failure,
                 );
-                if callback_failure.is_some() {
+                if !callback_failure.is_empty() {
                     outputs[pos].0.output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
@@ -6609,14 +6830,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                         note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
                                                         self.spawn_parallel_tool_result(
                                                             &mut callback_tasks, &callback_target, conc_reqs[expired_pos].1,
-                                                            outcome, *duration_ms, expired_pos == 0,
+                                                            outcome, *duration_ms,
                                                         );
                                                     }
                                                 }
                                                 Some(result) = callback_tasks.join_next(), if !callback_tasks.is_empty() => {
                                                     let failed = matches!(
                                                         &result,
-                                                        Ok((_, Some((Err(_), _)))) | Err(_)
+                                                        Ok((_, (Err(_), _), _)) | Err(_)
                                                     );
                                                     completed.push(result);
                                                     if failed {
@@ -6670,7 +6891,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
                                 );
                                 outputs[pos].0.is_error = true;
-                            } else if callback_failure.is_some() {
+                            } else if !callback_failure.is_empty() {
                                 outputs[pos].0.output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                                 );
@@ -6706,7 +6927,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                             response.is_approved()
                                 && owner_verified
-                                && callback_failure.is_none()
+                                && callback_failure.is_empty()
                                 && self.stream_observer_error().is_none()
                         } else {
                             // No approval sink (headless / sub-run): fail
@@ -6758,7 +6979,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     &callback_target.token,
                     &mut callback_failure,
                 );
-                if callback_failure.is_some() {
+                if !callback_failure.is_empty() {
                     outputs[pos].0.output = format!(
                         "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                     );
@@ -6798,7 +7019,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 note_sandbox_retry_unavailable(outcome, self.cancel_token.is_some_and(|token| token.is_cancelled()));
                                 self.spawn_parallel_tool_result(
                                     &mut callback_tasks, &callback_target, conc_reqs[expired_pos].1,
-                                    outcome, *duration_ms, expired_pos == 0,
+                                    outcome, *duration_ms,
                                 );
                             }
                         }
@@ -6815,7 +7036,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 req,
                 outcome,
                 *duration_ms,
-                pos == 0,
             );
         }
 
@@ -6916,13 +7136,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         while let Some(result) = callback_tasks.join_next().await {
             self.observe_parallel_callback(result, &callback_target.token, &mut callback_failure);
         }
-        if let Some((run_id, error)) = callback_failure
-            && !self
-                .cancel_token
-                .is_some_and(|cancel| cancel.is_cancelled())
-        {
-            self.handle_post_tool_result_error(&run_id, &error);
-        }
+        self.record_tool_result_callback_failures(&callback_failure);
 
         // Clear batch progress when done.
         self.render.tool_batch_progress = None;
@@ -6945,10 +7159,12 @@ pub(crate) struct TurnResult {
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
     pub(crate) refreshed_token: Option<String>,
-    /// A server-requested edge callback exhausted its bounded identical
-    /// retry. Closing this local stream does not establish the server run's
-    /// terminal state or authorize a user cancellation.
-    pub(crate) callback_delivery_failed: bool,
+    /// Callback or session-lease failure observed by this physical stream.
+    /// Closing the stream does not establish the server run's terminal state
+    /// or authorize a user cancellation.
+    pub(crate) delivery_failure: Option<astra_core::ClassifiedError>,
+    /// Callback category remains separate when an independent lease failure is primary.
+    pub(crate) callback_error_kind: Option<astra_core::ErrorKind>,
     /// Exact durable callback owner when supplied by the producer. This is
     /// authoritative over the consuming stream's run identity.
     pub(crate) callback_failure_run_id: Option<String>,
@@ -6987,7 +7203,8 @@ impl TurnResult {
             ttft_ms: None,
             edge_tool_round: Vec::new(),
             refreshed_token: None,
-            callback_delivery_failed: false,
+            delivery_failure: None,
+            callback_error_kind: None,
             callback_failure_run_id: None,
             output_transport_failure: None,
             pending_reliable_stream_event: None,
@@ -8780,17 +8997,38 @@ pub(crate) async fn consume_turn_sse(
             None,
         )
     };
-    apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
     let request_session_lease_failed = request_session_lease_failure.is_some();
-    let callback_delivery_failed =
-        auth_failure || callback_failure.is_some() || request_session_lease_failed;
-    apply_edge_callback_failure_result(&mut sse_result.accum, callback_failure);
-    apply_request_session_lease_failure_result(
+    let callback_failure = callback_failure.or_else(|| {
+        auth_failure.then(|| EdgeCallbackFailure {
+            message: EDGE_AUTH_FAILURE_MESSAGE.to_string(),
+            kind: astra_core::ErrorKind::Auth,
+        })
+    });
+    // Preserve both observations if the lease and callback fail together.
+    let callback_error_kind = callback_failure.as_ref().map(|failure| failure.kind);
+    let delivery_failure = match (request_session_lease_failure, callback_failure) {
+        (Some(lease), Some(callback)) => Some(astra_core::ClassifiedError::new(
+            lease.kind,
+            format!("{}\n{}", lease.message, callback.message),
+        )),
+        (Some(lease), None) => Some(astra_core::ClassifiedError::new(lease.kind, lease.message)),
+        (None, Some(callback)) => Some(astra_core::ClassifiedError::new(
+            callback.kind,
+            callback.message,
+        )),
+        (None, None) => None,
+    };
+    apply_edge_callback_failure_result(
         &mut sse_result.accum,
-        request_session_lease_failure,
+        delivery_failure
+            .as_ref()
+            .map(|failure| EdgeCallbackFailure {
+                message: failure.message.clone(),
+                kind: failure.kind,
+            }),
     );
     if let Some(failure) = observer_failure
-        && !callback_delivery_failed
+        && delivery_failure.is_none()
         && output_transport_failure.is_none()
         && !cancel_token.is_some_and(|token| token.is_cancelled())
         && !sse_result
@@ -8822,7 +9060,8 @@ pub(crate) async fn consume_turn_sse(
         ttft_ms: sse_result.ttft_ms,
         edge_tool_round,
         refreshed_token,
-        callback_delivery_failed,
+        delivery_failure,
+        callback_error_kind,
         callback_failure_run_id,
         output_transport_failure,
         pending_reliable_stream_event,
@@ -9009,8 +9248,7 @@ mod tests {
         EdgeToolExecResult, PostApprovalError, PostToolResultError, RecordedApprovalDecision,
         RenderPolicy, SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
         ToolOutputSummaryKind, ToolResultIdentity, TurnResult, acquire_tool_permit_or_cancel,
-        append_skill_loaded_marker, apply_edge_auth_failure_result,
-        apply_edge_callback_failure_result, approval_batch_group_key,
+        append_skill_loaded_marker, apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
         approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
@@ -11668,7 +11906,13 @@ mod tests {
             error_message: Some("Cancelled by user".to_string()),
             ..Default::default()
         };
-        apply_edge_auth_failure_result(&mut accum, true);
+        apply_edge_callback_failure_result(
+            &mut accum,
+            Some(EdgeCallbackFailure {
+                message: super::EDGE_AUTH_FAILURE_MESSAGE.into(),
+                kind: astra_core::ErrorKind::Auth,
+            }),
+        );
         let error = accum.error_message.as_deref().unwrap_or_default();
         assert_eq!(error, super::EDGE_AUTH_FAILURE_MESSAGE);
         assert!(!error.contains("Cancelled by user"));
@@ -11679,7 +11923,7 @@ mod tests {
             error_message: Some("Cancelled by user".to_string()),
             ..Default::default()
         };
-        apply_edge_auth_failure_result(&mut accum2, false);
+        apply_edge_callback_failure_result(&mut accum2, None);
         assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
     }
 
@@ -11736,6 +11980,11 @@ mod tests {
             (
                 500,
                 r#"{"error_code":"database_error","detail":"database unavailable"}"#,
+                astra_core::ErrorKind::DatabaseError,
+            ),
+            (
+                503,
+                r#"{"error_code":"database_error","detail":"cannot retain tool result"}"#,
                 astra_core::ErrorKind::DatabaseError,
             ),
             (
@@ -14409,18 +14658,58 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[tokio::test]
-    async fn tool_batch_delivers_sibling_while_callback_is_stalled() {
+    async fn callback_wait_status_can_be_sent_after_a_full_channel_drains() {
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(1);
+        status_tx
+            .try_send(chat_stream::StreamEvent::StatusLine("busy".into()))
+            .unwrap();
+        let target = super::EdgeCallbackTarget {
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            token: "token".into(),
+            executor_id: "edge".into(),
+            owner: None,
+            cancel: None,
+            status_tx: Some(status_tx),
+            status_reported: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
+        };
+        target.report_wait_status();
+        assert!(
+            matches!(status_rx.try_recv(), Ok(chat_stream::StreamEvent::StatusLine(line)) if line == "busy")
+        );
+        target.report_wait_status();
+        target.report_wait_status();
+        assert!(
+            matches!(status_rx.try_recv(), Ok(chat_stream::StreamEvent::StatusLine(line)) if line.contains("Waiting for the server"))
+        );
+        assert!(status_rx.try_recv().is_err());
+    }
+
+    async fn check_stalled_batch_callback(slow_id: &'static str) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
-            .respond_with(|request: &wiremock::Request| {
+            .respond_with(move |request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
-                if body["request_id"] == "callback-1" {
-                    ResponseTemplate::new(403)
-                        .set_body_string("callback denied")
-                        .set_delay(std::time::Duration::from_secs(2))
+                if matches!(slow_id, "both" | "auth_and_denied" | "conflict_and_denied")
+                    || body["request_id"] == slow_id
+                {
+                    let response = if slow_id == "auth_and_denied"
+                        && body["request_id"] == "callback-1"
+                    {
+                        ResponseTemplate::new(401).set_body_string("authentication rejected")
+                    } else if slow_id == "conflict_and_denied" && body["request_id"] == "callback-2"
+                    {
+                        ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                            "error_code": astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE,
+                            "detail": "Rejected Bearer synthetic-secret-1234567890",
+                        }))
+                    } else {
+                        ResponseTemplate::new(403).set_body_string("callback denied")
+                    };
+                    response.set_delay(std::time::Duration::from_millis(2_250))
                 } else {
                     ResponseTemplate::new(200)
                 }
@@ -14433,6 +14722,7 @@ mod tests {
         std::fs::write(temp.path().join("two.txt"), "two").unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -14443,7 +14733,7 @@ mod tests {
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: Some(&cancel),
-                stream_event_tx: None,
+                stream_event_tx: Some(status_tx),
                 stream_event_sink: None,
                 approval_request_tx: None,
                 ask_user_request_tx: None,
@@ -14482,8 +14772,6 @@ mod tests {
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-2".into(),
                     read_only_execution: false,
-                    // This result must be posted before the stalled sibling's
-                    // two-second response, within its own shorter budget.
                     execution_timeout_ms: 500,
                     command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
@@ -14495,7 +14783,34 @@ mod tests {
 
         assert_eq!(results.len(), 2, "tool results remain locally observable");
         assert!(results.iter().all(|result| result.status == "completed"));
-        assert!(host.callback_failure.is_some());
+        let mut waiting_statuses = 0;
+        while let Ok(event) = status_rx.try_recv() {
+            if matches!(event, chat_stream::StreamEvent::StatusLine(ref text)
+                if text == "Waiting for the server to confirm the tool result…")
+            {
+                waiting_statuses += 1;
+            }
+        }
+        assert_eq!(waiting_statuses, 1, "a stalled callback reports one wait");
+        let failure = host
+            .callback_failure
+            .as_ref()
+            .expect("callback failure is retained");
+        if matches!(slow_id, "both" | "auth_and_denied" | "conflict_and_denied") {
+            assert!(failure.message.contains("callback-1"));
+            assert!(failure.message.contains("callback-2"));
+        } else {
+            assert!(failure.message.contains(slow_id));
+        }
+        if slow_id == "auth_and_denied" {
+            assert!(host.auth_failure);
+            assert_eq!(failure.kind, astra_core::ErrorKind::Auth);
+        }
+        if slow_id == "conflict_and_denied" {
+            assert_eq!(failure.kind, astra_core::ErrorKind::ContractViolation);
+            assert!(!failure.message.contains("synthetic-secret-1234567890"));
+            assert!(failure.message.contains("[REDACTED"));
+        }
         assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
         assert!(cancel.is_cancelled());
         let requests = server.received_requests().await.unwrap();
@@ -14510,6 +14825,20 @@ mod tests {
         assert!(requests.iter().any(|request| {
             serde_json::from_slice::<Value>(&request.body).unwrap()["request_id"] == "callback-2"
         }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn tool_batch_delivers_sibling_while_callback_is_stalled() {
+        for slow_id in [
+            "callback-1",
+            "callback-2",
+            "both",
+            "auth_and_denied",
+            "conflict_and_denied",
+        ] {
+            check_stalled_batch_callback(slow_id).await;
+        }
     }
 
     #[cfg(unix)]
@@ -15065,6 +15394,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successive_callback_failures_keep_identity_and_strongest_category() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        for (run, request, status, body, expected) in [
+            (
+                "run-unknown",
+                "req-unknown",
+                403,
+                "{}",
+                astra_core::ErrorKind::Unknown,
+            ),
+            (
+                "run-db",
+                "req-db",
+                503,
+                r#"{"error_code":"database_error"}"#,
+                astra_core::ErrorKind::DatabaseError,
+            ),
+            (
+                "run-conflict",
+                "req-conflict",
+                409,
+                r#"{"error_code":"edge_callback_payload_conflict"}"#,
+                astra_core::ErrorKind::ContractViolation,
+            ),
+            (
+                "run-auth",
+                "req-auth",
+                401,
+                "{}",
+                astra_core::ErrorKind::Auth,
+            ),
+        ] {
+            let error = astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: body.into(),
+            };
+            host.record_tool_result_callback_failures(&[(run.into(), request.into(), error)]);
+            assert_eq!(host.callback_failure.as_ref().unwrap().kind, expected);
+            assert_eq!(host.callback_failure_run_id.as_deref(), Some(run));
+        }
+        let message = &host.callback_failure.as_ref().unwrap().message;
+        for request in ["req-unknown", "req-db", "req-conflict", "req-auth"] {
+            assert!(message.contains(request));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_callback_failure_survives_physical_stream_cancellation() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = arrived.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"request_id":"single"}),
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(403).set_delay(std::time::Duration::from_millis(250))
+            })
+            .with_priority(1)
+            .mount(&fixture.callbacks)
+            .await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let parent = tokio_util::sync::CancellationToken::new();
+        let physical = parent.child_token();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&physical));
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "run-single".into(),
+                turn_chain_id: "turn".into(),
+                request_id: "single".into(),
+                edge_agent_id: "edge-test".into(),
+                status: "completed".into(),
+                output: "result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let result = {
+            let post = host.post_tool_result_with_auth_retry(&body);
+            tokio::pin!(post);
+            tokio::select! {
+                _ = arrived.notified() => physical.cancel(),
+                result = &mut post => panic!("callback must still be in flight: {result:?}"),
+            }
+            post.await
+        };
+        assert!(matches!(result, Err(PostToolResultError::RequestFailed(_))));
+        assert!(!parent.is_cancelled());
+        let failure = host
+            .callback_failure
+            .as_ref()
+            .expect("callback error must survive stream cancellation");
+        assert!(failure.message.contains("run-single"));
+        assert!(failure.message.contains("single"));
+        assert_eq!(failure.kind, astra_core::ErrorKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn stream_break_retains_inflight_callback_failures() {
+        use futures_util::StreamExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let server = MockServer::start().await;
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let stream_break = Arc::new(tokio::sync::Notify::new());
+        let callback_arrived = arrived.clone();
+        let break_signal = stream_break.clone();
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if callback_arrived.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    break_signal.notify_one();
+                }
+                let status = if body["request_id"] == "one" {
+                    401
+                } else {
+                    403
+                };
+                ResponseTemplate::new(status).set_delay(std::time::Duration::from_millis(250))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("one.txt"), "one").unwrap();
+        std::fs::write(workspace.path().join("two.txt"), "two").unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut cache = EdgeToolCache::new(8);
+        let parent = tokio_util::sync::CancellationToken::new();
+        let physical = parent.child_token();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "token",
+                executor_id: "edge",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&physical),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let event = |id, path| {
+            serde_json::json!({
+                "type": "tool_request", "session_id": "session", "run_id": "run", "turn_chain_id": "turn",
+                "request_id": id, "schema_admitted_by_server": true, "execution_timeout_ms": 300000,
+                "command_timeout_cap_ms": 30000, "execution_deadline_unix_ms": 4102444800000u64,
+                "tool": "read_file", "args": {"path": path},
+            })
+        };
+        let wire = format!(
+            "data: {{\"type\":\"session_info\",\"session_id\":\"session\",\"run_id\":\"run\"}}\n\ndata: {}\n\ndata: {}\n\n",
+            event("one", "one.txt"),
+            event("two", "two.txt")
+        );
+        let mut chunks = Box::pin(
+            futures_util::stream::iter(vec![Ok::<Vec<u8>, String>(wire.into_bytes())]).chain(
+                futures_util::stream::once(async move {
+                    stream_break.notified().await;
+                    Err("synthetic stream break".to_string())
+                }),
+            ),
+        );
+        let (_, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(3),
+                Some(&physical),
+                None,
+            ),
+        )
+        .await
+        .expect("in-flight callbacks and stream must settle");
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(physical.is_cancelled());
+        assert!(!parent.is_cancelled());
+        assert!(host.auth_failure);
+        let failure = host
+            .callback_failure
+            .as_ref()
+            .expect("callback failure must survive stream break");
+        assert_eq!(failure.kind, astra_core::ErrorKind::Auth);
+        assert!(failure.message.contains("one"));
+        assert!(failure.message.contains("two"));
+        assert_eq!(arrived.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn callback_task_panic_retains_identity_and_acknowledgement_fact() {
+        #[derive(Debug)]
+        struct PanicBearer;
+        impl astra_thin_client::client::BearerProvider for PanicBearer {
+            fn token(
+                &self,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<String, astra_thin_client::ThinClientError>,
+            > {
+                Box::pin(async { panic!("synthetic credential provider panic") })
+            }
+        }
+        let workspace = tempdir().unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let target = super::EdgeCallbackTarget {
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+                .unwrap()
+                .with_bearer_provider(std::sync::Arc::new(PanicBearer)),
+            token: "token".into(),
+            executor_id: "edge".into(),
+            owner: None,
+            cancel: None,
+            status_tx: None,
+            status_reported: None,
+        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "session".into(),
+                run_id: "child-run".into(),
+                turn_chain_id: "turn".into(),
+                request_id: "child-request".into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "result".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        target.spawn_result(
+            &mut tasks,
+            executor,
+            "read_file".into(),
+            body,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let (run_id, result, request_id) = tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(run_id, "child-run");
+        assert_eq!(request_id, "child-request");
+        let error = result.0.unwrap_err().to_string();
+        assert!(error.contains("before acknowledgement"));
+        assert!(error.contains("outcome is unknown"));
+
+        let after_ack = super::settle_parallel_callback(
+            async { Some((Ok(serde_json::Value::Null), None)) },
+            || panic!("synthetic local bookkeeping panic"),
+        )
+        .await
+        .0
+        .unwrap_err()
+        .to_string();
+        assert!(after_ack.contains("server acknowledged"));
+        assert!(!after_ack.contains("before acknowledgement"));
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        host.record_tool_result_callback_failures(&[(
+            "child-run".into(),
+            "child-request".into(),
+            astra_thin_client::ThinClientError::CallbackBookkeepingFailed("synthetic".into()),
+        )]);
+        let message = &host.callback_failure.as_ref().unwrap().message;
+        assert!(message.contains("server acknowledged"));
+        assert!(!message.contains("unacknowledged"));
+        let interrupted = super::settle_parallel_callback(async { None }, || panic!("no ack"))
+            .await
+            .0
+            .unwrap_err()
+            .to_string();
+        assert!(interrupted.contains("acknowledgement is unknown"));
+    }
+
+    #[tokio::test]
     async fn cancelled_batch_still_attempts_to_deliver_completed_results() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
@@ -15079,6 +15703,7 @@ mod tests {
             owner: None,
             cancel: Some(cancel.clone()),
             status_tx: None,
+            status_reported: None,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut tasks = tokio::task::JoinSet::new();
@@ -15104,7 +15729,7 @@ mod tests {
             );
         }
         while let Some(result) = tasks.join_next().await {
-            assert!(matches!(result.unwrap().1, Some((Ok(_), _))));
+            assert!(matches!(result.unwrap().1, (Ok(_), _)));
         }
         let requests = fixture.callbacks.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -15138,6 +15763,7 @@ mod tests {
             owner: None,
             cancel: Some(cancel.clone()),
             status_tx: None,
+            status_reported: None,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut tasks = tokio::task::JoinSet::new();
@@ -15182,7 +15808,7 @@ mod tests {
             .expect("the sibling must not wait for the retry backoff")
             .unwrap()
             .unwrap();
-        assert!(matches!(first.1, Some((Ok(_), _))));
+        assert!(matches!(first.1, (Ok(_), _)));
         let requests = fixture.callbacks.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
@@ -15194,17 +15820,7 @@ mod tests {
             "two"
         );
         cancel.cancel();
-        assert!(
-            tasks
-                .join_next()
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .unwrap()
-                .0
-                .is_err()
-        );
+        assert!(tasks.join_next().await.unwrap().unwrap().1.0.is_err());
     }
 
     #[serial_test::serial]
@@ -15952,6 +16568,7 @@ mod tests {
             owner: Some(owner.clone()),
             cancel: None,
             status_tx: None,
+            status_reported: None,
         };
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
@@ -16016,6 +16633,7 @@ mod tests {
         edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", false).await;
         edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", true).await;
         edge_tool_result_401_refresh_acknowledges_once(None, "cancel_during_refresh", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "refresh_timeout", false).await;
         for transition in [
             "current_profile",
             "replacement",
@@ -16068,7 +16686,7 @@ mod tests {
         };
         let should_post = matches!(transition, "unchanged" | "current_profile");
         let should_send_initial = should_post
-            || transition == "cancel_during_refresh"
+            || matches!(transition, "cancel_during_refresh" | "refresh_timeout")
             || (!approval && transition == "proactive_refresh_failure");
         let refresh_started = std::sync::Arc::new(tokio::sync::Notify::new());
         let server = MockServer::start().await;
@@ -16087,10 +16705,10 @@ mod tests {
         } else {
             200
         };
-        let refresh_delay = if transition == "cancel_during_refresh" {
-            std::time::Duration::from_secs(1)
-        } else {
-            std::time::Duration::ZERO
+        let refresh_delay = match transition {
+            "cancel_during_refresh" => std::time::Duration::from_secs(3),
+            "refresh_timeout" => std::time::Duration::from_secs(2),
+            _ => std::time::Duration::ZERO,
         };
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
@@ -16203,16 +16821,72 @@ mod tests {
                 _ = refresh_started.notified() => physical_cancel.cancel(),
                 _ = &mut post => panic!("refresh must remain in flight until cancellation"),
             }
-            post.await.is_ok()
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut post)
+                .await
+                .expect("cancellation must preserve the 401 without waiting for refresh")
+                .is_ok()
+        } else if transition == "refresh_timeout" {
+            let target = super::EdgeCallbackTarget {
+                api: api.clone().without_bearer_provider(),
+                token: initial_token.into(),
+                executor_id: "edge-test".into(),
+                owner: host.owner_auth_snapshot.clone(),
+                cancel: Some(physical_cancel.clone()),
+                status_tx: None,
+                status_reported: None,
+            };
+            let (result, _) = target
+                .post(
+                    &body,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await;
+            let error = result.expect_err("refresh exceeds callback deadline");
+            assert!(
+                is_edge_auth_failure(&error),
+                "retain the observed 401: {error:?}"
+            );
+            let details = super::edge_callback_error_details(&error);
+            assert!(details.contains("401"));
+            assert!(details.contains("refresh did not settle"));
+            host.record_tool_result_callback_failures(&[(
+                body.run_id.clone(),
+                body.request_id.clone(),
+                error,
+            )]);
+            let message = &host.callback_failure.as_ref().unwrap().message;
+            assert!(message.contains("req-1"));
+            assert!(message.contains("refresh did not settle"));
+            false
         } else {
             host.post_tool_result_with_auth_retry(&body).await.is_ok()
         };
 
         assert_eq!(posted, should_post);
-        if transition == "cancel_during_refresh" {
+        if matches!(transition, "cancel_during_refresh" | "refresh_timeout") {
+            assert!(host.auth_failure);
+            let message = &host.callback_failure.as_ref().unwrap().message;
+            assert!(message.contains("req-1"));
+            assert!(message.contains("401"));
             assert!(physical_cancel.is_cancelled());
             assert!(!parent_cancel.is_cancelled());
-            assert_eq!(host.token, "fresh-token");
+            // Refresh settlement owns the rotation after this callback stops waiting.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let saved = crate::cli::cli_config::cli_utils::load_credentials();
+                    if saved
+                        .profiles
+                        .get("test")
+                        .and_then(|profile| profile.refresh_token.as_deref())
+                        == Some("fresh-refresh-token")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("refresh settlement must retain ownership");
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
             return;
         }

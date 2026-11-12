@@ -476,7 +476,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 assert!(failure.partial.tool_call_records[0].ok);
             }
             assert!(failure.partial.tool_outcomes.is_none());
-            assert!(failure.partial.failed_run_terminal.is_some());
+            assert!(failure.partial.observed_run_terminal.is_some());
             let sid = "failed-root-projection";
             let mut event = session_journal::JournalEvent::turn_error(
                 Some(sid),
@@ -3204,4 +3204,299 @@ async fn basic_cli_post_catalog_auth_failure_never_authorizes_replay() {
         "this failure occurs after executor creation"
     );
     assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn user_cancel_during_callback_failures_preserves_scoped_evidence() {
+    use crate::cli::turn::local_run_control::LocalRunControl;
+    use futures_util::StreamExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+    let source = temp.path().join("result.txt");
+    std::fs::write(&source, "one\ntwo\n").unwrap();
+    let control = LocalRunControl::shared();
+    let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let event = |id, line| {
+        serde_json::json!({
+            "type":"tool_request", "session_id":"callback-cancel-session", "run_id":"callback-cancel-run",
+            "turn_chain_id":"chain", "request_id":id, "schema_admitted_by_server":true,
+            "execution_timeout_ms":300000, "command_timeout_cap_ms":30000,
+            "execution_deadline_unix_ms":4102444800000u64, "tool":"read_file",
+            "args":{"path":source, "start_line":line, "end_line":line},
+        })
+    };
+    let wire = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+        serde_json::json!({"type":"session_info", "session_id":"callback-cancel-session", "run_id":"callback-cancel-run"}),
+        event("req-one", 1),
+        event("req-two", 2),
+    );
+    let app = Router::new()
+        .route(
+            "/chat/stream",
+            post(move || {
+                let wire = wire.clone();
+                async move {
+                    let chunks =
+                        futures_util::stream::once(async move { Ok::<_, std::io::Error>(wire) })
+                            .chain(futures_util::stream::pending());
+                    (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                }
+            }),
+        )
+        .route(
+            "/tools/result",
+            post({
+                let control = control.clone();
+                let cancel = cancel.clone();
+                let barrier = barrier.clone();
+                let arrived = arrived.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let control = control.clone();
+                    let cancel = cancel.clone();
+                    let barrier = barrier.clone();
+                    let arrived = arrived.clone();
+                    async move {
+                        if arrived.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                            control.request_cancel_for_user();
+                            cancel.cancel();
+                        }
+                        barrier.wait().await;
+                        let status = if body["request_id"] == "req-one" {
+                            axum::http::StatusCode::UNAUTHORIZED
+                        } else {
+                            axum::http::StatusCode::FORBIDDEN
+                        };
+                        (status, Json(serde_json::json!({"error":"callback denied"})))
+                    }
+                }
+            }),
+        );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "inspect the results");
+    let mut pm = PermissionManager::new(true);
+    let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+    params.run_control = Some(control);
+    params.cancel_token = Some(cancel);
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(5), stream_chat_sse(params))
+        .await
+        .expect("cancelled callback work must settle")
+        .unwrap_err();
+    assert_eq!(arrived.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        failure.partial.failure_kind,
+        Some(astra_core::ErrorKind::Cancelled)
+    );
+    assert!(failure.partial.callback_client_detached);
+    assert_eq!(
+        failure.partial.callback_error_kind,
+        Some(astra_core::ErrorKind::Auth)
+    );
+    assert!(failure.error.contains("req-one"), "{}", failure.error);
+    assert!(failure.error.contains("req-two"), "{}", failure.error);
+    let interruption = failure
+        .partial
+        .interruption
+        .expect("user cancellation is recorded")
+        .to_string();
+    assert!(interruption.contains("req-one"));
+    assert!(interruption.contains("req-two"));
+    assert!(interruption.contains("requires_intervention"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn callback_failure_and_authoritative_terminal_are_both_retained() {
+    use astra_turn_core::interruption::{
+        InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+    };
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+
+    for terminal_kind in ["failed", "interrupted", "completed", "malformed"] {
+        let malformed = terminal_kind == "malformed";
+        let interrupted = terminal_kind == "interrupted";
+        let completed = terminal_kind == "completed";
+        let temp = tempfile::tempdir().unwrap();
+        let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+        let source = temp.path().join("result.txt");
+        std::fs::write(&source, "observed result").unwrap();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let request = serde_json::json!({
+            "type":"tool_request", "session_id":"terminal-session", "run_id":"terminal-run",
+            "turn_chain_id":"chain", "request_id":"req-terminal", "schema_admitted_by_server":true,
+            "execution_timeout_ms":300000, "command_timeout_cap_ms":30000,
+            "execution_deadline_unix_ms":4102444800000u64, "tool":"read_file", "args":{"path":source},
+        });
+        let prefix = format!(
+            "data: {}\n\ndata: {request}\n\n",
+            serde_json::json!({
+                "type":"session_info", "session_id":"terminal-session", "run_id":"terminal-run",
+            })
+        );
+        let terminal = if interrupted {
+            let interruption = InterruptionRecord::new(
+                InterruptionKind::ExecutionIncomplete,
+                ResumeAction::ContinueImmediately,
+                InterruptionStateSummary::default(),
+            );
+            serde_json::json!({"type":"run_finished", "run_id":"terminal-run", "owner_generation":1,
+                "status":"failed", "error_code":"execution_incomplete", "error_kind":null,
+                "error":interruption.user_message, "interruption":interruption.to_json()})
+        } else if completed || malformed {
+            serde_json::json!({"type":"run_finished", "run_id":"terminal-run", "owner_generation":1,
+                "status": if malformed { "unrecognized" } else { "completed" }})
+        } else {
+            serde_json::json!({"type":"run_finished", "run_id":"terminal-run", "owner_generation":1,
+                "status":"failed", "error_code":"network", "error_kind":"network", "error":"server network failure"})
+        };
+        let suffix = format!("data: {terminal}\n\n");
+        let app = Router::new()
+            .route(
+                "/chat/stream",
+                post({
+                    let arrived = arrived.clone();
+                    move || {
+                        let prefix = prefix.clone();
+                        let suffix = suffix.clone();
+                        let arrived = arrived.clone();
+                        async move {
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(prefix)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                arrived.notified().await;
+                                Ok::<_, std::io::Error>(suffix)
+                            }))
+                            .chain(futures_util::stream::pending());
+                            (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/tools/result",
+                post({
+                    let arrived = arrived.clone();
+                    move || {
+                        let arrived = arrived.clone();
+                        async move {
+                            arrived.notify_one();
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            (
+                                axum::http::StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({"error":"callback denied"})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "inspect the result");
+        let mut pm = PermissionManager::new(true);
+        let params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        let failure =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream_chat_sse(params))
+                .await
+                .expect("terminal and callback must settle")
+                .expect_err("a failed callback must remain observable with a terminal");
+        assert!(failure.error.contains("req-terminal"), "{}", failure.error);
+        assert!(failure.partial.callback_client_detached);
+        assert_eq!(
+            failure.partial.callback_error_kind,
+            Some(astra_core::ErrorKind::Unknown)
+        );
+        if malformed {
+            assert_eq!(
+                failure.partial.failure_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+            assert!(
+                failure.error.contains("invalid durable run lifecycle"),
+                "{}",
+                failure.error
+            );
+            continue;
+        }
+        let root = failure
+            .partial
+            .observed_run_terminal
+            .as_ref()
+            .expect("the authoritative root terminal is retained");
+        assert_eq!(root.run_id, "terminal-run");
+        if completed {
+            assert_eq!(
+                root.status,
+                astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Completed
+            );
+        } else if !interrupted {
+            assert_eq!(root.error_kind, Some(astra_core::ErrorKind::Network));
+        }
+        let interruption = failure
+            .partial
+            .interruption
+            .as_ref()
+            .expect("unconfirmed callback requires intervention")
+            .to_string();
+        assert!(interruption.contains("req-terminal"));
+        assert!(interruption.contains("requires_intervention"));
+        if completed {
+            assert!(
+                interruption.contains("server run completed"),
+                "{interruption}"
+            );
+            assert!(!interruption.contains("did not complete"), "{interruption}");
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn session_lease_failure_is_not_reported_as_a_callback_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+    let app = Router::new().route(
+        "/chat/stream",
+        post(|| async {
+            (TEST_SSE_HEADERS, format!("data: {}\n\n", serde_json::json!({
+                "type": "session_info", "session_id": "different-session", "run_id": "root-run"
+            })))
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "session identity test");
+    let mut pm = PermissionManager::new(true);
+    let lease = crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
+        Some("original-session"),
+    )
+    .unwrap();
+    let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+    params.request_session_execution_lease = Some(lease.clone());
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(5), stream_chat_sse(params))
+        .await
+        .expect("identity failure must settle")
+        .expect_err("changed session must fail");
+    assert!(lease.failure().is_some());
+    assert!(!failure.partial.callback_client_detached);
+    assert!(failure.partial.callback_error_kind.is_none());
+    assert!(failure.partial.remote_cancel_required);
+    assert!(
+        failure.error.contains("session identity"),
+        "{}",
+        failure.error
+    );
 }

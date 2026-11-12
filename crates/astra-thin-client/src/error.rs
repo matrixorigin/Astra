@@ -40,10 +40,24 @@ pub enum ThinClientError {
     AdmissionDeadlineExpired,
     #[error("tool-result callback delivery deadline expired")]
     CallbackDeadlineExpired,
+    #[error(
+        "credential refresh did not settle before the callback stopped waiting and may still complete; original callback: {0}"
+    )]
+    CallbackAuthRefreshUnconfirmed(#[source] Box<ThinClientError>),
+    #[error(
+        "tool-result retry could not obtain credentials: {auth}; previous callback: {previous}"
+    )]
+    CallbackRetryAuthFailed {
+        previous: Box<ThinClientError>,
+        #[source]
+        auth: Box<ThinClientError>,
+    },
     #[error("the original authenticated owner could not be confirmed before tool-result delivery")]
     CallbackOwnerUnconfirmed,
     #[error("tool-result delivery task failed: {0}")]
     CallbackTaskFailed(String),
+    #[error("server acknowledged the tool result, but local bookkeeping failed: {0}")]
+    CallbackBookkeepingFailed(String),
     #[error("tool-result retry was cancelled before delivery")]
     CallbackRetryCancelled,
     #[error(

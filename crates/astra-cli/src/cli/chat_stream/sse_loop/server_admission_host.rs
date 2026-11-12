@@ -337,13 +337,15 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// reasons `remote_cancel_required` becomes true, so settlement does not
     /// turn a lost callback acknowledgement into a user cancellation.
     pub callback_client_detached: bool,
+    /// The callback's category, independent of a concurrent lease or root failure.
+    pub callback_error_kind: Option<astra_core::ErrorKind>,
     /// Exact durable owner to cancel. Callback failures may name a projected
     /// child; physical-stream failures use the immutable root owner.
     pub remote_cancel_run_id: Option<String>,
     /// Latest immutable physical SSE owner, retained through final-output
     /// delivery and durable cancellation.
     pub last_physical_run_id: Option<String>,
-    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
+    pub observed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
     /// moved into the shared loop.  These facts drive user-facing recovery and
@@ -1223,7 +1225,6 @@ impl CliServerAdmissionHost<'_> {
         self.last_error_code = turn_result.core.error_code.clone();
         self.last_error_metadata = turn_result.core.error_metadata.clone();
         if self.output_transport_failure.is_none()
-            && !turn_result.callback_delivery_failed
             && let Some(output_failure) = turn_result.output_transport_failure.take()
         {
             self.output_transport_failure = Some(output_failure);
@@ -1234,9 +1235,12 @@ impl CliServerAdmissionHost<'_> {
         }
         let unsettled_physical_owner_run_id =
             crate::cli::stream::streaming_types::unsettled_physical_owner_run_id(&turn_result.core);
-        self.callback_client_detached |= turn_result.callback_delivery_failed;
+        self.callback_client_detached |= turn_result.callback_error_kind.is_some();
+        if turn_result.callback_error_kind.is_some() {
+            self.callback_error_kind = turn_result.callback_error_kind;
+        }
         self.remote_cancel_required |=
-            turn_result.callback_delivery_failed || unsettled_physical_owner_run_id.is_some();
+            turn_result.delivery_failure.is_some() || unsettled_physical_owner_run_id.is_some();
         if self.remote_cancel_run_id.is_none() {
             self.remote_cancel_run_id = turn_result
                 .callback_failure_run_id

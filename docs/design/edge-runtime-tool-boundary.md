@@ -128,10 +128,11 @@ owner even if the caller stops waiting. Only a Server acknowledgement marks
 the result delivered. After the receipt window has elapsed, a short best-effort attempt
 may still retain a late result; its acknowledgement does not prove the current
 round consumed it. Unrepeated delivery makes no additional queries. Each
-result in the existing bounded tool batch has an independent callback future,
+result in a tool batch has an independent callback future,
 so retry backoff or a stalled response cannot consume a sibling's delivery
-budget. The tool-execution concurrency limit is unchanged; callback delivery
-does not add a second permit queue.
+budget. The process-wide tool-execution limit is unchanged; it does not bound
+callback futures or their retained payloads. Callback count and memory grow
+with outstanding completed results until their individual deadlines settle.
 
 When durable dispatch is configured, an uncertain write does not release a
 local waiter: the write may have committed before its acknowledgement was
@@ -143,21 +144,21 @@ Completed results can be delivered independently, including results from the
 same run. The Server consumes locally available results as they arrive and
 assembles the model-facing batch in its original request order. Each pending
 tool has a local waiter; completed outputs and progress events can coexist in
-memory while a sibling is still running. When durable dispatch is configured,
-each local waiter also subscribes to the existing process-wide wait coordinator.
-It batches active identities and polls only while unresolved waiters exist;
-there is no per-request polling task. A callback accepted by another Server
-instance can therefore be consumed before the local deadline, while a local
-callback wins when both paths are ready. After timeout or uncertain
-cancellation, final exact-result reads remain serialized per batch: if many
-results time out while the durable store is slow, each read gets its own
-one-second timeout, so the batch can wait proportionally longer. In local-only
-mode, the bounded replay cache can evict an already consumed receipt before
-its HTTP retry arrives under load.
+memory while a sibling is still running. Normal waiting performs no recurring
+result reads. After the local receipt deadline or uncertain cancellation, an
+existing exact durable read may recover a callback accepted by another Server
+instance. If that read fails or the result arrives later, its outcome remains
+unconfirmed for the live turn. Final reads remain
+serialized per batch: if many results time out while the durable store is
+slow, each read gets its own one-second timeout, so the batch can wait
+proportionally longer. In local-only mode, the bounded replay cache can evict
+an already consumed receipt before its HTTP retry arrives under load.
 
 If delivery cannot be confirmed, the Server retains run authority; a client
-disconnect does not establish that an outstanding tool stopped. In particular,
-an unconfirmed side effect must not be repeated to manufacture a receipt.
+disconnect does not establish that an outstanding tool stopped. When multiple
+callback deliveries fail, the existing interruption reports their scoped run
+and request identities and errors, with authentication failure taking priority.
+An unconfirmed side effect must not be repeated to manufacture a receipt.
 
 A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that

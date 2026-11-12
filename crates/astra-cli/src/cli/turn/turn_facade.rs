@@ -265,8 +265,10 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     {
         return result;
     }
-    let must_cancel_physical_root = binding_failure.is_none()
-        && matches!(&result, Err(failure) if failure.partial.callback_client_detached
+    // A callback may identify a child run. A session lease belongs to the
+    // physical root, so its settlement must use only the verified root ID.
+    let must_cancel_physical_root = binding_failure.is_some()
+        || matches!(&result, Err(failure) if failure.partial.callback_client_detached
             && (user_cancel.is_some_and(|token| token.is_cancelled())
                 || failure.partial.output_transport_failure.is_some()));
     let exact_run_id = if must_cancel_physical_root {
@@ -323,7 +325,9 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     }
     match result {
         Err(mut turn_failure) => {
-            turn_failure.partial.failed_run_terminal = None;
+            if !turn_failure.partial.callback_client_detached {
+                turn_failure.partial.observed_run_terminal = None;
+            }
             let callback_detach_without_binding =
                 binding_failure.is_none() && turn_failure.partial.callback_client_detached;
             let mut error = if let Some(failure) = binding_failure {
@@ -357,7 +361,8 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                 turn_failure.partial.remote_cancel_run_id = None;
             } else {
                 turn_failure.partial.remote_cancel_required = true;
-                if turn_failure.partial.remote_cancel_run_id.is_none() {
+                if must_cancel_physical_root || turn_failure.partial.remote_cancel_run_id.is_none()
+                {
                     turn_failure.partial.remote_cancel_run_id = exact_run_id;
                 }
             }
@@ -434,6 +439,7 @@ pub(crate) fn is_settled_stdout_closure(failure: &TurnFailure) -> bool {
     failure.partial.output_transport_failure
         == Some(crate::cli::stream::streaming_types::OutputTransportFailure::Closed)
         && !failure.partial.remote_cancel_required
+        && !failure.partial.callback_client_detached
 }
 
 #[derive(Clone, Default)]
@@ -1065,6 +1071,12 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(failure.partial.remote_cancel_required, !has_root);
+            if !user_cancelled && has_root {
+                assert!(
+                    !is_settled_stdout_closure(&failure),
+                    "a callback failure remains a hard error after output cleanup"
+                );
+            }
             if !has_root {
                 assert!(failure.error.contains("no authoritative run id"));
             }
@@ -1196,6 +1208,15 @@ mod tests {
             },
         };
         assert!(!is_settled_stdout_closure(&unsettled));
+        let callback_failed = TurnFailure {
+            error: "stdout closed and tool callback was unconfirmed".into(),
+            partial: PartialTurnData {
+                output_transport_failure: Some(OutputTransportFailure::Closed),
+                callback_client_detached: true,
+                ..Default::default()
+            },
+        };
+        assert!(!is_settled_stdout_closure(&callback_failed));
 
         // Facade exits must never infer output ownership from a process-global
         // closed sink. A simultaneous hard runtime error has no typed output
@@ -1247,6 +1268,7 @@ mod tests {
                 partial: crate::PartialTurnData {
                     interruption: Some(serde_json::json!({"kind": "stream_transport"})),
                     remote_cancel_required: true,
+                    run_id: Some("run-binding-failure".to_string()),
                     remote_cancel_run_id: Some("run-binding-failure".to_string()),
                     ..Default::default()
                 },
@@ -1258,6 +1280,71 @@ mod tests {
         assert!(settled.error.contains("changed within one request"));
         assert!(!settled.partial.remote_cancel_required);
         assert_eq!(settled.partial.remote_cancel_run_id, None);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn binding_failure_with_child_callback_cancels_only_the_root() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        for has_root in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id": "run-root", "execution_settled": true,
+                })))
+                .expect(u64::from(has_root))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-child"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let session = format!("binding-child-root-{}", uuid::Uuid::new_v4());
+            let holder =
+                crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
+                    Some(&session),
+                )
+                .unwrap();
+            holder.bind("different-session").unwrap_err();
+            let failure = settle_request_session_binding_failure(
+                &api,
+                "token",
+                None,
+                Some(holder.as_ref()),
+                None,
+                None,
+                Err(super::TurnFailure {
+                    error: "child callback failed".into(),
+                    partial: crate::PartialTurnData {
+                        run_id: has_root.then(|| "run-root".into()),
+                        callback_client_detached: true,
+                        remote_cancel_required: true,
+                        remote_cancel_run_id: Some("run-child".into()),
+                        ..Default::default()
+                    },
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.partial.remote_cancel_required, !has_root);
+            assert!(failure.error.contains("child callback failed"));
+            if !has_root {
+                assert!(failure.error.contains("no authoritative run id"));
+                assert!(failure.partial.remote_cancel_run_id.is_none());
+                drop(holder);
+                assert!(
+                    astra_services::session_journal::SessionExecutionLease::try_acquire(&session)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[serial_test::serial]
@@ -1295,6 +1382,7 @@ mod tests {
                 error: "stream cancelled after identity failure".to_string(),
                 partial: crate::PartialTurnData {
                     remote_cancel_required: true,
+                    run_id: Some("run-unsettled".to_string()),
                     remote_cancel_run_id: Some("run-unsettled".to_string()),
                     ..Default::default()
                 },

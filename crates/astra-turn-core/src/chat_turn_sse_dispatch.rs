@@ -366,13 +366,20 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// An owner-stamped terminal observed for this physical stream's root.
+    /// This is an observation, not proof of complete client-side settlement.
+    pub fn observed_root_terminal(&self) -> Option<&DurableRunTerminal> {
+        self.run_terminal.as_ref().filter(|terminal| {
+            terminal.owner_generation.is_some()
+                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+        })
+    }
+
     /// A classified failure accepted by the physical root terminal dispatcher.
     /// This proves failure closure, never successful completion or tool authority.
     pub fn has_authoritative_failed_terminal(&self) -> bool {
-        self.run_terminal.as_ref().is_some_and(|terminal| {
+        self.observed_root_terminal().is_some_and(|terminal| {
             terminal.status == DurableRunTerminalStatus::Failed
-                && terminal.owner_generation.is_some()
-                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                 && (self.has_authoritative_interrupted_terminal()
                     || terminal.error_kind.is_some_and(|kind| {
                         kind != astra_core::ErrorKind::ContractViolation
@@ -385,10 +392,8 @@ impl ChatTurnSseAccum {
     /// failure. Only the owner-stamped, validated terminal grants this closure.
     pub fn has_authoritative_interrupted_terminal(&self) -> bool {
         self.error_kind.is_none()
-            && self.run_terminal.as_ref().is_some_and(|terminal| {
+            && self.observed_root_terminal().is_some_and(|terminal| {
                 terminal.status == DurableRunTerminalStatus::Failed
-                    && terminal.owner_generation.is_some()
-                    && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                     && terminal.error_kind.is_none()
                     && terminal.interruption.is_some()
             })

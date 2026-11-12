@@ -274,14 +274,23 @@ struct DurableTerminalProbe {
     finished: bool,
 }
 
+fn terminal_probe_contract_error(message: impl Into<String>) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+}
+
 impl DurableTerminalProbe {
-    fn bind_accumulator_root(&mut self, run_id: &str) -> Result<(), String> {
-        self.identity.bind_legacy_hint(run_id)
+    fn bind_accumulator_root(&mut self, run_id: &str) -> Result<(), astra_core::ClassifiedError> {
+        self.identity
+            .bind_legacy_hint(run_id)
+            .map_err(terminal_probe_contract_error)
     }
 
     // Include the consumed prefix so read-ahead cannot inspect bytes after the
     // terminal already accepted by this probe.
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Option<(DurableRunTerminal, usize)>, String> {
+    fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<(DurableRunTerminal, usize)>, astra_core::ClassifiedError> {
         if self.finished {
             return Ok(None);
         }
@@ -298,7 +307,9 @@ impl DurableTerminalProbe {
             }
             for event in parsed.events {
                 let event_type = event.get("type").and_then(Value::as_str);
-                self.identity.observe_event(&event)?;
+                self.identity
+                    .observe_event(&event)
+                    .map_err(terminal_probe_contract_error)?;
                 if event_type == Some("run_finished") {
                     // Descendant lifecycle is observability data on the root
                     // stream, not root control. Scope by producer identity
@@ -310,12 +321,15 @@ impl DurableTerminalProbe {
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                         .ok_or_else(|| {
-                            "run_finished event omitted its durable run_id".to_string()
+                            terminal_probe_contract_error(
+                                "run_finished event omitted its durable run_id",
+                            )
                         })?;
                     if self.identity.run_id() != Some(event_run_id) {
                         continue;
                     }
-                    if let Some(terminal) = durable_run_terminal_from_event(&event)?
+                    if let Some(terminal) = durable_run_terminal_from_event(&event)
+                        .map_err(terminal_probe_contract_error)?
                         && terminal.status.is_unsuccessful()
                     {
                         return Ok(Some((terminal, bytes.len() - input.len())));
@@ -325,12 +339,21 @@ impl DurableTerminalProbe {
         }
         Ok(None)
     }
-    fn take_trailing_terminal(&mut self) -> Result<Option<DurableRunTerminal>, String> {
-        let mut tail = self.frames.take_buf().map_err(|error| error.to_string())?;
+    fn take_trailing_terminal(
+        &mut self,
+    ) -> Result<Option<DurableRunTerminal>, astra_core::ClassifiedError> {
+        let mut tail = self.frames.take_buf().map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamTransport,
+                error.to_string(),
+            )
+        })?;
         if tail.trim().is_empty() {
             return Ok(None);
         }
-        validated_sse_event(&tail)?;
+        validated_sse_event(&tail).map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, error)
+        })?;
         // EOF is the only point where an unterminated final SSE block becomes
         // dispatchable. Reuse the exact normal probe path by supplying the
         // missing framing boundary after ownership of the tail is taken.
@@ -849,7 +872,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
             Ok(_) => {}
             Err(error) => {
-                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort = Some(error.kind);
                 abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
                 break;
             }
@@ -969,7 +992,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort = Some(error.kind);
                             abort_message =
                                 Some(format!("Error: invalid durable run lifecycle: {error}"));
                             if let Some(token) = cancel_token {
@@ -1034,7 +1057,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort = Some(error.kind);
                             abort_message =
                                 Some(format!("Error: invalid durable run lifecycle: {error}"));
                             if let Some(token) = cancel_token {
@@ -1116,7 +1139,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             if let Some(run_id) = accum.run_id.as_deref()
                 && let Err(error) = terminal_probe.bind_accumulator_root(run_id)
             {
-                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort = Some(error.kind);
                 abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
                 break;
             }
@@ -1184,7 +1207,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
-                                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                                    abort = Some(error.kind);
                                     abort_message = Some(format!(
                                         "Error: invalid durable run lifecycle: {error}"
                                     ));
@@ -1238,7 +1261,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 }
                             }
                             Err(error) => {
-                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort = Some(error.kind);
                                 abort_message = Some(format!(
                                     "Error: invalid durable run lifecycle: {error}"
                                 ));
@@ -1385,7 +1408,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
             Ok(_) => {}
             Err(error) => {
-                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort = Some(error.kind);
                 abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
                 if let Some(token) = cancel_token {
                     token.cancel();
@@ -1410,6 +1433,10 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 && accum.has_authoritative_failed_terminal()
                 && root_terminal_matches_abort);
         accum.stream_complete = false;
+        let prior_contract_message = (accum.error_kind
+            == Some(astra_core::ErrorKind::ContractViolation))
+        .then(|| accum.error_message.clone())
+        .flatten();
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             abort = accum.error_kind;
         }
@@ -1427,9 +1454,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         accum.tool_calls.clear();
         pending.clear();
         let msg = match abort {
-            Some(astra_core::ErrorKind::ContractViolation) => accum
-                .error_message
-                .clone()
+            Some(astra_core::ErrorKind::ContractViolation) => prior_contract_message
+                .or(abort_message)
                 .unwrap_or_else(|| "Invalid durable root terminal".to_string()),
             Some(astra_core::ErrorKind::StreamIdle) if !preserve_failed_output => {
                 let timeout_used = if first_sse_frame_seen {
@@ -2253,6 +2279,28 @@ mod tests {
 
     fn chunks_from_sse(events: &str) -> Vec<Result<Vec<u8>, String>> {
         vec![Ok(events.as_bytes().to_vec())]
+    }
+
+    #[test]
+    fn terminal_probe_distinguishes_contract_failure_from_truncated_stream() {
+        let mut probe = DurableTerminalProbe::default();
+        probe
+            .push_bytes(sse_event("session_info", ",\"run_id\":\"root\"").as_bytes())
+            .unwrap();
+        let error = probe
+            .push_bytes(
+                sse_event(
+                    "run_finished",
+                    ",\"run_id\":\"root\",\"status\":\"invalid\"",
+                )
+                .as_bytes(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        let mut truncated = DurableTerminalProbe::default();
+        truncated.push_bytes(b"data: {broken").unwrap();
+        let error = truncated.take_trailing_terminal().unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
     }
 
     #[test]
