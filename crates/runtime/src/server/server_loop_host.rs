@@ -16654,19 +16654,37 @@ impl ServerAgenticLoopHost {
                 let fallback_limit = fallback_limit.clone();
                 waits.push(async move {
                     let started = std::time::Instant::now();
-                    let delivery = astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel(
-                        &ledger, &edge_agent_id, &identity, tc,
+                    let delivery = Self::wait_tool_result_with_dispatch(
+                        dispatch_service.as_deref(),
+                        &ledger,
+                        tc,
+                        &identity,
+                        &edge_agent_id,
                         execution_deadline
                             .checked_add(astra_turn_core::edge_ledger::TOOL_RESULT_DELIVERY_GRACE)
                             .unwrap_or(execution_deadline)
                             .saturating_duration_since(Instant::now()),
                         cancel.as_deref(),
-                    ).await;
+                    )
+                    .await;
                     let delivery = Self::resolve_tool_result_dispatch_fallback(
-                        dispatch_service.as_deref(), &ledger, (&fallback_limit, cancel.as_deref()),
-                        tc, &identity, &edge_agent_id, delivery,
-                    ).await;
-                    (work_attribution, id, tool_name, args, delivery, started.elapsed())
+                        dispatch_service.as_deref(),
+                        &ledger,
+                        (&fallback_limit, cancel.as_deref()),
+                        tc,
+                        &identity,
+                        &edge_agent_id,
+                        delivery,
+                    )
+                    .await;
+                    (
+                        work_attribution,
+                        id,
+                        tool_name,
+                        args,
+                        delivery,
+                        started.elapsed(),
+                    )
                 });
             }
             while let Some((work_attribution, id, tool_name, args, delivery, elapsed)) =
@@ -16901,6 +16919,67 @@ impl ServerAgenticLoopHost {
             .filter(|milliseconds| *milliseconds > 0)
     }
 
+    /// Wait on local callback custody and the existing shared durable-dispatch
+    /// coordinator together. A callback handled by another server instance must
+    /// not wait for the local deadline before it becomes visible here.
+    async fn wait_tool_result_with_dispatch(
+        dispatch_service: Option<&dyn EdgeDispatchService>,
+        edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
+        tc: &Value,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        budget: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
+
+        let local = wait_tool_result_ledger_for_tool_with_cancel(
+            edge_callback_ledger,
+            edge_agent_id,
+            identity,
+            tc,
+            budget,
+            cancel,
+        );
+        tokio::pin!(local);
+        let Some(dispatch_service) = dispatch_service else {
+            return local.await;
+        };
+        let durable = dispatch_service.wait_result(identity, Some(budget));
+        tokio::pin!(durable);
+        tokio::select! {
+            // Preserve local callback custody when both paths are ready.
+            biased;
+            delivery = &mut local => delivery,
+            result = &mut durable => match result {
+                Ok(Some(result_json)) => {
+                    if let Some(delivery) = Self::project_tool_result_dispatch(
+                        edge_callback_ledger,
+                        tc,
+                        identity,
+                        edge_agent_id,
+                        &result_json,
+                    ).await {
+                        delivery
+                    } else {
+                        local.await
+                    }
+                }
+                Ok(None) => local.await,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "astra_runtime::server_loop_host",
+                        run_id = %identity.run_id,
+                        request_id = %identity.request_id,
+                        error = %error,
+                        "durable edge result wait failed; local callback remains authoritative"
+                    );
+                    local.await
+                }
+            },
+        }
+    }
+
     async fn resolve_tool_result_dispatch_fallback(
         dispatch_service: Option<&dyn EdgeDispatchService>,
         edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
@@ -16910,9 +16989,6 @@ impl ServerAgenticLoopHost {
         edge_agent_id: &str,
         delivery: astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
-        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
-        use astra_turn_core::edge_ledger::tool_callback_key;
-
         let cancelled_unknown = delivery.tool_results.iter().any(|result| {
             result.status == "cancelled"
                 && result
@@ -16993,8 +17069,31 @@ impl ServerAgenticLoopHost {
         };
 
         drop(permit);
+        Self::project_tool_result_dispatch(
+            edge_callback_ledger,
+            tc,
+            identity,
+            edge_agent_id,
+            &result_json,
+        )
+        .await
+        .unwrap_or(delivery)
+    }
+
+    /// Project an authenticated durable result through the same canonical
+    /// validation and local-ledger consumer used by the final recovery read.
+    async fn project_tool_result_dispatch(
+        edge_callback_ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
+        tc: &Value,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Option<astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery> {
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
+        use astra_turn_core::edge_ledger::tool_callback_key;
+
         let (body, execution_completion) =
-            match canonical_edge_dispatch_result(identity, edge_agent_id, &result_json) {
+            match canonical_edge_dispatch_result(identity, edge_agent_id, result_json) {
                 Ok(body) => body,
                 Err(error) => {
                     tracing::warn!(
@@ -17005,9 +17104,9 @@ impl ServerAgenticLoopHost {
                         turn_chain_id = %identity.turn_chain_id,
                         request_id = %identity.request_id,
                         error = %error,
-                        "edge dispatch fallback rejected a non-canonical durable result"
+                        "edge dispatch result rejected non-canonical durable evidence"
                     );
-                    return delivery;
+                    return None;
                 }
             };
         let key = tool_callback_key(identity);
@@ -17026,17 +17125,19 @@ impl ServerAgenticLoopHost {
             });
         }
 
-        wait_tool_result_ledger_for_tool_with_cancel(
-            edge_callback_ledger,
-            edge_agent_id,
-            identity,
-            tc,
-            Duration::from_millis(0),
-            // The authenticated durable result is already available; do not
-            // replace it with a synthetic cancellation in this second read.
-            None,
+        Some(
+            wait_tool_result_ledger_for_tool_with_cancel(
+                edge_callback_ledger,
+                edge_agent_id,
+                identity,
+                tc,
+                Duration::ZERO,
+                // The authenticated durable result is already available; do
+                // not replace it with a synthetic cancellation in this read.
+                None,
+            )
+            .await,
         )
-        .await
     }
 
     /// Prove that an already-committed Edge request still has process-local
@@ -42453,6 +42554,70 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wait_tool_result_with_dispatch_consumes_remote_result_before_local_deadline() {
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-dispatch",
+            "s-dispatch",
+            "test-run",
+            "test-chain",
+            "r1",
+        );
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-1".to_string(),
+                status: "completed".to_string(),
+                output: "from another server instance".to_string(),
+                duration_ms: 17,
+                tool_result_fields: None,
+            },
+        );
+        let dispatch = Arc::new(StaticWaitResultEdgeDispatch {
+            result_json: Some(serde_json::to_string(&body).expect("serialize tool result")),
+            wait_delay: Duration::from_millis(25),
+            ..Default::default()
+        });
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            identity.user_id.clone(),
+            identity.session_id.clone(),
+        )
+        .with_edge_dispatch_service(dispatch.clone())
+        .build();
+        let tool_call = json!({
+            "id": identity.request_id,
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        });
+
+        let delivery = tokio::time::timeout(
+            Duration::from_secs(1),
+            ServerAgenticLoopHost::wait_tool_result_with_dispatch(
+                host.edge_dispatch_service.as_deref(),
+                &host.edge_callback_ledger,
+                &tool_call,
+                &identity,
+                "edge-1",
+                Duration::from_secs(30),
+                None,
+            ),
+        )
+        .await
+        .expect("a durable remote result must not wait for the 30-second local deadline");
+        assert_eq!(delivery.tool_results.len(), 1);
+        assert_eq!(delivery.tool_results[0].status, "completed");
+        assert_eq!(
+            delivery.raw_tool_output(0),
+            Some("from another server instance")
+        );
+        assert_eq!(dispatch.wait_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

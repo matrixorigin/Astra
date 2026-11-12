@@ -53,7 +53,6 @@ const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
 pub struct ToolResultDelivery<'a> {
     pub budget: Duration,
     pub owner_current: &'a (dyn Fn() -> bool + Send + Sync),
-    pub concurrency: Option<&'a tokio::sync::Semaphore>,
     pub cancel: Option<&'a tokio_util::sync::CancellationToken>,
     /// The same result has already been sent, for example before a 401 refresh.
     pub previous_attempt: bool,
@@ -2652,25 +2651,8 @@ impl ThinClient {
             if !(delivery.owner_current)() {
                 return Err(ThinClientError::CallbackOwnerUnconfirmed);
             }
-            let permit = if let Some(concurrency) = delivery.concurrency {
-                let acquire = tokio::time::timeout_at(deadline, concurrency.acquire());
-                let acquired = if is_retry && let Some(cancel) = delivery.cancel {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(previous_error.take().unwrap_or(ThinClientError::CallbackRetryCancelled)),
-                        acquired = acquire => acquired,
-                    }
-                } else {
-                    acquire.await
-                };
-                Some(
-                    acquired
-                        .map_err(|_| ThinClientError::CallbackDeadlineExpired)?
-                        .map_err(|_| ThinClientError::CallbackDeadlineExpired)?,
-                )
-            } else {
-                None
-            };
+            // Each result owns an independent delivery budget. Do not serialize
+            // callbacks behind a sibling whose response is stalled.
             if !(delivery.owner_current)() {
                 return Err(ThinClientError::CallbackOwnerUnconfirmed);
             }
@@ -2720,8 +2702,6 @@ impl ThinClient {
                     (error, None)
                 }
             };
-
-            drop(permit);
 
             let delay = tool_result_retry_delay(body, attempt, retry_base)
                 .max(Duration::from_secs(retry_after.unwrap_or(0)));
@@ -5114,7 +5094,6 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_secs(5),
                     owner_current: &|| true,
-                    concurrency: None,
                     cancel: None,
                     previous_attempt: false,
                 },
@@ -5167,7 +5146,6 @@ mod tests {
                     ToolResultDelivery {
                         budget: Duration::from_secs(2),
                         owner_current: &|| true,
-                        concurrency: None,
                         cancel: None,
                         previous_attempt: false,
                     },
@@ -5233,7 +5211,6 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_secs(2),
                     owner_current: &|| true,
-                    concurrency: None,
                     cancel: None,
                     previous_attempt: false,
                 },
@@ -5283,7 +5260,6 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_millis(200),
                     owner_current: &|| true,
-                    concurrency: None,
                     cancel: None,
                     previous_attempt: false,
                 },
@@ -5333,7 +5309,6 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_secs(1),
                     owner_current: &|| current.load(Ordering::SeqCst),
-                    concurrency: None,
                     cancel: None,
                     previous_attempt: false,
                 },
@@ -5385,7 +5360,6 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_secs(180),
                     owner_current: &|| true,
-                    concurrency: None,
                     cancel: None,
                     previous_attempt: false,
                 },
@@ -5431,13 +5405,11 @@ mod tests {
                 tool_result_fields: None,
             })
         };
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = Vec::new();
         for id in ["failed-a", "failed-b"] {
             let client = client.clone();
             let body = body(id);
-            let semaphore = semaphore.clone();
             let cancel = cancel.clone();
             blocked.push(tokio::spawn(async move {
                 client
@@ -5448,7 +5420,6 @@ mod tests {
                         ToolResultDelivery {
                             budget: Duration::from_secs(30),
                             owner_current: &|| true,
-                            concurrency: Some(&semaphore),
                             cancel: Some(&cancel),
                             previous_attempt: false,
                         },
@@ -5472,14 +5443,13 @@ mod tests {
                 ToolResultDelivery {
                     budget: Duration::from_secs(1),
                     owner_current: &|| true,
-                    concurrency: Some(&semaphore),
                     cancel: None,
                     previous_attempt: false,
                 },
             ),
         )
         .await
-        .expect("backoff must release its HTTP permit")
+        .expect("healthy delivery must not wait for sibling backoff")
         .unwrap();
         cancel.cancel();
         for task in blocked {
@@ -5488,168 +5458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_result_cancel_interrupts_a_retry_waiting_for_a_permit() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        let server = MockServer::start().await;
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = attempts.clone();
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(move |_: &wiremock::Request| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                ResponseTemplate::new(503).insert_header("Retry-After", "1")
-            })
-            .mount(&server)
-            .await;
-        let client = ThinClient::new(&server.uri(), None).unwrap();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let retry_started = Arc::new(AtomicBool::new(false));
-        let task = {
-            let semaphore = semaphore.clone();
-            let cancel = cancel.clone();
-            let attempts = attempts.clone();
-            let retry_started = retry_started.clone();
-            tokio::spawn(async move {
-                let body =
-                    ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
-                        session_id: "session".into(),
-                        run_id: "run".into(),
-                        turn_chain_id: "turn".into(),
-                        request_id: "request".into(),
-                        edge_agent_id: "edge".into(),
-                        status: "completed".into(),
-                        output: "result".into(),
-                        duration_ms: 1,
-                        tool_result_fields: None,
-                    });
-                let owner_current = || {
-                    if attempts.load(Ordering::SeqCst) > 0 {
-                        retry_started.store(true, Ordering::SeqCst);
-                    }
-                    true
-                };
-                client
-                    .post_tool_result_with_policy(
-                        Some("tok"),
-                        Some("edge"),
-                        &body,
-                        Duration::from_secs(3),
-                        Duration::from_millis(1),
-                        ToolResultDelivery {
-                            budget: Duration::from_secs(5),
-                            owner_current: &owner_current,
-                            concurrency: Some(&semaphore),
-                            cancel: Some(&cancel),
-                            previous_attempt: false,
-                        },
-                    )
-                    .await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let permit = semaphore.acquire().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !retry_started.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the retry must reach the held semaphore");
-        cancel.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("cancel must wake a retry blocked on the permit")
-            .unwrap();
-        assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        drop(permit);
-    }
-
-    #[tokio::test]
-    async fn refreshed_tool_result_cancelled_in_permit_queue_is_not_resent() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let client = ThinClient::new(&server.uri(), None).unwrap();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = semaphore.acquire().await.unwrap();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let waiting = Arc::new(AtomicBool::new(false));
-        let task = {
-            let semaphore = semaphore.clone();
-            let cancel = cancel.clone();
-            let waiting = waiting.clone();
-            tokio::spawn(async move {
-                let body =
-                    ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
-                        session_id: "session".into(),
-                        run_id: "run".into(),
-                        turn_chain_id: "turn".into(),
-                        request_id: "request".into(),
-                        edge_agent_id: "edge".into(),
-                        status: "completed".into(),
-                        output: "result".into(),
-                        duration_ms: 1,
-                        tool_result_fields: None,
-                    });
-                let owner_current = || {
-                    waiting.store(true, Ordering::SeqCst);
-                    true
-                };
-                client
-                    .post_tool_result(
-                        Some("fresh"),
-                        Some("edge"),
-                        &body,
-                        ToolResultDelivery {
-                            budget: Duration::from_secs(5),
-                            owner_current: &owner_current,
-                            concurrency: Some(&semaphore),
-                            cancel: Some(&cancel),
-                            previous_attempt: true,
-                        },
-                    )
-                    .await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !waiting.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        cancel.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            result,
-            Err(ThinClientError::CallbackRetryCancelled)
-        ));
-        drop(permit);
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn tool_result_slow_error_bodies_keep_the_batch_connection_limit() {
+    async fn tool_result_slow_error_body_does_not_delay_sibling() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5666,7 +5475,7 @@ mod tests {
                     if index == 0 {
                         stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000\r\n\r\n{").await.unwrap();
                         arrived.send(()).unwrap();
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                     } else {
                         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
                     }
@@ -5675,7 +5484,6 @@ mod tests {
             while connections.join_next().await.is_some() {}
         });
         let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let body = |id: &str| {
             ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
                 session_id: "session".into(),
@@ -5691,7 +5499,6 @@ mod tests {
         };
         let slow = {
             let client = client.clone();
-            let semaphore = semaphore.clone();
             let body = body("slow-a");
             tokio::spawn(async move {
                 client
@@ -5700,9 +5507,8 @@ mod tests {
                         Some("edge"),
                         &body,
                         ToolResultDelivery {
-                            budget: Duration::from_secs(3),
+                            budget: Duration::from_millis(500),
                             owner_current: &|| true,
-                            concurrency: Some(&semaphore),
                             cancel: None,
                             previous_attempt: false,
                         },
@@ -5712,28 +5518,23 @@ mod tests {
         };
         arrivals.recv().await.unwrap();
         let healthy_body = body("healthy");
-        let healthy = client.post_tool_result(
-            Some("tok"),
-            Some("edge"),
-            &healthy_body,
-            ToolResultDelivery {
-                budget: Duration::from_secs(3),
-                owner_current: &|| true,
-                concurrency: Some(&semaphore),
-                cancel: None,
-                previous_attempt: false,
-            },
-        );
-        tokio::pin!(healthy);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut healthy)
-                .await
-                .is_err()
-        );
-        tokio::time::timeout(Duration::from_secs(3), healthy)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            client.post_tool_result(
+                Some("tok"),
+                Some("edge"),
+                &healthy_body,
+                ToolResultDelivery {
+                    budget: Duration::from_millis(200),
+                    owner_current: &|| true,
+                    cancel: None,
+                    previous_attempt: false,
+                },
+            ),
+        )
+        .await
+        .expect("a stalled sibling response must not consume this result's budget")
+        .unwrap();
         assert!(slow.await.unwrap().is_err());
         server.abort();
     }

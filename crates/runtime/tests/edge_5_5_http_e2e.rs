@@ -466,7 +466,6 @@ async fn tool_result_retry_recovers_a_lost_ack_after_server_consumption() {
             astra_thin_client::client::ToolResultDelivery {
                 budget: Duration::from_secs(20),
                 owner_current: &|| true,
-                concurrency: None,
                 cancel: None,
                 previous_attempt: false,
             },

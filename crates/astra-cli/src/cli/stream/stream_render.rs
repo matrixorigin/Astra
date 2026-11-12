@@ -1776,7 +1776,6 @@ struct EdgeCallbackTarget {
     executor_id: String,
     owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     cancel: Option<tokio_util::sync::CancellationToken>,
-    concurrency: Option<Arc<tokio::sync::Semaphore>>,
     status_tx: Option<chat_stream::StreamEventTx>,
 }
 
@@ -1860,7 +1859,6 @@ impl EdgeCallbackTarget {
             astra_thin_client::client::ToolResultDelivery {
                 budget: deadline.saturating_duration_since(tokio::time::Instant::now()),
                 owner_current: &owner_current,
-                concurrency: self.concurrency.as_deref(),
                 cancel: self.cancel.as_ref(),
                 previous_attempt,
             },
@@ -2314,7 +2312,6 @@ impl<'a> CliSseStreamHost<'a> {
             executor_id: self.executor_id.to_string(),
             owner: self.owner_auth_snapshot.clone(),
             cancel: self.cancel_token.cloned(),
-            concurrency: None,
             status_tx: self.stream_event_tx.clone(),
         }
         .post(body, deadline)
@@ -6396,7 +6393,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             executor_id: self.executor_id.to_string(),
             owner: self.owner_auth_snapshot.clone(),
             cancel: self.cancel_token.cloned(),
-            concurrency: Some(Arc::new(tokio::sync::Semaphore::new(1))),
             status_tx: self.stream_event_tx.clone(),
         };
         let mut callback_tasks = tokio::task::JoinSet::new();
@@ -14388,14 +14384,16 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn tool_batch_delivers_sibling_after_permanent_callback_failure() {
+    async fn tool_batch_delivers_sibling_while_callback_is_stalled() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
             .respond_with(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 if body["request_id"] == "callback-1" {
-                    ResponseTemplate::new(403).set_body_string("callback denied")
+                    ResponseTemplate::new(403)
+                        .set_body_string("callback denied")
+                        .set_delay(std::time::Duration::from_secs(2))
                 } else {
                     ResponseTemplate::new(200)
                 }
@@ -14457,7 +14455,9 @@ mod tests {
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-2".into(),
                     read_only_execution: false,
-                    execution_timeout_ms: 300_000,
+                    // This result must be posted before the stalled sibling's
+                    // two-second response, within its own shorter budget.
+                    execution_timeout_ms: 500,
                     command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
@@ -14477,11 +14477,9 @@ mod tests {
             2,
             "each executed result gets a delivery attempt"
         );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&requests[0].body).unwrap()["request_id"],
-            "callback-1",
-            "a later result cannot overtake the first HTTP attempt"
-        );
+        assert!(requests.iter().any(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["request_id"] == "callback-1"
+        }));
         assert!(requests.iter().any(|request| {
             serde_json::from_slice::<Value>(&request.body).unwrap()["request_id"] == "callback-2"
         }));
@@ -14991,7 +14989,6 @@ mod tests {
             executor_id: "edge-test".into(),
             owner: None,
             cancel: Some(cancel.clone()),
-            concurrency: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
             status_tx: None,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -15051,7 +15048,6 @@ mod tests {
             executor_id: "edge-test".into(),
             owner: None,
             cancel: Some(cancel.clone()),
-            concurrency: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
             status_tx: None,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -15866,7 +15862,6 @@ mod tests {
             executor_id: "edge-test".into(),
             owner: Some(owner.clone()),
             cancel: None,
-            concurrency: None,
             status_tx: None,
         };
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
