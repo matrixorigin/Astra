@@ -13774,6 +13774,33 @@ mod tests {
         )
     }
 
+    async fn hold_all_but_one_tool_execution_slot() -> tokio::sync::OwnedSemaphorePermit {
+        let sem = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
+        let capacity = astra_turn_core::parallel_tool_exec::max_concurrent_tool_executions();
+        assert!(
+            capacity >= 2,
+            "this scheduling scenario requires at least two tool slots"
+        );
+        let held = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sem.clone()
+                .acquire_many_owned(u32::try_from(capacity - 1).unwrap()),
+        )
+        .await
+        .expect("other tool executions must settle")
+        .expect("open shared semaphore");
+        assert_eq!(sem.available_permits(), 1);
+        held
+    }
+
+    #[cfg(unix)]
+    fn retarget_symlink(link: &std::path::Path, target: &std::path::Path) {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_file(link).unwrap();
+        }
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
     async fn reserve_shared_tool_capacity() -> (
         std::sync::Arc<tokio::sync::Semaphore>,
         tokio::sync::OwnedSemaphorePermit,
@@ -14571,6 +14598,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[serial_test::serial]
     #[tokio::test]
     async fn callback_rejection_closes_an_outstanding_sandbox_approval() {
@@ -14612,8 +14640,15 @@ mod tests {
         let outside = base.path().join("outside");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        let path = outside.join("private.txt");
-        std::fs::write(&path, "not approved").unwrap();
+        let outside_path = outside.join("private.txt");
+        let inside_path = project.join("inside.txt");
+        std::fs::write(&outside_path, "not approved").unwrap();
+        std::fs::write(&inside_path, "initially allowed").unwrap();
+        let path = project.join("current.txt");
+        retarget_symlink(&path, &inside_path);
+        // Leave one slot for the memory sibling. The file tool cannot execute
+        // until the symlink is retargeted after batch preflight.
+        let _held_capacity = hold_all_but_one_tool_execution_slot().await;
         let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -14641,6 +14676,7 @@ mod tests {
         })
         .await
         .unwrap();
+        retarget_symlink(&path, &outside_path);
         release.send(()).unwrap();
         let mut approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
@@ -14675,6 +14711,7 @@ mod tests {
         callback_server.abort();
     }
 
+    #[cfg(unix)]
     #[serial_test::serial]
     #[tokio::test]
     async fn decided_sandbox_result_is_delivered_while_another_approval_waits() {
@@ -14688,6 +14725,15 @@ mod tests {
         }
         std::fs::write(first.join("a.txt"), "first").unwrap();
         std::fs::write(second.join("b.txt"), "second").unwrap();
+        let inside_first = project.join("first.txt");
+        let inside_second = project.join("second");
+        std::fs::write(&inside_first, "initially allowed").unwrap();
+        std::fs::create_dir(&inside_second).unwrap();
+        let first_link = project.join("first-link.txt");
+        let second_link = project.join("second-link");
+        retarget_symlink(&first_link, &inside_first);
+        retarget_symlink(&second_link, &inside_second);
+        let _held_capacity = hold_all_but_one_tool_execution_slot().await;
         let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -14700,20 +14746,20 @@ mod tests {
             "first",
             "denied-one",
             "read_file",
-            serde_json::json!({"path": first.join("a.txt")}),
+            serde_json::json!({"path": &first_link}),
         );
         let mut held = parallel_recall("first", "held-memory");
         held.run_id = denied.run_id.clone();
         held.turn_chain_id = denied.turn_chain_id.clone();
         let requests = vec![
+            held,
             denied,
             parallel_batch_request(
                 "second",
                 "denied-two",
                 "list_dir",
-                serde_json::json!({"path": second}),
+                serde_json::json!({"path": &second_link}),
             ),
-            held,
         ];
         let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
         let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -14725,6 +14771,8 @@ mod tests {
         })
         .await
         .unwrap();
+        retarget_symlink(&first_link, &first.join("a.txt"));
+        retarget_symlink(&second_link, &second);
         release.send(()).unwrap();
         let first_approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
