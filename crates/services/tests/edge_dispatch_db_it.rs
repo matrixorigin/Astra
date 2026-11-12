@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
-    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchFailure,
-    EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchService,
-    EdgeRegistrationLease, EdgeRegistryService,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchDeliveryError,
+    EdgeDispatchFailure, EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity,
+    EdgeDispatchService, EdgeRegistrationLease, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -182,6 +182,59 @@ async fn edge_dispatch_full_lifecycle() {
         result.unwrap().contains("hello"),
         "result should contain hello"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_concurrent_conflicting_results_have_one_durable_winner() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let first = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let second = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-conflict-{}", unique_suffix());
+    let agent = format!("ed-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user, &Uuid::new_v4().to_string());
+    first
+        .admit_dispatch(&identity, &agent, &serde_json::json!({"tool": "read_file"}))
+        .await
+        .unwrap();
+    let a = r#"{"output":"first"}"#;
+    let b = r#"{"output":"second"}"#;
+    let (a_result, b_result) = tokio::join!(
+        first.deliver_result(&identity, &agent, a),
+        second.deliver_result(&identity, &agent, b),
+    );
+    assert!(
+        !(matches!(a_result, Ok(true)) && matches!(b_result, Ok(true))),
+        "different outcomes must never both be accepted"
+    );
+    let stored = first
+        .wait_result(&identity, Some(std::time::Duration::ZERO))
+        .await
+        .unwrap()
+        .expect("one outcome is durable");
+    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let (winner, loser) = if stored["output"] == "first" {
+        (a, b)
+    } else {
+        assert_eq!(stored["output"], "second");
+        (b, a)
+    };
+    assert!(
+        second
+            .deliver_result(&identity, &agent, winner)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        second.deliver_result(&identity, &agent, loser).await,
+        Err(EdgeDispatchDeliveryError::PayloadConflict)
+    ));
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

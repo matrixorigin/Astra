@@ -771,37 +771,49 @@ fn assert_no_completed_turn(directory: std::path::PathBuf, session_id: &str) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_settles_exact_run_without_wall_deadline() {
-    assert_one_shot_sigint(true, true, false, false, false, false).await;
+    assert_one_shot_sigint(true, true, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_preserves_wall_deadline_contract() {
-    assert_one_shot_sigint(true, true, true, false, false, false).await;
+    assert_one_shot_sigint(true, true, true, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_unsettled_cancel_is_not_success() {
-    assert_one_shot_sigint(false, true, false, false, false, false).await;
+    assert_one_shot_sigint(false, true, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_without_run_identity_never_cancels_session() {
-    assert_one_shot_sigint(false, false, false, false, false, false).await;
+    assert_one_shot_sigint(false, false, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_second_sigint_returns_unverified_json() {
-    assert_one_shot_sigint(false, true, false, true, false, false).await;
+    assert_one_shot_sigint(false, true, false, true, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_interrupts_setup_before_stream_admission() {
-    assert_one_shot_sigint(false, false, false, false, true, false).await;
+    assert_one_shot_sigint(false, false, false, false, true, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_retains_inflight_callback_failure() {
+    assert_one_shot_sigint(true, true, false, false, false, false, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_wall_deadline_retains_inflight_callback_failure() {
+    assert_one_shot_sigint(true, true, true, false, false, false, true).await;
 }
 
 /// Exercise the real command router and process signal policy with a held
@@ -814,6 +826,7 @@ async fn assert_one_shot_sigint(
     second: bool,
     setup: bool,
     local_fenced: bool,
+    callback: bool,
 ) {
     use axum::body::{Body, Bytes};
     use axum::extract::Path;
@@ -829,6 +842,9 @@ async fn assert_one_shot_sigint(
     let cancels = Arc::new(AtomicUsize::new(0));
     let chat_counter = chats.clone();
     let cancel_counter = cancels.clone();
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let callback_counter = callbacks.clone();
+    let callback_cancels = cancels.clone();
     let models = Arc::new(AtomicUsize::new(0));
     let model_counter = models.clone();
     let app = axum::Router::new()
@@ -854,10 +870,20 @@ async fn assert_one_shot_sigint(
             async move {
                 chats.fetch_add(1, Ordering::SeqCst);
                 let stream = futures_util::stream::once(async move {
-                    Ok::<Bytes, Infallible>(Bytes::from(if identity {
-                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"sigint-partial-ready\"}\n\n"
+                    Ok::<Bytes, Infallible>(Bytes::from(if callback {
+                        format!("data: {}\n\ndata: {}\n\n", serde_json::json!({
+                            "type":"session_info", "session_id":"sigint-session", "run_id":"sigint-run"
+                        }), serde_json::json!({
+                            "type":"tool_request", "session_id":"sigint-session", "run_id":"sigint-run",
+                            "turn_chain_id":"chain", "request_id":"sigint-callback", "schema_admitted_by_server":true,
+                            "execution_timeout_ms":300000, "command_timeout_cap_ms":30000,
+                            "execution_deadline_unix_ms":4102444800000u64,
+                            "tool":"read_file", "args":{"path":"missing-input.txt"}
+                        }))
+                    } else if identity {
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"sigint-partial-ready\"}\n\n".to_string()
                     } else {
-                        ": held before authoritative admission identity\n\n"
+                        ": held before authoritative admission identity\n\n".to_string()
                     }))
                 }).chain(futures_util::stream::pending());
                 Response::builder()
@@ -865,6 +891,17 @@ async fn assert_one_shot_sigint(
                     .header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
                         astra_server_types::AGENT_INTERACTION_API_MAJOR)
                     .body(Body::from_stream(stream)).unwrap()
+            }
+        }))
+        .route("/tools/result", post(move || {
+            let callbacks = callback_counter.clone();
+            let cancels = callback_cancels.clone();
+            async move {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                while cancels.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                (axum::http::StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":"callback denied"})))
             }
         }))
         .route("/chat/runs/{run_id}", delete(move |Path(run): Path<String>| {
@@ -920,7 +957,10 @@ async fn assert_one_shot_sigint(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if wall {
-        command.args(["--max-wall-time-seconds", "120"]);
+        command.args([
+            "--max-wall-time-seconds",
+            if callback { "74" } else { "120" },
+        ]);
     }
     let mut child = command.spawn().unwrap();
     let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
@@ -928,6 +968,8 @@ async fn assert_one_shot_sigint(
         loop {
             let ready = if setup {
                 models.load(Ordering::SeqCst) > 0
+            } else if callback {
+                callbacks.load(Ordering::SeqCst) > 0
             } else if identity {
                 // Quiet mode defers token projection. The ordered warning
                 // receipt proves the preceding partial text was consumed.
@@ -960,7 +1002,9 @@ async fn assert_one_shot_sigint(
             excerpt(&output.stderr)
         );
     }
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    if !(wall && callback) {
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    }
     if second {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while cancels.load(Ordering::SeqCst) == 0 {
@@ -999,7 +1043,22 @@ async fn assert_one_shot_sigint(
     } else {
         assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
-    if settled && !local_fenced {
+    if callback {
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(json["callback_error_kind"], "unknown");
+        assert!(
+            json["error"].as_str().unwrap().contains("sigint-callback"),
+            "{json}"
+        );
+        if !wall {
+            assert_eq!(json["interruption"]["kind"], "user_cancelled");
+            assert!(
+                json["interruption"]
+                    .to_string()
+                    .contains("requires_intervention")
+            );
+        }
+    } else if settled && !local_fenced {
         assert_eq!(output.status.code(), Some(5));
         assert_eq!(json["final_state"], "interrupted");
         assert_eq!(json["interruption_kind"], "execution_incomplete");
@@ -1060,7 +1119,7 @@ async fn assert_one_shot_sigint(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_server_settled_cannot_hide_local_ownership_fence() {
-    assert_one_shot_sigint(true, true, false, false, false, true).await;
+    assert_one_shot_sigint(true, true, false, false, false, true, false).await;
 }
 
 #[cfg(unix)]

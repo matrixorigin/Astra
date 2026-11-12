@@ -258,6 +258,11 @@ jobs:
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-logging
           --features otel --profile ci
+      - name: Test runtime OTLP diagnostics
+        run: >-
+          cargo nextest run --manifest-path Cargo.toml -p astra-runtime
+          --lib --features otel --profile ci
+          -E 'test(/llm_trace_/)'
       - name: Test server e2e-hooks (selective)
         env:
           RUST_MIN_STACK: "16777216"
