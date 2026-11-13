@@ -41760,7 +41760,7 @@ mod tests {
             } else {
                 assert!(request.is_none());
                 assert_eq!(outcome.results[0].status, "denied");
-                assert!(outcome.results[0].output.contains("user_denied"));
+                assert!(outcome.results[0].output.contains("approval_denied"));
                 assert!(outcome.results[0].output.contains("user declined removal"));
                 assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
                     &ledger,
@@ -41937,7 +41937,7 @@ mod tests {
                 } else {
                     assert_eq!(write.status, "denied");
                     assert!(
-                        write.output.contains("user_denied") && write.output.contains("policy")
+                        write.output.contains("approval_denied") && write.output.contains("policy")
                     );
                     assert!(
                         !committed

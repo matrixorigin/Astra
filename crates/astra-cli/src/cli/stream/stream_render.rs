@@ -1276,8 +1276,10 @@ pub(crate) struct EdgeSseContext<'a> {
 // Implements the runtime's `SseStreamHost` trait, wiring terminal rendering,
 // local tool execution, and permission prompts into the generic SSE consumer.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalWaitError {
+    /// Preserve the channel owner's cause for enqueue or response failure.
+    InterfaceUnavailable(chat_stream::InteractiveRequestEnqueueError),
     PermissionModePending,
     AdmissionClosed,
     ObserverUnavailable,
@@ -3935,6 +3937,7 @@ impl CliSseEdgeHost<'_> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        let status = edge_tool_terminal_status(&status, tool_result_fields.as_ref()).to_string();
         let request_id = req.request_id.as_str();
         let tool = req.tool.as_str();
         let args = &req.args;
@@ -4011,14 +4014,23 @@ impl CliSseEdgeHost<'_> {
 
     fn sandbox_expansion_scope(
         &self,
+        tool: &str,
         args: &serde_json::Value,
         sandbox_msg: &str,
-    ) -> Option<PathBuf> {
-        crate::sandbox_retry::sandbox_expand_dir_from_denial_or_workspace(
-            args,
-            sandbox_msg,
-            &self.executor.effective_project_root(),
-        )
+        outcome: &crate::edge_tools::ToolExecutionOutcome,
+    ) -> Option<astra_sandbox::SandboxApprovalScope> {
+        let scope = if tool == "bash" {
+            outcome.sandbox_approval_scope.clone()?
+        } else {
+            let path = crate::sandbox_retry::sandbox_expand_dir_from_denial_or_workspace(
+                args,
+                sandbox_msg,
+                &self.executor.effective_project_root(),
+            )?;
+            astra_sandbox::SandboxApprovalScope::for_existing_path(&path).ok()?
+        };
+        scope.verify().ok()?;
+        Some(scope)
     }
 
     async fn preflight_explicit_path_sandbox_expansion_target(
@@ -4042,12 +4054,10 @@ impl CliSseEdgeHost<'_> {
             ));
         };
 
-        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &expand_dir)
+        let scope = astra_sandbox::SandboxApprovalScope::for_existing_path(&expand_dir)
+            .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
+        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &scope)
             .await?;
-        if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-            astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
-            return Ok(false);
-        }
         Ok(true)
     }
 
@@ -4055,8 +4065,26 @@ impl CliSseEdgeHost<'_> {
         &mut self,
         tool: &str,
         sandbox_msg: &str,
-        expand_dir: &Path,
+        scope: &astra_sandbox::SandboxApprovalScope,
     ) -> Result<(), String> {
+        if self.edge_admission_stop.is_cancelled()
+            || self
+                .effective_tool_cancel_token()
+                .is_some_and(|token| token.is_cancelled())
+            || self.stream_observer_error().is_some()
+            || self
+                .owner_auth_snapshot
+                .as_ref()
+                .is_some_and(|owner| !owner.is_current())
+        {
+            return Err(format!(
+                "Error: {sandbox_msg} (sandbox expansion interrupted before commit)"
+            ));
+        }
+        scope
+            .verify()
+            .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
+        let expand_dir = scope.path();
         let sandbox_tool_key = format!("sandbox_expand:{tool}");
         let guard_args = serde_json::json!({
             "reason": sandbox_msg,
@@ -4076,7 +4104,11 @@ impl CliSseEdgeHost<'_> {
         };
 
         match decision {
-            crate::cli::permission_manager::GateOutcome::Allow => Ok(()),
+            crate::cli::permission_manager::GateOutcome::Allow => self
+                .executor
+                .expand_approved_sandbox_scope(scope)
+                .map(|_| ())
+                .map_err(|error| format!("Error: {sandbox_msg} ({error})")),
             crate::cli::permission_manager::GateOutcome::Deny(reason) => Err(format!(
                 "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
             )),
@@ -4091,9 +4123,6 @@ impl CliSseEdgeHost<'_> {
                         "permission",
                         "Denied sandbox expansion {sandbox_tool_key}: approval prompt unavailable. reason={reason}"
                     );
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     let reason = if self.render_policy.is_silent() {
                         "approval required for an external path, but this run cannot ask for approvals in the current mode"
                     } else {
@@ -4116,18 +4145,21 @@ impl CliSseEdgeHost<'_> {
                         resp_tx,
                     ),
                 ) {
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     return Err(format!(
                         "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
                     ));
                 }
+                let execution_cancel = self.effective_tool_cancel_token();
                 let response = self
-                    .wait_for_approval_response(resp_rx, self.cancel_token)
+                    .wait_for_approval_response(resp_rx, execution_cancel.as_ref())
                     .await;
                 let response = match response {
                     Ok(response) => response,
+                    Err(ApprovalWaitError::InterfaceUnavailable(error)) => {
+                        return Err(format!(
+                            "Error: {sandbox_msg} (approval unavailable: {error})"
+                        ));
+                    }
                     Err(ApprovalWaitError::ObserverUnavailable) => {
                         return Err(format!(
                             "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
@@ -4141,6 +4173,23 @@ impl CliSseEdgeHost<'_> {
                 };
 
                 if response.is_approved() {
+                    if self.edge_admission_stop.is_cancelled()
+                        || self
+                            .effective_tool_cancel_token()
+                            .is_some_and(|token| token.is_cancelled())
+                        || self.stream_observer_error().is_some()
+                        || self
+                            .owner_auth_snapshot
+                            .as_ref()
+                            .is_some_and(|owner| !owner.is_current())
+                    {
+                        return Err(format!(
+                            "Error: {sandbox_msg} (sandbox expansion interrupted before commit)"
+                        ));
+                    }
+                    self.executor
+                        .expand_approved_sandbox_scope(scope)
+                        .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
                     let save_warning_tx = self.stream_event_tx.clone();
                     if let Some(pm) = self.perm_manager.as_mut() {
                         let workspace_untrusted = !pm.project_allow_rules_active();
@@ -4168,14 +4217,11 @@ impl CliSseEdgeHost<'_> {
                                     | astra_turn_core::permission::scope::AllowScope::User
                             )
                         ) {
-                            pm.trust_sandbox_root(expand_dir.to_path_buf());
+                            pm.trust_canonical_sandbox_root(expand_dir.to_path_buf());
                         }
                     }
                     Ok(())
                 } else {
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     Err(format!(
                         "Error: {sandbox_msg} (sandbox expansion for {tool} denied: user denied)"
                     ))
@@ -4215,6 +4261,7 @@ impl CliSseEdgeHost<'_> {
             }
             fields.extend(rejected_tool_result_fields());
             let mut outcome = Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output:
                     "Error: automatic rollback is unsupported; no tools in this batch were run."
                         .to_string(),
@@ -4232,10 +4279,11 @@ impl CliSseEdgeHost<'_> {
         for (req, outcome) in requests.iter().zip(outcomes) {
             let outcome = Arc::try_unwrap(outcome)
                 .expect("all callback owners settled before building rejected results");
+            let status = edge_tool_outcome_status(&outcome);
             for event in self.tool_completion_events(
                 req,
                 &outcome.output,
-                "failed",
+                status,
                 0,
                 outcome.tool_result_fields.as_ref(),
             ) {
@@ -4249,7 +4297,7 @@ impl CliSseEdgeHost<'_> {
                 args: req.args.clone(),
                 output: outcome.output,
                 tool_result_fields: outcome.tool_result_fields,
-                status: "failed".to_string(),
+                status: status.to_string(),
                 duration_ms: 0,
             });
         }
@@ -4334,8 +4382,8 @@ impl CliSseEdgeHost<'_> {
             biased;
             _ = self.wait_for_permission_selection() => Err(ApprovalWaitError::PermissionModePending),
             _ = self.edge_admission_stop.cancelled() => Err(ApprovalWaitError::AdmissionClosed),
-            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Ok(chat_stream::ApprovalResponse::Deny),
-            result = response => Ok(result.unwrap_or(chat_stream::ApprovalResponse::Deny)),
+            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Err(ApprovalWaitError::AdmissionClosed),
+            result = response => result.map_err(|_| ApprovalWaitError::InterfaceUnavailable(chat_stream::InteractiveRequestEnqueueError::Unavailable)),
             _ = async {
                 if let Some(tx) = &self.stream_event_tx { tx.closed().await } else { std::future::pending::<()>().await }
             } => {
@@ -4472,7 +4520,7 @@ impl CliSseEdgeHost<'_> {
                 "permission",
                 "Auto-denied cloud approval for {tool}: {error}"
             );
-            return Ok(ApprovalDecision::Deny);
+            return Err(ApprovalWaitError::InterfaceUnavailable(error));
         }
 
         let response = self
@@ -5600,7 +5648,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
 
         if call_count > max_calls {
             // Hard cap exceeded — return a stub telling the LLM to stop.
-            let body = if let Some((cached_out, _)) =
+            let mut body = if let Some((cached_out, _)) =
                 self.validated_cache_entry(&dedup_sig, tool, args)
             {
                 format!(
@@ -5618,7 +5666,21 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     call_count, max_calls,
                 )
             };
-            let status = "failed";
+            body.push_str("\nThis suppressed attempt did not run.");
+            if let Some(workdir) = args.get("workdir").and_then(Value::as_str) {
+                let requested =
+                    astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
+                        workdir, 512,
+                    );
+                let active = self.executor.effective_project_root();
+                let active =
+                    astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
+                        &active.to_string_lossy(),
+                        512,
+                    );
+                body.push_str(&format!(" Requested workdir: `{requested}`; active workspace: `{active}`. Check the intended directory and the original rejection before another attempt."));
+            }
+            let status = "rejected";
             let result = self
                 .finish_edge_tool_with_fields(
                     request,
@@ -6176,214 +6238,37 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     if self.edge_admission_stop.is_cancelled() {
                         tool_execution_marked_error = outcome.is_error;
                         outcome.output
-                    } else if let Some(expand_dir) =
-                        self.sandbox_expansion_scope(args, &sandbox_msg)
+                    } else if let Some(scope) =
+                        self.sandbox_expansion_scope(tool, args, &sandbox_msg, &outcome)
                     {
-                        let execution_cancel = self.effective_tool_cancel_token();
-                        if let Some(pm) = &mut self.perm_manager {
-                            let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                            let guard_args = serde_json::json!({
-                                "reason": sandbox_msg.clone(),
-                                "directory": expand_dir.to_string_lossy(),
-                            });
-                            let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                                Some(&mut **pm),
-                                &sandbox_tool_key,
-                                &guard_args,
-                            );
-                            let approved = match decision {
-                                crate::cli::permission_manager::GateOutcome::Allow => true,
-                                crate::cli::permission_manager::GateOutcome::Deny(_) => false,
-                                crate::cli::permission_manager::GateOutcome::NeedApproval {
-                                    header,
-                                    detail,
-                                    reason,
-                                    ..
-                                } => {
-                                    if let Some(tx) = &self.approval_request_tx {
-                                        use crate::cli::chat_stream::ApprovalResponse;
-                                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                        // `🔒 ` prefix visually marks sandbox-escape
-                                        // prompts; header/detail/reason otherwise
-                                        // come straight from the permission manager
-                                        // so we don't echo the same text thrice.
-                                        let response =
-                                            match chat_stream::enqueue_interactive_request(
-                                                tx,
-                                                chat_stream::ApprovalRequest::bare(
-                                                    sandbox_tool_key.clone(),
-                                                    format!("🔒 {header}"),
-                                                    detail,
-                                                    reason,
-                                                    guard_args.clone(),
-                                                    resp_tx,
-                                                ),
-                                            ) {
-                                                Ok(()) => self
-                                                    .wait_for_approval_response(
-                                                        resp_rx,
-                                                        execution_cancel.as_ref(),
-                                                    )
-                                                    .await
-                                                    .unwrap_or(ApprovalResponse::Deny),
-                                                Err(error) => {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Auto-denied sandbox expansion {sandbox_tool_key}: {error}"
-                                                    );
-                                                    ApprovalResponse::Deny
-                                                }
-                                            };
-                                        if self.edge_admission_stop.is_cancelled() {
-                                            false
-                                        } else {
-                                            let pm = self.perm_manager.as_mut().expect(
-                                                "permission owner retained across approval wait",
-                                            );
-                                            let selected_scope = response.always_scope(
-                                            astra_turn_core::permission::scope::AllowScope::Project,
-                                        );
-                                            match selected_scope {
-                                            Some(astra_turn_core::permission::scope::AllowScope::Project) => {
-                                                // Persistent: writes a tool-level allow
-                                                // rule to settings for future sessions.
-                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                                let remember_preview =
-                                                    astra_turn_core::permission::match_target::remember_preview(
-                                                        &sandbox_tool_key,
-                                                        &guard_args,
-                                                        "in this workspace",
-                                                    );
-                                                pm.add_allow_rule(&rule);
-                                                if let Some(err) = pm.take_last_save_error() {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
-                                                    );
-                                                    let event = chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                        ),
-                                                    );
-                                                    if let Some(tx) = &self.shared.stream_event_tx {
-                                                        try_send_stream_event(tx, event.clone());
-                                                    }
-                                                    if let Some(sink) = &self.shared.stream_event_sink {
-                                                        sink.send(event);
-                                                    }
-                                                }
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::RestOfSession,
-                                            ) => {
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::User,
-                                            ) => {
-                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                                let remember_preview =
-                                                    astra_turn_core::permission::match_target::remember_preview(
-                                                        &sandbox_tool_key,
-                                                        &guard_args,
-                                                        "for this user",
-                                                    );
-                                                pm.add_user_allow_rule(&rule);
-                                                if let Some(err) = pm.take_last_save_error() {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
-                                                    );
-                                                    let event = chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                        ),
-                                                    );
-                                                    if let Some(tx) = &self.shared.stream_event_tx {
-                                                        try_send_stream_event(tx, event.clone());
-                                                    }
-                                                    if let Some(sink) = &self.shared.stream_event_sink {
-                                                        sink.send(event);
-                                                    }
-                                                }
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::OnceThisCall
-                                                | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
-                                            )
-                                            | None => {}
-                                        }
-                                            if matches!(
-                                            selected_scope,
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::Project
-                                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
-                                                    | astra_turn_core::permission::scope::AllowScope::User
-                                            )
-                                        ) {
-                                            pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                        }
-                                            response.is_approved()
-                                        }
-                                    } else if self.shared.render_policy.is_silent() {
-                                        // Sub-run mode: auto-deny sandbox expansion
-                                        astra_core::agent_warn!(
-                                            "permission",
-                                            "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
-                                        );
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                        false
-                                    } else {
-                                        // Issue #326 P0 (tui-only) / #331:
-                                        // legacy interactive stdin path is dead
-                                        // code now that the REPL is gone. With
-                                        // no approval channel and not silent =
-                                        // configuration mismatch, fail closed.
-                                        astra_core::agent_warn!(
-                                            "permission",
-                                            "Auto-denied sandbox expansion {sandbox_tool_key}: \
-                                             no approval sink installed (no TUI, not silent). \
-                                             Pass --mode auto or attach to a TUI session. reason={reason}"
-                                        );
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                        false
-                                    }
-                                }
-                            };
-                            if approved
-                                && !self.edge_admission_stop.is_cancelled()
-                                && self.stream_observer_error().is_none()
+                        match self
+                            .resolve_sandbox_expansion_approval(tool, &sandbox_msg, &scope)
+                            .await
+                        {
+                            Ok(())
+                                if !self.edge_admission_stop.is_cancelled()
+                                    && self.stream_observer_error().is_none() =>
                             {
-                                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-                                    astra_core::agent_warn!(
-                                        "sandbox",
-                                        "post-approval expansion rejected: {e}"
-                                    );
-                                }
                                 outcome = execute_with_invocation_metadata_responsive(
-                                    std::sync::Arc::clone(&self.executor),
-                                    tool.to_string(),
-                                    args.clone(),
+                                    std::sync::Arc::clone(&self.executor), tool.to_string(), args.clone(),
                                     astra_tools::tool_engine::ToolInvocationMetadata {
                                         admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval),
                                         ..invocation
-                                    },
-                                    self.effective_tool_cancel_token(),
-                                )
-                                .await;
+                                    }, self.effective_tool_cancel_token(),
+                                ).await;
                                 normalize_sandbox_denied_outcome(&mut outcome);
                                 tool_result_fields = outcome.tool_result_fields;
                                 tool_execution_marked_error = outcome.is_error;
                                 outcome.output
-                            } else {
+                            }
+                            Ok(()) => {
                                 tool_execution_marked_error = true;
                                 format!("Error: {sandbox_msg}")
                             }
-                        } else {
-                            tool_execution_marked_error = outcome.is_error;
-                            outcome.output
+                            Err(error) => {
+                                tool_execution_marked_error = true;
+                                error
+                            }
                         }
                     } else {
                         tool_execution_marked_error = true;
@@ -6524,6 +6409,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     reason: Some("Approval interrupted before a decision was submitted".into()),
                 };
             }
+            Err(ApprovalWaitError::InterfaceUnavailable(error)) => (
+                astra_thin_client::ApprovalDecision::Deny,
+                Some(format!("Approval unavailable: {error}")),
+            ),
             Err(ApprovalWaitError::ObserverUnavailable) => (
                 astra_thin_client::ApprovalDecision::Deny,
                 Some("Approval unavailable: stream observer closed".to_string()),
@@ -6643,6 +6532,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     });
                     continue;
                 }
+                Err(ApprovalWaitError::InterfaceUnavailable(error)) => (
+                    astra_thin_client::ApprovalDecision::Deny,
+                    Some(format!("Approval unavailable: {error}")),
+                ),
                 Err(ApprovalWaitError::ObserverUnavailable) => (
                     astra_thin_client::ApprovalDecision::Deny,
                     Some("Approval unavailable: stream observer closed".to_string()),
@@ -6968,6 +6861,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         let unstarted = |message: &str| {
                             (
                                 crate::edge_tools::ToolExecutionOutcome {
+                                    sandbox_approval_scope: None,
                                     tool_result_fields: Some(rejected_tool_result_fields()),
                                     ..crate::edge_tools::ToolExecutionOutcome::error(
                                         message.to_string(),
@@ -7224,7 +7118,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 let tool = req.tool.clone();
                 let args = req.args.clone();
                 let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
+                let Some(expand_dir) =
+                    self.sandbox_expansion_scope(&tool, &args, &sandbox_msg, &outputs[pos].0)
+                else {
                     parallel_outcome_mut(&mut outputs[pos].0).output =
                         crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
                             &tool,
@@ -7233,6 +7129,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 };
+                let scope = expand_dir;
+                let expand_dir = scope.path();
+                let mut approved_response = None;
                 let guard_args = serde_json::json!({
                     "reason": sandbox_msg.clone(),
                     "directory": expand_dir.to_string_lossy(),
@@ -7318,17 +7217,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                     }
                                     response
                                 }
-                                Err(error) => {
-                                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
-                                        "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
-                                    );
-                                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                                    Ok(ApprovalResponse::Deny)
-                                }
+                                Err(error) => Err(ApprovalWaitError::InterfaceUnavailable(error)),
                             };
-                            let approval_interrupted = response.is_err();
-                            let observer_unavailable =
-                                matches!(response, Err(ApprovalWaitError::ObserverUnavailable));
+                            let wait_error = response.as_ref().err().copied();
                             let response = response.unwrap_or(ApprovalResponse::Deny);
                             self.drain_parallel_callbacks(
                                 &mut callback_tasks,
@@ -7349,49 +7240,56 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                 &callback_target.token,
                                 &mut callback_failure,
                             );
-                            if stop_new_executions.is_cancelled() {
-                                break 'resolve;
-                            }
-                            if observer_unavailable {
-                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
-                                    "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
-                                );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                            } else if !callback_failure.is_empty() {
+                            // One selection owner: delivery/owner errors outrank
+                            // interface errors, then the actual local decision.
+                            if !callback_failure.is_empty() {
                                 parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                                 );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             } else if !owner_verified {
                                 parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because execution was cancelled or its original account could not be confirmed)"
                                 );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                            } else if !approval_interrupted
-                                && let Some(pm) = self.perm_manager.as_mut()
-                            {
-                                if response.is_approved() {
-                                    let workspace_untrusted = !pm.project_allow_rules_active();
-                                    let always_scope = approval_default_always_scope(
-                                        &approval_scope_context_for_tool(
-                                            &approval_tool,
-                                            &guard_args,
-                                            false,
-                                            workspace_untrusted,
-                                        ),
-                                    );
-                                    let save_warning_tx = self.shared.stream_event_tx.clone();
-                                    apply_approval_memory_action(
-                                        pm,
-                                        approval_memory_action(&response, always_scope, true),
-                                        &approval_tool,
-                                        &guard_args,
-                                        response.match_target(),
-                                        save_warning_tx.as_ref(),
-                                    );
-                                } else {
-                                    pm.record_approval(&approval_tool, Some(&guard_args), false);
+                            } else if let Some(error) = wait_error {
+                                match error {
+                                    ApprovalWaitError::ObserverUnavailable => {
+                                        parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                            "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
+                                        );
+                                    }
+                                    ApprovalWaitError::InterfaceUnavailable(error) => {
+                                        parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                            "Error: {sandbox_msg} (approval unavailable: {error})"
+                                        );
+                                    }
+                                    ApprovalWaitError::AdmissionClosed
+                                    | ApprovalWaitError::PermissionModePending => {
+                                        let cancelled = self
+                                            .cancel_token
+                                            .is_some_and(|token| token.is_cancelled());
+                                        if cancelled
+                                            || tokio::time::Instant::now() >= execution_deadline
+                                        {
+                                            note_sandbox_retry_unavailable(
+                                                parallel_outcome_mut(&mut outputs[pos].0),
+                                                cancelled,
+                                            );
+                                        } else {
+                                            parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                                "Error: {sandbox_msg} (sandbox expansion interrupted before a decision)"
+                                            );
+                                        }
+                                    }
                                 }
+                            } else if response.is_approved() {
+                                approved_response = Some((approval_tool, response.clone()));
+                            } else {
+                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                    "Error: {sandbox_msg} (sandbox expansion denied: user denied)"
+                                );
+                            }
+                            if stop_new_executions.is_cancelled() {
+                                break 'resolve;
                             }
                             response.is_approved()
                                 && owner_verified
@@ -7454,12 +7352,39 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
-                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-                    astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+                if let Err(error) = self.executor.expand_approved_sandbox_scope(&scope) {
+                    parallel_outcome_mut(&mut outputs[pos].0).output =
+                        format!("Error: {sandbox_msg} ({error})");
                     break 'resolve;
                 }
-                if let Some(pm) = &mut self.perm_manager {
-                    pm.record_approval(&sandbox_tool_key, Some(&args), true);
+                if let Some((approval_tool, response)) = approved_response
+                    && let Some(pm) = self.perm_manager.as_mut()
+                {
+                    let always_scope =
+                        approval_default_always_scope(&approval_scope_context_for_tool(
+                            &approval_tool,
+                            &guard_args,
+                            false,
+                            !pm.project_allow_rules_active(),
+                        ));
+                    apply_approval_memory_action(
+                        pm,
+                        approval_memory_action(&response, always_scope, true),
+                        &approval_tool,
+                        &guard_args,
+                        response.match_target(),
+                        self.shared.stream_event_tx.as_ref(),
+                    );
+                    if matches!(
+                        response.always_scope(always_scope),
+                        Some(
+                            astra_turn_core::permission::scope::AllowScope::Project
+                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                | astra_turn_core::permission::scope::AllowScope::User
+                        )
+                    ) {
+                        pm.trust_canonical_sandbox_root(expand_dir.to_path_buf());
+                    }
                 }
                 let retry = catch_tool_execution_panic(execute_with_invocation_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
@@ -7596,7 +7521,7 @@ pub(crate) struct TurnResult {
     /// Time to first token in milliseconds (streaming latency).
     pub(crate) ttft_ms: Option<u64>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
-    pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
+    pub(crate) edge_tool_round: Vec<ScopedEdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
     pub(crate) refreshed_token: Option<String>,
     /// Callback or session-lease failure observed by this physical stream.
@@ -8920,6 +8845,19 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
     edge_tool_result_status(outcome.is_error, outcome.tool_result_fields.as_ref())
 }
 
+/// Preserve specific errors/cancellation, while projecting consistent
+/// pre-start facts through both sequential and batch result publication.
+fn edge_tool_terminal_status<'a>(status: &'a str, fields: Option<&Map<String, Value>>) -> &'a str {
+    if status != "cancelled"
+        && tool_result_status_is_failure(status)
+        && astra_tools::execution_outcome::execution_was_not_started(fields)
+    {
+        "rejected"
+    } else {
+        status
+    }
+}
+
 fn edge_tool_result_status(is_error: bool, fields: Option<&Map<String, Value>>) -> &'static str {
     if !is_error {
         "completed"
@@ -8929,7 +8867,7 @@ fn edge_tool_result_status(is_error: bool, fields: Option<&Map<String, Value>>) 
     }) {
         "cancelled"
     } else {
-        "failed"
+        edge_tool_terminal_status("failed", fields)
     }
 }
 
@@ -8937,28 +8875,10 @@ fn normalize_sandbox_denied_outcome(
     outcome: &mut crate::edge_tools::ToolExecutionOutcome,
 ) -> Option<String> {
     let fields = outcome.tool_result_fields.as_ref()?;
-    let started = fields.get("execution_started").and_then(Value::as_bool);
-    let fact = fields.get("execution_fact").and_then(Value::as_str);
     if !outcome.is_error
         || fields.get("error_kind").and_then(Value::as_str)
             != Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
-        || (started != Some(false) && fact != Some("not_executed"))
-        || fields
-            .get("execution_started")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || fields
-            .get("execution_fact")
-            .is_some_and(|value| value.as_str() != Some("not_executed"))
-        || fields
-            .get("disposition")
-            .is_some_and(|value| value.as_str() != Some("rejected"))
-        || fields
-            .get("executed")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || fields
-            .get("side_effects_maybe")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || astra_tools::execution_outcome::outcome_is_unknown(Some(fields))
+        || !astra_tools::execution_outcome::execution_was_rejected(Some(fields))
     {
         return None;
     }
@@ -8998,6 +8918,7 @@ where
         Ok(output) => (output, t0.elapsed().as_millis() as u64),
         Err(payload) => (
             crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: format!(
                     "Tool execution panicked: {}",
                     panic_payload_summary(payload.as_ref())
@@ -9388,7 +9309,6 @@ pub(crate) async fn consume_turn_sse(
         let edge_tool_round = scoped_results
             .into_iter()
             .filter(|result| host.scoped_result_belongs_to_foreground(result))
-            .map(|result| result.result)
             .collect();
         let lw = host.render().lines_written;
         let md = host.render().md.take();
@@ -9446,10 +9366,7 @@ pub(crate) async fn consume_turn_sse(
                 .await;
         let lw = render.lines_written;
         let md = render.md.take();
-        let tool_results = std::mem::take(&mut result.tool_results)
-            .into_iter()
-            .map(|result| result.result)
-            .collect();
+        let tool_results = std::mem::take(&mut result.tool_results);
         (
             result,
             tool_results,
@@ -10306,7 +10223,7 @@ mod tests {
             assert_eq!(marker.exists(), !read_only);
             assert_eq!(
                 result.tool_results[0].status,
-                if read_only { "failed" } else { "completed" }
+                if read_only { "rejected" } else { "completed" }
             );
         }
 
@@ -10383,7 +10300,7 @@ mod tests {
                     (args).clone(),
                 ))
                 .await;
-            assert_eq!(result.status, "failed", "{}", result.output);
+            assert_eq!(result.status, "rejected", "{}", result.output);
             assert!(
                 result.output.contains("Approval is unavailable"),
                 "{}",
@@ -13535,15 +13452,19 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            host.sandbox_expansion_scope(
-                &serde_json::json!({
-                    "command": "find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"
-                }),
-                "sandbox policy denied this workspace command",
-            ),
-            Some(project.clone())
+        let mut diagnostic_only = crate::edge_tools::ToolExecutionOutcome::error(
+            "sandbox policy denied this workspace command".into(),
         );
+        diagnostic_only.tool_result_fields = Some(
+            serde_json::json!({"sandbox_approval_directory":external})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(host.sandbox_expansion_scope(
+            "bash", &serde_json::json!({"command":"find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"}),
+            "sandbox policy denied this workspace command", &diagnostic_only,
+        ).is_none(), "neither prose nor serialized diagnostic paths can supply approval authority");
 
         let expanded = host
             .preflight_explicit_path_sandbox_expansion(
@@ -14711,7 +14632,7 @@ mod tests {
             assert!(
                 results
                     .iter()
-                    .all(|result| result.status == "failed" && result.duration_ms == 0)
+                    .all(|result| result.status == "rejected" && result.duration_ms == 0)
             );
             assert!(results.iter().all(|result| {
                 !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result)
@@ -14812,7 +14733,7 @@ mod tests {
                 .iter()
                 .map(|result| result.status.as_str())
                 .collect::<Vec<_>>(),
-            ["completed", "failed", "completed", "failed", "failed"]
+            ["completed", "failed", "completed", "rejected", "rejected"]
         );
         assert!(
             results[2].output.contains("Error: literal file content"),
@@ -14833,6 +14754,770 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_cwd_approval_preserves_exact_trailing_characters() {
+        for suffix in [";", " ", "' ", ")", ","] {
+            for command in ["pwd", "printf ran > marker"] {
+                for auto in [false, true] {
+                    let (fixture, _) = ParallelBatchFixture::new().await;
+                    let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                    let project = base.path().join("project");
+                    let cwd = base.path().join(format!("review{suffix}"));
+                    std::fs::create_dir(&project).unwrap();
+                    std::fs::create_dir(&cwd).unwrap();
+                    let mut cache = EdgeToolCache::new(8);
+                    let mut manager =
+                        crate::cli::permission_manager::PermissionManager::with_project(
+                            false, &project,
+                        );
+                    manager.set_mode(if auto {
+                        crate::cli::permission_manager::PermissionMode::Auto
+                    } else {
+                        crate::cli::permission_manager::PermissionMode::Prompt
+                    });
+                    let (approval_tx, mut approvals) =
+                        tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(4);
+                    let responder = tokio::spawn(async move {
+                        while let Some(request) = approvals.recv().await {
+                            request
+                                .response_tx
+                                .send(chat_stream::ApprovalResponse::AllowOnce)
+                                .unwrap();
+                        }
+                    });
+                    let mut host = fixture.host(&project, &mut cache, None);
+                    host.perm_manager = Some(&mut manager);
+                    host.approval_request_tx = Some(approval_tx);
+                    let results = host
+                        .execute_tools_batch(vec![parallel_batch_request(
+                            "owner",
+                            "cwd",
+                            "bash",
+                            serde_json::json!({"command":command, "workdir":cwd}),
+                        )])
+                        .await;
+                    assert_eq!(results[0].status, "completed", "{}", results[0].output);
+                    if command == "pwd" {
+                        assert_eq!(
+                            results[0]
+                                .output
+                                .strip_suffix('\n')
+                                .unwrap_or(&results[0].output),
+                            cwd.to_str().unwrap()
+                        );
+                    } else {
+                        assert_eq!(std::fs::read_to_string(cwd.join("marker")).unwrap(), "ran");
+                    }
+                    assert!(!project.join("marker").exists());
+                    assert!(
+                        host.executor
+                            .resolve_checked(base.path().to_str().unwrap())
+                            .is_err(),
+                        "only the exact existing cwd is approved"
+                    );
+                    assert_eq!(host.executor.effective_project_root(), project);
+                    responder.abort();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_unapprovable_cwd_alias_never_prompts_or_grants_its_target() {
+        use std::os::unix::ffi::OsStringExt;
+        for non_utf8 in [false, true] {
+            for auto in [false, true] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                let project = base.path().join("project");
+                std::fs::create_dir(&project).unwrap();
+                let target = if non_utf8 {
+                    base.path()
+                        .join(std::ffi::OsString::from_vec(b"directory-\xff".to_vec()))
+                } else {
+                    base.path().join("ordinary")
+                };
+                std::fs::create_dir(&target).unwrap();
+                let alias = if non_utf8 {
+                    base.path().join("alias")
+                } else {
+                    let sensitive = base.path().join(".ssh");
+                    std::fs::create_dir(&sensitive).unwrap();
+                    sensitive.join("alias")
+                };
+                std::os::unix::fs::symlink(&target, &alias).unwrap();
+                let mut cache = EdgeToolCache::new(8);
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false, &project,
+                );
+                manager.set_mode(if auto {
+                    crate::cli::permission_manager::PermissionMode::Auto
+                } else {
+                    crate::cli::permission_manager::PermissionMode::Prompt
+                });
+                let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+                let mut host = fixture.host(&project, &mut cache, None);
+                host.perm_manager = Some(&mut manager);
+                host.approval_request_tx = Some(tx);
+                let results = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    host.execute_tools_batch(vec![parallel_batch_request(
+                        "owner",
+                        "unapprovable",
+                        "bash",
+                        serde_json::json!({"command":"pwd", "workdir":alias}),
+                    )]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+                assert!(
+                    approvals.try_recv().is_err(),
+                    "unapprovable paths do not prompt"
+                );
+                assert!(
+                    !host
+                        .executor
+                        .sandbox_policy
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .is_path_allowed(&target),
+                    "no target grant"
+                );
+                assert!(
+                    host.executor
+                        .resolve_checked(base.path().to_str().unwrap())
+                        .is_err(),
+                    "no ancestor grant"
+                );
+                assert_eq!(
+                    results[0].tool_result_fields.as_ref().unwrap()["execution_started"],
+                    false
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_sandbox_wait_preserves_channel_and_decision_causes() {
+        for cause in ["deny", "deadline", "dropped", "busy", "closed"] {
+            let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let outside = base.path().join("outside");
+            let next_dir = base.path().join("next-outside");
+            for path in [&project, &outside, &next_dir] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let inside = project.join("inside.txt");
+            let denied = outside.join("private.txt");
+            let next_file = next_dir.join("next.txt");
+            std::fs::write(&inside, "initial").unwrap();
+            std::fs::write(&denied, "must-not-read").unwrap();
+            std::fs::write(&next_file, "next-approved").unwrap();
+            let link = project.join("current.txt");
+            retarget_symlink(&link, &inside);
+            let _held_capacity = hold_all_but_one_tool_execution_slot().await;
+            let mut cache = EdgeToolCache::new(8);
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(1);
+            let reserved = if cause == "busy" {
+                Some(tx.clone().reserve_owned().await.unwrap())
+            } else {
+                None
+            };
+            if cause == "closed" {
+                approvals.close();
+            }
+            let mut host = fixture.host(&project, &mut cache, None);
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let executor = host.executor.clone();
+            let mut file_request = parallel_batch_request(
+                "owner",
+                "parallel-read",
+                "read_file",
+                serde_json::json!({"path":link}),
+            );
+            if cause == "deadline" {
+                file_request.execution_timeout_ms = 2_000;
+                file_request.execution_deadline_at =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            }
+            let mut execution = Box::pin(
+                host.execute_tools_batch(vec![parallel_recall("owner", "memory"), file_request]),
+            );
+            let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut execution => panic!("memory must hold the execution slot: {result:?}"), arrival = arrivals.recv() => arrival.unwrap() }
+            }).await.unwrap();
+            retarget_symlink(&link, &denied);
+            release.send(()).unwrap();
+            let mut held_response = None;
+            if !matches!(cause, "busy" | "closed") {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! { result = &mut execution => panic!("parallel read must request approval: {result:?}"), request = approvals.recv() => request.unwrap() }
+                }).await.unwrap();
+                match cause {
+                    "deny" => approval
+                        .response_tx
+                        .send(chat_stream::ApprovalResponse::Deny)
+                        .unwrap(),
+                    "deadline" => held_response = Some(approval.response_tx),
+                    _ => drop(approval.response_tx),
+                }
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+                .await
+                .unwrap();
+            drop(held_response);
+            drop(reserved);
+            let result = &results[1];
+            assert_eq!(result.status, "rejected", "{}", result.output);
+            let expected = match cause {
+                "deny" => "user denied",
+                "deadline" => "sandbox retry deadline expired",
+                "busy" => "interactive request queue is busy",
+                _ => "interactive request surface is unavailable",
+            };
+            assert!(
+                result.output.contains(expected),
+                "{cause}: {}",
+                result.output
+            );
+            assert!(!result.output.contains("must-not-read"));
+            if cause != "deny" {
+                assert!(!result.output.contains("user denied"));
+            }
+            assert!(executor.resolve_checked(denied.to_str().unwrap()).is_err());
+            let posts = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = posts
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "parallel-read")
+                .unwrap();
+            assert_eq!(body["output"], result.output);
+            assert_eq!(body["status"], result.status);
+            assert_eq!(body["tool_result_fields"]["execution_started"], false);
+            if matches!(cause, "deny" | "deadline" | "dropped") {
+                let mut next = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+                    "owner",
+                    "parallel-next",
+                    "read_file",
+                    serde_json::json!({"path":next_file}),
+                )]));
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! { result = &mut next => panic!("next call must still request approval: {result:?}"), request = approvals.recv() => request.unwrap() }
+                }).await.unwrap();
+                approval
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+                let results = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].status, "completed", "{}", results[0].output);
+                assert!(results[0].output.contains("next-approved"));
+                assert!(executor.resolve_checked(denied.to_str().unwrap()).is_err());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_denial_preserves_callback_and_model_facts_for_all_interface_causes() {
+        for batch in [false, true] {
+            for cause in ["dropped", "busy", "closed", "denied"] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let count = if batch { 2 } else { 1 };
+                Mock::given(method("POST"))
+                    .and(path("/approval/respond"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .expect(count)
+                    .mount(&fixture.callbacks)
+                    .await;
+                let workspace = tempdir().unwrap();
+                let mut cache = EdgeToolCache::new(8);
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false,
+                    workspace.path(),
+                );
+                manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+                let (tx, mut approvals) =
+                    tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+                let reserved = if cause == "busy" {
+                    Some(tx.clone().reserve_owned().await.unwrap())
+                } else {
+                    None
+                };
+                if cause == "closed" {
+                    approvals.close();
+                }
+                let mut host = fixture.host(workspace.path(), &mut cache, None);
+                host.perm_manager = Some(&mut manager);
+                host.approval_request_tx = Some(tx);
+                let requests: Vec<_> = (0..count)
+                    .map(
+                        |i| astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                            session_id: Some("session".into()),
+                            run_id: Some("run".into()),
+                            request_id: format!("unavailable-{i}"),
+                            tool: "bash".into(),
+                            approval_kind: astra_thin_client::ApprovalKind::Standard,
+                            detail: Some(r#"{"command":"touch marker"}"#.into()),
+                            display_label: None,
+                        },
+                    )
+                    .collect();
+                let consume = async {
+                    if matches!(cause, "dropped" | "denied") {
+                        for _ in 0..count {
+                            let request = approvals.recv().await.unwrap();
+                            if cause == "denied" {
+                                request
+                                    .response_tx
+                                    .send(chat_stream::ApprovalResponse::Deny)
+                                    .unwrap();
+                            } else {
+                                drop(request.response_tx);
+                            }
+                        }
+                    }
+                };
+                let resolve = async {
+                    if batch {
+                        host.resolve_approvals_batch(&requests, Some("session"), Some("run"))
+                            .await
+                    } else {
+                        vec![
+                            host.resolve_approval(
+                                &requests[0].request_id,
+                                "bash",
+                                astra_thin_client::ApprovalKind::Standard,
+                                Some("session"),
+                                Some("run"),
+                                requests[0].detail.as_deref(),
+                                None,
+                            )
+                            .await,
+                        ]
+                    }
+                };
+                let (results, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(resolve, consume)
+                    })
+                    .await
+                    .unwrap();
+                drop(reserved);
+                assert_eq!(results.len(), count as usize);
+                assert!(!host.edge_admission_stop.is_cancelled());
+                assert!(host.callback_failure.is_none());
+                assert!(host.cloud_pre_approved.is_empty());
+                let posts = fixture.callbacks.received_requests().await.unwrap();
+                assert_eq!(posts.len(), count as usize);
+                for (request, result) in requests.iter().zip(results) {
+                    assert_eq!(result.decision, "deny");
+                    let expected_reason = match cause {
+                        "busy" => Some("Approval unavailable: interactive request queue is busy"),
+                        "denied" => None,
+                        _ => {
+                            Some("Approval unavailable: interactive request surface is unavailable")
+                        }
+                    };
+                    assert_eq!(result.reason.as_deref(), expected_reason);
+                    let body: Value = posts
+                        .iter()
+                        .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                        .find(|body| body["request_id"] == request.request_id)
+                        .unwrap();
+                    assert_eq!(body["decision"], "deny");
+                    assert_eq!(body["reason"].as_str(), expected_reason);
+                    assert_eq!(body["session_id"], "session");
+                    assert_eq!(body["run_id"], "run");
+                    use astra_turn_core::cloud::tool_delivery::{
+                        CloudApprovalResult, approval_denial_delivery, parse_cloud_approval_outcome,
+                    };
+                    let CloudApprovalResult::Denied { reason } =
+                        parse_cloud_approval_outcome(Some(&body))
+                    else {
+                        panic!("callback must retain its denied decision")
+                    };
+                    let call = serde_json::json!({"id": request.request_id, "function":{"name":"bash","arguments":request.detail}});
+                    let delivered = approval_denial_delivery(&call, reason.as_deref());
+                    let model: Value = serde_json::from_str(
+                        delivered.tool_messages[0]["content"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(model["error"], "approval_denied");
+                    assert_eq!(
+                        model["reason"].as_str(),
+                        Some(expected_reason.unwrap_or_default())
+                    );
+                    let directive = model["directive"].as_str().unwrap();
+                    assert!(directive.contains("Approval was denied"));
+                    assert!(directive.contains("NOT executed"));
+                    assert!(!directive.contains("User feedback"));
+                    assert!(!directive.contains("The user"));
+                    assert!(!directive.contains("Do NOT retry"));
+                    assert_eq!(
+                        delivered.tool_results[0]
+                            .tool_result_fields
+                            .as_ref()
+                            .unwrap()["execution_started"],
+                        false
+                    );
+                }
+                assert!(!workspace.path().join("marker").exists());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sandbox_call_denial_or_interrupted_wait_does_not_deny_the_session() {
+        // Bash is serialized by the canonical tool policy.
+        for expired in [false, true] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let first = base.path().join("first");
+            let second = base.path().join("second");
+            for path in [&project, &first, &second] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let mut cache = EdgeToolCache::new(8);
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, &mut cache, None);
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let mut request = parallel_batch_request(
+                "owner",
+                "first-denied",
+                "bash",
+                serde_json::json!({"command":"pwd", "workdir":first}),
+            );
+            if expired {
+                request.execution_timeout_ms = 2_000;
+                request.execution_deadline_at =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                request.command_timeout_cap_ms = Some(2_000);
+            }
+            let requests = vec![request];
+            let mut execution = Box::pin(host.execute_tools_batch(requests));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut execution => panic!("expected first prompt: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            let mut held = Some(approval.response_tx);
+            if !expired {
+                held.take()
+                    .unwrap()
+                    .send(chat_stream::ApprovalResponse::Deny)
+                    .unwrap();
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+                .await
+                .unwrap();
+            drop(held);
+            assert_ne!(results[0].status, "completed");
+            if !expired {
+                assert!(
+                    results[0].output.contains("user denied"),
+                    "{}",
+                    results[0].output
+                );
+            }
+            let callbacks = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = callbacks
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "first-denied")
+                .unwrap();
+            assert_eq!(body["output"], results[0].output);
+            assert_eq!(body["status"], results[0].status);
+
+            if expired {
+                assert!(
+                    !results[0].output.contains("user denied"),
+                    "{}",
+                    results[0].output
+                );
+            }
+            assert!(
+                host.executor
+                    .resolve_checked(first.to_str().unwrap())
+                    .is_err()
+            );
+            let mut next = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+                "owner",
+                "next-allowed",
+                "bash",
+                serde_json::json!({"command":"pwd", "workdir":second}),
+            )]));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut next => panic!("a previous per-call denial must not deny this request: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            approval
+                .response_tx
+                .send(chat_stream::ApprovalResponse::AllowOnce)
+                .unwrap();
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+                .await
+                .unwrap();
+            assert_eq!(results[0].status, "completed", "{}", results[0].output);
+            assert_eq!(
+                results[0]
+                    .output
+                    .strip_suffix('\n')
+                    .unwrap_or(&results[0].output),
+                second.to_str().unwrap()
+            );
+            assert!(
+                host.executor
+                    .resolve_checked(first.to_str().unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_approval_rejects_replaced_or_vanished_directory_before_remembering_it() {
+        for replacement in ["symlink", "directory", "missing"] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let approved = base.path().join("approved");
+            let other = base.path().join("other");
+            for path in [&project, &approved, &other] {
+                std::fs::create_dir(path).unwrap();
+            }
+            std::fs::write(approved.join("note"), "original-must-not-run").unwrap();
+            std::fs::write(other.join("note"), "replacement-must-not-run").unwrap();
+            let mut cache = EdgeToolCache::new(8);
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, &mut cache, None);
+            let executor = host.executor.clone();
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let requests = vec![parallel_batch_request(
+                "owner",
+                "replace",
+                "bash",
+                serde_json::json!({"command":"cat note", "workdir":approved}),
+            )];
+            let mut batch = Box::pin(host.execute_tools_batch(requests));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut batch => panic!("expected prompt: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            std::fs::rename(&approved, base.path().join("original")).unwrap();
+            match replacement {
+                "symlink" => std::os::unix::fs::symlink(&other, &approved).unwrap(),
+                "directory" => {
+                    std::fs::create_dir(&approved).unwrap();
+                    std::fs::write(approved.join("note"), "replacement-must-not-run").unwrap();
+                }
+                _ => {}
+            }
+            approval
+                .response_tx
+                .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                .unwrap();
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+                .await
+                .unwrap();
+            assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+            assert!(!results[0].output.contains("must-not-run"));
+            assert_eq!(
+                results[0].tool_result_fields.as_ref().unwrap()["execution_started"],
+                false
+            );
+            for path in [&approved, &other, base.path()] {
+                assert!(
+                    executor.resolve_checked(path.to_str().unwrap()).is_err(),
+                    "no failed scope or parent grant: {path:?}"
+                );
+            }
+            drop(host);
+            assert!(!matches!(
+                manager.check_nonblocking(
+                    "sandbox_expand:bash",
+                    &serde_json::json!({"directory":other})
+                ),
+                crate::cli::permission_manager::GateOutcome::Allow
+            ));
+            let callbacks = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = callbacks
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "replace")
+                .unwrap();
+            assert_eq!(body["status"], "rejected");
+            assert_eq!(body["tool_result_fields"]["status"], "rejected");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_missing_target_approval_does_not_follow_a_retargeted_symlink() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let project = base.path().join("project");
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        for path in [&project, &first, &second] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(second.join("new.txt"), "must-not-read-after-retarget").unwrap();
+        let link = project.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut manager =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
+        let mut host = fixture.host(&project, &mut cache, None);
+        let executor = host.executor.clone();
+        host.perm_manager = Some(&mut manager);
+        host.approval_request_tx = Some(approval_tx);
+        let mut batch = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+            "owner",
+            "missing",
+            "bash",
+            serde_json::json!({"command":"cat link/new.txt"}),
+        )]));
+        let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut batch => panic!("missing external target must request approval: {result:?}"),
+                request = approvals.recv() => request.unwrap(),
+            }
+        }).await.unwrap();
+        retarget_symlink(&link, &second);
+        approval
+            .response_tx
+            .send(chat_stream::ApprovalResponse::AllowOnce)
+            .unwrap();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                results = &mut batch => results,
+                request = approvals.recv() => {
+                    request.unwrap().response_tx.send(chat_stream::ApprovalResponse::Deny).unwrap();
+                    batch.await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+        assert!(!results[0].output.contains("must-not-read-after-retarget"));
+        assert!(executor.resolve_checked(first.to_str().unwrap()).is_ok());
+        assert!(executor.resolve_checked(second.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_operand_approval_does_not_expand_an_already_authorized_cwd() {
+        for parallel in [false, true] {
+            for auto in [false, true] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                let project = base.path().join("project");
+                let cwd = base.path().join("allowed's checkout");
+                let denied = base.path().join("denied's checkout");
+                for path in [&project, &cwd, &denied] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                let target = denied.join("input");
+                std::fs::write(&target, "authorized-after-approval").unwrap();
+                std::os::unix::fs::symlink(&target, cwd.join("link")).unwrap();
+                let mut cache = EdgeToolCache::new(8);
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false, &project,
+                );
+                manager.set_mode(if auto {
+                    crate::cli::permission_manager::PermissionMode::Auto
+                } else {
+                    crate::cli::permission_manager::PermissionMode::Prompt
+                });
+                let mut host = fixture.host(&project, &mut cache, None);
+                host.executor.expand_sandbox_path(cwd.clone()).unwrap();
+                host.perm_manager = Some(&mut manager);
+                let request = parallel_batch_request(
+                    "owner",
+                    "operand",
+                    "bash",
+                    serde_json::json!({"command":"cat link", "workdir":cwd}),
+                );
+                let results = if parallel {
+                    host.execute_tools_batch(vec![
+                        request,
+                        parallel_batch_request(
+                            "owner",
+                            "sibling",
+                            "list_dir",
+                            serde_json::json!({}),
+                        ),
+                    ])
+                    .await
+                } else {
+                    host.execute_tools_batch(vec![request]).await
+                };
+                let result = &results[0];
+                if auto {
+                    assert_eq!(result.status, "completed", "{}", result.output);
+                    assert!(result.output.contains("authorized-after-approval"));
+                    assert!(
+                        host.executor
+                            .resolve_checked(target.to_str().unwrap())
+                            .is_ok()
+                    );
+                    assert!(
+                        host.executor
+                            .resolve_checked(base.path().to_str().unwrap())
+                            .is_err(),
+                        "do not approve the common parent"
+                    );
+                } else {
+                    assert_eq!(result.status, "rejected", "{}", result.output);
+                    assert_eq!(
+                        result.tool_result_fields.as_ref().unwrap()["status"],
+                        "rejected"
+                    );
+                    assert!(!result.output.contains("authorized-after-approval"));
+                    assert!(
+                        host.executor
+                            .resolve_checked(target.to_str().unwrap())
+                            .is_err()
+                    );
+                }
+                let callbacks = fixture.callbacks.received_requests().await.unwrap();
+                let body: Value = callbacks
+                    .iter()
+                    .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+                    .find(|body| body["request_id"] == "operand")
+                    .unwrap();
+                assert_eq!(body["status"], result.status);
+                if !auto {
+                    assert_eq!(body["tool_result_fields"]["status"], body["status"]);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn parallel_batch_preflights_external_paths_in_auto_mode() {
         let server = MockServer::start().await;
@@ -15031,7 +15716,7 @@ mod tests {
                 args: serde_json::json!({"path": first, "transaction_id": 1}),
             }])
             .await;
-        assert_eq!(rejected[0].status, "failed");
+        assert_eq!(rejected[0].status, "rejected");
         assert!(
             !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&rejected[0])
                 .was_executed()
@@ -15073,7 +15758,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn expired_server_deadline_posts_failed_callback_without_executing_tool() {
+    async fn expired_server_deadline_posts_rejected_callback_without_executing_tool() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -15141,7 +15826,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "failed");
+        assert_eq!(results[0].status, "rejected");
         assert!(results[0].output.contains("deadline expired"));
         assert!(
             !target.exists(),
@@ -15156,7 +15841,7 @@ mod tests {
         let callback: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("json callback");
         assert_eq!(callback["request_id"], "expired-1");
-        assert_eq!(callback["status"], "failed");
+        assert_eq!(callback["status"], "rejected");
         assert_eq!(callback["tool_result_fields"]["disposition"], "rejected");
         assert_eq!(callback["tool_result_fields"]["execution_started"], false);
         assert!(
@@ -15439,7 +16124,7 @@ mod tests {
                 .find(|result| result.request_id == "denied-read")
                 .unwrap()
                 .status,
-            "failed"
+            "rejected"
         );
         assert!(executor.resolve_checked(&target.to_string_lossy()).is_err());
         assert!(
@@ -15695,113 +16380,149 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn callback_rejection_closes_an_outstanding_sandbox_approval() {
-        let (mut fixture, mut arrivals) = ParallelBatchFixture::new().await;
-        let release_rejection = std::sync::Arc::new(tokio::sync::Notify::new());
-        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-        let router = axum::Router::new().route(
-            "/tools/result",
-            axum::routing::post({
-                let gate = release_rejection.clone();
-                let received = received.clone();
-                move |axum::Json(body): axum::Json<Value>| {
-                    let gate = gate.clone();
-                    let received = received.clone();
-                    async move {
-                        let reject = body["request_id"] == "rejected-memory";
-                        received.lock().unwrap().push(body);
-                        let status = if reject {
-                            gate.notified().await;
-                            axum::http::StatusCode::FORBIDDEN
-                        } else {
-                            axum::http::StatusCode::OK
-                        };
-                        (status, axum::Json(serde_json::json!({"ok": !reject})))
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        fixture.api = astra_thin_client::ThinClient::new(
-            &format!("http://{}", listener.local_addr().unwrap()),
-            None,
-        )
-        .unwrap();
-        let callback_server =
-            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        let project = base.path().join("project");
-        let outside = base.path().join("outside");
-        std::fs::create_dir(&project).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        let outside_path = outside.join("private.txt");
-        let inside_path = project.join("inside.txt");
-        std::fs::write(&outside_path, "not approved").unwrap();
-        std::fs::write(&inside_path, "initially allowed").unwrap();
-        let path = project.join("current.txt");
-        retarget_symlink(&path, &inside_path);
-        // Leave one slot for the memory sibling. The file tool cannot execute
-        // until the symlink is retargeted after batch preflight.
-        let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut pm =
-            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
-        pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
-        let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
-        host.perm_manager = Some(&mut pm);
-        host.approval_request_tx = Some(approval_tx);
-        let executor = host.executor.clone();
-        let requests = vec![
-            parallel_recall("first", "rejected-memory"),
-            parallel_batch_request(
-                "second",
-                "sandbox-read",
-                "read_file",
-                serde_json::json!({"path": path}),
-            ),
-        ];
-        let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
-        let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = &mut batch => panic!("memory sibling must start"),
-                arrival = arrivals.recv() => arrival.unwrap(),
+        struct CallbackWake(tokio::sync::Notify);
+        impl std::task::Wake for CallbackWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.notify_one();
             }
-        })
-        .await
-        .unwrap();
-        retarget_symlink(&path, &outside_path);
-        release.send(()).unwrap();
-        let mut approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = &mut batch => panic!("sandbox approval must be requested"),
-                request = approvals.recv() => request.unwrap(),
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                self.0.notify_one();
             }
-        })
-        .await
-        .unwrap();
-        release_rejection.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                biased;
-                _ = approval.response_tx.closed() => {},
-                _ = &mut batch => panic!("the approval receiver must close first"),
-            }
-        })
-        .await
-        .expect("failed callback closes the obsolete approval");
-        let results = batch.await;
-        assert_eq!(results[1].status, "failed");
-        assert!(executor.resolve_checked(&path.to_string_lossy()).is_err());
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), requests.len());
-        for request in &requests {
-            assert!(
-                received
-                    .iter()
-                    .any(|body| body["request_id"] == request.request_id)
-            );
         }
-        callback_server.abort();
+        for drop_responder in [false, true] {
+            let (mut fixture, mut arrivals) = ParallelBatchFixture::new().await;
+            let release_rejection = std::sync::Arc::new(tokio::sync::Notify::new());
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let router = axum::Router::new().route(
+                "/tools/result",
+                axum::routing::post({
+                    let gate = release_rejection.clone();
+                    let received = received.clone();
+                    move |axum::Json(body): axum::Json<Value>| {
+                        let gate = gate.clone();
+                        let received = received.clone();
+                        async move {
+                            let reject = body["request_id"] == "rejected-memory";
+                            received.lock().unwrap().push(body);
+                            let status = if reject {
+                                gate.notified().await;
+                                axum::http::StatusCode::FORBIDDEN
+                            } else {
+                                axum::http::StatusCode::OK
+                            };
+                            (status, axum::Json(serde_json::json!({"ok": !reject})))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            fixture.api = astra_thin_client::ThinClient::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                None,
+            )
+            .unwrap();
+            let callback_server =
+                tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let outside = base.path().join("outside");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let outside_path = outside.join("private.txt");
+            let inside_path = project.join("inside.txt");
+            std::fs::write(&outside_path, "not approved").unwrap();
+            std::fs::write(&inside_path, "initially allowed").unwrap();
+            let path = project.join("current.txt");
+            retarget_symlink(&path, &inside_path);
+            // Leave one slot for the memory sibling. The file tool cannot execute
+            // until the symlink is retargeted after batch preflight.
+            let _held_capacity = hold_all_but_one_tool_execution_slot().await;
+            let mut cache = EdgeToolCache::new(8);
+            let mut pm =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, &mut cache, None);
+            host.perm_manager = Some(&mut pm);
+            host.approval_request_tx = Some(approval_tx);
+            let executor = host.executor.clone();
+            let requests = vec![
+                parallel_recall("first", "rejected-memory"),
+                parallel_batch_request(
+                    "second",
+                    "sandbox-read",
+                    "read_file",
+                    serde_json::json!({"path": path}),
+                ),
+            ];
+            let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
+            let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("memory sibling must start"),
+                    arrival = arrivals.recv() => arrival.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            retarget_symlink(&path, &outside_path);
+            release.send(()).unwrap();
+            let mut approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("sandbox approval must be requested"),
+                    request = approvals.recv() => request.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            let results = if drop_responder {
+                // Poll the suspended batch with a dedicated waker. With the HTTP
+                // response held, its callback JoinSet can only wake when released.
+                let signal = std::sync::Arc::new(CallbackWake(tokio::sync::Notify::new()));
+                {
+                    let waker = std::task::Waker::from(signal.clone());
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    assert!(std::future::Future::poll(batch.as_mut(), &mut cx).is_pending());
+                }
+                release_rejection.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), signal.0.notified())
+                    .await
+                    .unwrap();
+                drop(approval.response_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+                    .await
+                    .unwrap()
+            } else {
+                release_rejection.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { biased; _ = approval.response_tx.closed() => {}, _ = &mut batch => panic!("the approval receiver must close first") }
+            }).await.expect("failed callback closes the obsolete approval");
+                batch.await
+            };
+            assert!(
+                results[1]
+                    .output
+                    .contains("earlier result could not be confirmed"),
+                "{}",
+                results[1].output
+            );
+            assert_eq!(results[1].status, "rejected");
+            assert!(executor.resolve_checked(&path.to_string_lossy()).is_err());
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), requests.len());
+            for request in &requests {
+                assert!(
+                    received
+                        .iter()
+                        .any(|body| body["request_id"] == request.request_id)
+                );
+            }
+            let body = received
+                .iter()
+                .find(|body| body["request_id"] == "sandbox-read")
+                .unwrap();
+            assert_eq!(body["output"], results[1].output);
+            callback_server.abort();
+        }
     }
 
     #[cfg(unix)]
@@ -15874,7 +16595,7 @@ mod tests {
             .iter()
             .find(|r| r.request_id == "sandbox-read")
             .unwrap();
-        assert_eq!(denied.status, "failed");
+        assert_eq!(denied.status, "rejected");
         assert!(!denied.output.contains("TOP-SECRET-CONTENT"));
         assert!(executor.resolve_checked(&link.to_string_lossy()).is_err());
         assert_eq!(
@@ -16206,7 +16927,7 @@ mod tests {
         })
         .await
         .expect("sandbox denial must be delivered during cancellation");
-        assert_eq!(denied_result["status"], "failed");
+        assert_eq!(denied_result["status"], "rejected");
         assert_eq!(
             denied_result["tool_result_fields"]["error_kind"],
             "sandbox_denied"
@@ -16454,6 +17175,7 @@ mod tests {
             edge_agent_id: body.edge_agent_id,
             tool: tool.to_string(),
             outcome: std::sync::Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: body.output,
                 tool_result_fields: body.tool_result_fields,
                 is_error: false,
@@ -17066,7 +17788,7 @@ mod tests {
         drop(batch);
         assert_eq!(results.len(), 3);
         for result in results {
-            assert_eq!(result.status, "failed");
+            assert_eq!(result.status, "rejected");
             assert_eq!(
                 result.tool_result_fields.as_ref().unwrap()["execution_fact"],
                 "not_executed"
@@ -19203,6 +19925,7 @@ mod tests {
         );
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: operation blocked by local policy".to_string(),
             tool_result_fields: Some(fields),
             is_error: true,
@@ -19233,6 +19956,7 @@ mod tests {
             fields.insert("execution_fact".into(), serde_json::json!(fact));
             fields.insert("side_effects_maybe".into(), serde_json::json!(effects));
             let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: "SANDBOX_DENIED: ordinary output".into(),
                 tool_result_fields: Some(fields),
                 is_error,
@@ -19245,6 +19969,7 @@ mod tests {
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         fields.insert("executed".into(), Value::Null);
         let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: outside".into(),
             tool_result_fields: Some(fields),
             is_error: true,
@@ -19579,8 +20304,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_tool_rejection_uses_consistent_non_execution_facts() {
+        use super::edge_tool_result_status;
+        use serde_json::Map;
+        let mut fields = Map::new();
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
+        assert_eq!(edge_tool_result_status(true, Some(&fields)), "rejected");
+        assert_eq!(edge_tool_result_status(false, Some(&fields)), "completed");
+        for (key, value) in [
+            ("execution_started", Value::Bool(true)),
+            ("execution_fact", Value::String("unknown".into())),
+            ("side_effects_maybe", Value::Bool(true)),
+            ("disposition", Value::String("executed".into())),
+        ] {
+            let mut contradictory = fields.clone();
+            contradictory.insert(key.into(), value);
+            assert_eq!(
+                edge_tool_result_status(true, Some(&contradictory)),
+                "failed"
+            );
+        }
+        fields.insert("status".into(), Value::String("cancelled".into()));
+        fields.insert("error_kind".into(), Value::String("cancelled".into()));
+        assert_eq!(edge_tool_result_status(true, Some(&fields)), "cancelled");
+    }
+
+    #[test]
     fn edge_tool_outcome_status_prefers_structured_error_flag() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "plain body from failing transport".to_string(),
             tool_result_fields: None,
             is_error: true,
@@ -19593,6 +20346,7 @@ mod tests {
         for started in [false, true] {
             let result = astra_tools::cancelled_tool_result("bash", started);
             let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: result.output,
                 tool_result_fields: result.metadata,
                 is_error: result.is_error,
@@ -19606,13 +20360,17 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .remove("error_kind");
-            assert_eq!(edge_tool_outcome_status(&outcome), "failed");
+            assert_eq!(
+                edge_tool_outcome_status(&outcome),
+                if started { "failed" } else { "rejected" }
+            );
         }
     }
 
     #[test]
     fn edge_tool_outcome_status_keeps_agent_interrupted_as_completed_tool_call() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: serde_json::json!({
                 "status": "interrupted",
                 "finish_reason": "budget_exhausted",
@@ -19629,6 +20387,7 @@ mod tests {
     #[test]
     fn successful_outcome_body_cannot_create_a_failed_terminal_status() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: a successful file read returned this first line".to_string(),
             tool_result_fields: None,
             is_error: false,
@@ -20729,7 +21488,7 @@ mod tests {
             .await;
         assert_eq!(first.status, "completed", "{}", first.output);
         assert_eq!(second.status, "completed", "{}", second.output);
-        assert_eq!(third.status, "failed");
+        assert_eq!(third.status, "rejected");
         assert!(third.output.contains("Duplicate call skipped"));
 
         host.tool_cache.output_cache.insert(
@@ -20788,7 +21547,7 @@ mod tests {
                 (args).clone(),
             ))
             .await;
-        assert_eq!(same_round_third.status, "failed");
+        assert_eq!(same_round_third.status, "rejected");
 
         let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
         host.on_accepted_sse_event(&missing_request)
@@ -20802,7 +21561,7 @@ mod tests {
                 (args).clone(),
             ))
             .await;
-        assert_eq!(after_missing.status, "failed");
+        assert_eq!(after_missing.status, "rejected");
 
         let mismatched =
             provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
@@ -20815,7 +21574,7 @@ mod tests {
                 (args).clone(),
             ))
             .await;
-        assert_eq!(after_mismatch.status, "failed");
+        assert_eq!(after_mismatch.status, "rejected");
     }
 
     #[test]
@@ -20937,7 +21696,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         for result in &results {
-            assert_eq!(result.status, "failed");
+            assert_eq!(result.status, "rejected");
             assert!(result.output.contains("automatic rollback is unsupported"));
             let fields = result.tool_result_fields.as_ref().unwrap();
             assert_eq!(fields.get("execution_started"), Some(&Value::Bool(false)));
@@ -21068,7 +21827,7 @@ mod tests {
             }),
         ));
         assert_eq!(
-            no_op.status, "failed",
+            no_op.status, "rejected",
             "no-op must remain a visible tool error"
         );
         let no_op_fields = no_op
@@ -21086,6 +21845,8 @@ mod tests {
             "a no-op correction must not undo the earlier successful edit"
         );
 
+        // No mutation alone does not prove that the tool never started.
+        // Keep failures unless the producer explicitly supplies no-start facts.
         let batch_no_op = execute_one!(request(
             "same-file-batch-no-op",
             "str_replace",
@@ -21786,7 +22547,7 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(result.status, "failed");
+        assert_eq!(result.status, "rejected");
         assert!(
             result.output.contains(
                 "name-based process killing commands (`pkill` / `killall`) are not allowed"

@@ -170,19 +170,17 @@ fn denied_tool_content(reason: Option<&str>) -> String {
     let safe_reason = reason.map(|value| {
         astra_text_utils::credential_redaction::redact_credentials_for_display(value).0
     });
-    let mut parts = vec!["The user REJECTED this tool call. The tool was NOT executed."];
-    let feedback_line;
+    // The protocol records a denied approval, not who made that decision.
+    // Interface failure, policy and explicit denial share this projection.
+    let mut parts = vec!["Approval was denied. The tool was NOT executed."];
+    let reason_line;
     if let Some(r) = safe_reason.as_deref().filter(|s| !s.is_empty()) {
-        feedback_line = format!("User feedback: \"{r}\"");
-        parts.push(&feedback_line);
+        reason_line = format!("Approval reason: \"{r}\"");
+        parts.push(&reason_line);
     }
-    parts.push(
-        "IMPORTANT: Do NOT retry this exact approach. \
-         Ask the user how to proceed, or try a safer alternative.",
-    );
     let directive = parts.join("\n");
     json!({
-        "error": "user_denied",
+        "error": "approval_denied",
         "reason": safe_reason.unwrap_or_default(),
         "directive": directive,
     })
@@ -396,7 +394,7 @@ fn journal_decision_to_cloud_result(
     Some(result)
 }
 
-/// Terminal edge delivery for an explicit user denial.
+/// Terminal edge delivery for a denied approval, without inferring its source.
 pub fn approval_denial_delivery(tc: &Value, reason: Option<&str>) -> EdgeToolRoundDelivery {
     let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
     let tool_name = tc
@@ -1902,18 +1900,19 @@ mod tests {
         let s = denied_tool_content(Some(
             "policy violation; AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE",
         ));
-        assert!(s.contains("user_denied"));
+        assert!(s.contains("approval_denied"));
         assert!(s.contains("policy violation"));
         assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(s.contains("REJECTED"));
-        assert!(s.contains("Do NOT retry"));
+        assert!(s.contains("Approval was denied"));
+        assert!(!s.contains("Do NOT retry"));
+        assert!(!s.contains("User feedback"));
     }
 
     #[test]
     fn denied_tool_content_without_reason() {
         let s = denied_tool_content(None);
-        assert!(s.contains("user_denied"));
-        assert!(s.contains("REJECTED"));
+        assert!(s.contains("approval_denied"));
+        assert!(s.contains("Approval was denied"));
         // No "User feedback" line when reason is absent
         assert!(!s.contains("User feedback"));
     }
@@ -1931,7 +1930,7 @@ mod tests {
         let r = persist_denied_tool_result(&tc, Some("no"));
         assert_eq!(r["tool_call_id"], "call_123");
         assert_eq!(r["name"], "write_file");
-        assert!(r["result"].as_str().unwrap().contains("user_denied"));
+        assert!(r["result"].as_str().unwrap().contains("approval_denied"));
     }
 
     #[test]
@@ -1977,13 +1976,13 @@ mod tests {
             .expect("result must be a string (stringified JSON directive)");
         let parsed: Value =
             serde_json::from_str(result_str).expect("result is valid JSON string payload");
-        assert_eq!(parsed["error"].as_str(), Some("user_denied"));
+        assert_eq!(parsed["error"].as_str(), Some("approval_denied"));
         assert_eq!(parsed["reason"].as_str(), Some("path outside workspace"));
         assert!(
             parsed["directive"]
                 .as_str()
                 .unwrap()
-                .starts_with("The user REJECTED this tool call."),
+                .starts_with("Approval was denied. The tool was NOT executed."),
             "directive must open with the canonical rejection sentence"
         );
     }

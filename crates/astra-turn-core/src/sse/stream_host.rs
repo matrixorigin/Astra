@@ -229,7 +229,7 @@ impl ToolBatchRequest {
             output: astra_text_utils::credential_redaction::redact_credentials_for_display(&error)
                 .0,
             tool_result_fields: Some(fields),
-            status: "failed".into(),
+            status: "rejected".into(),
             duration_ms: 0,
         }
     }
@@ -3882,7 +3882,7 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.approval_results.len(), 1);
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].status, "failed");
+        assert_eq!(result.tool_results[0].status, "rejected");
         assert_eq!(
             result.tool_results[0]
                 .tool_result_fields

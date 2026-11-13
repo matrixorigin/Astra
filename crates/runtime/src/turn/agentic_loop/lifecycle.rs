@@ -1024,7 +1024,7 @@ struct ParallelAgentSummary {
     /// Terminality is ownership state, not outcome quality.  A failed or
     /// cancelled child is no longer live and must not block parent synthesis.
     terminal: bool,
-    successful: bool,
+    normal_result_available: bool,
     completed_result: Option<String>,
     partial_result: Option<String>,
     incomplete_reason: Option<String>,
@@ -1034,7 +1034,7 @@ struct ParallelAgentSummary {
 struct CompletedParallelAgent {
     label: String,
     /// The provider-observed terminal result may have been compacted from the
-    /// bounded required-context lane after repeated leases. Terminal success
+    /// bounded required-context lane after repeated leases. Result observation
     /// remains authoritative even when this presentation copy is gone.
     result: Option<String>,
 }
@@ -1089,7 +1089,7 @@ fn apply_parallel_agent_budget_projection(
     }
     if projection.terminal {
         entry.terminal = true;
-        entry.successful = projection.successful;
+        entry.normal_result_available = projection.normal_result_available;
         entry.completed_result = projection.completed_result.clone();
         entry.partial_result = projection.partial_result.clone();
         entry.incomplete_reason = projection.incomplete_reason.clone();
@@ -1136,7 +1136,7 @@ fn collect_parallel_agent_budget_rollup(
                     // provider observation. After two provider leases the
                     // host deliberately compacts the presentation result,
                     // so missing `result` is not a child failure.
-                    entry.successful = true;
+                    entry.normal_result_available = true;
                     entry.completed_result = observed_result;
                     entry.partial_result = None;
                     entry.incomplete_reason = None;
@@ -1150,10 +1150,12 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                entry.successful.then_some(CompletedParallelAgent {
-                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
-                    result: entry.completed_result.clone(),
-                })
+                entry
+                    .normal_result_available
+                    .then_some(CompletedParallelAgent {
+                        label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                        result: entry.completed_result.clone(),
+                    })
             })
         })
         .collect();
@@ -1161,7 +1163,7 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                if !entry.terminal || entry.successful {
+                if !entry.terminal || entry.normal_result_available {
                     return None;
                 }
                 Some(TerminalParallelAgentIssue {
@@ -1220,7 +1222,7 @@ fn parallel_agent_budget_exhaustion_summary(
         " You can continue in the next message."
     };
     let mut lines = vec![format!(
-        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated without a result; {} remain live. Check each result to determine whether its work is complete.{}]",
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated with an execution issue or without an available normal result; {} remain live. Check each result to determine whether its work is complete.{}]",
         current_agentic_step(state),
         rollup.completed.len(),
         rollup.terminal_issues.len(),

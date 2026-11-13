@@ -2683,6 +2683,12 @@ impl PermissionManager {
         let Ok(canonical) = std::fs::canonicalize(root) else {
             return;
         };
+        self.trust_canonical_sandbox_root(canonical);
+    }
+
+    /// Store the already committed scope. Resolving it again could trust a
+    /// replacement symlink rather than the directory the user approved.
+    pub(crate) fn trust_canonical_sandbox_root(&mut self, canonical: PathBuf) {
         if !self.trusted_sandbox_roots.iter().any(|r| r == &canonical) {
             self.trusted_sandbox_roots.push(canonical);
             self.publish_permission_policy();
@@ -6918,5 +6924,28 @@ mod tests {
     #[test]
     fn parse_sandbox_target_path_returns_none_for_unrelated_reason() {
         assert!(parse_sandbox_target_path("some other error").is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn committed_scope_trust_does_not_resolve_a_replacement_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let committed = allowed.canonicalize().unwrap();
+        std::fs::rename(&allowed, tmp.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(&other, &allowed).unwrap();
+        let mut manager = PermissionManager::new(false);
+        manager.trust_canonical_sandbox_root(committed.clone());
+        assert_eq!(manager.trusted_sandbox_roots, vec![committed]);
+        assert!(!super::path_under_trusted_roots(
+            &other,
+            &manager.trusted_sandbox_roots
+        ));
+        assert!(!super::path_under_trusted_roots(
+            &allowed,
+            &manager.trusted_sandbox_roots
+        ));
     }
 }
