@@ -289,6 +289,21 @@ Reflection also requires both grants because candidate responses can contain
 existing memory content. The canonical port resolves this compound requirement;
 MOI checks both grants against one fresh workspace/identity resolution. Generic
 ports must return matching backend/owner identities for their read/write checks.
+
+Ordinary explicit mutations (`remember`, `update`, `forget`, `feedback`) return
+gateway-owned receipts, not raw backend records. A deduplicated store or a
+correction can otherwise return metadata inherited from an existing memory,
+exposing it through write-only authority. Receipts retain confirmed memory IDs,
+purge counts, newly created snapshot/feedback identifiers and bounded status
+categories. Backend warning text is replaced by a local purge warning, and
+mutation HTTP errors retain their structured status/remediation without the
+upstream body. Pending/partial statuses remain distinguishable from completed
+writes. Empty success responses retain their existing operation semantics;
+`remember` still requires an exact nonempty memory ID. This projection is shared
+by direct and Server-proxy tools for every grant; it adds no read request or
+authorization lookup. Reading a resulting record requires a separate authorized
+read operation. Reflection remains the compound read/write operation above.
+
 An active account, permission to chat,
 a provider signature or an old UI capability projection is insufficient.
 Ordinary Roles do not receive these grants by default. Every operation resolves

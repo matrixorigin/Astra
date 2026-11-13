@@ -508,6 +508,90 @@ fn memory_operation_requires_write(operation: &str) -> bool {
     )
 }
 
+fn snapshot_transport_error(error: reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else {
+        "transport"
+    };
+    format!("memoria snapshot request failed: {kind}")
+}
+
+/// A mutation can return a deduplicated record or metadata inherited from an
+/// older record. Write authority permits its receipt, not that stored content.
+/// Project every ordinary write the same way, without an additional read grant.
+fn memory_write_receipt(operation: &str, body: &str) -> Option<Value> {
+    if !memory_operation_requires_write(operation) || operation == "reflect" {
+        return None;
+    }
+    let invalid = || json!({"error":"memory backend returned a malformed write receipt"});
+    let Ok(response) = serde_json::from_str::<Value>(body) else {
+        return Some(invalid());
+    };
+    if !response.is_object() {
+        return Some(invalid());
+    }
+    if response.get("error").is_some_and(|error| !error.is_null())
+        || response.get("success") == Some(&Value::Bool(false))
+        || matches!(
+            response.get("status").and_then(Value::as_str),
+            Some("error" | "failed")
+        )
+    {
+        return Some(json!({"error":"memory backend rejected the write"}));
+    }
+    let status = match response.get("status").and_then(Value::as_str) {
+        None | Some("ok" | "success" | "completed" | "created" | "updated" | "deleted") => {
+            "completed"
+        }
+        Some(status @ ("queued" | "pending" | "accepted" | "partial")) => status,
+        Some(_) => return Some(invalid()),
+    };
+    let mut receipt = json!({"status":status});
+    if operation == "remember" || (operation == "update" && response.get("memory_id").is_some()) {
+        let id = match astra_memoria::confirmed_memory_id(&response) {
+            Ok(id) => id,
+            Err(error) => return Some(json!({"error":error})),
+        };
+        receipt["memory_id"] = json!(id);
+    }
+    if operation == "forget" {
+        for key in [
+            "purged",
+            "deleted_count",
+            "requested_count",
+            "unresolved_count",
+        ] {
+            if let Some(count) = response.get(key).and_then(Value::as_u64) {
+                receipt[key] = json!(count);
+            }
+        }
+        if response
+            .get("warning")
+            .is_some_and(|warning| !warning.is_null())
+        {
+            receipt["warning"] = json!(
+                "The memory service reported a purge warning; verify the returned counts before assuming all requested memories were removed."
+            );
+        }
+    }
+    let receipt_keys: &[&str] = match operation {
+        "forget" => &["snapshot_name"],
+        "feedback" => &["feedback_id", "memory_id"],
+        _ => &[],
+    };
+    for &key in receipt_keys {
+        if let Some(id) = response.get(key).and_then(Value::as_str)
+            && astra_memoria::validate_memory_id(id).is_ok()
+        {
+            receipt[key] = json!(id);
+        }
+    }
+    Some(receipt)
+}
+
 /// Whether a prompt-facing memory response represents service availability,
 /// rather than a caller/validation/content error.
 ///
@@ -560,11 +644,16 @@ fn format_memory_http_error(
     body: &str,
 ) -> String {
     const MAX_DETAIL_CHARS: usize = 512;
-    let detail = body
-        .trim()
-        .chars()
-        .take(MAX_DETAIL_CHARS)
-        .collect::<String>();
+    // Mutation errors can also contain stored content. Status and locally
+    // generated remediation suffice without exposing an upstream response body.
+    let detail = if memory_operation_requires_write(op) {
+        String::new()
+    } else {
+        body.trim()
+            .chars()
+            .take(MAX_DETAIL_CHARS)
+            .collect::<String>()
+    };
     let memory_id = args
         .get("memory_id")
         .and_then(Value::as_str)
@@ -1250,7 +1339,9 @@ impl MemoriaToolGateway {
                                     Self::empty_success_response(op, args).to_string()
                                 } else {
                                     self.record_service_success();
-                                    text
+                                    memory_write_receipt(op, &text)
+                                        .map(|receipt| receipt.to_string())
+                                        .unwrap_or(text)
                                 }
                             }
                             Err(e) => {
@@ -1344,20 +1435,6 @@ impl MemoriaToolGateway {
                 lifecycle.complete(returned_memory_ids);
             }
             return decorated;
-        }
-        if op == "remember" {
-            match serde_json::from_str::<Value>(&raw_text) {
-                Ok(response) if response.get("error").is_some_and(|error| !error.is_null()) => {}
-                Ok(response) => {
-                    if let Err(error) = astra_memoria::confirmed_memory_id(&response) {
-                        return json!({"error": error}).to_string();
-                    }
-                }
-                Err(_) => {
-                    return json!({"error": "memory backend returned a malformed write receipt"})
-                        .to_string();
-                }
-            }
         }
         if op == "expand" {
             return Self::decorate_expand_response(
@@ -1528,21 +1605,21 @@ impl MemoriaToolGateway {
                 .json(&json!({"name": name}))
                 .send()
                 .await
-                .map_err(|e| format!("memoria snapshot request failed: {e}"))?;
+                .map_err(snapshot_transport_error)?;
             if response.status().is_success() {
                 return Ok(());
             }
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "memoria snapshot request failed: status={status}, body={body}"
-            ));
+            return Err(format!("memoria snapshot request failed: status={status}"));
         }
-        let Some(cloud_base) = self.cloud_base.as_deref() else {
-            return memoria_snapshot_create(name).await.map(|_| ());
-        };
-        let Some(token) = self.cloud_token.as_deref() else {
-            return memoria_snapshot_create(name).await.map(|_| ());
+        let Some((cloud_base, token)) = self.cloud_base.as_deref().zip(self.cloud_token.as_deref())
+        else {
+            // Legacy standalone transports have unstructured diagnostics.
+            // This best-effort pre-op caller logs only a local failure marker.
+            return memoria_snapshot_create(name)
+                .await
+                .map(|_| ())
+                .map_err(|_| "memoria snapshot request failed".to_string());
         };
         let client = astra_core::net::client_builder_for_target(cloud_base)
             .timeout(Duration::from_secs(5))
@@ -1554,15 +1631,12 @@ impl MemoriaToolGateway {
             .json(&json!({ "name": name }))
             .send()
             .await
-            .map_err(|e| format!("memoria snapshot request failed: {e}"))?;
+            .map_err(snapshot_transport_error)?;
         if resp.status().is_success() {
             Ok(())
         } else {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(format!(
-                "memoria snapshot request failed: status={status}, body={body}"
-            ))
+            Err(format!("memoria snapshot request failed: status={status}"))
         }
     }
 
@@ -2270,6 +2344,190 @@ mod tests {
 
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
             unreachable!("the prompt-facing gateway resolves raw tool transport")
+        }
+    }
+
+    #[tokio::test]
+    async fn write_tools_expose_only_receipts_without_requiring_read_access() {
+        for denied in [Some(false), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/snapshots"))
+                .respond_with(ResponseTemplate::new(201))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let cases = [
+                (
+                    "remember",
+                    "POST",
+                    "/v1/memories",
+                    json!({"content":"new fact"}),
+                    json!({"memory_id":"mem-after","content":"new fact","extra_metadata":{"structured_content":"PRIVATE-EXISTING-FACT"},"session_id":"PRIVATE-EXISTING-SESSION"}),
+                    json!({"status":"completed","memory_id":"mem-after"}),
+                ),
+                (
+                    "update",
+                    "PUT",
+                    "/v1/memories/mem-before/correct",
+                    json!({"memory_id":"mem-before","content":"corrected fact","reason":"user correction"}),
+                    json!({"memory_id":"mem-after","content":"corrected fact","extra_metadata":{"structured_content":"PRIVATE-EXISTING-FACT"},"session_id":"PRIVATE-EXISTING-SESSION"}),
+                    json!({"status":"completed","memory_id":"mem-after"}),
+                ),
+                (
+                    "forget",
+                    "POST",
+                    "/v1/memories/purge",
+                    json!({"memory_id":"mem-before","reason":"user request"}),
+                    json!({"purged":1,"requested_count":1,"unresolved_count":0,"snapshot_name":"pre_purge_fixture","content":"PRIVATE-EXISTING-FACT","warning":"PRIVATE-EXISTING-FACT"}),
+                    json!({"status":"completed","purged":1,"requested_count":1,"unresolved_count":0,"snapshot_name":"pre_purge_fixture","warning":"The memory service reported a purge warning; verify the returned counts before assuming all requested memories were removed."}),
+                ),
+                (
+                    "feedback",
+                    "POST",
+                    "/v1/memories/mem-before/feedback",
+                    json!({"memory_id":"mem-before","signal":"useful"}),
+                    json!({"feedback_id":"feedback-receipt","memory_id":"mem-before","signal":"useful","content":"PRIVATE-EXISTING-FACT"}),
+                    json!({"status":"completed","feedback_id":"feedback-receipt","memory_id":"mem-before"}),
+                ),
+            ];
+            let admission = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(Arc::new(
+                ToolTransportPort {
+                    transport: astra_memoria::MemoriaToolTransport {
+                        base_url: server.uri(),
+                        credential: "fixture-key".into(),
+                        owner_user_id: "fixture-owner".into(),
+                        owner_scoped_master: true,
+                    },
+                    admission: admission.clone(),
+                    denied,
+                    write_owner: None,
+                },
+            ));
+            for (op, verb, endpoint, args, backend, expected) in cases {
+                Mock::given(method(verb))
+                    .and(path(endpoint))
+                    .and(header("authorization", "Memoria-Owner fixture-key"))
+                    .and(header("x-user-id", "fixture-owner"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(backend))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let output = gateway.call(op, &args).await;
+                assert!(!memoria_output_is_error(&output), "{op}: {output}");
+                assert!(
+                    !output.contains("PRIVATE-EXISTING"),
+                    "{op} leaked stored data"
+                );
+                assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), expected);
+            }
+            assert_eq!(*admission.lock().unwrap(), vec![true; 4]);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_receipt_errors_do_not_disclose_backend_content() {
+        for (status, body) in [
+            (200, r#"{"error":{"content":"PRIVATE-EXISTING-FACT"}}"#),
+            (200, "PRIVATE-EXISTING-FACT: invalid JSON"),
+            (400, r#"{"detail":"PRIVATE-EXISTING-FACT"}"#),
+            (503, r#"{"detail":"PRIVATE-EXISTING-FACT"}"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/memory/store"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("fixture-key".into()));
+            let output = gateway
+                .call("remember", &json!({"content":"new fact"}))
+                .await;
+            assert!(memoria_output_is_error(&output), "{status}: {output}");
+            assert!(
+                !output.contains("PRIVATE-EXISTING"),
+                "{status} leaked stored data"
+            );
+            assert_eq!(
+                memory_output_indicates_service_failure(&output),
+                status == 503
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_errors_omit_upstream_content_before_logging() {
+        for mode in ["proxy", "direct", "legacy"] {
+            let direct = mode == "direct";
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(if direct || mode == "legacy" {
+                    "/v1/snapshots"
+                } else {
+                    "/memory/snapshots"
+                }))
+                .respond_with(ResponseTemplate::new(503).set_body_string("PRIVATE-EXISTING-FACT"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let _env =
+                (mode == "legacy").then(|| MemoriaEnvGuard::set(&server.uri(), "fixture-key"));
+            let gateway = if mode == "legacy" {
+                MemoriaToolGateway::new(None, None)
+            } else {
+                MemoriaToolGateway::new(Some(server.uri()), Some("fixture-key".into()))
+            };
+            let transport = astra_memoria::MemoriaToolTransport {
+                base_url: server.uri(),
+                credential: "fixture-key".into(),
+                owner_user_id: "fixture-owner".into(),
+                owner_scoped_master: true,
+            };
+            let error = gateway
+                .proxy_snapshot_create("pre_update_fixture", direct.then_some(&transport))
+                .await
+                .unwrap_err();
+            assert!(mode == "legacy" || error.contains("503"));
+            assert!(!error.contains("PRIVATE-EXISTING"));
+            assert!(!error.contains(&server.uri()));
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_receipts_preserve_incomplete_status_and_reject_false_success() {
+        for (backend, expected) in [
+            (
+                json!({"memory_id":"mem-pending","status":"queued","content":"PRIVATE-EXISTING-FACT"}),
+                json!({"memory_id":"mem-pending","status":"queued"}),
+            ),
+            (
+                json!({"memory_id":"mem-pending","success":false,"content":"PRIVATE-EXISTING-FACT"}),
+                json!({"error":"memory backend rejected the write"}),
+            ),
+            (
+                json!({"memory_id":"mem-pending","status":"PRIVATE-EXISTING-FACT"}),
+                json!({"error":"memory backend returned a malformed write receipt"}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/memory/store"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(backend))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("fixture-key".into()));
+            let output = gateway
+                .call("remember", &json!({"content":"new fact"}))
+                .await;
+            assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), expected);
+            server.verify().await;
         }
     }
 
