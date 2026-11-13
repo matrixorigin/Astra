@@ -508,9 +508,11 @@ Generic Server execution remains workspace-only. The pinned directory is checked
 against its current authorization before launch, and relative read registration
 uses its verified identity. A pre-start refusal remains `rejected` / “Did not run”
 through callbacks and transcript restoration; it is distinct from an attempted
-command that failed. Bash sandbox retries use the producer's exact
-`sandbox_denied_path` when available; ambiguous or unrepresentable targets are
-returned to the model without guessing an approval scope from error prose.
+command that failed. Bash sandbox retries use the producer's local
+`SandboxApprovalScope` handle for the exact existing directory. The
+`sandbox_approval_directory` callback field is diagnostic, not grant authority.
+Ambiguous or unrepresentable targets are returned to the model without guessing
+an approval scope from error prose.
 Callback run/call scope remains attached through root auditing. Resume joins
 existing callback facts with transcript items by that exact identity. If a
 remote transcript omits the tool row, confirmed refusals are rendered from the

@@ -6507,6 +6507,7 @@ pub(crate) mod tests {
         pub(crate) executed_model_item_ids: Vec<Option<String>>,
         pub(crate) executed_volatile: Vec<Vec<VolatileInjection>>,
         pub(crate) text_only_turns: Vec<bool>,
+        pub(crate) fanout_pagination_boundaries: Vec<Option<ForegroundFanoutPagination>>,
         pub(crate) skill_auto_route_decision: Option<String>,
         pub(crate) skill_auto_route_queries: Vec<String>,
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
@@ -6576,6 +6577,7 @@ pub(crate) mod tests {
                 provider_response_gate: None,
                 executed_volatile: Vec::new(),
                 text_only_turns: Vec::new(),
+                fanout_pagination_boundaries: Vec::new(),
                 skill_auto_route_decision: None,
                 skill_auto_route_queries: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
@@ -6845,6 +6847,13 @@ pub(crate) mod tests {
             }
             self.text_only_turns
                 .push(state.hooks.completion_settlement.text_only);
+            self.fanout_pagination_boundaries.push(
+                state
+                    .hooks
+                    .completion_settlement
+                    .foreground_fanout_pagination
+                    .clone(),
+            );
             let result = self.turn_results.remove(0);
             for edge_result in &self.admitted_results_by_turn[self.current_turn] {
                 self.valid_tools.insert(edge_result.tool.clone());
@@ -9954,35 +9963,208 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_foreground_fanout_forces_one_text_only_parent_synthesis() {
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![make_terminal_agent_fanout_edge_tool("review-group")],
-                10,
-                5,
-                None,
-            ),
-            edge_tool_result(
-                vec![make_edge_tool("read_file", "stale prior objective")],
-                10,
-                5,
-                None,
-            ),
-            text_result("Synthesized findings A, B, and C.", 10, 5, None),
-        ])
-        .with_valid_tools(&["agent_fanout", "read_file"]);
+    async fn terminal_foreground_fanout_keeps_parent_verification_available() {
+        for child_text in [
+            "Review finished; validate the conclusion against the source.",
+            "Review is incomplete; the remaining lead is unverified.",
+        ] {
+            // A replay of the fixed start can return its already-terminal group.
+            let mut fanout = make_terminal_agent_fanout_edge_tool("review-group");
+            fanout.args["group_id"] = json!("review-group");
+            fanout.args["slots"] = json!(
+                (0..3)
+                    .map(|slot| json!({
+                        "id":format!("review-{slot}"), "description":"Review code",
+                        "prompt":"Return attributed findings and any unverified leads."
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            let mut output: Value = serde_json::from_str(&fanout.output).unwrap();
+            output["results"][0]["result"] = serde_json::from_str::<Value>(
+                &astra_turn_core::orchestration::agent_result_wire::render_completed_agent_result(
+                    "child-0",
+                    child_text,
+                    Some("normal"),
+                ),
+            )
+            .unwrap();
+            fanout.output = output.to_string();
+            let mut host = MockHost::new(vec![
+                edge_tool_result(vec![fanout], 10, 5, None),
+                edge_tool_result(
+                    vec![make_edge_tool("read_file", "parent verification evidence")],
+                    10,
+                    5,
+                    None,
+                ),
+                text_result("Parent verified the remaining lead.", 10, 5, None),
+            ])
+            .with_valid_tools(&["agent_fanout", "read_file"]);
+            let mut state = make_state();
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{outcome:?}"
+            );
+            assert_eq!(host.text_only_turns, vec![false, false, false]);
+            assert!(
+                state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .any(|record| record.name == "read_file" && record.was_executed()),
+                "normal child evidence must leave permitted parent verification available"
+            );
+            assert!(
+                state
+                    .messages
+                    .iter()
+                    .any(|message| message.to_string().contains("parent verification evidence"))
+            );
+            assert_eq!(state.final_text, "Parent verified the remaining lead.");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_foreground_fanout_pages_then_allows_parent_verification() {
+        // Match the producer's default window, without aggregate re-windowing.
+        let page_bytes = 8_192_usize;
+        let child_text = format!(
+            "{}Review is incomplete; parent verification is still needed.",
+            "review evidence ".repeat(600)
+        );
+        assert!(child_text.len() > page_bytes && child_text.len() <= 2 * page_bytes);
+        let mut fanout = make_terminal_agent_fanout_edge_tool("review-group");
+        fanout.args["group_id"] = json!("review-group");
+        fanout.args["slots"] = json!(
+            (0..3)
+                .map(|slot| json!({
+                    "id":format!("review-{slot}"), "description":"Review code",
+                    "prompt":"Return attributed findings and any unverified leads."
+                }))
+                .collect::<Vec<_>>()
+        );
+        let mut output: Value = serde_json::from_str(&fanout.output).unwrap();
+        for slot in [0, 1] {
+            output["results"][slot]["result_truncated"] = json!(true);
+            output["results"][slot]["result_start_offset"] = json!(0);
+            output["results"][slot]["result_end_offset"] = json!(page_bytes);
+            output["results"][slot]["result_bytes"] = json!(child_text.len());
+            output["results"][slot]["result"]["result"] = json!(&child_text[..page_bytes]);
+            output["results"][slot]["next_call"] = json!(format!(
+                "agent_fanout(action='get_results', group_id='review-group', slot_index={slot}, offset={page_bytes}, max_bytes={page_bytes})"
+            ));
+        }
+        fanout.output = output.to_string();
+        let mut turns = vec![edge_tool_result(vec![fanout], 10, 5, None)];
+        // Arrival order is independent of slot order; each exact tail is required.
+        for slot in [1, 0] {
+            let page = json!({
+                "status":"completed","group_id":"review-group","target_count":3,
+                "active":0,"terminal":3,"completed":3,
+                "result_read":{"slot_index":slot,"offset":page_bytes,"max_bytes":page_bytes},
+                "results":[{"slot_index":slot,"result_start_offset":page_bytes,
+                    "result_end_offset":child_text.len(),"result_bytes":child_text.len(),"result_truncated":true,
+                    "result":{"result_family":"child_result","agent_id":format!("child-{slot}"),
+                        "status":"completed","result":&child_text[page_bytes..]}}]
+            });
+            let mut result = make_edge_tool_with_args(
+                "agent_fanout",
+                json!({"action":"get_results","group_id":"review-group","slot_index":slot,"offset":page_bytes,"max_bytes":page_bytes}),
+                &page.to_string(),
+            );
+            // Fanout result reads use the control-plane binding, like start.
+            result.tool_result_fields = Some(control_plane_runtime_environment_fields());
+            result.request_id = format!("review-page-{slot}");
+            turns.push(edge_tool_result(vec![result], 10, 5, None));
+        }
+        turns.push(edge_tool_result(
+            vec![make_edge_tool(
+                "read_file",
+                "verified after both result pages",
+            )],
+            10,
+            5,
+            None,
+        ));
+        turns.push(text_result(
+            "Parent checked the paginated findings.",
+            10,
+            5,
+            None,
+        ));
+        let mut host = MockHost::new(turns).with_valid_tools(&["agent_fanout", "read_file"]);
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
-        assert_eq!(host.turn_count(), 3);
-        assert_eq!(
-            state.total_tool_calls, 2,
-            "suppressed calls remain auditable"
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
         );
-        assert_eq!(state.final_text, "Synthesized findings A, B, and C.");
-        assert_eq!(host.text_only_turns, vec![false, true, true]);
+        assert!(host.text_only_turns.iter().all(|text_only| !text_only));
+        let pending_at_boundaries: Vec<_> = host
+            .fanout_pagination_boundaries
+            .iter()
+            .map(|pagination| {
+                pagination.as_ref().map(|pagination| {
+                    (
+                        pagination.group_id.as_str(),
+                        pagination.target_count,
+                        pagination.pending_slots.clone(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            pending_at_boundaries,
+            vec![
+                None,
+                Some((
+                    "review-group",
+                    3,
+                    BTreeMap::from([(0, page_bytes as u64), (1, page_bytes as u64)])
+                )),
+                Some(("review-group", 3, BTreeMap::from([(0, page_bytes as u64)]))),
+                None,
+                None,
+            ],
+            "the parent loop must observe both exact page tails before ordinary verification"
+        );
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .foreground_fanout_pagination
+                .is_none()
+        );
+        for request_id in ["review-page-1", "review-page-0"] {
+            assert!(
+                state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .any(|record| record.tool_call_id.as_deref() == Some(request_id)
+                        && record.was_executed()),
+                "missing executed page {request_id}: {:#?}",
+                state.stall.tool_call_records
+            );
+        }
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| record.name == "read_file" && record.was_executed())
+        );
+        assert!(state.messages.iter().any(|message| {
+            message
+                .to_string()
+                .contains("verified after both result pages")
+        }));
+        assert_eq!(state.final_text, "Parent checked the paginated findings.");
     }
 
     #[tokio::test]
@@ -10428,40 +10610,75 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn durable_remote_cancel_is_terminal_and_never_opens_a_second_round() {
-        let cancelled = ScriptedTurn {
-            response: HostTurnResult {
-                accum: ChatTurnSseAccum {
-                    run_id: Some("run-cancelled".to_string()),
-                    error_message: Some("Server run run-cancelled was cancelled".to_string()),
+        for after_fanout in [false, true] {
+            let cancelled = ScriptedTurn {
+                response: HostTurnResult {
+                    accum: ChatTurnSseAccum {
+                        run_id: Some("run-cancelled".to_string()),
+                        error_message: Some("Server run run-cancelled was cancelled".to_string()),
+                        error_kind: Some(astra_core::ErrorKind::Cancelled),
+                        ..ChatTurnSseAccum::default()
+                    },
+                    ttft_ms: Some(5),
+
                     error_kind: Some(astra_core::ErrorKind::Cancelled),
-                    ..ChatTurnSseAccum::default()
                 },
-                ttft_ms: Some(5),
+                edge_tool_round: Vec::new(),
+            };
+            let mut turns = Vec::new();
+            if after_fanout {
+                turns.push(edge_tool_result(
+                    vec![make_terminal_agent_fanout_edge_tool("review-before-cancel")],
+                    10,
+                    5,
+                    None,
+                ));
+            }
+            turns.push(cancelled);
+            turns.push(edge_tool_result(
+                vec![make_edge_tool(
+                    "read_file",
+                    "must never execute after cancellation",
+                )],
+                10,
+                5,
+                None,
+            ));
+            let mut host = MockHost::new(turns).with_valid_tools(&["agent_fanout", "read_file"]);
+            let mut state = make_state();
 
-                error_kind: Some(astra_core::ErrorKind::Cancelled),
-            },
-            edge_tool_round: Vec::new(),
-        };
-        let mut host = MockHost::new(vec![
-            cancelled,
-            text_result("must never execute", 10, 5, Some(42)),
-        ]);
-        let mut state = make_state();
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(matches!(
-            outcome,
-            Err(ref error) if error.kind == astra_core::ErrorKind::Cancelled
-        ));
-        assert_eq!(
-            host.current_turn, 1,
-            "an authoritative durable cancellation cannot be downgraded to a tool failure or retry"
-        );
-        assert!(
-            state.interruption.is_none(),
-            "provider cancellation without durable user proof is runtime-owned"
-        );
+            assert!(matches!(
+                outcome,
+                Err(ref error) if error.kind == astra_core::ErrorKind::Cancelled
+            ));
+            assert_eq!(
+                host.current_turn,
+                1 + usize::from(after_fanout),
+                "an authoritative durable cancellation cannot be downgraded to a tool failure or retry"
+            );
+            assert!(
+                state.interruption.is_none(),
+                "provider cancellation without durable user proof is runtime-owned"
+            );
+            assert!(
+                !state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .any(|record| record.name == "read_file" && record.was_executed())
+            );
+            if after_fanout {
+                assert!(
+                    state
+                        .stall
+                        .tool_call_records
+                        .iter()
+                        .any(|record| record.name == "agent_fanout" && record.was_executed())
+                );
+            }
+        }
     }
 
     #[tokio::test]

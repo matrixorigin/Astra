@@ -2327,7 +2327,7 @@ async fn render_agent_fanout_results(
         obj.insert(
             "instruction".into(),
             json!(
-                "Every fanout slot has terminated. Read the returned results to assess the assigned work. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Present the collected results; ask the user before starting any additional fanout."
+                "Every fanout slot has terminated. Read the returned results to assess the assigned work, and continue any needed verification directly with permitted tools while the parent work budget remains. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Report the assessed results and any remaining gaps; ask the user before starting any additional fanout."
             ),
         );
     }

@@ -49618,6 +49618,18 @@ mod tests {
             serde_json::from_str::<Value>(&rejection.result)
                 .is_ok_and(|value| value["error_kind"] == "fanout_result_pagination_pending")
         }));
+
+        // The shared observer clears this carrier after all exact tails arrive.
+        state
+            .hooks
+            .completion_settlement
+            .foreground_fanout_pagination = None;
+        let admitted = host.admit_terminal_tool_calls(&state, &calls[..1], Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"], "read-stale");
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut host, &calls[..1], Some("tool_calls"));
+        assert!(admission.rejected.is_empty());
     }
 
     #[test]
