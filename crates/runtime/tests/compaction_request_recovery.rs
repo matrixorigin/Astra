@@ -20,10 +20,18 @@ fn a_changed_request_can_compact_after_a_futile_request() {
         assert_eq!(protected, before);
     }
     assert_eq!(tracker.to_json()["consecutive_futile_attempts"], 3);
-    let mut changed: Vec<Value> = vec![json!({"role":"system","content":"required"})];
+    let mut changed: Vec<Value> = vec![
+        json!({"role":"system","content":"required"}),
+        json!({"role":"user","content":"Inspect observations"}),
+    ];
     for i in 0..20 {
-        changed.push(json!({"role":"user","content":format!("q{i}")}));
-        changed.push(json!({"role":"assistant","content":"old detail ".repeat(2_000)}));
+        let id = format!("call-{i}");
+        changed.push(json!({"role":"assistant","tool_calls":[{
+            "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+        }]}));
+        changed.push(
+            json!({"role":"tool","tool_call_id":id,"content":"observed detail ".repeat(2_000)}),
+        );
     }
     let latest = json!({"role":"user","content":"Preserve my current goal."});
     changed.push(latest.clone());

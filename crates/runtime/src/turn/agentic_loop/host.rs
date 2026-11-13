@@ -3963,9 +3963,6 @@ pub struct AgenticLoopState {
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
 
-    /// Provider-aware compaction strategy for microcompact placeholders.
-    pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
-
     // ── Approval checkpoint persistence ──
     /// Approval overrides synchronized from CLI's PermissionManager before each turn.
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
@@ -4148,7 +4145,6 @@ impl AgenticLoopState {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
-            compact_strategy: Default::default(),
             approval_overrides: None,
             session_turn: 0,
             canonical_turn_chain_id: None,
@@ -7133,7 +7129,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn restored_history_is_hydrated_before_first_round_compaction() {
+    async fn restored_history_is_hydrated_before_pressure_checks_without_losing_evidence() {
         let mut state = make_test_loop_state();
         let long_text = "history ".repeat(256);
         for index in 0..6 {
@@ -7164,15 +7160,23 @@ pub(crate) mod tests {
             .expect("the restored turn should execute");
 
         assert!(matches!(outcome, AgenticLoopOutcome::Completed));
-        assert_eq!(host.hydrated_history_snapshots, vec![admitted_history]);
+        assert_eq!(
+            host.hydrated_history_snapshots,
+            vec![admitted_history.clone()]
+        );
         assert_eq!(host.executed_messages.len(), 1);
         assert!(host.executed_messages[0].contains(&recovered));
         assert!(host.executed_messages[0].iter().any(|message| {
             message["role"] == "user" && message["content"] == "fresh follow-up"
         }));
         assert!(
-            state.context_compression_triggered,
-            "the fixture must exercise first-round resume compaction"
+            admitted_history
+                .iter()
+                .all(|message| host.executed_messages[0].contains(message))
+        );
+        assert!(
+            !state.context_compression_triggered,
+            "an unavailable summary/reader cannot claim a successful rewrite"
         );
     }
 
@@ -7823,6 +7827,19 @@ pub(crate) mod tests {
             assert!(host.handoff_snapshots.is_empty());
             assert!(host.cancelled_agent_ids.is_empty());
         }
+    }
+
+    pub(crate) fn admit_history_recovery(host: &mut MockHost, state: &mut AgenticLoopState) {
+        host.history_artifact_enabled = true;
+        state
+            .current_run_id
+            .get_or_insert_with(|| "history-recovery-run".into());
+        let source = state.messages.clone();
+        state.initialize_canonical_rewrite_proof(
+            &source,
+            &astra_turn_types::canonical_conversation_root(&source),
+            0,
+        );
     }
 
     pub(crate) fn make_state() -> AgenticLoopState {
@@ -9620,13 +9637,19 @@ pub(crate) mod tests {
             let mut state = make_state();
             state.max_turn_input_tokens = 100_000;
             state.messages.clear();
+            state
+                .messages
+                .push(json!({"role":"user","content":"Earlier inspection"}));
             for index in 0..20 {
+                let id = format!("old-{index}");
                 state
                     .messages
-                    .push(json!({"role":"user","content":format!("old question {index}")}));
-                state
-                    .messages
-                    .push(json!({"role":"assistant","content":"old answer ".repeat(200)}));
+                    .push(json!({"role":"assistant","tool_calls":[{
+                        "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                    }]}));
+                state.messages.push(
+                    json!({"role":"tool","tool_call_id":id,"content":"old evidence ".repeat(300)}),
+                );
             }
             state.messages.push(
                 json!({"role":"user","content":"Fix this; preserve the authentication boundary."}),
@@ -13312,8 +13335,6 @@ pub(crate) mod tests {
         state.max_turn_input_tokens = 80_000;
         state.current_session_id = Some(session_id.clone());
         state.current_run_id = Some("budget-recovery-run".into());
-        // Make sure tier-1 compression path fires (not tier-2 spill-only):
-        state.compact_tier_applied = CompactionTier::Normal;
         state
             .messages
             .push(json!({"role": "user", "content": "diagnose and fix the failing test"}));
@@ -13321,7 +13342,7 @@ pub(crate) mod tests {
         for i in 0..16 {
             state.messages.push(json!({
                 "role": "assistant",
-                "content": format!("step {i}: investigated something long {}", "x".repeat(200)),
+                "content": format!("step {i}: investigated something long {}", "x".repeat(2_000)),
             }));
             state.messages.push(json!({
                 "role": "user",
@@ -13329,6 +13350,7 @@ pub(crate) mod tests {
             }));
         }
 
+        admit_history_recovery(&mut host, &mut state);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must complete");
 
@@ -13364,6 +13386,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn budget_after_pre_turn_compact_still_spills_old_messages() {
+        use astra_turn_core::compaction_types::CompactionKind;
         let session_id = format!(
             "precompact-spill-{}",
             std::time::SystemTime::now()
@@ -13399,12 +13422,36 @@ pub(crate) mod tests {
                 .push(json!({"role": "user", "content": format!("follow-up {i}")}));
         }
 
+        admit_history_recovery(&mut host, &mut state);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
         assert_eq!(state.final_text, "Done after spill.");
-        assert_eq!(host.history_artifacts.len(), 1);
-        host.history_artifacts[0].validate(&session_id).unwrap();
+        let reactive = host
+            .compaction_events
+            .iter()
+            .find(|event| event.kind == CompactionKind::ReactiveBudget)
+            .unwrap();
+        assert!(reactive.tokens_freed > 0);
+        assert!(
+            90_000u64.saturating_sub(reactive.tokens_freed) as f64 / 80_000.0
+                > CompactionTier::pre_turn_trigger(80_000),
+            "the fixture still needs pressure recovery"
+        );
+        assert_eq!(host.history_artifacts.len(), 2);
+        for history in &host.history_artifacts {
+            history.validate(&session_id).unwrap();
+        }
+        assert_ne!(
+            host.history_artifacts[0].transcript_json,
+            host.history_artifacts[1].transcript_json
+        );
+        assert!(host.compaction_events.iter().any(|event| {
+            matches!(
+                event.kind,
+                CompactionKind::ProactiveDefault | CompactionKind::ProactiveAggressive
+            ) && event.tokens_freed > 0
+        }));
         let has_spill_msg = state.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
@@ -13422,73 +13469,6 @@ pub(crate) mod tests {
         assert!(
             !has_budget_wrapup_msg,
             "spill recovery should avoid injecting the hard wrap-up message"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_tier_gate_skips_mechanical_compression() {
-        // When compact_tier_applied >= CompactHistory (e.g. after a pre-turn LLM
-        // summary), handle_token_budget must NOT run the tier-1 mechanical
-        // CompactionEngine again. We verify this by populating the history
-        // with otherwise-compressible tool_result payloads: if the guard is
-        // broken, CompactionEngine would rewrite them to `[Cleared]` and the
-        // original text would disappear. With the guard honoured the messages
-        // stay intact and artifact spill (an independent tier-2 recovery) runs.
-        let session_id = format!(
-            "tier-gate-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![make_edge_tool("bash", "large output")],
-                90_000,
-                2_000,
-                Some(100),
-            ),
-            text_result("Compacted result.", 40_000, 500, None),
-        ]);
-        let mut state = make_state();
-        state.max_turn_input_tokens = 80_000;
-        state.current_session_id = Some(session_id.clone());
-        state.current_run_id = Some("budget-recovery-run".into());
-        // Simulate a pre-turn LLM compact having already run.
-        state.compact_tier_applied = CompactionTier::CompactHistory;
-        let distinctive_tool_payload = "SENTINEL_RESULT_PAYLOAD_DO_NOT_CLEAR_".repeat(200);
-        state
-            .messages
-            .push(json!({"role": "user", "content": "kick off"}));
-        state.messages.push(json!({
-            "role": "assistant",
-            "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
-            ],
-        }));
-        state.messages.push(json!({
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": distinctive_tool_payload.clone(),
-        }));
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Compacted result.");
-
-        // Either the payload still appears verbatim in live messages, OR it was
-        // moved to a durable artifact via tier-2 spill (whose system marker shows up instead).
-        // What must NOT happen: the mechanical pipeline rewriting it to
-        // `[Cleared]` in place — that would mean the tier guard failed.
-        let has_cleared_tombstone = state.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("[Cleared") && !s.contains("[Context compressed"))
-        });
-        assert!(
-            !has_cleared_tombstone,
-            "tier-1 mechanical compression must be skipped when compact_tier_applied >= CompactHistory",
         );
     }
 
@@ -14838,7 +14818,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let stats = astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
             &mut state.messages,
             0.0,
-            state.compact_strategy,
+            Default::default(),
             None,
             state.last_request_message_count,
         );

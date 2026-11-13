@@ -20988,7 +20988,7 @@ mod tests {
                     );
                     history.push(authority.clone());
                     let response = format!("{SUMMARY}\nGENERATION_{generation}");
-                    let client = MockSummaryClient::ptl_then_success(&response);
+                    let client = MockSummaryClient::success(&response);
                     let accepted = generate_inline_summary(
                         std::slice::from_ref(&stable),
                         &history,
@@ -21000,10 +21000,10 @@ mod tests {
                         &client,
                     )
                     .await
-                    .expect("valid summary after retry");
+                    .expect("valid complete-input summary");
                     let requests = client.recorded_requests();
-                    assert_eq!(requests.len(), 2);
-                    for (attempt, request) in requests.iter().enumerate() {
+                    assert_eq!(requests.len(), 1);
+                    for request in &requests {
                         assert_eq!(request.first(), Some(&stable));
                         assert_eq!(request.contains(&authority), append_only);
                         if let Some(previous) = &previous {
@@ -21069,7 +21069,7 @@ mod tests {
                             }
                         }
                         assert!(pending_tools.is_empty());
-                        assert_eq!(paired, 3 - attempt);
+                        assert_eq!(paired, 3, "a summary never omits an input tool round");
                     }
                     // Model the accepted storage envelope, then restore from
                     // serialized history before the next generation.

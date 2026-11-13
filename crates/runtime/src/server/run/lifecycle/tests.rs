@@ -2177,41 +2177,84 @@ async fn exercise_primary_continuation_entry(
         settlements: Arc<AtomicUsize>,
         tool_feedback: Arc<TokioMutex<Vec<Value>>>,
         first_request: Arc<TokioMutex<Option<Value>>>,
+        summary_requests: Arc<AtomicUsize>,
     }
     async fn respond(
         State(probe): State<Probe>,
         Json(request): Json<Value>,
     ) -> axum::response::Response {
-        probe
-            .first_request
-            .lock()
-            .await
-            .get_or_insert_with(|| request.clone());
-        if let Some(messages) = request["messages"].as_array() {
-            *probe.tool_feedback.lock().await = messages
+        let messages = request["messages"].as_array().expect("provider messages");
+        let is_summary = messages.iter().any(|message| {
+            message["content"].as_str()
+                == Some(astra_turn_core::cloud::summary::INLINE_COMPACT_INSTRUCTION)
+        });
+        let message = if is_summary {
+            assert!(
+                probe.first_request.lock().await.is_none(),
+                "summary precedes primary execution"
+            );
+            assert_eq!(request["tool_choice"], "none");
+            let input = crate::prompts::estimate_wire_input_tokens(
+                messages,
+                crate::prompts::estimate_json_value_tokens(&request["tools"]),
+            );
+            let output = request["max_completion_tokens"]
+                .as_u64()
+                .or_else(|| request["max_tokens"].as_u64())
+                .expect("summary output budget") as usize;
+            assert!(
+                input + output < 128_000,
+                "complete summary must fit the admitted model: {input}+{output}"
+            );
+            assert!(serde_json::to_vec(&request).unwrap().len() < 2 * 1024 * 1024);
+            let receipts = messages
                 .iter()
-                .rev()
-                .filter(|message| message["role"] == "tool")
-                .take(2)
-                .cloned()
-                .collect();
-        }
-        let row: (String, String, Option<String>) = sqlx::query_as(
+                .filter_map(|message| {
+                    message["tool_call_id"]
+                        .as_str()
+                        .filter(|id| id.starts_with("prior-observation-"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(receipts.first().copied(), Some("prior-observation-0"));
+            assert!(
+                receipts.len() > 100,
+                "the complete selected prefix reaches the summarizer"
+            );
+            probe
+                .summary_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({"role":"assistant","content":"### Primary Request\nRead the current continuation live runtime overview.\n### Pending Tasks\nCollect current scope and coverage, then settle the active review.\n### Current Work\nPrior observations were archived.\n### Current State\nCONTINUATION_HISTORY_SUMMARIZED: prior observations are historical and cannot replace a new live overview."})
+        } else {
+            probe
+                .first_request
+                .lock()
+                .await
+                .get_or_insert_with(|| request.clone());
+            if let Some(messages) = request["messages"].as_array() {
+                *probe.tool_feedback.lock().await = messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message["role"] == "tool")
+                    .take(2)
+                    .cloned()
+                    .collect();
+            }
+            let row: (String, String, Option<String>) = sqlx::query_as(
             "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
         ).bind(&probe.owner).bind(&probe.attempt).fetch_one(probe.pool.get()).await.expect("observe attempt at provider boundary");
-        probe.observations.lock().await.push(row.clone());
-        let can_settle = request["tools"].as_array().is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|tool| tool["function"]["name"] == "settle_work_item")
-        });
-        let observer_selected = request["messages"].as_array().is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message["role"] == "tool"
-                    && message["tool_call_id"] == "continuation-observer-schema"
-            })
-        });
-        let evidence = request["messages"]
+            probe.observations.lock().await.push(row.clone());
+            let can_settle = request["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "settle_work_item")
+            });
+            let observer_selected = request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "continuation-observer-schema"
+                })
+            });
+            let evidence = request["messages"]
             .as_array()
             .and_then(|messages| {
                 messages.iter().rev().find(|message| {
@@ -2239,21 +2282,22 @@ async fn exercise_primary_continuation_entry(
                 );
                 json!({"scope":value["scope"],"data_coverage":value["data_coverage"],"projection_budget":value["projection_budget"],"source_budget":value["source_budget"]})
             });
-        let message = if row.1 == "running" && evidence.is_none() && !observer_selected {
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-observer-schema","type":"function","function":{"name":"tool_search","arguments":json!({"query":"select:introspect"}).to_string()}}]})
-        } else if row.1 == "running" && evidence.is_none() {
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"introspect","arguments":{"facet":"overview","depth":"summary","format":"json"}}).to_string()}}]})
-        } else if row.1 == "running" && can_settle {
-            probe
-                .settlements
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let settlement = json!({
-                "outcome": "delivered",
-                "summary": format!("Observed live overview scope: {}", evidence.expect("observed successful overview"))
-            });
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-settle","type":"function","function":{"name":"settle_work_item","arguments":serde_json::to_string(&settlement).unwrap()}}]})
-        } else {
-            json!({"role":"assistant","content":"Review delivered."})
+            if row.1 == "running" && evidence.is_none() && !observer_selected {
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-observer-schema","type":"function","function":{"name":"tool_search","arguments":json!({"query":"select:introspect"}).to_string()}}]})
+            } else if row.1 == "running" && evidence.is_none() {
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"introspect","arguments":{"facet":"overview","depth":"summary","format":"json"}}).to_string()}}]})
+            } else if row.1 == "running" && can_settle {
+                probe
+                    .settlements
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let settlement = json!({
+                    "outcome": "delivered",
+                    "summary": format!("Observed live overview scope: {}", evidence.expect("observed successful overview"))
+                });
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-settle","type":"function","function":{"name":"settle_work_item","arguments":serde_json::to_string(&settlement).unwrap()}}]})
+            } else {
+                json!({"role":"assistant","content":"Review delivered."})
+            }
         };
         let reason = if message.get("tool_calls").is_some() {
             "tool_calls"
@@ -2282,6 +2326,7 @@ async fn exercise_primary_continuation_entry(
     let settlements = Arc::new(AtomicUsize::new(0));
     let tool_feedback = Arc::new(TokioMutex::new(Vec::new()));
     let first_request = Arc::new(TokioMutex::new(None));
+    let summary_requests = Arc::new(AtomicUsize::new(0));
     let probe = Probe {
         pool: pool.clone(),
         owner: owner.into(),
@@ -2290,6 +2335,7 @@ async fn exercise_primary_continuation_entry(
         settlements: settlements.clone(),
         tool_feedback: tool_feedback.clone(),
         first_request: first_request.clone(),
+        summary_requests: summary_requests.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2328,9 +2374,24 @@ async fn exercise_primary_continuation_entry(
         for index in 0..160 {
             let call_id = format!("prior-observation-{index}");
             history.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
-            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(500)) } else { format!("Recent observation {index}") }}));
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
         }
         history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
+        let prompt_limit =
+            crate::prompts::budget_for_model_with_metadata(Some(&model_name), Some(128_000), None)
+                .effective_input_limit();
+        let turn_limit = astra_core::runtime_limits::RuntimeLimits::default()
+            .effective_max_turn_input_tokens_with_context_window(Some(&model_name), Some(128_000));
+        let estimated = crate::prompts::estimate_tokens(&history, 0, 0);
+        assert!(
+            estimated as f64 / turn_limit as f64
+                >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit),
+            "fixture must require pre-turn compaction: {estimated}/{turn_limit}"
+        );
+        assert!(
+            estimated < prompt_limit,
+            "complete history must fit the summary model"
+        );
         let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
@@ -2455,6 +2516,16 @@ async fn exercise_primary_continuation_entry(
                 .as_array()
                 .expect("provider messages");
             assert!(messages.len() < 160, "actual restored history must shrink");
+            assert_eq!(
+                summary_requests.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(
+                messages.iter().any(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("CONTINUATION_HISTORY_SUMMARIZED"))),
+                "the primary request contains the accepted semantic summary"
+            );
             let contract = messages
                 .iter()
                 .filter(|message| message["role"] == "user")
@@ -2514,13 +2585,13 @@ async fn exercise_primary_continuation_entry(
                 .position(|event| {
                     event.event_type == StepEventType::CompactionFired
                         && event.payload.as_ref().is_some_and(|payload| {
-                            payload["kind"] == "resume"
+                            payload["kind"] == "pre_turn_summary"
                                 && payload["tokens_saved"]
                                     .as_u64()
                                     .is_some_and(|saved| saved > 0)
                         })
                 })
-                .expect("actual resume compaction saved tokens");
+                .expect("actual pre-turn summary saved tokens");
             let first_model = window
                 .events
                 .iter()
@@ -2816,7 +2887,7 @@ fn compaction_commits_the_complete_replacement_projection() {
 }
 
 #[test]
-fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
+fn single_user_tool_turn_remains_committable_after_semantic_compaction() {
     let mut messages = vec![json!({"role": "user", "content": "translate the document"})];
     for index in 0..6 {
         messages.push(json!({
@@ -2839,31 +2910,28 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
     }
     messages.push(json!({"role": "assistant", "content": "translation complete"}));
 
-    let engine = crate::turn::CompactionEngine::from_config(
-        &astra_config::runtime_config::CompressionConfig {
-            preserve_recent_turns: 2,
-            ..Default::default()
-        },
+    let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+        &messages,
+        messages.len().saturating_sub(3),
+        astra_turn_core::cloud::history_summary::history_summary_message(
+            "completed progress summarized".into(),
+        ),
+        0,
         64_000,
-    );
-    let outcome = engine.compress_if_needed(
-        &mut messages,
-        &crate::turn::TokenBudget {
-            max_prompt_tokens: 64_000,
-            last_measured_tokens: 100_000,
-            current_round_index: None,
-            now_secs: 10_000_000,
-        },
-    );
+        None,
+        None,
+    )
+    .unwrap();
+    let tokens_freed = candidate.tokens_freed();
+    messages = candidate.messages;
 
-    assert!(
-        outcome.total_tokens_freed > 0,
-        "the real pipeline must compact"
-    );
+    assert!(tokens_freed > 0, "the real pipeline must compact");
     let boundary_index = messages
         .iter()
-        .position(|message| message["_compact_boundary"].as_bool() == Some(true))
-        .expect("tiered compaction must leave its canonical boundary marker");
+        .position(|message| {
+            astra_turn_core::cloud::history_summary::history_summary_text(message).is_some()
+        })
+        .expect("semantic compaction must leave its canonical boundary marker");
     assert_eq!(
         boundary_index, 1,
         "the protected first user precedes the boundary"
@@ -2920,7 +2988,7 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
 }
 
 #[test]
-fn typed_objective_relations_survive_real_tiered_compaction() {
+fn typed_objective_relations_survive_semantic_compaction() {
     use astra_turn_core::resume_hydration::objective_context_from_messages;
     use astra_turn_types::{ObjectiveRelation, UserTurnSemantics, mark_user_turn_semantics};
 
@@ -2980,30 +3048,30 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         let mut proof =
             CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
-        let engine = crate::turn::CompactionEngine::from_config(
-            &astra_config::runtime_config::CompressionConfig {
-                preserve_recent_turns: 2,
-                ..Default::default()
-            },
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &messages,
+            messages.len().saturating_sub(3),
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "completed progress summarized".into(),
+            ),
+            0,
             64_000,
-        );
-        let outcome = engine.compress_if_needed(
-            &mut messages,
-            &crate::turn::TokenBudget {
-                max_prompt_tokens: 64_000,
-                last_measured_tokens: 100_000,
-                current_round_index: None,
-                now_secs: 10_000_000,
-            },
-        );
+            None,
+            None,
+        )
+        .unwrap();
+        let tokens_freed = candidate.tokens_freed();
+        messages = candidate.messages;
         proof.finish(permit, &messages, None);
 
-        assert!(outcome.total_tokens_freed > 0, "real compaction must run");
+        assert!(tokens_freed > 0, "real compaction must run");
         assert_eq!(
             messages[0], head,
             "the compactor retains the protected head"
         );
-        assert_eq!(messages[1]["_compact_boundary"], true);
+        assert!(
+            astra_turn_core::cloud::history_summary::history_summary_text(&messages[1]).is_some()
+        );
         assert_eq!(messages[2], tail, "typed tail survives real compaction");
 
         for allow_empty_delta in [false, true] {
@@ -3018,11 +3086,7 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
                 .filter(|message| message["role"] == "user")
                 .cloned()
                 .collect::<Vec<_>>();
-            let expected_users = if relation == Some(ObjectiveRelation::Replace) {
-                vec![tail.clone()]
-            } else {
-                vec![head.clone(), tail.clone()]
-            };
+            let expected_users = vec![head.clone(), tail.clone()];
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");
