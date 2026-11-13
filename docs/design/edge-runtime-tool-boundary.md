@@ -627,6 +627,11 @@ bounded output, timeout and caller-owned cancellation. The CLI supplies its
 pressure-scaled output budget through the existing execution context. It preserves source
 error and exit metadata instead of reinterpreting result text.
 
+When the search fallback must enumerate files, it bounds the candidate list
+at 8 MiB. A larger or incomplete listing returns an actionable error instead
+of searching a truncated list; narrowing the path or using ripgrep can continue
+the search. Output truncation never turns an incomplete filename into a result.
+
 ## Path sensitivity and ordinary project content
 
 A hidden directory name under the user's home is not itself a sensitive-state

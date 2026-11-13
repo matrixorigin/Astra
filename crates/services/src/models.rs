@@ -6240,6 +6240,16 @@ enum ModelProbeError {
 }
 
 impl ModelProbeError {
+    fn responses(failure: astra_core::model_wire::responses::ResponsesStreamError) -> Self {
+        failure
+            .mapped()
+            .and_then(|(_, status)| StatusCode::from_u16(status).ok())
+            .map(Self::Http)
+            .unwrap_or(Self::Response(
+                "Model check did not produce a complete response",
+            ))
+    }
+
     fn transport(error: reqwest::Error) -> Self {
         // URLs, proxy credentials and provider errors must not escape through
         // reqwest's Display or its source chain.
@@ -6412,9 +6422,7 @@ async fn probe_responses(
                 }
                 let Some(block) = block else { break };
                 astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &block)
-                    .map_err(|_| {
-                        ModelProbeError::Response("Model check did not produce a complete response")
-                    })?;
+                    .map_err(ModelProbeError::responses)?;
                 if accumulator.completed() {
                     return finish_response_probe(accumulator);
                 }
@@ -6424,9 +6432,8 @@ async fn probe_responses(
             .finish()
             .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?
         {
-            astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
-                |_| ModelProbeError::Response("Model check did not produce a complete response"),
-            )?;
+            astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail)
+                .map_err(ModelProbeError::responses)?;
         }
         finish_response_probe(accumulator)
     })
@@ -8241,6 +8248,8 @@ mod tests {
             };
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(events)) }).chain(futures_util::stream::pending());
             Response::new(Body::from_stream(stream))
+        })).route("/rate-limit", post(|| async {
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"private\"}}\n\n"
         })).route("/incomplete", post(|| async { "data: {\"type\":\"response.created\"}\n\n" }))
         .route("/terminal-eof", post(|| async {
             format!("data: {}\n", serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}))
@@ -8285,6 +8294,20 @@ mod tests {
             .await
             .is_err()
         );
+        let failure = probe_responses(
+            &client,
+            &format!("{base}/rate-limit"),
+            "model",
+            "key",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ModelProbeError::Http(StatusCode::TOO_MANY_REQUESTS)
+        ));
         assert!(
             probe_responses(
                 &client,

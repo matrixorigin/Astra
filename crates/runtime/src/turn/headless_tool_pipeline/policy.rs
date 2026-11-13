@@ -1486,6 +1486,8 @@ mod tests {
         assert!(body.contains("`<deferred-tools>`"));
         assert!(body.contains("tool_search"));
         assert!(body.contains("query=\"select:grep\""));
+        assert!(body.contains("invoke_tool"));
+        assert!(!body.contains("after it appears in `tools[]`"));
         assert!(!body.contains("Unknown tool"));
     }
 

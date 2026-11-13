@@ -184,6 +184,7 @@ pub fn provider_error(code: &str) -> Option<(&'static str, u16)> {
         "subscription_sharing_usage_unavailable" => {
             Some(("subscription_sharing_usage_unavailable", 503))
         }
+        "rate_limit_exceeded" | "slow_down" => Some(("provider_rate_limited", 429)),
         "context_length_exceeded" | "context_window_exceeded" | "input_too_long" => {
             Some(("context_length_exceeded", 400))
         }
@@ -992,8 +993,9 @@ impl ResponseAccumulator {
                 } else {
                     let code = event
                         .pointer("/response/error/code")
-                        .or_else(|| event.get("code"))
                         .and_then(Value::as_str)
+                        .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
+                        .or_else(|| event.get("code").and_then(Value::as_str))
                         .map(str::to_owned)
                         .or_else(|| reason.map(str::to_owned));
                     return Err(ResponsesStreamError::Provider(code));
@@ -1004,8 +1006,9 @@ impl ResponseAccumulator {
             "error" | "response.failed" => {
                 let code = event
                     .pointer("/response/error/code")
-                    .or_else(|| event.get("code"))
                     .and_then(Value::as_str)
+                    .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
+                    .or_else(|| event.get("code").and_then(Value::as_str))
                     .map(str::to_owned);
                 return Err(ResponsesStreamError::Provider(code));
             }
@@ -1303,6 +1306,17 @@ mod tests {
     fn completion(items: Value) -> Value {
         json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":items,
             "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}})
+    }
+    #[test]
+    fn provider_rate_limits_are_recognized_in_both_terminal_event_shapes() {
+        for event in [
+            json!({"type":"error", "error":{"code":"rate_limit_exceeded"}}),
+            json!({"type":"response.failed", "response":{"error":{"code":"slow_down"}}}),
+            json!({"type":"error", "response":{"error":{"code":null}}, "error":{"code":"rate_limit_exceeded"}}),
+        ] {
+            let failure = ResponseAccumulator::default().observe(&event).unwrap_err();
+            assert_eq!(failure.mapped(), Some(("provider_rate_limited", 429)));
+        }
     }
     #[test]
     fn provider_cannot_supply_server_sealed_reasoning() {

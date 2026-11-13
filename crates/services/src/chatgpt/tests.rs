@@ -204,6 +204,11 @@ fn model_check_failures_keep_typed_provider_limits() {
             "subscription_sharing_usage_limit_exceeded",
         ),
         (
+            "rate_limit_exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider_rate_limited",
+        ),
+        (
             "subscription_sharing_usage_unavailable",
             StatusCode::SERVICE_UNAVAILABLE,
             "subscription_sharing_usage_unavailable",

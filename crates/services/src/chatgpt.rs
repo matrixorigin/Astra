@@ -155,6 +155,7 @@ fn model_check_failure(failure: &ResponsesStreamError) -> (StatusCode, Json<Erro
                 "subscription_sharing_usage_unavailable" => {
                     "ChatGPT subscription usage is temporarily unavailable"
                 }
+                "provider_rate_limited" => "The model provider is rate limiting requests",
                 _ => "The subscription model rejected the check request",
             };
             fail(

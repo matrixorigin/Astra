@@ -51,6 +51,12 @@ provider message text never does. A quota-coded 429 is terminal, unlike a
 transient rate limit. These access rejections do not trigger automatic retry,
 credential refresh, provider fallback, or a waiting run.
 
+An explicit transient Responses rate-limit event on a direct API-key route may
+use the existing per-invocation retry budget only before any provider output or
+usage. Each physical attempt is settled, and cancellation and the original
+deadline still apply. Subscription and MOI gateway routes retain their own
+rejection contracts; SSE failures do not mutate a global model-name cooldown.
+
 Both streaming and nonstreaming calls preserve these classifications through
 the shared agent loop and failed Run outcome. The negotiated MOI gateway can
 carry the same provider facts using `provider_authentication_failed`,

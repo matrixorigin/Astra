@@ -45,7 +45,7 @@ const DEFAULT_RETRY_AFTER_MS: u64 = 5_000;
 /// first. E2E rate-limit tests set this to a small value (e.g. `10`) so their
 /// retry-exhaustion assertions finish in <100ms instead of waiting 3×5s of the
 /// production policy default. Unset = production default. Cached after first read.
-fn default_retry_after_ms() -> u64 {
+pub fn default_retry_after_ms() -> u64 {
     static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| {
         std::env::var("ASTRA_DEFAULT_RETRY_AFTER_MS")

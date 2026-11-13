@@ -29,6 +29,11 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
             "The selected model returned an incomplete response. Check the model configuration or choose another model."
                 .to_string()
         }
+        "provider_rate_limited" => {
+            "The model provider is rate limiting requests. Try again later or choose another model."
+                .to_string()
+        }
+        "provider_rejected" => "The model provider rejected the request.".to_string(),
         _ => format!("Model request failed: {code}"),
     };
     astra_core::ClassifiedError::new(kind, message)
@@ -406,7 +411,7 @@ fn result(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect(
     response: reqwest::Response,
-    route: LlmExecutionRoute<'_>,
+    route: &LlmExecutionRoute<'_>,
     names: &HashSet<String>,
     cancel: LlmCancel<'_>,
     mut callback: Option<&mut LlmStreamCallback<'_>>,
@@ -426,11 +431,13 @@ pub(super) async fn collect(
             ),
             partial: LlmCallResult::default(),
             rejected: false,
+            provider_progress: false,
         })?;
     let mut accumulator = ResponseAccumulator::default();
     let mut reported_usage = serde_json::Map::new();
     let mut latest_usage = None;
     let mut rejected = false;
+    let mut provider_progress = false;
     let exchange = async {
         let mut stream = response.bytes_stream();
         let mut frames = SseBlankLineUtf8Buf::new();
@@ -498,6 +505,21 @@ pub(super) async fn collect(
                     ));
                 }
                 for event in parsed.events {
+                    provider_progress |= !matches!(
+                        event["type"].as_str(),
+                        Some(
+                            "response.created"
+                                | "response.queued"
+                                | "response.in_progress"
+                                | "response.failed"
+                                | "response.incomplete"
+                                | "error"
+                        )
+                    ) || event.pointer("/response/output").is_some_and(
+                        |output| output.as_array().is_none_or(|items| !items.is_empty()),
+                    ) || event
+                        .pointer("/response/usage")
+                        .is_some_and(|usage| !usage.is_null());
                     if event["type"] == "response.output_item.added"
                         && event["item"]["type"] == "function_call"
                     {
@@ -542,10 +564,9 @@ pub(super) async fn collect(
                                 error(provider_http_error_kind(status, code), code)
                             }
                             None => match &failure {
-                                ResponsesStreamError::Provider(_) => error(
-                                    astra_core::ErrorKind::StreamTransport,
-                                    "response_incomplete",
-                                ),
+                                ResponsesStreamError::Provider(_) => {
+                                    error(astra_core::ErrorKind::Unknown, "provider_rejected")
+                                }
                                 ResponsesStreamError::Codec(reason) => {
                                     error(astra_core::ErrorKind::StreamTransport, reason)
                                 }
@@ -633,6 +654,7 @@ pub(super) async fn collect(
         StreamCollectError::Provider {
             error,
             rejected,
+            provider_progress,
             partial: LlmCallResult {
                 full_text: accumulator.output.text,
                 reasoning: accumulator.output.reasoning,
