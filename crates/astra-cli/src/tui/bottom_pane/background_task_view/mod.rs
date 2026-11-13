@@ -45,7 +45,7 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) -> Self {
         let mut view = Self {
-            rows: sort_rows(visible_rows(rows, selected_id)),
+            rows: sort_rows(rows),
             selected: 0,
             completed: false,
             mode: Mode::List,
@@ -71,8 +71,7 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) {
         let current_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
-        let rows = visible_rows(rows, selected_id.or(current_selected_id.as_deref()));
-        let rows = sort_rows_preserving_work_unit_order(rows, &self.rows);
+        let rows = sort_rows(rows);
         let selected_idx = selected_id.and_then(|id| rows.iter().position(|row| row.id == id));
         let fallback_idx = current_selected_id
             .as_ref()
@@ -209,78 +208,6 @@ impl BackgroundTaskView {
             });
         }
     }
-}
-
-/// Keep the task switcher focused on live work and failures. Older successful
-/// shell output remains available through the task registry and session trace.
-fn visible_rows(rows: Vec<BackgroundTaskRow>, selected_id: Option<&str>) -> Vec<BackgroundTaskRow> {
-    let is_completed_shell = |row: &BackgroundTaskRow| {
-        row.kind == BackgroundTaskKind::Shell
-            && matches!(
-                row.status,
-                BackgroundTaskStatus::Completed | BackgroundTaskStatus::Cancelled
-            )
-    };
-    let mut completed: Vec<_> = rows.iter().filter(|row| is_completed_shell(row)).collect();
-    completed.sort_unstable_by(|a, b| b.ended_at_ms.cmp(&a.ended_at_ms).then(a.id.cmp(&b.id)));
-    let recent: std::collections::HashSet<_> = completed
-        .into_iter()
-        .take(3)
-        .map(|row| row.id.clone())
-        .collect();
-    rows.into_iter()
-        .filter(|row| {
-            !is_completed_shell(row)
-                || recent.contains(&row.id)
-                || selected_id == Some(row.id.as_str())
-        })
-        .collect()
-}
-
-fn work_unit_key(row: &BackgroundTaskRow) -> String {
-    row.fanout.as_ref().map_or_else(
-        || format!("task:{}", row.id),
-        |fanout| format!("fanout:{}", fanout.group_id),
-    )
-}
-
-/// Preserve the first observed position of every work unit across live
-/// refreshes. A fanout's children are discovered independently; recomputing
-/// its anchor from the earliest currently-visible child makes the whole group
-/// jump above and below unrelated rows as slots arrive.
-fn sort_rows_preserving_work_unit_order(
-    rows: Vec<BackgroundTaskRow>,
-    previous: &[BackgroundTaskRow],
-) -> Vec<BackgroundTaskRow> {
-    let mut previous_order = std::collections::HashMap::<String, usize>::new();
-    for row in previous {
-        let next = previous_order.len();
-        previous_order.entry(work_unit_key(row)).or_insert(next);
-    }
-
-    let initially_sorted = sort_rows(rows);
-    let mut next_order = previous_order.len();
-    let mut order = previous_order;
-    for row in &initially_sorted {
-        let key = work_unit_key(row);
-        if let std::collections::hash_map::Entry::Vacant(entry) = order.entry(key) {
-            entry.insert(next_order);
-            next_order += 1;
-        }
-    }
-
-    let mut rows = initially_sorted;
-    rows.sort_by_key(|row| {
-        (
-            order
-                .get(&work_unit_key(row))
-                .copied()
-                .unwrap_or(usize::MAX),
-            row.fanout.as_ref().map_or(0, |fanout| fanout.slot_index),
-            row.id.clone(),
-        )
-    });
-    rows
 }
 
 impl BottomPaneView for BackgroundTaskView {
@@ -518,37 +445,43 @@ mod tests {
     }
 
     #[test]
-    fn task_switcher_keeps_active_failures_and_recent_shell_results() {
-        let mut rows = vec![
-            row("running", "running", "build"),
-            row("failed", "failed", "test"),
-        ];
-        rows.extend((0..8).map(|index| {
-            row(&format!("done-{index}"), "completed", "inspection")
-                .with_timing(Some(index), Some(index))
-        }));
+    fn task_switcher_prioritizes_live_and_unobserved_work_without_hiding_history() {
+        let mut rows = vec![row("running", "running", "build").with_timing(Some(5_000), None)];
+        for index in 0..32 {
+            let mut failed = row(&format!("failed-{index:02}"), "failed", "check")
+                .with_timing(Some(index), Some(100 + index))
+                .with_terminal_attention(false, false);
+            failed.terminal_unobserved = index >= 17;
+            rows.push(failed);
+            rows.push(
+                row(&format!("done-{index:02}"), "completed", "inspection")
+                    .with_timing(Some(index), Some(1_000 + index))
+                    .with_terminal_attention(false, false),
+            );
+        }
         let mut view = BackgroundTaskView::new(rows.clone());
-        let shown = render(&view, 100, 12);
-        assert!(
-            shown.contains("running") && shown.contains("failed"),
-            "{shown}"
-        );
         assert_eq!(
-            view.rows
-                .iter()
-                .filter(|row| row.status == BackgroundTaskStatus::Completed)
-                .count(),
-            3
+            view.rows.len(),
+            65,
+            "all retained outputs remain inspectable"
         );
-        assert!(view.rows.iter().any(|row| row.id == "done-7"));
-        assert!(!view.rows.iter().any(|row| row.id == "done-0"));
-
-        view.replace_rows_with_selected(rows, Some("done-0"));
-        assert_eq!(view.selected_row().unwrap().id, "done-0");
+        assert_eq!(view.rows[0].id, "running");
+        assert!(view.rows[1..16].iter().all(|row| row.terminal_unobserved));
+        assert_eq!(
+            view.rows[16].id, "done-31",
+            "recent history precedes old observed failures"
+        );
+        view.replace_rows_with_selected(rows, Some("failed-00"));
+        assert_eq!(view.selected_row().unwrap().id, "failed-00");
+        view.request_local_output();
+        assert!(
+            matches!(view.pending_action.as_ref().map(|request| &request.action),
+            Some(BottomPaneViewAction::ViewShellOutput { task_id, .. }) if task_id == "failed-00")
+        );
     }
 
     #[test]
-    fn list_order_is_stable_across_status_and_elapsed_refreshes() {
+    fn list_order_uses_activity_and_recency_without_elapsed_time_noise() {
         let view = BackgroundTaskView::new(vec![
             row("third", "completed", "third task").with_timing(Some(300), Some(350)),
             row("first", "running", "first task").with_timing(Some(100), None),
@@ -560,7 +493,7 @@ mod tests {
                 .iter()
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["first", "second", "third"]
+            vec!["second", "first", "third"]
         );
 
         let refreshed = sort_rows(vec![
@@ -575,7 +508,7 @@ mod tests {
                 .iter()
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["first", "second", "third"]
+            vec!["second", "third", "first"]
         );
     }
 
@@ -604,22 +537,23 @@ mod tests {
     }
 
     #[test]
-    fn refresh_keeps_a_partially_discovered_fanout_at_its_first_observed_position() {
-        let mut view = BackgroundTaskView::new(vec![
-            row("unrelated", "running", "unrelated").with_timing(Some(100), None),
-            row("slot-2", "running", "second")
-                .with_timing(Some(200), None)
-                .with_fanout(fanout("review-1", 3, 1)),
-        ]);
-        view.move_down();
+    fn refresh_preserves_selected_identity_when_fanout_activity_changes() {
+        let mut view = BackgroundTaskView::new_with_selected(
+            vec![
+                row("unrelated", "running", "unrelated").with_timing(Some(100), None),
+                row("slot-2", "running", "second")
+                    .with_timing(Some(200), None)
+                    .with_fanout(fanout("review-1", 3, 1)),
+            ],
+            Some("slot-2"),
+        );
         assert_eq!(
             view.selected_row().map(|row| row.id.as_str()),
             Some("slot-2")
         );
 
-        // A later refresh discovers slot 1 with an earlier runtime timestamp.
-        // The group and selected identity must stay where the user first saw
-        // them instead of jumping above the unrelated task.
+        // Slot 2 completes while an older live slot is discovered. Re-rank
+        // the group using current facts without changing selected identity.
         view.replace_rows(vec![
             row("slot-1", "running", "first")
                 .with_timing(Some(50), None)
@@ -764,19 +698,19 @@ mod tests {
 
         assert_eq!(
             view.selected_row().map(|row| row.id.as_str()),
-            Some("agent-failed")
+            Some("standalone")
         );
 
         view.handle_key(key(KeyCode::Down));
         assert_eq!(
             view.selected_row().map(|row| row.id.as_str()),
-            Some("agent-done")
+            Some("agent-failed")
         );
 
         view.handle_key(key(KeyCode::Char('3')));
         assert_eq!(
             view.selected_row().map(|row| row.id.as_str()),
-            Some("standalone")
+            Some("agent-done")
         );
     }
 
@@ -936,9 +870,15 @@ mod tests {
     fn detail_renders_started_ended_and_elapsed() {
         let mut view = BackgroundTaskView::new(vec![
             BackgroundTaskRow::shell("timed", "completed", 2_000, "cargo test", None, None, None)
-                .with_timing(Some(0), Some(2_000)),
+                .with_timing(Some(0), Some(2_000))
+                .with_terminal_attention(false, false),
         ]);
 
+        let list = render(&view, 120, 5);
+        assert!(
+            list.contains("01-01 00:00Z") && list.contains("history"),
+            "{list}"
+        );
         view.handle_key(key(KeyCode::Enter));
         let text = render(&view, 120, 10);
         assert!(text.contains("started 1970-01-01 00:00:00Z"), "{text}");
