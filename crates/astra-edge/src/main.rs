@@ -109,13 +109,53 @@ fn is_permanent_connection_error(error: &(dyn std::error::Error + 'static)) -> b
 
 async fn observe_shutdown(
     shutdown: CancellationToken,
-    signal: impl Future<Output = std::io::Result<()>>,
+    first_signal: impl Future<Output = std::io::Result<()>>,
+    second_signal: impl Future<Output = std::io::Result<()>>,
+    on_second_interrupt: impl FnOnce(),
 ) {
-    if let Err(error) = signal.await {
-        tracing::warn!(%error, "Cannot install Ctrl+C handler");
-    } else {
-        tracing::info!("Ctrl+C received; shutting down");
-        shutdown.cancel();
+    match first_signal.await {
+        Err(error) => {
+            tracing::warn!(%error, "Cannot install Ctrl+C handler");
+        }
+        Ok(()) => {
+            tracing::info!("Ctrl+C received; shutting down");
+            shutdown.cancel();
+            // Tokio keeps a process-wide SIGINT handler installed after the
+            // first wait returns. Keep consuming later signals so a second
+            // Ctrl+C can escape leftover blocking work during runtime shutdown.
+            match second_signal.await {
+                Ok(()) => {
+                    tracing::warn!(
+                        "Second Ctrl+C received; exiting without waiting for leftover blocking work"
+                    );
+                    on_second_interrupt();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Cannot install a second Ctrl+C handler");
+                }
+            }
+        }
+    }
+}
+
+/// Drive one connection until it finishes or the process-lifetime shutdown
+/// token is cancelled. After cancel, the connection is awaited to completion
+/// with no wall-clock timeout so EdgeInvocationOwner can finish cancellation,
+/// join, and persist settlement.
+async fn await_connection_result<F>(
+    connection: &mut std::pin::Pin<&mut F>,
+    shutdown: &CancellationToken,
+) -> Option<Result<(), Box<dyn std::error::Error>>>
+where
+    F: Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => match connection.await {
+            Ok(()) => None,
+            Err(error) => Some(Err(error)),
+        },
+        result = &mut *connection => Some(result),
     }
 }
 
@@ -994,8 +1034,12 @@ async fn main() {
     // Register exactly one process-lifetime signal observer. Recreating or
     // dropping ctrl_c futures between connection phases can lose SIGINT.
     let shutdown = CancellationToken::new();
-    let _shutdown_listener =
-        tokio::spawn(observe_shutdown(shutdown.clone(), tokio::signal::ctrl_c()));
+    let _shutdown_listener = tokio::spawn(observe_shutdown(
+        shutdown.clone(),
+        tokio::signal::ctrl_c(),
+        tokio::signal::ctrl_c(),
+        || std::process::exit(130),
+    ));
 
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
@@ -1008,21 +1052,17 @@ async fn main() {
         );
         let connection = run_edge_connection(&config, shutdown.clone()).instrument(edge_span);
         tokio::pin!(connection);
-        let connection_result = tokio::select! {
-            result = &mut connection => Some(result),
-            _ = shutdown.cancelled() => {
-                // Give authenticated/active connections a bounded opportunity
-                // to settle the work they own after the shared token is cancelled.
-                let _ = tokio::time::timeout(Duration::from_secs(5), &mut connection).await;
-                None
+        let connection_result = await_connection_result(&mut connection, &shutdown).await;
+        if shutdown.is_cancelled() {
+            if let Some(Err(error)) = connection_result {
+                tracing::error!(error = %error, "Error while settling work after shutdown");
+                exit_with_error = true;
             }
-        };
+            break;
+        }
         let Some(connection_result) = connection_result else {
             break;
         };
-        if shutdown.is_cancelled() {
-            break;
-        }
         match connection_result {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
@@ -1090,8 +1130,16 @@ mod tests {
     #[tokio::test]
     async fn shutdown_signal_cancels_the_process_lifetime_token() {
         let shutdown = CancellationToken::new();
-        observe_shutdown(shutdown.clone(), std::future::ready(Ok(()))).await;
-        assert!(shutdown.is_cancelled());
+        let listener = tokio::spawn(observe_shutdown(
+            shutdown.clone(),
+            std::future::ready(Ok(())),
+            std::future::pending(),
+            || panic!("second interrupt should not run"),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .expect("first signal should cancel the token");
+        listener.abort();
     }
 
     #[tokio::test]
@@ -1100,10 +1148,79 @@ mod tests {
         observe_shutdown(
             shutdown.clone(),
             std::future::ready(Err(std::io::Error::other("signal registration failed"))),
+            std::future::pending(),
+            || panic!("second interrupt should not run"),
         )
         .await;
         assert!(!shutdown.is_cancelled());
         assert!(wait_for_reconnect(Duration::ZERO, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn second_ctrl_c_escalates_while_blocking_work_is_still_running() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = CancellationToken::new();
+        let escalated = Arc::new(AtomicBool::new(false));
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
+        let flag = escalated.clone();
+        let listener = tokio::spawn(observe_shutdown(
+            shutdown.clone(),
+            std::future::ready(Ok(())),
+            async move {
+                second_rx
+                    .await
+                    .map_err(|_| std::io::Error::other("second signal dropped"))
+            },
+            move || {
+                flag.store(true, Ordering::SeqCst);
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .expect("first signal should cancel the token");
+        let blocking = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
+        second_tx
+            .send(())
+            .expect("second signal receiver is still live");
+        tokio::time::timeout(Duration::from_secs(1), listener)
+            .await
+            .expect("second Ctrl+C should escalate without waiting for blocking work")
+            .expect("listener task should finish");
+        assert!(escalated.load(Ordering::SeqCst));
+        blocking.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_slow_settlement_without_a_wall_clock_drop() {
+        let shutdown = CancellationToken::new();
+        let connection = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        };
+        tokio::pin!(connection);
+        let started = std::time::Instant::now();
+        shutdown.cancel();
+        let result = await_connection_result(&mut connection, &shutdown).await;
+        assert!(result.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn shutdown_settlement_errors_are_returned_instead_of_discarded() {
+        let shutdown = CancellationToken::new();
+        let connection = async {
+            shutdown.cancelled().await;
+            Err::<(), Box<dyn std::error::Error>>("journal sync failed".into())
+        };
+        tokio::pin!(connection);
+        shutdown.cancel();
+        let result = await_connection_result(&mut connection, &shutdown).await;
+        let error = result.expect("settlement error should be observed");
+        assert!(error.is_err());
+        assert!(format!("{}", error.unwrap_err()).contains("journal sync failed"));
     }
 
     #[tokio::test]
