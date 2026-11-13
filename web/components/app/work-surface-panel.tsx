@@ -1309,7 +1309,7 @@ function agentCompactMeta(agent: AgentSurfaceItem) {
     items.push(agent.toolName);
   }
   if (agent.totalToolCalls) {
-    items.push(`${agent.totalToolCalls} tools`);
+    items.push(`${agent.totalToolCalls} reported tools`);
   }
   if (agent.totalPromptTokens || agent.totalCompletionTokens) {
     items.push(
@@ -1950,7 +1950,7 @@ function AgentTranscriptSummary({
 }) {
   const facts = [
     ["Messages", String(transcriptCount)],
-    ["Tools", String(agent.totalToolCalls ?? 0)],
+    ["Tools (reported)", agent.totalToolCalls === undefined ? "unknown" : String(agent.totalToolCalls)],
     [
       "Tokens",
       String(

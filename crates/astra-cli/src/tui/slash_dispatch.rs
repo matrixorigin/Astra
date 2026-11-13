@@ -91,7 +91,12 @@ pub(crate) fn parse_submission(text: &str) -> SubmissionInput<'_> {
     if trimmed.starts_with("//") {
         SubmissionInput::Literal(&trimmed[1..])
     } else if trimmed.starts_with('/') {
-        SubmissionInput::Command(text)
+        let (command, _args) = parse_slash(trimmed);
+        match command_registry::resolve_command(command) {
+            Ok(_) => SubmissionInput::Command(text),
+            Err(candidates) if !candidates.is_empty() => SubmissionInput::Command(text),
+            Err(_) => SubmissionInput::Conversation(text),
+        }
     } else {
         SubmissionInput::Conversation(text)
     }

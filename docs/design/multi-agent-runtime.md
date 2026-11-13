@@ -28,7 +28,8 @@ identity so presentation compaction cannot leave an accepted tool call open.
 
 Malformed, unknown, rejected, or uncertain-delivery receipts must not gain
 accepted-control authority. Existing run/call ownership checks, child completion
-barriers, reply obligations, and Work settlement remain authoritative. Evaluation,
+barriers and Work settlement remain authoritative. Question correlation is
+advisory and does not create another lifecycle dependency. Evaluation,
 recovery, and Server result projection consume the same classification; a later
 control receipt cannot erase an unrelated failed verification.
 An observation error does not establish child termination or release ownership.

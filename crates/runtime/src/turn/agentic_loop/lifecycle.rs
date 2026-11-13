@@ -56,7 +56,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
     let mut model_context_changed = false;
-    let reply_obligations = Arc::clone(&state.messaging.reply_obligations);
+    let question_correlations = Arc::clone(&state.messaging.question_correlations);
     const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
     let (mut retained_mailbox_messages, mut retained_mailbox_bytes) =
         retained_mailbox_usage(&state.volatile_pending);
@@ -155,16 +155,15 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         accepted,
                         data,
                     } => {
-                        if reply_obligations.should_expose_response(
+                        let assessment = question_correlations.classify_response(
                             state.current_run_id.as_deref().unwrap_or_default(),
                             &msg,
-                        ) {
-                            let data = data.as_ref().map(|data| format!(" · {data}"));
-                            parts.push(format!(
-                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                data.as_deref().unwrap_or("")
-                            ));
-                        }
+                        );
+                        let data = data.as_ref().map(|data| format!(" · {data}"));
+                        parts.push(format!(
+                            "[{from_label} run={} response to {request_id}; correlation={assessment}]: accepted={accepted}{}",
+                            msg.from.run_id, data.as_deref().unwrap_or("")
+                        ));
                     }
                     astra_messaging::types::MessagePayload::Signal(sig) => {
                         let signal = format!("[{from_label} signal]: {sig:?}");
@@ -234,10 +233,11 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         "correlation_id": msg.correlation_id,
                         "message_kind": message_kind,
                         "response_request_id": match &msg.payload {
-                            payload if astra_messaging::types::is_non_adoption_response(payload) => None,
                             astra_messaging::types::MessagePayload::Response { request_id, .. } => Some(request_id),
                             _ => None,
                         },
+                        "response_match": question_correlations.classify_response(
+                            state.current_run_id.as_deref().unwrap_or_default(), &msg),
                         "payload_digest": payload_digest,
                         "delivery_count": 0,
                         "display": display,
@@ -252,7 +252,6 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                     });
                     if let Some(prior) = prior {
                         if prior.payload["payload_digest"] != payload["payload_digest"]
-                            || prior.payload["display"] != payload["display"]
                             || prior.payload["response_request_id"]
                                 != payload["response_request_id"]
                         {
@@ -2883,9 +2882,9 @@ mod tests {
                 declarations: state.hooks.declarations.clone(),
                 phase: state.hooks.phase,
             },
-            reply_obligations: state
+            question_correlations: state
                 .messaging
-                .reply_obligations
+                .question_correlations
                 .snapshot("same-budget-run", 3)
                 .unwrap(),
             budget_wrapup_injected: true,

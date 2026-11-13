@@ -347,7 +347,7 @@ async fn stream_chat_sse_inner(
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 fanout_admission: spawner.attach_fanout_parent(&parent_turn_run_id).await,
-                reply_obligations: Arc::new(Default::default()),
+                question_correlations: Arc::new(Default::default()),
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 parent_delegation_authority:

@@ -3937,7 +3937,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
                 staged_response.clone(),
             );
         }
-        let source = crate::messaging::reply_obligations::ReplyObligations::default();
+        let source = crate::messaging::question_correlations::QuestionCorrelations::default();
         source
             .reserve(
                 "questioner",
@@ -3957,7 +3957,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
             run_execution_control: Some(RunExecutionControl::V4 {
                 completion_settlement: Default::default(),
                 hook_obligations: Default::default(),
-                reply_obligations: source.snapshot("questioner", 3).unwrap(),
+                question_correlations: source.snapshot("questioner", 3).unwrap(),
                 budget_wrapup_injected: false,
                 budget_wrapup_ignored_rounds: 0,
             }),
@@ -3989,7 +3989,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
             assert_eq!(state.volatile_pending.len(), 1);
             assert_eq!(state.volatile_pending[0].payload, staged_response);
             assert!(!state.volatile_pending[0].attempt_leased);
-            assert!(source.has_pending("questioner"));
+            assert!(!source.pending("questioner").is_empty());
         } else {
             result.unwrap();
             assert_eq!(state.recent_tools, vec!["must-not-apply"]);
@@ -3997,8 +3997,20 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
                 state.volatile_pending.is_empty(),
                 "new-run history cannot adopt the old answer"
             );
-            assert!(!state.messaging.reply_obligations.has_pending("new-run"));
-            assert!(!state.messaging.reply_obligations.has_pending("questioner"));
+            assert!(
+                state
+                    .messaging
+                    .question_correlations
+                    .pending("new-run")
+                    .is_empty()
+            );
+            assert!(
+                state
+                    .messaging
+                    .question_correlations
+                    .pending("questioner")
+                    .is_empty()
+            );
         }
         assert!(state.runtime_tool_executor.is_none());
     }
@@ -24313,6 +24325,71 @@ fn work_task_board_update_is_a_durable_live_lifecycle_edge() {
     assert!(live_delta_event_for_persistence(&board_update));
     assert!(streaming_event_for_persistence(&board_update));
     assert!(durable_replay_boundary_event(&board_update));
+}
+
+#[tokio::test]
+async fn runtime_wait_is_disposable_through_ordered_fanout_and_attached_delivery() {
+    // No durable run exists: any accidental lookup/flush must fail.
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(json!({"type":"occupied"})).unwrap();
+    let mut delivery = AttachedStreamDelivery::new(tx);
+    delivery.dropped_progress = 3;
+    let tracker = EmittedToolTerminalTracker::default();
+    let mut pending = PendingDurableLiveEvents::default();
+    for _ in 1..DURABLE_LIVE_BATCH_MAX_EVENTS {
+        pending.push(json!({"type":"agent_spawned", "agent_id":"child"}));
+    }
+    let count = pending.events.len();
+    let bytes = pending.estimated_bytes;
+    let hint = json!({"type":"runtime_wait", "run_id":"run-absent", "reason":"agent_input", "waiting":true});
+    for buffered in [true, false] {
+        if !buffered {
+            pending.take();
+        }
+        assert!(
+            process_ordered_live_fanout_event(
+                hint.clone(),
+                &mut pending,
+                &engine,
+                &runs,
+                "user-1",
+                "session-1",
+                "run-absent",
+                &live_tx,
+                &mut delivery,
+                &tracker,
+            )
+            .await
+            .is_ok()
+        );
+        if buffered {
+            assert_eq!(
+                (pending.events.len(), pending.estimated_bytes),
+                (count, bytes)
+            );
+            assert!(!pending.should_flush());
+            assert!(live_rx.try_recv().is_err());
+        } else {
+            assert_eq!(live_rx.try_recv().unwrap(), hint);
+        }
+        assert_eq!(delivery.dropped_progress, 3, "hints do not request repair");
+    }
+    assert_eq!(rx.try_recv().unwrap()["type"], "occupied");
+    assert!(rx.try_recv().is_err());
+    drop(rx);
+    send_attached_stream_event(&mut delivery, hint.clone(), "run-absent").await;
+    assert!(delivery.sender.is_none());
+    assert_eq!(delivery.dropped_progress, 3);
+    let gap = server_loop_host::HostEventGapTracker::default();
+    let before = gap.pending_recovery_snapshot();
+    record_unforwarded_host_event(&gap, hint);
+    assert_eq!(gap.pending_recovery_snapshot(), before);
+    assert!(store.appended_batches().is_empty());
+    assert!(runs.read().await.is_empty(), "no retained hint projection");
 }
 
 #[tokio::test]
