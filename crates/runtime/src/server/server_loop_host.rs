@@ -27761,10 +27761,14 @@ mod tests {
             "output={} fields={:?}",
             outcome.results[0].output, outcome.results[0].tool_result_fields
         );
+        let denial: serde_json::Value = serde_json::from_str(&outcome.results[0].output)
+            .expect("durable denial is a structured result");
+        assert_eq!(denial["error"], "approval_denied");
         assert!(
-            outcome.results[0].output.contains("REJECTED"),
-            "tool result must follow the durable denial, got {}",
-            outcome.results[0].output
+            denial["directive"]
+                .as_str()
+                .unwrap()
+                .contains("NOT executed")
         );
         assert!(
             !outcome.results[0].output.contains("timed out waiting"),
@@ -41760,7 +41764,7 @@ mod tests {
             } else {
                 assert!(request.is_none());
                 assert_eq!(outcome.results[0].status, "denied");
-                assert!(outcome.results[0].output.contains("user_denied"));
+                assert!(outcome.results[0].output.contains("approval_denied"));
                 assert!(outcome.results[0].output.contains("user declined removal"));
                 assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
                     &ledger,
@@ -41937,7 +41941,7 @@ mod tests {
                 } else {
                     assert_eq!(write.status, "denied");
                     assert!(
-                        write.output.contains("user_denied") && write.output.contains("policy")
+                        write.output.contains("approval_denied") && write.output.contains("policy")
                     );
                     assert!(
                         !committed
@@ -49614,6 +49618,18 @@ mod tests {
             serde_json::from_str::<Value>(&rejection.result)
                 .is_ok_and(|value| value["error_kind"] == "fanout_result_pagination_pending")
         }));
+
+        // The shared observer clears this carrier after all exact tails arrive.
+        state
+            .hooks
+            .completion_settlement
+            .foreground_fanout_pagination = None;
+        let admitted = host.admit_terminal_tool_calls(&state, &calls[..1], Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"], "read-stale");
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut host, &calls[..1], Some("tool_calls"));
+        assert!(admission.rejected.is_empty());
     }
 
     #[test]

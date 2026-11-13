@@ -799,6 +799,7 @@ impl BackgroundTaskRegistry {
         let fields = serde_json::json!({"task_id":id,"input_delivery":if close { "stdin_closed" } else { "written" },
             "bytes_written":bytes.map_or(0, str::len),"terminal":false});
         ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: fields.to_string(),
             tool_result_fields: fields.as_object().cloned(),
             is_error: false,

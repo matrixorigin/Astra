@@ -759,6 +759,42 @@ impl PreparedBashWorkdir {
         )
     }
 
+    /// Resolve the pinned identity's current label without trusting a replaced path.
+    pub fn verified_path(&self) -> Result<PathBuf, String> {
+        #[cfg(unix)]
+        return self.inspection().working_directory_path()
+            .map_err(|error| format!("Error: cannot identify the pinned bash working directory: {error}; no command was run"));
+        #[cfg(not(unix))]
+        Ok(self.path.clone())
+    }
+
+    /// Recheck existing workspace and cwd authority at the launch checkpoint.
+    pub fn validate_for_launch(
+        &self,
+        workspace_root: &Path,
+        local_policy: Option<&astra_sandbox::SandboxPolicy>,
+    ) -> Result<(), String> {
+        let root = workspace_root.canonicalize().map_err(|error| {
+            format!("Error: selected workspace is unavailable: {error}; no command was run")
+        })?;
+        #[cfg(unix)]
+        if !self.inspection().matches_root_path(&root).unwrap_or(false) {
+            return Err(
+                "Error: the selected workspace changed before execution; no command was run".into(),
+            );
+        }
+        let current = self.verified_path()?;
+        if self.path.starts_with(&root)
+            && !current.starts_with(&root)
+            && local_policy
+                .is_none_or(|policy| policy.isolation != astra_sandbox::IsolationLevel::Permissive)
+        {
+            return Err("Error: the pinned working directory moved outside its workspace before execution; no command was run".into());
+        }
+        validate_bash_workdir_authority(&root, &self.path, &current, local_policy)
+            .map_err(|error| error.to_string())
+    }
+
     /// Pin this prepared identity into the shared process-isolation executor.
     pub fn install_on_isolation_config(&self, config: &mut astra_sandbox::IsolationConfig) {
         config.working_dir = self.path.clone();
@@ -811,14 +847,42 @@ impl PreparedBashWorkdir {
 #[cfg(unix)]
 use astra_sandbox::{open_directory_beneath, open_filesystem_root};
 
-/// Resolve one Bash invocation's execution directory without changing the
-/// workspace authority boundary. The directory must already exist and its
-/// canonical path must remain beneath the canonical workspace root, which
-/// rejects traversal and symlink escapes before a process is spawned.
+#[derive(Debug)]
+pub struct BashWorkdirError {
+    pub message: String,
+    pub approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
+}
+
+impl From<String> for BashWorkdirError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            approval_scope: None,
+        }
+    }
+}
+impl std::fmt::Display for BashWorkdirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for BashWorkdirError {}
+
+impl std::ops::Deref for BashWorkdirError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Resolve and pin one invocation's cwd independently of the selected
+/// workspace. `None` keeps generic/Server execution workspace-only. Local
+/// callers supply their existing sandbox policy; a cwd never adds a grant.
 pub fn resolve_bash_workdir(
     workspace_root: &Path,
     args: &Value,
-) -> Result<PreparedBashWorkdir, String> {
+    local_policy: Option<&astra_sandbox::SandboxPolicy>,
+) -> Result<PreparedBashWorkdir, BashWorkdirError> {
     let requested = args
         .get("workdir")
         .map(|value| {
@@ -829,7 +893,11 @@ pub fn resolve_bash_workdir(
         .transpose()?
         .unwrap_or(".");
     if requested.trim().is_empty() {
-        return Err("Error: bash `workdir` must not be empty; no command was run".to_string());
+        return Err(
+            "Error: bash `workdir` must not be empty; no command was run"
+                .to_string()
+                .into(),
+        );
     }
 
     let canonical_root = workspace_root.canonicalize().map_err(|error| {
@@ -848,14 +916,15 @@ pub fn resolve_bash_workdir(
     if !resolved.is_dir() {
         return Err(format!(
             "Error: bash `workdir` `{requested}` is not a directory; no command was run"
-        ));
+        )
+        .into());
     }
-    if !resolved.starts_with(&canonical_root) {
-        return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
-            workspace_root.display()
-        ));
-    }
+    validate_bash_workdir_authority(
+        &canonical_root,
+        Path::new(requested),
+        &resolved,
+        local_policy,
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -874,16 +943,19 @@ pub fn resolve_bash_workdir(
                     "Error: cannot pin workspace root for bash `workdir`: {error}; no command was run"
                 )
             })?;
-        let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
-            format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
-                workspace_root.display()
-            )
-        })?;
-        let directory = open_directory_beneath(&root_directory, relative).map_err(|error| {
-            format!(
-                "Error: cannot pin bash `workdir` `{requested}` beneath workspace root: {error}; no command was run"
-            )
+        // Workspace-only callers retain the original descriptor-relative
+        // confinement even if the workspace path changes during preparation.
+        let (anchor, relative) = match resolved.strip_prefix(&canonical_root) {
+            Ok(relative) => (&root_directory, relative),
+            Err(_) => (
+                &filesystem_root,
+                resolved.strip_prefix("/").map_err(|_| {
+                    "Error: canonical bash workdir is not absolute; no command was run".to_string()
+                })?,
+            ),
+        };
+        let directory = open_directory_beneath(anchor, relative).map_err(|error| {
+            format!("Error: cannot pin bash `workdir` `{requested}`: {error}; no command was run")
         })?;
         let metadata = directory.metadata().map_err(|error| {
             format!(
@@ -907,7 +979,7 @@ pub fn resolve_bash_workdir(
         if resolved != canonical_root {
             return Err(
                 "Error: call-scoped subdirectory workdir requires pinned-directory support on this platform; no command was run"
-                    .to_string(),
+                    .to_string().into(),
             );
         }
         Ok(PreparedBashWorkdir {
@@ -915,6 +987,52 @@ pub fn resolve_bash_workdir(
             path: resolved,
         })
     }
+}
+
+fn validate_bash_workdir_authority(
+    workspace_root: &Path,
+    requested: &Path,
+    resolved: &Path,
+    local_policy: Option<&astra_sandbox::SandboxPolicy>,
+) -> Result<(), BashWorkdirError> {
+    let inside = resolved.starts_with(workspace_root);
+    let allowed = local_policy.map_or(inside, |policy| {
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace_root.join(requested)
+        };
+        policy.is_path_allowed(&candidate)
+            && policy.is_path_allowed(resolved)
+            && (inside
+                || requested.is_absolute()
+                || policy.isolation == astra_sandbox::IsolationLevel::Permissive)
+    });
+    if !allowed {
+        let action = if local_policy.is_some()
+            && !astra_sandbox::is_never_readable_path(requested)
+            && !astra_sandbox::is_never_readable_path(resolved)
+        {
+            "Use an authorized existing directory or request access through the existing permission controls."
+        } else {
+            "Use an existing directory inside the active workspace."
+        };
+        return Err(BashWorkdirError {
+            approval_scope: local_policy
+                .filter(|_| {
+                    requested.is_absolute()
+                        && !astra_sandbox::is_never_readable_path(requested)
+                        && !astra_sandbox::is_never_readable_path(resolved)
+                })
+                .and_then(|_| astra_sandbox::SandboxApprovalScope::for_directory(resolved).ok()),
+            message: format!(
+                "SANDBOX_DENIED: bash `workdir` `{}` is not authorized by the current workspace policy (active workspace root '{}'); no command was run. {action} Omit `workdir` to use the active workspace. Changing `workdir` does not select another session workspace.",
+                requested.display(),
+                workspace_root.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Attach the canonical model-visible execution-directory evidence shared by
@@ -1032,9 +1150,9 @@ pub async fn execute_bash_with_environment(
                 .to_string(),
         );
     }
-    let workdir = match resolve_bash_workdir(&ctx.workspace_root, args) {
+    let workdir = match resolve_bash_workdir(&ctx.workspace_root, args, None) {
         Ok(workdir) => workdir,
-        Err(error) => return ToolResult::error(error),
+        Err(error) => return ToolResult::error(error.to_string()),
     };
     execute_bash_with_environment_at_workdir(ctx, args, environment, &workdir).await
 }
@@ -7548,21 +7666,26 @@ mod workdir_tests {
         std::fs::create_dir(&nested).unwrap();
 
         assert_eq!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({}))
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({}), None)
                 .unwrap()
                 .path(),
             workspace.path().canonicalize().unwrap()
         );
         assert_eq!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "nested"}))
-                .unwrap()
-                .path(),
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "nested"}),
+                None
+            )
+            .unwrap()
+            .path(),
             nested.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_bash_workdir(
                 workspace.path(),
-                &serde_json::json!({"workdir": nested.display().to_string()})
+                &serde_json::json!({"workdir": nested.display().to_string()}),
+                None
             )
             .unwrap()
             .path(),
@@ -7570,18 +7693,30 @@ mod workdir_tests {
         );
         std::fs::write(workspace.path().join("file"), b"not a directory").unwrap();
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "missing"}))
-                .is_err()
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "missing"}),
+                None
+            )
+            .is_err()
         );
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "file"}))
-                .unwrap_err()
-                .contains("not a directory")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "file"}),
+                None
+            )
+            .unwrap_err()
+            .contains("not a directory")
         );
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": ".."}))
-                .unwrap_err()
-                .contains("SANDBOX_DENIED")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": ".."}),
+                None
+            )
+            .unwrap_err()
+            .contains("SANDBOX_DENIED")
         );
     }
 
@@ -7593,14 +7728,15 @@ mod workdir_tests {
         let error = resolve_bash_workdir(
             workspace.path(),
             &serde_json::json!({"workdir": original.path()}),
+            None,
         )
         .unwrap_err();
         assert!(error.contains(&original.path().display().to_string()));
         assert!(error.contains(&workspace.path().display().to_string()));
         assert!(error.contains("no command was run"));
-        assert!(error.contains("inside the selected workspace"));
-        assert!(error.contains("session rooted there"));
-        assert!(error.contains("creates and selects a new worktree"));
+        assert!(error.contains("inside the active workspace"));
+        assert!(error.contains("Omit `workdir`"));
+        assert!(!error.contains("creates and selects a new worktree"));
     }
 
     #[cfg(unix)]
@@ -7611,9 +7747,13 @@ mod workdir_tests {
         std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
 
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "escape"}))
-                .unwrap_err()
-                .contains("SANDBOX_DENIED")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "escape"}),
+                None
+            )
+            .unwrap_err()
+            .contains("SANDBOX_DENIED")
         );
     }
 
@@ -7708,7 +7848,7 @@ mod workdir_tests {
             "command": "printf pinned > marker; pwd",
             "workdir": "nested"
         });
-        let prepared = resolve_bash_workdir(workspace.path(), &args).unwrap();
+        let prepared = resolve_bash_workdir(workspace.path(), &args, None).unwrap();
         std::fs::rename(&nested, &retained).unwrap();
         std::os::unix::fs::symlink(outside.path(), &nested).unwrap();
         let ctx = crate::ToolContext::test(workspace.path());

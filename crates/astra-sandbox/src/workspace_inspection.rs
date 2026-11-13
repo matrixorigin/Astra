@@ -270,6 +270,21 @@ mod unix {
             self.resolve(path, false, true, false).is_ok()
         }
 
+        /// Return a label only while it still identifies the pinned cwd. This
+        /// does not grant workspace inspection authority outside `root`.
+        pub fn working_directory_path(&self) -> io::Result<PathBuf> {
+            let label = display_path(&self.cwd)?;
+            let filesystem = open_filesystem_root()?;
+            let absolute = label
+                .strip_prefix("/")
+                .map_err(|_| invalid("working directory is not absolute"))?;
+            let current = open_directory_beneath(&filesystem, absolute)?;
+            if !same(&current, &self.cwd)? {
+                return Err(invalid("working directory label changed during inspection"));
+            }
+            Ok(label)
+        }
+
         pub fn working_directory_relative(&self) -> io::Result<PathBuf> {
             self.directory_relative(&self.cwd)
         }
@@ -434,6 +449,29 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::Path;
+
+    #[test]
+    fn external_cwd_label_does_not_expand_workspace_inspection() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("input"), "outside").unwrap();
+        let inspection = PinnedWorkspaceInspection::new(
+            std::sync::Arc::new(fs::File::open(root.path()).unwrap()),
+            std::sync::Arc::new(fs::File::open(outside.path()).unwrap()),
+        );
+        assert_eq!(
+            inspection.working_directory_path().unwrap(),
+            outside.path().canonicalize().unwrap()
+        );
+        assert!(
+            inspection
+                .matches_root_path(&root.path().canonicalize().unwrap())
+                .unwrap()
+        );
+        assert!(inspection.working_directory_relative().is_err());
+        assert!(!inspection.target_is_inside(Path::new("input")));
+        assert!(inspection.open_regular(Path::new("input"), false).is_err());
+    }
 
     #[test]
     fn retained_directory_is_used_for_targets_sources_and_labels() {

@@ -498,12 +498,26 @@ credentials are never implicitly copied into a local shell.
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
 on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
 owner under the workspace writer lease. `enter` creates and selects a new
-worktree; it does not adopt a separately created worktree. To use an existing
-worktree outside the selected root, start or select a CLI/User Runner session
-rooted there under the normal trust and policy checks. Bash `workdir` selects
-an invocation directory inside that root and rejects outside paths before
-execution. This directory selection guard does not replace the shell provider's
-policy and sandbox controls over commands that change directory.
+worktree; it does not adopt a separately created worktree. Bash `workdir` selects
+only one invocation's directory. Local CLI/User Runner calls can use an existing
+external directory under their current sandbox policy, including already granted
+temporary worktrees; the selected session workspace and command permissions stay
+unchanged. Restrictive relative paths remain workspace-bound; absolute paths may
+use explicit existing grants. Permissive mode retains sensitive-path exclusions.
+Generic Server execution remains workspace-only. The pinned directory is checked
+against its current authorization before launch, and relative read registration
+uses its verified identity. A pre-start refusal remains `rejected` / “Did not run”
+through callbacks and transcript restoration; it is distinct from an attempted
+command that failed. Bash sandbox retries use the producer's local
+`SandboxApprovalScope` handle for the exact existing directory. The
+`sandbox_approval_directory` callback field is diagnostic, not grant authority.
+Ambiguous or unrepresentable targets are returned to the model without guessing
+an approval scope from error prose.
+Callback run/call scope remains attached through root auditing. Resume joins
+existing callback facts with transcript items by that exact identity. If a
+remote transcript omits the tool row, confirmed refusals are rendered from the
+existing scoped audit fact. This changes neither provider messages nor durable
+projections and adds no SQL reads.
 It has no legacy `git(action=worktree)` alias. Ordinary worktree Git commands remain shell operations. Generic Server
 executors cannot silently create a local session owner. Typed commit/stash tool
 journals and their automatic compensation are removed along with their producers;
@@ -625,3 +639,24 @@ IDE settings, shell configuration, `.gitmodules` and other ordinary project
 configuration follow the same workspace write authority as source files. Merely
 being configuration or potentially executable does not create a second approval
 boundary. Git/agent authority metadata and credential rules remain separate.
+
+Local Bash uses the selected workspace for session ownership and the explicit
+`workdir` for one command. An external cwd must already be authorized by the
+existing sandbox policy, or receive the existing sandbox expansion approval.
+Bash has no separate read-only cwd preflight. A confirmed pre-start denial may
+carry a local handle for the exact existing approval directory; callback JSON
+is diagnostic and cannot supply that authority. A missing or replaced approval
+directory fails closed, without selecting an ancestor or retrying the command.
+Permission checks use frozen canonical grant prefixes. Restoring a policy does
+not resolve saved prefixes into new grants; old noncanonical aliases may fail
+closed. Grants retain the existing path-permission semantics after commit.
+Standard isolation does not provide OS confinement against arbitrary filesystem
+mutation after its final check. No execution lifecycle, journal lane or SQL
+operation is added by this separation.
+
+Cloud approval denial uses the existing `approval_denied` identity and preserves
+its supplied reason. A denied decision proves that the gated tool did not run;
+it does not establish whether a user, policy or unavailable interface caused
+the decision. The model-facing projection therefore adds no user attribution
+or inferred retry instructions. Queue failures retain their existing typed
+busy/unavailable cause through the scoped callback and the same projection.
