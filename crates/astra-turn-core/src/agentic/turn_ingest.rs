@@ -330,7 +330,7 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(err) = snap.error_message {
         // Use pre-classified error_kind when available (from HostTurnResult),
-        // falling back to string-based classification for SSE-path errors.
+        // falling back to the shared provider-envelope projection for SSE errors.
         let kind = if let Some(k) = snap.error_kind {
             if k == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
@@ -340,14 +340,21 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            if astra_core::is_llm_context_window_error(err) {
+            // The core projection owns both explicit causes and supported
+            // generic input-overflow semantics. Unknown, unstructured, and
+            // unsupported prose stays Unknown instead of guessing a context
+            // transition from provider-controlled text.
+            let kind = astra_core::StructuredLlmError::parse(err)
+                .as_ref()
+                .and_then(|error| error.kind())
+                .unwrap_or(astra_core::ErrorKind::Unknown);
+            if kind == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
-                astra_core::ErrorKind::ContextWindow
             } else {
                 *st.consecutive_context_window_errors = 0;
-                astra_core::classify_llm_error_message(err)
             }
+            kind
         };
         return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
             kind,
@@ -1098,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn fatal_context_window_increments_ptl_streak() {
+    fn fatal_preclassified_context_window_increments_ptl_streak() {
         let err = Some("prompt is too long".to_string());
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
@@ -1116,7 +1123,7 @@ mod tests {
             current_request_usage: None,
             has_usage: true,
             error_message: &err,
-            error_kind: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 1;
@@ -1159,21 +1166,175 @@ mod tests {
     }
 
     #[test]
-    fn fatal_unclassified_error_uses_core_llm_classifier() {
-        let cases = [
+    fn fatal_structured_body_too_large_is_not_context_window() {
+        let err = Some(
+            r#"LLM error 413: {"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#
+                .to_string(),
+        );
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            server_execution_summary: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
+            has_usage: false,
+            error_message: &err,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 3;
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
+            if e.kind == astra_core::ErrorKind::InvalidRequest
+        ));
+        assert_eq!(pack.consecutive_context_window_errors, 0);
+    }
+
+    /// Untyped provider errors retain one recovery contract from SSE dispatch
+    /// through snapshot and ingestion. Supported generic input-overflow
+    /// envelopes use the same core projection as HTTP; output parameters and
+    /// unstructured prose remain outside context recovery.
+    #[test]
+    fn fatal_generic_provider_errors_share_http_semantics_through_sse() {
+        for (message, expected_kind, expected_streak) in [
             (
-                "Error: pool timed out while waiting for an open connection",
-                astra_core::ErrorKind::ConnectionPoolExhausted,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
-                "Error: Could not validate credentials",
-                astra_core::ErrorKind::Auth,
+                r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
-                "The security token included in the request is expired",
-                astra_core::ErrorKind::Auth,
+                r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
-        ];
+            (
+                r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the rate limit of 50,000 input tokens per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                r#"{"error":{"type":"rate_limit_error","message":"Rate limit: too many tokens in the input per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                2,
+            ),
+            (
+                r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+            (
+                r#"{"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+            (
+                r#"{"error":{"code":429,"message":"Too many tokens in the input per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                r#"{"error":{"code":429,"type":"invalid_request","message":"Too many tokens in the input per minute"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                "429 rate limit: too many tokens per minute",
+                astra_core::ErrorKind::Unknown,
+                0,
+            ),
+            ("prompt is too long", astra_core::ErrorKind::Unknown, 0),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            crate::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {}\n\n", json!({"type":"error","message":message})),
+                &mut accum,
+                &mut Vec::new(),
+            );
+            let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+            assert_eq!(
+                snap.error_kind, None,
+                "test must exercise the unclassified SSE fallback"
+            );
+
+            let mut pack = Pack::new();
+            pack.consecutive_context_window_errors = 1;
+            let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+            assert!(
+                matches!(&out, AgenticTurnIngestOutcome::Fatal(error)
+                    if error.kind == expected_kind),
+                "unexpected outcome for {message}: {out:?}"
+            );
+            assert_eq!(pack.consecutive_context_window_errors, expected_streak);
+        }
+    }
+
+    #[test]
+    fn fatal_structured_context_length_exceeded_is_context_window() {
+        let err = Some(
+            r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_def456"}}"#
+                .to_string(),
+        );
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            server_execution_summary: None,
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
+            has_usage: true,
+            error_message: &err,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 1;
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
+            if e.kind == astra_core::ErrorKind::ContextWindow
+        ));
+        assert_eq!(pack.consecutive_context_window_errors, 2);
+    }
+
+    #[test]
+    fn fatal_unstructured_error_is_unknown() {
+        let cases = [(
+            "Error: Could not validate credentials",
+            astra_core::ErrorKind::Unknown,
+        )];
 
         for (message, expected_kind) in cases {
             let err = Some(message.to_string());
@@ -1865,7 +2026,7 @@ mod tests {
             current_request_usage: None,
             has_usage: true,
             error_message: &err_msg,
-            error_kind: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
         };
         let outcome = ingest_agentic_turn_stream(&snap, "", pack.ingest_mut());
         assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));

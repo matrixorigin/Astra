@@ -13295,6 +13295,12 @@ pub(crate) mod tests {
         }
     }
 
+    fn rate_limit_error_result(error_msg: &str, prompt: u64, completion: u64) -> ScriptedTurn {
+        let mut turn = error_result(error_msg, prompt, completion);
+        turn.response.error_kind = Some(astra_core::ErrorKind::RateLimit);
+        turn
+    }
+
     #[tokio::test]
     async fn rate_limit_after_tool_calls_preserves_work() {
         // Turn 1: successful tool execution
@@ -13307,7 +13313,7 @@ pub(crate) mod tests {
                 1000,
                 Some(200),
             ),
-            error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
+            rate_limit_error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
         ]);
         let mut state = make_state();
         state
@@ -13333,7 +13339,7 @@ pub(crate) mod tests {
     async fn rate_limit_without_tool_calls_is_fatal() {
         // Turn 1: 429 rate limit error immediately (no prior tool work)
         // Expected: hard error (Err), because nothing to preserve
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: rate limit exceeded (after 3 retries)",
             0,
             0,
@@ -13380,7 +13386,7 @@ pub(crate) mod tests {
     async fn rate_limit_cooldown_records_consecutive_errors() {
         // Verify that the rate_limit_cooldown field on AgenticLoopState
         // accumulates errors from rate-limited turns.
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: 429 Too Many Requests (after 3 retries)",
             0,
             0,
@@ -13403,7 +13409,7 @@ pub(crate) mod tests {
         // Turn 1: 429 error (records into cooldown)
         // Turn 2: success (resets consecutive counters)
         let mut host = MockHost::new(vec![
-            error_result("Error: 429 rate limit", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit", 0, 0),
             text_result("All good now!", 100, 50, Some(80)),
         ]);
         // Need 2+ turns so the loop can try both
@@ -13460,7 +13466,7 @@ pub(crate) mod tests {
         // the typed failure must preserve results without fabricating success.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
-            error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
         ]);
         let mut state = make_state();
         state

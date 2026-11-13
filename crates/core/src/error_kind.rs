@@ -4,10 +4,9 @@
 //! [`ErrorKind`]. Downstream code should pattern-match on the kind instead of
 //! re-parsing display strings.
 //!
-//! Boundary outputs that are inherently unstructured still need explicit
-//! fallback classifiers:
-//! - [`classify_llm_error_message`] for provider / transport strings when the
-//!   caller did not receive structured metadata.
+//! Provider recovery uses the [`StructuredLlmError`] projection; arbitrary
+//! display strings never drive recovery. Other inherently unstructured
+//! boundaries keep explicit classifiers:
 //! - [`classify_tool_output`] for external tool output (bash, MCP).
 //! - [`classify_model_resolution_error_message`] for model registry lookup
 //!   failures returned as strings by legacy service boundaries.
@@ -329,8 +328,8 @@ impl ErrorKind {
                  Reduce input size: drop older messages, summarize, or use a model with a larger context."
             }
             Self::InvalidRequest => {
-                "The request was rejected by the LLM provider (400). \
-                 This may indicate a bug in request assembly. Do NOT retry with the same parameters."
+                "The request was rejected by the LLM provider. Do NOT retry with the same parameters; \
+                 reduce request size if the provider reports a body-size limit."
             }
             Self::ContractViolation => {
                 "The runtime violated an internal lifecycle or delivery contract. \
@@ -659,40 +658,236 @@ impl From<String> for ClassifiedError {
     }
 }
 
-// ── LLM error-message fallback classifier ────────────────────────────────────
+// ── Structured LLM provider error envelope ───────────────────────────────────
 
-/// Boundary fallback for context-window / prompt-too-long provider text.
+/// One parsed provider error response, shared by all classifiers at an HTTP
+/// boundary. Keeping the parsed root avoids reparsing and cloning the same
+/// envelope for kind, machine facts, parameters, and correlation IDs.
 ///
-/// This is not a general structured error classifier. Callers that already know
-/// the failure kind should construct [`ErrorKind::ContextWindow`] directly.
-#[must_use]
-pub fn is_llm_context_window_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    is_unstructured_llm_context_window_message_lower(&lower)
+/// Gateways such as TaaS return
+/// `{"error":{"message","type","param","code","request_id"}}`; Anthropic
+/// additionally places `request_id` at the top level. Explicit protocol
+/// causes classify authoritatively. A bounded set of supported generic
+/// provider/protocol envelopes also carries input-overflow semantics in its
+/// message; those semantics are normalized here, once for every consumer.
+#[derive(Debug)]
+pub struct StructuredLlmError {
+    value: serde_json::Value,
 }
 
-fn is_unstructured_llm_context_window_message_lower(lower: &str) -> bool {
+impl StructuredLlmError {
+    /// Parse a raw provider body or a message with JSON appended after a
+    /// human-readable prefix. A JSON response without an `error` member is not
+    /// a provider error projection.
+    #[must_use]
+    pub fn parse(body: &str) -> Option<Self> {
+        let trimmed = body.trim();
+        let value = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .or_else(|| {
+                let start = trimmed.find('{')?;
+                serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
+            })?;
+        value.get("error")?;
+        Some(Self { value })
+    }
+
+    fn error(&self) -> &serde_json::Value {
+        // `parse` establishes this invariant.
+        self.value.get("error").expect("parsed provider error")
+    }
+
+    /// Borrow a string field from the provider's `error` object.
+    #[must_use]
+    pub fn error_field(&self, key: &str) -> Option<&str> {
+        self.error().get(key)?.as_str()
+    }
+
+    /// The whitelisted machine-readable cause and its recovery kind. A
+    /// specific `type` cause outranks a generic `code` category.
+    #[must_use]
+    pub fn code(&self) -> Option<(ErrorKind, &'static str)> {
+        let token = |key: &str| {
+            self.error_field(key)
+                .filter(|token| !token.trim().is_empty())
+        };
+        let code = token("code").and_then(llm_error_envelope_code_class);
+        let category = token("type").and_then(llm_error_envelope_code_class);
+        code.filter(|(_, token)| *token != "invalid_request")
+            .or(category)
+            .or(code)
+    }
+
+    /// Whether the normalized protocol cause is more specific than the
+    /// generic `invalid_request` family.
+    #[must_use]
+    pub fn has_specific_cause(&self) -> bool {
+        self.code()
+            .is_some_and(|(_, token)| token != "invalid_request")
+    }
+
+    /// Derive recovery once for status-less SSE consumers. HTTP callers use
+    /// [`Self::kind_for_http_status`] so inferred generic semantics cannot
+    /// turn a 413 byte-limit rejection into context overflow.
+    #[must_use]
+    pub fn kind(&self) -> Option<ErrorKind> {
+        self.kind_with_status(None)
+    }
+
+    /// Derive recovery at an HTTP boundary. Explicit protocol causes and
+    /// numeric rate limits win; inferred generic input-overflow semantics are
+    /// valid only for HTTP 400 (or the status-less SSE form).
+    #[must_use]
+    pub fn kind_for_http_status(&self, status: u16) -> Option<ErrorKind> {
+        self.kind_with_status(Some(status))
+    }
+
+    fn kind_with_status(&self, status: Option<u16>) -> Option<ErrorKind> {
+        let cause = self.code();
+        if let Some((kind, token)) = cause
+            && token != "invalid_request"
+        {
+            return Some(kind);
+        }
+        if self.error().get("code").and_then(serde_json::Value::as_i64) == Some(429) {
+            return Some(ErrorKind::RateLimit);
+        }
+        if status.is_none_or(|status| status == 400) && self.is_supported_generic_input_overflow() {
+            return Some(ErrorKind::ContextWindow);
+        }
+        cause.map(|(kind, _)| kind)
+    }
+
+    /// Recognize only the documented generic provider/protocol families that
+    /// can carry input overflow without a dedicated string code. This is
+    /// deliberately not a fallback for arbitrary provider text: a specific
+    /// contrary code, a non-input parameter, or a non-400 numeric code keeps
+    /// the ordinary status/unknown classification.
+    fn is_supported_generic_input_overflow(&self) -> bool {
+        if !matches!(
+            self.error_field("type"),
+            Some("invalid_request" | "invalid_request_error" | "BadRequestError")
+        ) {
+            return false;
+        }
+        let specific_code = self
+            .error_field("code")
+            .filter(|token| !token.trim().is_empty())
+            .is_some_and(|token| token != "invalid_request");
+        if specific_code
+            || self
+                .error()
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|code| code != 400)
+        {
+            return false;
+        }
+        let input_parameter = self.error_field("param").is_none_or(|parameter| {
+            matches!(parameter, "input" | "input_tokens" | "messages" | "prompt")
+        });
+        input_parameter
+            && self.error_field("message").is_some_and(|message| {
+                is_supported_input_context_window_message_lower(&message.to_ascii_lowercase())
+            })
+    }
+
+    /// Extract and validate either the OpenAI-compatible nested request ID or
+    /// Anthropic's documented top-level `request_id`.
+    #[must_use]
+    pub fn request_id(&self) -> Option<String> {
+        self.error_field("request_id")
+            .and_then(validated_llm_provider_request_id)
+            .or_else(|| {
+                self.value
+                    .get("request_id")?
+                    .as_str()
+                    .and_then(validated_llm_provider_request_id)
+            })
+    }
+}
+
+/// Classify a single provider error-envelope code token.
+///
+/// This is the same whitelist [`StructuredLlmError::code`] applies to
+/// envelope bodies, exposed for boundaries that already hold the bare token
+/// (e.g. the negotiated MOI model gateway contract). Returns the classified
+/// kind alongside the canonical static token; unrecognized codes return
+/// `None` so HTTP status or the SSE Unknown boundary owns the outcome.
+#[must_use]
+pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static str)> {
+    // Responses already owns protocol alias normalization; every envelope
+    // consumer uses that canonical cause instead of maintaining another list.
+    let code = crate::model_wire::responses::provider_error(code)
+        .map(|(normalized, _)| normalized)
+        .unwrap_or(code);
+    match code {
+        "context_length_exceeded" => Some((ErrorKind::ContextWindow, "context_length_exceeded")),
+        "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
+        "invalid_request" => Some((ErrorKind::InvalidRequest, "invalid_request")),
+        "provider_schema_error" => Some((ErrorKind::InvalidRequest, "provider_schema_error")),
+        "rate_limit_error" => Some((ErrorKind::RateLimit, "rate_limit_error")),
+        _ => None,
+    }
+}
+
+/// Validate a provider-supplied request id before it crosses into
+/// user-visible errors or structured log fields.
+///
+/// Provider error envelopes are untrusted: an arbitrary `request_id` could
+/// carry echoed credentials, control characters, or unbounded diagnostics.
+/// A character whitelist cannot tell an identifier from a credential —
+/// `sk-proj-secretABC123` is alphanumerics and dashes — so only documented
+/// identifier shapes pass:
+///
+/// - `req_<uuid>` — TaaS and current OpenAI request ids.
+/// - `req_<hex>` — legacy OpenAI request ids (8..=96 hex digits).
+/// - `req_<24 ASCII alphanumerics>` — Anthropic request ids.
+/// - `<uuid>` — bare UUID request ids used by some gateways.
+///
+/// Credential shapes (`sk-…`, `Bearer …`, `AKIA…`), free text, and overlong
+/// values are structurally excluded: they match none of these forms.
+#[must_use]
+pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
+    const MAX_REQUEST_ID_LEN: usize = 128;
+    const MAX_REQ_HEX_LEN: usize = 96;
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    let is_uuid = |token: &str| {
+        token.len() == 36
+            && token.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    };
+    let valid = if let Some(token) = value.strip_prefix("req_") {
+        is_uuid(token)
+            || ((8..=MAX_REQ_HEX_LEN).contains(&token.len())
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            || (token.len() == 24 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    } else {
+        is_uuid(value)
+    };
+    valid.then(|| value.to_string())
+}
+
+// ── LLM error-message classification helpers ─────────────────────────────────
+
+/// Message semantics used only after a supported generic envelope and its
+/// input parameter have been established. Keep byte-limit, output-limit, and
+/// rate-limit wording out of this predicate; those are different recovery
+/// contracts even when they mention a context window.
+fn is_supported_input_context_window_message_lower(lower: &str) -> bool {
     lower.contains("context_length_exceeded")
         || lower.contains("maximum context length")
         || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
         || lower.contains("input is too long")
-        || lower.contains("context window")
-        || is_max_tokens_context_limit_error(lower)
-}
-
-fn is_max_tokens_context_limit_error(lower: &str) -> bool {
-    lower.contains("max_tokens")
-        && (lower.contains("max_tokens limit")
-            || lower.contains("max_tokens exceeded")
-            || lower.contains("max_tokens is too large")
-            || lower.contains("max_tokens exceeds")
-            || ((lower.contains("context") || lower.contains("prompt"))
-                && (lower.contains("exceed") || lower.contains("too long"))))
-}
-
-fn is_rate_limit_error_lower(lower: &str) -> bool {
-    lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
+        || lower.contains("context window exceeded")
 }
 
 fn is_database_error_lower(lower: &str) -> bool {
@@ -711,53 +906,6 @@ fn is_database_error_lower(lower: &str) -> bool {
         || lower.contains("invalid agent_runs.")
         || lower.contains("invalid agent_sessions.")
         || lower.contains("connection pool timed out")
-}
-
-/// Classify an unstructured LLM provider / transport error message.
-///
-/// This is the single fallback for LLM calls that cross a boundary without
-/// structured error metadata. New call sites should still prefer constructing
-/// [`ClassifiedError`] at the source.
-#[must_use]
-pub fn classify_llm_error_message(message: &str) -> ErrorKind {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("model selection is required")
-        || lower.contains("missing model selection")
-        || lower.contains("no concrete model was selected")
-    {
-        return ErrorKind::MissingModelSelection;
-    }
-    if is_rate_limit_error_lower(&lower) {
-        ErrorKind::RateLimit
-    } else if is_connection_pool_timeout(&lower) {
-        ErrorKind::ConnectionPoolExhausted
-    } else if is_unstructured_llm_context_window_message_lower(&lower) {
-        ErrorKind::ContextWindow
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        ErrorKind::StreamIdle
-    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
-    {
-        ErrorKind::StreamTransport
-    } else if lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
-        || lower.contains("api key")
-        || lower.contains("could not validate credentials")
-        || lower.contains("invalid credentials")
-        || lower.contains("bad credentials")
-        || lower.contains("authentication failed")
-        || lower.contains("token expired")
-        || lower.contains("invalid token")
-        || lower.contains("security token included in the request is expired")
-    {
-        ErrorKind::Auth
-    } else if lower.contains("cancelled") || lower.contains("canceled") {
-        ErrorKind::Cancelled
-    } else {
-        ErrorKind::Unknown
-    }
 }
 
 /// Classify model registry / model-selection resolution failures.
@@ -822,9 +970,9 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
 /// External tool-output fallback classifier.
 ///
 /// Used exclusively for external tool output (bash, MCP tools) where we don't
-/// control the error format. LLM provider / transport strings use
-/// [`classify_llm_error_message`]; internal runtime errors should be constructed
-/// with the correct [`ErrorKind`] at their source.
+/// control the error format. LLM provider recovery uses typed protocol facts;
+/// internal runtime errors should be constructed with the correct [`ErrorKind`]
+/// at their source.
 ///
 /// For external categories, more specific patterns come first:
 /// PolicyDenied > ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
@@ -1162,13 +1310,6 @@ pub fn is_workspace_read_before_write(lower: &str) -> bool {
         || lower.contains("read the full file before overwriting")
 }
 
-fn is_connection_pool_timeout(lower: &str) -> bool {
-    lower.contains("connection pool timed out")
-        || lower.contains("pool timed out while waiting for an open connection")
-        || lower.contains("pool timed out waiting for an open connection")
-        || (lower.contains("pool timed out") && lower.contains("open connection"))
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1360,80 +1501,357 @@ mod tests {
         let _: &dyn std::error::Error = &err;
     }
 
-    // ── classify_llm_error_message ──
+    fn projected_kind(body: &str) -> Option<ErrorKind> {
+        StructuredLlmError::parse(body).and_then(|error| error.kind())
+    }
 
     #[test]
-    fn classify_llm_error_message_cases() {
-        let cases: &[(&str, ErrorKind)] = &[
+    fn structured_kind_cases() {
+        let cases: &[(&str, Option<ErrorKind>)] = &[
+            // A 413 gateway byte limit is never model context overflow.
             (
-                "model selection is required",
-                ErrorKind::MissingModelSelection,
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // An explicit envelope code takes precedence over message semantics.
+            (
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"context_length_exceeded","param":null,"code":"context_length_exceeded","request_id":"req_def456"}}"#,
+                Some(ErrorKind::ContextWindow),
             ),
             (
-                "missing model selection for tool",
-                ErrorKind::MissingModelSelection,
+                r#"{"error":{"message":"unknown parameter 'temperature'","type":"invalid_request","param":"temperature","code":"invalid_request","request_id":"req_ghi789"}}"#,
+                Some(ErrorKind::InvalidRequest),
             ),
             (
-                "no concrete model was selected",
-                ErrorKind::MissingModelSelection,
+                r#"{"error":{"message":"schema rejected by provider","type":"provider_schema_error","param":"tools","code":"provider_schema_error","request_id":"req_jkl012"}}"#,
+                Some(ErrorKind::InvalidRequest),
             ),
-            ("context_length_exceeded", ErrorKind::ContextWindow),
-            ("maximum context length is 128000", ErrorKind::ContextWindow),
-            ("prompt is too long", ErrorKind::ContextWindow),
-            ("too many tokens in the input", ErrorKind::ContextWindow),
-            ("input is too long for this model", ErrorKind::ContextWindow),
-            ("context window exceeded", ErrorKind::ContextWindow),
-            ("max_tokens limit exceeded", ErrorKind::ContextWindow),
-            ("rate limit exceeded", ErrorKind::RateLimit),
-            ("error 429: too many requests", ErrorKind::RateLimit),
+            // error.type is accepted when error.code is absent.
             (
-                "Error: pool timed out while waiting for an open connection",
-                ErrorKind::ConnectionPoolExhausted,
+                r#"{"error":{"message":"context exceeded","type":"context_length_exceeded"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // Embedded in an "LLM error {status}: {json}" string.
+            (
+                r#"LLM error 413: {"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_mno345"}}"#,
+                Some(ErrorKind::InvalidRequest),
             ),
             (
-                "rate limit exceeded for max_tokens setting",
-                ErrorKind::RateLimit,
+                r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_pqr678"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // A present but unrecognized `code` must not block a recognized
+            // `type`: the typed rejection owns recovery, not message prose.
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"unsupported_parameter"}}"#,
+                Some(ErrorKind::InvalidRequest),
             ),
             (
-                "rate limit exceeded while pool timed out waiting for an open connection",
-                ErrorKind::RateLimit,
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
+                Some(ErrorKind::InvalidRequest),
             ),
-            ("request timed out", ErrorKind::StreamIdle),
-            ("connection refused", ErrorKind::StreamTransport),
+            // Both cause tokens unrecognized → None. HTTP status or the SSE
+            // Unknown boundary owns the result; unsupported provider prose is
+            // never a recovery fallback.
             (
-                "LLM stream transport error: connection reset",
-                ErrorKind::StreamTransport,
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+                None,
             ),
-            ("401 unauthorized", ErrorKind::Auth),
-            ("Error: Could not validate credentials", ErrorKind::Auth),
-            ("invalid credentials", ErrorKind::Auth),
-            ("bad credentials", ErrorKind::Auth),
-            ("token expired", ErrorKind::Auth),
-            ("invalid token", ErrorKind::Auth),
-            ("authentication failed", ErrorKind::Auth),
+            // No recognized typed cause → None; callers must not inspect prose.
             (
-                "The security token included in the request is expired",
-                ErrorKind::Auth,
+                r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
+                None,
             ),
-            ("LLM call cancelled", ErrorKind::Cancelled),
-            ("something went wrong", ErrorKind::Unknown),
+            (r#"{"error":{"message":"no code here"}}"#, None),
+            (r#"{"usage":{"tokens":1}}"#, None),
+            // Unstructured text and invalid JSON → no typed classification.
+            ("maximum context length exceeded", None),
+            ("LLM error 413: not json at all", None),
+            ("", None),
         ];
 
         for (input, expected) in cases {
             assert_eq!(
-                classify_llm_error_message(input),
+                projected_kind(input),
                 *expected,
-                "classify_llm_error_message({input:?}) should be {expected:?}"
+                "projected_kind({input:?}) should be {expected:?}"
             );
         }
     }
 
     #[test]
-    fn is_llm_context_window_error_is_case_insensitive() {
-        assert!(is_llm_context_window_error("MAX_TOKENS LIMIT EXCEEDED"));
-        assert!(!is_llm_context_window_error("rate limit exceeded"));
-        assert!(!is_llm_context_window_error("internal server error"));
-        assert!(!is_llm_context_window_error(""));
+    fn structured_context_overflow_normalizes_supported_causes() {
+        for body in [
+            r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+            r#"{"error":{"code":"input_too_long","type":"invalid_request_error","message":"request rejected"}}"#,
+            r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
+        ] {
+            let error = StructuredLlmError::parse(body).expect("structured envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::ContextWindow), "{body}");
+            assert_eq!(
+                error.code().map(|(_, code)| code),
+                Some("context_length_exceeded")
+            );
+        }
+
+        // These providers carry the same input-overflow cause through a
+        // generic family rather than a dedicated string code. Empty/generic
+        // codes and input parameters do not contradict that cause.
+        for body in [
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
+            r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+            r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+            r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
+            r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
+        ] {
+            let error = StructuredLlmError::parse(body).expect("generic provider envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::ContextWindow), "{body}");
+        }
+
+        for body in [
+            r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
+            r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","code":"some_future_code"}}"#,
+            r#"{"error":{"message":"prompt is too long","type":"invalid_request_error","param":"max_tokens"}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","param":"max_tokens"}}"#,
+        ] {
+            let error = StructuredLlmError::parse(body).expect("structured envelope");
+            assert_ne!(
+                error.kind(),
+                Some(ErrorKind::ContextWindow),
+                "unsupported families and output parameters must not authorize compaction: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_recovery_bounds_unsupported_prose() {
+        for body in [
+            r#"{"error":{"type":"invalid_request_error","message":"Request body too large; reduce the context window payload"}}"#,
+            r#"{"error":{"message":"prompt is too long"}}"#,
+        ] {
+            let error = StructuredLlmError::parse(body).expect("structured envelope");
+            assert_ne!(
+                error.kind(),
+                Some(ErrorKind::ContextWindow),
+                "unsupported prose is not a recovery fact: {body}"
+            );
+        }
+
+        let overflow = StructuredLlmError::parse(
+            r#"{"error":{"code":"context_length_exceeded","message":"request rejected"}}"#,
+        )
+        .expect("typed overflow");
+        assert_eq!(overflow.kind(), Some(ErrorKind::ContextWindow));
+
+        let generic_overflow = StructuredLlmError::parse(
+            r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
+        )
+        .expect("generic input overflow");
+        assert_eq!(generic_overflow.kind(), Some(ErrorKind::ContextWindow));
+        assert_eq!(
+            generic_overflow.kind_for_http_status(400),
+            Some(ErrorKind::ContextWindow)
+        );
+        assert_ne!(
+            generic_overflow.kind_for_http_status(413),
+            Some(ErrorKind::ContextWindow),
+            "HTTP 413 is a byte-limit rejection, not inferred model overflow"
+        );
+
+        let generic_anthropic_overflow = StructuredLlmError::parse(
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        )
+        .expect("generic Anthropic input overflow");
+        assert_eq!(
+            generic_anthropic_overflow.kind_for_http_status(400),
+            Some(ErrorKind::ContextWindow)
+        );
+        assert_ne!(
+            generic_anthropic_overflow.kind_for_http_status(413),
+            Some(ErrorKind::ContextWindow),
+            "status-less SSE semantics must not bypass the HTTP 413 boundary"
+        );
+
+        let rate_limit = StructuredLlmError::parse(
+            r#"{"error":{"code":429,"message":"Too many tokens in the input per minute"}}"#,
+        )
+        .expect("numeric rate-limit status");
+        assert_eq!(rate_limit.kind(), Some(ErrorKind::RateLimit));
+
+        let mixed_rate_limit = StructuredLlmError::parse(
+            r#"{"error":{"code":429,"type":"invalid_request","message":"Too many tokens in the input per minute"}}"#,
+        )
+        .expect("numeric rate limit with generic category");
+        assert_eq!(mixed_rate_limit.kind(), Some(ErrorKind::RateLimit));
+    }
+
+    #[test]
+    fn structured_rate_limit_cause_precedes_context_prose() {
+        for message in [
+            "This request would exceed the rate limit of 50,000 input tokens per minute",
+            "Rate limit: too many tokens in the input per minute",
+        ] {
+            let body = serde_json::json!({"error":{"type":"rate_limit_error","message":message}});
+            let error = StructuredLlmError::parse(&body.to_string()).expect("rate-limit envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::RateLimit), "{message}");
+            assert_eq!(error.code().map(|(_, code)| code), Some("rate_limit_error"));
+        }
+    }
+
+    fn projected_request_id(body: &str) -> Option<String> {
+        StructuredLlmError::parse(body).and_then(|error| error.request_id())
+    }
+
+    #[test]
+    fn structured_request_id_extraction() {
+        assert_eq!(
+            projected_request_id(
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123de"}}"#
+            ),
+            Some("req_abc123de".to_string())
+        );
+        assert_eq!(
+            projected_request_id(
+                r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def45678"}}"#
+            ),
+            Some("req_def45678".to_string())
+        );
+        assert_eq!(
+            projected_request_id(r#"{"error":{"message":"bad param","code":"invalid_request"}}"#),
+            None
+        );
+        assert_eq!(projected_request_id("not json"), None);
+        assert_eq!(
+            projected_request_id(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#
+            ),
+            Some("req_011CSHoEeqs5C35K2UUqR7Fy".to_string()),
+            "Anthropic's documented top-level, non-hexadecimal id must correlate"
+        );
+    }
+
+    #[test]
+    fn structured_request_id_rejects_untrusted_values() {
+        // Documented identifier shapes pass: TaaS's `req_<hyphenated-uuid>`,
+        // legacy `req_<hex>`, and bare UUID gateway ids.
+        assert_eq!(
+            projected_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("req_3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
+        assert_eq!(
+            projected_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
+        // Secret-bearing values must never reach user-visible errors or logs.
+        // A character whitelist cannot tell these credential shapes from an
+        // identifier — only the structural forms above are accepted.
+        for body in [
+            r#"{"error":{"code":"invalid_request","request_id":"Bearer secret-token"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-proj-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-ant-api03-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"AKIAIOSFODNN7EXAMPLE"}}"#,
+            // A `req_` prefix does not rescue a credential-shaped payload.
+            r#"{"error":{"code":"invalid_request","request_id":"req_sk-proj-secretABC123"}}"#,
+            // Control characters and quotes break log/message structure.
+            r#"{"error":{"code":"invalid_request","request_id":"req_ok\u000aevil"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req_\"quoted\""}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req spaced"}}"#,
+        ] {
+            assert_eq!(
+                projected_request_id(body),
+                None,
+                "untrusted request_id must be rejected: {body}"
+            );
+        }
+        // Overlong values are unbounded diagnostics, not identifiers.
+        let overlong = format!(
+            r#"{{"error":{{"code":"invalid_request","request_id":"req_{}"}}}}"#,
+            "a".repeat(256)
+        );
+        assert_eq!(projected_request_id(&overlong), None);
+    }
+
+    fn projected_code(body: &str) -> Option<(ErrorKind, &'static str)> {
+        StructuredLlmError::parse(body).and_then(|error| error.code())
+    }
+
+    #[test]
+    fn structured_code_is_whitelisted() {
+        // Only fixed protocol tokens are surfaced for user-visible messages;
+        // unrecognized codes yield None so free-text diagnostics never leak.
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                r#"{"error":{"code":"request_body_too_large","message":"request body too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            (
+                r#"{"error":{"code":"provider_schema_error","message":"bad shape"}}"#,
+                Some("provider_schema_error"),
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            // type fallback carries the same whitelist.
+            (
+                r#"{"error":{"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            // OpenAI-compatible envelopes commonly carry `"code": null`;
+            // unusable code values fall back to `type`.
+            (
+                r#"{"error":{"code":null,"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"","type":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            (
+                r#"{"error":{"code":123,"type":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            // A usable `code` keeps precedence over `type`.
+            (
+                r#"{"error":{"code":"context_length_exceeded","type":"invalid_request","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            // An unrecognized `code` defers to a recognized `type`; the
+            // surfaced token is the one that classified.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"invalid_request","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                Some("invalid_request"),
+            ),
+            // Both tokens unrecognized → None; no provider text is projected.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"some_new_type","message":"x"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"invalid_value","type":"invalid_request_error","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"internal_error: db conn 10.0.0.1 refused","message":"x"}}"#,
+                None,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                projected_code(input).map(|(_, code)| code),
+                *expected,
+                "projected_code({input:?}) should be {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -1843,13 +2261,6 @@ mod tests {
         ] {
             assert_ne!(kind.diagnosis_hint(), kind.guidance());
         }
-    }
-
-    #[test]
-    fn context_window_error_detected_in_llm_error_format() {
-        let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
-        let err = format!("LLM error 400: {api_body}");
-        assert!(is_llm_context_window_error(&err));
     }
 
     #[test]

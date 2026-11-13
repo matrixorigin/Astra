@@ -51,6 +51,24 @@ provider message text never does. A quota-coded 429 is terminal, unlike a
 transient rate limit. These access rejections do not trigger automatic retry,
 credential refresh, provider fallback, or a waiting run.
 
+Automatic context-window recovery uses an explicit typed protocol cause such
+as `context_length_exceeded` (including its normalized protocol aliases) as the
+authoritative signal. The shared `StructuredLlmError` boundary also normalizes
+the documented input-overflow semantics of supported generic
+`invalid_request`, `invalid_request_error`, and `BadRequestError` envelopes:
+only an absent/generic or numeric-400 code, an input or absent parameter, and
+a recognized input-overflow message qualify. A specific contrary code or an
+output parameter such as `max_tokens` never does. This inferred generic
+semantics is limited to HTTP 400 and status-less SSE; an inferred generic
+HTTP 413 failure remains a request-size rejection, never model context
+overflow. Unknown or unstructured
+HTTP 400/413 failures remain `invalid_request`; an untyped SSE failure without
+a recognized or supported normalized cause remains `unknown`. Chat streaming,
+Chat non-streaming, Responses, and untyped SSE ingest consume this same
+recovery projection. Structured non-stream failures use the same bounded
+status/cause/request-ID diagnostics as streaming failures, never the raw
+provider body.
+
 Both streaming and nonstreaming calls preserve these classifications through
 the shared agent loop and failed Run outcome. The negotiated MOI gateway can
 carry the same provider facts using `provider_authentication_failed`,
