@@ -225,6 +225,10 @@ pub struct EdgeConnectionContext {
     pub edge_agent_id: String,
     pub workspace_dir: PathBuf,
     pub journal_path: PathBuf,
+    /// Journal path used before `server_url` joined the key. The invocation
+    /// owner moves that file onto `journal_path` when the server file is
+    /// still empty. `None` means this journal never used that older name.
+    pub legacy_journal_path: Option<PathBuf>,
     /// Signals installed consumer readiness after journal recovery/replay.
     pub ready: Option<oneshot::Sender<()>>,
 }
@@ -515,7 +519,11 @@ impl EdgeInvocationOwner {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
             mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
-        let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
+        let journal = EdgeInvocationJournal::open_inheriting(
+            context.journal_path.clone(),
+            context.legacy_journal_path.clone(),
+        )
+        .await?;
         let journal_status = journal.status();
         tracing::info!(
             target: "astra.edge.invocation_journal",
@@ -1333,6 +1341,7 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: workspace.clone(),
                 journal_path: journal_path.clone(),
+                legacy_journal_path: None,
                 ready: None,
             };
             let mut owner =
@@ -1503,6 +1512,7 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: server_workspace.clone(),
                 journal_path: server_journal.clone(),
+                legacy_journal_path: None,
                 ready: None,
             };
             let mut owner = EdgeInvocationOwner::open(&context(), server_executor)
@@ -1648,6 +1658,7 @@ mod tests {
                         edge_agent_id: "edge".into(),
                         workspace_dir: workspace,
                         journal_path,
+                        legacy_journal_path: None,
                         ready: Some(ready),
                     },
                     executor,
@@ -1820,6 +1831,7 @@ mod tests {
                     edge_agent_id: "edge".into(),
                     workspace_dir: directory.path().to_owned(),
                     journal_path,
+                    legacy_journal_path: None,
                     ready: Some(ready),
                 },
                 Arc::new(NoDispatchExecutor),

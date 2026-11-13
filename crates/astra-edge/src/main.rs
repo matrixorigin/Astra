@@ -325,6 +325,22 @@ fn edge_invocation_journal_path_in_root(
     base.join("edge-invocations").join(format!("{key}.json"))
 }
 
+/// Journal key from before `server_url` was part of the identity. Opening the
+/// server-scoped path claims this file when it still holds the only custody.
+fn legacy_edge_invocation_journal_path_in_root(
+    edge_id: &str,
+    workspace_dir: &Path,
+    state_root: Option<PathBuf>,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(edge_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace_dir.to_string_lossy().as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    let base = state_root.unwrap_or_else(astra_core::local_state::local_state_root);
+    base.join("edge-invocations").join(format!("{key}.json"))
+}
+
 /// Build the runtime-environment capability advertisement for this edge.
 ///
 /// Callers must pass an already-canonical `workspace` path; `run_edge_agent`
@@ -867,6 +883,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 &workspace,
                 config.invocation_journal_root.clone(),
             ),
+            legacy_journal_path: Some(legacy_edge_invocation_journal_path_in_root(
+                &config.edge_id,
+                &workspace,
+                config.invocation_journal_root.clone(),
+            )),
             ready: managed_ready_sender(),
         },
         Arc::new(DefaultInvocationExecutor(
@@ -1627,9 +1648,21 @@ mod tests {
             "edge-test",
             "wss://other.example.test",
             &workspace,
-            Some(root),
+            Some(root.clone()),
         );
         assert_ne!(path, other_server);
+        let legacy =
+            legacy_edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root));
+        let mut hasher = Sha256::new();
+        hasher.update(b"edge-test");
+        hasher.update([0]);
+        hasher.update(workspace.to_string_lossy().as_bytes());
+        let key = format!("{:x}.json", hasher.finalize());
+        assert_eq!(
+            legacy.file_name().and_then(|name| name.to_str()),
+            Some(key.as_str())
+        );
+        assert_ne!(legacy, path);
     }
 
     fn edge_config(
