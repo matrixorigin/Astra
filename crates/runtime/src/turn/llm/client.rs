@@ -6837,8 +6837,8 @@ async fn call_prepared_llm_attempts(
 
         // For other 4xx errors, suppress the raw response body to avoid
         // leaking secrets that providers may echo back. Retain body for 5xx
-        // (helpful for diagnosing transient backend failures); recovery never
-        // inspects provider prose.
+        // (helpful for diagnosing transient backend failures); only the shared
+        // structured projection may inspect bounded generic overflow semantics.
         let base_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
@@ -9245,9 +9245,11 @@ fn provider_http_error_kind_with_projection(
         ErrorKind::RateLimit
     } else if status >= 500 {
         ErrorKind::ServerError
-    } else if let Some(kind) = structured.and_then(|error| error.kind()) {
+    } else if let Some(kind) = structured.and_then(|error| error.kind_for_http_status(status)) {
         // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
         // byte limit is a request-size problem, never context overflow.
+        // Generic message-derived overflow is admitted by the shared
+        // projection only for HTTP 400; explicit typed causes still win.
         kind
     } else if let Some((kind, _)) =
         normalized_code.and_then(astra_core::llm_error_envelope_code_class)
@@ -19814,12 +19816,12 @@ mod tests {
         .expect_err("unrecognized structured cause must fail the non-stream call");
         // Even maximal context-window prose does not authorize compaction for
         // an unrecognized structured family; only an explicit typed overflow
-        // protocol cause may do that.
+        // cause or a supported generic provider/protocol family may do that.
         assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
     }
 
     #[tokio::test]
-    async fn generic_provider_prose_is_bounded_without_losing_request_id() {
+    async fn generic_input_context_overflow_is_recoverable_without_losing_request_id() {
         const REQUEST_ID: &str = "req_011CSHoEeqs5C35K2UUqR7Fy";
         const ANTHROPIC_WITH_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#;
         const ANTHROPIC_WITHOUT_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"}}"#;
@@ -19850,8 +19852,8 @@ mod tests {
                 let error = provider_http_error(&base, provider, streaming).await;
                 assert_eq!(
                     error.kind,
-                    astra_core::ErrorKind::InvalidRequest,
-                    "provider prose must not drive recovery: provider={provider}, streaming={streaming}"
+                    astra_core::ErrorKind::ContextWindow,
+                    "supported generic input overflow must recover: provider={provider}, streaming={streaming}"
                 );
                 if correlated {
                     assert!(
@@ -19874,11 +19876,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn numeric_code_does_not_turn_provider_prose_into_recovery() {
+    async fn numeric_code_distinguishes_input_overflow_from_output_limit_in_both_http_adapters() {
         for (body, expected_kind) in [
             (
                 r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
-                astra_core::ErrorKind::InvalidRequest,
+                astra_core::ErrorKind::ContextWindow,
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
@@ -19954,14 +19956,14 @@ mod tests {
             (
                 400,
                 r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::InvalidRequest,
+                astra_core::ErrorKind::ContextWindow,
                 None,
                 false,
             ),
             (
                 400,
                 r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::InvalidRequest,
+                astra_core::ErrorKind::ContextWindow,
                 None,
                 false,
             ),
@@ -20042,11 +20044,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_recovery_requires_typed_overflow_facts() {
+    async fn provider_recovery_bounds_unsupported_prose_and_http_413() {
         for (status, body, expected_kind) in [
             (
                 413,
                 r#"{"error":{"type":"invalid_request_error","message":"Request body too large for this gateway; reduce the context window payload."}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                413,
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"}}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                413,
+                r#"{"error":{"code":null,"type":"invalid_request","message":"This model's maximum context length is 8001 tokens"}}"#,
                 astra_core::ErrorKind::InvalidRequest,
             ),
             (

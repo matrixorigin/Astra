@@ -330,7 +330,7 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(err) = snap.error_message {
         // Use pre-classified error_kind when available (from HostTurnResult),
-        // falling back to the typed provider-envelope projection for SSE errors.
+        // falling back to the shared provider-envelope projection for SSE errors.
         let kind = if let Some(k) = snap.error_kind {
             if k == astra_core::ErrorKind::ContextWindow {
                 *st.consecutive_context_window_errors =
@@ -340,9 +340,10 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            // Recovery requires typed provider facts. Unknown, unstructured,
-            // and prose-only failures stay Unknown instead of guessing a
-            // context transition from provider-controlled text.
+            // The core projection owns both explicit causes and supported
+            // generic input-overflow semantics. Unknown, unstructured, and
+            // unsupported prose stays Unknown instead of guessing a context
+            // transition from provider-controlled text.
             let kind = astra_core::StructuredLlmError::parse(err)
                 .as_ref()
                 .and_then(|error| error.kind())
@@ -1195,19 +1196,21 @@ mod tests {
     }
 
     /// Untyped provider errors retain one recovery contract from SSE dispatch
-    /// through snapshot and ingestion, including the output-parameter control.
+    /// through snapshot and ingestion. Supported generic input-overflow
+    /// envelopes use the same core projection as HTTP; output parameters and
+    /// unstructured prose remain outside context recovery.
     #[test]
     fn fatal_generic_provider_errors_share_http_semantics_through_sse() {
         for (message, expected_kind, expected_streak) in [
             (
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
-                astra_core::ErrorKind::Unknown,
-                0,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
                 r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
-                astra_core::ErrorKind::Unknown,
-                0,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
                 r#"{"error":{"code":"context_window_exceeded","type":"invalid_request_error","message":"request rejected"}}"#,
@@ -1216,13 +1219,13 @@ mod tests {
             ),
             (
                 r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::InvalidRequest,
-                0,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
                 r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
-                astra_core::ErrorKind::Unknown,
-                0,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
                 r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the rate limit of 50,000 input tokens per minute"}}"#,
@@ -1236,8 +1239,8 @@ mod tests {
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
-                astra_core::ErrorKind::Unknown,
-                0,
+                astra_core::ErrorKind::ContextWindow,
+                2,
             ),
             (
                 r#"{"error":{"type":"BadRequestError","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192"}}"#,
