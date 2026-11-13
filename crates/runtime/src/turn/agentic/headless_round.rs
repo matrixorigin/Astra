@@ -719,7 +719,13 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         let result_status = record_index
             .map(|index| &tool_call_records[index])
             .map(|record| {
-                if !record.was_executed() {
+                if record.outcome_is_unknown() {
+                    if record.was_executed() {
+                        "The call started, but its outcome and effects are unknown."
+                    } else {
+                        "Whether the call executed and caused effects is unknown."
+                    }
+                } else if !record.was_executed() {
                     "The call was not executed."
                 } else if record.ok {
                     "The call completed successfully."
@@ -782,25 +788,26 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
     let execution_fact = result
         .and_then(|fields| fields.get("execution_fact"))
         .and_then(Value::as_str);
-    let unknown =
-        if astra_tools::execution_outcome::outcome_is_unknown(result.and_then(Value::as_object)) {
-            true
-        } else {
-            match execution_fact {
-                Some("executed" | "not_executed") => false,
-                _ => {
-                    record.outcome_is_unknown()
-                        || matches!(
-                            record.error_kind,
-                            Some(
-                                astra_core::ErrorKind::Cancelled
-                                    | astra_core::ErrorKind::ToolTimeout
-                                    | astra_core::ErrorKind::ToolOutcomeUnknown
-                            )
+    let unknown = if disposition == ToolCallDisposition::Unknown
+        || astra_tools::execution_outcome::outcome_is_unknown(result.and_then(Value::as_object))
+    {
+        true
+    } else {
+        match execution_fact {
+            Some("executed" | "not_executed") => false,
+            _ => {
+                record.outcome_is_unknown()
+                    || matches!(
+                        record.error_kind,
+                        Some(
+                            astra_core::ErrorKind::Cancelled
+                                | astra_core::ErrorKind::ToolTimeout
+                                | astra_core::ErrorKind::ToolOutcomeUnknown
                         )
-                }
+                    )
             }
-        };
+        }
+    };
     if record.ok && disposition != ToolCallDisposition::Deferred && !unknown {
         return None;
     }
@@ -1136,6 +1143,19 @@ mod tests {
             assert_eq!(facts["error_kind"], evidence.kind.as_str());
             assert_eq!(facts["recovery_evidence"], json!(evidence));
         }
+        let uncertain = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Unknown),
+            error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+            ..Default::default()
+        };
+        let restored: ToolCallRecord =
+            serde_json::from_value(serde_json::to_value(uncertain).unwrap()).unwrap();
+        let advice = tool_outcome_advisory(&restored, None).unwrap();
+        let facts: Value =
+            serde_json::from_str(advice.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+        assert_eq!(facts["execution"], "unknown");
     }
 
     #[test]

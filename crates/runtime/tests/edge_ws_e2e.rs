@@ -711,7 +711,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
         if self.block_result.swap(false, Ordering::SeqCst) {
             self.result_started.notify_one();
             self.continue_result.notified().await;

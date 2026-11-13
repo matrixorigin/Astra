@@ -2041,6 +2041,7 @@ async fn execute_cli_command_impl(
         Some(Command::Logout) => {
             if crate::cli::native_auth::active().is_some() {
                 crate::cli::native_auth::logout().await?;
+                crate::cli::cloud_sync::clear_sync_cloud_access();
                 stdout_println!("Logged out of MOI");
                 return Ok(ExitCode::Success);
             }
@@ -2059,6 +2060,7 @@ async fn execute_cli_command_impl(
                 .await
                 .map_err(map_thin_err)?;
             clear_profile_auth(profile.as_deref())?;
+            crate::cli::cloud_sync::clear_sync_cloud_access();
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -2692,16 +2694,11 @@ async fn execute_cli_command_impl(
                                                 merge_cancelled_context_for_run(context_observation, &run_id, failure),
                                             );
                                         }
-                                        match result {
-                                            Ok(result) => Ok(result),
-                                            Err(_) if !user_interrupted => Ok(stream_result_from_incremental_snapshot(
-                                                wall_deadline_incremental_state
-                                                    .as_ref()
-                                                    .map(|state| state.snapshot())
-                                                    .unwrap_or(snapshot),
-                                            )),
-                                            Err(failure) => Err(failure),
-                                        }
+                                        recover_wall_deadline_clean_cancel(
+                                            result,
+                                            !user_interrupted && request_session_execution_lease.failure().is_none(),
+                                            wall_deadline_incremental_state.as_ref().expect("one-shot state"),
+                                        )
                                     }
                                     None => crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
                                         &format!("request interruption root drain did not settle for run {run_id}"),
@@ -2765,7 +2762,7 @@ async fn execute_cli_command_impl(
             let shell_shutdown = settle_one_shot_cleanup_observing_interrupt(
                 async {
                     let report = background_tasks.kill_all_and_wait(std::time::Duration::from_secs(2)).await;
-                    let unsettled = report.unsettled.len().saturating_add(report.evicted_unsettled);
+                    let unsettled = report.unsettled.len();
                     let unknown = report.unknown.len();
                     shell_settlement_confirmed = unsettled == 0 && unknown == 0;
                     if !shell_settlement_confirmed {
@@ -3775,7 +3772,9 @@ fn retain_one_shot_interruption_failure(
             }
         }
     };
-    failure.partial.failed_run_terminal = None;
+    if !failure.partial.callback_client_detached {
+        failure.partial.observed_run_terminal = None;
+    }
     retain_one_shot_observed_partial(&mut failure, incremental_state);
     if had_failure {
         if !failure.error.is_empty() {
@@ -3798,6 +3797,42 @@ pub(crate) fn settle_one_shot_user_interrupt_result(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let result = result.map_err(|mut failure| {
         retain_one_shot_observed_partial(&mut failure, incremental_state);
+        if failure.partial.callback_client_detached {
+            use astra_turn_core::interruption::{
+                InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+            };
+            if failure.partial.failure_kind != Some(astra_core::ErrorKind::Cancelled) {
+                failure.error = format!("user interrupted the turn; {}", failure.error);
+            }
+            failure.partial.failure_kind = Some(astra_core::ErrorKind::Cancelled);
+            let previous = failure.partial.interruption.take().and_then(|value| {
+                serde_json::from_value::<InterruptionRecord>(value).ok()
+            });
+            let summary = previous.map_or_else(InterruptionStateSummary::default, |record| {
+                InterruptionStateSummary {
+                    has_checkpoint: record.has_checkpoint,
+                    tool_calls_completed: record.tool_calls_completed,
+                    turns_completed: record.turns_completed,
+                    remaining_turns: record.remaining_turns,
+                    error_detail: record.error_detail,
+                    stall_signal: record.stall_signal,
+                    resume_restricted_tools: record.resume_restricted_tools,
+                }
+            });
+            let mut interruption = InterruptionRecord::new(
+                InterruptionKind::UserCancelled,
+                ResumeAction::RequiresIntervention {
+                    description: "A tool-result callback or its local bookkeeping needs attention; check the run before continuing.".into(),
+                },
+                InterruptionStateSummary { error_detail: Some(failure.error.clone()), ..summary },
+            );
+            if failure.partial.observed_run_terminal.as_ref().is_some_and(|terminal| {
+                terminal.status == astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Completed
+            }) {
+                interruption.user_message = "The server run completed, but the client was cancelled while confirming a tool result; check the run before continuing.".into();
+            }
+            failure.partial.interruption = Some(interruption.to_json());
+        }
         failure
     });
     let local_unsettled = one_shot_local_ownership_unsettled(executor, native_executor);
@@ -3810,6 +3845,22 @@ pub(crate) fn settle_one_shot_user_interrupt_result(
     }
     match result {
         Err(failure) if recover_clean_cancel && failure.is_clean_local_cancel() => Ok(
+            stream_result_from_incremental_snapshot(incremental_state.snapshot()),
+        ),
+        result => result,
+    }
+}
+
+/// Only a clean local cancellation may be projected as a deadline partial.
+/// Observed callback, session, output and other failures remain failures.
+#[allow(clippy::result_large_err)]
+fn recover_wall_deadline_clean_cancel(
+    result: Result<StreamResult, crate::TurnFailure>,
+    recovery_allowed: bool,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) -> Result<StreamResult, crate::TurnFailure> {
+    match result {
+        Err(failure) if recovery_allowed && failure.is_clean_local_cancel() => Ok(
             stream_result_from_incremental_snapshot(incremental_state.snapshot()),
         ),
         result => result,
@@ -4015,7 +4066,33 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         failure.partial.cancel_context_not_saved,
     );
     let partial = failure.partial;
-    let authoritative_failed = partial.failed_run_terminal.is_some()
+    let observed_terminal = partial
+        .callback_client_detached
+        .then(|| {
+            partial.observed_run_terminal.as_ref().map(|terminal| {
+                use astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus;
+                let status = match terminal.status {
+                    DurableRunTerminalStatus::Completed => "completed",
+                    DurableRunTerminalStatus::Cancelled => "cancelled",
+                    DurableRunTerminalStatus::Failed => "failed",
+                    DurableRunTerminalStatus::Delegated => "delegated",
+                    DurableRunTerminalStatus::Paused => "paused",
+                };
+                serde_json::json!({
+                    "run_id": terminal.run_id, "status": status,
+                    "owner_generation": terminal.owner_generation,
+                    "error_kind": terminal.error_kind.map(|kind| kind.as_str()),
+                })
+            })
+        })
+        .flatten();
+    let authoritative_failed = partial
+        .observed_run_terminal
+        .as_ref()
+        .is_some_and(|terminal| {
+            terminal.status
+                == astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed
+        })
         && !partial.remote_cancel_required
         && !partial.callback_client_detached
         && !partial.admission_rejected
@@ -4071,6 +4148,17 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     output["error"] = serde_json::json!(diagnostic);
     output["error_code"] = serde_json::json!(partial.error_code);
     output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    if let Some(kind) = partial.callback_error_kind {
+        output["callback_error_kind"] = serde_json::json!(kind.as_str());
+    }
+    if let Some(terminal) = observed_terminal {
+        output["server_terminal_observation"] = terminal;
+    }
+    if partial.callback_client_detached
+        && let Some(interruption) = partial.interruption
+    {
+        output["interruption"] = interruption;
+    }
     if let Some(observation) = partial.cancel_context_not_saved {
         output["context_not_saved"] = serde_json::json!(observation);
     }
@@ -4535,7 +4623,50 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 4. Project config
+    // 4. Cloud synchronization
+    stdout_println!("{}", "Cloud Sync".bold().magenta());
+    match crate::cli::cloud_sync::read_sync_outbox_status().await {
+        Ok(status) => {
+            if status.poisoned > 0 {
+                let summary = format!(
+                    "{} item(s) could not be synchronized and remain on this device",
+                    status.poisoned
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                issues.push(summary);
+            }
+            if status.skipped > 0 {
+                let summary = format!(
+                    "{} item(s) could not be prepared for synchronization",
+                    status.skipped
+                );
+                stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
+                if let Some(reason) = status.last_skipped_reason {
+                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                }
+                issues.push(summary);
+            }
+            if status.pending > 0 || status.in_flight > 0 {
+                stdout_println!("  {}", "Local changes are waiting to sync".yellow());
+            } else if status.poisoned == 0 && status.skipped == 0 {
+                stdout_println!("  {}", "No pending local changes".green());
+            }
+            if let Some(reason) = status.last_error.as_deref() {
+                stdout_println!("  {} {}", "Last sync error:".dim(), reason);
+            }
+        }
+        Err(error) => {
+            stdout_println!(
+                "  {} {}",
+                theme::icon_warn(),
+                "Unable to read sync status".yellow()
+            );
+            issues.push(format!("Unable to read sync status: {error}"));
+        }
+    }
+    stdout_println!();
+
+    // 5. Project config
     stdout_println!("{}", "Project Configuration".bold().magenta());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
@@ -4552,7 +4683,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     stdout_println!("  {} {}", "Working dir:".dim(), cwd.display());
     stdout_println!();
 
-    // 5. MCP configuration
+    // 6. MCP configuration
     stdout_println!("{}", "MCP Configuration".bold().magenta());
     for (scope, path_fn) in &[
         (
@@ -4609,7 +4740,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     }
     stdout_println!();
 
-    // 6. Environment
+    // 7. Environment
     stdout_println!("{}", "Environment".bold().magenta());
     stdout_println!("  {} {}", "OS:".dim(), std::env::consts::OS);
     stdout_println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
@@ -5340,7 +5471,7 @@ mod exit_code_tests {
             partial: crate::PartialTurnData {
                 run_id: Some("failed-root".into()),
                 failure_kind: Some(astra_core::ErrorKind::StreamTransport),
-                failed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                observed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
                     run_id: "failed-root".into(), owner_generation: Some(4),
                     status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                     error: Some("provider stream stopped".into()),
@@ -5378,6 +5509,30 @@ mod exit_code_tests {
     }
 
     #[test]
+    fn callback_failure_json_keeps_typed_callback_and_root_observation() {
+        let mut failure = accepted_failed_run();
+        failure.error = "root failed; callback request=req-a was unconfirmed".into();
+        failure.partial.callback_client_detached = true;
+        failure.partial.callback_error_kind = Some(astra_core::ErrorKind::Auth);
+        failure.partial.interruption = Some(serde_json::json!({
+            "kind":"interrupted", "resume_action":"requires_intervention"
+        }));
+        let output = super::hard_failure_json_output(failure);
+        assert_eq!(output["callback_error_kind"], "auth");
+        assert_eq!(output["server_terminal_observation"]["status"], "failed");
+        assert_eq!(
+            output["server_terminal_observation"]["run_id"],
+            "failed-root"
+        );
+        assert_eq!(
+            output["interruption"]["resume_action"],
+            "requires_intervention"
+        );
+        assert!(output["error"].as_str().unwrap().contains("req-a"));
+        assert_eq!(output["server_terminal_authoritative"], false);
+    }
+
+    #[test]
     fn failed_remote_run_does_not_invent_tool_result_classes() {
         for (count, outcomes) in [
             (0, None),
@@ -5405,7 +5560,19 @@ mod exit_code_tests {
         )
         .unwrap_err();
         assert!(!settled);
-        assert!(failure.partial.failed_run_terminal.is_none());
+        assert!(failure.partial.observed_run_terminal.is_none());
+        let mut callback_failure = accepted_failed_run();
+        callback_failure.partial.callback_client_detached = true;
+        let mut callback_settled = true;
+        let callback_failure = super::apply_one_shot_cleanup_result(
+            Err(callback_failure),
+            Err("local output writer failed".into()),
+            &Default::default(),
+            &mut callback_settled,
+        )
+        .unwrap_err();
+        assert!(!callback_settled);
+        assert!(callback_failure.partial.observed_run_terminal.is_some());
         let json = super::hard_failure_json_output(failure);
         assert_eq!(json["server_terminal_authoritative"], false);
         assert_eq!(json["server_terminal_unverified"], true);
@@ -5450,6 +5617,58 @@ mod exit_code_tests {
     fn exit_code_success_on_empty_result() {
         let sr = empty_stream_result();
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn one_shot_user_interrupt_keeps_callback_failure_and_origin() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        let mut failure = one_shot_cleanup_test_failure(astra_core::ErrorKind::Auth);
+        failure.error = "callback req-child rejected with 401".into();
+        failure.partial.callback_client_detached = true;
+        failure.partial.callback_error_kind = Some(astra_core::ErrorKind::Auth);
+        let failure =
+            super::settle_one_shot_user_interrupt_result(Err(failure), None, None, true, &state)
+                .unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::Cancelled)
+        );
+        assert_eq!(
+            failure.partial.callback_error_kind,
+            Some(astra_core::ErrorKind::Auth)
+        );
+        assert!(failure.error.contains("user interrupted"));
+        assert!(failure.error.contains("req-child"));
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["callback_error_kind"], "auth");
+        assert_eq!(json["interruption"]["kind"], "user_cancelled");
+        assert!(
+            json["interruption"]
+                .to_string()
+                .contains("requires_intervention")
+        );
+    }
+
+    #[test]
+    fn wall_deadline_drain_keeps_callback_and_other_hard_failures() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        let mut callback = one_shot_cleanup_test_failure(astra_core::ErrorKind::Cancelled);
+        callback.error = "callback req-child rejected with 401".into();
+        callback.partial.callback_client_detached = true;
+        callback.partial.callback_error_kind = Some(astra_core::ErrorKind::Auth);
+        let retained =
+            super::recover_wall_deadline_clean_cancel(Err(callback), true, &state).unwrap_err();
+        assert!(retained.error.contains("req-child"));
+        assert_eq!(
+            retained.partial.callback_error_kind,
+            Some(astra_core::ErrorKind::Auth)
+        );
+
+        let failure = one_shot_cleanup_test_failure(astra_core::ErrorKind::ContractViolation);
+        assert!(super::recover_wall_deadline_clean_cancel(Err(failure), true, &state).is_err());
+        let clean = || one_shot_cleanup_test_failure(astra_core::ErrorKind::Cancelled);
+        assert!(super::recover_wall_deadline_clean_cancel(Err(clean()), false, &state).is_err());
+        assert!(super::recover_wall_deadline_clean_cancel(Err(clean()), true, &state).is_ok());
     }
 
     #[test]
@@ -6130,6 +6349,8 @@ mod final_json_output_tests {
             serde_json::json!({
                 "succeeded": 2,
                 "failed": 0,
+                "started_unknown": 0,
+                "unknown": 0,
                 "rejected": 0,
                 "reused": 0,
                 "suppressed": 0,

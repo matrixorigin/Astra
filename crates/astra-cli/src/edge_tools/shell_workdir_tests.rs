@@ -67,6 +67,10 @@ async fn cli_bash_invalid_workdir_never_starts_the_command() {
     for workdir in invalid {
         let result = executor.execute_with_metadata("bash", &serde_json::json!({"command":"printf forbidden > should-not-exist", "workdir":workdir})).await;
         assert!(result.is_error, "{result:?}");
+        if result.output.contains("outside the active workspace root") {
+            assert!(result.output.contains("no command was run"), "{result:?}");
+            assert!(result.output.contains("session rooted there"), "{result:?}");
+        }
         let fields = result.tool_result_fields.unwrap();
         assert_eq!(fields["execution_started"], false);
         assert_eq!(fields["disposition"], "rejected");
@@ -177,7 +181,7 @@ fn cli_bash_workdir_launch_uses_the_pinned_directory_after_path_retarget() {
     std::fs::rename(root.join("nested"), root.join("original-moved")).unwrap();
     std::fs::create_dir(root.join("nested")).unwrap();
     std::fs::write(root.join("nested/value"), "wrong replacement").unwrap();
-    let output = super::run_shell_output_with_config(config).unwrap();
+    let output = super::run_shell_output_with_config(config, None, None).unwrap();
     assert!(output.output.status.success());
     assert_eq!(
         String::from_utf8(output.output.stdout).unwrap(),

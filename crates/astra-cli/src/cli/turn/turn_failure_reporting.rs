@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::cli::auth_flow::{is_auth_error, is_llm_provider_auth_error};
 use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
-use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::cli::session::session_startup;
 use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
@@ -153,7 +153,13 @@ pub(crate) fn report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    if is_llm_provider_auth_error(&failure.error) {
+    if failure.partial.callback_client_detached {
+        ui.show_error(&format!(
+            "  {} {}",
+            crate::cli::theme::icon_err(),
+            failure.error
+        ));
+    } else if is_llm_provider_auth_error(&failure.error) {
         ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
     } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
@@ -279,7 +285,7 @@ pub(crate) fn report_turn_failure(
             &err_event,
             "turn_failure_reporting:report_turn_failure",
         );
-        enqueue_ingestion_pub(state, &err_event);
+        schedule_journal_ingestion(journal);
         state.last_turn_event = Some(err_event.clone());
 
         let transcript_events = crate::cli::stream::streaming_types::root_run_transcript_events(
@@ -297,11 +303,9 @@ pub(crate) fn report_turn_failure(
                         Some(existing) => format!("{existing}; {message}"),
                         None => message,
                     });
-            } else {
-                for event in &transcript_events {
-                    enqueue_ingestion_pub(state, event);
-                }
             }
+            // The append may have written complete records before failing.
+            schedule_journal_ingestion(journal);
         }
     }
 
@@ -322,6 +326,30 @@ mod tests {
     use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_services::session_journal;
     use std::time::Instant;
+
+    #[test]
+    #[serial_test::serial]
+    fn callback_auth_failure_keeps_scoped_details_in_user_output() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let failure = crate::TurnFailure {
+            error: "HTTP 401: callback request=req-a was not confirmed".into(),
+            partial: crate::PartialTurnData {
+                callback_client_detached: true,
+                ..Default::default()
+            },
+        };
+        report_turn_failure(
+            &mut state,
+            None,
+            "request",
+            &failure,
+            Instant::now(),
+            &mut ui,
+        );
+        assert!(ui.errors.join("\n").contains("request=req-a"));
+    }
 
     #[test]
     fn line_surface_does_not_claim_a_composer_restore() {

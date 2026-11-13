@@ -121,7 +121,7 @@ impl FsLeafError {
         }
     }
 
-    fn into_tool_result(self) -> astra_tools::ToolResult {
+    pub(super) fn into_tool_result(self) -> astra_tools::ToolResult {
         match self {
             Self::SandboxDenied(message) => {
                 let mut metadata =
@@ -193,7 +193,7 @@ impl ToolExecutor {
         session.record_fuzzy_match_event(path.display().to_string(), strategy, outcome);
     }
 
-    fn resolve_checked_result(&self, path: &str) -> Result<PathBuf, FsLeafError> {
+    pub(super) fn resolve_checked_result(&self, path: &str) -> Result<PathBuf, FsLeafError> {
         if is_unc_path(path) {
             return Err("Error: UNC/network paths are not supported (security risk)"
                 .to_string()
@@ -1752,9 +1752,9 @@ impl ToolExecutor {
 
     pub(crate) fn list_dir(&self, args: &Value) -> astra_tools::ToolResult {
         let dir = match args.get("path").and_then(Value::as_str) {
-            Some(p) => match self.resolve_checked(p) {
+            Some(p) => match self.resolve_checked_result(p) {
                 Ok(safe) => safe,
-                Err(e) => return astra_tools::ToolResult::error(e).with_execution_not_started(),
+                Err(error) => return error.into_tool_result().with_execution_not_started(),
             },
             None => self.effective_project_root(),
         };

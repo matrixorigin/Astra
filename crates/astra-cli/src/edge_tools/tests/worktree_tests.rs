@@ -1588,6 +1588,69 @@ async fn submodule_file_rollback_remains_available() {
 }
 
 #[tokio::test]
+async fn a_session_rooted_in_an_existing_manual_worktree_uses_that_root_consistently() {
+    let repo = init_temp_git_repo();
+    let container = tempfile::tempdir().unwrap();
+    let checkout = container.path().join("manual-worktree");
+    let added = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["worktree", "add", "--detach"])
+        .arg(&checkout)
+        .arg("HEAD")
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let exe = ToolExecutor::new(&checkout);
+    let read = exe
+        .execute_with_metadata("read_file", &json!({"path":"tracked.txt"}))
+        .await;
+    let search = exe
+        .execute_with_metadata(
+            "grep",
+            &json!({"pattern":"committed", "path":".", "output_mode":"content"}),
+        )
+        .await;
+    let bash = exe
+        .execute_with_metadata("bash", &json!({"command":"pwd -P", "workdir":"."}))
+        .await;
+    assert!(
+        !read.is_error && read.output.contains("committed"),
+        "{read:?}"
+    );
+    assert!(
+        !search.is_error && search.output.contains("committed"),
+        "{search:?}"
+    );
+    assert!(!bash.is_error, "{bash:?}");
+    assert_eq!(
+        bash.output.trim(),
+        checkout.canonicalize().unwrap().to_str().unwrap()
+    );
+    let rejected = exe
+        .execute_with_metadata(
+            "bash",
+            &json!({"command":"touch never-started", "workdir":repo.path()}),
+        )
+        .await;
+    assert!(
+        rejected.is_error && rejected.output.contains("session rooted there"),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        rejected.tool_result_fields.unwrap()["execution_started"],
+        false
+    );
+    assert!(
+        !repo.path().join("never-started").exists() && !checkout.join("never-started").exists()
+    );
+    remove_preserved_test_worktree(repo.path(), &checkout);
+}
+
+#[tokio::test]
 async fn session_worktree_is_the_workspace_for_file_tools() {
     let dir = init_temp_git_repo();
     let exe = ToolExecutor::new(dir.path());
@@ -1599,6 +1662,27 @@ async fn session_worktree_is_the_workspace_for_file_tools() {
     std::fs::write(active.join("tracked.txt"), "worktree content\n").unwrap();
     std::fs::write(dir.path().join("example.rs"), "fn original_symbol() {}\n").unwrap();
     std::fs::write(active.join("example.rs"), "fn worktree_symbol() {}\n").unwrap();
+
+    // A stale original checkout must be rejected before execution on every
+    // attempt; the error gives the model the actual selected root and remedy.
+    for _ in 0..2 {
+        let rejected = exe
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "touch stale-workdir-marker", "workdir": dir.path()
+                }),
+            )
+            .await;
+        assert!(rejected.is_error, "{rejected:?}");
+        assert!(
+            rejected.output.contains(active.to_str().unwrap()),
+            "{rejected:?}"
+        );
+        assert!(rejected.output.contains("no command"), "{rejected:?}");
+        assert!(!dir.path().join("stale-workdir-marker").exists());
+        assert!(!active.join("stale-workdir-marker").exists());
+    }
 
     let read = exe
         .execute_with_metadata("read_file", &json!({"path":"tracked.txt"}))

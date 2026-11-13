@@ -347,7 +347,7 @@ async fn stream_chat_sse_inner(
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 fanout_admission: spawner.attach_fanout_parent(&parent_turn_run_id).await,
-                reply_obligations: Arc::new(Default::default()),
+                question_correlations: Arc::new(Default::default()),
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 parent_delegation_authority:
@@ -607,9 +607,10 @@ async fn stream_chat_sse_inner(
         request_session_execution_lease: p.request_session_execution_lease.take(),
         remote_cancel_required: false,
         callback_client_detached: false,
+        callback_error_kind: None,
         remote_cancel_run_id: None,
         last_physical_run_id: None,
-        failed_run_terminal: None,
+        observed_run_terminal: None,
         turn_evaluation: None,
         last_error_code: None,
         last_error_metadata: None,
@@ -920,10 +921,11 @@ async fn stream_chat_sse_inner(
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
                 partial_text_model_item_id: state.final_text_model_item_id.take(),
-                failed_run_terminal: host.failed_run_terminal.take(),
+                observed_run_terminal: host.observed_run_terminal.take(),
                 run_transcript_messages: state.take_run_transcript_capture(),
                 remote_cancel_required: host.remote_cancel_required,
                 callback_client_detached: host.callback_client_detached,
+                callback_error_kind: host.callback_error_kind,
                 remote_cancel_run_id: host.remote_cancel_run_id,
                 output_transport_failure: host.output_transport_failure,
                 interruption: state.interruption.as_ref().map(|i| i.to_json()),

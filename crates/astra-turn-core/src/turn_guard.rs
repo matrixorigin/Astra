@@ -357,9 +357,9 @@ impl TurnGuard {
         )
     }
 
-    /// Record an admission rejection without treating it as evidence that the
-    /// tool implementation executed and failed.
-    pub fn record_rejected_tool_result_with_kind(
+    /// Record an error that does not establish an execution failure, such as
+    /// a rejection or an outcome whose execution start is unknown.
+    pub fn record_tool_error_without_execution_health(
         &mut self,
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {

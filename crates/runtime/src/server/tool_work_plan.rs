@@ -997,6 +997,7 @@ mod tests {
                 astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                     metadata.get("disposition"),
                     metadata.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(metadata)),
                     astra_services::session_journal::ToolCallDisposition::Executed,
                 ),
                 astra_services::session_journal::ToolCallDisposition::Rejected

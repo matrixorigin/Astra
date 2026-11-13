@@ -5,9 +5,8 @@ use super::server_admission_host::CliServerAdmissionHost;
 use astra_pipeline::step_protocol::{StepCheckpoint, WorkspaceObservationQuarantineV1};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::turn::agentic_loop::finalization::{
-    TurnTraceFinalizationInput, UnattributedRecallRunBoundary,
-    commit_session_continuity_checkpoint, finalize_session_turn_trace, journal_writer_for_owner,
-    same_recovery_state,
+    TurnTraceFinalizationInput, commit_session_continuity_checkpoint, finalize_session_turn_trace,
+    journal_writer_for_owner, same_recovery_state,
 };
 use astra_runtime::turn::agentic_loop::host::{VolatileInjection, VolatileKind};
 use astra_runtime::turn::run_control::RunStatusProvider;
@@ -370,9 +369,54 @@ pub(super) async fn consume_remote_turn(
     host: &mut CliServerAdmissionHost<'_>,
     state: &mut RemoteTurnState,
 ) -> Result<(), astra_core::ClassifiedError> {
-    let _recalls = UnattributedRecallRunBoundary::new(host.executor.memory_recall_scope());
     let _channels = InteractionChannels(Arc::clone(&host.executor));
-    let result = consume_remote_turn_inner(host, state).await;
+    let mut result = consume_remote_turn_inner(host, state).await;
+    let lease_failed = host
+        .request_session_execution_lease
+        .as_ref()
+        .is_some_and(|lease| lease.failure().is_some());
+    let requires_intervention = host.callback_client_detached || lease_failed;
+    let intervention_description = if host.callback_client_detached {
+        "A tool-result callback or its local bookkeeping needs attention; check the run before continuing."
+    } else {
+        "The session identity could not be confirmed; check the run before continuing."
+    };
+    use astra_turn_core::orchestration_types::CancellationOrigin;
+    let cancellation_observed = result.as_ref().err().is_some_and(|error| {
+        error.kind == astra_core::ErrorKind::Cancelled
+            || (requires_intervention
+                && state
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled()))
+    });
+    let cancellation_origin = if cancellation_observed {
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        Some(if let Some(control) = state.run_control.as_ref() {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.cancellation_origin(&owner, &state.local_input_run_id),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(CancellationOrigin::Unverified)
+        } else if requires_intervention {
+            CancellationOrigin::Unverified
+        } else {
+            CancellationOrigin::Runtime
+        })
+    } else {
+        None
+    };
+    if cancellation_origin == Some(CancellationOrigin::User)
+        && requires_intervention
+        && let Err(error) = &mut result
+        && error.kind != astra_core::ErrorKind::Cancelled
+    {
+        error.kind = astra_core::ErrorKind::Cancelled;
+        error.message = format!("user interrupted the turn; {}", error.message);
+    }
     let rejected = super::is_pre_admission_rejection(
         host.last_error_code.as_deref(),
         host.last_error_metadata.as_ref(),
@@ -385,17 +429,38 @@ pub(super) async fn consume_remote_turn(
     } else {
         if let Err(error) = &result {
             state.step_recorder.end_turn(false);
-            if host.failed_run_terminal.is_none()
-                && state.interruption.is_none()
+            let failed_root = host.observed_run_terminal.as_ref().is_some_and(|terminal| {
+                terminal.status
+                    == astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed
+            });
+            if (requires_intervention || (!failed_root && state.interruption.is_none()))
                 && error.kind != astra_core::ErrorKind::Cancelled
-                && let Some((kind, action)) =
-                    astra_turn_core::interruption::interruption_from_error_kind(error.kind)
             {
-                state.interruption = Some(InterruptionRecord::new(
-                    kind,
-                    action,
-                    state.interruption_summary(error.message.clone()),
-                ));
+                let interruption = if requires_intervention {
+                    Some((
+                        InterruptionKind::Interrupted,
+                        ResumeAction::RequiresIntervention {
+                            description: intervention_description.into(),
+                        },
+                    ))
+                } else {
+                    astra_turn_core::interruption::interruption_from_error_kind(error.kind)
+                };
+                if let Some((kind, action)) = interruption {
+                    let mut interruption = InterruptionRecord::new(
+                        kind,
+                        action,
+                        state.interruption_summary(error.message.clone()),
+                    );
+                    if requires_intervention && host.observed_run_terminal.as_ref().is_some_and(|terminal| {
+                        terminal.status == astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Completed
+                    }) {
+                        interruption.user_message = format!(
+                            "The server run completed, but the client needs attention. {intervention_description}"
+                        );
+                    }
+                    state.interruption = Some(interruption);
+                }
             }
         }
         let cancelled = result
@@ -403,20 +468,7 @@ pub(super) async fn consume_remote_turn(
             .err()
             .is_some_and(|error| error.kind == astra_core::ErrorKind::Cancelled);
         if cancelled {
-            use astra_turn_core::orchestration_types::CancellationOrigin;
-            let owner = crate::cli::cli_config::cli_utils::cli_user_id();
-            let origin = if let Some(control) = state.run_control.as_ref() {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    control.cancellation_origin(&owner, &state.local_input_run_id),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(CancellationOrigin::Unverified)
-            } else {
-                CancellationOrigin::Runtime
-            };
+            let origin = cancellation_origin.unwrap_or(CancellationOrigin::Unverified);
             let reason = match origin {
                 CancellationOrigin::User => "parent turn cancelled by user",
                 CancellationOrigin::Runtime => "parent execution cancelled by runtime",
@@ -425,12 +477,35 @@ pub(super) async fn consume_remote_turn(
                 }
             };
             host.cancel_child_agents(&[], reason, origin).await;
-            if origin == CancellationOrigin::User && state.interruption.is_none() {
-                state.interruption = Some(InterruptionRecord::new(
+            if origin == CancellationOrigin::User
+                && (state.interruption.is_none() || requires_intervention)
+            {
+                let (action, detail) = if requires_intervention {
+                    (
+                        ResumeAction::RequiresIntervention {
+                            description: intervention_description.into(),
+                        },
+                        result
+                            .as_ref()
+                            .err()
+                            .map_or_else(|| reason.to_string(), |error| error.message.clone()),
+                    )
+                } else {
+                    (ResumeAction::ContinueImmediately, reason.to_string())
+                };
+                let mut interruption = InterruptionRecord::new(
                     InterruptionKind::UserCancelled,
-                    ResumeAction::ContinueImmediately,
-                    state.interruption_summary(reason.into()),
-                ));
+                    action,
+                    state.interruption_summary(detail),
+                );
+                if requires_intervention && host.observed_run_terminal.as_ref().is_some_and(|terminal| {
+                    terminal.status == astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Completed
+                }) {
+                    interruption.user_message = format!(
+                        "The server run completed, but the client was cancelled. {intervention_description}"
+                    );
+                }
+                state.interruption = Some(interruption);
             }
         }
         if result.is_err() {
@@ -585,12 +660,16 @@ async fn consume_remote_turn_inner(
         },
     );
     state.qualified_usage = turn.core.accounted_usage();
+    let root = turn.core.observed_root_terminal();
     if turn.core.has_authoritative_failed_terminal()
-        && !host.remote_cancel_required
-        && !host.callback_client_detached
-        && host.output_transport_failure.is_none()
+        || (turn.delivery_failure.is_some()
+            && root.is_some_and(|terminal| {
+                terminal.status
+                    != astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed
+            }))
     {
-        host.failed_run_terminal = turn.core.run_terminal.take();
+        // A root observation and a separate client failure can both be true.
+        host.observed_run_terminal = root.cloned();
     }
     state.capture_appended_messages(start);
     state.llm_rounds_completed = turn
@@ -632,7 +711,15 @@ async fn consume_remote_turn_inner(
     }
     match outcome {
         AgenticTurnIngestOutcome::Fatal(error) => return Err(error),
-        AgenticTurnIngestOutcome::Break => {}
+        AgenticTurnIngestOutcome::Break => {
+            // An interrupted root is an authoritative observation, but it
+            // does not settle a separate, unconfirmed callback delivery.
+            if turn.core.has_authoritative_interrupted_terminal()
+                && let Some(failure) = turn.delivery_failure.take()
+            {
+                return Err(failure);
+            }
+        }
         _ => unreachable!("remote ingest never transfers continuation authority"),
     }
     if let Some(summary) = state.remote_summary.as_ref()

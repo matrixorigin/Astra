@@ -852,7 +852,7 @@ pub fn resolve_bash_workdir(
     }
     if !resolved.starts_with(&canonical_root) {
         return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
+            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
             workspace_root.display()
         ));
     }
@@ -876,7 +876,7 @@ pub fn resolve_bash_workdir(
             })?;
         let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
+                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
                 workspace_root.display()
             )
         })?;
@@ -7583,6 +7583,24 @@ mod workdir_tests {
                 .unwrap_err()
                 .contains("SANDBOX_DENIED")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_workdir_rejection_explains_the_active_workspace() {
+        let workspace = tempdir().unwrap();
+        let original = tempdir().unwrap();
+        let error = resolve_bash_workdir(
+            workspace.path(),
+            &serde_json::json!({"workdir": original.path()}),
+        )
+        .unwrap_err();
+        assert!(error.contains(&original.path().display().to_string()));
+        assert!(error.contains(&workspace.path().display().to_string()));
+        assert!(error.contains("no command was run"));
+        assert!(error.contains("inside the selected workspace"));
+        assert!(error.contains("session rooted there"));
+        assert!(error.contains("creates and selects a new worktree"));
     }
 
     #[cfg(unix)]

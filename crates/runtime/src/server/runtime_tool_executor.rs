@@ -1078,16 +1078,6 @@ impl RuntimeToolExecutor {
         self
     }
 
-    /// Return the exact ledger scope used by server-local memory calls.
-    /// Agentic-loop cleanup asks the executor instead of reconstructing the
-    /// session or fallback producer from unrelated loop state.
-    pub(crate) fn memory_recall_scope(&self, run_id: Option<&str>) -> (String, String) {
-        (
-            self.session_id.clone(),
-            memory_producer_id(run_id).to_string(),
-        )
-    }
-
     /// Access the canonical transport-aware execution service and its
     /// current provider policy. Edge transport configuration is supplied
     /// through the shared service builder.
@@ -3172,12 +3162,12 @@ impl RuntimeToolExecutor {
 
     pub fn set_reply_obligations(
         &self,
-        obligations: std::sync::Arc<crate::messaging::reply_obligations::ReplyObligations>,
+        obligations: std::sync::Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     ) {
         if let Some(context) =
             astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context).as_mut()
         {
-            context.reply_obligations = obligations;
+            context.question_correlations = obligations;
         }
     }
 
@@ -5152,10 +5142,7 @@ impl RuntimeToolExecutor {
         }
 
         let lifecycle = LocalToolExecutionLifecycle {
-            session_id: &self.session_id,
-            producer_id: memory_producer_id(Some(&request.run_id)),
             aggregate_output_bytes: &self.aggregate_output_bytes,
-            memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),
         };
         let call_id = lifecycle.start(name, args).await;
@@ -10915,7 +10902,7 @@ pub(crate) mod tests {
             parent_delegation_authority:
                 crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("test-run"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "test-run".into(),
             agent_id: "test-agent".into(),
@@ -11448,6 +11435,7 @@ pub(crate) mod tests {
             astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
                 fields.get("disposition"),
                 fields.get("execution_started").and_then(Value::as_bool),
+                astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
                 astra_services::session_journal::ToolCallDisposition::Executed,
             ),
             astra_services::session_journal::ToolCallDisposition::Rejected,
@@ -11506,8 +11494,8 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
-            Err("MCP tools must not deliver edge dispatch results".to_string())
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+            Err("MCP tools must not deliver edge dispatch results".into())
         }
 
         async fn fail_dispatch(
@@ -11627,7 +11615,7 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             Ok(true)
         }
 
@@ -11697,7 +11685,7 @@ pub(crate) mod tests {
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             Ok(true)
         }
 

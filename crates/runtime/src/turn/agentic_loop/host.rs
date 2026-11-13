@@ -624,30 +624,6 @@ pub trait AgenticLoopHost: Send {
     ) {
     }
 
-    /// Exact process-local recall ledger scope owned by this loop.
-    ///
-    /// The default covers ordinary CLI and server runs. Hosts whose tool
-    /// executor intentionally uses a different session (for example an
-    /// isolated skill sub-run) override this rather than making finalization
-    /// infer tool ownership from prompt or transcript state.
-    fn memory_recall_scope(&self, state: &AgenticLoopState) -> Option<(String, String)> {
-        if let Some(executor) = state.runtime_tool_executor.as_deref() {
-            return Some(executor.memory_recall_scope(state.current_run_id.as_deref()));
-        }
-        let session_id = state
-            .current_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())?;
-        let producer_id = state
-            .current_run_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|producer_id| !producer_id.is_empty())
-            .unwrap_or("session");
-        Some((session_id.to_string(), producer_id.to_string()))
-    }
-
     /// Reconcile host-owned durable history after lifecycle restoration and
     /// before any first-round preparation may rewrite the admitted prefix.
     /// Implementations must be idempotent because a resumed loop can re-enter
@@ -2416,7 +2392,7 @@ pub struct MessagingState {
     pub(crate) root_registration: Option<RootMailboxRegistration>,
     /// Run-owned question obligations shared with the sending tool. These
     /// remain empty for ordinary turns and never trigger a database read.
-    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    pub question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
@@ -3213,6 +3189,8 @@ const TOOL_LEDGER_LIVE_WINDOW: usize = 256;
 enum ToolLedgerResultClass {
     Succeeded,
     Failed,
+    StartedUnknown,
+    Unknown,
     Rejected,
     Reused,
     Suppressed,
@@ -3220,7 +3198,13 @@ enum ToolLedgerResultClass {
 
 impl ToolLedgerResultClass {
     fn from_record(record: &ToolCallRecord) -> Option<Self> {
+        if record.effective_disposition() == ToolCallDisposition::Deferred {
+            return None;
+        }
         match record.effective_disposition() {
+            ToolCallDisposition::Executed if record.outcome_is_unknown() => {
+                Some(Self::StartedUnknown)
+            }
             ToolCallDisposition::Executed if record.ok => Some(Self::Succeeded),
             ToolCallDisposition::Executed => Some(Self::Failed),
             ToolCallDisposition::Rejected => Some(Self::Rejected),
@@ -3229,6 +3213,7 @@ impl ToolLedgerResultClass {
             // Deferred is explicitly not a terminal result. A later exact
             // callback may close the same attempt inside the live window.
             ToolCallDisposition::Deferred => None,
+            ToolCallDisposition::Unknown => Some(Self::Unknown),
         }
     }
 
@@ -3236,6 +3221,8 @@ impl ToolLedgerResultClass {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::StartedUnknown => "started_unknown",
+            Self::Unknown => "unknown",
             Self::Rejected => "rejected",
             Self::Reused => "reused",
             Self::Suppressed => "suppressed",
@@ -3249,6 +3236,8 @@ impl ToolLedgerResultClass {
         let slot = match self {
             Self::Succeeded => &mut counts.succeeded,
             Self::Failed => &mut counts.failed,
+            Self::StartedUnknown => &mut counts.started_unknown,
+            Self::Unknown => &mut counts.unknown,
             Self::Rejected => &mut counts.rejected,
             Self::Reused => &mut counts.reused,
             Self::Suppressed => &mut counts.suppressed,
@@ -3361,6 +3350,8 @@ impl ToolLedgerHandoff {
         let total = receipt.result_classes;
         if counts.succeeded > total.succeeded
             || counts.failed > total.failed
+            || counts.started_unknown > total.started_unknown
+            || counts.unknown > total.unknown
             || counts.rejected > total.rejected
             || counts.reused > total.reused
             || counts.suppressed > total.suppressed
@@ -4193,9 +4184,9 @@ impl AgenticLoopState {
                 declarations: self.hooks.declarations.clone(),
                 phase: self.hooks.phase,
             },
-            reply_obligations: self
+            question_correlations: self
                 .messaging
-                .reply_obligations
+                .question_correlations
                 .snapshot(run_id, generation)
                 .ok()?,
             budget_wrapup_injected: self.budget_wrapup_injected,
@@ -4861,12 +4852,13 @@ impl AgenticLoopState {
     /// Facts queued after request construction remain pending.
     pub fn commit_volatile_attempt_lease(&mut self) {
         let run_id = self.current_run_id.as_deref();
-        let replies = &self.messaging.reply_obligations;
+        let replies = &self.messaging.question_correlations;
         self.volatile_pending.retain_mut(|injection| {
             if !injection.attempt_leased {
                 return true;
             }
             if let Some(run_id) = run_id
+                && injection.payload["response_match"] != "not_adopted"
                 && let Some((request_id, sender)) = retained_response_identity(injection)
             {
                 replies.observe_typed_response(run_id, request_id, &sender);
@@ -5255,9 +5247,13 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     "input observation belongs to another run",
                 ));
             }
-            let outcome =
+            let result =
                 super::execution_phase::await_runtime_activity(host, state, observation.as_ref())
-                    .await?;
+                    .await;
+            // One presentation cleanup covers success, cancellation, error and
+            // handoff. This is not a durable lifecycle transition.
+            host.on_direct_child_completion_boundary(state, "wait_finished", 0, Instant::now());
+            let outcome = result?;
             if outcome == super::execution_phase::RuntimeActivityOutcome::ExecutionHandoff
                 || outcome.should_continue()
                     && host.execution_handoff_requested()
@@ -6003,6 +5999,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn delivered_unknown_is_terminal_without_claiming_execution() {
+        let mut accumulator = ToolLedgerReceiptAccumulator::default();
+        let mut deferred = receipt_test_record("deferred", false, ToolCallDisposition::Deferred);
+        deferred.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(ToolLedgerResultClass::from_record(&deferred), None);
+        for (id, disposition) in [
+            ("unknown-start", ToolCallDisposition::Unknown),
+            ("known-start", ToolCallDisposition::Executed),
+        ] {
+            let mut record = receipt_test_record(id, false, disposition);
+            record.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+            accumulator.observe_round(
+                &ToolLedgerAttemptBatch::from_validated_provider_calls(&[receipt_test_call(id)]),
+                &[record],
+            );
+        }
+        // One uncertain response must not pin the bounded ledger window.
+        for index in 0..300 {
+            let id = format!("later-{index}");
+            accumulator.observe_round(
+                &ToolLedgerAttemptBatch::from_validated_provider_calls(&[receipt_test_call(&id)]),
+                &[receipt_test_record(
+                    &id,
+                    true,
+                    ToolCallDisposition::Executed,
+                )],
+            );
+        }
+        let receipt = accumulator.receipt("run", 1);
+        assert!(receipt.is_complete());
+        assert_eq!(receipt.result_classes.unknown, 1);
+        assert_eq!(receipt.result_classes.started_unknown, 1);
+        assert_eq!(receipt.result_classes.failed, 0);
+        assert_eq!(receipt.result_classes.succeeded, 300);
+        assert!(
+            accumulator
+                .handoff("run", 1)
+                .unwrap()
+                .restore("run", 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn tool_receipt_folds_arbitrarily_many_settled_calls_in_fixed_memory() {
         let mut accumulator = ToolLedgerReceiptAccumulator::default();
         for index in 0..600 {
@@ -6277,7 +6317,7 @@ pub(crate) mod tests {
         )])
     }
 
-    fn control_plane_runtime_environment_fields() -> serde_json::Map<String, Value> {
+    pub(crate) fn control_plane_runtime_environment_fields() -> serde_json::Map<String, Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             astra_runtime_env::RunBinding::cloud_control_plane(&registry),
@@ -7649,7 +7689,7 @@ pub(crate) mod tests {
             } else {
                 state
                     .messaging
-                    .reply_obligations
+                    .question_correlations
                     .reserve(
                         "shutdown-question-run",
                         "question-id",
@@ -7661,17 +7701,13 @@ pub(crate) mod tests {
                 next_index: 0,
                 harness_pause_recovery_count: 0,
             };
-            let wait = if observation_timeout {
-                RuntimeInputWait::Observation {
-                    receipt: astra_tools::agent_tool_contract::AgentWaitReceipt {
-                        parent_run_id: "shutdown-question-run".into(),
-                        tool_call_id: "wait-call".into(),
-                        timeout_ms: 30_000,
-                    },
-                    deadline_unix_ms: 1,
-                }
-            } else {
-                RuntimeInputWait::Completion
+            let wait = RuntimeInputWait::Observation {
+                receipt: astra_tools::agent_tool_contract::AgentWaitReceipt {
+                    parent_run_id: "shutdown-question-run".into(),
+                    tool_call_id: "wait-call".into(),
+                    timeout_ms: 30_000,
+                },
+                deadline_unix_ms: if observation_timeout { 1 } else { u64::MAX },
             };
             state.loop_entry.wait_for_input(wait).unwrap();
             let remaining = state.remaining_turns;
@@ -7708,10 +7744,11 @@ pub(crate) mod tests {
                 "an already idle wait must reach the existing snapshot writer"
             );
             assert_eq!(
-                state
+                !state
                     .messaging
-                    .reply_obligations
-                    .has_pending("shutdown-question-run"),
+                    .question_correlations
+                    .pending("shutdown-question-run")
+                    .is_empty(),
                 !observation_timeout,
             );
             if observation_timeout {
@@ -7747,15 +7784,20 @@ pub(crate) mod tests {
             });
             let mut state = make_state();
             state.current_run_id = Some("cutoff-run".into());
-            state
-                .messaging
-                .reply_obligations
-                .reserve(
-                    "cutoff-run",
-                    "question",
-                    astra_messaging::AgentAddress::new("responder", "agent"),
-                )
-                .unwrap();
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "cutoff-run",
+                "child",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "parent".into(),
+                status: crate::orchestration::AgentStatus::Running {
+                    activity: "working".into(),
+                },
+                applied_user_intents: Vec::new(),
+            });
+            host.direct_child_owner = Some(owner);
             let outcome =
                 super::super::execution_phase::await_runtime_activity(&mut host, &mut state, None)
                     .await
@@ -14941,7 +14983,7 @@ mod parallel_execution_tests {
         for mismatch in ["none", "owner", "request", "sender", "not-leased"] {
             let mut state = make_state();
             state.current_run_id = Some("questioner".into());
-            let original = crate::messaging::reply_obligations::ReplyObligations::default();
+            let original = crate::messaging::question_correlations::QuestionCorrelations::default();
             original
                 .reserve(
                     "questioner",
@@ -14949,13 +14991,14 @@ mod parallel_execution_tests {
                     astra_messaging::AgentAddress::new("parent-mailbox", "orchestrator"),
                 )
                 .unwrap();
-            let snapshot: astra_turn_types::ReplyObligationsSnapshotV1 = serde_json::from_slice(
-                &serde_json::to_vec(&original.snapshot("questioner", 3).unwrap()).unwrap(),
-            )
-            .unwrap();
+            let snapshot: astra_turn_types::QuestionCorrelationsSnapshotV1 =
+                serde_json::from_slice(
+                    &serde_json::to_vec(&original.snapshot("questioner", 3).unwrap()).unwrap(),
+                )
+                .unwrap();
             state
                 .messaging
-                .reply_obligations
+                .question_correlations
                 .restore(&snapshot, "questioner", 3)
                 .unwrap();
             state.push_volatile_payload(VolatileKind::Mailbox, json!({
@@ -14969,7 +15012,13 @@ mod parallel_execution_tests {
             }));
             state.lease_volatile_pending().unwrap();
             state.restore_volatile_attempt_lease();
-            assert!(state.messaging.reply_obligations.has_pending("questioner"));
+            assert!(
+                !state
+                    .messaging
+                    .question_correlations
+                    .pending("questioner")
+                    .is_empty()
+            );
             if mismatch != "not-leased" {
                 state.lease_volatile_pending().unwrap();
             }
@@ -14978,7 +15027,11 @@ mod parallel_execution_tests {
             }
             state.commit_volatile_attempt_lease();
             assert_eq!(
-                state.messaging.reply_obligations.has_pending("questioner"),
+                !state
+                    .messaging
+                    .question_correlations
+                    .pending("questioner")
+                    .is_empty(),
                 mismatch != "none",
                 "{mismatch}"
             );
@@ -15483,7 +15536,7 @@ mod parallel_execution_tests {
         }
 
         #[tokio::test]
-        async fn input_wait_runs_post_turn_once_and_does_not_bypass_a_question_at_recovery_limit() {
+        async fn input_wait_runs_post_turn_once_without_bypassing_explicit_wait_or_child_custody() {
             use std::sync::atomic::Ordering;
             for tool_round in [false, true] {
                 let mut state = make_state();
@@ -15496,7 +15549,7 @@ mod parallel_execution_tests {
                 state.remaining_turns = 5;
                 state
                     .messaging
-                    .reply_obligations
+                    .question_correlations
                     .reserve(
                         "questioner",
                         "question-1",
@@ -15521,31 +15574,81 @@ mod parallel_execution_tests {
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let started = Arc::new(tokio::sync::Notify::new());
                 let first = if tool_round {
-                    edge_tool_result(vec![make_edge_tool("bash", "evidence")], 10, 5, None)
+                    let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+                        Arc::new(crate::messaging::InProcessTransport::new()),
+                        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+                    ));
+                    let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
+                    let mut ctx =
+                        crate::orchestration::agent_tool::tests::test_spawn_context(spawner, None);
+                    ctx.run_id = "questioner".into();
+                    ctx.fanout_admission = ctx.spawner.fanout_parent("questioner");
+                    let mut args =
+                        json!({"action":"wait", "timeout_ms":30_000, "_tool_call_id":"req-agent"});
+                    let output =
+                        crate::orchestration::agent_tool::handle_agent_tool(&args, Some(&ctx))
+                            .await;
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&output).unwrap()["status"],
+                        "wait_admitted"
+                    );
+                    // The runtime binds identity after admission; a provider
+                    // tool call must not supply this reserved argument itself.
+                    args.as_object_mut().unwrap().remove("_tool_call_id");
+                    let mut tool = make_edge_tool_with_args("agent", args, &output);
+                    tool.tool_result_fields = Some(crate::turn::agentic_loop::host::tests::control_plane_runtime_environment_fields());
+                    edge_tool_result(vec![tool], 10, 5, None)
                 } else {
                     text_result("intermediate result", 10, 5, None)
                 };
                 let mut host = MockHost::new(vec![first, text_result("must not run", 10, 5, None)])
-                    .with_valid_tools(&["bash"]);
+                    .with_valid_tools(&["agent"]);
+                if !tool_round {
+                    let owner =
+                        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                            "questioner",
+                            "child",
+                        );
+                    owner.set_direct_child_for_test(
+                        crate::orchestration::spawner::DirectChildCompletion {
+                            agent_id: "child".into(),
+                            run_id: "child-run".into(),
+                            parent_agent_id: "questioner".into(),
+                            status: crate::orchestration::AgentStatus::Running {
+                                activity: "working".into(),
+                            },
+                            applied_user_intents: vec![],
+                        },
+                    );
+                    host.direct_child_owner = Some(owner);
+                }
                 host.provider_call_counter = Some(Arc::clone(&calls));
                 host.child_wait_started = Some(Arc::clone(&started));
-                let task =
-                    tokio::spawn(
-                        async move { run_agentic_loop_with_host(&mut host, &mut state).await },
-                    );
-                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                let task = tokio::spawn(async move {
+                    let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+                    (result, state)
+                });
+                if tokio::time::timeout(Duration::from_secs(1), started.notified())
                     .await
-                    .expect("the real producer must reach the shared input-wait consumer");
+                    .is_err()
+                {
+                    cancellation.cancel();
+                    let (result, state) = task.await.unwrap();
+                    panic!(
+                        "input wait missing; tool_round={tool_round}; result={result:?}; records={:?}",
+                        state.stall.tool_call_records
+                    );
+                }
                 let calls_at_wait = calls.load(Ordering::SeqCst);
                 cancellation.cancel();
-                let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                let (outcome, _) = tokio::time::timeout(Duration::from_secs(1), task)
                     .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
                 assert_eq!(
                     calls_at_wait, 1,
-                    "PostTurn recovery cannot bypass the question"
+                    "PostTurn recovery cannot bypass explicit wait or child custody"
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 let trace = trace.read().unwrap();

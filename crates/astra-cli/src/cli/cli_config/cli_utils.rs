@@ -1061,6 +1061,9 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::Api { status, body } => {
             read_api_error(status.as_u16(), &body)
         }
+        astra_thin_client::ThinClientError::SyncOutboxBackpressure { status, body, .. } => {
+            read_api_error(status.as_u16(), &body)
+        }
         astra_thin_client::ThinClientError::Http(error) => {
             if error.is_timeout() {
                 "Request timed out".to_string()
@@ -1076,6 +1079,14 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         }
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
         | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
+        | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+        | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+        | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
+        | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+        | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(_)
+        | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+        | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
+        | astra_thin_client::ThinClientError::CallbackRetryCancelled
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
         | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
         | astra_thin_client::ThinClientError::InvalidProviderInteractionResponse(_)) => {

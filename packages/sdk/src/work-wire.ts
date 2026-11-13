@@ -4235,6 +4235,7 @@ const WORK_TURN_RUNTIME_EVENT_TYPES: Record<
   >,
   true
 > = {
+  runtime_wait: true,
   context_meta: true,
   run_started: true,
   run_paused: true,

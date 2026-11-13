@@ -94,6 +94,9 @@ pub(crate) enum TuiAppEvent {
     },
     WaitingForModel,
     ModelResponding,
+    RuntimeWait {
+        waiting: bool,
+    },
     StatusLine(String),
     /// Restore a user submission that never reached admission. The TUI keeps
     /// it in the composer while the user chooses an explicit recovery action.
@@ -150,6 +153,10 @@ pub(crate) enum TuiAppEvent {
     TurnProjectionDrained,
     TurnComplete,
     TurnError(String),
+    /// Cloud sync access denial, bound to the login that observed it.
+    CloudSyncAccessBlocked(crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot),
+    /// A sync problem belongs to this local account.
+    CloudSyncIssue(astra_services::OwnerScope),
     SystemWarning(String),
     SystemInfo(String),
     /// One canonical measured Explain Analyze fact from the active run stream.

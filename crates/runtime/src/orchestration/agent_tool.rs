@@ -396,7 +396,7 @@ pub struct AgentToolContext {
     /// Keeps this parent admission fence alive across projection eviction.
     pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
     /// The current run's question obligations, shared with its receive loop.
-    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    pub question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -724,7 +724,7 @@ async fn handle_agent_send_message_action(
         router.as_ref(),
         &ctx.run_id,
         &ctx.agent_id,
-        ctx.reply_obligations.as_ref(),
+        ctx.question_correlations.as_ref(),
     )
     .await
 }
@@ -738,14 +738,14 @@ pub async fn handle_agent_send_message_with_router(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> String {
     handle_agent_send_message_with_router_observed(
         args,
         router,
         run_id,
         agent_id,
-        reply_obligations,
+        question_correlations,
     )
     .await
     .output
@@ -756,7 +756,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> AgentToolOutcome {
     let content = match agent_message_content(args) {
         Ok(content) => content,
@@ -823,7 +823,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         message = message.with_correlation(request_id);
     }
     let message_id = message.id.clone();
-    let reply_obligation = if message_type == "question" {
+    let correlation = if message_type == "question" {
         let responder = match &message.to {
             MessageTarget::Direct { address } => address.clone(),
             MessageTarget::Broadcast { .. } | MessageTarget::Parent => {
@@ -833,10 +833,10 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 .into();
             }
         };
-        if let Err(error) = reply_obligations.reserve(run_id, &message_id, responder.clone()) {
+        if let Err(error) = question_correlations.reserve(run_id, &message_id, responder.clone()) {
             return rejected_agent_message(error).into();
         }
-        Some(astra_turn_types::PendingReply {
+        Some(astra_turn_types::QuestionCorrelation {
             request_id: message_id.clone(),
             expected_responder: astra_turn_types::AgentCommunicationParty {
                 run_id: responder.run_id,
@@ -864,7 +864,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 | astra_messaging::types::MailboxError::DeliveryRejected(_)
         );
         if message_type == "question" && definitely_rejected {
-            reply_obligations.reject(run_id, &message_id);
+            question_correlations.reject(run_id, &message_id);
         }
         return (if definitely_rejected {
             rejected_delivery_message(error.to_string())
@@ -879,7 +879,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 "message_id": message_id,
                 "target": target_display,
                 "message_type": message_type,
-                "reply_obligation": reply_obligation,
+                "reply_obligation": correlation,
                 "reason": error.to_string(),
                 "instruction": "Do not resend this message with a new identity; delivery may already have occurred.",
             })
@@ -897,9 +897,13 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         "target": target_display,
         "recipients": recipients,
         "message_type": message_type,
-        "reply_obligation": reply_obligation,
+        "reply_obligation": correlation,
     });
-    if message_type == "answer" {
+    if message_type == "question" {
+        result["instruction"] = json!(
+            "The question is queued asynchronously. Continue independent work, or call agent action wait for bounded observation when the answer is needed. A send does not suspend or prevent completion; transport acceptance does not prove observation, and a response still in transit may not reach a finished run."
+        );
+    } else if message_type == "answer" {
         result["instruction"] = json!(format!(
             "The answer is queued, not applied or completed. {CHILD_OUTCOME_GUIDANCE}"
         ));
@@ -3491,20 +3495,52 @@ async fn handle_agent_get_result_action_inner(
     // reconciliation request. The current parent owner is the read authority;
     // unrelated runs cannot use this retained payload.
     let mut retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
-    let needs_terminal_evidence = retained.as_ref().is_some_and(|child| {
-        matches!(
-            child.status,
-            AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
-        )
-    });
+    let inspecting = args.get("tool_outcomes").is_some();
+    let known_inspection_child = if inspecting {
+        if let Some(child) = &retained {
+            Some(child.run_id.clone())
+        } else {
+            ctx.spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .filter(|child| child.parent_run_id == ctx.run_id)
+                .map(|child| child.run_id)
+        }
+    } else {
+        None
+    };
+    // Inspecting one immutable tool observation does not collect or refresh
+    // the child lifecycle. Existing parent ownership already proves its scope.
+    let needs_terminal_evidence = !inspecting
+        && retained.as_ref().is_some_and(|child| {
+            matches!(
+                child.status,
+                AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
+            )
+        });
     if reconcile_durable {
         let refresh = if needs_terminal_evidence {
             let child = retained.as_ref().expect("known terminal child");
             ctx.spawner
                 .reconcile_durable_agent_runs_for(std::slice::from_ref(&child.run_id))
                 .await
-        } else if retained.is_none() {
-            reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+        } else if retained.is_none() && known_inspection_child.is_none() {
+            if args.get("tool_outcomes").is_some() {
+                match agent_id
+                    .rsplit_once('@')
+                    .map(|(_, run)| run)
+                    .filter(|run| uuid::Uuid::parse_str(run).is_ok())
+                {
+                    Some(candidate) => {
+                        ctx.spawner
+                            .reconcile_durable_agent_runs_for(&[candidate.to_string()])
+                            .await
+                    }
+                    None => Ok(0),
+                }
+            } else {
+                reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+            }
         } else {
             Ok(0)
         };
@@ -3516,6 +3552,127 @@ async fn handle_agent_get_result_action_inner(
 
     if needs_terminal_evidence && reconcile_durable {
         retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
+    }
+
+    if let Some(inspection) = args.get("tool_outcomes") {
+        let Some(inspection) = inspection.as_object() else {
+            return render_agent_tool_error(Some(agent_id), "tool_outcomes must be an object");
+        };
+        let parse_key = |name: &str| -> Result<Option<(&str, &str)>, &str> {
+            let Some(value) = inspection.get(name) else {
+                return Ok(None);
+            };
+            let turn = value
+                .get("turn_chain_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 256);
+            let request = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 256);
+            match (turn, request) {
+                (Some(turn), Some(request)) => Ok(Some((turn, request))),
+                _ => Err("tool_outcomes requires a valid turn_chain_id and request_id"),
+            }
+        };
+        let (after, exact) = match (parse_key("after"), parse_key("exact")) {
+            (Ok(after), Ok(exact)) if after.is_none() || exact.is_none() => (after, exact),
+            _ => {
+                return render_agent_tool_error(
+                    Some(agent_id),
+                    "provide either a valid after cursor or an exact tool identity",
+                );
+            }
+        };
+        let offset = inspection
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_bytes = inspection
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096);
+        if offset > usize::MAX as u64
+            || !(64..=4096).contains(&max_bytes)
+            || inspection
+                .get("offset")
+                .is_some_and(|value| value.as_u64().is_none())
+            || inspection
+                .get("max_bytes")
+                .is_some_and(|value| value.as_u64().is_none())
+            || (exact.is_none()
+                && (inspection.contains_key("offset") || inspection.contains_key("max_bytes")))
+        {
+            return render_agent_tool_error(
+                Some(agent_id),
+                "output paging requires an exact tool identity and max_bytes between 64 and 4096",
+            );
+        }
+        // The parent-owned retained result establishes direct-child identity.
+        // If it has not yet been retained, accept only a live state with the
+        // exact same parent, never a model-supplied run or session identity.
+        let child = if known_inspection_child.is_some() {
+            known_inspection_child
+        } else if let Some(child) = retained.as_ref() {
+            Some(child.run_id.clone())
+        } else {
+            ctx.spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .filter(|child| child.parent_run_id == ctx.run_id)
+                .map(|child| child.run_id)
+        };
+        let Some(child_run_id) = child else {
+            return render_unknown_agent_result(agent_id, UNKNOWN_AGENT_ID_ERROR);
+        };
+        let observation = match ctx
+            .spawner
+            .inspect_child_tool_outcomes(
+                &child_run_id,
+                after,
+                exact,
+                offset as usize,
+                max_bytes as usize,
+            )
+            .await
+        {
+            Ok(observation) => observation,
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::InvalidOffset) => {
+                json!({"status":"invalid_request", "note":"The requested offset is beyond the retained output. Use a previously returned next_offset."})
+            }
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::UnsafePageBoundary) => {
+                json!({"status":"invalid_request", "note":"This page cannot preserve a redaction marker or UTF-8 boundary. Use a returned next_offset and a larger max_bytes; if the marker exceeds the maximum, that portion is unavailable."})
+            }
+            Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy) => {
+                json!({"status":"unavailable", "note":"Tool outcome inspection is temporarily busy or at capacity. Try again later; inspection does not rerun the tool."})
+            }
+            Err(_) => {
+                json!({"status":"unavailable", "note":"Retained results could not be inspected. Their execution outcomes remain unknown."})
+            }
+        };
+        let inspection_failed = observation
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "unavailable" | "invalid_request"));
+        let exact_unavailable = exact.is_some()
+            && observation
+                .get("observations")
+                .and_then(Value::as_array)
+                .is_none_or(|rows| {
+                    rows.first().is_none_or(|row| {
+                        row.pointer("/result/status")
+                            .and_then(Value::as_str)
+                            .is_none_or(|status| matches!(status, "unavailable" | "unknown"))
+                    })
+                });
+        let status = if inspection_failed || exact_unavailable {
+            "tool_outcomes_unavailable"
+        } else {
+            "tool_outcomes_observed"
+        };
+        return json!({"result_family":"control_receipt", "action":"get_result", "status":status, "success":true,
+            "parent_run_id":ctx.run_id, "agent_id":agent_id, "run_id":child_run_id, "tool_outcomes":observation,
+            "note":"This inspection does not collect the child result; call get_result without tool_outcomes when needed."}).to_string();
     }
 
     let timeout = AGENT_RESULT_OBSERVE_GRACE;
@@ -3707,7 +3864,7 @@ pub(crate) mod tests {
                 MessagePayload::Request { .. }
             ));
         }
-        assert!(obligations.has_pending("parent-run"));
+        assert!(!obligations.pending("parent-run").is_empty());
     }
 
     #[tokio::test]
@@ -3731,7 +3888,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let obligations = crate::messaging::reply_obligations::ReplyObligations::default();
+        let obligations = crate::messaging::question_correlations::QuestionCorrelations::default();
 
         for message_type in ["question", "shutdown_request"] {
             let outcome = handle_agent_send_message_with_router_observed(
@@ -3746,7 +3903,7 @@ pub(crate) mod tests {
             assert_eq!(receipt["status"], "rejected", "{receipt}");
             assert_eq!(receipt["executed"], false, "{receipt}");
             assert!(outcome.accepted_send.is_none());
-            assert!(!obligations.has_pending("parent-run"));
+            assert!(obligations.pending("parent-run").is_empty());
             assert!(receiver.try_recv().is_none());
         }
         let outcome = handle_agent_send_message_with_router_observed(
@@ -4683,6 +4840,162 @@ pub(crate) mod tests {
         Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
     }
 
+    struct OutcomeInspectionReconciler(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    );
+
+    #[async_trait::async_trait]
+    impl crate::orchestration::spawner::DurableAgentReconciler for OutcomeInspectionReconciler {
+        async fn load_agent_recovery(
+            &self,
+        ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        async fn inspect_child_tool_outcomes(
+            &self,
+            child_run_id: &str,
+            _after: Option<(&str, &str)>,
+            exact: Option<(&str, &str)>,
+            _offset: usize,
+            _max_bytes: usize,
+        ) -> Result<Value, crate::orchestration::spawner::ToolOutcomeInspectionError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if exact.is_some_and(|(_, request)| request == "busy") {
+                Err(crate::orchestration::spawner::ToolOutcomeInspectionError::Busy)
+            } else if exact.is_some() {
+                Ok(
+                    json!({"observations": [{"result": {"status":"unavailable", "reason":"too large"}}]}),
+                )
+            } else {
+                Ok(json!({"observations": [{"child": child_run_id}]}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_outcome_inspection_is_explicit_and_scoped_to_the_parent() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("test-model"));
+        let reconciler = Arc::new(OutcomeInspectionReconciler(
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        spawner
+            .set_durable_agent_reconciler(reconciler.clone())
+            .await;
+        let receipt = handle_agent_spawn_action(
+            &json!({"description":"review", "prompt":"review the change"}),
+            Some(&ctx),
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        let agent_id = receipt["agent_id"].as_str().expect("spawned child");
+        let _ordinary =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        assert_eq!(
+            reconciler.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ordinary collection must not inspect dispatch storage"
+        );
+        let result = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {}}),
+            Some(&ctx),
+        )
+        .await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            result["tool_outcomes"]["observations"][0]["child"].is_string(),
+            "{result}"
+        );
+        let projection = astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire(
+            "get_result",
+            true,
+            Some(&result),
+        );
+        assert_eq!(
+            projection.outcome,
+            astra_turn_core::orchestration::agent_result_wire::AgentToolWireOutcomeKind::NoChange
+        );
+        assert_eq!(reconciler.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let mut other = ctx.clone();
+        other.run_id = "other-parent".into();
+        other.fanout_admission = spawner.fanout_parent(&other.run_id);
+        let denied = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {}}),
+            Some(&other),
+        )
+        .await;
+        assert!(!denied.contains("observations"), "{denied}");
+        assert_eq!(reconciler.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let unavailable = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {"exact": {
+                "turn_chain_id":"turn", "request_id":"request"}}}),
+            Some(&ctx),
+        )
+        .await;
+        let unavailable: Value = serde_json::from_str(&unavailable).unwrap();
+        assert_eq!(unavailable["status"], "tool_outcomes_unavailable");
+        assert_eq!(
+            unavailable["tool_outcomes"]["observations"][0]["result"]["status"],
+            "unavailable"
+        );
+        let busy = handle_agent_get_result_action(
+            &json!({"agent_id": agent_id, "tool_outcomes": {"exact": {
+                "turn_chain_id":"turn", "request_id":"busy"}}}),
+            Some(&ctx),
+        )
+        .await;
+        let busy: Value = serde_json::from_str(&busy).unwrap();
+        assert_eq!(busy["status"], "tool_outcomes_unavailable");
+        assert_eq!(busy["tool_outcomes"]["status"], "unavailable");
+        assert!(
+            busy["tool_outcomes"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("does not rerun")
+        );
+        ctx.fanout_admission.set_direct_child_for_test(
+            crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: Vec::new(),
+                agent_id: "failed-child".into(),
+                run_id: "failed-run".into(),
+                parent_agent_id: ctx.agent_id.clone(),
+                status: AgentStatus::Failed {
+                    error: "callback lost".into(),
+                    partial_result: String::new(),
+                    finish_reason: None,
+                },
+            },
+        );
+        ctx.fanout_admission.take_completed_direct_children();
+        let refreshes = reconciler.1.load(std::sync::atomic::Ordering::Relaxed);
+        let observed = handle_agent_get_result_action(
+            &json!({"agent_id":"failed-child", "tool_outcomes":{}}),
+            Some(&ctx),
+        )
+        .await;
+        assert!(observed.contains("failed-run"), "{observed}");
+        assert_eq!(
+            reconciler.1.load(std::sync::atomic::Ordering::Relaxed),
+            refreshes,
+            "tool pages must not rehydrate a retained failed child's lifecycle"
+        );
+        assert_eq!(
+            astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire(
+                "get_result",
+                true,
+                Some(&unavailable),
+            )
+            .outcome,
+            astra_turn_core::orchestration::agent_result_wire::AgentToolWireOutcomeKind::NoChange
+        );
+    }
+
     pub(crate) fn test_spawner_without_executor() -> Arc<DynamicAgentSpawner> {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -4697,7 +5010,7 @@ pub(crate) mod tests {
         AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             parent_model_reasoning: None,
             run_id: "run-parent".into(),

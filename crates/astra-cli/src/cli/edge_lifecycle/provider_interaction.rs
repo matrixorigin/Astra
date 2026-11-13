@@ -203,11 +203,17 @@ fn native_interaction_error(
     use astra_tools::ProviderInteractionDecision as D;
     // Never format the error: transport URLs, response bodies and auth values are private.
     let category = match error {
-        E::AdmissionDeadlineExpired => return D::Timeout,
+        E::AdmissionDeadlineExpired | E::CallbackDeadlineExpired => return D::Timeout,
         E::Http(error) if error.is_timeout() => return D::Timeout,
         E::Http(error) if error.is_decode() => "protocol",
         E::Http(_) => "network",
-        E::InvalidAuthHeader => "authentication",
+        E::InvalidAuthHeader
+        | E::CallbackOwnerUnconfirmed
+        | E::CallbackOwnerUnconfirmedAfterAttempt(_)
+        | E::CallbackAuthRefreshUnconfirmed(_)
+        | E::CallbackRetryAuthFailed { .. } => "authentication",
+        E::CallbackTaskFailed(_) | E::CallbackBookkeepingFailed(_) => "protocol",
+        E::CallbackRetryCancelled => return D::Cancelled,
         E::Api { status, .. } => {
             let category = match status.as_u16() {
                 401 | 403 => "authentication",
@@ -216,6 +222,12 @@ fn native_interaction_error(
             };
             return D::Error(format!(
                 "native interaction {category} (HTTP {})",
+                status.as_u16()
+            ));
+        }
+        E::SyncOutboxBackpressure { status, .. } => {
+            return D::Error(format!(
+                "native interaction server rejection (HTTP {})",
                 status.as_u16()
             ));
         }

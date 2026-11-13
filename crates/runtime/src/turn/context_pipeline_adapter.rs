@@ -1510,6 +1510,10 @@ mod tests {
             "environment_volatile".into(),
             Value::String("git: dirty (1 file changed)".into()),
         );
+        second_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.into(),
+            serde_json::json!(["The active local workspace is `/tmp/proj-worktree`."]),
+        );
         let mut second_state = make_state();
         second_state.llm_rounds_completed = 1;
         let second = build_composite_inputs(

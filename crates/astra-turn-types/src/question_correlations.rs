@@ -1,14 +1,14 @@
-//! Bounded question obligations carried by canonical execution control.
+//! Bounded advisory question identities carried by canonical execution control.
 
 use serde::{Deserialize, Serialize};
 
 use crate::AgentCommunicationParty;
 
-pub const MAX_PENDING_REPLIES: usize = 16;
+pub const MAX_QUESTION_CORRELATIONS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PendingReply {
+pub struct QuestionCorrelation {
     pub request_id: String,
     pub expected_responder: AgentCommunicationParty,
 }
@@ -17,22 +17,22 @@ pub struct PendingReply {
 /// producer against the paired checkpoint budget and execution custody.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReplyObligationsSnapshotV1 {
+pub struct QuestionCorrelationsSnapshotV1 {
     pub run_id: String,
     pub producer_owner_generation: u64,
-    pub pending: Vec<PendingReply>,
+    pub pending: Vec<QuestionCorrelation>,
 }
 
-impl ReplyObligationsSnapshotV1 {
+impl QuestionCorrelationsSnapshotV1 {
     pub fn validate_owner(&self, run_id: &str, generation: u64) -> Result<(), &'static str> {
         if run_id.is_empty()
             || self.run_id != run_id
             || self.producer_owner_generation != generation
         {
-            return Err("reply obligations belong to another execution owner");
+            return Err("question correlations belong to another execution owner");
         }
-        if self.pending.len() > MAX_PENDING_REPLIES {
-            return Err("too many unanswered agent questions");
+        if self.pending.len() > MAX_QUESTION_CORRELATIONS {
+            return Err("too many question correlations");
         }
         for (index, reply) in self.pending.iter().enumerate() {
             if reply.request_id.is_empty()

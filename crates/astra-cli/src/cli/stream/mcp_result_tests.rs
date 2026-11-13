@@ -6,7 +6,7 @@ use astra_runtime::turn::agentic::headless_round::{
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_thin_client::ToolResultRequest;
-use astra_turn_core::sse_stream_host::SseStreamHost;
+use astra_turn_core::sse_stream_host::SseEdgeWork;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -115,6 +115,8 @@ async fn callback_through_pipeline(
             execution_timeout_ms: 30_000,
             command_timeout_cap_ms: None,
             execution_deadline_unix_ms: u64::MAX,
+            execution_deadline_at: tokio::time::Instant::now()
+                + std::time::Duration::from_millis(30_000),
         }])
         .await;
     assert_eq!(results.len(), 1);
@@ -241,7 +243,11 @@ async fn callback_through_pipeline(
     let record = records.pop().unwrap();
     assert_eq!(
         record.effective_disposition(),
-        ToolCallDisposition::Executed
+        if lost_ack {
+            ToolCallDisposition::Unknown
+        } else {
+            ToolCallDisposition::Executed
+        }
     );
     assert_eq!(record.ok, callback.status == "completed");
     assert_eq!(

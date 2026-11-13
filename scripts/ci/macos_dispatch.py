@@ -278,8 +278,12 @@ def source(api, repo, run_id, attempt):
         labels = MACOS_MAIN_LABELS
     else:
         raise Unavailable("unsupported source event")
-    if labels not in (MACOS_SELF_HOSTED_LABELS, MACOS_MAIN_LABELS):
+    # Only an explicitly selected hosted macOS runner is a benign no-op.
+    # An empty/unknown selection means missing source metadata: fail closed.
+    if labels == ["macos-15"]:
         raise Unavailable("source does not prefer mini")
+    if labels not in (MACOS_SELF_HOSTED_LABELS, MACOS_MAIN_LABELS):
+        raise Unavailable("source runner metadata unavailable")
     return src
 
 
@@ -500,7 +504,9 @@ def main():
         if args.mode in {"admit", "cleanup"}:
             return 1
         if args.mode == "schedule":
-            status = 1
+            # A validated hosted-runner source does not require a mini attempt.
+            # Keep real API/dispatch failures fail-closed.
+            status = 0 if isinstance(error, Unavailable) and reason == "source does not prefer mini" else 1
     finally:
         if args.mode == "schedule" and src is not None:
             # One owner for cleanup, including obsolescence during admission.

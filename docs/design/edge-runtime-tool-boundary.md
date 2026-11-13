@@ -115,9 +115,60 @@ subject to redaction, and display-only markers cannot authorize edits.
 The CLI admits one Server-owned loop; local tools execute only through the
 Server's authenticated callback requests. Missing terminal execution evidence
 does not transfer continuation authority to the CLI. The adapter preserves
-observed results and usage, reports a typed protocol failure, and uses the
-existing physical-run cleanup path for an unsettled owner. It must not replay
-tools or open another admission to complete an incomplete stream.
+observed results and usage, reports a typed protocol failure, and leaves an
+unsettled run under Server authority. Explicit user cancellation and output
+failure continue to use the existing physical-run cleanup path. The adapter
+must not replay tools or open another admission to complete an incomplete stream.
+
+After local execution, the CLI retries transient result-delivery failures with
+the same scoped request and result hash. The tool itself is never replayed.
+Delivery retries remain bounded and stop on cancellation or a permanent
+rejection; an already-started credential rotation is settled by its existing
+owner even if the caller stops waiting. Only a Server acknowledgement marks
+the result delivered. After the receipt window has elapsed, a short best-effort attempt
+may still retain a late result; its acknowledgement does not prove the current
+round consumed it. Unrepeated delivery makes no additional queries. Delivery
+uses at most 16 concurrent callbacks per CLI process and at most four active
+callback tasks per stream, without holding a tool-execution permit. Queued
+results retain their original delivery deadline; congestion can therefore
+cause a result to expire without being sent. Completed outputs are shared with
+their callback rather than copied while waiting, but their total size and the
+number of concurrent streams are not bounded by these limits. The limits are
+per process, not a cluster-wide bound on Server work.
+
+While a tool batch runs, the SSE reader pauses further reads after accumulating
+one MiB of later executable work. It processes the whole already-received
+network chunk first, including a terminal event in that chunk; consequently
+the pending size can exceed the threshold by the size of that chunk. Terminal
+events in later chunks wait while backpressure applies. Callback failure
+warnings are best effort when the output channel cannot accept them; the final
+typed failure remains authoritative.
+
+When durable dispatch is configured, an uncertain write does not release a
+local waiter: the write may have committed before its acknowledgement was
+lost. The same result can be retried; a different canonical result after
+credential redaction is rejected. Explicit local-only hosts continue to use
+the local ledger.
+
+Completed results can be delivered independently, including results from the
+same run. The Server consumes locally available results as they arrive and
+assembles the model-facing batch in its original request order. Each pending
+tool has a local waiter; completed outputs and progress events can coexist in
+memory while a sibling is still running. Normal waiting performs no recurring
+result reads. After the local receipt deadline or uncertain cancellation, an
+existing exact durable read may recover a callback accepted by another Server
+instance. If that read fails or the result arrives later, its outcome remains
+unconfirmed for the live turn. Final reads remain
+serialized per batch: if many results time out while the durable store is
+slow, each read gets its own one-second timeout, so the batch can wait
+proportionally longer. In local-only mode, the bounded replay cache can evict
+an already consumed receipt before its HTTP retry arrives under load.
+
+If delivery cannot be confirmed, the Server retains run authority; a client
+disconnect does not establish that an outstanding tool stopped. When multiple
+callback deliveries fail, the existing interruption reports their scoped run
+and request identities and errors, with authentication failure taking priority.
+An unconfirmed side effect must not be repeated to manufacture a receipt.
 
 A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that
@@ -446,8 +497,14 @@ credentials are never implicitly copied into a local shell.
 
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
 on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
-owner under the workspace writer lease. It has no legacy `git(action=worktree)`
-alias. Ordinary worktree Git commands remain shell operations. Generic Server
+owner under the workspace writer lease. `enter` creates and selects a new
+worktree; it does not adopt a separately created worktree. To use an existing
+worktree outside the selected root, start or select a CLI/User Runner session
+rooted there under the normal trust and policy checks. Bash `workdir` selects
+an invocation directory inside that root and rejects outside paths before
+execution. This directory selection guard does not replace the shell provider's
+policy and sandbox controls over commands that change directory.
+It has no legacy `git(action=worktree)` alias. Ordinary worktree Git commands remain shell operations. Generic Server
 executors cannot silently create a local session owner. Typed commit/stash tool
 journals and their automatic compensation are removed along with their producers;
 shell side effects retain the existing shell observation and recovery contract.

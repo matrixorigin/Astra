@@ -259,7 +259,7 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
         "{}\n\n## Parent coordination\n\
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
          Stay within the delegated task boundary. Parent communication is a typed protocol: whenever the brief requires a parent answer, your next action MUST be `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", message=...)`; `ask_user` addresses the human, not your parent. Never put a question to the parent in ordinary text or in the terminal result: plain text cannot create a request ID and cannot be answered. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
-         A parent question is control flow, never terminal output. After the question tool returns `queued`, use `agent(action=\"wait\")` and wait for the correlated answer; do not finish the run until that answer is observed and the delegated brief is complete. \
+         A question is asynchronous coordination, never proof of completion. After `queued`, continue independent work or use `agent(action=\"wait\")` for bounded observation if the answer is needed. Use the exact request ID and actual sender identity; report unanswered questions and incomplete delegated work truthfully. \
          Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs. Honor the brief's requested output format exactly; persona and summary defaults must not add explanation or formatting. Otherwise keep a one-shot result to one line when sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
@@ -3135,6 +3135,31 @@ pub trait SpawnAgentExecutor: Send + Sync {
     fn bind_parent_session(&self, _session_id: &str) {}
 }
 
+/// Errors at the durable tool-outcome inspection boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolOutcomeInspectionError {
+    #[error("tool result offset is beyond the retained output")]
+    InvalidOffset,
+    #[error("tool result page would skip an atomic redaction marker or UTF-8 boundary")]
+    UnsafePageBoundary,
+    #[error("tool outcome inspection is busy")]
+    Busy,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<String> for ToolOutcomeInspectionError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for ToolOutcomeInspectionError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_owned())
+    }
+}
+
 /// Loads a bounded authoritative session snapshot for agents observed from a
 /// different executor. Implementations own coalescing/backoff so fanout reads
 /// never degrade into per-agent database polling.
@@ -3153,6 +3178,18 @@ pub trait DurableAgentReconciler: Send + Sync {
         _run_ids: &[String],
     ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
         self.load_agent_recovery().await
+    }
+
+    /// On-demand inspection only; absence does not prove non-execution.
+    async fn inspect_child_tool_outcomes(
+        &self,
+        _child_run_id: &str,
+        _after: Option<(&str, &str)>,
+        _exact: Option<(&str, &str)>,
+        _offset: usize,
+        _max_bytes: usize,
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
+        Err("durable tool outcome inspection is unavailable".into())
     }
 
     /// Subscribe to a process-wide durable wake hint for remote direct children.
@@ -3616,6 +3653,25 @@ impl DynamicAgentSpawner {
 
     pub async fn set_durable_agent_reconciler(&self, reconciler: Arc<dyn DurableAgentReconciler>) {
         *self.durable_reconciler.write().await = Some(reconciler);
+    }
+
+    pub async fn inspect_child_tool_outcomes(
+        &self,
+        child_run_id: &str,
+        after: Option<(&str, &str)>,
+        exact: Option<(&str, &str)>,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, ToolOutcomeInspectionError> {
+        let reconciler = self
+            .durable_reconciler
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "durable tool outcome inspection is unavailable".to_string())?;
+        reconciler
+            .inspect_child_tool_outcomes(child_run_id, after, exact, offset, max_bytes)
+            .await
     }
 
     pub fn retained_child_result(
@@ -12053,9 +12109,10 @@ pub(crate) mod tests {
         assert!(first.contains("message_type=\"question\""));
         assert!(first.contains("next action MUST be"));
         assert!(first.contains("Never put a question to the parent in ordinary text"));
-        assert!(first.contains("A parent question is control flow, never terminal output"));
-        assert!(first.contains("returns `queued`"));
-        assert!(first.contains("wait for the correlated answer"));
+        assert!(first.contains("A question is asynchronous coordination"));
+        assert!(first.contains("After `queued`, continue independent work"));
+        assert!(first.contains("`agent(action=\"wait\")` for bounded observation"));
+        assert!(first.contains("exact request ID and actual sender identity"));
         assert!(first.contains("`ask_user` addresses the human"));
         assert!(first.contains("Return only the answer, evidence, or decision"));
         assert!(first.contains("Honor the brief's requested output format exactly"));
@@ -13834,7 +13891,7 @@ pub(crate) mod tests {
             let ctx = AgentToolContext {
                 parent_delegation_authority: DelegationAuthority::Allowed,
                 fanout_admission: admission,
-                reply_obligations: Arc::new(Default::default()),
+                question_correlations: Arc::new(Default::default()),
                 delegation_model_admission: None,
                 run_id: "result-parent-0".into(),
                 agent_id: "root-agent".into(),
@@ -14005,7 +14062,7 @@ pub(crate) mod tests {
         let ctx = AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("mixed-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "mixed-parent".into(),
             agent_id: "root-agent".into(),
@@ -14127,7 +14184,7 @@ pub(crate) mod tests {
         let ctx = AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("next-turn"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "next-turn".into(),
             agent_id: "root-agent".into(),

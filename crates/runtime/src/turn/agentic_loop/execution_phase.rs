@@ -66,7 +66,7 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             })
         })
         .collect();
-    let replies = state.messaging.reply_obligations.pending(parent_run_id);
+    let replies = state.messaging.question_correlations.pending(parent_run_id);
     let reply_identities: Vec<_> = replies
         .iter()
         .map(|reply| {
@@ -340,12 +340,23 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
             })
             .sum()
     };
-    if pending_bytes(state).saturating_add(
-        serde_json::to_vec(&payload)
-            .expect("child notification must serialize")
-            .len(),
-    ) > budget
-    {
+    let payload_bytes = serde_json::to_vec(&payload)
+        .expect("child notification must serialize")
+        .len();
+    let mut retained_bytes = pending_bytes(state);
+    if retained_bytes.saturating_add(payload_bytes) > budget {
+        // Correlation notices are optional; producer-owned child results win
+        // even when another completion was staged in an earlier batch.
+        for entry in &mut state.volatile_pending {
+            if entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && let Some(object) = entry.payload.as_object_mut()
+            {
+                object.remove("unobserved_questions");
+            }
+        }
+        retained_bytes = pending_bytes(state);
+    }
+    if retained_bytes.saturating_add(payload_bytes) > budget {
         // Compact payloads in place: delivery counters, observation markers,
         // and parent identity belong to the existing injection, not this batch.
         for notification in state
@@ -392,6 +403,38 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
             ));
         }
     }
+    let questions: Vec<_> = state
+        .messaging
+        .question_correlations
+        .pending(owner.parent_run_id())
+        .into_iter()
+        .filter(|question| {
+            payload["children"].as_array().is_some_and(|children| {
+                children.iter().any(|child| {
+                    child["run_id"] == question.expected_responder.run_id
+                        && child["agent_id"] == question.expected_responder.agent_id
+                })
+            }) && !state.volatile_pending.iter().any(|entry| {
+                entry.payload["response_request_id"] == question.request_id
+                    && entry.payload["sender"]["run_id"] == question.expected_responder.run_id
+                    && entry.payload["sender"]["agent_id"] == question.expected_responder.agent_id
+                    && entry.payload["response_match"] != "not_adopted"
+            })
+        })
+        .collect();
+    if !questions.is_empty() {
+        payload["unobserved_questions"] = serde_json::json!({
+            "questions": questions,
+            "instruction": "No matching response was observed before this notification; it may have been sent or still be in transit. The terminal result is not an answer. Continue using the known outcome, or explicitly wait if an answer is needed.",
+        });
+        // This batch's optional notice may only use otherwise unused bytes.
+        if pending_bytes(state).saturating_add(payload.to_string().len()) > budget {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("unobserved_questions");
+        }
+    }
     state.push_volatile_payload(
         super::host::VolatileKind::BackgroundTaskNotification,
         payload,
@@ -416,14 +459,6 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    let run_id = state.current_run_id.as_deref().unwrap_or_default();
-    if state.messaging.reply_obligations.has_pending(run_id) {
-        finish_direct_child_barrier_incomplete(
-            state,
-            "agent finalization reached an unanswered question",
-        );
-        return;
-    }
     let Some(owner) = host.direct_child_completion_owner(state) else {
         return;
     };
@@ -507,7 +542,10 @@ pub(crate) enum RuntimeActivityOutcome {
 
 impl RuntimeActivityOutcome {
     pub(crate) fn should_continue(&self) -> bool {
-        matches!(self, Self::InputReady | Self::ObservationTimedOut)
+        matches!(
+            self,
+            Self::InputReady | Self::ObservationTimedOut | Self::NoPendingWork
+        )
     }
 }
 
@@ -531,13 +569,11 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
 ) -> Result<RuntimeActivityOutcome, astra_core::ClassifiedError> {
     let owner = host.direct_child_completion_owner(state);
     let run_id = state.current_run_id.clone().unwrap_or_default();
-    let replies = Arc::clone(&state.messaging.reply_obligations);
     let retained_runtime_input = has_retained_runtime_input(state);
     if observation_request.is_none()
         && !owner
             .as_ref()
             .is_some_and(|owner| owner.has_pending_direct_children())
-        && !replies.has_pending(&run_id)
         && !retained_runtime_input
     {
         return Ok(RuntimeActivityOutcome::NoPendingWork);
@@ -554,7 +590,8 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
     let authority_deadline = remaining.map(|remaining| admitted_now + remaining);
     let work_deadline = time_budget.map(|budget| admitted_now + budget.work_remaining);
     let paused_authority_live = || {
-        authority_deadline.is_none_or(|end| tokio::time::Instant::now() < end)
+        observation_request.is_none()
+            && authority_deadline.is_none_or(|end| tokio::time::Instant::now() < end)
             && owner
                 .as_ref()
                 .is_some_and(|owner| owner.paused_direct_child_reason().is_some())
@@ -700,7 +737,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         }
                     } => ReadySource::Mailbox(message),
                 };
-                let boundary = match source {
+                let mut boundary = match source {
                     ReadySource::Child => Some(RuntimeInputBoundary::ChildReady),
                     ReadySource::Intent(Some(index)) => {
                         checked_watermark = checked_watermark.max(index);
@@ -723,8 +760,13 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                     }
                     ReadySource::ObservationTimeout => None,
                 };
+                // The observation cutoff limits parking, not ownership of an
+                // admitted capacity request or input transaction. Those keep
+                // the original execution deadline and cancellation boundary.
                 let mut input_deadline = if boundary.is_none() || paused_authority_live() {
                     authority_deadline
+                } else if observation_request.is_some() {
+                    work_deadline
                 } else {
                     deadline
                 };
@@ -786,6 +828,12 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         observation_request.map(|request| request.tool_call_id.as_str()),
                     );
                     return Err(error);
+                }
+                if observation_deadline.is_some_and(|end| tokio::time::Instant::now() >= end) {
+                    // A wake can precede the cutoff but capacity arrive after
+                    // it. Leave ready input in its existing owner for the next
+                    // iteration; a tool timeout never cancels a child run.
+                    boundary = None;
                 }
                 let Some(boundary) = boundary else {
                     if paused_authority_live() {
@@ -849,7 +897,6 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         && !owner
                             .as_ref()
                             .is_some_and(|owner| owner.has_pending_direct_children())
-                        && !replies.has_pending(&run_id)
                 {
                     break 'waiting if matches!(source, ReadySource::Child) {
                         "synthesis_ready"
@@ -1430,7 +1477,8 @@ pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool 
         // A later tool's success template cannot replace the model's chance to
         // interpret that result after an earlier invocation went unconfirmed.
         || state.stall.tool_call_records.iter().any(|record| {
-            record.was_executed()
+            record.outcome_is_unknown()
+                || (record.was_executed()
                 && !record.ok
                 && matches!(
                     record.error_kind,
@@ -1439,7 +1487,7 @@ pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool 
                             | astra_core::ErrorKind::ToolTimeout
                             | astra_core::ErrorKind::ToolOutcomeUnknown
                     )
-                )
+                ))
         })
         || missing_explicit_verification_hooks(state)
             .map(|missing| missing.is_some_and(|labels| !labels.is_empty()))
@@ -4805,10 +4853,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if host
                 .direct_child_completion_owner(state)
                 .is_some_and(|owner| owner.has_pending_direct_children())
-                || state
-                    .messaging
-                    .reply_obligations
-                    .has_pending(state.current_run_id.as_deref().unwrap_or_default())
             {
                 // Close provider timing before waiting. The wait is its own
                 // Explain interval, never part of model inference time.
@@ -6260,14 +6304,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn admitted_wait_parks_main_loop_without_provider_calls() {
+    #[tokio::test(start_paused = true)]
+    async fn admitted_wait_observes_timeout_without_bypassing_child_results() {
         for reply_pending in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let context =
                 crate::server::runtime_tool_executor::tests::test_agent_tool_context(dir.path());
             let owner = Arc::clone(&context.fanout_admission);
-            let replies = Arc::clone(&context.reply_obligations);
+            let replies = Arc::clone(&context.question_correlations);
             let responder = astra_messaging::AgentAddress::new("child-run", "child-agent");
             if reply_pending {
                 replies
@@ -6295,7 +6339,7 @@ mod tests {
             );
             executor.set_agent_tool_context(context);
             let mut state = make_state();
-            state.messaging.reply_obligations = Arc::clone(&replies);
+            state.messaging.question_correlations = Arc::clone(&replies);
             state.runtime_tool_executor = Some(Arc::new(executor));
             state.current_run_id = Some("test-run".into());
             state.current_session_id = Some("test-session".into());
@@ -6303,21 +6347,33 @@ mod tests {
             state.canonical_turn_chain_id = Some("test-chain".into());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let wait_started = Arc::new(tokio::sync::Notify::new());
-            let mut host = MockHost::new(vec![
-            server_tool_result(
-                vec![serde_json::json!({
-                    "id":"wait-call", "type":"function", "function":{
-                        "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1} else {10000}}).to_string(),
+            let mut turns = vec![
+                server_tool_result(
+                    vec![serde_json::json!({
+                        "id":"wait-call", "type":"function", "function":{
+                            "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1000} else {10000}}).to_string(),
+                        },
+                    })],
+                    vec![],
+                    10,
+                    5,
+                    None,
+                ),
+                text_result(
+                    if reply_pending {
+                        "child still running"
+                    } else {
+                        "42"
                     },
-                })],
-                vec![],
-                10,
-                5,
-                None,
-            ),
-            text_result("42", 10, 5, None),
-        ])
-        .with_valid_tools(&["agent"]);
+                    10,
+                    5,
+                    None,
+                ),
+            ];
+            if reply_pending {
+                turns.push(text_result("42", 10, 5, None));
+            }
+            let mut host = MockHost::new(turns).with_valid_tools(&["agent"]);
             host.provider_call_counter = Some(Arc::clone(&counter));
             host.child_wait_started = Some(Arc::clone(&wait_started));
             let task = tokio::spawn(async move {
@@ -6339,24 +6395,19 @@ mod tests {
                 "parked execution must not call provider"
             );
             if reply_pending {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::time::timeout(Duration::from_secs(2), wait_started.notified()).await
+                    .expect("the observation timeout resumes the model, then child custody parks it again");
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
                 assert!(
-                    replies.has_pending("test-run"),
-                    "observation timeout cannot settle question"
+                    !task.is_finished(),
+                    "an unanswered question does not replace the child-result fence"
                 );
-                assert!(replies.observe_response(
-                    "test-run",
-                    &astra_messaging::AgentMessage::new(
-                        responder,
-                        astra_messaging::MessageTarget::Direct {
-                            address: astra_messaging::AgentAddress::new("test-run", "test-agent")
-                        },
-                        astra_messaging::MessagePayload::Response {
-                            request_id: "question".into(),
-                            accepted: true,
-                            data: None
-                        },
-                    )
-                ));
+                assert!(owner.has_pending_direct_children());
+                assert!(
+                    !replies.pending("test-run").is_empty(),
+                    "timeout cannot settle question correlation"
+                );
             }
             owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
                 applied_user_intents: Vec::new(),
@@ -6382,8 +6433,16 @@ mod tests {
                 matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
                 "{outcome:?}"
             );
-            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                if reply_pending { 3 } else { 2 }
+            );
             assert_eq!(state.final_text, "42");
+            assert_eq!(
+                !replies.pending("test-run").is_empty(),
+                reply_pending,
+                "completion does not require manufacturing an answer"
+            );
             assert_eq!(
                 astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(
                     &state.stall.tool_call_records
@@ -6392,9 +6451,16 @@ mod tests {
                 "accepted waiting must not introduce a child execution failure"
             );
             assert!(
-                serde_json::to_string(&host.executed_volatile[1])
-                    .unwrap()
-                    .contains("42"),
+                host.executed_volatile.last().unwrap().iter().any(|entry| {
+                    entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                        && entry.payload["children"]
+                            .as_array()
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child["run_id"] == "child-run" && child["result"] == "42"
+                                })
+                            })
+                }),
                 "continuation must consume the canonical child result"
             );
             assert!(
@@ -6810,6 +6876,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
             grant.notify_one();
             tokio::time::sleep(Duration::from_millis(25)).await;
+            if observation_timeout {
+                let (host, state, result) = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.unwrap(), RuntimeActivityOutcome::ObservationTimedOut);
+                assert!(owner.has_pending_direct_children());
+                assert!(host.executed_messages.is_empty());
+                assert!(
+                    state
+                        .volatile_pending
+                        .iter()
+                        .any(|entry| entry.payload["agent_wait"] == "timed_out")
+                );
+                continue;
+            }
             assert!(!task.is_finished());
             assert!(owner.has_pending_direct_children());
             cancellation.cancel();
@@ -6830,6 +6912,136 @@ mod tests {
                     .volatile_pending
                     .iter()
                     .all(|entry| entry.payload["agent_wait"] != "timed_out")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_observation_cutoff_preserves_readmission_and_started_input() {
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            Arc::new(crate::messaging::InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
+        let mut ctx = crate::orchestration::agent_tool::tests::test_spawn_context(spawner, None);
+        ctx.run_id = "agent-run".into();
+        ctx.fanout_admission = ctx.spawner.fanout_parent("agent-run");
+        let output = crate::orchestration::agent_tool::handle_agent_tool(
+            &serde_json::json!({"action":"wait", "timeout_ms":15_000, "_tool_call_id":"wait-call"}),
+            Some(&ctx),
+        )
+        .await;
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["status"], "wait_admitted");
+        let receipt: astra_tools::agent_tool_contract::AgentWaitReceipt =
+            serde_json::from_value(output["wait_request"].clone()).unwrap();
+        for (phase, work_seconds) in [
+            ("capacity", 40),
+            ("poll", 40),
+            ("apply", 40),
+            ("capacity", 10),
+            ("apply", 10),
+        ] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "agent-run",
+                "child",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: vec![],
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "agent".into(),
+                status: crate::orchestration::AgentStatus::Paused {
+                    reason: "user pause".into(),
+                },
+            });
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut provider = StubRunControlProvider::new(vec![UserIntentPoll {
+                next_cursor: 1,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "guidance".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 0,
+                    input: serde_json::json!({"content":"Use the existing result."}),
+                }],
+                ..UserIntentPoll::default()
+            }]);
+            let mut host = MockHost::new(vec![]).with_execution_time_budget_remaining(
+                astra_turn_types::ExecutionTimeRemaining {
+                    work_remaining: Duration::from_secs(work_seconds),
+                    total_remaining: Duration::from_secs(60),
+                },
+            );
+            let gate = Some((entered.clone(), release.clone()));
+            match phase {
+                "capacity" => host.capacity_readmission_gate = gate,
+                "poll" => provider.poll_gate = gate,
+                "apply" => provider.apply_gate = gate,
+                _ => unreachable!(),
+            }
+            let provider = Arc::new(provider);
+            let (_wake_tx, wake_rx) = tokio::sync::watch::channel(0);
+            host.direct_child_owner = Some(owner.clone());
+            let mut state = make_state();
+            state.current_run_id = Some("agent-run".into());
+            state.current_session_id = Some("session".into());
+            state.owner_user_id = Some("user".into());
+            state.current_run_owner_generation = Some(3);
+            state.run_control = Some(provider.clone());
+            state.user_intents.bind_wake(Some(wake_rx));
+            let receipt = receipt.clone();
+            let task = tokio::spawn(async move {
+                let result = await_runtime_activity(&mut host, &mut state, Some(&receipt)).await;
+                (host, state, result)
+            });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("real input wake must reach the selected capacity/IO boundary");
+            tokio::time::advance(Duration::from_secs(16)).await;
+            tokio::task::yield_now().await;
+            if work_seconds > 15 {
+                assert!(
+                    !task.is_finished(),
+                    "{phase}: retain admitted ownership until capacity/input settles"
+                );
+            }
+            release.notify_one();
+            let (host, state, result) = task.await.unwrap();
+            assert_eq!(
+                result.unwrap(),
+                if work_seconds < 15 {
+                    RuntimeActivityOutcome::Incomplete
+                } else if phase == "capacity" {
+                    RuntimeActivityOutcome::ObservationTimedOut
+                } else {
+                    RuntimeActivityOutcome::InputReady
+                },
+                "{phase}"
+            );
+            assert!(owner.has_pending_direct_children(), "{phase}");
+            if work_seconds > 15 {
+                assert!(host.cancelled_agent_ids.is_empty(), "{phase}");
+                assert!(
+                    state.interruption.is_none(),
+                    "{phase}: {:?}",
+                    state.interruption
+                );
+            } else {
+                assert!(
+                    state.interruption.is_some(),
+                    "{phase}: real work cutoff remains authoritative"
+                );
+            }
+            assert_eq!(
+                provider.poll_call_count().await,
+                usize::from(phase != "capacity")
+            );
+            assert_eq!(
+                state.user_intents.user_intent_cursor(),
+                usize::from(phase != "capacity" && work_seconds > 15)
             );
         }
     }
@@ -6876,6 +7088,14 @@ mod tests {
             started.notified().await;
             tokio::time::advance(Duration::from_secs(16)).await;
             tokio::task::yield_now().await;
+            if observe {
+                let (host, state, result) = task.await.unwrap();
+                assert_eq!(result.unwrap(), RuntimeActivityOutcome::ObservationTimedOut);
+                assert!(owner.has_pending_direct_children());
+                assert!(host.executed_messages.is_empty());
+                assert!(state.interruption.is_none());
+                continue;
+            }
             assert!(
                 !task.is_finished(),
                 "soft cutoff must not retire live ownership"
@@ -7038,34 +7258,6 @@ mod tests {
             host.rendered_final_text,
             vec!["2024, from the child's workspace evidence."]
         );
-    }
-
-    #[tokio::test]
-    async fn textless_parent_waits_for_pending_reply_without_consuming_recovery() {
-        let mut state = make_state();
-        state.current_run_id = Some("parent-run".into());
-        state
-            .messaging
-            .reply_obligations
-            .reserve(
-                "parent-run",
-                "question",
-                astra_messaging::AgentAddress::new("child-run", "child-agent"),
-            )
-            .unwrap();
-        let mut host = MockHost::new(vec![text_result("", 10, 0, Some(1))]);
-
-        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .unwrap();
-
-        assert!(matches!(control, TurnExecutionControl::WaitForInput));
-        assert_eq!(
-            state.hooks.completion_settlement.textless_response_retries,
-            0
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(state.messaging.reply_obligations.has_pending("parent-run"));
     }
 
     #[tokio::test]
@@ -7725,6 +7917,86 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn optional_question_notice_cannot_displace_a_later_child_result() {
+        use crate::orchestration::spawner::DirectChildCompletion;
+        let budget = crate::orchestration::agent_tool::MAX_FANOUT_AGGREGATE_BYTES;
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-a",
+        );
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        for index in 0..16 {
+            state
+                .messaging
+                .question_correlations
+                .reserve(
+                    "parent-run",
+                    &format!("question-{index}"),
+                    astra_messaging::AgentAddress::new("run-a", "child-a"),
+                )
+                .unwrap();
+        }
+        let first = "\"".repeat(budget / 4);
+        owner.set_direct_child_for_test(DirectChildCompletion {
+            agent_id: "child-a".into(),
+            run_id: "run-a".into(),
+            parent_agent_id: "parent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: first.clone(),
+                finish_reason: None,
+            },
+            applied_user_intents: vec![],
+        });
+        stage_direct_child_results(&mut host, &mut state).unwrap();
+        let mut first_payload = state.volatile_pending[0].payload.clone();
+        assert!(
+            first_payload
+                .as_object_mut()
+                .unwrap()
+                .remove("unobserved_questions")
+                .is_some()
+        );
+        let mut second_child = DirectChildCompletion {
+            agent_id: "child-b".into(),
+            run_id: "run-b".into(),
+            parent_agent_id: "parent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: String::new(),
+                finish_reason: None,
+            },
+            applied_user_intents: vec![],
+        };
+        let mut empty_second = first_payload.clone();
+        empty_second["children"] = serde_json::json!([second_child.notification(budget)]);
+        let available =
+            budget - first_payload.to_string().len() - empty_second.to_string().len() - 128;
+        let second = "\"".repeat(available / 2);
+        second_child.status = crate::orchestration::AgentStatus::Completed {
+            result: second.clone(),
+            finish_reason: None,
+        };
+        owner.set_direct_child_for_test(second_child);
+        stage_direct_child_results(&mut host, &mut state).unwrap();
+        assert_eq!(state.volatile_pending.len(), 2);
+        for (entry, expected) in state.volatile_pending.iter().zip([first, second]) {
+            assert_eq!(entry.payload["children"][0]["result"], expected);
+            assert_ne!(entry.payload["children"][0]["result_truncated"], true);
+            assert!(entry.payload.get("unobserved_questions").is_none());
+        }
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .map(|entry| entry.payload.to_string().len())
+                .sum::<usize>()
+                <= budget
+        );
     }
 
     #[test]

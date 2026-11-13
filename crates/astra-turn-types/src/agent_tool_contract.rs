@@ -63,6 +63,10 @@ pub enum AgentControlOutcome {
     MessageQueued,
     #[serde(rename = "ok")]
     ListObserved,
+    #[serde(rename = "tool_outcomes_observed")]
+    ToolOutcomesObserved,
+    #[serde(rename = "tool_outcomes_unavailable")]
+    ToolOutcomesUnavailable,
 }
 
 impl AgentControlOutcome {
@@ -72,6 +76,7 @@ impl AgentControlOutcome {
             Self::WaitAdmitted => AgentAction::Wait,
             Self::MessageQueued => AgentAction::SendMessage,
             Self::ListObserved => AgentAction::List,
+            Self::ToolOutcomesObserved | Self::ToolOutcomesUnavailable => AgentAction::GetResult,
         }
     }
 }

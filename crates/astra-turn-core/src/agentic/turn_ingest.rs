@@ -574,9 +574,12 @@ mod tests {
                     vec![Ok(frames.concat().into_bytes())]
                 };
                 let mut source = futures_util::stream::iter(chunks);
-                let (result, _) =
-                    consume_sse_stream(&mut source, &mut NoopSseStreamHost, stream_idle_timeout())
-                        .await;
+                let (result, _) = consume_sse_stream(
+                    &mut source,
+                    &mut NoopSseStreamHost::default(),
+                    stream_idle_timeout(),
+                )
+                .await;
                 let accum = result.accum;
                 assert!(accum.has_authoritative_interrupted_terminal(), "{accum:?}");
                 assert!(accum.error_kind.is_none());

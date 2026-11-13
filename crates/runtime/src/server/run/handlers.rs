@@ -372,6 +372,7 @@ pub(crate) struct RunProjectionResponse {
     pub latest_event_type: Option<String>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    /// Last persisted aggregate; live execution has no exact count here.
     pub total_tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
@@ -1606,7 +1607,7 @@ mod tests {
                     let mut source = futures_util::stream::iter(chunks);
                     let (result, abort) = consume_sse_stream(
                         &mut source,
-                        &mut NoopSseStreamHost,
+                        &mut NoopSseStreamHost::default(),
                         std::time::Duration::from_secs(1),
                     )
                     .await;
@@ -2565,6 +2566,10 @@ mod tests {
                 .expect("mark failed")
         );
 
+        engine
+            .start_run("active-projection-http", "u1", "session-projection")
+            .await
+            .unwrap();
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
             Arc::new(
@@ -2582,6 +2587,7 @@ mod tests {
         );
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2600,6 +2606,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("projection response should be valid json");
         assert_eq!(json.get("status"), Some(&json!("failed")));
+        assert!(
+            json.get("total_tool_calls")
+                .is_some_and(serde_json::Value::is_number)
+        );
         assert_eq!(json.get("latest_event_type"), Some(&json!("run_finished")));
         assert_eq!(json.get("run_event_high_watermark"), Some(&json!(5)));
         assert_eq!(
@@ -2649,6 +2659,28 @@ mod tests {
                 .iter()
                 .any(|event| event.get("full_text") == Some(&json!("durable answer"))),
             "run projection should keep bounded durable transcript data"
+        );
+        let active = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/active-projection-http/projection")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.status(), StatusCode::OK);
+        let bytes = body::to_bytes(active.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let active: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(active["status"], "running");
+        assert!(
+            active
+                .get("total_tool_calls")
+                .is_some_and(serde_json::Value::is_number)
         );
     }
 
