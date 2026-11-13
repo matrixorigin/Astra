@@ -142,12 +142,12 @@ fn provider_access_error(status: u16, body: &str) -> Option<astra_core::Classifi
             .and_then(Value::as_str)
             .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
     });
-    let kind = match (status, code) {
-        (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
-            ErrorKind::ProviderQuotaExhausted
-        }
-        (401 | 403, Some("invalid_api_key" | "invalid_token" | "authentication_error"))
-        | (401, _) => ErrorKind::Auth,
+    let kind = match (
+        status,
+        code.and_then(astra_core::error_kind::provider_access_code_kind),
+    ) {
+        (403 | 429, Some(ErrorKind::ProviderQuotaExhausted)) => ErrorKind::ProviderQuotaExhausted,
+        (401 | 403, Some(ErrorKind::Auth)) | (401, _) => ErrorKind::Auth,
         (403, _) => ErrorKind::ProviderForbidden,
         _ => return None,
     };
@@ -6033,7 +6033,11 @@ async fn call_prepared_llm_attempts(
         llm_attempt.received_response(&response);
         let status = response.status().as_u16();
         if response.status().is_success() {
-            if subscription.is_none() {
+            let is_responses = route
+                .inference_protocol
+                .unwrap_or_else(|| llm_provider_protocol(provider))
+                == LlmProviderProtocol::OpenAiResponses;
+            if subscription.is_none() && !is_responses {
                 cooldown.with(model_key, |c| c.record_success());
             }
             if provider_uses_bedrock_converse(provider) {
@@ -6270,14 +6274,10 @@ async fn call_prepared_llm_attempts(
                     }
                 }
             }
-            let stream_result = if route
-                .inference_protocol
-                .unwrap_or_else(|| llm_provider_protocol(provider))
-                == LlmProviderProtocol::OpenAiResponses
-            {
+            let stream_result = if is_responses {
                 responses::collect(
                     response,
-                    route,
+                    &route,
                     &authorized_tool_names,
                     cancel,
                     stream_callback.as_deref_mut(),
@@ -6362,6 +6362,9 @@ async fn call_prepared_llm_attempts(
                     .await
                     {
                         return Err(attach_llm_result_details(error, &result));
+                    }
+                    if subscription.is_none() && is_responses {
+                        cooldown.with(model_key, |c| c.record_success());
                     }
                     llm_attempt.succeed();
                     return Ok(result);

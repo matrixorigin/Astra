@@ -2312,7 +2312,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CooldownRejected,
                     ResumeAction::WaitAndRetry {
-                        delay_seconds: reset_in_ms / 1000,
+                        delay_seconds: Some(reset_in_ms / 1000),
                     },
                     interruption_state_summary(
                         state,
@@ -2326,7 +2326,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             state.interruption = Some(InterruptionRecord::new(
                 InterruptionKind::CooldownRejected,
                 ResumeAction::WaitAndRetry {
-                    delay_seconds: reset_in_ms / 1000,
+                    delay_seconds: Some(reset_in_ms / 1000),
                 },
                 interruption_state_summary(state, Some(format!("Rate limit: {}", reason.as_str()))),
             ));

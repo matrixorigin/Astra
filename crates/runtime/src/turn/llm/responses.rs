@@ -29,10 +29,51 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
             "The selected model returned an incomplete response. Check the model configuration or choose another model."
                 .to_string()
         }
+        "provider_rate_limited" => {
+            "The model provider is rate limiting requests. Try again later or choose another model."
+                .to_string()
+        }
+        "auth" => "The model provider rejected its credentials.".to_string(),
+        "provider_quota_exhausted" => {
+            "The model provider account balance or quota is exhausted.".to_string()
+        }
+        "provider_rejected" => "The model provider rejected the request.".to_string(),
         _ => format!("Model request failed: {code}"),
     };
     astra_core::ClassifiedError::new(kind, message)
         .with_details_json(json!({"source":"responses","code":code}).to_string())
+}
+
+/// Provider prose can contain credentials or shared account usage. Only the
+/// dimension on the same structured rate-limit error is safe to describe.
+fn rate_limit_dimension(event: &Value) -> Option<&'static str> {
+    let error = [event.pointer("/response/error"), event.get("error")]
+        .into_iter()
+        .flatten()
+        .find(|error| error.get("code").and_then(Value::as_str).is_some())?;
+    let code = error.get("code").and_then(Value::as_str)?;
+    if !matches!(
+        astra_core::model_wire::responses::provider_error(code),
+        Some(("provider_rate_limited", _))
+    ) {
+        return None;
+    }
+    match error.get("type").and_then(Value::as_str) {
+        Some("tokens") => Some("tokens"),
+        Some("requests") => Some("requests"),
+        _ => None,
+    }
+}
+
+fn rate_limit_error(event: &Value) -> astra_core::ClassifiedError {
+    let mut classified = error(astra_core::ErrorKind::RateLimit, "provider_rate_limited");
+    classified.message = match rate_limit_dimension(event) {
+        Some("tokens") => "The model provider reported a token rate limit. Requests include conversation context and tools. Try again later, check the provider limit, or choose another model.",
+        Some("requests") => "The model provider reported a request rate limit. Try again later, check the provider limit, or choose another model.",
+        _ => return classified,
+    }
+    .to_string();
+    classified
 }
 pub(super) fn credential_error(
     value: (
@@ -406,7 +447,7 @@ fn result(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect(
     response: reqwest::Response,
-    route: LlmExecutionRoute<'_>,
+    route: &LlmExecutionRoute<'_>,
     names: &HashSet<String>,
     cancel: LlmCancel<'_>,
     mut callback: Option<&mut LlmStreamCallback<'_>>,
@@ -416,6 +457,11 @@ pub(super) async fn collect(
     usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let binding = route.subscription;
+    let direct_provider = binding.is_none()
+        && !uses_moi_model_gateway_error_contract(route.header_overrides)
+        && !response
+            .headers()
+            .contains_key(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
     let scope = binding
         .map(|credential| credential.connection_id())
         .or(route.response_scope)
@@ -538,14 +584,22 @@ pub(super) async fn collect(
                             rejected = true;
                         }
                         match failure.mapped() {
+                            Some(("provider_rate_limited", _)) if direct_provider => {
+                                rate_limit_error(&event)
+                            }
                             Some((code, status)) => {
                                 error(provider_http_error_kind(status, code), code)
                             }
                             None => match &failure {
-                                ResponsesStreamError::Provider(_) => error(
-                                    astra_core::ErrorKind::StreamTransport,
-                                    "response_incomplete",
-                                ),
+                                ResponsesStreamError::Provider(_) => match direct_provider
+                                    .then(|| failure.access_error_kind())
+                                    .flatten()
+                                {
+                                    Some(kind) => error(kind, kind.as_str()),
+                                    None => {
+                                        error(astra_core::ErrorKind::Unknown, "provider_rejected")
+                                    }
+                                },
                                 ResponsesStreamError::Codec(reason) => {
                                     error(astra_core::ErrorKind::StreamTransport, reason)
                                 }

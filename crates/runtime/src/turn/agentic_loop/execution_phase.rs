@@ -4646,10 +4646,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.rate_limit_cooldown.record_529(None);
             }
 
-            if is_rate_limit {
+            if is_rate_limit
+                && let Some((kind, action)) =
+                    astra_turn_core::interruption::interruption_from_error_kind(e.kind)
+            {
                 state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::RateLimited,
-                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    kind,
+                    action,
                     interruption_state_summary(
                         state,
                         Some(format!("Rate limit during streaming: {}", e.message)),
@@ -11557,6 +11560,13 @@ mod tests {
             .as_ref()
             .expect("direct provider 429 must be represented as an interruption");
         assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(
+            interruption.resume_action,
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None
+            }
+        );
+        assert!(!interruption.user_message.contains("30s"));
         assert_eq!(state.llm_rounds_completed, 1);
         let metrics = state.rate_limit_cooldown.metrics();
         assert_eq!(metrics.total_429_errors, 1);
