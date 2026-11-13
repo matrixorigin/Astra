@@ -44,7 +44,9 @@ impl DurableMemoriaPort {
     }
 
     pub async fn prepare_plan(&self) -> Result<FinalizationPlan, String> {
-        let (client, owner) = self.transport(true).await?;
+        // The recovery owner gates writes separately. Both a new inventory and
+        // a retained plan contain memory content and need fresh read authority.
+        let (client, owner) = self.transport(false).await?;
         let checked_owner = owner.clone();
         let previous = self
             .store
@@ -465,7 +467,14 @@ impl MemoriaPort for DurableMemoriaPort {
         if session_id != self.claim.session_id {
             return Err("reflection session scope mismatch".into());
         }
-        let (client, owner) = self.transport(true).await?;
+        // Reflection returns candidate content as well as creating memories.
+        let transport = self
+            .inner
+            .resolve_read_write_transport()
+            .await?
+            .ok_or("reflection requires a read/write memory transport")?;
+        let owner = transport.owner_user_id.clone();
+        let client = HttpMemoriaPort::from_transport(transport).for_durable_session();
         let checked_owner = owner.clone();
         let cached = self
             .store

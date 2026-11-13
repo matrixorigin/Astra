@@ -407,6 +407,25 @@ pub trait MemoriaPort: Send + Sync {
         Ok(None)
     }
 
+    /// Resolve compound operations that both reveal stored memory and mutate it.
+    /// Providers may override this to check both grants in one fresh snapshot.
+    /// The default requires matching owner/backend identities across both checks.
+    async fn resolve_read_write_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        let Some(read) = self.resolve_tool_transport(false).await? else {
+            return Ok(None);
+        };
+        let Some(write) = self.resolve_tool_transport(true).await? else {
+            return Ok(None);
+        };
+        if read.owner_user_id != write.owner_user_id
+            || read.base_url != write.base_url
+            || read.owner_scoped_master != write.owner_scoped_master
+        {
+            return Err("memory_scope_violation: read and write authority differ".into());
+        }
+        Ok(Some(write))
+    }
+
     /// Resolve observer write authority at dispatch. Implementations may
     /// combine admission and transport resolution when the same fresh check
     /// enforces both; the default preserves separate checks for custom ports.

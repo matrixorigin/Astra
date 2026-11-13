@@ -280,7 +280,16 @@ workspace or grant fails closed before UC/Memoria access.
 MOI decides `memory.read` and `memory.write` independently through current
 workspace IAM. The grant is `none`, `read_only`, `write_only` or `read_write`;
 write permission alone never enables reads, and read permission alone never
-enables observation or maintenance. An active account, permission to chat,
+enables observation or maintenance. Session-end consolidation also reads working
+memory: preparing or reusing its frozen snapshot requires fresh `memory.read`,
+in addition to write admission and the fresh write checks on later mutations.
+Write-only observation and saves remain allowed; consolidation waits for the
+read grant rather than reading through a write-authorized deployment transport.
+Reflection also requires both grants because candidate responses can contain
+existing memory content. The canonical port resolves this compound requirement;
+MOI checks both grants against one fresh workspace/identity resolution. Generic
+ports must return matching backend/owner identities for their read/write checks.
+An active account, permission to chat,
 a provider signature or an old UI capability projection is insufficient.
 Ordinary Roles do not receive these grants by default. Every operation resolves
 fresh authority; an admitted grant also requires the existing live UC

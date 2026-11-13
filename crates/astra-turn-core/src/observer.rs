@@ -104,18 +104,6 @@ pub fn should_run_observer(full_text: &str, has_tool_calls: bool) -> bool {
 /// observation. Preserve the checkpoint's filter state for new content, and
 /// exclude a prior human segment if its memory-tool call arrives in the new
 /// suffix before the next human boundary.
-pub fn filter_memory_operation_turns_with_context(
-    context: &[Value],
-    messages: &[Value],
-    preceding_memory_operation: bool,
-) -> (Vec<Value>, bool) {
-    let (mut context, mut new, flag) =
-        filter_memory_operation_parts(context, messages, preceding_memory_operation);
-    context.append(&mut new);
-    (context, flag)
-}
-
-/// Keep reference context separate from newly due text for durable windowing.
 pub fn filter_memory_operation_parts(
     context: &[Value],
     messages: &[Value],
@@ -178,24 +166,33 @@ mod tests {
             json!({"role":"assistant","content":"Saved your address."}),
             json!({"role":"user","content":"He had surgery."}),
         ];
-        let (result, flag) = filter_memory_operation_turns_with_context(&context, &messages, false);
-        assert_eq!(
-            result,
-            vec![context[0].clone(), context[1].clone(), messages[3].clone()]
-        );
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &messages, false);
+        assert_eq!(reference, context[..2]);
+        assert_eq!(new, messages[3..]);
         assert!(!flag);
-        let (empty, flag) =
-            filter_memory_operation_turns_with_context(&context, &messages[..3], false);
-        assert!(empty.is_empty());
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &messages[..3], false);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
         assert!(flag);
-        let (continuation, flag) =
-            filter_memory_operation_turns_with_context(&[], &context[3..], false);
-        assert_eq!(continuation, context[3..]);
+        let (reference, new, flag) = filter_memory_operation_parts(&[], &context[3..], false);
+        assert!(reference.is_empty());
+        assert_eq!(new, context[3..]);
         assert!(!flag);
-        let (empty, flag) =
-            filter_memory_operation_turns_with_context(&context, &context[3..], true);
-        assert!(empty.is_empty());
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &context[3..], true);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
         assert!(flag);
+        // Reference text must never become newly due, including when no memory
+        // operation is present. Durable cursor offsets address only `new`.
+        let (reference, new, flag) =
+            filter_memory_operation_parts(&context[..2], &messages[3..], false);
+        assert_eq!(reference, context[..2]);
+        assert_eq!(new, messages[3..]);
+        assert!(!flag);
+        let (reference, new, flag) = filter_memory_operation_parts(&context[..2], &[], false);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
+        assert!(!flag);
     }
 
     #[test]

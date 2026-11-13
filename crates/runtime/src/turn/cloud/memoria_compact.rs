@@ -584,6 +584,15 @@ impl UserScopedMemoriaPort {
     // Resolve fresh authority without constructing an HTTP client. Transport
     // consumers such as the observer own their request-specific client policy.
     async fn transport(&self, write: bool) -> Result<MemoriaToolTransport, MemoriaOperationError> {
+        self.transport_for_operations(&[write]).await
+    }
+
+    // Compound operations check independent grants against one fresh identity
+    // and workspace resolution. No grant or transport is cached between calls.
+    async fn transport_for_operations(
+        &self,
+        operations: &[bool],
+    ) -> Result<MemoriaToolTransport, MemoriaOperationError> {
         let owner_user_id = self
             .owner_user_id()
             .map_err(MemoriaOperationError::AuthorityUnavailable)?;
@@ -595,17 +604,19 @@ impl UserScopedMemoriaPort {
             self.self_hosted_fallback.is_some(),
         ) {
             MemoriaAuthoritySelection::Scoped(credential) => {
-                if let Some(message) = credential.access.denial_message(write) {
-                    // Built-in grants belong to the hosting product, not to
-                    // the separate Memoria website's Connected apps page.
-                    let message = if credential.owner_scoped_master && write {
-                        "Memory access is read-only. Ask your workspace memory administrator to grant memory.write before saving or modifying memories."
-                    } else if credential.owner_scoped_master {
-                        "Memory read access is not enabled. Ask your workspace memory administrator to grant memory.read."
-                    } else {
-                        message
-                    };
-                    return Err(MemoriaOperationError::Disabled(message.into()));
+                for &write in operations {
+                    if let Some(message) = credential.access.denial_message(write) {
+                        // Built-in grants belong to the hosting product, not to
+                        // the separate Memoria website's Connected apps page.
+                        let message = if credential.owner_scoped_master && write {
+                            "Memory access is read-only. Ask your workspace memory administrator to grant memory.write before saving or modifying memories."
+                        } else if credential.owner_scoped_master {
+                            "Memory read access is not enabled. Ask your workspace memory administrator to grant memory.read."
+                        } else {
+                            message
+                        };
+                        return Err(MemoriaOperationError::Disabled(message.into()));
+                    }
                 }
                 Ok(MemoriaToolTransport {
                     base_url: self.resolver.provider.base_url.clone(),
@@ -701,6 +712,13 @@ impl MemoriaPort for UserScopedMemoriaPort {
             .await
             .map_err(|error| error.to_string())?;
         Ok(Some(transport))
+    }
+
+    async fn resolve_read_write_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        self.transport_for_operations(&[false, true])
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
@@ -829,10 +847,11 @@ impl MemoriaPort for UserScopedMemoriaPort {
         session_id: &str,
         force: bool,
     ) -> Result<ReflectSummary, String> {
-        self.client(true)
-            .await
-            .map_err(|error| error.to_string())?
-            .0
+        let transport = self
+            .resolve_read_write_transport()
+            .await?
+            .ok_or("reflection requires a read/write memory transport")?;
+        HttpMemoriaPort::from_transport(transport)
             .reflect_session(session_id, force)
             .await
     }

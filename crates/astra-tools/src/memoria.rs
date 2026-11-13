@@ -1107,10 +1107,15 @@ impl MemoriaToolGateway {
         }
 
         let tool_transport = if let Some(port) = self.memoria_port.as_ref() {
-            match port
-                .resolve_tool_transport(memory_operation_requires_write(op))
-                .await
-            {
+            let resolved = if op == "reflect" {
+                // Candidate mode returns existing memory content, so a write
+                // grant alone cannot authorize this compound operation.
+                port.resolve_read_write_transport().await
+            } else {
+                port.resolve_tool_transport(memory_operation_requires_write(op))
+                    .await
+            };
+            match resolved {
                 Ok(Some(transport)) => Some(transport),
                 Ok(None) => {
                     return json!({
@@ -2205,6 +2210,8 @@ mod tests {
     struct ToolTransportPort {
         transport: astra_memoria::MemoriaToolTransport,
         admission: Arc<std::sync::Mutex<Vec<bool>>>,
+        denied: Option<bool>,
+        write_owner: Option<String>,
     }
 
     #[test]
@@ -2230,7 +2237,14 @@ mod tests {
             write: bool,
         ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
             self.admission.lock().unwrap().push(write);
-            Ok(Some(self.transport.clone()))
+            if self.denied == Some(write) {
+                return Err("memory operation is disabled".into());
+            }
+            let mut transport = self.transport.clone();
+            if write && let Some(owner) = &self.write_owner {
+                transport.owner_user_id = owner.clone();
+            }
+            Ok(Some(transport))
         }
 
         async fn retrieve_ext(
@@ -2260,6 +2274,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflection_requires_read_and_write_before_revealing_candidates() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/reflect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates":[{"memories":[{"content":"PRIVATE-EXISTING-FACT"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (denied, write_owner) in [
+            (Some(false), None),
+            (Some(true), None),
+            (None, Some("changed-owner".to_string())),
+            (None, None),
+        ] {
+            let allowed = denied.is_none() && write_owner.is_none();
+            let admission = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let port = Arc::new(ToolTransportPort {
+                transport: astra_memoria::MemoriaToolTransport {
+                    base_url: server.uri(),
+                    credential: "fixture-key".into(),
+                    owner_user_id: "fixture-owner".into(),
+                    owner_scoped_master: true,
+                },
+                admission: admission.clone(),
+                denied,
+                write_owner,
+            });
+            let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
+            let output = gateway.call("reflect", &json!({"mode":"candidates"})).await;
+            assert_eq!(memoria_output_is_error(&output), !allowed);
+            assert_eq!(output.contains("PRIVATE-EXISTING-FACT"), allowed);
+            assert_eq!(
+                *admission.lock().unwrap(),
+                if denied == Some(false) {
+                    vec![false]
+                } else {
+                    vec![false, true]
+                }
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                usize::from(allowed)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn composition_owned_port_supplies_scoped_tool_transport() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2279,6 +2342,8 @@ mod tests {
                 owner_scoped_master: false,
             },
             admission: Arc::clone(&admission),
+            denied: None,
+            write_owner: None,
         });
         let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
 
@@ -2320,6 +2385,8 @@ mod tests {
                 owner_scoped_master: true,
             },
             admission: Arc::new(std::sync::Mutex::new(Vec::new())),
+            denied: None,
+            write_owner: None,
         });
         let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
 

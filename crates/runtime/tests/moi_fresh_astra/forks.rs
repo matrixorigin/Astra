@@ -1705,19 +1705,26 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
 
     let fixture = ReviewFixture::new().await;
     let read_only = Arc::new(AtomicBool::new(true));
+    let write_only = Arc::new(AtomicBool::new(false));
+    let identity_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflection_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let callback_issuer = base.clone();
     let grant = read_only.clone();
+    let write_grant = write_only.clone();
+    let calls = identity_calls.clone();
+    let reflect_calls = reflection_calls.clone();
     let bridge = Router::new()
         .route("/callback", route_post(move |headers: HeaderMap, Json(body): Json<Value>| {
-            let issuer = callback_issuer.clone(); let grant = grant.clone();
+            let issuer = callback_issuer.clone(); let grant = grant.clone(); let write_grant = write_grant.clone();
+            calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 assert_eq!(headers["authorization"], "Bearer lifecycle-callback-key");
                 assert_eq!(body["action"], "resolve_memory_identity");
                 Json(json!({"code":0,"data":{"external_subject":body["external_subject"],"provider_scope_id":body["provider_scope_id"],
                     "issuer":issuer,"uc_subject":"lifecycle-uc-owner",
-                    "memory_access":if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
+                    "memory_access":if write_grant.load(Ordering::SeqCst) {"write_only"} else if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
             }
         }))
         .route("/protocol/openid-connect/token", route_post(|| async {
@@ -1725,6 +1732,10 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
         }))
         .route("/api/v1/uc/internal/users/{subject}/status", axum::routing::get(|| async {
             Json(json!({"code":"OK","data":{"uc_sub":"lifecycle-uc-owner","status":"active"}}))
+        }))
+        .route("/v1/reflect", route_post(move || {
+            reflect_calls.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"candidates":[{"memories":[{"content":"EXISTING-PRIVATE-MEMORY"}]}]})) }
         }))
         .route("/check", route_post(|| async {Json(json!({"code":0,"data":{"ok":true}}))}));
     let bridge = tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
@@ -1781,6 +1792,31 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
         .unwrap()
         .unwrap()
         .owner_user_id;
+    // A compound operation must use one fresh MOI/UC identity resolution,
+    // and neither one-sided grant may reveal reflection candidate contents.
+    for only_write in [false, true] {
+        write_only.store(only_write, Ordering::SeqCst);
+        let before = identity_calls.load(Ordering::SeqCst);
+        assert!(port.resolve_read_write_transport().await.is_err());
+        assert_eq!(identity_calls.load(Ordering::SeqCst), before + 1);
+    }
+    assert!(port.resolve_tool_transport(true).await.unwrap().is_some());
+    assert!(port.reflect_session(&fixture.parent, false).await.is_err());
+    assert_eq!(reflection_calls.load(Ordering::SeqCst), 0);
+    write_only.store(false, Ordering::SeqCst);
+    read_only.store(false, Ordering::SeqCst);
+    let before = identity_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        port.resolve_read_write_transport()
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_user_id,
+        first_owner
+    );
+    assert_eq!(identity_calls.load(Ordering::SeqCst), before + 1);
+    read_only.store(true, Ordering::SeqCst);
+
     let other_payload = json!({"client_session_ref":"workspace-memory-other"}).to_string();
     let (status, other_session) = response(
         &app,
