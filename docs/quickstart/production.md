@@ -97,6 +97,9 @@ cancelled and its result is kept for the next connection. The token is not
 written to the runner metadata. Each background runner keeps the credential it
 last authenticated for its own identity, and the execution record for its own
 server, so another runner in the same workspace does not replace either. A
-record written before records were separated by server stays with the server
-that next opens it. If that older record and a server-specific record both
-exist, startup stops and names both files instead of dropping either one.
+record written before records were separated by server does not name a server.
+Startup stops and names that file and this server's file instead of giving the
+record to whichever server starts first, or starting from an empty history.
+Move its snapshot and WAL onto the server that owns the work, then start again.
+If that older record and a server-specific record both exist, startup stops
+and names both files as well.

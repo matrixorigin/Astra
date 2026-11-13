@@ -326,7 +326,7 @@ fn edge_invocation_journal_path_in_root(
 }
 
 /// Journal key from before `server_url` was part of the identity. Opening the
-/// server-scoped path claims this file when it still holds the only custody.
+/// server-scoped path stops while this file still holds records.
 fn legacy_edge_invocation_journal_path_in_root(
     edge_id: &str,
     workspace_dir: &Path,
@@ -1177,6 +1177,12 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
             Err(e) => {
                 if managed_background::shutdown_requested() {
                     return false;
+                }
+                if e.downcast_ref::<astra_edge::EdgeJournalCustodyError>()
+                    .is_some()
+                {
+                    eprintln!("Error: {e}");
+                    return true;
                 }
                 if is_permanent_connection_error(e.as_ref()) {
                     // A connect command either hands its credential over

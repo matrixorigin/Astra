@@ -45,9 +45,9 @@ pub(crate) enum JournalError {
     )]
     AmbiguousCustody { current: PathBuf, legacy: PathBuf },
     #[error(
-        "the previous invocation record at {legacy} was claimed by another server during startup, so this server will not open an empty history; if that record belongs here, move it to {current} and start again"
+        "the previous invocation record at {legacy} does not name its server, so this server will not take it or start from an empty history; if that work belongs here, move its snapshot and WAL to {current}, then start again"
     )]
-    LegacyClaimedElsewhere { current: PathBuf, legacy: PathBuf },
+    UnattributedLegacy { current: PathBuf, legacy: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,23 +270,15 @@ fn nonempty_file(path: &Path) -> Result<bool, JournalError> {
     }
 }
 
-fn inherit_legacy_journal(current: &Path, legacy: &Path) -> Result<(), JournalError> {
-    if !durable_custody(legacy)? {
-        return Ok(());
-    }
-    if durable_custody(current)? {
-        return Err(JournalError::AmbiguousCustody {
-            current: current.to_path_buf(),
-            legacy: legacy.to_path_buf(),
-        });
-    }
-    let lock_path = legacy.with_extension("json.lock");
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| JournalError::Io {
+async fn lock_journal(path: &Path) -> Result<std::fs::File, JournalError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|source| JournalError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
-    }
+    let lock_path = path.with_extension("json.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -297,80 +289,29 @@ fn inherit_legacy_journal(current: &Path, legacy: &Path) -> Result<(), JournalEr
             path: lock_path.clone(),
             source,
         })?;
-    if let Err(source) = fs2::FileExt::try_lock_exclusive(&lock) {
-        return Err(if source.kind() == std::io::ErrorKind::WouldBlock {
-            JournalError::LegacyClaimedElsewhere {
-                current: current.to_path_buf(),
-                legacy: legacy.to_path_buf(),
-            }
-        } else {
-            JournalError::Io {
-                path: lock_path,
-                source,
-            }
-        });
-    }
-    let result = inherit_legacy_journal_locked(current, legacy);
-    let _ = fs2::FileExt::unlock(&lock);
-    result
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|source| JournalError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(lock)
 }
 
-fn inherit_legacy_journal_locked(current: &Path, legacy: &Path) -> Result<(), JournalError> {
-    let legacy_has = durable_custody(legacy)?;
-    let current_has = durable_custody(current)?;
-    if current_has && legacy_has {
+/// Called only while the caller already holds `current`'s journal lock.
+/// A pre-server file has no server identity, so startup order cannot claim it.
+fn refuse_unattributed_legacy(current: &Path, legacy: &Path) -> Result<(), JournalError> {
+    if !durable_custody(legacy)? {
+        return Ok(());
+    }
+    if durable_custody(current)? {
         return Err(JournalError::AmbiguousCustody {
             current: current.to_path_buf(),
             legacy: legacy.to_path_buf(),
         });
     }
-    if !legacy_has {
-        return if current_has {
-            Ok(())
-        } else {
-            Err(JournalError::LegacyClaimedElsewhere {
-                current: current.to_path_buf(),
-                legacy: legacy.to_path_buf(),
-            })
-        };
-    }
-    move_custody(legacy, current)?;
-    if let Some(parent) = current.parent() {
-        let directory = std::fs::File::open(parent).map_err(|source| JournalError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        directory.sync_all().map_err(|source| JournalError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
-fn move_custody(from: &Path, to: &Path) -> Result<(), JournalError> {
-    let moved_snapshot = move_file(from, to)?;
-    if let Err(error) = move_file(
-        &from.with_extension("json.wal"),
-        &to.with_extension("json.wal"),
-    ) {
-        if moved_snapshot {
-            let _ = std::fs::rename(to, from);
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn move_file(from: &Path, to: &Path) -> Result<bool, JournalError> {
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(JournalError::Io {
-            path: from.to_path_buf(),
-            source,
-        }),
-    }
+    Err(JournalError::UnattributedLegacy {
+        current: current.to_path_buf(),
+        legacy: legacy.to_path_buf(),
+    })
 }
 
 impl EdgeInvocationJournal {
@@ -378,43 +319,25 @@ impl EdgeInvocationJournal {
         Self::open_inheriting(path, None).await
     }
 
-    /// Open `path`, first moving a pre-server journal onto it when this
-    /// server-scoped file does not already hold custody. Two populated files
-    /// are left untouched and reported; a legacy file taken by another server
-    /// during this call is not replaced with an empty history.
+    /// Open `path` under its exclusive lock. A pre-server journal is left in
+    /// place: this server neither takes it nor starts from an empty history
+    /// while that file still has records.
     pub(crate) async fn open_inheriting(
         path: PathBuf,
         legacy: Option<PathBuf>,
     ) -> Result<Self, JournalError> {
-        if let Some(legacy) = legacy.as_ref().filter(|legacy| *legacy != &path) {
-            inherit_legacy_journal(&path, legacy)?;
+        let lock = lock_journal(&path).await?;
+        if let Some(legacy) = legacy.as_ref().filter(|legacy| *legacy != &path)
+            && let Err(error) = refuse_unattributed_legacy(&path, legacy)
+        {
+            drop(lock);
+            return Err(error);
         }
-        Self::open_at(path).await
+        Self::open_locked(path, lock).await
     }
 
-    async fn open_at(path: PathBuf) -> Result<Self, JournalError> {
+    async fn open_locked(path: PathBuf, lock: std::fs::File) -> Result<Self, JournalError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| JournalError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        let lock_path = path.with_extension("json.lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|source| JournalError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|source| JournalError::Io {
-            path: lock_path,
-            source,
-        })?;
         let mut state = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice::<JournalFile>(&bytes).map_err(|error| {
                 JournalError::Corrupt {
@@ -1723,11 +1646,22 @@ mod tests {
         assert_eq!(journal["walByteCapacity"], MAX_WAL_BYTES);
     }
 
+    fn place_legacy_record(current: &Path, legacy: &Path) {
+        if legacy.exists() {
+            std::fs::rename(legacy, current).unwrap();
+        }
+        let legacy_wal = legacy.with_extension("json.wal");
+        if legacy_wal.exists() {
+            std::fs::rename(&legacy_wal, current.with_extension("json.wal")).unwrap();
+        }
+    }
+
     #[tokio::test]
-    async fn legacy_completion_replays_from_the_server_journal() {
+    async fn legacy_completion_stays_put_until_its_server_is_chosen() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join("legacy.json");
-        let current = dir.path().join("server.json");
+        let current = dir.path().join("server-a.json");
+        let other = dir.path().join("server-b.json");
         let identity = identity("call-legacy-done");
         let request_id = identity.storage_key();
         let args = json!({"command": "effect"});
@@ -1754,11 +1688,23 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let mut restored =
-            EdgeInvocationJournal::open_inheriting(current.clone(), Some(legacy.clone()))
+        for path in [&current, &other] {
+            let error = EdgeInvocationJournal::open_inheriting(path.clone(), Some(legacy.clone()))
                 .await
+                .err()
                 .unwrap();
-        assert!(!legacy.exists());
+            assert!(matches!(error, JournalError::UnattributedLegacy { .. }));
+            assert!(error.to_string().contains(legacy.to_str().unwrap()));
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+        }
+        assert!(legacy.exists() || legacy.with_extension("json.wal").exists());
+        assert!(!current.with_extension("json.wal").exists());
+        assert!(!other.with_extension("json.wal").exists());
+
+        place_legacy_record(&current, &legacy);
+        let mut restored = EdgeInvocationJournal::open_inheriting(current, Some(legacy.clone()))
+            .await
+            .unwrap();
         assert!(matches!(
             restored
                 .prepare(&request_id, &identity, 2, "bash", &args, true, None)
@@ -1767,23 +1713,14 @@ mod tests {
             PrepareOutcome::Replay(result) if result.output == "done-once"
         ));
         drop(restored);
-
-        let other = dir.path().join("other-server.json");
-        let mut second = EdgeInvocationJournal::open_inheriting(other, Some(legacy))
+        let second = EdgeInvocationJournal::open_inheriting(other, Some(legacy))
             .await
             .unwrap();
         assert_eq!(second.status().records, 0);
-        assert!(matches!(
-            second
-                .prepare(&request_id, &identity, 1, "bash", &args, true, None)
-                .await
-                .unwrap(),
-            PrepareOutcome::Execute
-        ));
     }
 
     #[tokio::test]
-    async fn legacy_running_record_is_recovered_without_reexecution() {
+    async fn legacy_running_record_is_recovered_after_it_is_placed() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join("legacy.json");
         let current = dir.path().join("server.json");
@@ -1803,11 +1740,22 @@ mod tests {
         ));
         drop(journal);
 
-        let mut restored = EdgeInvocationJournal::open_inheriting(current, Some(legacy.clone()))
+        let error = EdgeInvocationJournal::open_inheriting(current.clone(), Some(legacy.clone()))
             .await
+            .err()
             .unwrap();
-        assert!(!legacy.exists());
-        assert!(!legacy.with_extension("json.wal").exists());
+        assert!(matches!(error, JournalError::UnattributedLegacy { .. }));
+        assert_eq!(
+            tokio::fs::metadata(current.with_extension("json.wal"))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(legacy.with_extension("json.wal").exists());
+
+        place_legacy_record(&current, &legacy);
+        let mut restored = EdgeInvocationJournal::open(current).await.unwrap();
         let pending = restored.pending_results().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
@@ -1820,6 +1768,76 @@ mod tests {
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_empty_journal_keeps_its_files_when_a_second_open_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let current = dir.path().join("server.json");
+        let mut owner = EdgeInvocationJournal::open(current.clone()).await.unwrap();
+        let legacy_identity = identity("call-live-owner");
+        let request_id = legacy_identity.storage_key();
+        let args = json!({"command": "effect"});
+        let mut legacy_journal = EdgeInvocationJournal::open(legacy.clone()).await.unwrap();
+        legacy_journal
+            .prepare(&request_id, &legacy_identity, 1, "bash", &args, true, None)
+            .await
+            .unwrap();
+        legacy_journal
+            .complete(
+                &request_id,
+                1,
+                DurableEdgeResult {
+                    output: "kept".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(legacy_journal);
+
+        let error = EdgeInvocationJournal::open_inheriting(current.clone(), Some(legacy.clone()))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, JournalError::Io { .. }));
+        assert!(legacy.exists() || legacy.with_extension("json.wal").exists());
+
+        let owned = identity("call-owned");
+        let owned_id = owned.storage_key();
+        assert!(matches!(
+            owner
+                .prepare(&owned_id, &owned, 1, "bash", &args, true, None)
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        owner
+            .complete(
+                &owned_id,
+                1,
+                DurableEdgeResult {
+                    output: "from-owner".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(owner);
+
+        let mut restored = EdgeInvocationJournal::open(current).await.unwrap();
+        assert!(matches!(
+            restored
+                .prepare(&owned_id, &owned, 2, "bash", &args, true, None)
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(result) if result.output == "from-owner"
         ));
     }
 
@@ -1878,13 +1896,15 @@ mod tests {
         assert!(current.exists() || current.with_extension("json.wal").exists());
     }
 
-    #[test]
-    fn legacy_claim_held_by_another_opener_does_not_start_empty() {
+    #[tokio::test]
+    async fn destination_lock_is_taken_before_legacy_files_are_examined() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join("legacy.json");
         let current = dir.path().join("server.json");
-        std::fs::write(&legacy, b"{\"not\":\"opened\"}").unwrap();
-        let lock_path = legacy.with_extension("json.lock");
+        std::fs::write(&legacy, b"{\"kept\":\"legacy\"}").unwrap();
+        let wal = current.with_extension("json.wal");
+        std::fs::write(&wal, b"").unwrap();
+        let lock_path = current.with_extension("json.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1893,9 +1913,13 @@ mod tests {
             .open(&lock_path)
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
-        let error = inherit_legacy_journal(&current, &legacy).unwrap_err();
-        assert!(matches!(error, JournalError::LegacyClaimedElsewhere { .. }));
-        assert!(legacy.exists());
+        let error = EdgeInvocationJournal::open_inheriting(current.clone(), Some(legacy.clone()))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, JournalError::Io { .. }));
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"{\"kept\":\"legacy\"}");
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
         assert!(!current.exists());
         fs2::FileExt::unlock(&lock).unwrap();
     }
