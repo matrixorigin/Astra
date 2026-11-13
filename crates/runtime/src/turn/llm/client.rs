@@ -142,12 +142,12 @@ fn provider_access_error(status: u16, body: &str) -> Option<astra_core::Classifi
             .and_then(Value::as_str)
             .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
     });
-    let kind = match (status, code) {
-        (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
-            ErrorKind::ProviderQuotaExhausted
-        }
-        (401 | 403, Some("invalid_api_key" | "invalid_token" | "authentication_error"))
-        | (401, _) => ErrorKind::Auth,
+    let kind = match (
+        status,
+        code.and_then(astra_core::error_kind::provider_access_code_kind),
+    ) {
+        (403 | 429, Some(ErrorKind::ProviderQuotaExhausted)) => ErrorKind::ProviderQuotaExhausted,
+        (401 | 403, Some(ErrorKind::Auth)) | (401, _) => ErrorKind::Auth,
         (403, _) => ErrorKind::ProviderForbidden,
         _ => return None,
     };
@@ -6040,9 +6040,6 @@ async fn call_prepared_llm_attempts(
             if subscription.is_none() && !is_responses {
                 cooldown.with(model_key, |c| c.record_success());
             }
-            let gateway_response = response
-                .headers()
-                .contains_key(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
                     response,
@@ -6327,21 +6324,7 @@ async fn call_prepared_llm_attempts(
                     error,
                     partial,
                     rejected,
-                    provider_progress,
                 }) => {
-                    // A Responses `response.created` id alone does not deliver
-                    // text, tools, or usage and must not prevent a safe retry.
-                    let has_partial = !partial.full_text.is_empty()
-                        || !partial.reasoning.is_empty()
-                        || !partial.tool_calls.is_empty()
-                        || !partial.usage.is_empty()
-                        || partial.finish_reason.is_some()
-                        || partial.effective_finish_reason.is_some();
-                    let transient_rate_limit = error
-                        .details_json
-                        .as_deref()
-                        .and_then(|details| serde_json::from_str::<Value>(details).ok())
-                        .is_some_and(|details| details["code"] == "provider_rate_limited");
                     let error = attach_llm_result_details(error, &partial);
                     if rejected {
                         finish_observed_provider_error_with_partial(
@@ -6359,22 +6342,6 @@ async fn call_prepared_llm_attempts(
                             &partial,
                         )
                         .await?;
-                    }
-                    if subscription.is_none()
-                        && !gateway_response
-                        && !uses_moi_model_gateway_error_contract(header_overrides)
-                        && rejected
-                        && transient_rate_limit
-                        && !has_partial
-                        && !provider_progress
-                        && attempt < max_retries
-                        && error.kind == astra_core::ErrorKind::RateLimit
-                    {
-                        // This attempt has its own route credentials; a process-global
-                        // model-name cooldown would throttle unrelated accounts.
-                        retry_delay_override_ms =
-                            Some(astra_turn_core::rate_limit_cooldown::default_retry_after_ms());
-                        continue;
                     }
                     return Err(error);
                 }
@@ -8264,7 +8231,6 @@ enum StreamCollectError {
         error: astra_core::ClassifiedError,
         partial: LlmCallResult,
         rejected: bool,
-        provider_progress: bool,
     },
     IdleTimeout {
         elapsed_ms: u64,

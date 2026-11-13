@@ -200,81 +200,128 @@ async fn provider_terminal_errors_reach_the_runtime_with_the_right_kind() {
     use std::collections::HashSet;
     for (code, expected) in [
         ("rate_limit_exceeded", astra_core::ErrorKind::RateLimit),
+        (
+            "insufficient_quota",
+            astra_core::ErrorKind::ProviderQuotaExhausted,
+        ),
+        (
+            "insufficient_balance",
+            astra_core::ErrorKind::ProviderQuotaExhausted,
+        ),
+        ("invalid_api_key", astra_core::ErrorKind::Auth),
+        ("invalid_token", astra_core::ErrorKind::Auth),
+        ("authentication_error", astra_core::ErrorKind::Auth),
         ("private-unknown-code", astra_core::ErrorKind::Unknown),
     ] {
-        let first =
-            json!({"type":"error", "error":{"code":code,"message":"private-provider-text"}});
-        let later = json!({"type":"response.failed", "response":{"error":{"code":code}}});
-        let response = reqwest::Response::from(
-            axum::http::Response::builder()
-                .status(200)
-                .body(reqwest::Body::from(format!(
-                    "data: {first}\n\ndata: {later}\n\n"
-                )))
-                .unwrap(),
-        );
-        let route = LlmExecutionRoute {
-            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
-            response_scope: Some("scope"),
-            subscription: None,
-            fixed_temperature: None,
-            supported_reasoning_efforts: None,
-            thinking_protocol: None,
-            model_name: "model",
-            wire_model_name: None,
-            api_key: "key",
-            base_url: "http://localhost",
-            provider: "openai",
-            header_overrides: None,
-            request_body_overrides: None,
-            completions_url_override: None,
-            request_timeout: None,
-        };
-        let failure = collect(
-            response,
-            &route,
-            &HashSet::new(),
-            LlmCancel::None,
-            None,
-            Instant::now(),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        let StreamCollectError::Provider {
-            error, rejected, ..
-        } = failure
-        else {
-            panic!("expected provider failure")
-        };
-        assert_eq!(error.kind, expected);
-        assert!(rejected);
-        assert!(!error.message.contains("private"));
+        for shape in ["error-code", "failed-code", "error-type"] {
+            let event = match shape {
+                "error-code" => {
+                    json!({"type":"error","error":{"code":code,"message":"private-provider-text"}})
+                }
+                "failed-code" => {
+                    json!({"type":"response.failed","response":{"error":{"code":code,"message":"private-provider-text"}}})
+                }
+                _ => {
+                    json!({"type":"error","error":{"code":null,"type":code,"message":"private-provider-text"}})
+                }
+            };
+            for gateway in ["none", "request", "response"] {
+                let mut builder = axum::http::Response::builder().status(200);
+                if gateway == "response" {
+                    builder = builder.header(
+                        astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                        "v1",
+                    );
+                }
+                let response = reqwest::Response::from(
+                    builder
+                        .body(reqwest::Body::from(format!("data: {event}\n\n")))
+                        .unwrap(),
+                );
+                let gateway_headers = (gateway == "request").then(|| {
+                    std::collections::HashMap::from([(
+                        astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+                        "v1".to_string(),
+                    )])
+                });
+                let route = LlmExecutionRoute {
+                    inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                    response_scope: Some("scope"),
+                    subscription: None,
+                    fixed_temperature: None,
+                    supported_reasoning_efforts: None,
+                    thinking_protocol: None,
+                    model_name: "model",
+                    wire_model_name: None,
+                    api_key: "key",
+                    base_url: "http://localhost",
+                    provider: "openai",
+                    header_overrides: gateway_headers.as_ref(),
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let failure = collect(
+                    response,
+                    &route,
+                    &HashSet::new(),
+                    LlmCancel::None,
+                    None,
+                    Instant::now(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+                let StreamCollectError::Provider {
+                    error, rejected, ..
+                } = failure
+                else {
+                    panic!("expected provider failure")
+                };
+                let expected = if gateway != "none"
+                    && matches!(
+                        expected,
+                        astra_core::ErrorKind::Auth | astra_core::ErrorKind::ProviderQuotaExhausted
+                    ) {
+                    astra_core::ErrorKind::Unknown
+                } else {
+                    expected
+                };
+                assert_eq!(error.kind, expected, "{code} {shape} {gateway}");
+                assert!(rejected);
+                assert!(!error.message.contains("private"));
+                assert!(
+                    !error
+                        .details_json
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("private")
+                );
+            }
+        }
     }
 }
 
 #[tokio::test]
-async fn streamed_rate_limit_retries_only_before_partial_output() {
+async fn streamed_rate_limit_settles_once_and_can_continue_later() {
     use axum::{Router, extract::State, routing::post};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    for (progress, failures, model) in [
-        ("none", 1, "fixture-retry-rate"),
-        ("text", 1, "fixture-partial-rate"),
-        ("reasoning", 1, "fixture-reasoning-rate"),
-        ("item", 1, "fixture-item-rate"),
-        ("inline", 1, "fixture-inline-rate"),
-        ("usage", 1, "fixture-usage-rate"),
-        ("gateway", 1, "fixture-gateway-rate"),
-        ("none", 4, "fixture-shared-rate"),
-        ("none", 1, "fixture-shared-rate"),
+
+    for progress in [
+        "none",
+        "text",
+        "reasoning",
+        "item",
+        "inline",
+        "usage",
+        "gateway",
     ] {
         let requests = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&requests);
         let app = Router::new()
             .route("/responses", post(move |State(count): State<Arc<AtomicUsize>>| async move {
-                if count.fetch_add(1, Ordering::SeqCst) < failures {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     let first = json!({"type":"response.created","response":{"id":"response-1"}});
                     let delta = match progress {
                         "text" => Some(json!({"type":"response.output_text.delta","delta":"partial"})),
@@ -295,7 +342,7 @@ async fn streamed_rate_limit_retries_only_before_partial_output() {
                     format!("data: {done}\n\n")
                 }
             }))
-            .with_state(count);
+            .with_state(Arc::clone(&requests));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -304,13 +351,6 @@ async fn streamed_rate_limit_retries_only_before_partial_output() {
         let messages = [json!({"role":"user","content":"hi"})];
         let thinking = ThinkingConfig::ModelDefault;
         let attempts = Attempts::default();
-        if failures == 4 {
-            rate_limit_cooldown().with(model, |cooldown| {
-                cooldown.record_success();
-                cooldown.record_429(None);
-                cooldown.record_429(None);
-            });
-        }
         let gateway_headers = (progress == "gateway").then(|| {
             std::collections::HashMap::from([(
                 astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
@@ -329,7 +369,7 @@ async fn streamed_rate_limit_retries_only_before_partial_output() {
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: None,
-                model_name: model,
+                model_name: "fixture-rate-limit",
                 wire_model_name: None,
                 api_key: "key",
                 base_url: &base,
@@ -343,54 +383,118 @@ async fn streamed_rate_limit_retries_only_before_partial_output() {
             temperature: None,
             thinking: &thinking,
         };
-        let result = call_llm_and_collect_with_stream_callback(
+        let failure = call_llm_and_collect_with_stream_callback(
             call(),
             LlmCancel::None,
             None,
             Some(&attempts),
             RuntimeToolChoice::Auto,
-            Some(Duration::from_secs(20)),
+            Some(Duration::from_secs(8)),
         )
-        .await;
-        if progress != "none" || failures == 4 {
-            assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::RateLimit);
-            assert_eq!(
-                requests.load(Ordering::SeqCst),
-                if progress != "none" { 1 } else { 4 }
-            );
-        } else {
-            assert_eq!(result.unwrap().full_text, "done");
-            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, astra_core::ErrorKind::RateLimit, "{progress}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{progress}");
+        assert_eq!(attempts.next.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.finished.lock().unwrap().len(), 1);
+        if progress == "text" {
+            assert!(failure.details_json.as_deref().unwrap().contains("partial"));
         }
-        assert_eq!(
-            attempts.next.load(Ordering::SeqCst) as usize,
-            requests.load(Ordering::SeqCst)
-        );
-        assert_eq!(
-            attempts.finished.lock().unwrap().len(),
-            requests.load(Ordering::SeqCst)
-        );
-        if failures == 4 {
-            assert_eq!(
-                rate_limit_cooldown().with(model, |cooldown| cooldown.metrics().consecutive_errors),
-                2
-            );
-            let continued = call_llm_and_collect_with_stream_callback(
-                call(),
-                LlmCancel::None,
-                None,
-                Some(&attempts),
-                RuntimeToolChoice::Auto,
-                Some(Duration::from_secs(20)),
-            )
-            .await
-            .expect("the same route and context can continue after a transient limit");
-            assert_eq!(continued.full_text, "done");
-            assert_eq!(requests.load(Ordering::SeqCst), 5);
-            assert_eq!(attempts.finished.lock().unwrap().len(), 5);
-        }
+
+        let continued = call_llm_and_collect_with_stream_callback(
+            call(),
+            LlmCancel::None,
+            None,
+            Some(&attempts),
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(8)),
+        )
+        .await
+        .expect("a later explicit call can continue on the same route");
+        assert_eq!(continued.full_text, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.finished.lock().unwrap().len(), 2);
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn concurrent_streamed_rate_limits_do_not_multiply_attempts() {
+    assert_concurrent_streamed_rate_limits(32).await;
+}
+
+#[tokio::test]
+#[ignore = "local 1000-session load check; requires a sufficient open-file limit"]
+async fn thousand_concurrent_streamed_rate_limits_do_not_multiply_attempts() {
+    assert_concurrent_streamed_rate_limits(1000).await;
+}
+
+async fn assert_concurrent_streamed_rate_limits(concurrency: usize) {
+    use axum::{Router, extract::State, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(|State(count): State<Arc<AtomicUsize>>| async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n"
+            }),
+        )
+        .with_state(Arc::clone(&requests));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let messages = [json!({"role":"user","content":"hi"})];
+    let thinking = ThinkingConfig::ModelDefault;
+    let attempts = Attempts::default();
+    let calls = (0..concurrency).map(|_| {
+        call_llm_and_collect_with_stream_callback(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                    response_scope: Some("scope"),
+                    subscription: None,
+                    fixed_temperature: None,
+                    supported_reasoning_efforts: None,
+                    thinking_protocol: None,
+                    model_name: "fixture-concurrent-limit",
+                    wire_model_name: None,
+                    api_key: "key",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(128),
+                temperature: None,
+                thinking: &thinking,
+            },
+            LlmCancel::None,
+            None,
+            Some(&attempts),
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(8)),
+        )
+    });
+    let results = futures_util::future::join_all(calls).await;
+    assert!(
+        results
+            .into_iter()
+            .all(|result| result.unwrap_err().kind == astra_core::ErrorKind::RateLimit)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), concurrency);
+    assert_eq!(attempts.next.load(Ordering::SeqCst) as usize, concurrency);
+    assert_eq!(attempts.finished.lock().unwrap().len(), concurrency);
+    server.abort();
 }
 
 #[tokio::test]

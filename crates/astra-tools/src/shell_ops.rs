@@ -3288,16 +3288,25 @@ async fn run_grep_with_grep_program(
         )
         .await?;
 
-        let matched = if request.output_mode == SearchOutputMode::Count {
-            chunk_output
-                .stdout
+        // Only an unfinished chunk can end in the middle of a grep record.
+        // Filter and combine complete records after removing that partial tail.
+        let chunk_stdout = complete_search_records(
+            &chunk_output.stdout,
+            chunk_output.stdout_capped || chunk_output.timed_out || chunk_output.cancelled,
+            '\n',
+        );
+        let mut matched = if request.output_mode == SearchOutputMode::Count {
+            chunk_stdout
                 .lines()
                 .filter(|line| !line.ends_with(":0"))
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
-            chunk_output.stdout.clone()
+            chunk_stdout.to_string()
         };
+        if !matched.is_empty() && !matched.ends_with('\n') {
+            matched.push('\n');
+        }
         if chunk_output.exit_code > 1 {
             exit_code = chunk_output.exit_code;
         }
@@ -3309,7 +3318,7 @@ async fn run_grep_with_grep_program(
             append_output_chunk(
                 &mut stdout,
                 &matched,
-                RAW_GREP_OUTPUT_LIMIT,
+                RAW_GREP_OUTPUT_LIMIT + 1,
                 &mut stdout_capped,
             );
         }
@@ -3644,10 +3653,14 @@ fn append_output_line(output: &mut String, line: &str, max_bytes: usize, capped:
     if *capped {
         return;
     }
-    if !output.is_empty() {
-        append_capped(output, "\n", max_bytes, capped);
+    // Retain whole records only. One final separator byte beyond the content
+    // budget lets a record that exactly fits remain explicitly complete.
+    if output.len().saturating_add(line.len()) > max_bytes {
+        *capped = true;
+        return;
     }
-    append_capped(output, line, max_bytes, capped);
+    output.push_str(line);
+    output.push('\n');
 }
 
 fn append_output_chunk(output: &mut String, chunk: &str, max_bytes: usize, capped: &mut bool) {
@@ -5126,6 +5139,74 @@ printf 'probe.txt:1:needle\n'
         };
         let error = run_grep_with_grep(&direct, None).await.err().unwrap();
         assert!(error.contains("cannot be represented safely"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_fallback_keeps_completed_count_when_a_later_batch_is_cancelled() {
+        let workspace = tempdir().unwrap();
+        let scripts = tempdir().unwrap();
+        for index in 0..201 {
+            std::fs::write(
+                workspace.path().join(format!("{index:03}.txt")),
+                if index == 0 { "needle\n" } else { "other\n" },
+            )
+            .unwrap();
+        }
+        let first = scripts.path().join("first");
+        let second = scripts.path().join("second");
+        let program = write_fake_rg_script(
+            scripts.path(),
+            &format!(
+                "if [ -e '{}' ]; then touch '{}'; exec sleep 30; fi\ntouch '{}'\nexec grep \"$@\"",
+                first.display(),
+                second.display(),
+                first.display(),
+            ),
+        );
+        let request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: ".",
+            pattern: "needle",
+            include_globs: vec![],
+            ignore_rules: vec![],
+            case_sensitive: true,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Count,
+            multiline: false,
+        };
+        let cancellation = CancellationToken::new();
+        let search =
+            run_grep_with_grep_program(program.to_str().unwrap(), &request, Some(&cancellation));
+        tokio::pin!(search);
+        tokio::select! {
+            _ = &mut search => panic!("search ended before the second batch"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !second.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }) => result.expect("second batch must start"),
+        }
+        cancellation.cancel();
+        let output = search.await.unwrap();
+        assert!(output.cancelled);
+        let records = complete_search_records(&output.stdout, true, '\n');
+        assert!(records.contains("000.txt:1"), "{records:?}");
+    }
+
+    #[test]
+    fn multiline_output_keeps_complete_records_at_the_capture_limit() {
+        let mut output = String::new();
+        let mut capped = false;
+        append_output_line(&mut output, "a:1", 3, &mut capped);
+        assert_eq!(output, "a:1\n");
+        assert!(!capped);
+        append_output_line(&mut output, "b:2", 3, &mut capped);
+        assert!(capped);
+        assert_eq!(complete_search_records(&output, true, '\n'), "a:1\n");
+        assert_eq!(complete_search_records("a:1\nb:partial", true, '\n'), "a:1");
     }
 
     #[cfg(unix)]

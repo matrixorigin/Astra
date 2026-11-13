@@ -209,6 +209,30 @@ impl ResponsesStreamError {
             _ => None,
         }
     }
+
+    /// Known ordinary-provider access failures, without inventing an HTTP status.
+    pub fn access_error_kind(&self) -> Option<crate::ErrorKind> {
+        match self {
+            ResponsesStreamError::Provider(Some(code)) => {
+                crate::error_kind::provider_access_code_kind(code)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn terminal_error_code(event: &Value) -> Option<&str> {
+    event
+        .pointer("/response/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
+        .or_else(|| event.get("code").and_then(Value::as_str))
+        .or_else(|| {
+            event
+                .pointer("/response/error/type")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| event.pointer("/error/type").and_then(Value::as_str))
 }
 
 fn reasoning_size(item: &Value) -> Result<(usize, usize), &'static str> {
@@ -991,11 +1015,7 @@ impl ResponseAccumulator {
                     self.output.finish_reason = Some("length".into());
                     self.completed = true;
                 } else {
-                    let code = event
-                        .pointer("/response/error/code")
-                        .and_then(Value::as_str)
-                        .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
-                        .or_else(|| event.get("code").and_then(Value::as_str))
+                    let code = terminal_error_code(event)
                         .map(str::to_owned)
                         .or_else(|| reason.map(str::to_owned));
                     return Err(ResponsesStreamError::Provider(code));
@@ -1004,12 +1024,7 @@ impl ResponseAccumulator {
             // Terminal upstream failures keep the raw provider code verbatim
             // (structured field only, never prose). Callers own the mapping.
             "error" | "response.failed" => {
-                let code = event
-                    .pointer("/response/error/code")
-                    .and_then(Value::as_str)
-                    .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
-                    .or_else(|| event.get("code").and_then(Value::as_str))
-                    .map(str::to_owned);
+                let code = terminal_error_code(event).map(str::to_owned);
                 return Err(ResponsesStreamError::Provider(code));
             }
             _ => {}

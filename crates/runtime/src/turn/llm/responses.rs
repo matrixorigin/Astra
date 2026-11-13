@@ -33,6 +33,10 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
             "The model provider is rate limiting requests. Try again later or choose another model."
                 .to_string()
         }
+        "auth" => "The model provider rejected its credentials.".to_string(),
+        "provider_quota_exhausted" => {
+            "The model provider account balance or quota is exhausted.".to_string()
+        }
         "provider_rejected" => "The model provider rejected the request.".to_string(),
         _ => format!("Model request failed: {code}"),
     };
@@ -421,6 +425,11 @@ pub(super) async fn collect(
     usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let binding = route.subscription;
+    let direct_provider = binding.is_none()
+        && !uses_moi_model_gateway_error_contract(route.header_overrides)
+        && !response
+            .headers()
+            .contains_key(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
     let scope = binding
         .map(|credential| credential.connection_id())
         .or(route.response_scope)
@@ -431,13 +440,11 @@ pub(super) async fn collect(
             ),
             partial: LlmCallResult::default(),
             rejected: false,
-            provider_progress: false,
         })?;
     let mut accumulator = ResponseAccumulator::default();
     let mut reported_usage = serde_json::Map::new();
     let mut latest_usage = None;
     let mut rejected = false;
-    let mut provider_progress = false;
     let exchange = async {
         let mut stream = response.bytes_stream();
         let mut frames = SseBlankLineUtf8Buf::new();
@@ -505,21 +512,6 @@ pub(super) async fn collect(
                     ));
                 }
                 for event in parsed.events {
-                    provider_progress |= !matches!(
-                        event["type"].as_str(),
-                        Some(
-                            "response.created"
-                                | "response.queued"
-                                | "response.in_progress"
-                                | "response.failed"
-                                | "response.incomplete"
-                                | "error"
-                        )
-                    ) || event.pointer("/response/output").is_some_and(
-                        |output| output.as_array().is_none_or(|items| !items.is_empty()),
-                    ) || event
-                        .pointer("/response/usage")
-                        .is_some_and(|usage| !usage.is_null());
                     if event["type"] == "response.output_item.added"
                         && event["item"]["type"] == "function_call"
                     {
@@ -564,9 +556,15 @@ pub(super) async fn collect(
                                 error(provider_http_error_kind(status, code), code)
                             }
                             None => match &failure {
-                                ResponsesStreamError::Provider(_) => {
-                                    error(astra_core::ErrorKind::Unknown, "provider_rejected")
-                                }
+                                ResponsesStreamError::Provider(_) => match direct_provider
+                                    .then(|| failure.access_error_kind())
+                                    .flatten()
+                                {
+                                    Some(kind) => error(kind, kind.as_str()),
+                                    None => {
+                                        error(astra_core::ErrorKind::Unknown, "provider_rejected")
+                                    }
+                                },
                                 ResponsesStreamError::Codec(reason) => {
                                     error(astra_core::ErrorKind::StreamTransport, reason)
                                 }
@@ -654,7 +652,6 @@ pub(super) async fn collect(
         StreamCollectError::Provider {
             error,
             rejected,
-            provider_progress,
             partial: LlmCallResult {
                 full_text: accumulator.output.text,
                 reasoning: accumulator.output.reasoning,
