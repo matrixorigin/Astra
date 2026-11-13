@@ -304,6 +304,41 @@ async fn provider_terminal_errors_reach_the_runtime_with_the_right_kind() {
     }
 }
 
+#[test]
+fn rate_limit_diagnostics_only_use_recognized_structured_dimensions() {
+    for (event, expected) in [
+        (
+            json!({"error":{"code":"rate_limit_exceeded","type":"tokens","message":"private 123"}}),
+            "token rate limit",
+        ),
+        (
+            json!({"response":{"error":{"code":"slow_down","type":"requests","message":"private 123"}}}),
+            "request rate limit",
+        ),
+        (
+            json!({"error":{"code":"rate_limit_exceeded","type":"private 123"}}),
+            "rate limiting requests",
+        ),
+        (
+            json!({"error":{"code":"invalid_api_key","type":"tokens"}}),
+            "rate limiting requests",
+        ),
+        (
+            json!({"error":{"code":"rate_limit_exceeded","type":{}}}),
+            "rate limiting requests",
+        ),
+        (
+            json!({"response":{"error":{"code":"rate_limit_exceeded","type":"unknown"}}, "error":{"code":"rate_limit_exceeded","type":"tokens"}}),
+            "rate limiting requests",
+        ),
+    ] {
+        let failure = rate_limit_error(&event);
+        assert!(failure.message.contains(expected), "{}", failure.message);
+        assert!(!failure.message.contains("private"));
+        assert!(!failure.details_json.unwrap().contains("private"));
+    }
+}
+
 #[tokio::test]
 async fn streamed_rate_limit_settles_once_and_can_continue_later() {
     use axum::{Router, extract::State, routing::post};
@@ -330,11 +365,11 @@ async fn streamed_rate_limit_settles_once_and_can_continue_later() {
                         _ => None,
                     };
                     let failure = if progress == "inline" {
-                        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"},"output":[{"type":"reasoning","id":"item-1"}]}})
+                        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","type":"tokens","message":"private provider data"},"output":[{"type":"reasoning","id":"item-1"}]}})
                     } else if progress == "usage" {
-                        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":12,"output_tokens":2}}})
+                        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","type":"tokens","message":"private provider data"},"usage":{"input_tokens":12,"output_tokens":2}}})
                     } else {
-                        json!({"type":"error","error":{"code":"rate_limit_exceeded"}})
+                        json!({"type":"error","error":{"code":"rate_limit_exceeded","type":"tokens","message":"private provider data"}})
                     };
                     format!("data: {first}\n\n{}data: {failure}\n\n", delta.map_or_else(String::new, |delta| format!("data: {delta}\n\n")))
                 } else {
@@ -394,6 +429,11 @@ async fn streamed_rate_limit_settles_once_and_can_continue_later() {
         .await
         .unwrap_err();
         assert_eq!(failure.kind, astra_core::ErrorKind::RateLimit, "{progress}");
+        assert_eq!(
+            failure.message.contains("token rate limit"),
+            progress != "gateway"
+        );
+        assert!(!failure.message.contains("private"));
         assert_eq!(requests.load(Ordering::SeqCst), 1, "{progress}");
         assert_eq!(attempts.next.load(Ordering::SeqCst), 1);
         assert_eq!(attempts.finished.lock().unwrap().len(), 1);

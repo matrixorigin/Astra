@@ -128,18 +128,16 @@ async fn provider_body(mut response: reqwest::Response) -> ApiResult<Vec<u8>> {
 
 /// Typed failure for a probe whose stream never completed. Recognized protocol
 /// codes keep their own status, so eligibility, quota, and length rejections
-/// stay distinguishable from a transport/format failure. Upstream prose is
-/// never echoed into the public detail; the verbatim provider code is
-/// server-side evidence, length-capped because it is untrusted input.
+/// stay distinguishable from a transport/format failure. Provider-controlled
+/// codes and prose are not safe to include in either public errors or logs.
 fn model_check_failure(failure: &ResponsesStreamError) -> (StatusCode, Json<ErrorResponse>) {
     let mapped = failure.mapped();
-    let upstream_code: String = match failure {
-        ResponsesStreamError::Provider(Some(code)) => code.chars().take(128).collect(),
-        ResponsesStreamError::Provider(None) => "provider_terminal_event_without_code".into(),
-        ResponsesStreamError::Codec(reason) => (*reason).into(),
+    let reason = match failure {
+        ResponsesStreamError::Codec(reason) => *reason,
+        ResponsesStreamError::Provider(_) => mapped.map_or("unrecognized", |(code, _)| code),
     };
     tracing::warn!(
-        upstream_code,
+        reason,
         mapped_status = mapped.map(|(_, status)| status),
         "ChatGPT subscription model check did not complete"
     );

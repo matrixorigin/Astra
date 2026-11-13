@@ -55,13 +55,17 @@ Responses stream rejections settle the physical attempt and report the provider
 error without automatically replaying it. A later user turn may continue when
 the provider is available. Subscription and MOI gateway routes retain their own
 rejection contracts; SSE failures do not mutate a global model-name cooldown.
+For direct provider rate-limit events, an explicitly reported token or request
+dimension may be described without forwarding provider prose or shared usage.
+An unknown reset time is not presented as a fixed retry delay. Run errors do
+not invent `retry_after_ms` for provider rate limits or overloads.
 
 Both streaming and nonstreaming calls preserve these classifications through
 the shared agent loop and failed Run outcome. The negotiated MOI gateway can
 carry the same provider facts using `provider_authentication_failed`,
 `provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
 (for example `insufficient_credit`) keep their separate versioned contract.
-Provider diagnostics, balances, and echoed credentials never enter public
+Provider-supplied prose, balances, and echoed credentials never enter public
 error messages. Clients must not infer an end-user billing remedy from a
 provider-account failure. Real input/authorization waits retain their existing
 lifecycle semantics.

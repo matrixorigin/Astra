@@ -9132,6 +9132,21 @@ fn server_subrun_immediately_resumable_interruption_is_partial_not_paused() {
         server_subrun_live_reason(&outcome, &state).as_deref(),
         Some("empty_completion")
     );
+
+    let (kind, action) = astra_turn_core::interruption::interruption_from_error_kind(
+        astra_core::ErrorKind::RateLimit,
+    )
+    .unwrap();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        kind,
+        action,
+        Default::default(),
+    ));
+    assert_eq!(server_subrun_completed_agent_status(&state), STATUS_FAILED);
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_FAILED
+    );
 }
 
 #[test]
@@ -22080,6 +22095,34 @@ fn finalize_run_events_provider_error_retains_typed_failure() {
     assert_eq!(events[1]["data"]["error_kind"], "budget_exhausted");
     assert_eq!(events[2]["event_type"], "run_finished");
     assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
+
+    // A classified provider failure keeps its real guidance and partial text.
+    let (kind, action) = astra_turn_core::interruption::interruption_from_error_kind(
+        astra_core::ErrorKind::RateLimit,
+    )
+    .unwrap();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        kind,
+        action,
+        Default::default(),
+    ));
+    let message = "The model provider reported a token rate limit. Try again later, check the provider limit, or choose another model.";
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            message,
+        )),
+        vec![],
+        &state,
+    );
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.as_deref().unwrap().contains(message));
+    assert_eq!(events[0]["data"]["partial"], true);
+    for event in &events[1..] {
+        assert_eq!(event["data"]["error_kind"], "rate_limit");
+        assert!(event["data"]["error"].as_str().unwrap().contains(message));
+        assert!(event["data"].get("interruption").is_none());
+    }
 }
 
 #[test]

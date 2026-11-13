@@ -43,6 +43,38 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
     astra_core::ClassifiedError::new(kind, message)
         .with_details_json(json!({"source":"responses","code":code}).to_string())
 }
+
+/// Provider prose can contain credentials or shared account usage. Only the
+/// dimension on the same structured rate-limit error is safe to describe.
+fn rate_limit_dimension(event: &Value) -> Option<&'static str> {
+    let error = [event.pointer("/response/error"), event.get("error")]
+        .into_iter()
+        .flatten()
+        .find(|error| error.get("code").and_then(Value::as_str).is_some())?;
+    let code = error.get("code").and_then(Value::as_str)?;
+    if !matches!(
+        astra_core::model_wire::responses::provider_error(code),
+        Some(("provider_rate_limited", _))
+    ) {
+        return None;
+    }
+    match error.get("type").and_then(Value::as_str) {
+        Some("tokens") => Some("tokens"),
+        Some("requests") => Some("requests"),
+        _ => None,
+    }
+}
+
+fn rate_limit_error(event: &Value) -> astra_core::ClassifiedError {
+    let mut classified = error(astra_core::ErrorKind::RateLimit, "provider_rate_limited");
+    classified.message = match rate_limit_dimension(event) {
+        Some("tokens") => "The model provider reported a token rate limit. Requests include conversation context and tools. Try again later, check the provider limit, or choose another model.",
+        Some("requests") => "The model provider reported a request rate limit. Try again later, check the provider limit, or choose another model.",
+        _ => return classified,
+    }
+    .to_string();
+    classified
+}
 pub(super) fn credential_error(
     value: (
         axum::http::StatusCode,
@@ -552,6 +584,9 @@ pub(super) async fn collect(
                             rejected = true;
                         }
                         match failure.mapped() {
+                            Some(("provider_rate_limited", _)) if direct_provider => {
+                                rate_limit_error(&event)
+                            }
                             Some((code, status)) => {
                                 error(provider_http_error_kind(status, code), code)
                             }

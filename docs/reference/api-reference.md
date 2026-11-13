@@ -571,6 +571,10 @@ Run admission. A caller must finish or release an outstanding standalone
 Controller writer before starting Server chat. Session/Work Controller APIs
 and their signed execution grants remain separate supported contracts.
 
+An interruption with `resume_action.wait_and_retry` reports `delay_seconds` as
+a number when a delay is known, or `null` when the provider's recovery time is
+unknown. The hint does not automatically retry the Run.
+
 ## Retired persistence APIs
 
 `/sandbox` and `/sandbox/{name}` metadata CRUD,
