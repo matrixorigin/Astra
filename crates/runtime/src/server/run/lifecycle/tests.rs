@@ -11289,7 +11289,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
     }
 }
 
-fn test_service() -> AgenticRunLifecycleService {
+pub(crate) fn test_service() -> AgenticRunLifecycleService {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     AgenticRunLifecycleService::new(
         test_settings(),
@@ -39205,4 +39205,231 @@ async fn db_cancel_observation_does_not_promote_stale_local_retirement_over_remo
     assert!(settled.execution_settled);
     cleanup_lifecycle_run_fixture(&pool, &user, &run).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+}
+
+#[test]
+fn issue_1275_provider_ledger_does_not_require_websocket_process_authorization() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    let result = AgenticRunLifecycleService::runtime_process_authorization_context(&request);
+    assert!(
+        matches!(result, Ok(None)),
+        "ledger was classified as WebSocket: {result:?}"
+    );
+}
+
+#[test]
+fn issue_1275_ledger_keeps_workspace_and_identity_validation() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    for invalid in 0..3 {
+        let mut request = request.clone();
+        match invalid {
+            0 => request.workspace_binding = None,
+            1 => request.executor_binding.as_mut().unwrap().executor_id = Some(" ".into()),
+            _ => request.executor_binding.as_mut().unwrap().transport = None,
+        }
+        assert!(
+            AgenticRunLifecycleService::runtime_process_authorization_context(&request).is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_1275_rejected_or_expired_request_never_polls_session_creation() {
+    for kind in 0..3 {
+        let service = test_service();
+        let mut request = test_request("hello");
+        request.session_id = None;
+        match kind {
+            0 => request.message = " ".into(),
+            1 => service.execution_handoff_requested.cancel(),
+            _ => {
+                request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 0,
+                })
+            }
+        }
+        let created = AtomicUsize::new(0);
+        let create_session = Box::pin(async {
+            created.fetch_add(1, Ordering::SeqCst);
+            Ok(astra_services::runs::ResolvedChatSession {
+                session_id: Some("new-session".into()),
+                full_llm_capture: false,
+                session_admission_facts: None,
+            })
+        });
+        let error = service
+            .stream_chat_with_session("u1".into(), request, create_session)
+            .await
+            .unwrap_err();
+        let expected = [
+            "chat_input_empty",
+            "server_shutting_down",
+            "execution_deadline_expired",
+        ][kind];
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some(expected),
+            "case {kind}"
+        );
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            0,
+            "case {kind} created a Session"
+        );
+        assert!(service.runs.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn issue_1275_session_error_wins_over_late_shutdown() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.session_id = None;
+    let created = AtomicUsize::new(0);
+    let create_session = Box::pin(async {
+        created.fetch_add(1, Ordering::SeqCst);
+        service.execution_handoff_requested.cancel();
+        Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session write failed",
+            "session_creation_failed",
+        ))
+    });
+    let error = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("session_creation_failed")
+    );
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert!(service.runs.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn issue_1275_provider_ledger_chat_creates_once_and_completes() {
+    let (service, llm) = terminal_test_service().await;
+    let mut request = authorized_edge_dispatch_request();
+    request.session_id = None;
+    request.admitted_model_execution = None;
+    request.message.clear();
+    request.user_intent = Some("Reply done".into());
+    request.context = Some(serde_json::Map::from_iter([(
+        "task_ref".into(),
+        json!("issue-1275-ledger"),
+    )]));
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model",
+                "model_gateway",
+                &format!("{}/chat/completions", llm.base_url),
+            )),
+            ..Default::default()
+        });
+    let original = request.clone();
+    let mut expected = original.clone();
+    expected.session_id = Some("ledger-chat".into());
+    expected.full_llm_capture = true;
+    let expected_identity = service
+        .run_start_idempotency("u1", &expected)
+        .unwrap()
+        .unwrap();
+    let created = AtomicUsize::new(0);
+    let create_session = Box::pin(async {
+        created.fetch_add(1, Ordering::SeqCst);
+        Ok(astra_services::runs::ResolvedChatSession {
+            session_id: Some("ledger-chat".into()),
+            full_llm_capture: true,
+            session_admission_facts: None,
+        })
+    });
+    let stream = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap();
+    assert_eq!(stream.session_id, "ledger-chat");
+    let durable = service
+        .load_durable_run_for_user(&stream.run_id, "u1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.start_request_fingerprint.as_deref(),
+        Some(expected_identity.request_fingerprint())
+    );
+    let events = tokio::time::timeout(Duration::from_secs(10), collect_chat_stream(stream))
+        .await
+        .unwrap();
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert!(llm.requests.load(Ordering::SeqCst) > 0);
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "run_finished")
+        .expect("missing terminal event");
+    assert_eq!(finished["status"], "completed", "{finished}");
+    let complete = events
+        .iter()
+        .find(|e| e["type"] == "turn_complete")
+        .expect("missing completed answer");
+    assert_eq!(complete["assistant_text"], "done");
+    let provider_calls = llm.requests.load(Ordering::SeqCst);
+    service.execution_handoff_requested.cancel();
+    let replay = service.stream_chat("u1".into(), expected).await.unwrap();
+    collect_chat_stream(replay).await;
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls,
+        "replay must precede mutable admission"
+    );
+    let error = service
+        .stream_chat_with_session(
+            "u1".into(),
+            original,
+            Box::pin(async { panic!("an unbound retry must not create another Session") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_session_mismatch")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_1275_session_creation_does_not_replenish_deadline() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 1,
+    });
+    let mut known_session = None;
+    let create_session = Box::pin(async {
+        tokio::time::advance(Duration::from_secs(2)).await;
+        known_session = Some("created-before-expiry".to_string());
+        Ok(astra_services::runs::ResolvedChatSession {
+            session_id: known_session.clone(),
+            full_llm_capture: false,
+            session_admission_facts: None,
+        })
+    });
+    let error = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("execution_deadline_expired")
+    );
+    assert_eq!(known_session.as_deref(), Some("created-before-expiry"));
+    assert!(service.runs.read().await.is_empty());
 }
