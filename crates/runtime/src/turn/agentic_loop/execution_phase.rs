@@ -5915,12 +5915,13 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
 
     // First attempt: compact-and-continue instead of hard-stopping.
-    // Two-tier strategy:
-    //   1. Aggressive compression pipeline (clear tool results)
-    //   2. If still over: persist old messages as a session artifact, keep an introspect reference
-    // Only if both fail do we inject the stop directive.
+    // Eliminate exact duplicate results first, then persist recoverable history
+    // only if pressure remains. A prior semantic summary does not disable safe
+    // deduplication of new observations.
     {
-        let rewrite_permit = state.begin_canonical_rewrite();
+        let rewrite_permit = state
+            .begin_canonical_rewrite()
+            .filter(|permit| permit.is_valid());
         let budget = super::super::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
@@ -5930,12 +5931,8 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .unwrap_or_default()
                 .as_secs(),
         };
-        // A pre-turn summary already replaced completed history; running the
-        // mechanical pipeline again would rewrite its retained rounds into
-        // `[Cleared]` tombstones. Artifact spill below remains an independent
-        // recovery path, so it stays available regardless of the tier.
         let (mut total_freed, mut total_messages_removed, mut layer_descriptions) =
-            if state.compact_tier_applied < CompactionTier::CompactHistory {
+            if rewrite_permit.is_some() {
                 let pipeline = super::super::CompactionEngine::aggressive_pipeline();
                 let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
                 (
@@ -5955,6 +5952,9 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 (0, 0, Vec::new())
             };
 
+        if total_freed > 0 {
+            state.finish_canonical_rewrite(rewrite_permit);
+        }
         // Commit an artifact-backed rewrite only after durable storage succeeds.
         if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
             if let Some((freed, removed)) = spill_old_messages_to_artifact(host, state).await {
@@ -5965,7 +5965,6 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         }
 
         if total_freed > 0 {
-            state.finish_canonical_rewrite(rewrite_permit);
             let pressure = measured as f64 / state.max_turn_input_tokens as f64;
             state.context_compression_triggered = true;
             state.step_recorder.record_compaction_with_kind(
@@ -13696,6 +13695,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spilled_duplicate_evidence_survives_later_summary_and_resume() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.messages = vec![serde_json::json!({"role":"user","content":"Inspect the long task"})];
+        let bytes = "CONFIRMED_RESOURCE_BYTES".repeat(200);
+        for index in 0..24 {
+            let id = format!("duplicate-{index}");
+            state
+                .messages
+                .push(serde_json::json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                }]}));
+            state
+                .messages
+                .push(serde_json::json!({"role":"tool","tool_call_id":id,"content":bytes}));
+        }
+        assert!(
+            crate::turn::cloud::compaction::compact_duplicate_tool_outputs(&mut state.messages)
+                .estimated_tokens_freed
+                > 0
+        );
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+        assert!(
+            spill_old_messages_to_artifact(&mut host, &mut state)
+                .await
+                .is_some()
+        );
+        let artifact = host.history_artifacts[0].clone();
+        assert_eq!(
+            artifact
+                .transcript_json
+                .matches("CONFIRMED_RESOURCE_BYTES")
+                .count(),
+            200,
+            "the full target is stored once, not once per duplicate"
+        );
+        state.messages.extend([
+            serde_json::json!({"role":"assistant","tool_calls":[{"id":"next","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"next\"}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"next","content":"new observation"}),
+        ]);
+        let client = astra_turn_core::cloud_summary::test_support::MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nInspect\n### Current State\nIn progress",
+        );
+        let summary =
+            astra_turn_core::cloud_summary::generate_compact_summary(&state.messages, &client)
+                .await
+                .unwrap();
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &state.messages,
+            state.messages.len().saturating_sub(2),
+            astra_turn_core::cloud::history_summary::history_summary_message(summary),
+            0,
+            state.max_turn_input_tokens,
+            None,
+            None,
+        )
+        .unwrap();
+        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(candidate.messages).unwrap();
+        assert!(
+            !serde_json::to_string(&restored)
+                .unwrap()
+                .contains("CONFIRMED_RESOURCE_BYTES")
+        );
+        let handle = restored
+            .iter()
+            .filter_map(astra_turn_core::cloud::history_summary::history_summary_text)
+            .flat_map(astra_turn_core::cloud::history_summary::context_history_artifact_handles)
+            .next()
+            .unwrap();
+        let id = handle
+            .strip_prefix(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+            .unwrap();
+        let store = crate::server::explain_analyze_artifact::tests::MemoryStore::default();
+        let session = state.current_session_id.as_deref().unwrap();
+        crate::server::context_history_artifact::persist(&store, "owner", id, artifact)
+            .await
+            .unwrap();
+        let output = crate::server::context_history_artifact::resolve_request(
+            Some(&store),
+            "owner",
+            session,
+            &serde_json::json!({"artifact":handle,"max_bytes":65_536}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.contains(&bytes),
+            "the old target remains readable after it leaves live history"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_human_artifact_spill_preserves_public_evidence_and_rewrite_authority() {
+        for admitted in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 10_000;
+            state.current_run_id = Some("artifact-run".into());
+            state.messages =
+                vec![serde_json::json!({"role":"user","content":"Finish the long task"})];
+            for round in 0..24 {
+                state.messages.extend([
+                    serde_json::json!({"role":"assistant","reasoning_content":"private reasoning",
+                        "tool_calls":[{"id":format!("call-{round}"),"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                    serde_json::json!({"role":"tool","tool_call_id":format!("call-{round}"),
+                        "content":format!("CONFIRMED_RESOURCE_{round}: {}", "evidence ".repeat(200))}),
+                ]);
+            }
+            let original = state.messages.clone();
+            if admitted {
+                state.initialize_canonical_rewrite_proof(
+                    &original,
+                    &astra_turn_types::canonical_conversation_root(&original),
+                    0,
+                );
+            }
+            let result = spill_old_messages_to_artifact(&mut host, &mut state).await;
+            if admitted {
+                assert!(result.is_some());
+                assert_eq!(state.messages[0], original[0]);
+                assert!(state.canonical_rewrite_proof().is_some());
+                let stored = &host.history_artifacts[0].transcript_json;
+                assert!(stored.contains("CONFIRMED_RESOURCE_0:"));
+                assert!(!stored.contains("private reasoning"));
+                assert!(state.messages.iter().any(|message| {
+                    message["content"].as_str().is_some_and(|text| {
+                        text.contains(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+                    })
+                }));
+                astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+            } else {
+                assert!(result.is_none());
+                assert_eq!(state.messages, original);
+                assert!(host.history_artifacts.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn artifact_spill_carries_prior_summary_and_recovery_handles() {
         use astra_turn_core::cloud::history_summary::{
             history_summary_message, history_summary_text,
@@ -13715,6 +13855,11 @@ mod tests {
             }
             state.messages.push(serde_json::json!({"role":"user", "content":format!("current request {generation}")}));
             let before = state.messages.clone();
+            state.initialize_canonical_rewrite_proof(
+                &before,
+                &astra_turn_types::canonical_conversation_root(&before),
+                0,
+            );
             let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
                 .await
                 .unwrap();
@@ -13731,14 +13876,7 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
-        for condition in [
-            "failure",
-            "cancel",
-            "late-cancel",
-            "no-benefit",
-            "reasoning",
-            "success",
-        ] {
+        for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
             let mut host = MockHost::new(Vec::new());
             host.history_artifact_enabled = true;
             host.history_artifact_error = condition == "failure";
@@ -13759,6 +13897,11 @@ mod tests {
                 });
             }
             let original = state.messages.clone();
+            state.initialize_canonical_rewrite_proof(
+                &original,
+                &astra_turn_types::canonical_conversation_root(&original),
+                0,
+            );
             if condition == "cancel" || condition == "late-cancel" {
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
                 if condition == "cancel" {
@@ -13797,6 +13940,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prior_summary_allows_safe_dedup_but_does_not_authorize_rewrites() {
+        for (admitted, duplicates) in [(true, true), (false, true), (true, false)] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 32_000;
+            state.last_measured_prompt_tokens = Some(40_000);
+            state.compact_tier_applied = CompactionTier::CompactHistory;
+            state.messages = vec![serde_json::json!({"role":"user","content":"Continue"})];
+            for index in 0..6 {
+                let id = format!("read-{index}");
+                let content = format!(
+                    "receipt {}: {}",
+                    if duplicates { 0 } else { index },
+                    "evidence ".repeat(1000)
+                );
+                state.messages.extend([
+                    serde_json::json!({"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                    serde_json::json!({"role":"tool","tool_call_id":id,"content":content}),
+                ]);
+            }
+            let before = state.messages.clone();
+            if admitted {
+                super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+            }
+            // Isolate no-gain behavior when the optional durable reader is absent.
+            if !duplicates {
+                host.history_artifact_enabled = false;
+            }
+            handle_token_budget(
+                &mut host,
+                &mut state,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+                &text_result("working", 40_000, 20, None),
+            )
+            .await;
+            assert!(host.history_artifacts.is_empty());
+            if admitted && duplicates {
+                assert!(!state.budget_wrapup_injected);
+                assert!(state.context_compression_triggered);
+                let event = host
+                    .compaction_events
+                    .iter()
+                    .find(|event| event.kind == CompactionKind::ReactiveBudget)
+                    .unwrap();
+                assert!(
+                    event.tokens_before.saturating_sub(event.tokens_freed)
+                        <= state.max_turn_input_tokens,
+                    "dedup savings must actually relieve the admitted artifact path's pressure"
+                );
+                assert!(
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message["content"] == before[2]["content"])
+                );
+                for message in &state.messages {
+                    if let Some(target) =
+                        astra_turn_core::compression_types::duplicate_output_reference(message)
+                    {
+                        let retained = state
+                            .messages
+                            .iter()
+                            .find(|row| row["tool_call_id"] == target)
+                            .unwrap();
+                        assert_eq!(retained["content"], before[2]["content"]);
+                    }
+                }
+            } else {
+                assert_eq!(state.messages, before);
+                assert!(state.budget_wrapup_injected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn reactive_compaction_does_not_arm_wrapup_after_success() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
@@ -13806,16 +14028,14 @@ mod tests {
             .messages
             .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
         for i in 0..16 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("step {i}: {}", "x".repeat(240)),
-            }));
-            state.messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!("follow-up {i}: {}", "y".repeat(220)),
-            }));
+            let id = format!("read-{i}");
+            state.messages.extend([
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
+            ]);
         }
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let control = handle_token_budget(
             &mut host,
             &mut state,
@@ -13866,17 +14086,15 @@ mod tests {
             .messages
             .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
         for i in 0..24 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("step {i}: {}", "x".repeat(240)),
-            }));
-            state.messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!("follow-up {i}: {}", "y".repeat(220)),
-            }));
+            let id = format!("read-{i}");
+            state.messages.extend([
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
+            ]);
         }
 
         state.last_measured_prompt_tokens = Some(90_000);
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let first = handle_token_budget(
             &mut host,
             &mut state,
@@ -13898,7 +14116,7 @@ mod tests {
         for i in 0..12 {
             state.messages.push(serde_json::json!({
                 "role": "assistant",
-                "content": format!("new evidence {i}: {}", "z".repeat(240)),
+                "content": format!("new evidence {i}: {}", "z".repeat(2_000)),
             }));
         }
 
@@ -13925,27 +14143,36 @@ mod tests {
         assert_eq!(state.compaction_effectiveness.attempt_count, 2);
         assert!(state.compaction_effectiveness.cumulative_tokens_freed > first_savings);
 
-        // Without new history, another retry cannot claim progress from gross
-        // removed bytes while replacing them with an equally large boundary.
-        let compacted = state.messages.clone();
-        let savings = state.compaction_effectiveness.cumulative_tokens_freed;
-        let third = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("still working", 88_000, 320, Some(20)),
-        )
-        .await;
-        assert!(matches!(third, Some(TurnExecutionControl::ContinueLoop)));
-        assert!(state.budget_wrapup_injected);
-        assert_eq!(state.messages, compacted);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 2);
-        assert_eq!(
-            state.compaction_effectiveness.cumulative_tokens_freed,
-            savings
+        // Repeated recovery can consume the retained completed tail, but every
+        // accepted rewrite must make real progress and converge to no benefit.
+        for _ in 0..6 {
+            let before = state.messages.clone();
+            let savings = state.compaction_effectiveness.cumulative_tokens_freed;
+            let control = handle_token_budget(
+                &mut host,
+                &mut state,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+                &text_result("still working", 88_000, 320, Some(20)),
+            )
+            .await;
+            assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
+            if state.budget_wrapup_injected {
+                assert_eq!(state.messages, before);
+                assert_eq!(
+                    state.compaction_effectiveness.cumulative_tokens_freed,
+                    savings
+                );
+                break;
+            }
+            assert!(state.messages.len() < before.len());
+            assert!(state.compaction_effectiveness.cumulative_tokens_freed > savings);
+        }
+        assert!(
+            state.budget_wrapup_injected,
+            "bounded history recovery must converge"
         );
     }
 
@@ -13966,6 +14193,7 @@ mod tests {
             }));
         }
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let control = handle_token_budget(
             &mut host,
             &mut state,
@@ -17344,31 +17572,44 @@ const SPILL_MIN_KEEP: usize = 6;
 const SPILL_MIN_TOTAL: usize = 10;
 const SPILL_MIN_SPILL: usize = 4;
 
-async fn spill_old_messages_to_artifact(
+pub(super) async fn spill_old_messages_to_artifact(
     host: &mut dyn AgenticLoopHost,
     state: &mut AgenticLoopState,
 ) -> Option<(u64, usize)> {
-    use crate::turn::cloud::compaction::{prepare_prefix_summary, protected_history_spill_count};
+    use crate::turn::cloud::compaction::{
+        adjust_spill_boundary_for_tool_pairs, prepare_conversation_summary,
+    };
     if state.messages.len() < SPILL_MIN_TOTAL || !host.context_history_artifacts_available(state) {
         return None;
     }
     let keep =
         (state.messages.len() * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
-    let count =
-        protected_history_spill_count(&state.messages, state.messages.len().saturating_sub(keep));
+    let count = adjust_spill_boundary_for_tool_pairs(
+        &state.messages,
+        state.messages.len().saturating_sub(keep),
+    );
     if count < SPILL_MIN_SPILL {
         return None;
     }
+    let rewrite_permit = state
+        .begin_canonical_rewrite()
+        .filter(|permit| permit.is_valid())?;
     let session_id = state.current_session_id.as_deref()?;
     let run_id = state.current_run_id.as_deref()?;
-    let transcript: Vec<_> = state.messages[..count]
-        .iter()
-        .map(astra_core::model_wire::responses::without_continuation)
-        .collect();
+    let transcript =
+        crate::turn::llm::model_origin::public_summary_history(&state.messages).ok()?;
+    // Keep the complete public snapshot: typed duplicate references in the
+    // spilled prefix may target a later retained result. That target must stay
+    // recoverable after a subsequent semantic summary replaces the live tail.
+    let message_count = transcript.len();
     let transcript = serde_json::to_string(&transcript).ok()?;
-    let history =
-        astra_turn_types::ContextHistoryArtifactV1::new(session_id, run_id, count, transcript)
-            .ok()?;
+    let history = astra_turn_types::ContextHistoryArtifactV1::new(
+        session_id,
+        run_id,
+        message_count,
+        transcript,
+    )
+    .ok()?;
     let id = uuid::Uuid::new_v4().to_string();
     let handle = format!(
         "{}{id}",
@@ -17381,9 +17622,9 @@ async fn spill_old_messages_to_artifact(
 {summary}
 
 Exact transcript: {handle}
-Use introspect(artifact=\"{handle}\") for earlier details."
+Recover earlier details through the authorized artifact reader in the current tool surface."
     ));
-    let candidate = prepare_prefix_summary(
+    let (candidate, sent_prefix) = prepare_conversation_summary(
         &state.messages,
         count,
         reference,
@@ -17392,6 +17633,7 @@ Use introspect(artifact=\"{handle}\") for earlier details."
         crate::prompts::measured_prompt_tokens_from_manifest(
             state.last_llm_context_manifest_trace.as_ref(),
         ),
+        state.last_request_message_count,
     )?;
     tokio::select! {
         biased;
@@ -17429,6 +17671,8 @@ Use introspect(artifact=\"{handle}\") for earlier details."
     let freed = candidate.tokens_freed();
     let removed = candidate.messages_removed;
     state.messages = candidate.messages;
+    state.last_request_message_count = sent_prefix;
+    state.finish_canonical_rewrite(Some(rewrite_permit));
     Some((freed, removed))
 }
 

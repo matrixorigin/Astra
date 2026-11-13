@@ -2816,7 +2816,7 @@ fn compaction_commits_the_complete_replacement_projection() {
 }
 
 #[test]
-fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
+fn single_user_tool_turn_remains_committable_after_semantic_compaction() {
     let mut messages = vec![json!({"role": "user", "content": "translate the document"})];
     for index in 0..6 {
         messages.push(json!({
@@ -2839,31 +2839,28 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
     }
     messages.push(json!({"role": "assistant", "content": "translation complete"}));
 
-    let engine = crate::turn::CompactionEngine::from_config(
-        &astra_config::runtime_config::CompressionConfig {
-            preserve_recent_turns: 2,
-            ..Default::default()
-        },
+    let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+        &messages,
+        messages.len().saturating_sub(3),
+        astra_turn_core::cloud::history_summary::history_summary_message(
+            "completed progress summarized".into(),
+        ),
+        0,
         64_000,
-    );
-    let outcome = engine.compress_if_needed(
-        &mut messages,
-        &crate::turn::TokenBudget {
-            max_prompt_tokens: 64_000,
-            last_measured_tokens: 100_000,
-            current_round_index: None,
-            now_secs: 10_000_000,
-        },
-    );
+        None,
+        None,
+    )
+    .unwrap();
+    let tokens_freed = candidate.tokens_freed();
+    messages = candidate.messages;
 
-    assert!(
-        outcome.total_tokens_freed > 0,
-        "the real pipeline must compact"
-    );
+    assert!(tokens_freed > 0, "the real pipeline must compact");
     let boundary_index = messages
         .iter()
-        .position(|message| message["_compact_boundary"].as_bool() == Some(true))
-        .expect("tiered compaction must leave its canonical boundary marker");
+        .position(|message| {
+            astra_turn_core::cloud::history_summary::history_summary_text(message).is_some()
+        })
+        .expect("semantic compaction must leave its canonical boundary marker");
     assert_eq!(
         boundary_index, 1,
         "the protected first user precedes the boundary"
@@ -2920,7 +2917,7 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
 }
 
 #[test]
-fn typed_objective_relations_survive_real_tiered_compaction() {
+fn typed_objective_relations_survive_semantic_compaction() {
     use astra_turn_core::resume_hydration::objective_context_from_messages;
     use astra_turn_types::{ObjectiveRelation, UserTurnSemantics, mark_user_turn_semantics};
 
@@ -2980,30 +2977,30 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         let mut proof =
             CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
-        let engine = crate::turn::CompactionEngine::from_config(
-            &astra_config::runtime_config::CompressionConfig {
-                preserve_recent_turns: 2,
-                ..Default::default()
-            },
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &messages,
+            messages.len().saturating_sub(3),
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "completed progress summarized".into(),
+            ),
+            0,
             64_000,
-        );
-        let outcome = engine.compress_if_needed(
-            &mut messages,
-            &crate::turn::TokenBudget {
-                max_prompt_tokens: 64_000,
-                last_measured_tokens: 100_000,
-                current_round_index: None,
-                now_secs: 10_000_000,
-            },
-        );
+            None,
+            None,
+        )
+        .unwrap();
+        let tokens_freed = candidate.tokens_freed();
+        messages = candidate.messages;
         proof.finish(permit, &messages, None);
 
-        assert!(outcome.total_tokens_freed > 0, "real compaction must run");
+        assert!(tokens_freed > 0, "real compaction must run");
         assert_eq!(
             messages[0], head,
             "the compactor retains the protected head"
         );
-        assert_eq!(messages[1]["_compact_boundary"], true);
+        assert!(
+            astra_turn_core::cloud::history_summary::history_summary_text(&messages[1]).is_some()
+        );
         assert_eq!(messages[2], tail, "typed tail survives real compaction");
 
         for allow_empty_delta in [false, true] {
@@ -3018,11 +3015,7 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
                 .filter(|message| message["role"] == "user")
                 .cloned()
                 .collect::<Vec<_>>();
-            let expected_users = if relation == Some(ObjectiveRelation::Replace) {
-                vec![tail.clone()]
-            } else {
-                vec![head.clone(), tail.clone()]
-            };
+            let expected_users = vec![head.clone(), tail.clone()];
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");

@@ -5001,7 +5001,6 @@ struct LoopEnvironment {
     agent_id: String,
     model_name: Option<String>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
-    compact_strategy: astra_turn_core::microcompact::CompactStrategy,
     inference_purpose: astra_turn_types::InferencePurpose,
     request_constraints: RequestConstraints,
     client_pipeline_skills: Vec<astra_turn_types::SkillCatalogIdentity>,
@@ -12167,16 +12166,6 @@ impl AgenticRunLifecycleService {
             agent_id: authorization.agent_id,
             model_name: authorization.model_name,
             thinking: authorization.thinking,
-            compact_strategy: authorization
-                .model_execution
-                .as_ref()
-                .map(|execution| {
-                    crate::turn::llm::context::compact_strategy_from_model_metadata(
-                        execution.cache_capability,
-                        &execution.provider,
-                    )
-                })
-                .unwrap_or_default(),
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             request_constraints: request_constraints.clone(),
             client_pipeline_skills: edge_context
@@ -12444,7 +12433,6 @@ impl AgenticRunLifecycleService {
             agent_id,
             model_name,
             thinking,
-            compact_strategy,
             inference_purpose,
             mut request_constraints,
             client_pipeline_skills,
@@ -12547,7 +12535,6 @@ impl AgenticRunLifecycleService {
             thinking,
             permission_context: root_permission_context,
             memory_extraction_service,
-            compact_strategy,
             session_turn: facts.original.session_turn,
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
@@ -24785,15 +24772,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
         });
 
         // Build edge profile from agent's system prompt and metadata.
-        let compact_strategy = admitted_model_execution
-            .as_ref()
-            .map(|execution| {
-                crate::turn::llm::context::compact_strategy_from_model_metadata(
-                    execution.cache_capability,
-                    &execution.provider,
-                )
-            })
-            .unwrap_or_default();
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(
@@ -25085,7 +25063,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             skill_executor: None,
             permission_context: Some(permission_context),
             memory_extraction_service,
-            compact_strategy,
             harness: {
                 #[cfg(feature = "harness")]
                 {
