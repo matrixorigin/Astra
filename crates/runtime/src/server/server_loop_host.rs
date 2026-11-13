@@ -27761,10 +27761,14 @@ mod tests {
             "output={} fields={:?}",
             outcome.results[0].output, outcome.results[0].tool_result_fields
         );
+        let denial: serde_json::Value = serde_json::from_str(&outcome.results[0].output)
+            .expect("durable denial is a structured result");
+        assert_eq!(denial["error"], "approval_denied");
         assert!(
-            outcome.results[0].output.contains("REJECTED"),
-            "tool result must follow the durable denial, got {}",
-            outcome.results[0].output
+            denial["directive"]
+                .as_str()
+                .unwrap()
+                .contains("NOT executed")
         );
         assert!(
             !outcome.results[0].output.contains("timed out waiting"),

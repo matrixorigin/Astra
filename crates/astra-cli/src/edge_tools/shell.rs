@@ -5509,17 +5509,33 @@ mod tests {
         assert!(bytes.ends_with(b"\n[background log truncated]\n"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[tokio::test]
     async fn environment_background_reaper_runs_if_cleanup_task_is_dropped() {
         let temp = tempfile::tempdir().unwrap();
         let lock = std::sync::Arc::new(tokio::sync::RwLock::new(()));
         let guard = lock.clone().read_owned().await;
-        let (mut command, mut owner) = astra_sandbox::BashInvocationOwner::prepare(
-            "sh",
-            &["-c".to_string(), "sleep 60".to_string()],
-        )
-        .unwrap();
+        let workdir =
+            astra_tools::shell_ops::resolve_bash_workdir(temp.path(), &serde_json::json!({}), None)
+                .unwrap();
+        let args = ["-c".to_string(), "sleep 60".to_string()];
+        #[cfg(target_os = "linux")]
+        let (mut command, mut owner) =
+            astra_sandbox::BashInvocationOwner::prepare_with_supervisor_helper(
+                std::env::current_exe().unwrap(),
+                [
+                    "--exact".to_string(),
+                    "edge_tools::shell::tests::invocation_supervisor_test_helper".to_string(),
+                    "--nocapture".to_string(),
+                ],
+                "sh",
+                &args,
+            )
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let (mut command, mut owner) =
+            astra_sandbox::BashInvocationOwner::prepare("sh", &args).unwrap();
+        command.current_dir(workdir.path());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         owner.install(&mut command).unwrap();
@@ -5539,7 +5555,8 @@ mod tests {
             child: Some(child),
             invocation_owner: Some(owner),
             _workspace_guard: Some(guard),
-            root: temp.path().to_path_buf(),
+            roots: vec![workdir.path().to_path_buf()],
+            workdir,
             pid,
         };
         let queued_cleanup = move || drop(reaper);

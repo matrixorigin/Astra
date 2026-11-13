@@ -2013,7 +2013,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
                                     "execution_timeout_ms":300_000,"command_timeout_cap_ms":30_000,
                                     "execution_deadline_unix_ms":4_102_444_800_000_u64,
                                     "tool":"bash","args":{
-                                        "command":"echo hi","transaction_id":"tx-e2e",
+                                        "command":"printf TRANSACTION_MUST_NOT_EXECUTE","transaction_id":"tx-e2e",
                                         "rollback_on_failure":true
                                     }
                                 })
@@ -2154,7 +2154,16 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
-    assert_eq!(tool_results[0]["status"].as_str(), Some("failed"));
+    assert_eq!(tool_results[0]["status"].as_str(), Some("rejected"));
+    let fields = &tool_results[0]["tool_result_fields"];
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(fields["disposition"], "rejected");
+    assert!(
+        !tool_results[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("TRANSACTION_MUST_NOT_EXECUTE")
+    );
     drop(tool_results);
 }
 

@@ -4058,9 +4058,11 @@ mod tests {
         assert!(unfinished_parallel_agent_ids(&state).is_empty());
         let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new())
             .expect("compacted completion summary");
-        assert!(summary.contains(
-            "1 sub-agent(s) exited with a result; 0 terminated without a result; 0 remain live."
-        ));
+        assert!(summary.contains("Compacted child"), "{summary}");
+        assert!(
+            summary.contains("exited; result was already observed"),
+            "{summary}"
+        );
     }
 
     #[test]
