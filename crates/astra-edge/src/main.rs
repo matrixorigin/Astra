@@ -159,6 +159,20 @@ where
     }
 }
 
+/// Race pre-owner transport establishment (proxy CONNECT, TLS and the
+/// WebSocket upgrade) against shutdown. Once a connection is admitted, its
+/// settlement is awaited by [`await_connection_result`] instead.
+async fn establish_unless_shutdown<T>(
+    establish: impl Future<Output = T>,
+    shutdown: &CancellationToken,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        result = establish => Some(result),
+    }
+}
+
 async fn wait_for_reconnect(delay: Duration, shutdown: &CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(delay) => true,
@@ -797,42 +811,51 @@ async fn run_edge_connection(
     // Snapshot the live token per connection attempt: the renewal task may
     // have replaced it since the previous (re)connect.
     let token_snapshot = config.token_manager.snapshot().await;
-    let ws_stream = if let Some(ref proxy_url) = proxy {
-        connect_via_proxy(&url, proxy_url, &token_snapshot)
+    let establish = async {
+        let ws_stream = if let Some(ref proxy_url) = proxy {
+            connect_via_proxy(&url, proxy_url, &token_snapshot)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "astra.edge",
+                        edge_id = %config.edge_id,
+                        url = %url,
+                        proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
+                        error = %e,
+                        "WebSocket connect via proxy failed"
+                    );
+                    e
+                })?
+        } else {
+            let request = edge_ws_request(&url, &token_snapshot)?;
+            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(
                     target: "astra.edge",
                     edge_id = %config.edge_id,
                     url = %url,
-                    proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
                     error = %e,
-                    "WebSocket connect via proxy failed"
+                    "WebSocket connect failed"
                 );
                 e
-            })?
-    } else {
-        let request = edge_ws_request(&url, &token_snapshot)?;
-        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "astra.edge",
-                edge_id = %config.edge_id,
-                url = %url,
-                error = %e,
-                "WebSocket connect failed"
-            );
-            e
-        })?;
-        ws
+            })?;
+            ws
+        };
+        Ok::<_, Box<dyn std::error::Error>>(ws_stream)
     };
-    let (write, read) = ws_stream.split();
+    // No EdgeInvocationOwner exists yet, so nothing needs settling: a stalled
+    // proxy/TLS/WebSocket handshake must yield to the first Ctrl+C.
+    let Some(ws_stream) = establish_unless_shutdown(establish, &shutdown).await else {
+        tracing::info!("Shutdown requested before the Edge connection was established");
+        return Ok(());
+    };
+    let (write, read) = ws_stream?.split();
 
     tracing::info!("WebSocket connected, authenticating...");
 
@@ -1221,6 +1244,52 @@ mod tests {
         let error = result.expect("settlement error should be observed");
         assert!(error.is_err());
         assert!(format!("{}", error.unwrap_err()).contains("journal sync failed"));
+    }
+
+    #[tokio::test]
+    async fn first_shutdown_cancels_a_stalled_websocket_handshake() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // The peer accepts TCP but never answers the WebSocket upgrade.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = EdgeConfig {
+            capacity_providers: Vec::new(),
+            server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
+            token_manager: token_manager::TokenManager::new(
+                "test-token".into(),
+                None,
+                state.path().join("token"),
+            ),
+            workspace_dir: workspace.path().to_owned(),
+            edge_id: "handshake-test".into(),
+            materialization_id: "handshake-materialization".into(),
+            reconnect: false,
+            invocation_journal_root: Some(state.path().to_owned()),
+        };
+        let held = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+        let shutdown = CancellationToken::new();
+        let connection = run_edge_connection(&config, shutdown.clone());
+        tokio::pin!(connection);
+        // Let the attempt reach the pending upgrade before signalling.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut connection)
+                .await
+                .is_err(),
+            "handshake should still be pending"
+        );
+        shutdown.cancel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            await_connection_result(&mut connection, &shutdown),
+        )
+        .await
+        .expect("first shutdown must end a stalled handshake");
+        assert!(result.is_none());
+        held.abort();
     }
 
     #[tokio::test]
