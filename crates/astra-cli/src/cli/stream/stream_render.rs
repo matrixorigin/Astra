@@ -12441,6 +12441,7 @@ mod tests {
         // auth failure overrides "Cancelled by user"
         let mut accum = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
         apply_edge_callback_failure_result(
@@ -12458,6 +12459,7 @@ mod tests {
         // without auth failure keeps existing error
         let mut accum2 = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
         apply_edge_callback_failure_result(&mut accum2, None);
@@ -12751,6 +12753,7 @@ mod tests {
     fn edge_callback_failure_overrides_generic_cancellation_projection() {
         let mut accum = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
 

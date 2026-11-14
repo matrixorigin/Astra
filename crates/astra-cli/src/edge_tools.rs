@@ -9367,26 +9367,48 @@ pub(crate) mod tests {
         let launched: serde_json::Value = serde_json::from_str(&launched).unwrap();
         let id = launched["agent_id"].as_str().unwrap();
         let timed_out = executor
-            .execute(
+            .execute_with_metadata(
                 "task_output",
                 &serde_json::json!({"task_id":id,"block":true,"timeout_ms":10}),
             )
             .await;
-        assert!(timed_out.contains("Wait timed out"), "{timed_out}");
+        assert_eq!(
+            timed_out
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("wait_result"))
+                .and_then(Value::as_str),
+            Some("timeout"),
+            "{}",
+            timed_out.output,
+        );
+        assert!(
+            matches!(
+                spawner.wait_for_agent_outcome(id, Duration::ZERO).await,
+                astra_runtime::orchestration::WaitForAgentOutcome::TimedOut
+            ),
+            "an observation timeout must leave the held child available"
+        );
 
-        let waiting = executor.clone();
-        let task_id = id.to_string();
-        let wait = tokio::spawn(async move {
-            waiting
-                .execute(
-                    "task_output",
-                    &serde_json::json!({"task_id":task_id,"block":true,"timeout_ms":2000}),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
+        let wait_args = serde_json::json!({"task_id":id,"block":true,"timeout_ms":2000});
+        let wait = executor.execute("task_output", &wait_args);
+        tokio::pin!(wait);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(
+                    futures_util::poll!(wait.as_mut()).is_pending(),
+                    "the held child has no outcome yet"
+                );
+                if executor.foreground_wait_control.is_active() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the observer registers before releasing the child");
         release.add_permits(1);
-        let completed = wait.await.unwrap();
+        let completed = wait.await;
         assert!(completed.contains("child result"), "{completed}");
         assert!(!completed.contains("Wait timed out"), "{completed}");
         let already_done = executor
