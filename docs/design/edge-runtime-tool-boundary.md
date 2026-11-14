@@ -174,6 +174,24 @@ A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that
 ceiling while the request remains pending. Local approval cannot widen it.
 
+Task observation uses the shared millisecond wait contract (30 seconds by
+default, bounded to 1–300,000ms), capped by the selected resource policy. The
+Server-issued command cap and immutable delivery deadline bound the CLI wait;
+the existing settlement reserve is excluded from observation work, including
+after admission delays. Expiry can return a running-task snapshot. Interrupting
+an in-flight observation reports that the observer started and ended; it does
+not claim the task stopped or the parent run was cancelled.
+
+A classified callback failure takes precedence over a non-authoritative,
+unclassified stream closure. The original transport message remains secondary
+context. Concrete selected errors and owner-stamped terminal outcomes retain
+their authority; an unresolved callback never authorizes re-execution.
+
+CLI output bounds use per-tool caps and supplied context pressure. Executor
+lifetime output volume is not retained-context occupancy and no longer reduces
+later reads. The full-file size gate, ranged access, delivered coverage,
+redaction and session-owned artifact handling remain in force.
+
 Bash command time is carried by the Server's `command_timeout_cap_ms` request
 metadata. The separate delivery deadline includes callback settlement time and
 must not extend the command budget. Missing or invalid command authority rejects

@@ -783,6 +783,7 @@ mod tests {
             model_limit: 200_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
+            cache_protocol: Default::default(),
             project_context: "test project".into(),
             edge_profile: EdgeProfile::default(),
             self_model: None,

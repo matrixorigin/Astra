@@ -40,6 +40,7 @@ fn build_sources() -> (
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
+            cache_protocol: Default::default(),
             project_context: "Pipeline contract test project".into(),
             edge_profile: EdgeProfile {
                 cwd: Some("/tmp/astra-contract".into()),
@@ -512,5 +513,126 @@ mod proptest_reserves {
             }
             assert!(d.count() <= PercentileDigest::MAX_SAMPLES);
         }
+    }
+}
+
+fn adaptive_schema_fixture(
+    protocol: astra_turn_core::cache_placement::CacheProtocol,
+    recovery: u32,
+    tools: Vec<serde_json::Value>,
+    explicit: bool,
+) -> astra_turn_core::context_pipeline::PipelineRunOutput {
+    use astra_turn_core::context_pipeline::{AdaptivePipelineRunInput, HistoryOptimizationOwner};
+    let (statics, mut agent, latches, mut session, mut turn, ext, stats) = build_sources();
+    session.cache_protocol = protocol;
+    agent.tool_schemas = tools;
+    turn.recovery.consecutive_ptl_errors = recovery;
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        working_memory: None,
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig {
+        provider_policy: session.provider_policy.clone(),
+    });
+    if explicit {
+        pipeline
+            .run(PipelineRunInput {
+                sources: &sources,
+                planning_messages: None,
+                tokens: &turn.tokens,
+                model_limit: session.model_limit,
+                recovery: &turn.recovery,
+                latches: &latches,
+                optimize_limits: &OptimizeLimits::for_tier(
+                    astra_turn_core::compaction_types::CompactionTier::TrimSchemas,
+                    session.model_limit,
+                ),
+                model_id: &session.model_id,
+                query_source: "schema-contract",
+            })
+            .unwrap()
+    } else {
+        pipeline
+            .run_adaptive(AdaptivePipelineRunInput {
+                sources: &sources,
+                planning_messages: None,
+                tokens: &turn.tokens,
+                model_limit: session.model_limit,
+                recovery: &turn.recovery,
+                latches: &latches,
+                model_id: &session.model_id,
+                query_source: "schema-contract",
+                suppress_tool_result_clearing: false,
+                history_owner: HistoryOptimizationOwner::DownstreamSemanticCompactor,
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn cached_runtime_schemas_survive_all_recovery_tiers_but_follow_current_authority() {
+    use astra_turn_core::cache_placement::CacheProtocol;
+    use astra_turn_core::compaction_types::CompactionTier;
+    let tools = vec![serde_json::json!({"type":"function","function":{
+        "name":"observe","description":"Observe the selected task. Return complete current evidence.",
+        "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["status","stop"]}},"required":["action"],"additionalProperties":false}
+    }})];
+    for protocol in [
+        CacheProtocol::MarkerExplicit,
+        CacheProtocol::BedrockCachePoint,
+        CacheProtocol::OpenAiAutoPrefix,
+        CacheProtocol::StrictHistoryMatch,
+    ] {
+        for (recovery, tier) in [
+            (0, CompactionTier::Normal),
+            (1, CompactionTier::TrimSchemas),
+            (2, CompactionTier::CompactHistory),
+            (3, CompactionTier::AggressivePrune),
+            (0, CompactionTier::Normal),
+        ] {
+            let run = adaptive_schema_fixture(protocol, recovery, tools.clone(), false);
+            assert_eq!(run.plan.compact_tier, tier, "{protocol:?}");
+            assert_eq!(run.optimized.tool_schemas, tools, "{protocol:?}/{tier:?}");
+        }
+        let mut narrowed = tools.clone();
+        narrowed[0]["function"]["parameters"]["properties"]["action"]["enum"] =
+            serde_json::json!(["status"]);
+        narrowed[0]["function"]["description"] =
+            serde_json::json!("Observe the task. This scope is read-only.");
+        let run = adaptive_schema_fixture(protocol, 3, narrowed.clone(), false);
+        assert_eq!(
+            run.optimized.tool_schemas, narrowed,
+            "current authority must replace the old contract"
+        );
+        let run = adaptive_schema_fixture(protocol, 3, Vec::new(), false);
+        assert!(
+            run.optimized.tool_schemas.is_empty(),
+            "removed tools cannot remain cached authority"
+        );
+    }
+}
+
+#[test]
+fn uncached_and_explicit_context_callers_keep_schema_pruning() {
+    use astra_turn_core::cache_placement::CacheProtocol;
+    let tools = vec![serde_json::json!({"type":"function","function":{
+        "name":"observe","description":"Observe the task. Return current evidence.",
+        "parameters":{"type":"object","properties":{}}
+    }})];
+    for (protocol, explicit) in [
+        (CacheProtocol::None, false),
+        (CacheProtocol::OpenAiAutoPrefix, true),
+    ] {
+        let run = adaptive_schema_fixture(protocol, 1, tools.clone(), explicit);
+        assert_eq!(
+            run.optimized.tool_schemas[0]["function"]["description"],
+            "Observe the task."
+        );
     }
 }

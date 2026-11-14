@@ -2945,7 +2945,7 @@ pub enum VolatileKind {
     /// authoritative runtime state immediately before each LLM request.
     ActiveTurnFrame,
     /// "Context was just compacted — continue working, do not
-    /// summarize." Injected by `handle_token_budget` after a
+    /// summarize." Injected by `preparation budget recovery` after a
     /// successful compact+spill pass so the model resumes the task
     /// instead of misreading the smaller context as an interruption
     /// (session 0e37eb46 regression).
@@ -3842,9 +3842,12 @@ pub struct AgenticLoopState {
     /// Most recent composite snapshot created for this session.
     pub last_composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 
-    // ── Context calibration (measured prompt vs estimate) ──
+    // ── Current context pressure and physical usage ──
     /// Last successful LLM turn's reported `prompt_tokens` (previous provider response).
     pub last_measured_prompt_tokens: Option<u64>,
+    /// Whether the latest physical sample may still floor context pressure.
+    /// Canonical replacement invalidates this fact without changing paid usage.
+    pub(crate) prompt_measurement_current: bool,
     /// Consecutive fatal ingests whose error matched context-window / PTL patterns.
     pub consecutive_context_window_errors: u32,
 
@@ -4126,6 +4129,7 @@ impl AgenticLoopState {
             rate_limit_cooldown: Default::default(),
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
+            prompt_measurement_current: false,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
@@ -4251,6 +4255,11 @@ impl AgenticLoopState {
             provider_reported: self.telemetry.local_usage_provider_reported,
             unavailable: self.telemetry.local_usage_unavailable,
         }
+    }
+
+    pub(crate) fn record_prompt_measurement(&mut self, measured: Option<u64>) {
+        self.last_measured_prompt_tokens = measured;
+        self.prompt_measurement_current = measured.is_some();
     }
 
     pub(crate) fn initialize_canonical_rewrite_proof(
@@ -6474,6 +6483,7 @@ pub(crate) mod tests {
         turn_results: Vec<HostTurnResult>,
         pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
         direct_context_errors: bool,
+
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
         pre_execution_rejection: Option<String>,
         current_turn: usize,
@@ -6554,6 +6564,7 @@ pub(crate) mod tests {
                 history_artifacts: Vec::new(),
                 history_artifact_error: false,
                 history_artifact_enabled: false,
+
                 history_artifact_cancel: None,
                 rendered_compaction_summaries: Vec::new(),
                 quiet: true,
@@ -9677,6 +9688,302 @@ pub(crate) mod tests {
             );
             assert_eq!(state.final_text, "Recovered after compaction");
         }
+    }
+
+    fn unique_context_history() -> Vec<Value> {
+        let mut messages = vec![json!({"role":"user","content":"Inspect the resources"})];
+        for index in 0..20 {
+            let id = format!("unique-{index}");
+            messages.extend([
+                json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file",
+                        "arguments":json!({"path":format!("resource-{index}")}).to_string()}
+                }]}),
+                json!({"role":"tool","tool_call_id":id,
+                    "content":format!("CONFIRMED_RESOURCE_{index}: {}", "evidence ".repeat(400))}),
+            ]);
+        }
+        messages.push(json!({"role":"user","content":"Continue with the confirmed receipts"}));
+        messages
+    }
+
+    fn context_overflow_response() -> ScriptedTurn {
+        let mut result = text_result("", 0, 0, None);
+        result.response.accum.error_message =
+            Some("input exceeds the provider context window".into());
+        result.response.error_kind = Some(astra_core::ErrorKind::ContextWindow);
+        result
+    }
+
+    #[tokio::test]
+    async fn context_overflow_unique_receipts_use_authorized_artifact_recovery() {
+        for direct in [false, true] {
+            let mut host = MockHost::new(vec![
+                context_overflow_response(),
+                text_result("Recovered after compaction", 100, 10, None),
+            ]);
+            host.direct_context_errors = direct;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages = unique_context_history();
+            assert!(
+                super::super::lifecycle::estimate_context_pressure_for_state(&state).0
+                    < CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
+            );
+            admit_history_recovery(&mut host, &mut state);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{direct}: {outcome:?}"
+            );
+            assert_eq!(host.turn_count(), 2);
+            assert_eq!(host.history_artifacts.len(), 1);
+            assert!(
+                host.history_artifacts[0]
+                    .transcript_json
+                    .contains("CONFIRMED_RESOURCE_0")
+            );
+            assert!(
+                host.history_artifacts[0]
+                    .transcript_json
+                    .contains("CONFIRMED_RESOURCE_19")
+            );
+            assert!(
+                serde_json::to_string(&host.executed_messages[1])
+                    .unwrap()
+                    .contains(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+            );
+            astra_turn_types::validate_canonical_tool_pairing(&host.executed_messages[1]).unwrap();
+            assert_eq!(state.final_text, "Recovered after compaction");
+            assert_eq!(state.compaction_effectiveness.attempt_count, 1);
+            assert_eq!(
+                state.compaction_effectiveness.consecutive_futile_attempts,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_failed_artifact_preserves_history_and_original_error() {
+        for failure in [
+            "reader",
+            "writer",
+            "missing-permit",
+            "invalid-permit",
+            "late-cancel",
+        ] {
+            let mut host = MockHost::new(vec![context_overflow_response()]);
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages = unique_context_history();
+            admit_history_recovery(&mut host, &mut state);
+            match failure {
+                "reader" => host.history_artifact_enabled = false,
+                "writer" => host.history_artifact_error = true,
+                "missing-permit" => {
+                    state.canonical_rewrite_state = CanonicalRewriteState::default()
+                }
+                "invalid-permit" => {
+                    state.messages[0]["content"] = json!("A changed admitted prefix")
+                }
+                "late-cancel" => {
+                    let token = Arc::new(CancellationToken::new());
+                    state.cancellation.token = Some(token.clone());
+                    host.history_artifact_cancel = Some(token);
+                }
+                _ => unreachable!(),
+            }
+            let original = state.messages.clone();
+            let error = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind,
+                astra_core::ErrorKind::ContextWindow,
+                "{failure}: {error:?}"
+            );
+            assert_eq!(error.message, "input exceeds the provider context window");
+            assert_eq!(state.messages, original, "{failure}");
+            assert_eq!(
+                host.turn_count(),
+                1,
+                "{failure}: failed salvage cannot retry the provider"
+            );
+            assert_eq!(
+                host.history_artifacts.len(),
+                usize::from(failure == "late-cancel")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn measured_pressure_compacts_after_settling_the_selected_tool_batch() {
+        use astra_turn_core::compaction_types::CompactionKind;
+        for measured in [70_000u64, 90_000] {
+            for next in [
+                "done",
+                "same-measurement",
+                "aggregate-only",
+                "opaque-overflow",
+            ] {
+                let first = edge_tool_result(
+                    vec![make_edge_tool("read_file", "new observation")],
+                    measured,
+                    10,
+                    None,
+                );
+                let mut turns = vec![first];
+                if next == "opaque-overflow" {
+                    turns.extend((0..8).map(|_| context_overflow_response()));
+                } else {
+                    if next != "done" {
+                        let mut observation = make_edge_tool("read_file", "next observation");
+                        observation.request_id = "next-observation".into();
+                        let mut second = edge_tool_result(vec![observation], measured, 10, None);
+                        if next == "aggregate-only" {
+                            second.response.accum.current_request_usage = None;
+                            second.response.accum.usage_is_run_total = true;
+                        }
+                        turns.push(second);
+                    }
+                    turns.push(text_result("done", 20_000, 10, None));
+                }
+                let mut host = MockHost::new(turns).with_valid_tools(&["read_file"]);
+                let mut state = make_state();
+                state.max_turn_input_tokens = 80_000;
+                state.messages =
+                    vec![json!({"role":"user","content":"Continue reviewing the observations"})];
+                for index in 0..20 {
+                    let id = format!("prior-{index}");
+                    state.messages.extend([
+                        json!({"role":"assistant","tool_calls":[{
+                            "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                        }]}),
+                        json!({"role":"tool","tool_call_id":id,"content":"evidence ".repeat(970)}),
+                    ]);
+                }
+                admit_history_recovery(&mut host, &mut state);
+                // After a rewrite, hidden provider input may still reject a
+                // locally fitting request. Without a reader, retain that typed
+                // failure rather than fabricate recovery or lose a tool result.
+                if next == "opaque-overflow" {
+                    host.history_artifact_enabled = false;
+                }
+                let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+                if next == "opaque-overflow" {
+                    assert_eq!(
+                        outcome.unwrap_err().kind,
+                        astra_core::ErrorKind::ContextWindow
+                    );
+                } else {
+                    assert!(outcome.is_ok(), "{measured}/{next}: {outcome:?}");
+                    assert_eq!(state.final_text, "done");
+                    assert_eq!(state.last_measured_prompt_tokens, Some(20_000));
+                }
+                if next == "opaque-overflow" {
+                    assert!(host.turn_count() >= 2);
+                    assert!(
+                        host.turn_count()
+                            <= crate::turn::compaction_replay::MAX_COMPACT_RETRIES as usize + 2
+                    );
+                } else {
+                    assert_eq!(host.turn_count(), if next == "done" { 2 } else { 3 });
+                }
+                assert!(
+                    host.executed_messages[1]
+                        .iter()
+                        .any(|row| row["role"] == "tool" && row["content"] == "new observation"),
+                    "the selected batch must settle before recovery"
+                );
+                let pressure_rewrites = host
+                    .compaction_events
+                    .iter()
+                    .filter(|event| {
+                        event.tokens_freed > 0
+                            && matches!(
+                                event.kind,
+                                CompactionKind::ReactiveBudget
+                                    | CompactionKind::ProactiveDefault
+                                    | CompactionKind::ProactiveAggressive
+                            )
+                    })
+                    .count();
+                let measured_pressure_checks = host
+                    .compaction_events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == CompactionKind::PressureWarning
+                            && event.tokens_before == measured
+                    })
+                    .count();
+                assert_eq!(
+                    measured_pressure_checks,
+                    if next == "same-measurement" { 2 } else { 1 },
+                    "{measured}/{next}: only a fresh physical sample reapplies its pressure floor"
+                );
+                if next == "same-measurement" {
+                    assert!(
+                        host.executed_messages[2].iter().any(
+                            |row| row["role"] == "tool" && row["content"] == "next observation"
+                        )
+                    );
+                } else {
+                    assert_eq!(host.history_artifacts.len(), 0, "{measured}/{next}");
+                    assert_eq!(
+                        pressure_rewrites, 1,
+                        "{measured}/{next}: stale or aggregate usage cannot reapply pressure"
+                    );
+                }
+                let event = host
+                    .compaction_events
+                    .iter()
+                    .find(|event| event.tokens_freed > 0)
+                    .unwrap();
+                assert!(event.tokens_freed > 30_000);
+                assert_eq!(
+                    event.kind,
+                    if measured > 80_000 {
+                        CompactionKind::ReactiveBudget
+                    } else {
+                        CompactionKind::ProactiveDefault
+                    }
+                );
+                if next == "done" {
+                    assert_eq!(state.total_prompt, measured + 20_000);
+                }
+                if next == "same-measurement" {
+                    assert_eq!(state.total_prompt, measured * 2 + 20_000);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_preparation_spill_never_dispatches_the_provider() {
+        let mut host = MockHost::new(vec![text_result("must not run", 10, 1, None)]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 40_000;
+        state.messages = unique_context_history();
+        let original = state.messages.clone();
+        let token = Arc::new(CancellationToken::new());
+        state.cancellation.token = Some(token.clone());
+        host.history_artifact_cancel = Some(token);
+        admit_history_recovery(&mut host, &mut state);
+        state.record_prompt_measurement(Some(50_000));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Cancelled));
+        assert_eq!(host.turn_count(), 0);
+        assert_eq!(state.messages, original);
+        assert_eq!(
+            host.history_artifacts.len(),
+            1,
+            "a late durable write remains evidence"
+        );
+        assert_eq!(state.last_measured_prompt_tokens, Some(50_000));
     }
 
     #[tokio::test]
@@ -13300,8 +13607,8 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "Done — summary of progress.");
     }
 
-    // Session 0e37eb46 regression: after `handle_token_budget` runs
-    // compaction + spill and returns `ContinueLoop`, the model often
+    // Session 0e37eb46 regression: after preparation compresses history,
+    // the model often
     // produces a "progress summary" instead of resuming work —
     // because its working memory was just shredded and without a
     // counter-directive, the model reads the small post-compaction
@@ -13325,7 +13632,7 @@ pub(crate) mod tests {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_edge_tool("bash", "large output")],
-                90_000, // exceeds budget → triggers handle_token_budget
+                90_000, // exceeds budget → triggers preparation budget recovery
                 2_000,
                 Some(100),
             ),
@@ -13385,7 +13692,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn budget_after_pre_turn_compact_still_spills_old_messages() {
+    async fn budget_after_prior_summary_spills_once_without_rearchiving_relief() {
         use astra_turn_core::compaction_types::CompactionKind;
         let session_id = format!(
             "precompact-spill-{}",
@@ -13434,24 +13741,29 @@ pub(crate) mod tests {
             .unwrap();
         assert!(reactive.tokens_freed > 0);
         assert!(
-            90_000u64.saturating_sub(reactive.tokens_freed) as f64 / 80_000.0
-                > CompactionTier::pre_turn_trigger(80_000),
-            "the fixture still needs pressure recovery"
+            super::super::lifecycle::estimate_context_pressure_for_state(&state).0
+                < CompactionTier::pre_turn_trigger(80_000)
         );
-        assert_eq!(host.history_artifacts.len(), 2);
-        for history in &host.history_artifacts {
-            history.validate(&session_id).unwrap();
+        assert_eq!(
+            host.history_artifacts.len(),
+            1,
+            "a relieved history is not archived again"
+        );
+        host.history_artifacts[0].validate(&session_id).unwrap();
+        for index in 0..12 {
+            assert!(
+                host.history_artifacts[0]
+                    .transcript_json
+                    .contains(&format!("analysis step {index}:"))
+            );
         }
-        assert_ne!(
-            host.history_artifacts[0].transcript_json,
-            host.history_artifacts[1].transcript_json
+        assert_eq!(
+            host.compaction_events
+                .iter()
+                .filter(|event| event.tokens_freed > 0)
+                .count(),
+            1
         );
-        assert!(host.compaction_events.iter().any(|event| {
-            matches!(
-                event.kind,
-                CompactionKind::ProactiveDefault | CompactionKind::ProactiveAggressive
-            ) && event.tokens_freed > 0
-        }));
         let has_spill_msg = state.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())

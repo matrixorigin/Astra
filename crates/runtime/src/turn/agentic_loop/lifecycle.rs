@@ -1987,6 +1987,17 @@ pub(crate) fn estimate_context_pressure_with_system_prompt_tokens(
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
+/// A physical sample floors pressure only until canonical history is replaced.
+/// Paid usage remains untouched; a replacement uses the fresh local estimate.
+pub(crate) fn estimate_context_pressure_with_measurement(state: &AgenticLoopState) -> (f64, u64) {
+    let (pressure, local) = estimate_context_pressure_for_state(state);
+    if state.max_turn_input_tokens == 0 || !state.prompt_measurement_current {
+        return (pressure, local);
+    }
+    let tokens = local.max(state.last_measured_prompt_tokens.unwrap_or(0));
+    (tokens as f64 / state.max_turn_input_tokens as f64, tokens)
+}
+
 // AgenticLoopState currently carries the effective input budget, not the full
 // model context window. This approximation is used only for skill-listing size
 // hints; callers with registry metadata should pass the full context window.
@@ -2000,10 +2011,33 @@ fn approximate_context_window_from_effective_input_budget(
     Some(approx_context_window.min(u64::from(u32::MAX)) as u32)
 }
 
-/// Run the compaction pipeline and record results (event + audit).
-///
-/// Shared by pre-turn and resume. Exact deduplication runs first; the existing
-/// durable artifact owner is used only if pressure remains.
+fn record_context_compaction<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    event: CompactionEvent,
+    audit_label: &str,
+    layers: u32,
+) {
+    state.context_compression_triggered = true;
+    state.step_recorder.record_compaction_with_kind(
+        &event.kind.to_string(),
+        event.messages_removed.min(u32::MAX as usize) as u32,
+        event.tokens_freed,
+        event.pressure,
+    );
+    if let Some(ref mut sess) = state.pipeline_session {
+        sess.record_compaction_audit(
+            audit_label,
+            layers,
+            event.tokens_freed.min(u64::from(u32::MAX)) as u32,
+        );
+        sess.stats.record_compaction(event.tokens_freed);
+    }
+    host.on_compaction(event);
+}
+
+/// One preparation owner: exact dedup, optional semantic summary, then durable
+/// artifact recovery. Each step remeasures the history actually retained.
 async fn run_proactive_compaction<H: AgenticLoopHost>(
     pressure: f64,
     tokens_measured: u64,
@@ -2027,84 +2061,100 @@ async fn run_proactive_compaction<H: AgenticLoopHost>(
     } else {
         CompactionEngine::default_pipeline_for(max_tokens)
     };
-    let messages_before = state.messages.len();
-    let Some(rewrite_permit) = state
-        .begin_canonical_rewrite()
-        .filter(|permit| permit.is_valid())
-    else {
+    let rewrite_permit = state.begin_canonical_rewrite();
+    if rewrite_permit
+        .as_ref()
+        .is_some_and(|permit| !permit.is_valid())
+    {
         return;
-    };
-    let mut outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-    if outcome.total_tokens_freed > 0 {
-        state.finish_canonical_rewrite(Some(rewrite_permit));
     }
-    let remaining = budget
-        .last_measured_tokens
-        .saturating_sub(outcome.total_tokens_freed);
-    let still_under_pressure = budget.max_prompt_tokens > 0
-        && remaining as f64 / budget.max_prompt_tokens as f64
-            >= CompactionTier::pre_turn_trigger(budget.max_prompt_tokens);
-    if still_under_pressure
-        && let Some((freed, removed)) =
+    let before = state.messages.len();
+    let mut outcome = if let Some(permit) = rewrite_permit {
+        let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+        if outcome.total_tokens_freed > 0 {
+            state.prompt_measurement_current = false;
+            state.finish_canonical_rewrite(Some(permit));
+        }
+        outcome
+    } else {
+        super::super::PipelineOutcome {
+            layer_results: vec![],
+            total_tokens_freed: 0,
+            budget_satisfied: false,
+        }
+    };
+    let mut removed = before.saturating_sub(state.messages.len());
+    let mut summary_freed = 0;
+    let (remaining_pressure, _) = estimate_context_pressure_with_measurement(state);
+    if remaining_pressure >= CompactionTier::pre_turn_trigger(max_tokens)
+        && state.messages.len() > 10
+        && let Some(event) = host.maybe_pre_turn_compact(state, remaining_pressure).await
+    {
+        state.prompt_measurement_current = false;
+        summary_freed = event.tokens_freed;
+        record_context_compaction(host, state, event, "pre_turn_summary", 1);
+    }
+    let (remaining_pressure, _) = estimate_context_pressure_with_measurement(state);
+    if remaining_pressure >= CompactionTier::pre_turn_trigger(max_tokens)
+        && let Some((freed, messages_removed)) =
             super::execution_phase::spill_old_messages_to_artifact(host, state).await
     {
+        removed += messages_removed;
         outcome.total_tokens_freed += freed;
         outcome.layer_results.push((
             "history_artifact".into(),
             astra_turn_core::compression_types::CompressionResult {
                 estimated_tokens_freed: freed,
-                messages_removed: removed,
+                messages_removed,
                 ..Default::default()
             },
         ));
     }
+    let total_freed = outcome.total_tokens_freed.saturating_add(summary_freed);
     state
         .compaction_effectiveness
-        .record_compaction(outcome.total_tokens_freed);
+        .record_compaction(total_freed);
     if outcome.total_tokens_freed > 0 {
-        let messages_after = state.messages.len();
-        let messages_removed = messages_before.saturating_sub(messages_after);
-        let layer_descriptions: Vec<String> = outcome
+        let descriptions = outcome
             .layer_results
             .iter()
             .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
             .collect();
-        state.context_compression_triggered = true;
-        state.step_recorder.record_compaction_with_kind(
-            &kind.to_string(),
-            messages_removed.min(u32::MAX as usize) as u32,
-            outcome.total_tokens_freed,
-            pressure,
-        );
         let event = CompactionEvent::new(
             kind,
             pressure,
             outcome.total_tokens_freed,
             tokens_measured,
             max_tokens,
-            messages_removed,
-            messages_after,
-            layer_descriptions,
+            removed,
+            state.messages.len(),
+            descriptions,
         );
-        host.on_compaction(event);
+        record_context_compaction(
+            host,
+            state,
+            event,
+            audit_label,
+            outcome.layer_results.len() as u32,
+        );
+    }
+    if total_freed > 0 && kind == CompactionKind::ReactiveBudget {
         if let Some(ref mut sess) = state.pipeline_session {
-            sess.record_compaction_audit(
-                audit_label,
-                outcome.layer_results.len() as u32,
-                outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
-            );
-            sess.stats.record_compaction(outcome.total_tokens_freed);
+            sess.recovery.record_reactive_compact();
         }
+        state.push_volatile(
+            super::host::VolatileKind::CompactResume,
+            super::super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
+        );
+        try_write_heavy_checkpoint(state);
     }
 }
 
-pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
+async fn check_preparation_controls<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_index: usize,
-) -> Result<PreparedTurnIteration, astra_core::ClassifiedError> {
-    let quiet = host.is_quiet();
-
+    poll_durable: bool,
+) -> Result<Option<PreparedTurnIteration>, astra_core::ClassifiedError> {
     // Outer loop: re-evaluate pause/cancel state until we either get
     // cancelled or the run is no longer paused. This replaces the prior
     // recursive `Box::pin(prepare_turn_iteration(...)).await` which
@@ -2112,7 +2162,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     loop {
         if wait_for_pause_clear_or_cancel(host, state).await? {
             let origin = resolve_cancellation_origin(state).await;
-            return Ok(finish_cancellation(host, state, origin).await);
+            return Ok(Some(finish_cancellation(host, state, origin).await));
         }
 
         // Fast-path in-memory cancel check (same pod)
@@ -2125,37 +2175,42 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .cancellation
                 .token
                 .as_ref()
-                .is_some_and(|t| t.is_cancelled());
+                .is_some_and(|t| t.is_cancelled())
+            || state
+                .cancellation
+                .execution_lease_lost
+                .as_ref()
+                .is_some_and(|lost| lost.load(Ordering::Acquire));
 
         // Server's live watcher owns cross-pod observation. Local flags are
         // already checked above; profiles without a watcher retain polling.
-        let durable_control_status = if !in_memory_cancelled && !state.has_durable_control_watcher()
-        {
-            if let Some(ref rc) = state.run_control {
-                if let (Some(user_id), Some(run_id)) = (
-                    state.owner_user_id.as_deref(),
-                    state.current_run_id.as_deref(),
-                ) {
-                    match rc.control_status(user_id, run_id).await {
-                        Ok(status) => status,
-                        Err(error) => {
-                            tracing::warn!(
-                                run_id,
-                                error = %error,
-                                "failed to poll run control status"
-                            );
-                            None
+        let durable_control_status =
+            if poll_durable && !in_memory_cancelled && !state.has_durable_control_watcher() {
+                if let Some(ref rc) = state.run_control {
+                    if let (Some(user_id), Some(run_id)) = (
+                        state.owner_user_id.as_deref(),
+                        state.current_run_id.as_deref(),
+                    ) {
+                        match rc.control_status(user_id, run_id).await {
+                            Ok(status) => status,
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id,
+                                    error = %error,
+                                    "failed to poll run control status"
+                                );
+                                None
+                            }
                         }
+                    } else {
+                        None
                     }
                 } else {
                     None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         if in_memory_cancelled
             || matches!(durable_control_status, Some(RunControlStatus::Cancelled))
@@ -2169,7 +2224,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 }
             }
             let origin = resolve_cancellation_origin(state).await;
-            return Ok(finish_cancellation(host, state, origin).await);
+            return Ok(Some(finish_cancellation(host, state, origin).await));
         }
 
         if matches!(durable_control_status, Some(RunControlStatus::Paused)) {
@@ -2185,18 +2240,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         break;
     }
 
-    // Cancellation and pause have priority over round control. Capture the
-    // permission selection before any mode-dependent preparation begins.
-    super::settings_boundary::apply_round_settings(host, state).await?;
+    Ok(None)
+}
 
-    if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
-        super::execution_phase::finish_unavailable_verification(state, error);
-        try_write_heavy_checkpoint(state);
-        return Ok(PreparedTurnIteration::Finished(
-            AgenticLoopOutcome::Completed,
-        ));
-    }
-
+async fn enforce_preparation_deadline<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Option<PreparedTurnIteration> {
     if host
         .execution_time_budget_remaining()
         .is_some_and(|remaining| !remaining.has_work())
@@ -2227,11 +2277,41 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     ));
                 }
                 try_write_heavy_checkpoint(state);
-                return Ok(PreparedTurnIteration::Finished(
+                return Some(PreparedTurnIteration::Finished(
                     AgenticLoopOutcome::Completed,
                 ));
             }
         }
+    }
+
+    None
+}
+
+pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    turn_index: usize,
+) -> Result<PreparedTurnIteration, astra_core::ClassifiedError> {
+    let quiet = host.is_quiet();
+
+    if let Some(finished) = check_preparation_controls(host, state, true).await? {
+        return Ok(finished);
+    }
+
+    // Cancellation and pause have priority over round control. Capture the
+    // permission selection before any mode-dependent preparation begins.
+    super::settings_boundary::apply_round_settings(host, state).await?;
+
+    if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
+        super::execution_phase::finish_unavailable_verification(state, error);
+        try_write_heavy_checkpoint(state);
+        return Ok(PreparedTurnIteration::Finished(
+            AgenticLoopOutcome::Completed,
+        ));
+    }
+
+    if let Some(finished) = enforce_preparation_deadline(host, state).await {
+        return Ok(finished);
     }
 
     // Workspace ownership is separate from an invocation's outcome. An
@@ -2557,97 +2637,67 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     maybe_pre_route_skill(host, state).await;
 
     if turn_index > 0 || state.messages.len() > 10 {
-        // Context pressure estimation + adaptive compaction.
-        // When pipeline_session is active, use its pressure model (predictive
-        // with reserves) and cascade-aware limits. Otherwise fall back to
-        // legacy inline estimation.
-        // The last provider measurement includes protocol-owned input which
-        // the local text estimator cannot see. Use it until a new request is
-        // measured, discounting only the savings from rewrites in this pass.
-        let mut measured_floor = state.last_measured_prompt_tokens.unwrap_or(0);
-        let pressure_with_measurement = |state: &AgenticLoopState, floor: u64| {
-            let (pressure, estimate) = estimate_context_pressure_for_state(state);
-            if state.max_turn_input_tokens == 0 || estimate >= floor {
-                (pressure, estimate)
-            } else {
-                (floor as f64 / state.max_turn_input_tokens as f64, floor)
-            }
-        };
-        let (mut pressure, mut pressure_estimate_tokens) =
-            pressure_with_measurement(state, measured_floor);
-
-        // Pre-turn LLM compact: if pressure exceeds the model-adaptive
-        // trigger, let the host run an optional cache-friendly inline-summary
-        // pass before the next LLM call.
-        if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
-            && state.messages.len() > 10
-        {
-            if let Some(event) = host.maybe_pre_turn_compact(state, pressure).await {
-                measured_floor = measured_floor.saturating_sub(event.tokens_freed);
-                state.context_compression_triggered = true;
-                state
-                    .compaction_effectiveness
-                    .record_compaction(event.tokens_freed);
-                state.step_recorder.record_compaction_with_kind(
-                    &event.kind.to_string(),
-                    event.messages_removed.min(u32::MAX as usize) as u32,
-                    event.tokens_freed,
-                    event.pressure,
-                );
-                if let Some(ref mut sess) = state.pipeline_session {
-                    let audit_label = event.kind.to_string();
-                    sess.record_compaction_audit(
-                        &audit_label,
-                        event.messages_removed.min(u32::MAX as usize) as u32,
-                        event.tokens_freed.min(u64::from(u32::MAX)) as u32,
-                    );
-                    sess.stats.record_compaction(event.tokens_freed);
-                }
-                host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) =
-                    pressure_with_measurement(state, measured_floor);
-            }
-        }
-
-        // Pre-turn pressure warning: when context is near the model-adaptive
-        // warning threshold, emit a non-intrusive advisory so the user knows
-        // compaction is imminent.
+        let (pressure, tokens) = estimate_context_pressure_with_measurement(state);
         if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) {
-            let warning = CompactionEvent::new(
+            host.on_compaction(CompactionEvent::new(
                 CompactionKind::PressureWarning,
                 pressure,
-                0, // no tokens freed yet
-                pressure_estimate_tokens,
+                0,
+                tokens,
                 state.max_turn_input_tokens,
-                0,                    // no messages removed
-                state.messages.len(), // current message count
-                vec![],               // no layers applied
-            );
-            host.on_compaction(warning);
+                0,
+                state.messages.len(),
+                vec![],
+            ));
         }
-
-        // Canonical history is shortened by the semantic-summary or durable
-        // history-artifact owner. A local tool-result file does not establish
-        // that another Server instance can retrieve the omitted evidence.
-        // Re-estimate pressure after the semantic-summary attempt.
-        // Include selected schema and measured system overhead in this check.
-        let (post_mc_pressure, post_mc_tokens) = pressure_with_measurement(state, measured_floor);
-
-        // Proactive compression gate: if pressure is still high,
-        // try a recoverable history rewrite *before* calling
-        // the LLM, preventing 413 errors instead of reacting to them.
-        if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            let is_aggressive =
-                post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
-            let (kind, label) = if turn_index == 0 {
+        if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
+            let (kind, label) = if state.prompt_measurement_current
+                && state
+                    .last_measured_prompt_tokens
+                    .is_some_and(|n| n > state.max_turn_input_tokens)
+            {
+                (CompactionKind::ReactiveBudget, "reactive_budget")
+            } else if turn_index == 0 {
                 (CompactionKind::Resume, "resume")
-            } else if is_aggressive {
+            } else if pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
                 (CompactionKind::ProactiveAggressive, "aggressive")
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
-            run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label)
-                .await;
+            run_proactive_compaction(pressure, tokens, state, host, kind, label).await;
+            // A process-local host may have no durable identity. Reuse the
+            // local stop/deadline owners after I/O without another SQL poll.
+            if let Some(finished) = check_preparation_controls(host, state, false).await? {
+                return Ok(finished);
+            }
+            if let Some(finished) = enforce_preparation_deadline(host, state).await {
+                return Ok(finished);
+            }
+        }
+        // The prior batch has settled before preparation. Only an applicable
+        // physical measurement can arm the existing graceful wind-down rail.
+        if !state.budget_wrapup_injected
+            && state.max_turn_input_tokens > 0
+            && state.prompt_measurement_current
+            && let Some(measured) = state.last_measured_prompt_tokens
+            && measured > state.max_turn_input_tokens
+        {
+            state.budget_wrapup_injected = true;
+            state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::TokenRail);
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "⚠ Token budget reached ({measured}/{} tokens) — wrapping up.",
+                        state.max_turn_input_tokens,
+                    ),
+                );
+            }
+            state.push_volatile(
+                super::host::VolatileKind::BudgetAdvisory,
+                super::super::budget_messaging::BUDGET_REACHED_ADVISORY,
+            );
+            try_write_heavy_checkpoint(state);
         }
     }
 
@@ -6429,7 +6479,7 @@ mod tests {
                 json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
             }));
             assert!(estimate_context_pressure_for_state(&state).0 < 0.5);
-            state.last_measured_prompt_tokens = Some(195_000);
+            state.record_prompt_measurement(Some(195_000));
 
             super::super::host::tests::admit_history_recovery(&mut host, &mut state);
             prepare_turn_iteration(&mut host, &mut state, turn_index)

@@ -1231,6 +1231,7 @@ fn apply_pre_turn_summary(
     let messages_removed = candidate.messages_removed;
     state.last_request_message_count = sent_prefix;
     state.messages = candidate.messages;
+    state.prompt_measurement_current = false;
     state.finish_canonical_rewrite(Some(rewrite_permit));
     state.compact_tier_applied = CompactionTier::CompactHistory;
     state.context_compression_triggered = true;
@@ -16241,7 +16242,7 @@ impl ServerAgenticLoopHost {
                             ),
                         );
                     }
-                    if tool_name == "bash" {
+                    if matches!(tool_name.as_str(), "bash" | "task_output") {
                         event.insert(
                             "command_timeout_cap_ms".to_string(),
                             json!(command_timeout_cap_ms),
@@ -16846,6 +16847,9 @@ impl ServerAgenticLoopHost {
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
             .map(|seconds| (seconds * 1_000.0).ceil().min(u64::MAX as f64) as u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
+        if tool_name == "task_output" {
+            return astra_tools::tool_engine::task_output_timeout_ms(args).min(policy_cap_ms);
+        }
         let requested_ms = args
             .get("timeout")
             .and_then(Value::as_f64)
@@ -18269,6 +18273,7 @@ impl ServerAgenticLoopHost {
                 boundary.messages_after = result.messages.len();
             }
             state.messages = candidate;
+            state.prompt_measurement_current = false;
             // execute_turn_and_ingest_phase captured this prefix before
             // request preparation. Rebase its microcompact protection count
             // onto the accepted history, leaving later tool results eligible.
@@ -23164,7 +23169,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // auxiliary inference. Its client still uses normal admission.
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
-            state.compaction_effectiveness.record_futile();
             tracing::debug!(
                 target: "astra::pre_turn_compaction",
                 pressure,
@@ -23266,7 +23270,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if let Some(summary_text) = summary_text {
             let event = apply_pre_turn_summary(state, pressure, summary_text, spill_count);
             if event.is_none() {
-                state.compaction_effectiveness.record_futile();
                 tracing::warn!(
                     target: "astra::pre_turn_compaction",
                     pressure,
@@ -23277,7 +23280,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             event
         } else {
-            state.compaction_effectiveness.record_futile();
             tracing::warn!(
                 target: "astra::pre_turn_compaction",
                 pressure,
@@ -26050,6 +26052,33 @@ mod tests {
                     astra_services::session_journal::ToolCallDisposition::Executed,
                 ),
                 astra_services::session_journal::ToolCallDisposition::Rejected,
+            );
+        }
+    }
+
+    #[test]
+    fn task_output_dispatch_honors_its_millisecond_wait_contract() {
+        let host = test_host_builder("observation-owner", "observation-session")
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .build();
+        for (args, expected) in [
+            (json!({"task_id":"task","block":true}), 30_000),
+            (json!({"task_id":"task","block":true,"timeout_ms":1}), 1),
+            (json!({"timeout_ms":0}), 1),
+            (json!({"timeout_ms":-1}), 30_000),
+            (json!({"timeout_ms":"300000"}), 30_000),
+            (json!({"timeout_ms":30_000}), 30_000),
+            (json!({"timeout_ms":180_000}), 180_000),
+            (json!({"timeout_ms":999_999}), 300_000),
+            (
+                json!({"task_id":"task","block":true,"timeout_ms":300_000}),
+                300_000,
+            ),
+        ] {
+            assert_eq!(
+                host.edge_execution_timeout_ms("task_output", &args),
+                expected,
+                "the observation and its dispatch must share one wait budget"
             );
         }
     }
@@ -41115,10 +41144,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pipeline_prunes_tool_schemas_under_pressure() {
-        // Forces the planner into TrimSchemas+ tier by driving up recovery
-        // state (PTL errors), then verifies the returned tool_schemas reflect
-        // tier-appropriate pruning — tool descriptions should be truncated.
+    async fn run_turn_pipeline_preserves_cacheable_tool_schemas_under_pressure() {
+        // Recovery may raise the pressure tier without changing the current
+        // cacheable tool contract. Authority still comes from current schemas.
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -41161,13 +41189,9 @@ mod tests {
             "recovery PTL=1 must escalate tier above Normal, got {:?}",
             outcome.tier
         );
-        // Description must have been touched by TrimSchemas (first-sentence truncation).
-        let pruned_desc = outcome.tool_schemas[0]["function"]["description"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            !pruned_desc.contains("deletes temp dirs"),
-            "trailing sentence should be stripped under TrimSchemas, got: {pruned_desc:?}"
+        assert_eq!(
+            outcome.tool_schemas, tools,
+            "pressure alone cannot rewrite a cacheable tool contract"
         );
     }
 

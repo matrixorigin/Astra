@@ -3147,6 +3147,7 @@ mod tests {
             }),
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-1"),
@@ -3164,6 +3165,7 @@ mod tests {
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-1"),
@@ -3187,6 +3189,7 @@ mod tests {
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-2"),
@@ -3239,6 +3242,7 @@ mod tests {
             }),
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("later-turn"),
                 tool_call_id: Some("untrusted-later-start"),
@@ -3338,6 +3342,7 @@ mod tests {
             &deferred_args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&deferred_run_id),
                 turn_chain_id: Some("turn-4"),
                 tool_call_id: Some("physical-defer"),
@@ -3391,6 +3396,7 @@ mod tests {
             &deferred_args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&deferred_run_id),
                 turn_chain_id: Some("turn-after-restart"),
                 tool_call_id: Some("physical-plan-only"),
@@ -3448,6 +3454,7 @@ mod tests {
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-5"),
                 tool_call_id: Some("physical-active-defer"),
@@ -3478,6 +3485,7 @@ mod tests {
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-6"),
                 tool_call_id: Some("physical-assignment-replay"),
@@ -3601,6 +3609,7 @@ mod tests {
                 &args,
                 ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("recovery-turn"),
                     tool_call_id: Some(&physical_call_id),
@@ -3714,6 +3723,7 @@ mod tests {
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("recovery-turn"),
                 tool_call_id: Some("physical-foreign-fence"),

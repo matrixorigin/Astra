@@ -58,6 +58,7 @@ fn start_args(goal: &str, tasks: &[WorkAdmissionTask]) -> Value {
 fn invocation<'a>(run_id: &'a str, call_id: &'a str) -> ToolInvocationMetadata<'a> {
     ToolInvocationMetadata {
         admission_deadline: None,
+        observation_deadline: None,
         run_id: Some(run_id),
         turn_chain_id: Some("precedence-regression-replay"),
         tool_call_id: Some(call_id),
@@ -1114,6 +1115,7 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 &json!({}),
                 ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("terminal-cut-repair-turn"),
                     tool_call_id: Some("terminal-cut-repair-call"),
@@ -1189,6 +1191,7 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 &serde_json::to_value(&settlement).expect("settlement arguments"),
                 ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("settlement-replay-turn"),
                     tool_call_id: Some("settlement-replay-call"),

@@ -550,6 +550,7 @@ pub(crate) fn build_session_context(
         model_limit: u32::try_from(max_input_tokens).unwrap_or(u32::MAX),
         provider_policy,
         provider_strategy,
+        cache_protocol: capability.protocol,
         // Cross-session project context (summaries of prior sessions on
         // this repo) is session-stable — feeding it through the pipeline's
         // `ProjectContext` section puts it in CacheScope::Session behind the

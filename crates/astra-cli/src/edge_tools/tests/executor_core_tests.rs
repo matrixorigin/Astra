@@ -271,9 +271,6 @@ async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure()
 #[tokio::test]
 async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     let executor = test_executor();
-    let aggregate_before = executor
-        .aggregate_output_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
     let outcome = executor
         .execute_with_metadata_cancelable(
             "bash",
@@ -303,13 +300,6 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     assert!(
         !outcome.output.is_empty(),
         "cancel-aware async bash must normalize an empty command result"
-    );
-    assert_eq!(
-        executor
-            .aggregate_output_bytes
-            .load(std::sync::atomic::Ordering::Relaxed),
-        aggregate_before + outcome.output.len(),
-        "cancel-aware async bash output must be accounted exactly once"
     );
 }
 

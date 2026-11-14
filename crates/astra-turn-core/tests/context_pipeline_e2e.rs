@@ -42,6 +42,7 @@ fn build_sources() -> (
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
+            cache_protocol: Default::default(),
             project_context: "Rust project with cargo build system".into(),
             edge_profile: EdgeProfile {
                 cwd: Some("/home/user/myproject".into()),
