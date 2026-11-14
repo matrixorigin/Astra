@@ -959,6 +959,7 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_empty_input_returns_empty() {
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -981,6 +982,7 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_unreachable_server_uses_lexical_fallback() {
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1055,6 +1057,7 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1086,6 +1089,7 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1120,6 +1124,7 @@ mod tests {
         )
         .await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1145,6 +1150,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1180,6 +1186,7 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["1"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1205,6 +1212,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), r#"{"true":[],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -1234,6 +1242,7 @@ mod tests {
         let base =
             spawn_mock_completions(captured.clone(), r#"{"true":["0"],"uncertain":[]}"#).await;
         let params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,

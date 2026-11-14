@@ -629,6 +629,31 @@ Reflection            3k tokens   Workspace
 
 TaaS financial data includes its source and observation time and links to the authoritative TaaS billing surface. Astra estimates must not be presented as the final TaaS ledger.
 
+#### Genesis runtime usage provenance
+
+Native Genesis admission may attach a non-serializable usage-attestation
+capability to the exact admitted model, endpoint and server-held credential.
+The shared streaming/nonstream transport signs each physical HTTP attempt after
+awaited admission, binding its fresh timestamp, admission identity, POST path,
+upstream model, credential digest and exact wire-body digest. Cloning does not
+create another admission; new BYOK/device/MOI-gateway material does not inherit
+the capability. A mismatched route or credential is rejected before dispatch.
+
+The key is the optional server-only `ASTRA_GENESIS_USAGE_SIGNING_KEY`, independent
+of UC authentication and MOI nonbillable signing. TaaS verifies it with its
+dedicated verifier key and records `astra_runtime`, which includes CLI-initiated
+server execution but does not attest the physical client binary. Console and
+MOI retain their own verified origins. Plain PAT use, older deployments and an
+unconfigured signer remain unknown. No client-provided source label is trusted.
+
+This provenance never changes inference admission, prices or settlement and
+does not add a second Token counter or ledger in Astra. TaaS's committed usage
+fact remains authoritative; BYOK and other backends outside TaaS stay outside
+that dashboard's coverage. Deploy TaaS verification before enabling the signer,
+and drain old signers before retiring a rotation key. Protocol vectors and the
+paired verifier are tracked in matrixorigin/taas#522; the Astra tracking issue
+is matrixorigin/Astra#1253 and its implementation PR is matrixorigin/Astra#1254.
+
 ### Administration
 
 The administration experience is organized by operator task, not by exposing every database entity:

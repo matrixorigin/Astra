@@ -324,7 +324,9 @@ impl DatabaseModelService {
                 })
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
-        Ok(AdmittedModelExecution {
+        let base_url = format!("{}/v1", provider.settings.genesis_url);
+        let execution = AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -341,7 +343,7 @@ impl DatabaseModelService {
             model_name: item.name.clone(),
             wire_model_name: None,
             api_key: catalog.api_key.clone(),
-            base_url: format!("{}/v1", provider.settings.genesis_url),
+            base_url,
             provider: "openai".into(),
             cache_capability: None,
             thinking_capability: None,
@@ -354,7 +356,13 @@ impl DatabaseModelService {
             header_overrides: HashMap::new(),
             completions_url_override: None,
             request_timeout_ms: None,
-        })
+        };
+        match provider.settings.genesis_usage_signing_key.as_deref() {
+            Some(key) => execution
+                .with_genesis_usage_attestation(key)
+                .map_err(|_| unavailable()),
+            None => Ok(execution),
+        }
     }
 }
 
@@ -442,6 +450,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let provider = UcNativeProvider::new(UcNativeSettings {
+            genesis_usage_signing_key: None,
             builtin_memory: false,
             issuer: format!("{origin}/realms/moi"),
             adapter_url: origin.clone(),
@@ -530,6 +539,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn genesis_admission_mints_server_only_scoped_usage_provenance() {
+        let (mut service, _state, _server) = fixture().await;
+        const KEY: &str = "synthetic-attribution-key-32-bytes";
+        service
+            .uc_provider
+            .as_mut()
+            .unwrap()
+            .settings
+            .genesis_usage_signing_key = Some(KEY.into());
+        let catalog = service.genesis_catalog("account-A").await.unwrap();
+        let first = service
+            .admit_genesis("account-A", &catalog.items[0].offering_id)
+            .await
+            .unwrap();
+        let second = service
+            .admit_genesis("account-A", &catalog.items[0].offering_id)
+            .await
+            .unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"synthetic body"));
+        let headers = |execution: &AdmittedModelExecution| {
+            execution
+                .usage_attestation
+                .as_ref()
+                .unwrap()
+                .headers_for_request(
+                    "POST",
+                    &format!("{}/chat/completions", execution.base_url),
+                    &execution.model_name,
+                    &execution.api_key,
+                    &hash,
+                )
+                .unwrap()
+        };
+        assert_ne!(
+            headers(&first)["x-genesis-usage-execution"],
+            headers(&second)["x-genesis-usage-execution"]
+        );
+        assert!(first.header_overrides.is_empty());
+        let projection = serde_json::to_string(&catalog.items).unwrap();
+        assert!(!projection.contains(KEY) && !projection.contains("usage_attestation"));
+        assert!(!format!("{first:?}").contains(KEY));
+        let gateway = AdmittedModelExecution::from_endpoint(
+            "gateway".into(),
+            "model".into(),
+            "openai".into(),
+            "https://byok.example.test/v1/chat/completions".into(),
+            "Bearer synthetic-device-key".into(),
+            None,
+            32000,
+        );
+        assert!(gateway.usage_attestation.is_none());
+    }
+
+    #[tokio::test]
     async fn genesis_catalog_is_paginated_account_bound_and_never_exports_credentials() {
         let (service, state, _server) = fixture().await;
         let a = service.genesis_catalog("account-A").await.unwrap();
@@ -566,6 +629,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admitted.api_key, "synthetic-pat-account-A");
+        assert!(admitted.usage_attestation.is_none());
         assert_eq!(admitted.access_kind, ModelAccessKind::AstraCloud);
         assert_eq!(
             admitted.execution_placement,
