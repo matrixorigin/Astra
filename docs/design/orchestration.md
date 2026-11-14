@@ -162,6 +162,9 @@ an invalid slot, but provider or child execution can still fail after launch.
 Neither carrier may override an authoritative primary-only Work topology.
 Provider-authored parallel calls do not cancel a user-requested durable Work
 graph or its deferred activation; a conflicting proposal is rejected.
+Coordinator continuation uses the same activation boundary as genesis,
+including a cold binding. Conflicting `run_next_work_item` calls receive a typed
+rejection while existing Work and pending-operation recovery remain intact.
 An explicit Required Work decision is a turn-wide establishment fence:
 neither a one-slot nor a multi-slot fanout proposal, valid or malformed, can
 start work or authorize sibling calls before the `start_work` receipt. An

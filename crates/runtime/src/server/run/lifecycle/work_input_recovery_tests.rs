@@ -4,21 +4,36 @@ use axum::{Json, Router, extract::State, routing::post};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
 async fn invalid_work_graph_is_corrected_through_native_run() {
-    exercise_work_graph_input_recovery(true).await;
+    exercise_work_graph_input_recovery(1, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
 async fn valid_work_graph_native_control() {
-    exercise_work_graph_input_recovery(false).await;
+    exercise_work_graph_input_recovery(0, false).await;
 }
 
-async fn exercise_work_graph_input_recovery(invalid_first: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+async fn invalid_work_graph_recovers_after_accepted_clarification() {
+    exercise_work_graph_input_recovery(1, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+async fn two_invalid_model_proposals_can_be_corrected() {
+    exercise_work_graph_input_recovery(2, false).await;
+}
+
+async fn exercise_work_graph_input_recovery(invalid_rounds: usize, steer: bool) {
     #[derive(Clone)]
     struct Probe {
         pool: SharedPool,
         owner: String,
-        invalid_first: bool,
+        steer: bool,
+        invalid_rounds: usize,
+        rejection_seen: Arc<tokio::sync::Notify>,
+        release_response: Arc<tokio::sync::Notify>,
         calls: Arc<AtomicUsize>,
         observations: Arc<TokioMutex<Vec<Value>>>,
     }
@@ -63,8 +78,24 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
             .collect();
         probe.observations.lock().await.push(json!({
             "round":ordinal, "works":works, "operations":operations,
-            "attempt":attempt, "tools":tools, "feedback":feedback
+            "attempt":attempt, "tools":tools, "feedback":feedback,
+            "clarification_seen":messages.iter().any(|message| message["role"]=="user"
+                && message["content"].as_str().is_some_and(|content|
+                    content.contains("Continue the dependency-free observation"))),
+
         }));
+        if probe.steer && ordinal == 2 {
+            assert_eq!(works, 0);
+            assert_eq!(operations, 0);
+            assert!(feedback.iter().any(|message| {
+                message["tool_call_id"] == "invalid-work-input"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("cannot depend on itself"))
+            }));
+            probe.rejection_seen.notify_one();
+            probe.release_response.notified().await;
+        }
         let tool = |name: &str, id: &str, args: Value| {
             json!({
                 "role":"assistant","content":null,"tool_calls":[{
@@ -73,14 +104,17 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
             })
         };
         let message = if works == 0 {
-            let invalid = probe.invalid_first && ordinal == 1;
+            let invalid = ordinal <= probe.invalid_rounds;
+            let call_id = if !invalid {
+                "corrected-work-input".to_string()
+            } else if ordinal == 1 {
+                "invalid-work-input".to_string()
+            } else {
+                format!("invalid-work-input-{ordinal}")
+            };
             tool(
                 "start_work",
-                if invalid {
-                    "invalid-work-input"
-                } else {
-                    "corrected-work-input"
-                },
+                &call_id,
                 json!({
                     "goal":"Observe the live runtime and deliver one task.",
                     "activation":"start",
@@ -141,7 +175,10 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
     let probe = Probe {
         pool: pool.clone(),
         owner: owner.clone(),
-        invalid_first,
+        steer,
+        invalid_rounds,
+        rejection_seen: Arc::new(tokio::sync::Notify::new()),
+        release_response: Arc::new(tokio::sync::Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
         observations: Arc::new(TokioMutex::new(Vec::new())),
     };
@@ -194,6 +231,21 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
         .create_run(owner.clone(), request)
         .await
         .expect("native run admission");
+    if steer {
+        tokio::time::timeout(Duration::from_secs(30), probe.rejection_seen.notified())
+            .await
+            .expect("must receive actual validation rejection before clarification");
+        let accepted = tokio::time::timeout(Duration::from_secs(10),
+            service.submit_run_user_intent(run.run_id.clone(), owner.clone(), RunUserIntentData {
+                intent_id:"clarify-invalid-work".into(),
+                delivery:astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input:json!({"content":"Continue the dependency-free observation in Work and deliver the declared task."}),
+            })).await.expect("user clarification admission must not wait for the model")
+            .expect("user clarification must be accepted");
+        assert!(!accepted.duplicate);
+        eprintln!("WORK_CLARIFICATION_ACCEPTED {:?}", accepted);
+        probe.release_response.notify_one();
+    }
     tokio::time::timeout(Duration::from_secs(60), async {
         while service.background_task_count() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -213,9 +265,29 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
     eprintln!(
         "WORK_INPUT_NATIVE_REPLAY {}",
         json!({
-            "invalid_first":invalid_first,"terminal":terminal,"requests":observations
+            "steer":steer,"invalid_rounds":invalid_rounds,"terminal":terminal,"requests":observations
         })
     );
+    if steer {
+        assert_eq!(
+            service
+                .run_user_intent_status(
+                    owner.clone(),
+                    session.clone(),
+                    run.run_id.clone(),
+                    "clarify-invalid-work".into()
+                )
+                .await
+                .unwrap(),
+            astra_turn_types::UserIntentStatus::Applied
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|row| row["clarification_seen"] == true),
+            "the actual next model boundary must receive the applied clarification"
+        );
+    }
     assert_eq!(
         terminal.0, "completed",
         "native correction was stranded: {terminal:?}"
@@ -247,7 +319,7 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
         attempts,
         vec![("completed".into(), Some("delivered".into()), run.run_id)]
     );
-    if invalid_first {
+    if invalid_rounds > 0 {
         assert_eq!(
             observations[1]["works"], 0,
             "invalid call cannot create Work"
@@ -257,16 +329,29 @@ async fn exercise_work_graph_input_recovery(invalid_first: bool) {
             "invalid input cannot admit a durable operation"
         );
         let final_feedback = observations.last().unwrap()["feedback"].as_array().unwrap();
+        let rejected: std::collections::HashSet<_> = observations
+            .iter()
+            .flat_map(|row| row["feedback"].as_array().unwrap())
+            .filter_map(|row| row["tool_call_id"].as_str())
+            .filter(|id| id.starts_with("invalid-work-input"))
+            .collect();
         assert_eq!(
-            final_feedback
-                .iter()
-                .filter(|row| row["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("initial Work task cannot depend on itself")))
-                .count(),
-            1,
-            "the invalid carrier must be rejected once, not replayed"
+            rejected.len(),
+            invalid_rounds,
+            "no host replay may replace a model correction"
         );
+        assert!(!rejected.iter().any(|id| id.contains("retry")));
+        if !steer {
+            assert_eq!(
+                final_feedback
+                    .iter()
+                    .filter(|row| row["content"].as_str().is_some_and(
+                        |text| text.contains("initial Work task cannot depend on itself")
+                    ))
+                    .count(),
+                invalid_rounds
+            );
+        }
         assert!(
             final_feedback
                 .iter()

@@ -10386,6 +10386,27 @@ impl ServerAgenticLoopHost {
         });
     }
 
+    fn work_activation_rejection(
+        &self,
+        activation: astra_services::work::WorkEstablishmentActivation,
+    ) -> Option<(&'static str, &'static str)> {
+        if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault
+            || activation != astra_services::work::WorkEstablishmentActivation::Start
+        {
+            return None;
+        }
+        // Activation belongs to the user intent, even after its genesis handoff settles.
+        matches!(
+            self.pending_work_admission.as_ref().map(|assessment| &assessment.decision),
+            Some(astra_services::WorkAdmissionDecision::Required {
+                activation: astra_services::WorkAdmissionActivation::Defer, ..
+            })
+        ).then_some((
+            "work_activation_conflict",
+            "Work admission requires defer; keep the plan and wait for the user to request task execution.",
+        ))
+    }
+
     /// Return the typed reason a provider-selected genesis carrier cannot
     /// cross the current semantic boundary.  The carrier is never compared
     /// with user/model prose: only the closed admission state and its typed
@@ -10418,19 +10439,11 @@ impl ServerAgenticLoopHost {
             return None;
         }
 
+        if let Some((kind, error)) = self.work_activation_rejection(provider_activation) {
+            return Some((kind, error, true));
+        }
         if let Some(decision) = self.pending_work_decision() {
             return match decision {
-                astra_services::WorkAdmissionDecision::Required { activation, .. }
-                    if *activation == astra_services::WorkAdmissionActivation::Defer
-                        && provider_activation
-                            == astra_services::work::WorkEstablishmentActivation::Start =>
-                {
-                    Some((
-                        "work_activation_conflict",
-                        "Work admission requires defer; the provider start_work carrier cannot execute this turn.",
-                        true,
-                    ))
-                }
                 astra_services::WorkAdmissionDecision::Required { .. } => None,
                 astra_services::WorkAdmissionDecision::NotRequired { .. } => Some((
                     "work_lifecycle_not_requested",
@@ -11114,8 +11127,8 @@ impl ServerAgenticLoopHost {
         Ok(())
     }
 
-    /// Fresh ordinary chat has no admitted Work operation to recover. The
-    /// explicit Work and checkpoint paths keep their existing durable recovery.
+    /// Keep implicit reads dormant for ordinary chat or deferred execution.
+    /// Permitted Work continuation and checkpoints retain explicit recovery.
     pub(crate) fn skip_implicit_work_recovery(&mut self) {
         self.work_establishment_hydrated = true;
     }
@@ -11634,6 +11647,13 @@ impl ServerAgenticLoopHost {
             let arguments = astra_turn_core::tool::args::shape::parse_tool_call_arguments(&call)
                 .unwrap_or(Value::Null);
             let action = arguments.get("action").and_then(Value::as_str);
+            let activation_rejection = if name == "run_next_work_item" {
+                self.work_activation_rejection(
+                    astra_services::work::WorkEstablishmentActivation::Start,
+                )
+            } else {
+                None
+            };
             // A failed provider genesis may have committed the session
             // binding before its receipt was delivered. The bounded retry is
             // still the same logical operation: the host-owned pending
@@ -11717,6 +11737,7 @@ impl ServerAgenticLoopHost {
                     "canonical_work_attempt_required",
                     "No canonical WorkItem attempt is assigned to this run. Waiting for an ordinary child agent is not a blocked WorkItem; continue the child handoff without repeating this settlement.",
                 )),
+                _ if activation_rejection.is_some() => activation_rejection,
                 "run_next_work_item" if work_item_runner_admitted => Some((
                     "canonical_work_parallel_execution_not_allowed",
                     "Canonical Work runs one foreground task at a time. Wait for the current run_next_work_item result before starting the next task.",
@@ -22705,8 +22726,28 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             && !logical_provider_tool_calls.iter().any(|call|
                 astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"));
         if provider_requests_work_continuation && self.pending_work_establishment.is_none() {
-            self.work_establishment_hydrated = false;
-            self.hydrate_pending_work_establishment(state).await?;
+            if self
+                .work_activation_rejection(
+                    astra_services::work::WorkEstablishmentActivation::Start,
+                )
+                .is_some()
+            {
+                // Resolve the target without advancing an older operation. A
+                // later acknowledgement must not synthesize a new genesis
+                // merely because the rejected call never reached its handler.
+                self.skip_implicit_work_recovery();
+                if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                    executor.resolve_work_binding().await.map_err(|error| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ToolBinding,
+                            error.output,
+                        )
+                    })?;
+                }
+            } else {
+                self.work_establishment_hydrated = false;
+                self.hydrate_pending_work_establishment(state).await?;
+            }
         }
         // Recompute after recovery: an exact already-admitted carrier keeps
         // precedence; only an ordinary continuation bypasses new genesis.
@@ -25027,73 +25068,427 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn provider_continuation_precedes_new_required_work_genesis() {
-        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
-        let observations =
-            crate::server::provider_test_support::ProviderObservationsFixture::default();
-        let response = json!({"choices":[{
+    async fn provider_continuation_keeps_current_activation_without_new_genesis() {
+        for (activation, handoff_pending) in [
+            (astra_services::WorkAdmissionActivation::Start, true),
+            (astra_services::WorkAdmissionActivation::Defer, true),
+            (astra_services::WorkAdmissionActivation::Defer, false),
+        ] {
+            let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+            let observations =
+                crate::server::provider_test_support::ProviderObservationsFixture::default();
+            let response = json!({"choices":[{
             "message":{"role":"assistant","content":null,"tool_calls":[{
                 "id":"continue-existing-work","type":"function",
                 "function":{"name":"run_next_work_item","arguments":"{}"}
             }]},"finish_reason":"tool_calls"
         }],"usage":{"prompt_tokens":12,"completion_tokens":5}});
-        let provider = ProviderGateway::start(vec![ProviderScript::new(
-            "provider_continuation_precedes_new_required_work_genesis",
-            |request| request.path == "/v1/chat/completions",
-            vec![ProviderResponse::OpenAi(response)],
-        )])
-        .await;
-        let session = "continuation-required-session";
-        let mut host = test_host_builder("continuation-required-owner", session)
-            .with_provider_observations(observations.clone())
-            .with_admitted_model_execution(Some(test_gateway_execution(
-                format!("{}/v1/chat/completions", provider.base_url),
-                Some(3000),
-            )))
-            .build();
-        host.pending_work_admission = Some(
-            astra_services::WorkAdmissionDecision::Required {
+            let provider = ProviderGateway::start(vec![ProviderScript::new(
+                "provider_continuation_keeps_current_activation_without_new_genesis",
+                |request| request.path == "/v1/chat/completions",
+                vec![ProviderResponse::OpenAi(response)],
+            )])
+            .await;
+            let session = "continuation-required-session";
+            let mut host = test_host_builder("continuation-required-owner", session)
+                .with_provider_observations(observations.clone())
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    format!("{}/v1/chat/completions", provider.base_url),
+                    Some(3000),
+                )))
+                .build();
+            host.turn_intent_policy = TurnIntentExecutionPolicy::Auto;
+            host.pending_work_admission = Some(
+                astra_services::WorkAdmissionDecision::Required {
+                    assessment: None,
+                    domain: None,
+                    workspace_mutation:
+                        astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                    mutation_completion_scope:
+                        astra_config::user_profile::MutationCompletionScope::Unknown,
+                    goal: "continue the existing Work".into(),
+                    tasks: vec![astra_services::WorkAdmissionTask {
+                        after_initial_tasks: vec![],
+                        objective: "one existing task".into(),
+                        expected_result: "one result".into(),
+                    }],
+                    deferred_graph_mutations: vec![],
+                    activation,
+                    execution_topology: astra_services::WorkExecutionTopology::Primary,
+                    required_capabilities: vec![],
+                }
+                .into(),
+            );
+            host.pending_work_admission
+                .as_mut()
+                .unwrap()
+                .work_handoff_pending = handoff_pending;
+            let mut state = create_durable_execution_test_state(session);
+            state.message = "Continue the existing Work.".into();
+            state.user_intent = state.message.clone();
+            let result = host
+                .execute_turn(&mut state)
+                .await
+                .expect("provider response");
+            assert_eq!(
+                result.accum.tool_calls.len(),
+                1,
+                "{:?}",
+                result.accum.tool_calls
+            );
+            assert_eq!(
+                result.accum.tool_calls[0]["function"]["name"],
+                "run_next_work_item"
+            );
+            assert!(
+                host.pending_work_establishment.is_none(),
+                "no replacement genesis carrier"
+            );
+            let admission = host.admit_tool_calls(&result.accum.tool_calls, Some("tool_calls"));
+            if activation == astra_services::WorkAdmissionActivation::Defer {
+                assert!(admission.admitted.is_empty());
+                assert_eq!(admission.rejected.len(), 1);
+                let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+                assert_eq!(rejection["error_kind"], "work_activation_conflict");
+                assert_eq!(
+                    host.pending_work_admission.as_ref().unwrap().activation(),
+                    activation
+                );
+            } else {
+                assert_eq!(admission.admitted.len(), 1);
+                assert!(admission.rejected.is_empty());
+            }
+            observations.assert_quiescent();
+            provider.assert_complete();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn continuation_activation_preserves_existing_work_and_recovery() {
+        use crate::server::runtime_tool_executor::RuntimeToolExecutor;
+        use astra_services::WorkAdmissionActivation::{Defer, Start};
+        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+        use astra_services::work::{
+            DatabaseWorkEstablishmentService, DatabaseWorkRepository, InternalSessionId,
+            WorkEstablishmentPhase, WorkEstablishmentState, WorkOwnerId, WorkRepository,
+        };
+        use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMetadata};
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = MatrixOneSettings::from_env();
+        astra_services::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        for (activation, warm, pending) in [
+            (Start, false, false),
+            (Start, true, false),
+            (Defer, false, false),
+            (Defer, true, false),
+            (Start, false, true),
+            (Start, true, true),
+            (Defer, false, true),
+            (Defer, true, true),
+        ] {
+            let owner = WorkOwnerId::parse(format!("activation-{}", uuid::Uuid::new_v4())).unwrap();
+            let session =
+                InternalSessionId::parse(format!("activation-{}", uuid::Uuid::new_v4())).unwrap();
+            let run_id = format!("activation-run-{}", uuid::Uuid::new_v4());
+            crate::server::work_test_support::admit_running_test_session(
+                &pool,
+                &owner,
+                &session,
+                &run_id,
+                "Continuation activation",
+            )
+            .await;
+            // A real run has its opening event before the loop's control cursor.
+            DatabaseRunStateStore::new(pool.clone())
+                .append_event(
+                    owner.as_str(),
+                    session.as_str(),
+                    &run_id,
+                    json!({"event_type":"run_started","data":{}}),
+                )
+                .await
+                .unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let make_executor = || {
+                let mut executor = RuntimeToolExecutor::new(
+                    workspace.path().to_path_buf(),
+                    owner.as_str().into(),
+                    session.as_str().into(),
+                    None,
+                    None,
+                )
+                .with_capabilities(
+                    crate::capabilities::lifecycle_server_capabilities(true, false),
+                );
+                executor.set_service_pool(pool.clone());
+                executor.set_invocation_ledger(
+                    crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_database(
+                        pool.clone(), "work-lifecycle-test-owner".into(),
+                    ),
+                );
+                executor
+            };
+            let args = json!({"goal":"Observe the current runtime","activation":if pending {"start"} else {"defer"},
+                "tasks":[{"objective":"Observe the current runtime","expected_result":"One verified observation"}]});
+            let request = crate::server::tool_work_lifecycle::canonical_work_establishment_request(
+                &owner,
+                &session,
+                "activation-turn",
+                &run_id,
+                &args,
+                None,
+            )
+            .unwrap();
+            let establishment = DatabaseWorkEstablishmentService::new(pool.clone());
+            if pending {
+                establishment.admit(&request).await.unwrap();
+                let creation = crate::server::work_handlers::derive_work_creation(
+                    &owner,
+                    astra_server_types::WorkCreateRequestV1 {
+                        request_id: request.operation_id.clone(),
+                        goal: "Observe the current runtime".into(),
+                        criteria: vec![],
+                    },
+                )
+                .unwrap();
+                DatabaseWorkRepository::new(pool.clone())
+                    .create_genesis_in_running_session(
+                        creation.genesis.in_session(session.clone()),
+                        &run_id,
+                    )
+                    .await
+                    .unwrap();
+                establishment
+                    .advance_phase(
+                        &request,
+                        WorkEstablishmentPhase::AwaitingGenesis,
+                        WorkEstablishmentPhase::AwaitingPlan,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let initial = crate::server::tool_work_lifecycle::execute_start_work(
+                    &make_executor(),
+                    &args,
+                    ToolInvocationMetadata {
+                        run_id: Some(&run_id),
+                        turn_chain_id: Some("activation-turn"),
+                        tool_call_id: Some("prepare-plan"),
+                        admission_source: Some(ToolInvocationAdmissionSource::Policy),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(!initial.is_error, "{}", initial.output);
+            }
+            let before = establishment
+                .load(&owner, &request.operation_id)
+                .await
+                .unwrap();
+            let count = || {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM work_item_attempts WHERE owner_id=?",
+                )
+                .bind(owner.as_str())
+                .fetch_one(pool.get())
+            };
+            assert_eq!(count().await.unwrap(), 0);
+            let executor = Arc::new(make_executor());
+            if warm {
+                assert!(executor.resolve_work_binding().await.unwrap().is_some());
+            } else {
+                assert!(!executor.has_work_binding());
+            }
+            let observations =
+                crate::server::provider_test_support::ProviderObservationsFixture::default();
+            let response = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                "id":"continue-existing-work","type":"function",
+                "function":{"name":"run_next_work_item","arguments":"{}"}
+            }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5}});
+            let mut responses = vec![ProviderResponse::OpenAi(response)];
+            if activation == Defer {
+                responses.push(ProviderResponse::OpenAi(json!({
+                    "choices":[{"message":{"role":"assistant",
+                        "content":"The plan is retained without starting a task."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1}
+                })));
+            }
+            let provider = ProviderGateway::start(vec![ProviderScript::new(
+                "continuation_activation",
+                |request| request.path == "/v1/chat/completions",
+                responses,
+            )])
+            .await;
+            let mut host = test_host_builder(owner.as_str(), session.as_str())
+                .with_pool(pool.clone())
+                .with_provider_observations(observations.clone())
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    format!("{}/v1/chat/completions", provider.base_url),
+                    Some(3000),
+                )))
+                .build();
+            host.skip_implicit_work_recovery();
+            host.turn_intent_policy = TurnIntentExecutionPolicy::Auto;
+            host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
                 assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
                 mutation_completion_scope:
                     astra_config::user_profile::MutationCompletionScope::Unknown,
-                goal: "continue the existing Work".into(),
+                goal: "Observe the current runtime".into(),
                 tasks: vec![astra_services::WorkAdmissionTask {
+                    objective: "Observe the current runtime".into(),
+                    expected_result: "One verified observation".into(),
                     after_initial_tasks: vec![],
-                    objective: "one existing task".into(),
-                    expected_result: "one result".into(),
                 }],
                 deferred_graph_mutations: vec![],
-                activation: astra_services::WorkAdmissionActivation::Start,
+                activation,
                 execution_topology: astra_services::WorkExecutionTopology::Primary,
                 required_capabilities: vec![],
+            });
+            // A prepared graph has settled its handoff, not the current defer policy.
+            if activation == Defer && warm && !pending {
+                host.pending_work_admission
+                    .as_mut()
+                    .unwrap()
+                    .work_handoff_pending = false;
             }
-            .into(),
-        );
-        let mut state = create_durable_execution_test_state(session);
-        state.message = "Continue the existing Work.".into();
-        state.user_intent = state.message.clone();
-        let result = host
-            .execute_turn(&mut state)
-            .await
-            .expect("provider response");
-        assert_eq!(
-            result.accum.tool_calls.len(),
-            1,
-            "{:?}",
-            result.accum.tool_calls
-        );
-        assert_eq!(
-            result.accum.tool_calls[0]["function"]["name"],
-            "run_next_work_item"
-        );
-        assert!(
-            host.pending_work_establishment.is_none(),
-            "no replacement genesis carrier"
-        );
-        observations.assert_quiescent();
-        provider.assert_complete();
+            let mut state = create_durable_execution_test_state(session.as_str());
+            state.current_run_id = Some(run_id.clone());
+            state.canonical_turn_chain_id = Some("activation-turn".into());
+            state.message = if activation == Defer {
+                "Prepare this Work plan only; do not execute it."
+            } else {
+                "Continue the existing Work."
+            }
+            .into();
+            state.user_intent = state.message.clone();
+            state.turn_intent = Some(
+                astra_config::user_profile::TurnIntent::default()
+                    .with_work_lifecycle(WorkLifecycleIntent::Required),
+            );
+            state.runtime_tool_executor = Some(executor.clone());
+            let turn = host.execute_turn(&mut state).await.unwrap();
+            let admission = host.admit_tool_calls(&turn.accum.tool_calls, Some("tool_calls"));
+            if activation == Defer {
+                assert!(
+                    admission.admitted.is_empty(),
+                    "defer warm={warm} pending={pending}"
+                );
+                assert_eq!(admission.rejected.len(), 1);
+                let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+                assert_eq!(rejection["error_kind"], "work_activation_conflict");
+                assert_eq!(
+                    host.pending_work_admission.as_ref().unwrap().activation(),
+                    Defer
+                );
+                assert!(executor.has_work_binding());
+                state.commit_volatile_attempt_lease();
+                state.current_round_index += 1;
+                let acknowledgement = host.execute_turn(&mut state).await.unwrap();
+                assert!(
+                    acknowledgement.accum.tool_calls.is_empty(),
+                    "deferred acknowledgement must not create another Work operation"
+                );
+                assert_eq!(
+                    acknowledgement.accum.full_text,
+                    "The plan is retained without starting a task."
+                );
+                let terminal =
+                    host.admit_tool_calls(&acknowledgement.accum.tool_calls, Some("stop"));
+                assert!(terminal.admitted.is_empty() && terminal.rejected.is_empty());
+            } else {
+                assert_eq!(admission.admitted.len(), 1);
+                assert!(admission.rejected.is_empty());
+                let call = admission.admitted[0].logical_target_call();
+                let name = astra_turn_core::tool::args::shape::tool_call_name(call).unwrap();
+                // Match the shared pipeline's Allowed permission projection
+                // for these owned Work-control invocations.
+                let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                    source:
+                        crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                    reason: None,
+                    updates_hash: None,
+                };
+                let execution = executor
+                    .execute_invocation_before_governance(
+                        &run_id,
+                        "activation-turn",
+                        call["id"].as_str().unwrap(),
+                        name,
+                        &astra_turn_core::tool::args::shape::tool_call_arguments_value(call),
+                        None,
+                        Some(&grant),
+                        Some(
+                            crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                                expected_control_epoch: i64::try_from(
+                                    state.user_intents.user_intent_cursor(),
+                                )
+                                .unwrap(),
+                                expected_owner_generation: state
+                                    .current_run_owner_generation
+                                    .unwrap(),
+                                expected_execution_binding_generation: None,
+                            },
+                        ),
+                        None,
+                        admission.admitted[0].runtime_control_kind(),
+                        false,
+                        None,
+                    )
+                    .await;
+                let governed = crate::server::runtime_tool_executor::govern_runtime_tool_result(
+                    execution.result,
+                    false,
+                );
+                let result = executor
+                    .finish_governed_tool_result(governed, execution.pending)
+                    .await
+                    .result;
+                assert!(
+                    !result.is_error,
+                    "start warm={warm} pending={pending}: {}",
+                    result.output
+                );
+            }
+            assert_eq!(count().await.unwrap(), i64::from(activation == Start));
+            let after = establishment
+                .load(&owner, &request.operation_id)
+                .await
+                .unwrap();
+            if activation == Defer {
+                assert_eq!(after.state, before.state);
+                assert_eq!(after.phase, before.phase);
+                assert_eq!(after.payload_json, before.payload_json);
+            } else {
+                assert_eq!(after.state, WorkEstablishmentState::Complete);
+            }
+            for table in ["works", "work_establishment_operations"] {
+                let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE owner_id=?"
+                )))
+                .bind(owner.as_str())
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+                assert_eq!(total, 1, "no replacement {table}");
+            }
+            state.commit_volatile_attempt_lease();
+            observations.assert_quiescent();
+            provider.assert_complete();
+            eprintln!(
+                "WORK_ACTIVATION_DB activation={activation:?} warm={warm} pending={pending} attempts={}",
+                count().await.unwrap()
+            );
+            crate::server::work_test_support::cleanup_work_owner(&pool, owner.as_str()).await;
+        }
+        pool.close().await;
     }
 
     #[tokio::test]
