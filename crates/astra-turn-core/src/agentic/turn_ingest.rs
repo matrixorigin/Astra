@@ -349,10 +349,11 @@ pub fn ingest_agentic_turn_stream(
                 astra_core::classify_llm_error_message(err)
             }
         };
-        return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
-            kind,
-            err.clone(),
-        ));
+        // Server run errors may already carry the structured kind as a
+        // display prefix. Keep it out of the message so Display adds it once.
+        let prefix = format!("[{}] ", kind.as_str());
+        let message = err.strip_prefix(&prefix).unwrap_or(err);
+        return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(kind, message));
     }
 
     if !round_has_tool_requests {
@@ -1130,32 +1131,37 @@ mod tests {
 
     #[test]
     fn fatal_non_context_resets_ptl_streak() {
-        let err = Some("rate limited".to_string());
-        let snap = AgenticTurnStreamSnapshot {
-            ttft_ms: None,
-            session_id: &None,
-            run_id: &None,
-            full_text: "",
-            tool_calls: &[],
-            server_execution_summary: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            qualified_usage: None,
-            current_request_input_tokens: None,
-            current_request_usage: None,
-            has_usage: false,
-            error_message: &err,
-            error_kind: None,
-        };
-        let mut pack = Pack::new();
-        pack.consecutive_context_window_errors = 4;
-        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
-        assert!(
-            matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "rate limited")
-        );
-        assert_eq!(pack.consecutive_context_window_errors, 0);
+        for (text, expected) in [
+            ("rate limited", "rate limited"),
+            ("[rate_limit] rate limited", "rate limited"),
+            ("[auth] rate limited", "[auth] rate limited"),
+        ] {
+            let err = Some(text.to_string());
+            let snap = AgenticTurnStreamSnapshot {
+                ttft_ms: None,
+                session_id: &None,
+                run_id: &None,
+                full_text: "",
+                tool_calls: &[],
+                server_execution_summary: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                qualified_usage: None,
+                current_request_input_tokens: None,
+                current_request_usage: None,
+                has_usage: false,
+                error_message: &err,
+                error_kind: Some(astra_core::ErrorKind::RateLimit),
+            };
+            let mut pack = Pack::new();
+            pack.consecutive_context_window_errors = 4;
+            let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+            assert!(matches!(out, AgenticTurnIngestOutcome::Fatal(ref e)
+            if e.kind == astra_core::ErrorKind::RateLimit && e.message == expected));
+            assert_eq!(pack.consecutive_context_window_errors, 0);
+        }
     }
 
     #[test]

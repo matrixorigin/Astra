@@ -49,6 +49,17 @@ pub fn summary_evidence_message(message: &Value) -> Option<Value> {
     }))
 }
 
+/// Parse the existing machine-owned history handle grammar. A handle is a
+/// reference only; the artifact reader still enforces owner/session authority.
+pub fn context_history_artifact_handles(text: &str) -> impl Iterator<Item = &str> {
+    let prefix = astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX;
+    text.match_indices(prefix).filter_map(move |(offset, _)| {
+        let handle = text.get(offset..offset + prefix.len() + 36)?;
+        uuid::Uuid::parse_str(&handle[prefix.len()..]).ok()?;
+        Some(handle)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

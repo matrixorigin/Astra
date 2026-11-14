@@ -204,6 +204,11 @@ fn model_check_failures_keep_typed_provider_limits() {
             "subscription_sharing_usage_limit_exceeded",
         ),
         (
+            "rate_limit_exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider_rate_limited",
+        ),
+        (
             "subscription_sharing_usage_unavailable",
             StatusCode::SERVICE_UNAVAILABLE,
             "subscription_sharing_usage_unavailable",
@@ -246,6 +251,38 @@ fn model_check_failures_keep_typed_provider_limits() {
             "upstream code must not reach the public detail"
         );
     }
+}
+
+#[test]
+fn model_check_logs_do_not_include_untrusted_provider_codes() {
+    use std::io::{self, Write};
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || LogWriter(Arc::clone(&writer)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let _ = model_check_failure(&ResponsesStreamError::Provider(Some(
+            "secret-provider-data".into(),
+        )));
+        let _ = model_check_failure(&ResponsesStreamError::Codec("invalid stream framing"));
+    });
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("unrecognized"));
+    assert!(logs.contains("invalid stream framing"));
+    assert!(!logs.contains("secret-provider-data"));
 }
 
 fn service_without_pool() -> Arc<ChatgptConnections> {

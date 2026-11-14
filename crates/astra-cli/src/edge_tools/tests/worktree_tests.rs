@@ -1630,23 +1630,19 @@ async fn a_session_rooted_in_an_existing_manual_worktree_uses_that_root_consiste
         bash.output.trim(),
         checkout.canonicalize().unwrap().to_str().unwrap()
     );
-    let rejected = exe
+    let explicit = exe
         .execute_with_metadata(
             "bash",
-            &json!({"command":"touch never-started", "workdir":repo.path()}),
+            &json!({
+                "command":"touch explicit-workdir-marker", "workdir":repo.path()
+            }),
         )
         .await;
-    assert!(
-        rejected.is_error && rejected.output.contains("session rooted there"),
-        "{rejected:?}"
-    );
-    assert_eq!(
-        rejected.tool_result_fields.unwrap()["execution_started"],
-        false
-    );
-    assert!(
-        !repo.path().join("never-started").exists() && !checkout.join("never-started").exists()
-    );
+    assert!(!explicit.is_error, "{explicit:?}");
+    assert!(repo.path().join("explicit-workdir-marker").exists());
+    assert!(!checkout.join("explicit-workdir-marker").exists());
+    assert_eq!(exe.effective_project_root(), checkout);
+
     remove_preserved_test_worktree(repo.path(), &checkout);
 }
 
@@ -1663,25 +1659,25 @@ async fn session_worktree_is_the_workspace_for_file_tools() {
     std::fs::write(dir.path().join("example.rs"), "fn original_symbol() {}\n").unwrap();
     std::fs::write(active.join("example.rs"), "fn worktree_symbol() {}\n").unwrap();
 
-    // A stale original checkout must be rejected before execution on every
-    // attempt; the error gives the model the actual selected root and remedy.
+    // Explicit cwd uses an existing temporary-directory grant. It must not
+    // redirect the command or change the workspace used by later file tools.
     for _ in 0..2 {
-        let rejected = exe
+        let explicit = exe
             .execute_with_metadata(
                 "bash",
                 &json!({
-                    "command": "touch stale-workdir-marker", "workdir": dir.path()
+                    "command":"pwd -P; touch explicit-workdir-marker", "workdir":dir.path()
                 }),
             )
             .await;
-        assert!(rejected.is_error, "{rejected:?}");
-        assert!(
-            rejected.output.contains(active.to_str().unwrap()),
-            "{rejected:?}"
+        assert!(!explicit.is_error, "{explicit:?}");
+        assert_eq!(
+            explicit.output.trim(),
+            dir.path().canonicalize().unwrap().to_str().unwrap()
         );
-        assert!(rejected.output.contains("no command"), "{rejected:?}");
-        assert!(!dir.path().join("stale-workdir-marker").exists());
-        assert!(!active.join("stale-workdir-marker").exists());
+        assert!(dir.path().join("explicit-workdir-marker").exists());
+        assert!(!active.join("explicit-workdir-marker").exists());
+        assert_eq!(exe.effective_project_root(), active);
     }
 
     let read = exe

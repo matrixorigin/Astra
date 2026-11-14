@@ -4576,15 +4576,17 @@ mod tests {
                 .push(json!({"role":"assistant", "content":"answer"}));
             state.final_text = "answer".into();
             let permit = state.begin_canonical_rewrite();
-            state.messages = crate::turn::cloud::compaction::prepare_prefix_summary(
+            state.messages = crate::turn::cloud::compaction::prepare_conversation_summary(
                 &state.messages,
                 2,
                 astra_turn_core::cloud::history_summary::history_summary_message("summary".into()),
                 0,
                 128_000,
                 None,
+                None,
             )
             .unwrap()
+            .0
             .messages;
             state.finish_canonical_rewrite(permit);
             let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(

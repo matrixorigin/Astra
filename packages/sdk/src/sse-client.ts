@@ -214,7 +214,8 @@ export class SSEClient {
       }
 
       this.options.onStateChange?.('connected');
-      await this.readStream(response.body);
+      await this.readStream(response.body, linkedSignal, heartbeatController);
+      if (linkedSignal.aborted) return;
       if (heartbeatController.signal.aborted && !this.sawTerminalEvent) {
         throw new Error('Heartbeat timeout');
       }
@@ -250,12 +251,15 @@ export class SSEClient {
     this.options.onStateChange?.('disconnected');
   }
 
-  private async readStream(body: ReadableStream<Uint8Array>): Promise<void> {
+  private async readStream(
+    body: ReadableStream<Uint8Array>, signal: AbortSignal, heartbeatController: AbortController,
+  ): Promise<void> {
+    if (signal.aborted) return;
     const reader = body.getReader();
     // Preserve the BOM here; SseDataParser owns removing exactly one leading BOM.
     const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
     const parser = new SseDataParser(
-      (data) => this.processSSEData(data),
+      (data) => { if (!signal.aborted) this.processSSEData(data); },
       this.options.onRawLine,
     );
     let streamFailed = false;
@@ -263,7 +267,7 @@ export class SSEClient {
 
     try {
       this.resetHeartbeatTimer();
-      while (!this.closed) {
+      while (!this.closed && !signal.aborted) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -281,9 +285,12 @@ export class SSEClient {
     } finally {
       parser.push(decoder.decode());
       parser.finish();
-      this.clearHeartbeatTimer();
+      // close() already cleared the cancelled attempt's timer. A replacement
+      // connection may now own the shared timer.
+      if (this.heartbeatController === heartbeatController) this.clearHeartbeatTimer();
       reader.releaseLock();
     }
+    if (signal.aborted) return;
     if (streamFailed && !this.sawTerminalEvent) throw streamError;
     if (this.options.requireTerminalEvent && !this.sawTerminalEvent) {
       throw new Error(
@@ -293,6 +300,9 @@ export class SSEClient {
   }
 
   private processSSEData(data: string): void {
+    // Cancellation can occur in a callback while the parser still holds more
+    // events from the same network chunk, including its final buffered event.
+    if (this.closed || this.options.signal?.aborted) return;
     const event = parseSseEvent(data);
     if (event === undefined) return;
     try {

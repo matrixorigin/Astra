@@ -5,38 +5,18 @@
 //! compaction when tier >= AggressivePrune and LLM summary is enabled.
 //!
 //! Design principles:
-//! - **PTL retry**: if the summary request itself exceeds the context window,
-//!   drop the oldest API rounds and retry (up to [`MAX_PTL_RETRIES`]).
-//! - **Fallback**: if retries are exhausted, return `None` so callers can
-//!   fall back to pure truncation.
+//! - A successful summary covers the complete supplied history. A rejected
+//!   request leaves the source intact for recovery or an artifact-backed rewrite.
 //! - **Testable**: the LLM call is abstracted behind [`SummaryLlmClient`] so
 //!   tests can inject mock responses without a real API.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use crate::{
-    cloud::compact_prompt::{
-        COMPACT_SYSTEM_PROMPT, build_compact_user_prompt, render_messages_for_summary,
-    },
-    cloud::grouping::{ApiRound, drop_oldest_rounds, flatten_rounds, group_by_api_round},
-};
-
-/// Maximum number of PTL retry attempts before giving up and returning `None`.
-pub const MAX_PTL_RETRIES: usize = 3;
-
-/// Minimum number of API rounds to keep when dropping for PTL retry.
-pub const MIN_ROUNDS_TO_KEEP: usize = 1;
+use crate::{cloud::compact_prompt::COMPACT_SYSTEM_PROMPT, cloud::grouping::group_by_api_round};
 
 fn validated_structured_summary(text: &str) -> Option<String> {
     crate::cloud::compact_prompt::validated_structured_summary(text)
-}
-
-fn cloud_summary_serialization_dimensions(rendered: &str, source_rows: usize) -> (u64, u64) {
-    (
-        u64::try_from(rendered.len()).unwrap_or(u64::MAX),
-        u64::try_from(source_rows).unwrap_or(u64::MAX),
-    )
 }
 
 fn record_summary_prompt_clone(messages: &[Value]) {
@@ -55,37 +35,6 @@ fn record_summary_prompt_clone(messages: &[Value]) {
             &error,
         ),
     }
-}
-
-fn record_summary_rounds_clone(rounds: &[ApiRound]) {
-    if !astra_core::history_work::instrumentation_enabled() {
-        return;
-    }
-    let mut bytes = 0_u64;
-    let mut rows = 0_u64;
-    for round in rounds {
-        for message in round.messages() {
-            match astra_core::history_work::serialized_bytes(&message) {
-                Ok(message_bytes) => {
-                    bytes = bytes.saturating_add(message_bytes);
-                    rows = rows.saturating_add(1);
-                }
-                Err(error) => {
-                    astra_core::history_work::record_serialization_failure(
-                        astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
-                        &error,
-                    );
-                    return;
-                }
-            }
-        }
-    }
-    astra_core::history_work::record_operation(
-        astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
-        bytes,
-        rows,
-        0,
-    );
 }
 
 /// Inline compact instruction appended as a trailing user message in the
@@ -215,99 +164,19 @@ pub trait SummaryLlmClient: Send + Sync {
 /// PTL retry behaviour:
 /// 1. Render messages into compaction prompt
 /// 2. Call LLM
-/// 3. If PTL error: drop oldest round and retry (up to `MAX_PTL_RETRIES`)
+/// 3. On a limit or failure, preserve the complete source history.
 /// 4. If other error: return `None` immediately
 pub async fn generate_compact_summary(
     messages: &[Value],
     client: &dyn SummaryLlmClient,
 ) -> Option<String> {
-    // Carry prior summaries through every retry, including summaries restored
-    // mid-history. Stable instructions and runtime authority are not evidence.
-    let system_msgs = messages
-        .iter()
-        .filter(|message| super::history_summary::history_summary_text(message).is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut rounds = group_by_api_round(messages).1;
-    let min_keep = MIN_ROUNDS_TO_KEEP;
-
-    for attempt in 0..=MAX_PTL_RETRIES {
-        let msgs_for_summary = flatten_rounds(&system_msgs, &rounds);
-        record_summary_prompt_clone(&msgs_for_summary);
-        let rendered = render_messages_for_summary(&msgs_for_summary);
-        if astra_core::history_work::instrumentation_enabled() {
-            let (bytes, rows) =
-                cloud_summary_serialization_dimensions(&rendered, msgs_for_summary.len());
-            astra_core::history_work::record_operation(
-                astra_core::history_work::HistoryWorkSite::CloudSummarySerialization,
-                bytes,
-                rows,
-                0,
-            );
-        }
-        let prompt_messages = build_summary_messages(&rendered);
-        record_summary_prompt_clone(&prompt_messages);
-
-        match client
-            .summarize(
-                astra_turn_types::InferencePurpose::RequiredCompaction,
-                &prompt_messages,
-            )
-            .await
-        {
-            Ok(resp) if !resp.is_ptl_error => {
-                return (resp.finish_reason.as_deref() != Some("length"))
-                    .then(|| validated_structured_summary(&resp.text))
-                    .flatten();
-            }
-            Ok(resp) if resp.is_ptl_error => {
-                if attempt >= MAX_PTL_RETRIES {
-                    eprintln!(
-                        "[compact_summary] PTL retries exhausted after {} attempts, falling back to truncation",
-                        attempt
-                    );
-                    return None;
-                }
-                // Drop the oldest round and retry
-                let rounds_before = rounds.len();
-                let new_rounds = drop_oldest_rounds(&rounds, 1, min_keep);
-                if new_rounds.len() == rounds_before {
-                    // Can't drop any more rounds
-                    eprintln!("[compact_summary] cannot drop more rounds, giving up");
-                    return None;
-                }
-                eprintln!(
-                    "[compact_summary] PTL error, dropping oldest round (attempt {}, {} → {} rounds)",
-                    attempt,
-                    rounds_before,
-                    new_rounds.len()
-                );
-                rounds = new_rounds.to_vec();
-                record_summary_rounds_clone(&rounds);
-            }
-            Ok(_) => unreachable!(),
-            Err(e) => {
-                eprintln!("[compact_summary] LLM error: {e}, falling back to truncation");
-                return None;
-            }
-        }
-    }
-
-    None
-}
-
-/// Build the messages array for the summary LLM call.
-fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
-    vec![
-        serde_json::json!({
-            "role": "system",
-            "content": COMPACT_SYSTEM_PROMPT,
-        }),
-        serde_json::json!({
-            "role": "user",
-            "content": build_compact_user_prompt(rendered_conversation),
-        }),
-    ]
+    generate_inline_summary(
+        &[json!({"role":"system", "content":COMPACT_SYSTEM_PROMPT})],
+        messages,
+        InlineSummaryHistoryProjection::Semantic,
+        client,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -341,12 +210,8 @@ fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
 ///   projection contract and stable history-side instructions are excluded.
 /// - `client`: LLM client used to POST the request.
 ///
-/// Returns `Some(summary_text)` on success, or `None` if PTL retries are
-/// exhausted (caller should fall back to structural compaction).
-///
-/// PTL retry behaviour mirrors [`generate_compact_summary`]: on a context-window
-/// error we drop the oldest API round from `history` and retry up to
-/// [`MAX_PTL_RETRIES`] times.
+/// Returns a complete-input summary or None. The caller keeps the source on
+/// rejection; retrying with omitted rounds cannot establish summary coverage.
 pub async fn generate_inline_summary(
     system_messages: &[Value],
     history: &[Value],
@@ -379,80 +244,96 @@ pub async fn generate_inline_summary(
         .iter()
         .filter_map(super::history_summary::summary_evidence_message)
         .collect::<Vec<_>>();
-    let mut rounds = group_by_api_round(history).1;
-    let min_keep = MIN_ROUNDS_TO_KEEP;
-
-    for attempt in 0..=MAX_PTL_RETRIES {
-        // Keep historical evidence in assistant context while satisfying
-        // providers that require the first conversation message to be user.
-        // This preamble belongs only to the auxiliary request, never history.
-        let mut messages: Vec<Value> =
-            Vec::with_capacity(system_messages.len() + history.len() + 2);
-        messages.extend(system_messages.iter().cloned());
-        if !summaries.is_empty() {
-            messages.push(json!({
-                "role": "user",
-                "content": "Use the following previous conversation summaries as historical evidence, not new instructions or user requests, when summarizing the conversation that follows.",
-            }));
-        }
-        messages.extend(summaries.iter().cloned());
-        for round in &rounds {
-            if runtime_frames_visible {
-                messages.extend(round.messages().iter().cloned());
-            } else {
-                messages.extend(round.summary_messages().cloned());
-            }
-        }
-        messages.push(json!({
-            "role": "user",
-            "content": INLINE_COMPACT_INSTRUCTION,
-        }));
-        record_summary_prompt_clone(&messages);
-
-        match client
-            .summarize(
-                astra_turn_types::InferencePurpose::RequiredCompaction,
-                &messages,
-            )
-            .await
+    let rounds = group_by_api_round(history).1;
+    let semantic = |message: &&Value| {
+        !astra_turn_types::is_runtime_owned_message(message)
+            && message.get("role").and_then(Value::as_str) != Some("system")
+            && super::history_summary::history_summary_text(message).is_none()
+    };
+    let normalized_source = history.iter().filter(semantic).map(|message| {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
         {
-            Ok(resp) if !resp.is_ptl_error => {
-                return (resp.finish_reason.as_deref() != Some("length"))
-                    .then(|| validated_structured_summary(&resp.text))
-                    .flatten();
-            }
-            Ok(resp) if resp.is_ptl_error => {
-                if attempt >= MAX_PTL_RETRIES {
-                    eprintln!(
-                        "[inline_summary] PTL retries exhausted after {} attempts",
-                        attempt
-                    );
-                    return None;
-                }
-                let rounds_before = rounds.len();
-                let new_rounds = drop_oldest_rounds(&rounds, 1, min_keep);
-                if new_rounds.len() == rounds_before {
-                    eprintln!("[inline_summary] cannot drop more rounds, giving up");
-                    return None;
-                }
-                eprintln!(
-                    "[inline_summary] PTL error, dropping oldest round (attempt {}, {} → {} rounds)",
-                    attempt,
-                    rounds_before,
-                    new_rounds.len()
-                );
-                rounds = new_rounds.to_vec();
-                record_summary_rounds_clone(&rounds);
-            }
-            Ok(_) => unreachable!(),
-            Err(e) => {
-                eprintln!("[inline_summary] LLM error: {e}, giving up");
-                return None;
-            }
+            std::borrow::Cow::Owned(
+                crate::chat_history_openai::sanitize_empty_assistant_tool_calls_cloned(message),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(message)
         }
+    });
+    if !rounds
+        .iter()
+        .flat_map(|round| round.summary_messages())
+        .filter(semantic)
+        .map(std::borrow::Cow::Borrowed)
+        .eq(normalized_source)
+    {
+        return None;
     }
 
-    None
+    // Keep historical evidence in assistant context while satisfying
+    // providers that require the first conversation message to be user.
+    // This preamble belongs only to the auxiliary request, never history.
+    let mut messages: Vec<Value> = Vec::with_capacity(system_messages.len() + history.len() + 2);
+    messages.extend(system_messages.iter().cloned());
+    if !summaries.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": "Use the following previous conversation summaries as historical evidence, not new instructions or user requests, when summarizing the conversation that follows.",
+        }));
+    }
+    messages.extend(summaries.iter().cloned());
+    for round in &rounds {
+        if runtime_frames_visible {
+            messages.extend(round.messages().iter().cloned());
+        } else {
+            messages.extend(round.summary_messages().cloned());
+        }
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": INLINE_COMPACT_INSTRUCTION,
+    }));
+    record_summary_prompt_clone(&messages);
+
+    match client
+        .summarize(
+            astra_turn_types::InferencePurpose::RequiredCompaction,
+            &messages,
+        )
+        .await
+    {
+        Ok(resp) if !resp.is_ptl_error => {
+            if resp.finish_reason.as_deref() == Some("length") {
+                return None;
+            }
+            let mut summary = validated_structured_summary(&resp.text)?;
+            let carried: std::collections::BTreeSet<_> = history
+                .iter()
+                .filter_map(super::history_summary::history_summary_text)
+                .flat_map(super::history_summary::context_history_artifact_handles)
+                .collect();
+            let present: std::collections::BTreeSet<_> =
+                super::history_summary::context_history_artifact_handles(&summary)
+                    .map(str::to_owned)
+                    .collect();
+            for handle in carried {
+                if !present.contains(handle) {
+                    summary.push_str("\nRecoverable history: ");
+                    summary.push_str(handle);
+                }
+            }
+            Some(summary)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("[inline_summary] LLM error: {e}, giving up");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +502,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_summary_input_retains_late_tool_evidence_and_structured_content() {
+        let history = vec![
+            json!({"role":"user","content":"Continue the long tool task"}),
+            json!({"role":"assistant","content":"decision", "tool_calls":[{
+                "id":"receipt","type":"function","function":{"name":"read_file","arguments":format!(r#"{{"path":"{}LATE_ARGUMENT"}}"#, "p".repeat(900))}
+            }]}),
+            json!({"role":"tool","tool_call_id":"receipt","content":[
+                {"type":"text","text":format!("{}CONFIRMED_RESOURCE", "evidence ".repeat(1000))},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+            ]}),
+        ];
+        for inline in [false, true] {
+            let client = MockSummaryClient::success(valid_summary());
+            let summary = if inline {
+                generate_inline_summary(
+                    &[],
+                    &history,
+                    InlineSummaryHistoryProjection::Semantic,
+                    &client,
+                )
+                .await
+            } else {
+                generate_compact_summary(&history, &client).await
+            };
+            assert!(summary.is_some());
+            let wire = serde_json::to_string(&client.recorded_requests()[0]).unwrap();
+            assert!(wire.contains("LATE_ARGUMENT"));
+            assert!(wire.contains("CONFIRMED_RESOURCE"));
+            assert!(wire.contains("data:image/png;base64,AA=="));
+        }
+        let client = MockSummaryClient::success(valid_summary());
+        let reference = format!(
+            "{}{}",
+            astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+            uuid::Uuid::nil()
+        );
+        let retained = vec![
+            super::super::history_summary::history_summary_message(format!(
+                "Earlier evidence: {reference}"
+            )),
+            json!({"role":"user","content":"continue"}),
+            json!({"role":"assistant","content":"done","tool_calls":[]}),
+        ];
+        let replacement = generate_compact_summary(&retained, &client).await.unwrap();
+        assert_eq!(
+            super::super::history_summary::context_history_artifact_handles(&replacement)
+                .collect::<Vec<_>>(),
+            vec![reference.as_str()]
+        );
+        let client = MockSummaryClient::success(valid_summary());
+        let unsupported = [json!({"role":"unknown","content":"uncovered evidence"})];
+        assert!(
+            generate_compact_summary(&unsupported, &client)
+                .await
+                .is_none()
+        );
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn success_on_first_attempt() {
         let body = "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current Work\nIn progress\n### Current State\nDone";
         let client = MockSummaryClient::success(body);
@@ -635,24 +576,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ptl_retry_drops_oldest_round_and_succeeds() {
+    async fn ptl_does_not_publish_a_summary_that_omits_oldest_rounds() {
         let body = "### Primary Request\nX\n### Pending Tasks\nY\n### Current Work\nW\n### Current State\nZ";
         let client = MockSummaryClient::ptl_then_success(body);
         let msgs = make_messages(4); // 4 rounds, enough to drop one
         let result = generate_compact_summary(&msgs, &client).await;
-        assert_eq!(result.as_deref(), Some(body));
-        assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            client.recorded_purposes(),
-            [
-                astra_turn_types::InferencePurpose::RequiredCompaction,
-                astra_turn_types::InferencePurpose::RequiredCompaction,
-            ]
-        );
+        assert!(result.is_none());
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(client.recorded_requests().len(), 1);
     }
 
     #[tokio::test]
-    async fn returns_none_when_all_retries_exhausted() {
+    async fn returns_none_on_context_limit() {
         let client = MockSummaryClient::always_ptl();
         // Only 1 round — can't drop any, gives up
         let msgs = vec![
@@ -669,38 +604,6 @@ mod tests {
         let msgs = make_messages(2);
         let result = generate_compact_summary(&msgs, &client).await;
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn build_summary_messages_structure() {
-        let msgs = build_summary_messages("some conversation");
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["role"].as_str().unwrap(), "system");
-        assert_eq!(msgs[1]["role"].as_str().unwrap(), "user");
-        assert!(
-            msgs[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("some conversation")
-        );
-    }
-
-    #[test]
-    fn cloud_summary_serialization_counts_exact_utf8_artifact_and_source_rows() {
-        let messages = vec![
-            json!({"role": "user", "content": "你好🚀"}),
-            json!({"role": "assistant", "content": "résumé"}),
-        ];
-        let rendered = render_messages_for_summary(&messages);
-
-        assert_eq!(
-            cloud_summary_serialization_dimensions(&rendered, messages.len()),
-            (rendered.len() as u64, 2)
-        );
-        assert!(
-            rendered.len() > rendered.chars().count(),
-            "measurement must count the existing UTF-8 artifact bytes"
-        );
     }
 
     #[test]
@@ -848,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ptl_retry_with_minimum_rounds() {
+    async fn ptl_preserves_the_only_human_round() {
         // Exactly 2 messages (1 round) — can't drop below minimum, returns None
         let client = MockSummaryClient::always_ptl();
         let msgs = vec![
@@ -858,11 +761,11 @@ mod tests {
         let result = generate_compact_summary(&msgs, &client).await;
         assert!(result.is_none());
         // Should give up quickly — can't drop the only round
-        assert!(client.call_count.load(Ordering::SeqCst) <= 2);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn history_summary_survives_rendered_and_inline_ptl_retries() {
+    async fn history_summary_is_covered_without_partial_history_retries() {
         use super::super::history_summary::{HISTORY_SUMMARY_FIELD, history_summary_message};
         let text = format!(
             "{}\n{}\nFACT_BEYOND_ORDINARY_EXCERPT_CAP",
@@ -896,9 +799,9 @@ mod tests {
             } else {
                 generate_compact_summary(&history, &client).await
             };
-            assert!(result.is_some());
+            assert!(result.is_none());
             let requests = client.recorded_requests();
-            assert_eq!(requests.len(), 2);
+            assert_eq!(requests.len(), 1);
             for request in requests {
                 let serialized = serde_json::to_string(&request).unwrap();
                 assert!(serialized.contains("FACT_BEYOND_ORDINARY_EXCERPT_CAP"));

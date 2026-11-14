@@ -4,13 +4,16 @@ use crate::path::{canonicalize_parent_and_append, normalize_path};
 use std::path::{Path, PathBuf};
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
+    if let Ok(path) = canonicalize_parent_and_append(&path)
+        && !paths.iter().any(|existing| existing == &path)
+    {
         paths.push(path);
     }
 }
 
 fn default_temp_allowed_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("/tmp")];
+    let mut paths = Vec::new();
+    push_unique_path(&mut paths, PathBuf::from("/tmp"));
     push_unique_path(&mut paths, normalize_path(&std::env::temp_dir()));
     paths
 }
@@ -27,6 +30,75 @@ pub enum IsolationLevel {
     Standard,
     /// Full isolation: Standard + restricted shell.
     Strict,
+}
+
+/// An existing path selected by the denying validator. The live handle binds
+/// an approval wait to that object; it is never wire authority.
+#[derive(Debug, Clone)]
+pub struct SandboxApprovalScope {
+    path: PathBuf,
+    handle: std::sync::Arc<same_file::Handle>,
+}
+
+impl SandboxApprovalScope {
+    pub fn for_directory(path: &Path) -> std::io::Result<Self> {
+        let scope = Self::for_existing_path(path)?;
+        if !scope.path.is_dir() {
+            return Err(std::io::Error::other(
+                "sandbox approval requires an existing directory",
+            ));
+        }
+        Ok(scope)
+    }
+
+    /// Explicit file tools may also bind an existing exact-file grant.
+    pub fn for_existing_path(path: &Path) -> std::io::Result<Self> {
+        if !path.is_absolute() || is_never_readable_path(path) || path.to_str().is_none() {
+            return Err(std::io::Error::other(
+                "sandbox approval requires an exactly representable safe path",
+            ));
+        }
+        let path = path.canonicalize()?;
+        if path.parent().is_none() || is_never_readable_path(&path) || path.to_str().is_none() {
+            return Err(std::io::Error::other(
+                "sandbox approval requires a safe existing path",
+            ));
+        }
+        let handle = std::sync::Arc::new(same_file::Handle::from_path(&path)?);
+        let scope = Self { path, handle };
+        scope.verify()?;
+        Ok(scope)
+    }
+
+    /// A concrete leaf may authorize its existing parent. Missing directory
+    /// chains never widen to the nearest existing ancestor.
+    pub fn for_target(path: &Path) -> Option<Self> {
+        let path = canonicalize_parent_and_append(path).ok()?;
+        if is_never_readable_path(&path) {
+            return None;
+        }
+        let dir = if path.is_dir() {
+            path.as_path()
+        } else {
+            path.parent()?
+        };
+        Self::for_directory(dir).ok()
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn verify(&self) -> std::io::Result<()> {
+        if self.path.canonicalize()? != self.path
+            || same_file::Handle::from_path(&self.path)? != *self.handle
+        {
+            return Err(std::io::Error::other(
+                "sandbox approval directory changed; no grant was added",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Configurable security policy for tool execution.
@@ -49,7 +121,10 @@ pub struct SandboxPolicy {
 
     /// Additional allowed path prefixes (e.g., /tmp, ~/.config).
     /// Paths outside project_root AND these prefixes are rejected.
-    pub allowed_paths: Vec<PathBuf>,
+    // Stored canonical prefixes never follow a later replacement symlink.
+    // Deserialization preserves these frozen values, including old aliases
+    // that now fail closed; restoring a policy must not mint a new grant.
+    allowed_paths: Vec<PathBuf>,
 
     /// Environment variable allowlist. When set, only these vars (plus
     /// a safe baseline) are passed to child processes.
@@ -352,6 +427,60 @@ fn is_always_denied_env_key(key: &str) -> bool {
 }
 
 impl SandboxPolicy {
+    pub fn clear_allowed_paths(&mut self) {
+        self.allowed_paths.clear();
+    }
+
+    /// Resolve a configured grant once, before it enters the policy.
+    pub fn add_allowed_path(&mut self, path: &Path) -> Result<PathBuf, crate::SandboxPathError> {
+        let path = canonicalize_parent_and_append(path)?;
+        self.add_canonical_allowed_path(path)
+    }
+
+    /// For owners that have already resolved and checked the configured path.
+    pub fn add_canonical_allowed_path(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<PathBuf, crate::SandboxPathError> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(crate::SandboxPathError::ResolutionFailed {
+                requested: path.display().to_string(),
+                reason: "expected a canonical absolute grant".into(),
+            });
+        }
+        if is_never_readable_path(&path) {
+            return Err(crate::SandboxPathError::SensitivePath {
+                requested: path.display().to_string(),
+            });
+        }
+        if !self.allowed_paths.contains(&path) {
+            self.allowed_paths.push(path.clone());
+        }
+        Ok(path)
+    }
+
+    pub fn set_allowed_paths(&mut self, paths: &[PathBuf]) -> Result<(), crate::SandboxPathError> {
+        let paths = paths
+            .iter()
+            .map(|path| canonicalize_parent_and_append(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.allowed_paths = paths;
+        Ok(())
+    }
+
+    /// Commit a previously bound scope without resolving its prefix again.
+    pub fn add_approved_scope(&mut self, scope: &SandboxApprovalScope) -> std::io::Result<()> {
+        scope.verify()?;
+        if !self.allowed_paths.contains(&scope.path) {
+            self.allowed_paths.push(scope.path.clone());
+        }
+        Ok(())
+    }
+
     /// Create a policy for a project directory with Standard isolation defaults.
     pub fn for_project(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
@@ -452,10 +581,10 @@ impl SandboxPolicy {
 
     pub(crate) fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         self.is_within_project_root(resolved)
-            || self.allowed_paths.iter().any(|prefix| {
-                canonicalize_parent_and_append(prefix)
-                    .is_ok_and(|prefix| resolved.starts_with(prefix))
-            })
+            || self
+                .allowed_paths
+                .iter()
+                .any(|prefix| resolved.starts_with(prefix))
     }
 
     /// Additional absolute grants cannot authorize relative workspace escapes.
@@ -754,5 +883,47 @@ mod tests {
         assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.env")));
         assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.kube/config")));
         assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.npmrc")));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn frozen_configured_and_serialized_grants_do_not_follow_replacement_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let allowed = tmp.path().join("allowed");
+        let other = tmp.path().join("other");
+        for path in [&project, &allowed, &other] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut policy = SandboxPolicy::for_project(&project);
+        policy.clear_allowed_paths();
+        policy.add_allowed_path(&allowed).unwrap();
+        assert!(policy.is_path_allowed(&allowed.join("future")));
+        let saved = serde_json::to_string(&policy).unwrap();
+        std::fs::rename(&allowed, tmp.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(&other, &allowed).unwrap();
+        let restored: SandboxPolicy = serde_json::from_str(&saved).unwrap();
+        for policy in [&policy, &restored] {
+            assert!(!policy.is_path_allowed(&allowed.join("future")));
+            assert!(!policy.is_path_allowed(&other.join("future")));
+        }
+        // Ordinary replacement retains the documented path-permission contract.
+        std::fs::remove_file(&allowed).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        assert!(policy.is_path_allowed(&allowed.join("future")));
+        // Exact-file configured grants retain their narrow scope.
+        let file = other.join("tool");
+        std::fs::write(&file, "runtime").unwrap();
+        policy.add_allowed_path(&file).unwrap();
+        assert!(policy.is_path_allowed(&file));
+        assert!(!policy.is_path_allowed(&other.join("sibling")));
+    }
+
+    #[test]
+    fn approval_scope_never_selects_an_ancestor_of_a_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            super::SandboxApprovalScope::for_target(&tmp.path().join("missing/leaf")).is_none()
+        );
+        assert!(super::SandboxApprovalScope::for_target(&tmp.path().join("new-leaf")).is_some());
     }
 }

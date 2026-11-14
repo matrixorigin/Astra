@@ -358,6 +358,8 @@ const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
 const RAW_GLOB_OUTPUT_LIMIT: usize = 120_000;
+// The fallback needs a complete input list, not the smaller display budget.
+const SEARCH_FILE_LIST_LIMIT: usize = 8 * 1024 * 1024;
 const RAW_STDERR_OUTPUT_LIMIT: usize = 16_000;
 
 const DEFAULT_SEARCH_EXCLUDE_DIRS: &[&str] = &[
@@ -451,6 +453,7 @@ struct SearchResultGroup {
 #[derive(Clone)]
 struct SearchIgnoreRule {
     pattern: String,
+    regex: Regex,
     negated: bool,
 }
 
@@ -759,6 +762,42 @@ impl PreparedBashWorkdir {
         )
     }
 
+    /// Resolve the pinned identity's current label without trusting a replaced path.
+    pub fn verified_path(&self) -> Result<PathBuf, String> {
+        #[cfg(unix)]
+        return self.inspection().working_directory_path()
+            .map_err(|error| format!("Error: cannot identify the pinned bash working directory: {error}; no command was run"));
+        #[cfg(not(unix))]
+        Ok(self.path.clone())
+    }
+
+    /// Recheck existing workspace and cwd authority at the launch checkpoint.
+    pub fn validate_for_launch(
+        &self,
+        workspace_root: &Path,
+        local_policy: Option<&astra_sandbox::SandboxPolicy>,
+    ) -> Result<(), String> {
+        let root = workspace_root.canonicalize().map_err(|error| {
+            format!("Error: selected workspace is unavailable: {error}; no command was run")
+        })?;
+        #[cfg(unix)]
+        if !self.inspection().matches_root_path(&root).unwrap_or(false) {
+            return Err(
+                "Error: the selected workspace changed before execution; no command was run".into(),
+            );
+        }
+        let current = self.verified_path()?;
+        if self.path.starts_with(&root)
+            && !current.starts_with(&root)
+            && local_policy
+                .is_none_or(|policy| policy.isolation != astra_sandbox::IsolationLevel::Permissive)
+        {
+            return Err("Error: the pinned working directory moved outside its workspace before execution; no command was run".into());
+        }
+        validate_bash_workdir_authority(&root, &self.path, &current, local_policy)
+            .map_err(|error| error.to_string())
+    }
+
     /// Pin this prepared identity into the shared process-isolation executor.
     pub fn install_on_isolation_config(&self, config: &mut astra_sandbox::IsolationConfig) {
         config.working_dir = self.path.clone();
@@ -811,14 +850,42 @@ impl PreparedBashWorkdir {
 #[cfg(unix)]
 use astra_sandbox::{open_directory_beneath, open_filesystem_root};
 
-/// Resolve one Bash invocation's execution directory without changing the
-/// workspace authority boundary. The directory must already exist and its
-/// canonical path must remain beneath the canonical workspace root, which
-/// rejects traversal and symlink escapes before a process is spawned.
+#[derive(Debug)]
+pub struct BashWorkdirError {
+    pub message: String,
+    pub approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
+}
+
+impl From<String> for BashWorkdirError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            approval_scope: None,
+        }
+    }
+}
+impl std::fmt::Display for BashWorkdirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for BashWorkdirError {}
+
+impl std::ops::Deref for BashWorkdirError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Resolve and pin one invocation's cwd independently of the selected
+/// workspace. `None` keeps generic/Server execution workspace-only. Local
+/// callers supply their existing sandbox policy; a cwd never adds a grant.
 pub fn resolve_bash_workdir(
     workspace_root: &Path,
     args: &Value,
-) -> Result<PreparedBashWorkdir, String> {
+    local_policy: Option<&astra_sandbox::SandboxPolicy>,
+) -> Result<PreparedBashWorkdir, BashWorkdirError> {
     let requested = args
         .get("workdir")
         .map(|value| {
@@ -829,7 +896,11 @@ pub fn resolve_bash_workdir(
         .transpose()?
         .unwrap_or(".");
     if requested.trim().is_empty() {
-        return Err("Error: bash `workdir` must not be empty; no command was run".to_string());
+        return Err(
+            "Error: bash `workdir` must not be empty; no command was run"
+                .to_string()
+                .into(),
+        );
     }
 
     let canonical_root = workspace_root.canonicalize().map_err(|error| {
@@ -848,14 +919,15 @@ pub fn resolve_bash_workdir(
     if !resolved.is_dir() {
         return Err(format!(
             "Error: bash `workdir` `{requested}` is not a directory; no command was run"
-        ));
+        )
+        .into());
     }
-    if !resolved.starts_with(&canonical_root) {
-        return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
-            workspace_root.display()
-        ));
-    }
+    validate_bash_workdir_authority(
+        &canonical_root,
+        Path::new(requested),
+        &resolved,
+        local_policy,
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -874,16 +946,19 @@ pub fn resolve_bash_workdir(
                     "Error: cannot pin workspace root for bash `workdir`: {error}; no command was run"
                 )
             })?;
-        let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
-            format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside the active workspace root '{}'; no command was run. `workdir` only chooses a directory inside the selected workspace. For an existing worktree outside this root, start or select a CLI/User Runner session rooted there. The `worktree` tool with action `enter` creates and selects a new worktree; action `exit` returns to the original workspace.",
-                workspace_root.display()
-            )
-        })?;
-        let directory = open_directory_beneath(&root_directory, relative).map_err(|error| {
-            format!(
-                "Error: cannot pin bash `workdir` `{requested}` beneath workspace root: {error}; no command was run"
-            )
+        // Workspace-only callers retain the original descriptor-relative
+        // confinement even if the workspace path changes during preparation.
+        let (anchor, relative) = match resolved.strip_prefix(&canonical_root) {
+            Ok(relative) => (&root_directory, relative),
+            Err(_) => (
+                &filesystem_root,
+                resolved.strip_prefix("/").map_err(|_| {
+                    "Error: canonical bash workdir is not absolute; no command was run".to_string()
+                })?,
+            ),
+        };
+        let directory = open_directory_beneath(anchor, relative).map_err(|error| {
+            format!("Error: cannot pin bash `workdir` `{requested}`: {error}; no command was run")
         })?;
         let metadata = directory.metadata().map_err(|error| {
             format!(
@@ -907,7 +982,7 @@ pub fn resolve_bash_workdir(
         if resolved != canonical_root {
             return Err(
                 "Error: call-scoped subdirectory workdir requires pinned-directory support on this platform; no command was run"
-                    .to_string(),
+                    .to_string().into(),
             );
         }
         Ok(PreparedBashWorkdir {
@@ -915,6 +990,52 @@ pub fn resolve_bash_workdir(
             path: resolved,
         })
     }
+}
+
+fn validate_bash_workdir_authority(
+    workspace_root: &Path,
+    requested: &Path,
+    resolved: &Path,
+    local_policy: Option<&astra_sandbox::SandboxPolicy>,
+) -> Result<(), BashWorkdirError> {
+    let inside = resolved.starts_with(workspace_root);
+    let allowed = local_policy.map_or(inside, |policy| {
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace_root.join(requested)
+        };
+        policy.is_path_allowed(&candidate)
+            && policy.is_path_allowed(resolved)
+            && (inside
+                || requested.is_absolute()
+                || policy.isolation == astra_sandbox::IsolationLevel::Permissive)
+    });
+    if !allowed {
+        let action = if local_policy.is_some()
+            && !astra_sandbox::is_never_readable_path(requested)
+            && !astra_sandbox::is_never_readable_path(resolved)
+        {
+            "Use an authorized existing directory or request access through the existing permission controls."
+        } else {
+            "Use an existing directory inside the active workspace."
+        };
+        return Err(BashWorkdirError {
+            approval_scope: local_policy
+                .filter(|_| {
+                    requested.is_absolute()
+                        && !astra_sandbox::is_never_readable_path(requested)
+                        && !astra_sandbox::is_never_readable_path(resolved)
+                })
+                .and_then(|_| astra_sandbox::SandboxApprovalScope::for_directory(resolved).ok()),
+            message: format!(
+                "SANDBOX_DENIED: bash `workdir` `{}` is not authorized by the current workspace policy (active workspace root '{}'); no command was run. {action} Omit `workdir` to use the active workspace. Changing `workdir` does not select another session workspace.",
+                requested.display(),
+                workspace_root.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Attach the canonical model-visible execution-directory evidence shared by
@@ -1032,9 +1153,9 @@ pub async fn execute_bash_with_environment(
                 .to_string(),
         );
     }
-    let workdir = match resolve_bash_workdir(&ctx.workspace_root, args) {
+    let workdir = match resolve_bash_workdir(&ctx.workspace_root, args, None) {
         Ok(workdir) => workdir,
-        Err(error) => return ToolResult::error(error),
+        Err(error) => return ToolResult::error(error.to_string()),
     };
     execute_bash_with_environment_at_workdir(ctx, args, environment, &workdir).await
 }
@@ -1780,13 +1901,16 @@ pub async fn grep_at_authorized_path(
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
     };
+    let stdout = complete_search_records(&stdout, stdout_capped || timed_out || cancelled, '\n');
 
     if exit_code == 1 && stdout.trim().is_empty() {
-        let output = if stderr.trim().is_empty() {
-            "No matches found".into()
-        } else {
-            format!("No matches found (warnings: {})", stderr.trim())
-        };
+        let output = no_visible_results_message(
+            "matches",
+            timed_out,
+            cancelled,
+            stdout_capped,
+            stderr.trim(),
+        );
         return search_process_result(output, exit_code, timed_out, cancelled);
     }
 
@@ -1823,7 +1947,7 @@ pub async fn grep_at_authorized_path(
             .collect::<Vec<_>>()
             .join("\n")
     } else {
-        stdout
+        stdout.to_string()
     };
 
     // Count mode with all-zero results should report as no matches (exit 1)
@@ -1950,6 +2074,16 @@ pub async fn grep_at_authorized_path(
     search_process_result(result_text, exit_code, timed_out, cancelled)
 }
 
+fn complete_search_records(output: &str, incomplete: bool, delimiter: char) -> &str {
+    if incomplete && !output.ends_with(delimiter) {
+        output
+            .rsplit_once(delimiter)
+            .map_or("", |(complete, _)| complete)
+    } else {
+        output
+    }
+}
+
 fn search_process_result(
     output: String,
     exit_code: i32,
@@ -2074,15 +2208,29 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         };
     }
 
+    // A capped or interrupted listing may end in the middle of a filename.
+    let stdout = complete_search_records(&stdout, stdout_capped || timed_out || cancelled, '\0');
+    let pattern_regex = match glob_pattern_regex(&pattern) {
+        Ok(regex) => regex,
+        Err(error) => return ToolResult::error(error),
+    };
     let mut files: Vec<String> = stdout
-        .lines()
+        .split('\0')
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
-        .filter(|line| glob_matches_path(&pattern, line))
+        .filter(|line| glob_regex_matches_path(&pattern, &pattern_regex, line))
         .filter(|line| {
             !should_ignore_search_path_in_scope(workspace_root, &target, line, &ignore_rules)
         })
         .collect();
+    if files
+        .iter()
+        .any(|path| path.contains('\n') || path.contains('\r') || path.contains('\u{fffd}'))
+    {
+        return ToolResult::error(
+            "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
+        );
+    }
     let gitignored_paths = match load_gitignored_search_paths(workspace_root, &files).await {
         Ok(paths) => paths,
         Err(e) => return ToolResult::error(e),
@@ -2192,8 +2340,8 @@ fn probe_ripgrep_command(program: &str) -> bool {
         if !run_ripgrep_probe(
             program,
             &probe_root,
-            &["--files", "--hidden", "-g", "*.txt", "."],
-            "probe.txt",
+            &["--files", "--null", "--hidden", "-g", "*.txt", "."],
+            "probe.txt\0",
         ) {
             return Some(false);
         }
@@ -2733,8 +2881,10 @@ fn load_search_ignore_rules(workspace_root: &Path) -> Result<Vec<SearchIgnoreRul
                 index + 1
             )
         })?;
+        let regex = glob_pattern_regex(&normalized)?;
         rules.push(SearchIgnoreRule {
             pattern: normalized,
+            regex,
             negated,
         });
     }
@@ -2802,7 +2952,7 @@ fn should_ignore_search_path_with_default_scope(
 
     let mut ignored = false;
     for rule in rules {
-        if glob_matches_path(&rule.pattern, path) {
+        if glob_regex_matches_path(&rule.pattern, &rule.regex, path) {
             ignored = !rule.negated;
         }
     }
@@ -2848,6 +2998,7 @@ async fn load_gitignored_search_paths(
     let mut cmd = exact_command.into_tokio();
     cmd.kill_on_drop(true)
         .arg("check-ignore")
+        .arg("-z")
         .arg("--stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2858,13 +3009,17 @@ async fn load_gitignored_search_paths(
         Err(_) => return Ok(std::collections::HashSet::new()),
     };
 
-    let payload = format!("{}\n", candidates.join("\n"));
+    let payload = format!("{}\0", candidates.join("\0"));
     let output = exchange_gitignore_io(child, payload.as_bytes(), Duration::from_secs(5)).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let exit_code = exit_code_from_status(&output.status);
     if exit_code == 0 {
-        return Ok(stdout.lines().map(strip_current_dir_prefix).collect());
+        return Ok(stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(strip_current_dir_prefix)
+            .collect());
     }
     if exit_code == 1 {
         return Ok(std::collections::HashSet::new());
@@ -3027,11 +3182,21 @@ async fn run_grep_with_grep(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    run_grep_with_grep_program("grep", request, cancel_token).await
+}
+
+async fn run_grep_with_grep_program(
+    program: &str,
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<ReadOnlyCommandOutput, String> {
     let deadline = tokio::time::Instant::now() + GREP_TIMEOUT;
-    let enumerated = enumerate_search_files(request, cancel_token, deadline).await?;
+    let enumerated =
+        enumerate_search_files(request, cancel_token, deadline, SEARCH_FILE_LIST_LIMIT).await?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut stdout_capped = false;
+    let mut stderr_capped = false;
     let mut exit_code = if enumerated.files.is_empty() {
         if enumerated.timed_out || enumerated.cancelled {
             -1
@@ -3045,7 +3210,23 @@ async fn run_grep_with_grep(
     let mut cancelled = enumerated.cancelled;
     let mut saw_match_output = false;
 
-    for chunk in enumerated.files.chunks(200) {
+    let mut start = 0;
+    while start < enumerated.files.len() {
+        let mut end = start;
+        let mut output_budget = 0usize;
+        while end < enumerated.files.len() && end - start < 200 {
+            let size = enumerated.files[end].len().saturating_add(32);
+            if end > start
+                && request.output_mode == SearchOutputMode::Count
+                && output_budget.saturating_add(size) >= RAW_GREP_OUTPUT_LIMIT
+            {
+                break;
+            }
+            output_budget = output_budget.saturating_add(size);
+            end += 1;
+        }
+        let chunk = &enumerated.files[start..end];
+        start = end;
         if timed_out || cancelled || stdout_capped {
             break;
         }
@@ -3058,7 +3239,7 @@ async fn run_grep_with_grep(
             break;
         }
 
-        let mut cmd = Command::new("grep");
+        let mut cmd = Command::new(program);
         cmd.current_dir(request.workspace_root).kill_on_drop(true);
         match request.output_mode {
             SearchOutputMode::Content => {
@@ -3107,25 +3288,51 @@ async fn run_grep_with_grep(
         )
         .await?;
 
-        if !chunk_output.stdout.trim().is_empty() {
-            saw_match_output = true;
-            exit_code = 0;
-            append_output_chunk(
-                &mut stdout,
-                &chunk_output.stdout,
-                RAW_GREP_OUTPUT_LIMIT,
-                &mut stdout_capped,
-            );
-        } else if exit_code == 1 && chunk_output.exit_code > 1 {
+        // Only an unfinished chunk can end in the middle of a grep record.
+        // Filter and combine complete records after removing that partial tail.
+        let chunk_stdout = complete_search_records(
+            &chunk_output.stdout,
+            chunk_output.stdout_capped || chunk_output.timed_out || chunk_output.cancelled,
+            '\n',
+        );
+        let mut matched = if request.output_mode == SearchOutputMode::Count {
+            chunk_stdout
+                .lines()
+                .filter(|line| !line.ends_with(":0"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            chunk_stdout.to_string()
+        };
+        if !matched.is_empty() && !matched.ends_with('\n') {
+            matched.push('\n');
+        }
+        if chunk_output.exit_code > 1 {
             exit_code = chunk_output.exit_code;
         }
+        if !matched.trim().is_empty() {
+            saw_match_output = true;
+            if exit_code <= 1 {
+                exit_code = 0;
+            }
+            append_output_chunk(
+                &mut stdout,
+                &matched,
+                RAW_GREP_OUTPUT_LIMIT + 1,
+                &mut stdout_capped,
+            );
+        }
+        stdout_capped |= chunk_output.stdout_capped;
 
         if !chunk_output.stderr.trim().is_empty() {
-            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                stderr.push('\n');
-            }
-            stderr.push_str(chunk_output.stderr.trim_end());
+            append_output_chunk(
+                &mut stderr,
+                chunk_output.stderr.trim_end(),
+                RAW_STDERR_OUTPUT_LIMIT,
+                &mut stderr_capped,
+            );
         }
+        stderr_capped |= chunk_output.stderr_capped;
 
         timed_out |= chunk_output.timed_out;
         cancelled |= chunk_output.cancelled;
@@ -3135,6 +3342,12 @@ async fn run_grep_with_grep(
         exit_code = -1;
     }
 
+    if stderr_capped {
+        let mut preview = astra_text_utils::live_redaction::OutputPreview::new(stderr.len(), false);
+        preview.append(stderr.as_bytes());
+        let (safe, _, _) = preview.finish(true);
+        stderr = String::from_utf8_lossy(&safe).into_owned();
+    }
     Ok(ReadOnlyCommandOutput {
         stdout,
         stderr,
@@ -3142,7 +3355,7 @@ async fn run_grep_with_grep(
         timed_out,
         cancelled,
         stdout_capped,
-        stderr_capped: false,
+        stderr_capped,
         scope_settled: false,
         scope_ownership: None,
         scope_quarantined: false,
@@ -3160,7 +3373,8 @@ async fn run_grep_multiline_locally(
     let mut stdout = String::new();
     let mut stdout_capped = false;
 
-    let enumerated = enumerate_search_files(request, cancel_token, deadline).await?;
+    let enumerated =
+        enumerate_search_files(request, cancel_token, deadline, SEARCH_FILE_LIST_LIMIT).await?;
     let mut timed_out = enumerated.timed_out;
     let mut cancelled = enumerated.cancelled;
     for relative_path in enumerated.files {
@@ -3246,10 +3460,14 @@ async fn enumerate_search_files(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
     deadline: tokio::time::Instant,
+    max_bytes: usize,
 ) -> Result<EnumeratedSearchFiles, String> {
     let target_path = request.workspace_root.join(request.target);
     if target_path.is_file() {
         let relative = relative_search_target(request.workspace_root, &target_path);
+        if relative.contains('\n') || relative.contains('\r') || relative.contains('\u{fffd}') {
+            return Err("Error: the search filename cannot be represented safely.".into());
+        }
         let gitignored =
             load_gitignored_search_paths(request.workspace_root, std::slice::from_ref(&relative))
                 .await?;
@@ -3271,18 +3489,60 @@ async fn enumerate_search_files(
         request.workspace_root,
         request.target,
         cancel_token,
-        GREP_TIMEOUT,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        max_bytes,
     )
     .await?;
+    if listed.timed_out || listed.cancelled {
+        return Ok(EnumeratedSearchFiles {
+            files: Vec::new(),
+            timed_out: listed.timed_out,
+            cancelled: listed.cancelled,
+        });
+    }
+    if listed.stdout_capped {
+        return Err("Error: search file list exceeded its limit. Narrow 'path' or use ripgrep for a complete search.".into());
+    }
+    if listed.exit_code != 0 {
+        return Err(format!(
+            "Error: could not list search files: {}",
+            format_search_warning(&listed.stderr)
+        ));
+    }
+    if !listed.stdout.is_empty()
+        && (!listed.stdout.ends_with('\0') || listed.stdout.contains('\u{fffd}'))
+    {
+        return Err("Error: search encountered an incomplete or unsupported filename. Narrow 'path' or use ripgrep.".into());
+    }
+    let includes = request
+        .include_globs
+        .iter()
+        .filter_map(|glob| glob_pattern_regex(glob).ok().map(|regex| (glob, regex)))
+        .collect::<Vec<_>>();
     let mut files = listed
         .stdout
-        .lines()
+        .split('\0')
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
-        .filter(|line| matches_search_file_filters(line, &request.include_globs))
+        .filter(|line| {
+            request.include_globs.is_empty()
+                || includes
+                    .iter()
+                    .any(|(glob, regex)| glob_regex_matches_path(glob, regex, line))
+        })
         .filter(|line| !request.ignores_path(line))
         .collect::<Vec<_>>();
-    let gitignored = load_gitignored_search_paths(request.workspace_root, &files).await?;
+    if files
+        .iter()
+        .any(|path| path.contains('\n') || path.contains('\r'))
+    {
+        return Err("Error: a search filename contains a newline and cannot be represented safely. Narrow 'path'.".into());
+    }
+    let gitignored = tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => return Ok(EnumeratedSearchFiles { files: Vec::new(), timed_out: true, cancelled: false }),
+        _ = async { if let Some(token) = cancel_token { token.cancelled().await } else { std::future::pending().await } } => return Ok(EnumeratedSearchFiles { files: Vec::new(), timed_out: false, cancelled: true }),
+        result = load_gitignored_search_paths(request.workspace_root, &files) => result?,
+    };
     files.retain(|line| !gitignored.contains(line));
     files.sort();
     files.dedup();
@@ -3393,10 +3653,14 @@ fn append_output_line(output: &mut String, line: &str, max_bytes: usize, capped:
     if *capped {
         return;
     }
-    if !output.is_empty() {
-        append_capped(output, "\n", max_bytes, capped);
+    // Retain whole records only. One final separator byte beyond the content
+    // budget lets a record that exactly fits remain explicitly complete.
+    if output.len().saturating_add(line.len()) > max_bytes {
+        *capped = true;
+        return;
     }
-    append_capped(output, line, max_bytes, capped);
+    output.push_str(line);
+    output.push('\n');
 }
 
 fn append_output_chunk(output: &mut String, chunk: &str, max_bytes: usize, capped: &mut bool) {
@@ -3421,6 +3685,7 @@ async fn run_glob_with_rg_program(
     cmd.current_dir(workspace_root)
         .kill_on_drop(true)
         .arg("--files")
+        .arg("--null")
         .arg("--hidden")
         .arg("--no-ignore-vcs");
     append_default_rg_excludes(&mut cmd);
@@ -3468,7 +3733,14 @@ async fn run_glob_with_preferred_backend_program(
     }
 
     match run_glob_with_rg_program(program, workspace_root, target, pattern, cancel_token).await {
-        Ok(output) if output.exit_code > 1 && !output.timed_out && !output.cancelled => {
+        Ok(output)
+            if !output.timed_out
+                && !output.cancelled
+                && (output.exit_code > 1
+                    || (!output.stdout_capped
+                        && !output.stdout.is_empty()
+                        && !output.stdout.ends_with('\0'))) =>
+        {
             run_glob_with_find(workspace_root, target, cancel_token).await
         }
         Ok(output) => Ok(output),
@@ -3481,7 +3753,14 @@ async fn run_glob_with_find(
     target: &str,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
-    run_search_file_listing_with_find(workspace_root, target, cancel_token, GLOB_TIMEOUT).await
+    run_search_file_listing_with_find(
+        workspace_root,
+        target,
+        cancel_token,
+        GLOB_TIMEOUT,
+        RAW_GLOB_OUTPUT_LIMIT,
+    )
+    .await
 }
 
 async fn run_search_file_listing_with_find(
@@ -3489,6 +3768,7 @@ async fn run_search_file_listing_with_find(
     target: &str,
     cancel_token: Option<&CancellationToken>,
     timeout: Duration,
+    max_bytes: usize,
 ) -> Result<ReadOnlyCommandOutput, String> {
     let shell_target = shell_safe_search_target(target);
     let mut cmd = Command::new("find");
@@ -3510,12 +3790,12 @@ async fn run_search_file_listing_with_find(
         .arg("-o")
         .arg("-type")
         .arg("f")
-        .arg("-print");
+        .arg("-print0");
 
     run_readonly_command_with_partial(
         &mut cmd,
         timeout,
-        RAW_GLOB_OUTPUT_LIMIT,
+        max_bytes,
         RAW_STDERR_OUTPUT_LIMIT,
         cancel_token,
         "search command",
@@ -4205,6 +4485,10 @@ fn strip_current_dir_prefix(line: &str) -> String {
 }
 
 pub fn glob_matches_path(pattern: &str, path: &str) -> bool {
+    glob_pattern_regex(pattern).is_ok_and(|regex| glob_regex_matches_path(pattern, &regex, path))
+}
+
+fn glob_regex_matches_path(pattern: &str, regex: &Regex, path: &str) -> bool {
     let normalized_path = path.replace('\\', "/");
     let candidate = if pattern.contains('/') || pattern.contains('\\') {
         normalized_path
@@ -4216,10 +4500,7 @@ pub fn glob_matches_path(pattern: &str, path: &str) -> bool {
             .to_string()
     };
 
-    match glob_pattern_regex(pattern) {
-        Ok(regex) => regex.is_match(&candidate),
-        Err(_) => false,
-    }
+    regex.is_match(&candidate)
 }
 
 fn glob_pattern_regex(pattern: &str) -> Result<Regex, String> {
@@ -4648,7 +4929,7 @@ mod tests {
             r#"
 for arg in "$@"; do
   if [ "$arg" = "--files" ]; then
-    printf 'probe.txt\n'
+    printf 'probe.txt\0'
     exit 0
   fi
 done
@@ -4675,6 +4956,32 @@ printf 'probe.txt:1:needle\n'
         assert!(
             !probe_ripgrep_command(fake_rg.to_str().unwrap()),
             "expected fake rg backend probe to fail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_falls_back_when_rg_ignores_nul_framing() {
+        let bin_dir = tempdir().unwrap();
+        let fake_rg = write_fake_rg_script(bin_dir.path(), "printf 'sample.txt\\n'");
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("sample.txt"), "").unwrap();
+        assert!(!probe_ripgrep_command(fake_rg.to_str().unwrap()));
+        let output = run_glob_with_preferred_backend_program(
+            fake_rg.to_str().unwrap(),
+            workspace.path(),
+            ".",
+            "*.txt",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .stdout
+                .split('\0')
+                .any(|path| path.ends_with("sample.txt"))
         );
     }
 
@@ -4724,6 +5031,216 @@ printf 'probe.txt:1:needle\n'
             "expected fallback grep output, got: {}",
             output.stdout
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_fallback_handles_large_lists_and_reports_incomplete_input() {
+        let workspace = tempdir().unwrap();
+        let nested = "d".repeat(120);
+        std::fs::create_dir(workspace.path().join(&nested)).unwrap();
+        for index in 0..1300 {
+            let name = format!("{index:04}-{}.txt", "a".repeat(96));
+            std::fs::write(workspace.path().join(&nested).join(name), "unrelated\n").unwrap();
+        }
+        let last = format!("{nested}/1299-{}.txt", "a".repeat(96));
+        std::fs::write(workspace.path().join(&last), "needle\nsecond\n").unwrap();
+        std::fs::write(workspace.path().join(".astraignore"), "ignored-*/\n").unwrap();
+        let mut request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: ".",
+            pattern: "needle",
+            include_globs: vec!["*.txt".into()],
+            ignore_rules: load_search_ignore_rules(workspace.path()).unwrap(),
+            case_sensitive: true,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Content,
+            multiline: false,
+        };
+        let regular = run_grep_with_grep(&request, None).await.unwrap();
+        assert_eq!(regular.exit_code, 0, "{}", regular.stderr);
+        assert!(regular.stdout.contains(&last), "{}", regular.stdout);
+
+        request.output_mode = SearchOutputMode::Count;
+        let count = run_grep_with_grep(&request, None).await.unwrap();
+        assert_eq!(count.exit_code, 0, "{}", count.stderr);
+        assert!(
+            count.stdout.contains(&format!("{last}:1")),
+            "{}",
+            count.stdout
+        );
+        assert!(!count.stdout_capped);
+
+        request.output_mode = SearchOutputMode::Content;
+        request.multiline = true;
+        request.pattern = "needle\\nsecond";
+        let multiline = run_grep_multiline_locally(&request, None).await.unwrap();
+        assert_eq!(multiline.exit_code, 0, "{}", multiline.stderr);
+        assert!(multiline.stdout.contains(&last), "{}", multiline.stdout);
+        let public_result = grep(
+            &crate::ToolContext::test(workspace.path()),
+            &serde_json::json!({"pattern":"needle\\nsecond","multiline":true,"include":"*.txt"}),
+        )
+        .await;
+        assert!(!public_result.is_error, "{}", public_result.output);
+        assert!(
+            public_result.output.contains(&last),
+            "{}",
+            public_result.output
+        );
+
+        let error = enumerate_search_files(
+            &request,
+            None,
+            tokio::time::Instant::now() + GREP_TIMEOUT,
+            64,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("file list exceeded"), "{error}");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = run_grep_multiline_locally(&request, Some(&cancellation))
+            .await
+            .unwrap();
+        assert!(cancelled.cancelled);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_fallback_rejects_unrepresentable_paths() {
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("has\nnewline.txt"), "needle\n").unwrap();
+        let request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: ".",
+            pattern: "needle",
+            include_globs: vec![],
+            ignore_rules: vec![],
+            case_sensitive: true,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Content,
+            multiline: false,
+        };
+        let error = run_grep_with_grep(&request, None).await.err().unwrap();
+        assert!(error.contains("filename contains a newline"), "{error}");
+        let direct = GrepRequest {
+            target: "has\nnewline.txt",
+            ..request
+        };
+        let error = run_grep_with_grep(&direct, None).await.err().unwrap();
+        assert!(error.contains("cannot be represented safely"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_fallback_keeps_completed_count_when_a_later_batch_is_cancelled() {
+        let workspace = tempdir().unwrap();
+        let scripts = tempdir().unwrap();
+        for index in 0..201 {
+            std::fs::write(
+                workspace.path().join(format!("{index:03}.txt")),
+                if index == 0 { "needle\n" } else { "other\n" },
+            )
+            .unwrap();
+        }
+        let first = scripts.path().join("first");
+        let second = scripts.path().join("second");
+        let program = write_fake_rg_script(
+            scripts.path(),
+            &format!(
+                "if [ -e '{}' ]; then touch '{}'; exec sleep 30; fi\ntouch '{}'\nexec grep \"$@\"",
+                first.display(),
+                second.display(),
+                first.display(),
+            ),
+        );
+        let request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: ".",
+            pattern: "needle",
+            include_globs: vec![],
+            ignore_rules: vec![],
+            case_sensitive: true,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Count,
+            multiline: false,
+        };
+        let cancellation = CancellationToken::new();
+        let search =
+            run_grep_with_grep_program(program.to_str().unwrap(), &request, Some(&cancellation));
+        tokio::pin!(search);
+        tokio::select! {
+            _ = &mut search => panic!("search ended before the second batch"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !second.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }) => result.expect("second batch must start"),
+        }
+        cancellation.cancel();
+        let output = search.await.unwrap();
+        assert!(output.cancelled);
+        let records = complete_search_records(&output.stdout, true, '\n');
+        assert!(records.contains("000.txt:1"), "{records:?}");
+    }
+
+    #[test]
+    fn multiline_output_keeps_complete_records_at_the_capture_limit() {
+        let mut output = String::new();
+        let mut capped = false;
+        append_output_line(&mut output, "a:1", 3, &mut capped);
+        assert_eq!(output, "a:1\n");
+        assert!(!capped);
+        append_output_line(&mut output, "b:2", 3, &mut capped);
+        assert!(capped);
+        assert_eq!(complete_search_records(&output, true, '\n'), "a:1\n");
+        assert_eq!(complete_search_records("a:1\nb:partial", true, '\n'), "a:1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_fallback_keeps_errors_when_matches_are_returned() {
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("sample.txt"), "needle\n").unwrap();
+        let program = write_fake_rg_script(
+            workspace.path(),
+            "printf 'sample.txt:1:needle\\n'\necho 'permission denied' >&2\nexit 2",
+        );
+        let request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: "sample.txt",
+            pattern: "needle",
+            include_globs: vec![],
+            ignore_rules: vec![],
+            case_sensitive: true,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Content,
+            multiline: false,
+        };
+        let output = run_grep_with_grep_program(program.to_str().unwrap(), &request, None)
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 2);
+        assert!(output.stdout.contains("needle"));
+        assert!(output.stderr.contains("permission denied"));
+        assert_eq!(complete_search_records("one\ntwo", true, '\n'), "one");
+        assert_eq!(complete_search_records("one\0two", true, '\0'), "one");
     }
 
     #[cfg(unix)]
@@ -5250,7 +5767,8 @@ printf 'probe.txt:1:needle\n'
             assert_eq!(output.exit_code, 0, "{}", output.stderr);
             let files: Vec<_> = output
                 .stdout
-                .lines()
+                .split('\0')
+                .filter(|path| !path.is_empty())
                 .filter(|path| !should_ignore_search_path_in_scope(&workspace, target, path, &[]))
                 .collect();
             assert_eq!(files, vec![external.join("visible.txt").to_str().unwrap()]);
@@ -7548,21 +8066,26 @@ mod workdir_tests {
         std::fs::create_dir(&nested).unwrap();
 
         assert_eq!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({}))
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({}), None)
                 .unwrap()
                 .path(),
             workspace.path().canonicalize().unwrap()
         );
         assert_eq!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "nested"}))
-                .unwrap()
-                .path(),
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "nested"}),
+                None
+            )
+            .unwrap()
+            .path(),
             nested.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_bash_workdir(
                 workspace.path(),
-                &serde_json::json!({"workdir": nested.display().to_string()})
+                &serde_json::json!({"workdir": nested.display().to_string()}),
+                None
             )
             .unwrap()
             .path(),
@@ -7570,18 +8093,30 @@ mod workdir_tests {
         );
         std::fs::write(workspace.path().join("file"), b"not a directory").unwrap();
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "missing"}))
-                .is_err()
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "missing"}),
+                None
+            )
+            .is_err()
         );
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "file"}))
-                .unwrap_err()
-                .contains("not a directory")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "file"}),
+                None
+            )
+            .unwrap_err()
+            .contains("not a directory")
         );
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": ".."}))
-                .unwrap_err()
-                .contains("SANDBOX_DENIED")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": ".."}),
+                None
+            )
+            .unwrap_err()
+            .contains("SANDBOX_DENIED")
         );
     }
 
@@ -7593,14 +8128,15 @@ mod workdir_tests {
         let error = resolve_bash_workdir(
             workspace.path(),
             &serde_json::json!({"workdir": original.path()}),
+            None,
         )
         .unwrap_err();
         assert!(error.contains(&original.path().display().to_string()));
         assert!(error.contains(&workspace.path().display().to_string()));
         assert!(error.contains("no command was run"));
-        assert!(error.contains("inside the selected workspace"));
-        assert!(error.contains("session rooted there"));
-        assert!(error.contains("creates and selects a new worktree"));
+        assert!(error.contains("inside the active workspace"));
+        assert!(error.contains("Omit `workdir`"));
+        assert!(!error.contains("creates and selects a new worktree"));
     }
 
     #[cfg(unix)]
@@ -7611,9 +8147,13 @@ mod workdir_tests {
         std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
 
         assert!(
-            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "escape"}))
-                .unwrap_err()
-                .contains("SANDBOX_DENIED")
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": "escape"}),
+                None
+            )
+            .unwrap_err()
+            .contains("SANDBOX_DENIED")
         );
     }
 
@@ -7708,7 +8248,7 @@ mod workdir_tests {
             "command": "printf pinned > marker; pwd",
             "workdir": "nested"
         });
-        let prepared = resolve_bash_workdir(workspace.path(), &args).unwrap();
+        let prepared = resolve_bash_workdir(workspace.path(), &args, None).unwrap();
         std::fs::rename(&nested, &retained).unwrap();
         std::os::unix::fs::symlink(outside.path(), &nested).unwrap();
         let ctx = crate::ToolContext::test(workspace.path());
