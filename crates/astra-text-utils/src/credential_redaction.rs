@@ -288,20 +288,24 @@ fn pem_header_regex() -> &'static Regex {
 
 fn pem_end_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM end regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM end regex")
+    })
 }
 
 fn pem_header_bytes_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
     RE.get_or_init(|| {
-        BytesRegex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM header bytes regex")
+        BytesRegex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+            .expect("PEM header bytes regex")
     })
 }
 
 fn pem_end_bytes_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
     RE.get_or_init(|| {
-        BytesRegex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM end bytes regex")
+        BytesRegex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+            .expect("PEM end bytes regex")
     })
 }
 
@@ -383,7 +387,7 @@ fn pem_marker_kind<'a>(marker: &'a str, prefix: &str) -> Option<&'a str> {
                 && value
                     .chars()
                     .all(|character| character.is_ascii_uppercase() || character == ' ')
-                && (value.ends_with("PRIVATE KEY") || value == "PGP PRIVATE KEY BLOCK")
+                && (value.ends_with("PRIVATE KEY") || *value == "PGP PRIVATE KEY BLOCK")
         })
 }
 
@@ -1780,7 +1784,7 @@ mod tests {
                     .contains(&secret)
             );
         }
-        let pem = "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nbody";
+        let pem = "-----BEGIN PRIVATE KEY-----\nbody";
         for end in 1..="-----BEGIN".len() {
             assert_eq!(
                 redact_credentials_for_display_streaming(&pem[..end], usize::MAX)
@@ -1807,9 +1811,9 @@ mod tests {
             ("hf_", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "\n"),
             ("https://user:", "zzzzzzzz", "@example.test\n"),
             (
-                "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\n",
+                "-----BEGIN PRIVATE KEY-----\n",
                 "zzzzzzzz",
-                "\n-----END PRIVATE KEY(?: BLOCK)?-----",
+                "\n-----END PRIVATE KEY-----",
             ),
         ] {
             let text = format!("{prefix}{secret}{suffix}");
@@ -1967,9 +1971,9 @@ mod tests {
 
     #[test]
     fn partial_pem_redaction_handles_many_orphan_end_markers() {
-        let prefix = "partial-key-----END PRIVATE KEY(?: BLOCK)?-----".repeat(10_000);
+        let prefix = "partial-key-----END PRIVATE KEY-----".repeat(10_000);
         let text = format!(
-            "{prefix}visible\n-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nsecret\n-----END PRIVATE KEY(?: BLOCK)?-----\nafter"
+            "{prefix}visible\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\nafter"
         );
         let (safe, count) = redact_credentials_for_display_partial(&text);
         assert_eq!(count, 2);
@@ -1980,9 +1984,9 @@ mod tests {
 
     #[test]
     fn partial_pem_redaction_preserves_an_overlapping_begin_marker() {
-        for suffix in ["", "\n-----END PRIVATE KEY(?: BLOCK)?-----\nafter"] {
+        for suffix in ["", "\n-----END PRIVATE KEY-----\nafter"] {
             let raw = format!(
-                "prefix-----END PRIVATE KEY(?: BLOCK)?-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nprivate-body{suffix}"
+                "prefix-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\nprivate-body{suffix}"
             );
             let (safe, count) = redact_credentials_for_display_partial(&raw);
             assert!(!safe.contains("private-body"), "{safe:?}");
@@ -1991,7 +1995,7 @@ mod tests {
                 assert!(safe.ends_with("\nafter"), "{safe:?}");
             }
         }
-        let adjacent = "prefix-----END PRIVATE KEY(?: BLOCK)?-----END PRIVATE KEY(?: BLOCK)?-----after";
+        let adjacent = "prefix-----END PRIVATE KEY-----END PRIVATE KEY-----after";
         let (safe, count) = redact_credentials_for_display_partial(adjacent);
         assert_eq!(count, 1);
         assert_eq!(safe, "[REDACTED:PRIVATE_KEY]after");
@@ -2000,9 +2004,9 @@ mod tests {
     #[test]
     fn overlapping_pem_blocks_share_one_safe_edit_reference() {
         let raw = concat!(
-            "before\n-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nFIRST_BODY\n",
-            "-----END PRIVATE KEY(?: BLOCK)?-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nSECOND_BODY\n",
-            "-----END PRIVATE KEY(?: BLOCK)?-----\nafter"
+            "before\n-----BEGIN PRIVATE KEY-----\nFIRST_BODY\n",
+            "-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\nSECOND_BODY\n",
+            "-----END PRIVATE KEY-----\nafter"
         );
         let (editable, count) = redact_credentials_in_text(raw);
         assert_eq!(count, 1);
@@ -2030,7 +2034,7 @@ mod tests {
                 .is_some()
         );
 
-        let incomplete = raw.replace("-----END PRIVATE KEY(?: BLOCK)?-----\nafter", "unterminated");
+        let incomplete = raw.replace("-----END PRIVATE KEY-----\nafter", "unterminated");
         let editable = redact_credentials_in_text(&incomplete).0;
         assert!(!editable.contains("SECOND_BODY"));
         assert!(resolve_redacted_anchor(&incomplete, &editable, false).is_err());
@@ -2039,9 +2043,9 @@ mod tests {
     #[test]
     fn pem_line_window_uses_all_blocks_on_the_same_line() {
         let raw = concat!(
-            "before\n-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nFIRST_BODY\n",
-            "-----END PRIVATE KEY(?: BLOCK)?----- -----BEGIN PRIVATE KEY(?: BLOCK)?-----\n",
-            "SECOND_BODY\n-----END PRIVATE KEY(?: BLOCK)?-----\nafter\n"
+            "before\n-----BEGIN PRIVATE KEY-----\nFIRST_BODY\n",
+            "-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----\n",
+            "SECOND_BODY\n-----END PRIVATE KEY-----\nafter\n"
         );
         assert_eq!(redact_line_window(raw, 5, 5), "[REDACTED:PRIVATE_KEY]");
         assert_eq!(redact_line_window(raw, 7, 7), "after");
@@ -2052,7 +2056,7 @@ mod tests {
         for (body_len, resolvable) in [(32_000, true), (33_000, false)] {
             let body = "A".repeat(body_len);
             let raw = format!(
-                "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\n{body}\n-----END PRIVATE KEY(?: BLOCK)?-----BEGIN PRIVATE KEY(?: BLOCK)?-----\n{body}\n-----END PRIVATE KEY(?: BLOCK)?-----"
+                "-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
             );
             let editable = redact_credentials_in_text(&raw).0;
             let resolved = resolve_redacted_anchor(&raw, &editable, false);
@@ -2066,9 +2070,9 @@ mod tests {
     #[test]
     fn pem_edit_anchors_resolve_chains_and_many_separate_blocks() {
         let chain = concat!(
-            "-----BEGIN RSA PRIVATE KEY(?: BLOCK)?-----\nfirst\n-----END RSA PRIVATE KEY(?: BLOCK)?-----",
-            "BEGIN EC PRIVATE KEY(?: BLOCK)?-----\nsecond\n-----END EC PRIVATE KEY(?: BLOCK)?-----",
-            "BEGIN PRIVATE KEY(?: BLOCK)?-----\nthird\n-----END PRIVATE KEY(?: BLOCK)?-----"
+            "-----BEGIN RSA PRIVATE KEY-----\nfirst\n-----END RSA PRIVATE KEY-----",
+            "BEGIN EC PRIVATE KEY-----\nsecond\n-----END EC PRIVATE KEY-----",
+            "BEGIN PRIVATE KEY-----\nthird\n-----END PRIVATE KEY-----"
         );
         let (safe, count) = redact_credentials_in_text(chain);
         assert_eq!(count, 1);
@@ -2078,7 +2082,7 @@ mod tests {
         );
 
         let many = (0..120)
-            .map(|i| format!("-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nkey{i}\n-----END PRIVATE KEY(?: BLOCK)?-----"))
+            .map(|i| format!("-----BEGIN PRIVATE KEY-----\nkey{i}\n-----END PRIVATE KEY-----"))
             .collect::<Vec<_>>()
             .join("\n");
         let (safe, count) = redact_credentials_in_text(&many);
@@ -2089,9 +2093,9 @@ mod tests {
         );
 
         let mixed = concat!(
-            "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nfirst\n-----END PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----\n",
             "password=abcdefghijklmnop\n",
-            "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nsecond\n-----END PRIVATE KEY(?: BLOCK)?-----"
+            "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----"
         );
         let (safe, count) = redact_credentials_in_text(mixed);
         assert_eq!(count, 3);
@@ -2107,7 +2111,7 @@ mod tests {
             let blocks = (0..3)
                 .map(|i| {
                     format!(
-                        "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nkey{}\n-----END PRIVATE KEY(?: BLOCK)?-----",
+                        "-----BEGIN PRIVATE KEY-----\nkey{}\n-----END PRIVATE KEY-----",
                         if duplicate { 0 } else { i }
                     )
                 })
@@ -2130,8 +2134,8 @@ mod tests {
 
     #[test]
     fn pem_anchor_rejects_an_overlapping_noncanonical_raw_occurrence() {
-        let first = "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nfirst\n-----END PRIVATE KEY(?: BLOCK)?-----";
-        let second = "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nsecond\n-----END PRIVATE KEY(?: BLOCK)?-----";
+        let first = "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----";
+        let second = "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----";
         let raw = format!("{first}{}{second}-", &second[5..]);
         let (safe, count) = redact_credentials_in_text(&raw);
         assert_eq!(count, 2);
@@ -2141,7 +2145,7 @@ mod tests {
 
     #[test]
     fn redaction_anchor_cannot_expand_past_the_source_size() {
-        let raw = "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nkey\n-----END PRIVATE KEY(?: BLOCK)?-----";
+        let raw = "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----";
         let marker = redact_credentials_in_text(raw).0;
         assert!(resolve_redacted_anchor(raw, &marker.repeat(10_000), false).is_err());
     }
@@ -2212,7 +2216,7 @@ mod tests {
     fn nested_pem_headers_conceal_the_unbounded_remainder() {
         for between in ["\nOUTER_BODY\n-----", ""] {
             let raw = format!(
-                "-----BEGIN PRIVATE KEY(?: BLOCK)?-----{between}BEGIN PRIVATE KEY(?: BLOCK)?-----\nINNER_BODY\n-----END PRIVATE KEY(?: BLOCK)?-----\nOUTER_SECRET\n-----END PRIVATE KEY(?: BLOCK)?-----\nafter"
+                "-----BEGIN PRIVATE KEY-----{between}BEGIN PRIVATE KEY-----\nINNER_BODY\n-----END PRIVATE KEY-----\nOUTER_SECRET\n-----END PRIVATE KEY-----\nafter"
             );
             let editable = redact_credentials_in_text(&raw).0;
             for safe in [
@@ -2242,7 +2246,7 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].0, 4096 - 3);
 
-        let overlong = format!("-----BEGIN {}PRIVATE KEY(?: BLOCK)?-----", "A".repeat(65));
+        let overlong = format!("-----BEGIN {}PRIVATE KEY-----", "A".repeat(65));
         assert!(private_key_header_markers_bytes(overlong.as_bytes()).is_empty());
     }
 
@@ -2521,9 +2525,9 @@ mod tests {
     fn pem_redaction_covers_the_entire_private_key_block() {
         let raw = concat!(
             "before\n",
-            "-----BEGIN RSA PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
             "MIIEOWIBAAKCAQEA_SENTINEL_BODY_SHOULD_NOT_LEAK\n",
-            "-----END RSA PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----END RSA PRIVATE KEY-----\n",
             "after"
         );
         let (redacted, count) = redact_credentials_in_text(raw);
@@ -2543,13 +2547,13 @@ mod tests {
             .expect("standalone PEM marker should resolve");
         assert_eq!(
             resolved_marker_only,
-            "-----BEGIN RSA PRIVATE KEY(?: BLOCK)?-----\nMIIEOWIBAAKCAQEA_SENTINEL_BODY_SHOULD_NOT_LEAK\n-----END RSA PRIVATE KEY(?: BLOCK)?-----"
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEOWIBAAKCAQEA_SENTINEL_BODY_SHOULD_NOT_LEAK\n-----END RSA PRIVATE KEY-----"
         );
     }
 
     #[test]
     fn malformed_pem_header_conceals_the_remaining_output() {
-        let raw = "-----BEGIN PRIVATE KEY(?: BLOCK)?-----\nUNTERMINATED_SECRET_BODY\nafter";
+        let raw = "-----BEGIN PRIVATE KEY-----\nUNTERMINATED_SECRET_BODY\nafter";
         let (redacted, count) = redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         assert!(!redacted.contains("UNTERMINATED_SECRET_BODY"));
@@ -2558,7 +2562,7 @@ mod tests {
 
     #[test]
     fn complete_display_view_does_not_treat_an_orphan_pem_footer_as_a_key() {
-        let raw = "documentation\n-----END RSA PRIVATE KEY(?: BLOCK)?-----\nordinary suffix";
+        let raw = "documentation\n-----END RSA PRIVATE KEY-----\nordinary suffix";
         let (redacted, count) = redact_credentials_for_display(raw);
         assert_eq!(count, 0);
         assert_eq!(redacted, raw);
@@ -2572,9 +2576,9 @@ mod tests {
     #[test]
     fn mismatched_pem_end_is_fail_closed_for_full_and_range_views() {
         let raw = concat!(
-            "-----BEGIN RSA PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
             "BODY_BEFORE_MISMATCH\n",
-            "-----END EC PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----END EC PRIVATE KEY-----\n",
             "BODY_AFTER_MISMATCH\n",
             "ordinary suffix"
         );
@@ -2593,9 +2597,9 @@ mod tests {
     fn line_window_conceals_pem_when_range_starts_inside_block() {
         let raw = concat!(
             "before\n",
-            "-----BEGIN RSA PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
             "PRIVATE_BODY_SENTINEL\n",
-            "-----END RSA PRIVATE KEY(?: BLOCK)?-----\n",
+            "-----END RSA PRIVATE KEY-----\n",
             "after\n"
         );
         let body_only = redact_line_window(raw, 3, 3);
@@ -2992,12 +2996,16 @@ mod basic_auth_redaction_regression_tests {
 
 #[cfg(test)]
 mod pgp_private_key_regression_tests {
-    use super::{private_key_header_markers, private_key_end_markers, redact_credentials_for_display};
+    use super::{
+        private_key_end_markers, private_key_header_markers, redact_credentials_for_display,
+    };
 
     #[test]
     fn recognizes_pgp_armor_as_private_key() {
         let secret = "lQOYBF7xQbkBCADQ";
-        let input = format!("-----BEGIN PGP PRIVATE KEY BLOCK-----\n{secret}\n-----END PGP PRIVATE KEY BLOCK-----");
+        let input = format!(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n{secret}\n-----END PGP PRIVATE KEY BLOCK-----"
+        );
         assert_eq!(private_key_header_markers(&input).len(), 1);
         assert_eq!(private_key_end_markers(&input).len(), 1);
         let (redacted, count) = redact_credentials_for_display(&input);
@@ -3013,9 +3021,8 @@ mod password_flag_redaction_regression_tests {
     #[test]
     fn hides_mysql_password_argument() {
         let secret = "S3cretPassw0rd123";
-        let (redacted, count) = redact_credentials_for_display(
-            &format!("mysql --password {secret} -h db")
-        );
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("mysql --password {secret} -h db"));
         assert_eq!(count, 1);
         assert!(!redacted.contains(secret));
         assert!(redacted.contains("PASSWORD_ARGUMENT"));
@@ -3036,8 +3043,7 @@ mod openai_project_key_redaction_regression_tests {
     #[test]
     fn hides_bare_project_api_key() {
         let secret = format!("sk-proj-{}", "A".repeat(48));
-        let (redacted, count) =
-            redact_credentials_for_display(&format!("key is {secret}"));
+        let (redacted, count) = redact_credentials_for_display(&format!("key is {secret}"));
         assert_eq!(count, 1);
         assert!(!redacted.contains(&secret));
         assert!(redacted.contains("OPENAI_API_KEY"));
@@ -3059,8 +3065,7 @@ mod anthropic_api_key_redaction_regression_tests {
     #[test]
     fn hides_bare_anthropic_api_key() {
         let secret = format!("sk-ant-api03-{}", "B".repeat(48));
-        let (redacted, count) =
-            redact_credentials_for_display(&format!("provider key: {secret}"));
+        let (redacted, count) = redact_credentials_for_display(&format!("provider key: {secret}"));
         assert_eq!(count, 1);
         assert!(!redacted.contains(&secret));
         assert!(redacted.contains("ANTHROPIC_API_KEY"));
@@ -3081,9 +3086,14 @@ mod slack_token_redaction_regression_tests {
 
     #[test]
     fn hides_bare_slack_bot_token() {
-        let secret = format!("{}-{}-{}-{}", "xoxb", "1".repeat(12), "2".repeat(12), "a".repeat(24));
-        let (redacted, count) =
-            redact_credentials_for_display(&format!("slack token: {secret}"));
+        let secret = format!(
+            "{}-{}-{}-{}",
+            "xoxb",
+            "1".repeat(12),
+            "2".repeat(12),
+            "a".repeat(24)
+        );
+        let (redacted, count) = redact_credentials_for_display(&format!("slack token: {secret}"));
         assert_eq!(count, 1);
         assert!(!redacted.contains(&secret));
         assert!(redacted.contains("SLACK_TOKEN"));
@@ -3105,8 +3115,7 @@ mod gitlab_token_redaction_regression_tests {
     #[test]
     fn hides_bare_gitlab_personal_access_token() {
         let secret = format!("{}-{}", "glpat", "A".repeat(32));
-        let (redacted, count) =
-            redact_credentials_for_display(&format!("gitlab token: {secret}"));
+        let (redacted, count) = redact_credentials_for_display(&format!("gitlab token: {secret}"));
         assert_eq!(count, 1);
         assert!(!redacted.contains(&secret));
         assert!(redacted.contains("GITLAB_TOKEN"));
