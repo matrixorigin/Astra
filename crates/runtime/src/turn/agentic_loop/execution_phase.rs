@@ -2409,7 +2409,7 @@ fn fold_provider_completion_error_usage(
         });
     if let Some(usage) = qualified {
         state.last_request_usage = None;
-        state.last_measured_prompt_tokens = None;
+        state.record_prompt_measurement(None);
         state.add_qualified_usage(Some(usage));
     }
     let transport_success = details
@@ -2417,7 +2417,7 @@ fn fold_provider_completion_error_usage(
         .and_then(serde_json::Value::as_bool)
         == Some(true);
     if transport_success {
-        state.last_measured_prompt_tokens = details
+        let measured = details
             .get("last_request_input_tokens")
             .and_then(serde_json::Value::as_u64)
             .or_else(|| {
@@ -2427,6 +2427,7 @@ fn fold_provider_completion_error_usage(
                     .and_then(|usage| usage.input_column())
                     .and_then(|tokens| u64::try_from(tokens).ok())
             });
+        state.record_prompt_measurement(measured);
         state.last_request_usage = details
             .get("last_request_usage")
             .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
@@ -3447,7 +3448,7 @@ fn record_superseded_llm_round(
     state.has_any_usage |= turn_result.accum.has_usage;
     state.add_qualified_usage(turn_result.accum.accounted_usage());
     state.last_request_usage = turn_result.accum.current_request_usage;
-    state.last_measured_prompt_tokens = turn_result.accum.measured_request_input_tokens();
+    state.record_prompt_measurement(turn_result.accum.measured_request_input_tokens());
     let tool_names = turn_result
         .accum
         .tool_calls
@@ -3565,7 +3566,7 @@ fn apply_terminal_control_stream_snapshot(
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
     state.has_any_usage |= snap.has_usage;
     // Only physical-request evidence can calibrate the next context window.
-    state.last_measured_prompt_tokens = snap.measured_request_input_tokens();
+    state.record_prompt_measurement(snap.measured_request_input_tokens());
     state.consecutive_context_window_errors = 0;
 
     state.last_request_usage = snap.current_request_usage;
@@ -3875,6 +3876,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let request_message_count = state.messages.len();
     let llm_attempt_index = state.llm_rounds_completed;
     state.last_llm_context_manifest_trace = None;
+    state.prompt_measurement_current = false;
     // Protect the exact request prefix we are about to send even if the LLM
     // call fails; the next retry/compaction pass must not clear tool results
     // that were already part of this attempted request.
@@ -4339,6 +4341,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
     let mut ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    state.record_prompt_measurement(snap.measured_request_input_tokens());
     if let (Some(original), AgenticTurnIngestOutcome::Fatal(error)) =
         (preparation_context_error, &mut ingest_outcome)
     {
@@ -4682,17 +4685,57 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     sess.recovery.record_ptl_error();
                 }
 
-                let rewrite_permit = state.begin_canonical_rewrite();
-                let outcome = super::super::compaction_replay::try_compact_for_retry_checked(
-                    &mut state.messages,
-                    &mut state.compaction_effectiveness,
-                    state.last_measured_prompt_tokens,
-                    state.max_turn_input_tokens,
-                    state.consecutive_context_window_errors,
-                );
+                let mut rewrite_permit = state.begin_canonical_rewrite();
+                // A host without a canonical coordinator may still dedup its
+                // local history. An invalid admitted proof cannot authorize it.
+                let mut outcome = if rewrite_permit
+                    .as_ref()
+                    .is_none_or(|permit| permit.is_valid())
+                {
+                    super::super::compaction_replay::try_compact_for_retry_checked(
+                        &mut state.messages,
+                        &mut state.compaction_effectiveness,
+                        state.last_measured_prompt_tokens,
+                        state.max_turn_input_tokens,
+                        state.consecutive_context_window_errors,
+                    )
+                } else {
+                    state.compaction_effectiveness.record_futile();
+                    super::super::compaction_replay::CompactionReplayOutcome::Futile
+                };
+                if matches!(
+                    &outcome,
+                    super::super::compaction_replay::CompactionReplayOutcome::Futile
+                ) && let Some((freed, removed)) =
+                    spill_old_messages_to_artifact(host, state).await
+                {
+                    // Spill already committed its rewrite proof. Record one
+                    // successful recovery and use the existing retry boundary.
+                    rewrite_permit = None;
+                    state.compaction_effectiveness.record_compaction(freed);
+                    let layer = astra_turn_core::compression_types::CompressionResult {
+                        estimated_tokens_freed: freed,
+                        messages_removed: removed,
+                        ..Default::default()
+                    };
+                    outcome = super::super::compaction_replay::CompactionReplayOutcome::Compacted(
+                        super::super::compaction_replay::CompactionReplayResult::from_pipeline(
+                            super::super::PipelineOutcome {
+                                layer_results: vec![("history_artifact".into(), layer)],
+                                total_tokens_freed: freed,
+                                // A new physical request determines actual fit.
+                                budget_satisfied: false,
+                            },
+                            state.consecutive_context_window_errors,
+                        ),
+                    );
+                }
                 match outcome {
                     super::super::compaction_replay::CompactionReplayOutcome::Compacted(result) => {
-                        state.finish_canonical_rewrite(rewrite_permit);
+                        state.prompt_measurement_current = false;
+                        if let Some(permit) = rewrite_permit {
+                            state.finish_canonical_rewrite(Some(permit));
+                        }
                         let tier_label = result.tier.to_string();
                         // Feed compaction stats into pipeline for reserve estimation.
                         if let Some(ref mut sess) = state.pipeline_session {
@@ -5197,9 +5240,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // tools after such a signal is not a protocol violation, so there is no
     // "ignored correction" phase and no synthetic abort here.
     emit_subrun_text_preview(host, state, prep.quiet);
-    if let Some(control) = handle_token_budget(host, state, prep, &turn_result).await {
-        return Ok(control);
-    }
+
     record_tool_selection(state, &turn_result, turn_index);
 
     Ok(TurnExecutionControl::Proceed(Box::new(
@@ -5869,170 +5910,6 @@ fn emit_subrun_text_preview<H: AgenticLoopHost>(
         };
         host.emit_headless_line(HeadlessStderrStyle::Dim, line);
     }
-}
-
-async fn handle_token_budget<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &mut AgenticLoopState,
-    prep: TurnIterationPrep,
-    turn_result: &HostTurnResult,
-) -> Option<TurnExecutionControl> {
-    if state.max_turn_input_tokens == 0 {
-        return None;
-    }
-    let measured = state.last_measured_prompt_tokens?;
-    if measured <= state.max_turn_input_tokens {
-        return None;
-    }
-
-    if state.budget_wrapup_injected {
-        if !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                "⚠ Token budget exceeded — completing turn.".to_string(),
-            );
-        }
-        state.interruption = Some(InterruptionRecord::new(
-            InterruptionKind::TokenBudgetExceeded,
-            ResumeAction::ContinueImmediately,
-            interruption_state_summary(
-                state,
-                Some(format!(
-                    "Token budget: {}/{} tokens",
-                    measured, state.max_turn_input_tokens,
-                )),
-            ),
-        ));
-        record_early_exit_llm_round(
-            state,
-            turn_result,
-            prep.turn_start_time,
-            Some("token_budget_exceeded"),
-        );
-        observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
-        state.step_recorder.end_turn(false);
-        return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
-    }
-
-    // First attempt: compact-and-continue instead of hard-stopping.
-    // Eliminate exact duplicate results first, then persist recoverable history
-    // only if pressure remains. A prior semantic summary does not disable safe
-    // deduplication of new observations.
-    {
-        let rewrite_permit = state
-            .begin_canonical_rewrite()
-            .filter(|permit| permit.is_valid());
-        let budget = super::super::TokenBudget {
-            max_prompt_tokens: state.max_turn_input_tokens,
-            last_measured_tokens: measured,
-            current_round_index: Some(state.current_round_index),
-            now_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        let (mut total_freed, mut total_messages_removed, mut layer_descriptions) =
-            if rewrite_permit.is_some() {
-                let pipeline = super::super::CompactionEngine::aggressive_pipeline();
-                let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-                (
-                    outcome.total_tokens_freed,
-                    outcome
-                        .layer_results
-                        .iter()
-                        .map(|(_, r)| r.messages_removed)
-                        .sum::<usize>(),
-                    outcome
-                        .layer_results
-                        .iter()
-                        .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
-                        .collect::<Vec<String>>(),
-                )
-            } else {
-                (0, 0, Vec::new())
-            };
-
-        if total_freed > 0 {
-            state.finish_canonical_rewrite(rewrite_permit);
-        }
-        // Commit an artifact-backed rewrite only after durable storage succeeds.
-        if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
-            if let Some((freed, removed)) = spill_old_messages_to_artifact(host, state).await {
-                total_freed += freed;
-                total_messages_removed += removed;
-                layer_descriptions.push(format!("history_artifact: ~{freed} tokens"));
-            }
-        }
-
-        if total_freed > 0 {
-            let pressure = measured as f64 / state.max_turn_input_tokens as f64;
-            state.context_compression_triggered = true;
-            state.step_recorder.record_compaction_with_kind(
-                "reactive_budget",
-                total_messages_removed.min(u32::MAX as usize) as u32,
-                total_freed,
-                pressure,
-            );
-            let event = CompactionEvent::new(
-                CompactionKind::ReactiveBudget,
-                pressure,
-                total_freed,
-                measured,
-                state.max_turn_input_tokens,
-                total_messages_removed,
-                state.messages.len(),
-                layer_descriptions.clone(),
-            );
-            host.on_compaction(event);
-            if let Some(ref mut sess) = state.pipeline_session {
-                sess.recovery.record_reactive_compact();
-                sess.stats.record_compaction(total_freed);
-            }
-            state
-                .compaction_effectiveness
-                .record_compaction(total_freed);
-            // Session 0e37eb46 regression: after compaction shreds the
-            // history, the model sees a much-shorter context and often
-            // misreads it as "I've been interrupted" → produces a
-            // progress summary instead of continuing. Inject a short
-            // directive that reframes it as "the runtime compressed
-            // your history; CONTINUE the task — do NOT summarize."
-            //
-            // Observable: stderr line above ("♻ Context pressure…")
-            // shows the compaction fired; this push_volatile adds the
-            // behavioural counter-directive to the volatile lane.
-            // Recoverable: if a future user wants the old behaviour,
-            // the volatile is singleton per turn and never persisted.
-            // Correctable: `compaction_injects_resume_directive_on_volatile_lane`
-            // test locks the contract.
-            state.push_volatile(
-                super::host::VolatileKind::CompactResume,
-                super::super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
-            );
-            try_write_heavy_checkpoint(state);
-            return Some(TurnExecutionControl::ContinueLoop);
-        }
-    }
-
-    // Compaction made no progress — inject the stop directive.
-    state.budget_wrapup_injected = true;
-    state.hooks.completion_settlement.wrapup_origin =
-        Some(super::host::BudgetWrapupOrigin::TokenRail);
-    if !prep.quiet {
-        host.emit_headless_line(
-            HeadlessStderrStyle::Yellow,
-            format!(
-                "⚠ Token budget reached ({measured}/{} tokens) — wrapping up.",
-                state.max_turn_input_tokens,
-            ),
-        );
-    }
-    state.push_volatile(
-        super::host::VolatileKind::BudgetAdvisory,
-        super::super::budget_messaging::BUDGET_REACHED_ADVISORY,
-    );
-    try_write_heavy_checkpoint(state);
-    Some(TurnExecutionControl::ContinueLoop)
 }
 
 fn record_tool_selection(
@@ -13946,7 +13823,7 @@ mod tests {
             host.history_artifact_enabled = true;
             let mut state = make_state();
             state.max_turn_input_tokens = 32_000;
-            state.last_measured_prompt_tokens = Some(40_000);
+            state.record_prompt_measurement(Some(40_000));
             state.compact_tier_applied = CompactionTier::CompactHistory;
             state.messages = vec![serde_json::json!({"role":"user","content":"Continue"})];
             for index in 0..6 {
@@ -13969,16 +13846,9 @@ mod tests {
             if !duplicates {
                 host.history_artifact_enabled = false;
             }
-            handle_token_budget(
-                &mut host,
-                &mut state,
-                TurnIterationPrep {
-                    quiet: true,
-                    turn_start_time: Instant::now(),
-                },
-                &text_result("working", 40_000, 20, None),
-            )
-            .await;
+            super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
+                .await
+                .unwrap();
             assert!(host.history_artifacts.is_empty());
             if admitted && duplicates {
                 assert!(!state.budget_wrapup_injected);
@@ -14016,207 +13886,6 @@ mod tests {
                 assert!(state.budget_wrapup_injected);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn reactive_compaction_does_not_arm_wrapup_after_success() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.max_turn_input_tokens = 80_000;
-        state.last_measured_prompt_tokens = Some(90_000);
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
-        for i in 0..16 {
-            let id = format!("read-{i}");
-            state.messages.extend([
-                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
-                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
-            ]);
-        }
-
-        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
-        let control = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("working", 90_000, 300, Some(20)),
-        )
-        .await;
-
-        assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
-        assert!(
-            !state.budget_wrapup_injected,
-            "successful reactive compaction should continue the turn without arming wrapup"
-        );
-        assert!(
-            state.context_compression_triggered,
-            "quiet reactive compaction must remain visible to the final context trace"
-        );
-        assert!(
-            host.compaction_events
-                .iter()
-                .any(|event| event.kind == CompactionKind::ReactiveBudget),
-            "quiet reactive compaction must emit the same structured callback as rendered mode"
-        );
-        assert!(
-            state.step_recorder.events().iter().any(|event| {
-                event.event_type == astra_pipeline::step_protocol::StepEventType::CompactionFired
-            }),
-            "quiet reactive compaction must still emit durable step audit"
-        );
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.kind == VolatileKind::CompactResume),
-            "successful reactive compaction should inject the continue-after-compact directive"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeated_budget_pressure_retries_compaction_before_wrapup() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.max_turn_input_tokens = 80_000;
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
-        for i in 0..24 {
-            let id = format!("read-{i}");
-            state.messages.extend([
-                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
-                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
-            ]);
-        }
-
-        state.last_measured_prompt_tokens = Some(90_000);
-        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
-        let first = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("working", 90_000, 300, Some(20)),
-        )
-        .await;
-        assert!(matches!(first, Some(TurnExecutionControl::ContinueLoop)));
-        assert!(!state.budget_wrapup_injected);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 1);
-        let first_savings = state.compaction_effectiveness.cumulative_tokens_freed;
-        assert!(first_savings > 0);
-
-        // A second provider round can add genuinely prunable evidence. Pressure
-        // alone must not count the already-installed boundary as new savings.
-        for i in 0..12 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("new evidence {i}: {}", "z".repeat(2_000)),
-            }));
-        }
-
-        state.last_measured_prompt_tokens = Some(88_000);
-        let second = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("still working", 88_000, 320, Some(20)),
-        )
-        .await;
-
-        assert!(
-            matches!(second, Some(TurnExecutionControl::ContinueLoop)),
-            "continued context pressure should retry compaction before forcing wrapup"
-        );
-        assert!(
-            !state.budget_wrapup_injected,
-            "repeat pressure after a successful compact should not flip straight into wrapup mode"
-        );
-        assert_eq!(state.compaction_effectiveness.attempt_count, 2);
-        assert!(state.compaction_effectiveness.cumulative_tokens_freed > first_savings);
-
-        // Repeated recovery can consume the retained completed tail, but every
-        // accepted rewrite must make real progress and converge to no benefit.
-        for _ in 0..6 {
-            let before = state.messages.clone();
-            let savings = state.compaction_effectiveness.cumulative_tokens_freed;
-            let control = handle_token_budget(
-                &mut host,
-                &mut state,
-                TurnIterationPrep {
-                    quiet: true,
-                    turn_start_time: Instant::now(),
-                },
-                &text_result("still working", 88_000, 320, Some(20)),
-            )
-            .await;
-            assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
-            if state.budget_wrapup_injected {
-                assert_eq!(state.messages, before);
-                assert_eq!(
-                    state.compaction_effectiveness.cumulative_tokens_freed,
-                    savings
-                );
-                break;
-            }
-            assert!(state.messages.len() < before.len());
-            assert!(state.compaction_effectiveness.cumulative_tokens_freed > savings);
-        }
-        assert!(
-            state.budget_wrapup_injected,
-            "bounded history recovery must converge"
-        );
-    }
-
-    #[tokio::test]
-    async fn prior_compactions_do_not_prevent_recovery_from_new_pressure() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.max_turn_input_tokens = 80_000;
-        state.last_measured_prompt_tokens = Some(90_000);
-        state.compaction_effectiveness.attempt_count = 14;
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
-        for i in 0..16 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("step {i}: {}", "x".repeat(240)),
-            }));
-        }
-
-        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
-        let control = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("working", 90_000, 300, Some(20)),
-        )
-        .await;
-
-        assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
-        assert!(
-            !state.budget_wrapup_injected,
-            "previous compactions must not prevent a useful recovery"
-        );
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.kind == VolatileKind::CompactResume),
-            "successful recovery should continue the user's task"
-        );
     }
 
     #[test]
@@ -17671,6 +17340,7 @@ Recover earlier details through the authorized artifact reader in the current to
     let freed = candidate.tokens_freed();
     let removed = candidate.messages_removed;
     state.messages = candidate.messages;
+    state.prompt_measurement_current = false;
     state.last_request_message_count = sent_prefix;
     state.finish_canonical_rewrite(Some(rewrite_permit));
     Some((freed, removed))

@@ -217,6 +217,13 @@ impl ContextPipeline {
                     }
                     if history_owner == HistoryOptimizationOwner::DownstreamSemanticCompactor {
                         limits.allow_round_dropping = false;
+                        // Pressure must not rewrite otherwise unchanged cacheable
+                        // declarations. Current schemas remain the sole authority.
+                        if input.sources.session.cache_protocol
+                            != crate::cache_placement::CacheProtocol::None
+                        {
+                            limits.allow_schema_pruning = false;
+                        }
                     }
                     limits
                 };

@@ -1839,16 +1839,30 @@ async fn session_continuation_restores_primary_attempt_after_run_recovery() {
     exercise_primary_attempt_continuation(ContinuationFixture::Recovered).await;
 }
 
+#[derive(Clone, Copy)]
 enum ContinuationFixture {
     Direct,
     NewTurn,
     Compacted,
     Recovered,
+    BudgetRecovered,
+    ContextWindowRecovered,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn reactive_budget_recovery_keeps_cache_prefix_without_artifact_sql() {
+    exercise_primary_attempt_continuation(ContinuationFixture::BudgetRecovered).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn provider_overflow_recovers_unique_history_through_authorized_artifact() {
+    exercise_primary_attempt_continuation(ContinuationFixture::ContextWindowRecovered).await;
 }
 
 async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     let through_new_turn = !matches!(fixture, ContinuationFixture::Direct);
-    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
     use astra_services::work::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         InternalSessionId, NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt,
@@ -2037,14 +2051,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     }
     if through_new_turn {
         exercise_primary_continuation_entry(
-            &pool,
-            &owner,
-            &session,
-            &work,
-            &branch,
-            &attempt,
-            &old_run,
-            compact_history,
+            &pool, &owner, &session, &work, &branch, &attempt, &old_run, fixture,
         )
         .await;
         cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
@@ -2165,8 +2172,16 @@ async fn exercise_primary_continuation_entry(
     branch: &str,
     attempt: &str,
     old_run: &str,
-    compact_history: bool,
+    fixture: ContinuationFixture,
 ) {
+    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
+    let budget_recovery = matches!(fixture, ContinuationFixture::BudgetRecovered);
+    let overflow_recovery = matches!(fixture, ContinuationFixture::ContextWindowRecovered);
+    let context_window = if budget_recovery || overflow_recovery {
+        120_000u32
+    } else {
+        128_000
+    };
     use axum::{Router, extract::State, response::IntoResponse, routing::post};
     #[derive(Clone)]
     struct Probe {
@@ -2178,6 +2193,9 @@ async fn exercise_primary_continuation_entry(
         tool_feedback: Arc<TokioMutex<Vec<Value>>>,
         first_request: Arc<TokioMutex<Option<Value>>>,
         summary_requests: Arc<AtomicUsize>,
+        primary_requests: Arc<TokioMutex<Vec<Value>>>,
+        budget_recovery: bool,
+        overflow_recovery: bool,
     }
     async fn respond(
         State(probe): State<Probe>,
@@ -2188,6 +2206,23 @@ async fn exercise_primary_continuation_entry(
             message["content"].as_str()
                 == Some(astra_turn_core::cloud::summary::INLINE_COMPACT_INSTRUCTION)
         });
+        let ordinal = if is_summary {
+            0
+        } else {
+            let mut primary = probe.primary_requests.lock().await;
+            primary.push(request.clone());
+            primary.len()
+        };
+        if probe.overflow_recovery && ordinal == 1 {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input exceeds the provider context window"}
+            }))).into_response();
+        }
+        let prompt_tokens = if probe.budget_recovery && ordinal == 1 {
+            100_000
+        } else {
+            3
+        };
         let message = if is_summary {
             assert!(
                 probe.first_request.lock().await.is_none(),
@@ -2312,14 +2347,14 @@ async fn exercise_primary_continuation_entry(
                 }
             }
             let chunk = json!({"choices":[{"index":0,"delta":delta}]});
-            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}});
+            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}});
             (
                 [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                 format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
             )
                 .into_response()
         } else {
-            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})).into_response()
+            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}})).into_response()
         }
     }
     let observations = Arc::new(TokioMutex::new(Vec::new()));
@@ -2327,6 +2362,7 @@ async fn exercise_primary_continuation_entry(
     let tool_feedback = Arc::new(TokioMutex::new(Vec::new()));
     let first_request = Arc::new(TokioMutex::new(None));
     let summary_requests = Arc::new(AtomicUsize::new(0));
+    let primary_requests = Arc::new(TokioMutex::new(Vec::new()));
     let probe = Probe {
         pool: pool.clone(),
         owner: owner.into(),
@@ -2336,6 +2372,9 @@ async fn exercise_primary_continuation_entry(
         tool_feedback: tool_feedback.clone(),
         first_request: first_request.clone(),
         summary_requests: summary_requests.clone(),
+        primary_requests: primary_requests.clone(),
+        budget_recovery,
+        overflow_recovery,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2356,9 +2395,9 @@ async fn exercise_primary_continuation_entry(
     };
     let offering_id = format!("continuation-offering-{}", Uuid::new_v4());
     let model_name = format!("continuation-model-{}", Uuid::new_v4());
-    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&offering_id).bind(&model_name)
-        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url)
+        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url).bind(context_window)
         .bind(r#"["text"]"#).bind(r#"["text"]"#).bind("[]").bind("{}").bind("[]").bind("{}")
         .execute(pool.get()).await.expect("seed unique test Offering");
     let service =
@@ -2367,26 +2406,33 @@ async fn exercise_primary_continuation_entry(
                 .with_pool(pool.clone()),
         ));
     let mut created = Vec::new();
-    if compact_history {
+    if compact_history || budget_recovery || overflow_recovery {
         let mut history = vec![
             json!({"role":"user","content":"Read the current continuation live runtime overview."}),
         ];
-        for index in 0..160 {
+        for index in 0..if compact_history { 160 } else { 20 } {
             let call_id = format!("prior-observation-{index}");
             history.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
-            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if budget_recovery { "evidence ".repeat(970) } else if overflow_recovery { format!("CONFIRMED_OBSERVATION_{index}: {}", "unique evidence ".repeat(250)) } else if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
         }
         history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
-        let prompt_limit =
-            crate::prompts::budget_for_model_with_metadata(Some(&model_name), Some(128_000), None)
-                .effective_input_limit();
+        let prompt_limit = crate::prompts::budget_for_model_with_metadata(
+            Some(&model_name),
+            Some(context_window),
+            None,
+        )
+        .effective_input_limit();
         let turn_limit = astra_core::runtime_limits::RuntimeLimits::default()
-            .effective_max_turn_input_tokens_with_context_window(Some(&model_name), Some(128_000));
+            .effective_max_turn_input_tokens_with_context_window(
+                Some(&model_name),
+                Some(context_window),
+            );
         let estimated = crate::prompts::estimate_tokens(&history, 0, 0);
-        assert!(
-            estimated as f64 / turn_limit as f64
-                >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit),
-            "fixture must require pre-turn compaction: {estimated}/{turn_limit}"
+        let requires_compact = estimated as f64 / turn_limit as f64
+            >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit);
+        assert_eq!(
+            requires_compact, compact_history,
+            "fixture pressure: {estimated}/{turn_limit}"
         );
         assert!(
             estimated < prompt_limit,
@@ -2609,6 +2655,118 @@ async fn exercise_primary_continuation_entry(
                     > 1,
                 "real compaction must be followed by multiple provider calls"
             );
+        }
+        if turn == 0 && (budget_recovery || overflow_recovery) {
+            let primary = primary_requests.lock().await;
+            assert!(
+                primary.len() >= 2,
+                "recovery rebuilds a real provider request"
+            );
+            assert_eq!(
+                summary_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no auxiliary inference"
+            );
+            assert_eq!(
+                primary[0]["tools"], primary[1]["tools"],
+                "stable tool/cache prefix"
+            );
+            assert_eq!(
+                primary[0]["messages"][0], primary[1]["messages"][0],
+                "stable system/cache prefix"
+            );
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT artifact_id, content_json FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_kind=?",
+            ).bind(owner).bind(session).bind(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_KIND)
+                .fetch_all(pool.get()).await.unwrap();
+            assert_eq!(
+                rows.len(),
+                usize::from(overflow_recovery),
+                "only true provider overflow needs an artifact"
+            );
+            if overflow_recovery {
+                let snapshot: astra_turn_types::ContextHistoryArtifactV1 =
+                    serde_json::from_str(&rows[0].1).unwrap();
+                snapshot.validate(session).unwrap();
+                for index in 0..20 {
+                    assert!(
+                        snapshot
+                            .transcript_json
+                            .contains(&format!("CONFIRMED_OBSERVATION_{index}:"))
+                    );
+                }
+                let handle = format!(
+                    "{}{}",
+                    astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+                    rows[0].0
+                );
+                assert!(primary[1]["messages"].to_string().contains(&handle));
+                let reader =
+                    astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
+                        .with_pool(pool.clone());
+                let args = json!({"artifact":handle,"max_bytes":65_536});
+                let output = crate::server::context_history_artifact::resolve_request(
+                    Some(&reader),
+                    owner,
+                    session,
+                    &args,
+                )
+                .await
+                .unwrap();
+                assert!(output.contains("CONFIRMED_OBSERVATION_0:"));
+                assert!(
+                    crate::server::context_history_artifact::resolve_request(
+                        Some(&reader),
+                        "foreign-owner",
+                        session,
+                        &args
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(
+                    crate::server::context_history_artifact::resolve_request(
+                        Some(&reader),
+                        owner,
+                        "foreign-session",
+                        &args
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            let journal =
+                astra_pipeline::step_checkpoint::FileBackedEventStore::load_recent_events_bounded(
+                    owner,
+                    session,
+                    4 * 1024 * 1024,
+                    1000,
+                )
+                .unwrap();
+            assert!(
+                journal.events.iter().any(|event| event.event_type
+                    == astra_pipeline::step_protocol::StepEventType::CompactionFired
+                    && event
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload["tokens_saved"]
+                            .as_u64()
+                            .is_some_and(|tokens| tokens > 0))),
+                "actual recovery saved context"
+            );
+            if budget_recovery {
+                let durable = service
+                    .run_engine
+                    .load_run(owner, &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    durable.total_prompt_tokens,
+                    100_000 + 3 * (primary.len() as u64 - 1),
+                    "each physical primary request remains in raw accounting"
+                );
+            }
         }
         let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
             .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();

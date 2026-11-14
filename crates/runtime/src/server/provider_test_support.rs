@@ -1136,12 +1136,18 @@ mod tests {
             server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
                 .with_memoria_client(Some(memory.clone()))
                 .build();
-        let history = (0..12)
-            .map(|index| json!({
-                "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(if index < 4 { 30_000 } else { 32 })),
-            }))
-            .collect();
+        let mut history =
+            vec![json!({"role":"user","content":"Inspect the historical resources."})];
+        for index in 0..12 {
+            let id = format!("historical-read-{index}");
+            history.extend([
+                json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                }]}),
+                json!({"role":"tool","tool_call_id":id,
+                    "content":format!("Historical evidence {index}: {}", "review evidence ".repeat(if index < 4 {30_000} else {32}))}),
+            ]);
+        }
         let mut state = loop_state(&session, history, "Summarize the review evidence.");
         host.prepare_model_selection(&mut state).await.unwrap();
         let result = host

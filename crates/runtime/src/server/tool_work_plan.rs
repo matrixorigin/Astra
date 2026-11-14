@@ -1046,6 +1046,7 @@ mod tests {
     ) -> ToolInvocationMetadata<'a> {
         ToolInvocationMetadata {
             admission_deadline: None,
+            observation_deadline: None,
             run_id: Some("run-1"),
             turn_chain_id: Some("turn-1"),
             tool_call_id: Some(call_id),

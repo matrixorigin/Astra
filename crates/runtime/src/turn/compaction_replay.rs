@@ -54,6 +54,31 @@ pub struct CompactionReplayResult {
     pub tier: CompactionKind,
 }
 
+impl CompactionReplayResult {
+    pub(crate) fn from_pipeline(outcome: PipelineOutcome, retry_count: u32) -> Self {
+        Self {
+            tokens_freed: outcome.total_tokens_freed,
+            messages_removed: outcome
+                .layer_results
+                .iter()
+                .map(|(_, result)| result.messages_removed)
+                .sum(),
+            layer_descriptions: outcome
+                .layer_results
+                .iter()
+                .map(|(name, result)| format!("{name}: ~{} tokens", result.estimated_tokens_freed))
+                .collect(),
+            budget_likely_satisfied: outcome.budget_satisfied,
+            pipeline_outcome: outcome,
+            tier: match retry_count {
+                0 | 1 => CompactionKind::RetryDefault,
+                2 => CompactionKind::RetryAggressive,
+                _ => CompactionKind::RetryEmergency,
+            },
+        }
+    }
+}
+
 /// Outcome of a compaction-replay attempt.
 ///
 /// When compaction frees tokens but the next LLM call still fails with a
@@ -221,35 +246,12 @@ pub(crate) fn try_compact_for_retry_tiered(
     // Attempt numbers are diagnostic; every retry uses the same exact
     // duplicate rule and cannot escalate into dropping unique evidence.
     let pipeline = CompactionEngine::aggressive_pipeline();
-    let tier = match retry_count {
-        0 | 1 => CompactionKind::RetryDefault,
-        2 => CompactionKind::RetryAggressive,
-        _ => CompactionKind::RetryEmergency,
-    };
     let outcome = pipeline.compress_if_needed(messages, &budget);
     if outcome.total_tokens_freed == 0 {
         return None; // Pipeline did nothing
     }
 
-    let messages_removed: usize = outcome
-        .layer_results
-        .iter()
-        .map(|(_, r)| r.messages_removed)
-        .sum();
-    let layer_descriptions: Vec<String> = outcome
-        .layer_results
-        .iter()
-        .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
-        .collect();
-
-    Some(CompactionReplayResult {
-        tokens_freed: outcome.total_tokens_freed,
-        messages_removed,
-        layer_descriptions,
-        budget_likely_satisfied: outcome.budget_satisfied,
-        pipeline_outcome: outcome,
-        tier,
-    })
+    Some(CompactionReplayResult::from_pipeline(outcome, retry_count))
 }
 
 /// A bounded rewrite either reduced history or made no progress. A future

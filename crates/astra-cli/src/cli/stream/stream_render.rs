@@ -1493,12 +1493,44 @@ fn apply_edge_callback_failure_result(
     callback_failure: Option<EdgeCallbackFailure>,
 ) {
     if let Some(failure) = callback_failure {
-        let preserve_existing_kind = accum
-            .error_kind
-            .is_some_and(|kind| kind != astra_core::ErrorKind::Cancelled)
-            || accum.has_authoritative_failed_terminal()
-            || accum.has_authoritative_interrupted_terminal();
+        let selected_terminal = (accum.has_authoritative_failed_terminal()
+            || accum.has_authoritative_interrupted_terminal())
+        .then(|| accum.observed_root_terminal())
+        .flatten()
+        .map(|terminal| {
+            (
+                terminal.error_kind,
+                terminal.error.clone().or_else(|| {
+                    terminal
+                        .interruption
+                        .as_ref()
+                        .map(|record| record.user_message.clone())
+                }),
+            )
+        });
+        let preserve_existing_kind = accum.error_kind.is_some_and(|kind| {
+            kind != astra_core::ErrorKind::Cancelled
+                && (kind != astra_core::ErrorKind::Unknown
+                    || failure.kind == astra_core::ErrorKind::Unknown)
+        }) || selected_terminal.is_some();
         if preserve_existing_kind {
+            if accum
+                .error_kind
+                .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
+                && let Some((kind, owner_message)) = selected_terminal
+            {
+                accum.error_kind = kind;
+                if let Some(owner_message) = owner_message {
+                    let prior = accum
+                        .error_message
+                        .take()
+                        .filter(|prior| prior != &owner_message);
+                    accum.error_message = Some(match prior {
+                        Some(prior) => format!("{owner_message}\n{prior}"),
+                        None => owner_message,
+                    });
+                }
+            }
             if let Some(message) = accum.error_message.as_mut() {
                 message.push('\n');
                 message.push_str(&failure.message);
@@ -1506,7 +1538,15 @@ fn apply_edge_callback_failure_result(
                 accum.error_message = Some(failure.message);
             }
         } else {
-            accum.error_message = Some(failure.message);
+            let prior = accum
+                .error_kind
+                .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
+                .then(|| accum.error_message.take())
+                .flatten();
+            accum.error_message = Some(match prior {
+                Some(prior) => format!("{}\n{prior}", failure.message),
+                None => failure.message,
+            });
             accum.error_kind = Some(failure.kind);
         }
     }
@@ -6219,6 +6259,17 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
                     command_timeout_cap_ms: request.command_timeout_cap_ms,
+                    observation_deadline: (tool == "task_output").then(|| {
+                        let deadline = invocation_identity
+                            .as_ref()
+                            .map_or(request.execution_deadline_at, |identity| {
+                                identity.execution_deadline_at
+                            })
+                            .into_std();
+                        deadline
+                            .checked_sub(astra_turn_core::chat_turn_heuristics::DIRECT_ACTION_SETTLEMENT_GRACE)
+                            .unwrap_or_else(std::time::Instant::now)
+                    }),
                     admission_source: Some(admission_source),
                     ..Default::default()
                 };
@@ -9021,6 +9072,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
             admission_deadline: invocation.admission_deadline,
+            observation_deadline: invocation.observation_deadline,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),
@@ -9639,6 +9691,109 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn callback_database_failure_precedes_unclassified_transport_loss() {
+        for kind in [Some("unknown"), None] {
+            let mut accum = ChatTurnSseAccum::default();
+            let event = serde_json::json!({"type":"error", "message":"stream closed before run_finished", "error_kind":kind});
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut vec![],
+            );
+            assert_eq!(
+                accum.error_kind,
+                kind.map(|_| astra_core::ErrorKind::Unknown)
+            );
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: astra_core::ErrorKind::DatabaseError,
+                    message: "The tool-result callback could not reach the database.".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::DatabaseError));
+            let message = accum.error_message.unwrap();
+            assert!(message.starts_with("The tool-result callback could not reach the database."));
+            assert!(message.contains("stream closed before run_finished"));
+        }
+    }
+
+    #[test]
+    fn callback_failure_preserves_concrete_and_authoritative_causes() {
+        use astra_core::ErrorKind;
+        for (existing, callback, expected) in [
+            (
+                ErrorKind::ToolTimeout,
+                ErrorKind::DatabaseError,
+                ErrorKind::ToolTimeout,
+            ),
+            (ErrorKind::Auth, ErrorKind::DatabaseError, ErrorKind::Auth),
+            (ErrorKind::Unknown, ErrorKind::Unknown, ErrorKind::Unknown),
+            (
+                ErrorKind::Cancelled,
+                ErrorKind::DatabaseError,
+                ErrorKind::DatabaseError,
+            ),
+        ] {
+            let mut accum = ChatTurnSseAccum {
+                error_kind: Some(existing),
+                error_message: Some("selected cause".into()),
+                ..Default::default()
+            };
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: callback,
+                    message: "callback details".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(expected));
+            assert!(
+                accum
+                    .error_message
+                    .as_ref()
+                    .unwrap()
+                    .contains("callback details")
+            );
+        }
+        for provisional_error in [false, true] {
+            let mut accum = ChatTurnSseAccum::default();
+            let mut events = vec![
+                serde_json::json!({"type":"run_started","run_id":"root","owner_generation":4}),
+            ];
+            if provisional_error {
+                events.push(serde_json::json!({"type":"run_error","run_id":"root","owner_generation":4,"error_kind":"unknown","error":"generic transport fallback"}));
+            }
+            events.push(serde_json::json!({"type":"run_finished","run_id":"root","owner_generation":4,"status":"failed","error_kind":"unknown","error":"owner-selected cause"}));
+            for event in events {
+                astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut vec![],
+                );
+            }
+            assert!(accum.has_authoritative_failed_terminal());
+            assert_eq!(
+                accum.run_terminal.as_ref().unwrap().error_kind,
+                Some(ErrorKind::Unknown)
+            );
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: ErrorKind::DatabaseError,
+                    message: "callback details".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(ErrorKind::Unknown));
+            let message = accum.error_message.unwrap();
+            assert!(message.starts_with("owner-selected cause"));
+            if provisional_error {
+                assert!(message.contains("generic transport fallback"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn edge_identity_binding_survives_backpressure_and_respects_cancellation() {
@@ -15768,7 +15923,14 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let target = temp.path().join("must-not-read.txt");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let captures = tempdir().expect("task capture directory");
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_background_tasks(
+                crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                    captures.path().to_path_buf(),
+                ),
+            ),
+        );
         let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -15848,6 +16010,42 @@ mod tests {
             !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&results[0])
                 .was_executed()
         );
+        // A tightened identity deadline is the authority even when the
+        // incoming request still advertises a later delivery window.
+        let deadline = tokio::time::Instant::now();
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        host.tool_result_identities.insert(
+            "observation-1".into(),
+            ToolResultIdentity {
+                work_attribution: None,
+                session_id: "test-session".into(),
+                run_id: "test-run".into(),
+                turn_chain_id: "test-chain".into(),
+                request_id: "observation-1".into(),
+                execution_deadline_unix_ms: unix_ms,
+                execution_deadline_at: deadline + std::time::Duration::from_secs(2),
+            },
+        );
+        let results = host.execute_tools_batch(vec![ToolBatchRequest {
+            work_attribution: None, admitted_skill_names: None,
+            session_id: "test-session".into(), run_id: "test-run".into(),
+            turn_chain_id: "test-chain".into(), request_id: "observation-1".into(),
+            read_only_execution: true, execution_timeout_ms: 60_000,
+            command_timeout_cap_ms: Some(300_000), execution_deadline_unix_ms: unix_ms,
+            execution_deadline_at: deadline + std::time::Duration::from_secs(60),
+            tool: "task_output".into(),
+            args: serde_json::json!({"task_id":"unknown-task","block":true,"timeout_ms":300_000}),
+        }]).await;
+        assert_eq!(results.len(), 1);
+        let fields = results[0].tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], "tool_timeout");
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["stage"], "observation");
+        assert!(deadline.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]

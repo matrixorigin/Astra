@@ -5724,6 +5724,7 @@ mod tests {
                 &args,
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -5902,6 +5903,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -5998,6 +6000,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -6085,6 +6088,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),
