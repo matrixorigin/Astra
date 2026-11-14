@@ -10,6 +10,7 @@ use serde_json::Value;
 /// Maximum time to wait for a git subprocess to complete.
 /// Prevents 67s+ hangs on large merge commits (observed in session 0ac7696c).
 const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+type StdoutConsumer<'a> = &'a mut dyn FnMut(&[u8]);
 
 #[derive(Debug)]
 pub enum GitProcessError {
@@ -312,7 +313,7 @@ impl BoundGitCommand {
         &mut self,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
-        self.run_sync(&self.args, true, 16 * 1024 * 1024, cancel)
+        self.run_sync(&self.args, true, 16 * 1024 * 1024, cancel, None)
             .map(|out| out.output)
     }
 
@@ -320,7 +321,16 @@ impl BoundGitCommand {
     pub fn output_with_ownership(
         &mut self,
     ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
-        self.run_sync(&self.args, true, 16 * 1024 * 1024, None)
+        self.run_sync(&self.args, true, 16 * 1024 * 1024, None, None)
+    }
+
+    /// Consume stdout incrementally without weakening the bound process owner.
+    pub fn output_with_stdout(
+        &mut self,
+        consumer: &mut dyn FnMut(&[u8]),
+    ) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
+        self.run_sync(&self.args, true, 16 * 1024 * 1024, None, Some(consumer))
+            .map(|out| out.output)
     }
 
     fn run_sync(
@@ -329,14 +339,16 @@ impl BoundGitCommand {
         force_worktree: bool,
         output_limit: usize,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        consumer: Option<StdoutConsumer<'_>>,
     ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
-        let result = astra_sandbox::run_sync_process_with_cancel(
+        let result = astra_sandbox::run_sync_process_with_stdout(
             "git",
             args,
             GIT_SUBPROCESS_TIMEOUT,
             output_limit,
             cancel,
             |cmd, _| self.configure(cmd, force_worktree),
+            consumer,
         );
         self.finish_sync_result(result)
     }
@@ -484,7 +496,7 @@ fn prepare_bound_git_command_with_pin_hook(
     ]
     .map(str::to_owned);
     let output = command
-        .run_sync(&args, false, 65536, cancel)
+        .run_sync(&args, false, 65536, cancel, None)
         .map_err(|e| format!("Error: cannot validate bound git repository: {e}"))?
         .output;
     if !output.status.success() {

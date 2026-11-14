@@ -4,7 +4,6 @@
 //! change counting, and safe cleanup.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -16,9 +15,27 @@ pub(super) fn workspace_safe_for_cleanup(path: &Path) -> bool {
             == Some(false)
 }
 
+// Checkout hooks run in the new worktree, so their ownership applies there
+// as well as to the repository where `git worktree add` was invoked.
+fn record_checkout_ownership(path: &Path, ownership: Option<astra_sandbox::ScopeOwnership>) {
+    match ownership {
+        None => {
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(path);
+        }
+        Some(owner) if !owner.is_authoritative() => {
+            astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                path,
+                Some(owner.as_str()),
+            );
+        }
+        Some(_) => {}
+    }
+}
+
 #[derive(Debug)]
 enum WorktreeError {
     Domain(String),
+    Unsupported(String),
     Process(astra_tools::git_gix::GitProcessError),
 }
 impl From<String> for WorktreeError {
@@ -39,7 +56,7 @@ impl From<astra_tools::git_gix::GitProcessError> for WorktreeError {
 impl std::fmt::Display for WorktreeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Domain(message) => write!(f, "{message}"),
+            Self::Domain(message) | Self::Unsupported(message) => write!(f, "{message}"),
             Self::Process(error) => write!(f, "{error}"),
         }
     }
@@ -49,6 +66,22 @@ impl WorktreeError {
         match self {
             Self::Domain(message) => {
                 super::ToolExecutionOutcome::error(format!("Error: {message}"))
+            }
+            Self::Unsupported(message) => {
+                let evidence = astra_core::ToolFailureEvidence::new(
+                    astra_core::ErrorKind::ToolUnavailable,
+                    astra_core::ToolFailureCause::CapabilityUnavailable,
+                    false,
+                    vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+                );
+                let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                    format!("Error: {message}"),
+                    evidence,
+                );
+                let fields = outcome.tool_result_fields.get_or_insert_default();
+                astra_tools::execution_outcome::insert_not_executed_fact(fields);
+                fields.insert("side_effects_maybe".into(), Value::Bool(false));
+                outcome
             }
             Self::Process(error) => error.into_outcome("worktree"),
         }
@@ -65,7 +98,7 @@ pub struct WorktreeSession {
     pub branch_name: String,
     /// Original project root to restore on `exit`.
     pub original_root: PathBuf,
-    /// Git commit SHA at the time the worktree was created.
+    /// Creation baseline for a new worktree; absent for a selected existing branch.
     pub original_head_commit: Option<String>,
     /// Identity of the checkout's own Git metadata directory.
     pub(crate) git_identity: String,
@@ -134,88 +167,70 @@ fn worktree_identity(path: &Path) -> Result<String, String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitWorktreeRollbackEntry {
-    sequence: u64,
-    pub worktree_path: PathBuf,
-    pub branch_name: String,
-    pub original_root: PathBuf,
-    pub turn_index: u32,
-    pub timestamp: SystemTime,
-    pub original_head_commit: Option<String>,
-    pub delete_branch_on_rollback: bool,
-    pub session_scoped: bool,
+fn existing_worktree_for_branch(
+    root: &Path,
+    branch: &str,
+) -> Result<Option<PathBuf>, WorktreeError> {
+    let output = astra_tools::git_gix::inspect_bound_git_worktree(
+        root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
+    if !output.status.success() {
+        return Err(astra_tools::git_gix::GitProcessError::Exit(format!(
+            "could not list worktrees: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+
+    let target = format!("branch refs/heads/{branch}");
+    let mut path = None;
+    let mut found = None;
+    for field in output.stdout.split(|byte| *byte == 0) {
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            path = Some(value);
+        } else if field == target.as_bytes() {
+            let value = path.ok_or("Git returned a worktree branch without a path")?;
+            #[cfg(unix)]
+            let candidate = {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()))
+            };
+            #[cfg(not(unix))]
+            let candidate = PathBuf::from(
+                std::str::from_utf8(value).map_err(|_| "Git returned an invalid worktree path")?,
+            );
+            if found.replace(candidate).is_some() {
+                return Err(
+                    "The branch is checked out in multiple worktrees; select it with Git first."
+                        .into(),
+                );
+            }
+        } else if field.is_empty() {
+            path = None;
+        }
+    }
+    Ok(found)
+}
+
+fn resolve_worktree_start_point(root: &Path, start_point: &str) -> Result<String, WorktreeError> {
+    let revision = format!("{start_point}^{{commit}}");
+    let resolved = astra_tools::git_gix::inspect_bound_git_worktree(
+        root,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    )?;
+    if !resolved.status.success() {
+        return Err("Worktree start point is not an existing commit".into());
+    }
+    Ok(String::from_utf8_lossy(&resolved.stdout).trim().to_string())
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct GitWorktreeRollbackJournal {
-    entries: Vec<GitWorktreeRollbackEntry>,
-    next_sequence: u64,
+pub(crate) struct WorktreeSessionOwner {
     pub(super) active_session: std::sync::Arc<std::sync::Mutex<Option<WorktreeSession>>>,
     pub(super) transition: std::sync::Arc<tokio::sync::RwLock<()>>,
     restored_session_id: Option<String>,
     session_root: Option<PathBuf>,
-}
-
-impl GitWorktreeRollbackJournal {
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &mut self,
-        worktree_path: PathBuf,
-        branch_name: String,
-        original_root: PathBuf,
-        turn_index: u32,
-        original_head_commit: Option<String>,
-        delete_branch_on_rollback: bool,
-        session_scoped: bool,
-    ) {
-        self.entries.push(GitWorktreeRollbackEntry {
-            sequence: self.next_sequence,
-            worktree_path,
-            branch_name,
-            original_root,
-            turn_index,
-            timestamp: SystemTime::now(),
-            original_head_commit,
-            delete_branch_on_rollback,
-            session_scoped,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    fn list(&self) -> Vec<GitWorktreeRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitWorktreeRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<GitWorktreeRollbackEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-            .cloned()
-            .collect()
-    }
-
-    fn remove_worktree(&mut self, worktree_path: &Path) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.worktree_path == worktree_path)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// Count uncommitted changes and new commits in a worktree since a baseline commit.
@@ -225,10 +240,20 @@ fn count_worktree_changes(
     original_head: Option<&str>,
     branch: &str,
 ) -> Result<(usize, usize), WorktreeError> {
-    // Count uncommitted files
+    // A directory entry is enough to establish that untracked work exists.
     let status = astra_tools::git_gix::inspect_bound_git_worktree(
         worktree_path,
-        &["status", "--porcelain", "--ignored=matching"],
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "status",
+            "--porcelain",
+            "--ignored=matching",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
     )?;
     if !status.status.success() || !status.stderr.is_empty() {
         return Err(astra_tools::git_gix::GitProcessError::Exit(
@@ -273,26 +298,76 @@ fn count_worktree_changes(
             head_changes
         }
     } else {
-        // An unknown creation baseline is not evidence that removal is safe.
-        1
+        // A selected branch is preserved, but detached or switched HEAD may
+        // contain commits that removing the checkout would abandon.
+        let repo = gix::open(worktree_path).map_err(|error| error.to_string())?;
+        let expected_branch = format!("refs/heads/{branch}");
+        let on_preserved_branch = repo
+            .head_name()
+            .ok()
+            .flatten()
+            .is_some_and(|head| head.to_string() == expected_branch)
+            && repo.head_id().is_ok();
+        usize::from(!on_preserved_branch)
     };
 
     Ok((changed_files, commits))
 }
 
-fn delete_worktree_branch(original_root: &Path, branch_name: &str) -> Result<(), String> {
-    let output = astra_tools::git_gix::prepare_bound_git_command(original_root)?
-        .args(["branch", "-D", branch_name])
-        .output()
-        .map_err(|error| format!("failed to delete worktree branch '{branch_name}': {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "failed to delete worktree branch '{branch_name}': {}",
-            stderr.trim()
-        ))
+fn ensure_worktree_index_is_visible(worktree_path: &Path) -> Result<(), WorktreeError> {
+    let mut command = astra_tools::git_gix::prepare_bound_git_command(worktree_path)
+        .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?;
+    let mut index = IndexVisibility::default();
+    let output = command
+        .args(["ls-files", "-v", "-z"])
+        .output_with_stdout(&mut |chunk| index.feed(chunk))
+        .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
+    if !output.status.success() || !output.stderr.is_empty() || !index.complete() {
+        return Err(astra_tools::git_gix::GitProcessError::Exit(
+            "failed to inspect the worktree index".to_string(),
+        )
+        .into());
+    }
+    // Git status ignores paths marked assume-unchanged or skip-worktree, so a
+    // clean status cannot establish that removing their files is safe.
+    if index.hidden {
+        return Err("Git skips checking some tracked files in this worktree; they may contain changes. Inspect them before setting discard_changes=true, or use exit_action=keep.".into());
+    }
+    Ok(())
+}
+
+/// `git ls-files -v -z` emits a tag, space, path and NUL for each entry.
+/// Paths may contain arbitrary bytes, and need not be retained.
+#[derive(Default)]
+struct IndexVisibility {
+    position: u8,
+    hidden: bool,
+    invalid: bool,
+}
+
+impl IndexVisibility {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.position {
+                0 if matches!(
+                    byte.to_ascii_uppercase(),
+                    b'H' | b'S' | b'M' | b'R' | b'C' | b'K' | b'?'
+                ) =>
+                {
+                    self.hidden |= byte.is_ascii_lowercase() || byte == b'S';
+                    self.position = 1;
+                }
+                1 if byte == b' ' => self.position = 2,
+                2 if byte != 0 => self.position = 3,
+                3 if byte == 0 => self.position = 0,
+                3 => {}
+                _ => self.invalid = true,
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        !self.invalid && self.position == 0
     }
 }
 
@@ -375,7 +450,7 @@ impl ToolExecutor {
             return;
         };
         let mut owner = self
-            .git_worktree_journal
+            .worktree_owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if owner.restored_session_id.as_deref() == Some(session_id.as_str()) {
@@ -516,404 +591,6 @@ impl ToolExecutor {
         ))
     }
 
-    fn normalize_worktree_path(&self, worktree_path: &Path) -> PathBuf {
-        if worktree_path.is_absolute() {
-            worktree_path.to_path_buf()
-        } else {
-            self.session_project_root().join(worktree_path)
-        }
-    }
-
-    fn record_git_worktree_rollback(
-        &self,
-        worktree_path: PathBuf,
-        branch_name: String,
-        original_root: PathBuf,
-        original_head_commit: Option<String>,
-        delete_branch_on_rollback: bool,
-        session_scoped: bool,
-    ) {
-        let turn_index = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        match self.git_worktree_journal.lock() {
-            Ok(mut journal) => journal.record(
-                worktree_path,
-                branch_name,
-                original_root,
-                turn_index,
-                original_head_commit,
-                delete_branch_on_rollback,
-                session_scoped,
-            ),
-            Err(poisoned) => poisoned.into_inner().record(
-                worktree_path,
-                branch_name,
-                original_root,
-                turn_index,
-                original_head_commit,
-                delete_branch_on_rollback,
-                session_scoped,
-            ),
-        }
-    }
-
-    fn git_worktree_entries(&self) -> Vec<GitWorktreeRollbackEntry> {
-        match self.git_worktree_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
-    }
-
-    fn git_worktree_restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitWorktreeRollbackEntry> {
-        match self.git_worktree_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn(turn_index),
-            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-        }
-    }
-
-    pub(super) fn git_worktree_restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<GitWorktreeRollbackEntry> {
-        match self.git_worktree_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
-    }
-
-    /// Callers hold the parent repository lease before acquiring checkout
-    /// leases, so concurrent executors cannot delete an active checkout.
-    pub(super) async fn acquire_git_worktree_rollback_leases(
-        &self,
-        args: &Value,
-        already_held: Option<&Path>,
-        parent: &astra_tools::workspace_observation::WorkspaceObservationLease,
-        cancel: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<
-        Vec<astra_tools::workspace_observation::WorkspaceObservationLease>,
-        astra_tools::workspace_observation::WorkspaceLeaseFailure,
-    > {
-        // On macOS rollback never removes a checkout, so acquiring its lease
-        // would only delay the refusal when another process is still using it.
-        if cfg!(target_os = "macos") {
-            return Ok(Vec::new());
-        }
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("current_turn");
-        let turn = match scope {
-            "turn" => args
-                .get("turn_index")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            "current_turn" => Some(
-                self.journal_turn_index
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            _ => None,
-        };
-        let Some(turn) = turn else {
-            return Ok(Vec::new());
-        };
-        let checkpoint = args
-            .get("worktree_after_sequence")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let mut roots: Vec<_> = self
-            .git_worktree_restore_plan_for_turn_since(turn, checkpoint)
-            .into_iter()
-            .map(|entry| entry.worktree_path)
-            .filter(|path| {
-                path != &self.session_project_root() && already_held != Some(path.as_path())
-            })
-            .collect();
-        roots.sort();
-        roots.dedup();
-        let mut leases: Vec<astra_tools::workspace_observation::WorkspaceObservationLease> =
-            Vec::with_capacity(roots.len());
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-        for root in roots {
-            let scope = leases
-                .iter()
-                .find(|lease| lease.covers_workspace(&root))
-                .unwrap_or(parent);
-            let lease =
-                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_parent(
-                    &root,
-                    scope,
-                    cancel,
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                )
-                .await?;
-            leases.push(lease);
-        }
-        Ok(leases)
-    }
-
-    fn remove_git_worktree_rollback(&self, worktree_path: &Path) {
-        match self.git_worktree_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_worktree(worktree_path);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_worktree(worktree_path);
-            }
-        }
-    }
-
-    fn maybe_restore_session_after_manual_worktree_removal(
-        &self,
-        worktree_path: &Path,
-    ) -> Result<Option<String>, String> {
-        let Some(session) = self.get_worktree_session() else {
-            return Ok(None);
-        };
-        if session.worktree_path != worktree_path {
-            return Ok(None);
-        }
-        self.persist_selected_worktree(None, &session.original_root)?;
-        *self
-            .worktree_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.clear_file_state();
-        Ok(Some(session.original_root.display().to_string()))
-    }
-
-    fn rollback_git_worktree_entry_json(entry: &GitWorktreeRollbackEntry) -> serde_json::Value {
-        let mut value = serde_json::Map::from_iter([
-            (
-                "worktree_path".to_string(),
-                Value::String(entry.worktree_path.display().to_string()),
-            ),
-            (
-                "branch".to_string(),
-                Value::String(entry.branch_name.clone()),
-            ),
-            (
-                "original_root".to_string(),
-                Value::String(entry.original_root.display().to_string()),
-            ),
-            (
-                "turn_index".to_string(),
-                Value::Number(serde_json::Number::from(entry.turn_index)),
-            ),
-            (
-                "delete_branch_on_rollback".to_string(),
-                Value::Bool(entry.delete_branch_on_rollback),
-            ),
-            (
-                "session_scoped".to_string(),
-                Value::Bool(entry.session_scoped),
-            ),
-        ]);
-        if let Some(original_head_commit) = entry.original_head_commit.as_ref() {
-            value.insert(
-                "original_head_commit".to_string(),
-                Value::String(original_head_commit.clone()),
-            );
-        }
-        Value::Object(value)
-    }
-
-    fn rollback_recorded_git_worktree(
-        &self,
-        entry: &GitWorktreeRollbackEntry,
-    ) -> Result<(bool, Option<String>), String> {
-        if cfg!(target_os = "macos") {
-            return Err(
-                "The worktree was kept. Check for running processes before removing it with Git."
-                    .into(),
-            );
-        }
-        if !workspace_safe_for_cleanup(&entry.worktree_path) {
-            return Err("A previous command may still be running; the worktree was kept.".into());
-        }
-        if !entry.worktree_path.exists() {
-            return Err(format!(
-                "recorded worktree path no longer exists: {}",
-                entry.worktree_path.display()
-            ));
-        }
-
-        let (changed_files, commits) = count_worktree_changes(
-            &entry.worktree_path,
-            entry.original_head_commit.as_deref(),
-            &entry.branch_name,
-        )
-        .map_err(|error| error.to_string())?;
-        // Inspection itself may run configured Git helpers. Recheck before
-        // deleting anything if their descendants could not be accounted for.
-        if !workspace_safe_for_cleanup(&entry.worktree_path) {
-            return Err("A command may still be running; the worktree was kept.".into());
-        }
-        if changed_files > 0 || commits > 0 {
-            return Err(format!(
-                "recorded worktree at {} is no longer clean ({} changed file(s), {} commit(s) since creation)",
-                entry.worktree_path.display(),
-                changed_files,
-                commits
-            ));
-        }
-
-        let output = astra_tools::git_gix::prepare_bound_git_command(&entry.original_root)?
-            .args(["worktree", "remove", "--force"])
-            .arg(&entry.worktree_path)
-            .output()
-            .map_err(|error| {
-                format!(
-                    "git worktree remove failed for {}: {error}",
-                    entry.worktree_path.display()
-                )
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "git worktree remove failed for {}: {}",
-                entry.worktree_path.display(),
-                stderr.trim()
-            ));
-        }
-
-        let session_restored = self
-            .maybe_restore_session_after_manual_worktree_removal(&entry.worktree_path)?
-            .is_some();
-        let branch_warning = if entry.delete_branch_on_rollback {
-            delete_worktree_branch(&entry.original_root, &entry.branch_name).err()
-        } else {
-            None
-        };
-
-        Ok((session_restored, branch_warning))
-    }
-
-    pub(crate) fn rollback_git_worktrees(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("current_turn");
-        let explicit_turn_index = if scope == "turn" {
-            match args.get("turn_index").and_then(Value::as_u64) {
-                Some(turn_index) => Some(turn_index),
-                None => {
-                    return serde_json::json!({
-                        "success": false,
-                        "error": "missing 'turn_index' for scope=turn",
-                    })
-                    .to_string();
-                }
-            }
-        } else {
-            None
-        };
-        let after_sequence = args
-            .get("worktree_after_sequence")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        match scope {
-            "list" => {
-                let entries = self
-                    .git_worktree_entries()
-                    .into_iter()
-                    .map(|entry| Self::rollback_git_worktree_entry_json(&entry))
-                    .collect::<Vec<_>>();
-                serde_json::json!({
-                    "success": true,
-                    "scope": "list",
-                    "total_entries": entries.len(),
-                    "entries": entries,
-                    "summary": format!(
-                        "Listed {} recorded git worktree rollback entr{}",
-                        entries.len(),
-                        if entries.len() == 1 { "y" } else { "ies" }
-                    ),
-                })
-                .to_string()
-            }
-            "turn" | "current_turn" => {
-                let turn_index = explicit_turn_index.unwrap_or_else(|| {
-                    self.journal_turn_index
-                        .load(std::sync::atomic::Ordering::Relaxed) as u64
-                }) as u32;
-                let plan = if after_sequence > 0 {
-                    self.git_worktree_restore_plan_for_turn_since(turn_index, after_sequence)
-                } else {
-                    self.git_worktree_restore_plan_for_turn(turn_index)
-                };
-                let mut restored = Vec::new();
-                let mut failed = Vec::new();
-                for entry in &plan {
-                    match self.rollback_recorded_git_worktree(entry) {
-                        Ok((session_restored, branch_warning)) => {
-                            self.remove_git_worktree_rollback(&entry.worktree_path);
-                            let mut restored_entry = Self::rollback_git_worktree_entry_json(entry)
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default();
-                            if session_restored {
-                                restored_entry
-                                    .insert("session_restored".to_string(), Value::Bool(true));
-                            }
-                            if let Some(warning) = branch_warning {
-                                restored_entry
-                                    .insert("warning".to_string(), Value::String(warning));
-                            }
-                            restored.push(Value::Object(restored_entry));
-                        }
-                        Err(error) => {
-                            let mut failed_entry = Self::rollback_git_worktree_entry_json(entry)
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default();
-                            failed_entry.insert("error".to_string(), Value::String(error));
-                            failed.push(Value::Object(failed_entry));
-                        }
-                    }
-                }
-                let success = !restored.is_empty() && failed.is_empty();
-                let summary = if plan.is_empty() {
-                    format!("No recorded git worktree rollback handles found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Removed {} recorded git worktree{} for turn {turn_index}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" }
-                    )
-                } else {
-                    format!(
-                        "Removed {} recorded git worktree{} for turn {turn_index} with {} failure{}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" },
-                        failed.len(),
-                        if failed.len() == 1 { "" } else { "s" }
-                    )
-                };
-                serde_json::json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "restored": restored,
-                    "failed": failed,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => serde_json::json!({
-                "success": false,
-                "error": format!(
-                    "unknown scope `{other}`. Supported: current_turn, turn, list"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
     /// Return the effective project root, considering any active worktree session.
     /// When inside a worktree session, returns the worktree path; otherwise returns
     /// the original `project_root`.
@@ -928,7 +605,7 @@ impl ToolExecutor {
     }
 
     pub(super) fn session_project_root(&self) -> PathBuf {
-        self.git_worktree_journal
+        self.worktree_owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .session_root
@@ -949,8 +626,7 @@ impl ToolExecutor {
             .clone()
     }
 
-    /// Enter a worktree session. Creates the worktree and updates internal state.
-    /// Returns the new WorktreeSession on success.
+    /// Enter a worktree session, creating a checkout or selecting an existing one.
     pub fn enter_worktree(&self, branch: &str) -> Result<WorktreeSession, String> {
         self.enter_worktree_result(branch, None)
             .map_err(|error| error.to_string())
@@ -980,71 +656,101 @@ impl ToolExecutor {
         if branch.is_empty() {
             return Err(("Branch name is required".to_string()).into());
         }
-        if branch
-            .chars()
-            .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
+        if branch.starts_with('-')
+            || branch == "HEAD"
+            || gix::refs::FullName::try_from(format!("refs/heads/{branch}")).is_err()
         {
-            return Err(("Invalid branch name".to_string()).into());
+            return Err("Invalid Git branch name".into());
         }
-
-        // Resolve the requested ref before creating anything, and use the
-        // exact checkout commit as the cleanup baseline.
-        let revision = format!("{}^{{commit}}", start_point.unwrap_or("HEAD"));
-        let resolved = astra_tools::git_gix::prepare_bound_git_command(&project_root)
-            .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?
-            .args(["rev-parse", "--verify", "--end-of-options", &revision])
-            .output()
-            .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
-        if !resolved.status.success() {
-            return Err("Worktree start point is not an existing commit".into());
-        }
-        let original_head = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
-
-        // Generate worktree path as sibling directory
-        let repo_name = project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo");
-        let sanitized_branch = branch.replace('/', "-");
-        let worktree_path = project_root
-            .parent()
-            .unwrap_or(&project_root)
-            .join(format!("{repo_name}-wt-{sanitized_branch}"));
-
-        let mut command = astra_tools::git_gix::prepare_bound_git_command(&project_root)
-            .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?;
-        command.args(["worktree", "add", "-b", branch]);
-        command.arg(&worktree_path).arg(&original_head);
-        let output = match command.output_with_ownership() {
-            Ok(output) => output,
-            Err(error) => {
-                if error.started && error.ownership.is_none() {
-                    astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                        &worktree_path,
-                    );
-                }
-                return Err(astra_tools::git_gix::GitProcessError::Execution(error).into());
+        let existing = existing_worktree_for_branch(&project_root, branch)?;
+        let (worktree_path, original_head) = if let Some(path) = existing {
+            validate_saved_worktree(&project_root, &project_root, &path, None).map_err(
+                |error| {
+                    WorktreeError::Domain(format!(
+                        "Cannot select the existing worktree at {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
+            if path.canonicalize().ok() == project_root.canonicalize().ok() {
+                return Err("This branch is already checked out in the current workspace.".into());
             }
+            let repo = gix::open(&path).map_err(|error| error.to_string())?;
+            let actual_branch = repo.head_name().map_err(|error| error.to_string())?;
+            if actual_branch.as_ref().map(ToString::to_string)
+                != Some(format!("refs/heads/{branch}"))
+            {
+                return Err("The worktree branch changed while selecting it; try again.".into());
+            }
+            if let Some(start_point) = start_point
+                && repo
+                    .head_id()
+                    .map_err(|error| error.to_string())?
+                    .to_string()
+                    != resolve_worktree_start_point(&project_root, start_point)?
+            {
+                return Err("The existing worktree is at a different commit than start_point; omit start_point to select it without changing its branch.".into());
+            }
+            // An existing branch is user-owned: its creation baseline is not
+            // known, and selecting it must never grant authority to delete it.
+            (path, None)
+        } else {
+            let original_head =
+                resolve_worktree_start_point(&project_root, start_point.unwrap_or("HEAD"))?;
+            let repo_name = project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo");
+            let sanitized_branch = branch.replace('/', "-");
+            let path = project_root
+                .parent()
+                .unwrap_or(&project_root)
+                .join(format!("{repo_name}-wt-{sanitized_branch}"));
+
+            let mut command = astra_tools::git_gix::prepare_bound_git_command(&project_root)
+                .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?;
+            command.args(["worktree", "add", "-b", branch]);
+            command.arg(&path).arg(&original_head);
+            let output = match command.output_with_ownership() {
+                Ok(output) => {
+                    record_checkout_ownership(&path, output.ownership);
+                    output
+                }
+                Err(error) => {
+                    if error.started {
+                        record_checkout_ownership(&path, error.ownership);
+                    }
+                    return Err(astra_tools::git_gix::GitProcessError::Execution(error).into());
+                }
+            };
+            if !output.output.status.success() {
+                return Err(astra_tools::git_gix::GitProcessError::Exit(format!(
+                    "git worktree add failed: {}. Worktree files may remain at {}",
+                    String::from_utf8_lossy(&output.output.stderr).trim(),
+                    path.display()
+                ))
+                .into());
+            }
+            (path, Some(original_head))
         };
 
-        if !output.output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.output.stderr);
-            return Err(astra_tools::git_gix::GitProcessError::Exit(format!(
-                "git worktree add failed: {}. Worktree files may remain at {}",
-                stderr.trim(),
+        // Git may report the same checkout through a resolved path (for
+        // example, /private/var instead of /var on macOS). Keep one identity
+        // for session selection across turns and executors.
+        let worktree_path = worktree_path.canonicalize().map_err(|error| {
+            WorktreeError::Domain(format!(
+                "Cannot resolve the worktree: {error}. Worktree was kept at {}",
                 worktree_path.display()
             ))
-            .into());
-        }
-
+        })?;
         let session = WorktreeSession {
             worktree_path: worktree_path.clone(),
             branch_name: branch.to_string(),
             original_root: project_root,
-            original_head_commit: Some(original_head),
+            original_head_commit: original_head,
             git_identity: worktree_identity(&worktree_path).map_err(|error| {
                 WorktreeError::Domain(format!(
-                    "Cannot identify the new worktree: {error}. Worktree was kept at {}",
+                    "Cannot identify the worktree: {error}. Worktree was kept at {}",
                     worktree_path.display()
                 ))
             })?,
@@ -1112,17 +818,22 @@ impl ToolExecutor {
             ));
         }
 
-        let preserved_for_safety = cfg!(target_os = "macos") && action == "remove";
-        let action = if preserved_for_safety { "keep" } else { action };
+        if cfg!(target_os = "macos") && action == "remove" {
+            return Err(WorktreeError::Unsupported(format!(
+                "Automatic worktree removal is unavailable on macOS. Nothing was removed or discarded; the session is still in {}. Use exit_action=keep to leave, then check for running processes before removing the worktree with Git.",
+                session.worktree_path.display()
+            )));
+        }
 
         if action == "remove" && !workspace_safe_for_cleanup(&session.worktree_path) {
             return Err("A previous command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
         }
 
-        // Keeping the checkout needs no Git inspection and remains available
-        // even if Git is unavailable or the workspace is being repaired.
-        let (changed_files, commits) = if action == "remove" {
-            let changes = count_worktree_changes(
+        // Only an unconfirmed removal needs to inspect local work. Explicit
+        // discard must also work when the checkout is too large or damaged to
+        // inspect, provided its process ownership is settled.
+        if action == "remove" && !discard_changes {
+            let (changed_files, commits) = count_worktree_changes(
                 &session.worktree_path,
                 session.original_head_commit.as_deref(),
                 &session.branch_name,
@@ -1130,26 +841,26 @@ impl ToolExecutor {
             if !workspace_safe_for_cleanup(&session.worktree_path) {
                 return Err("A command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
             }
-            changes
-        } else {
-            (0, 0)
-        };
-
-        if action == "remove" && (changed_files > 0 || commits > 0) && !discard_changes {
-            let mut parts = Vec::new();
-            if changed_files > 0 {
-                parts.push(format!("{} uncommitted file(s)", changed_files));
+            if changed_files > 0 || commits > 0 {
+                let mut parts = Vec::new();
+                if changed_files > 0 {
+                    parts.push(format!("{} uncommitted path(s)", changed_files));
+                }
+                if commits > 0 {
+                    parts.push(format!(
+                        "{} changed commit(s) in {}",
+                        commits, session.branch_name
+                    ));
+                }
+                return Err((format!(
+                    "Worktree has {}. Set discard_changes=true to confirm removal, or use action='keep' to preserve.",
+                    parts.join(" and ")
+                )).into());
             }
-            if commits > 0 {
-                parts.push(format!(
-                    "{} changed commit(s) in {}",
-                    commits, session.branch_name
-                ));
+            ensure_worktree_index_is_visible(&session.worktree_path)?;
+            if !workspace_safe_for_cleanup(&session.worktree_path) {
+                return Err("A command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
             }
-            return Err((format!(
-                "Worktree has {}. Set discard_changes=true to confirm removal, or use action='keep' to preserve.",
-                parts.join(" and ")
-            )).into());
         }
 
         let worktree_path_str = session.worktree_path.display().to_string();
@@ -1159,41 +870,51 @@ impl ToolExecutor {
             Some((
                 astra_tools::git_gix::prepare_bound_git_command(&original_root)
                     .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?,
-                astra_tools::git_gix::prepare_bound_git_command(&original_root)
-                    .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?,
+                session
+                    .original_head_commit
+                    .as_ref()
+                    .map(|_| {
+                        astra_tools::git_gix::prepare_bound_git_command(&original_root)
+                            .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)
+                    })
+                    .transpose()?,
             ))
         } else {
             None
         };
 
-        let branch_warning =
-            if let Some((mut remove_command, mut delete_branch_command)) = cleanup_commands {
-                let removed = remove_command
-                    .args(["worktree", "remove", "--force"])
-                    .arg(&session.worktree_path)
-                    .output()
-                    .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
-                if !removed.status.success() {
-                    return Err(astra_tools::git_gix::GitProcessError::Exit(format!(
-                        "Worktree removal failed; session remains active: {}",
-                        String::from_utf8_lossy(&removed.stderr).trim()
-                    ))
-                    .into());
-                }
-                match delete_branch_command
-                    .args(["branch", "-D", &branch_name])
-                    .output()
-                {
+        let branch_warning = if let Some((mut remove_command, delete_branch_command)) =
+            cleanup_commands
+        {
+            remove_command.args(["worktree", "remove"]);
+            if discard_changes {
+                remove_command.arg("--force");
+            }
+            let removed = remove_command
+                .arg(&session.worktree_path)
+                .output()
+                .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
+            if !removed.status.success() {
+                return Err(astra_tools::git_gix::GitProcessError::Exit(format!(
+                    "Worktree removal failed; session remains active: {}",
+                    String::from_utf8_lossy(&removed.stderr).trim()
+                ))
+                .into());
+            }
+            match delete_branch_command {
+                Some(mut command) => match command.args(["branch", "-D", &branch_name]).output() {
                     Ok(out) if out.status.success() => String::new(),
                     Ok(out) => format!(
                         " Branch cleanup failed: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
                     ),
                     Err(error) => format!(" Branch cleanup failed: {error}"),
-                }
-            } else {
-                String::new()
-            };
+                },
+                None => format!(" Existing branch {branch_name} was preserved."),
+            }
+        } else {
+            String::new()
+        };
         // Only forget the session once removal succeeded (or keep was selected)
         // and the session's durable selection has been updated.
         self.persist_selected_worktree(None, &session.original_root)?;
@@ -1205,13 +926,10 @@ impl ToolExecutor {
             state.clear();
         }
         if action == "remove" {
-            let discard_note = if changed_files > 0 || commits > 0 {
-                format!(
-                    " Discarded {} file(s) and {} commit(s).",
-                    changed_files, commits
-                )
+            let discard_note = if discard_changes {
+                " Local changes may have been discarded."
             } else {
-                String::new()
+                ""
             };
 
             Ok(format!(
@@ -1222,18 +940,11 @@ impl ToolExecutor {
                 branch_warning
             ))
         } else {
-            // Keep the worktree
-            let note = if preserved_for_safety {
-                " Automatic removal is unavailable on macOS; check for running processes before removing it with Git."
-            } else {
-                ""
-            };
             Ok(format!(
-                "✓ Exited worktree. Work preserved at {} on branch {}. Session restored to {}{}",
+                "✓ Exited worktree. Work preserved at {} on branch {}. Session restored to {}",
                 worktree_path_str,
                 branch_name,
-                original_root.display(),
-                note
+                original_root.display()
             ))
         }
     }
@@ -1252,14 +963,7 @@ impl ToolExecutor {
                 let start_point = args.get("start_point").and_then(Value::as_str);
                 match self.enter_worktree_result(branch, start_point) {
                     Ok(session) => {
-                        self.record_git_worktree_rollback(
-                            session.worktree_path.clone(),
-                            session.branch_name.clone(),
-                            session.original_root.clone(),
-                            session.original_head_commit.clone(),
-                            true,
-                            true,
-                        );
+                        let created = session.original_head_commit.is_some();
                         let mut tool_result_fields = serde_json::Map::from_iter([
                             (
                                 "worktree_path".to_string(),
@@ -1269,7 +973,6 @@ impl ToolExecutor {
                                 "branch".to_string(),
                                 Value::String(session.branch_name.clone()),
                             ),
-                            ("delete_branch_on_rollback".to_string(), Value::Bool(true)),
                             ("session_scoped".to_string(), Value::Bool(true)),
                         ]);
                         if let Some(original_head_commit) = session.original_head_commit.as_ref() {
@@ -1281,9 +984,14 @@ impl ToolExecutor {
                         super::ToolExecutionOutcome {
                             sandbox_approval_scope: None,
                             output: format!(
-                                "✓ Entered worktree\n  Branch: {}\n  Commit: {}\n  Path: {}\n  Session is now working in the worktree. Use `worktree` action=`exit` to leave.",
+                                "✓ Entered {}worktree\n  Branch: {}\n{}  Path: {}\n  Session is now working in the worktree. Use `worktree` action=`exit` to leave.",
+                                if created { "" } else { "existing " },
                                 session.branch_name,
-                                session.original_head_commit.as_deref().unwrap_or("unknown"),
+                                session
+                                    .original_head_commit
+                                    .as_ref()
+                                    .map(|head| format!("  Commit: {head}\n"))
+                                    .unwrap_or_default(),
                                 session.worktree_path.display()
                             ),
                             tool_result_fields: Some(tool_result_fields),
@@ -1302,24 +1010,13 @@ impl ToolExecutor {
                     .get("discard_changes")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let existing_session = (exit_action == "remove")
-                    .then(|| self.get_worktree_session())
-                    .flatten();
                 match self.exit_worktree_result(exit_action, discard) {
-                    Ok(msg) => {
-                        if exit_action == "remove"
-                            && !cfg!(target_os = "macos")
-                            && let Some(session) = existing_session
-                        {
-                            self.remove_git_worktree_rollback(&session.worktree_path);
-                        }
-                        super::ToolExecutionOutcome {
-                            sandbox_approval_scope: None,
-                            output: msg,
-                            tool_result_fields: None,
-                            is_error: false,
-                        }
-                    }
+                    Ok(msg) => super::ToolExecutionOutcome {
+                        sandbox_approval_scope: None,
+                        output: msg,
+                        tool_result_fields: None,
+                        is_error: false,
+                    },
                     Err(e) => e.into_outcome(),
                 }
             }
@@ -1332,5 +1029,188 @@ impl ToolExecutor {
     /// Execute the session worktree lifecycle.
     pub(super) fn worktree(&self, args: &Value) -> String {
         self.worktree_with_metadata(args).output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IndexVisibility, count_worktree_changes, ensure_worktree_index_is_visible};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{record_checkout_ownership, workspace_safe_for_cleanup};
+    use std::process::Command;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn weak_checkout_ownership_allows_work_but_not_cleanup_until_confirmed() {
+        use serde_json::json;
+
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let executor = super::ToolExecutor::new(repo.path());
+        let entered = executor
+            .execute_with_metadata(
+                "worktree",
+                &json!({"action":"enter", "branch":"weak-owner"}),
+            )
+            .await;
+        assert!(!entered.is_error, "{entered:?}");
+        let checkout = executor.get_worktree_session().unwrap().worktree_path;
+        astra_tools::workspace_observation::confirm_workspace_stopped(&checkout)
+            .await
+            .unwrap();
+        assert!(workspace_safe_for_cleanup(&checkout));
+        record_checkout_ownership(
+            &checkout,
+            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
+        );
+        assert_eq!(
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(&checkout),
+            Some(false)
+        );
+        assert!(!workspace_safe_for_cleanup(&checkout));
+        let written = executor
+            .execute_with_metadata("write_file", &json!({"path":"kept.txt", "content":"keep"}))
+            .await;
+        assert!(!written.is_error, "{written:?}");
+        if !cfg!(target_os = "macos") {
+            let refused = executor
+                .execute_with_metadata(
+                    "worktree",
+                    &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+                )
+                .await;
+            assert!(
+                refused.is_error && refused.output.contains("may still be running"),
+                "{refused:?}"
+            );
+            assert!(checkout.exists() && executor.in_worktree_session());
+        }
+        astra_tools::workspace_observation::confirm_workspace_stopped(&checkout)
+            .await
+            .unwrap();
+        assert!(workspace_safe_for_cleanup(&checkout));
+        let kept = executor
+            .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+            .await;
+        assert!(!kept.is_error, "{kept:?}");
+        crate::edge_tools::tests::worktree_tests::remove_preserved_test_worktree(
+            repo.path(),
+            &checkout,
+        );
+    }
+
+    #[test]
+    fn cleanup_inspection_does_not_trust_hidden_git_index_flags() {
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        assert!(ensure_worktree_index_is_visible(repo.path()).is_ok());
+        for (set, clear) in [
+            ("--assume-unchanged", "--no-assume-unchanged"),
+            ("--skip-worktree", "--no-skip-worktree"),
+        ] {
+            git(&["update-index", set, "tracked.txt"]);
+            assert!(ensure_worktree_index_is_visible(repo.path()).is_err());
+            git(&["update-index", clear, "tracked.txt"]);
+        }
+        git(&["config", "status.showUntrackedFiles", "no"]);
+        let untracked = repo.path().join("untracked");
+        std::fs::create_dir(&untracked).unwrap();
+        for index in 0..100 {
+            std::fs::write(untracked.join(index.to_string()), "local work\n").unwrap();
+        }
+        let (files, _) = count_worktree_changes(repo.path(), None, "unused").unwrap();
+        assert_eq!(
+            files, 1,
+            "untracked directories must stay visible without expanding each file"
+        );
+    }
+
+    #[test]
+    fn index_visibility_handles_fragmented_and_non_utf8_names() {
+        let mut index = IndexVisibility::default();
+        for chunk in [&b"H "[..], &b"a\xff\n\0s"[..], &b" hidden\0"[..]] {
+            index.feed(chunk);
+        }
+        assert!(index.complete());
+        assert!(index.hidden);
+        for incomplete in [
+            &b"H name"[..],
+            &b"H \0"[..],
+            &b"Hname\0"[..],
+            &b"X name\0"[..],
+        ] {
+            let mut index = IndexVisibility::default();
+            index.feed(incomplete);
+            assert!(!index.complete());
+        }
+    }
+
+    #[test]
+    fn index_inspection_streams_beyond_the_capture_limit() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let hash = Command::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD:tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        let mut update = Command::new("git")
+            .current_dir(repo.path())
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = update.stdin.take().unwrap();
+        let directory = format!("{}/", "d".repeat(80)).repeat(10);
+        for index in 0..21_000 {
+            write!(input, "100644 {}\t{directory}{index:05}\0", hash.trim()).unwrap();
+        }
+        drop(input);
+        assert!(update.wait().unwrap().success());
+        let mut listing = Command::new("git")
+            .current_dir(repo.path())
+            .args(["ls-files", "-v", "-z"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let bytes =
+            std::io::copy(&mut listing.stdout.take().unwrap(), &mut std::io::sink()).unwrap();
+        assert!(listing.wait().unwrap().success());
+        assert!(bytes > 16 * 1024 * 1024);
+        assert!(ensure_worktree_index_is_visible(repo.path()).is_ok());
+
+        let last = format!("{directory}20999");
+        for (set, clear) in [
+            ("--skip-worktree", "--no-skip-worktree"),
+            ("--assume-unchanged", "--no-assume-unchanged"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["update-index", set, "--", &last])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(ensure_worktree_index_is_visible(repo.path()).is_err());
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["update-index", clear, "--", &last])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 }

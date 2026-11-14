@@ -13,6 +13,11 @@ path = "src/main.rs"
 name = "mock_mcp_server"
 path = "src/bin/mock_mcp_server.rs"
 
+[[test]]
+name = "worktree_lifecycle"
+path = "tests/worktree_lifecycle.rs"
+harness = false
+
 [lib]
 name = "astra_cli"
 path = "src/lib.rs"

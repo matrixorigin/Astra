@@ -5,6 +5,8 @@ use std::io::{self, Read};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+type StdoutConsumer<'a> = &'a mut dyn FnMut(&[u8]);
+
 #[derive(Debug)]
 pub struct SyncProcessError {
     pub phase: &'static str,
@@ -127,8 +129,9 @@ fn read_available(
 
 // Use concrete child pipe types to share Unix and Windows descriptor bounds.
 macro_rules! drain {
-    ($pipe:expr, $buffer:expr, $total:expr, $limit:expr) => {{
+    ($pipe:expr, $buffer:expr, $total:expr, $limit:expr, $consumer:expr) => {{
         let mut eof = false;
+        let mut progressed = false;
         let mut bytes = [0; 8192];
         // Fairness budget: output flooding cannot starve timeout/other pipe.
         for _ in 0..8 {
@@ -138,24 +141,29 @@ macro_rules! drain {
                     break;
                 }
                 Ok(n) => {
-                    if $total.saturating_add(n) > $limit {
-                        return Err((
-                            "output limit",
-                            format!(
-                                "output exceeded {} bytes; incomplete output was discarded",
-                                $limit
-                            ),
-                        ));
+                    progressed = true;
+                    if let Some(consumer) = $consumer.as_deref_mut() {
+                        consumer(&bytes[..n]);
+                    } else {
+                        if $total.saturating_add(n) > $limit {
+                            return Err((
+                                "output limit",
+                                format!(
+                                    "output exceeded {} bytes; incomplete output was discarded",
+                                    $limit
+                                ),
+                            ));
+                        }
+                        $total += n;
+                        $buffer.extend_from_slice(&bytes[..n]);
                     }
-                    $total += n;
-                    $buffer.extend_from_slice(&bytes[..n]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(("output read", error.to_string())),
             }
         }
-        eof
+        (eof, progressed)
     }};
 }
 
@@ -182,6 +190,29 @@ pub fn run_sync_process_with_cancel(
     output_limit: usize,
     cancel: Option<&tokio_util::sync::CancellationToken>,
     configure: impl FnOnce(&mut Command, bool) -> io::Result<()>,
+) -> Result<SyncProcessOutput, SyncProcessError> {
+    run_sync_process_with_stdout(
+        program,
+        args,
+        timeout,
+        output_limit,
+        cancel,
+        configure,
+        None,
+    )
+}
+
+/// Stream stdout to a bounded-memory consumer while retaining the normal
+/// ownership, cancellation, timeout, and bounded stderr handling. The returned
+/// stdout is empty when a consumer is provided.
+pub fn run_sync_process_with_stdout(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    output_limit: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    configure: impl FnOnce(&mut Command, bool) -> io::Result<()>,
+    mut stdout_consumer: Option<StdoutConsumer<'_>>,
 ) -> Result<SyncProcessOutput, SyncProcessError> {
     let before = |phase, error: io::Error| SyncProcessError {
         phase,
@@ -231,6 +262,7 @@ pub fn run_sync_process_with_cancel(
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut total: usize = 0;
+        let mut no_consumer: Option<StdoutConsumer<'_>> = None;
         let deadline = Instant::now() + timeout;
         let mut status = None;
         let mut exit_deadline = None;
@@ -238,8 +270,10 @@ pub fn run_sync_process_with_cancel(
             if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 return Err(("cancellation", "execution cancelled".into()));
             }
-            let out_eof = drain!(&mut stdout, out, total, output_limit);
-            let err_eof = drain!(&mut stderr, err, total, output_limit);
+            let (out_eof, out_progress) =
+                drain!(&mut stdout, out, total, output_limit, stdout_consumer);
+            let (err_eof, err_progress) =
+                drain!(&mut stderr, err, total, output_limit, no_consumer);
             if status.is_none() {
                 status = child.try_wait().map_err(|e| ("wait", e.to_string()))?;
                 if status.is_some() {
@@ -261,7 +295,9 @@ pub fn run_sync_process_with_cancel(
             if Instant::now() >= deadline {
                 return Err(("timeout", format!("deadline of {timeout:?} exceeded")));
             }
-            std::thread::sleep(Duration::from_millis(5));
+            if !out_progress && !err_progress {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     })();
     match result {
@@ -360,6 +396,43 @@ mod tests {
         let start = Instant::now();
         assert_eq!(run("sleep 30 & wait", 1024).unwrap_err().phase, "timeout");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_stdout_preserves_exit_and_stderr_limits() {
+        let mut received = Vec::new();
+        let args = [
+            "-c".into(),
+            "printf 1234567890; printf err >&2; exit 7".into(),
+        ];
+        let output = run_sync_process_with_stdout(
+            "sh",
+            &args,
+            Duration::from_secs(3),
+            4,
+            None,
+            |_, _| Ok(()),
+            Some(&mut |bytes| received.extend_from_slice(bytes)),
+        )
+        .unwrap();
+        assert_eq!(received, b"1234567890");
+        assert!(output.output.stdout.is_empty());
+        assert_eq!(output.output.stderr, b"err");
+        assert_eq!(output.output.status.code(), Some(7));
+
+        let error = run_sync_process_with_stdout(
+            "sh",
+            &["-c".into(), "printf 1234567890 >&2".into()],
+            Duration::from_secs(3),
+            4,
+            None,
+            |_, _| Ok(()),
+            Some(&mut |_| {}),
+        )
+        .unwrap_err();
+        assert!(error.started);
+        assert_eq!(error.phase, "output limit");
     }
     #[cfg(unix)]
     #[test]

@@ -56,6 +56,7 @@ pub use workspace_inspection::{
 mod sync_process;
 pub use sync_process::{
     SyncProcessError, SyncProcessOutput, run_sync_process, run_sync_process_with_cancel,
+    run_sync_process_with_stdout,
 };
 
 pub use policy::SandboxApprovalScope;

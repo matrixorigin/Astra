@@ -8440,12 +8440,12 @@ fn classify_local_shell_submission(text: &str) -> LocalShellSubmission {
 
 async fn start_local_background_shell(
     registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
-    worktree_journal: Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    worktree_owner: Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>,
     command: &str,
 ) -> Result<String, String> {
     let root = std::env::current_dir().map_err(|error| error.to_string())?;
     let executor = crate::edge_tools::ToolExecutor::new(root)
-        .with_shared_git_worktree_journal(worktree_journal)
+        .with_shared_worktree_owner(worktree_owner)
         .with_background_tasks(registry.clone());
     // The user explicitly selected this local command. Install only its
     // canonical Bash surface instead of relying on a model request's surface.
@@ -9274,7 +9274,7 @@ pub(crate) async fn run_tui_session(
         tokio::sync::mpsc::channel::<AgentWorkbenchOutcome>(64);
 
     // Background task registry — owns spawned shell/agent processes.
-    let user_shell_worktree_journal = state.git_worktree_journal.clone();
+    let user_shell_worktree_owner = state.worktree_owner.clone();
     let mut background_registry = state
         .background_tasks
         .clone()
@@ -10277,7 +10277,7 @@ pub(crate) async fn run_tui_session(
                                     LocalShellSubmission::Background(command) => {
                                         match start_local_background_shell(
                                             &mut background_registry,
-                                            user_shell_worktree_journal.clone(),
+                                            user_shell_worktree_owner.clone(),
                                             &command,
                                         ).await {
                                             Ok(task_id) => chat_widget.commit_system(
@@ -11569,7 +11569,7 @@ pub(crate) async fn run_tui_session(
                                                                             LocalShellSubmission::Background(command) => {
                                                                                 match start_local_background_shell(
                                                                                     &mut background_registry,
-                                                                                    user_shell_worktree_journal.clone(),
+                                                                                    user_shell_worktree_owner.clone(),
                                                                                     &command,
                                                                                 ).await {
                                                                                     Ok(task_id) => chat_widget.commit_concurrent_system(

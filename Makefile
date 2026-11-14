@@ -1231,14 +1231,15 @@ test-runtime-e2e-hooks: sweep
 		--features e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
-#   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
+#   ASTRA_TEST_DB_IT=1   -> ordinary online/Matrix ignored integration tests
 #
 # This helper owns the astra-runtime / astra-plan integration binaries.
 # astra-services integration binaries run in test-online's core lane, beside
 # the astra-services ignored lib tests, so their test-binary linking and live-DB
 # time are charged to core. CI splits core into isolated core-runtime
-# and core-services jobs. `make test-online` remains the complete
-# online suite; ASTRA_ONLINE_LANE=core retains the combined core lane.
+# and core-services jobs. `make test-online` covers the ordinary
+# online suite; explicit pressure probes have separate documented entries.
+# ASTRA_ONLINE_LANE=core retains the combined core lane.
 #
 # Optional serial mode: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> -j 1
 .PHONY: test-ignored-integration
@@ -1263,7 +1264,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(compaction_work) and not test(=thousand_work_observer_refreshes_have_bounded_read_only_sql) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1271,7 +1272,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks) and not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(perf_benchmarks) and not binary(compaction_work) and not test(=thousand_work_observer_refreshes_have_bounded_read_only_sql) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \

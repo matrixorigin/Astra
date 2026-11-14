@@ -92,8 +92,8 @@ on every Test Suite run. The required online core aggregate also requires that
 fresh-database journey to pass; see the testing guide for its exact scope.
 
 CLI tests build and run all library/binary unit tests plus the offline
-`cli_pipe`, `process_supervisor`, `shell_execution_boundaries`, and
-`cli_mcp_setup` integration
+`cli_pipe`, `process_supervisor`, `shell_execution_boundaries`,
+`cli_mcp_setup`, and `worktree_lifecycle` integration
 targets once, after building the standalone mock MCP server. Five protected
 check labels require that same completed job; they do not repeat setup, builds,
 archive downloads, or tests.

@@ -1765,7 +1765,7 @@ pub(crate) async fn ensure_session_native_delivery(
     };
 
     let mut executor = ToolExecutor::new(root.clone())
-        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
+        .with_shared_worktree_owner(state.worktree_owner.clone())
         .with_active_session_id(session_id.to_owned())
         .with_cloud(api.api_origin(), token.to_owned())
         .with_shared_file_journal(state.file_journal.clone())

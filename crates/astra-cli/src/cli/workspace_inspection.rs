@@ -443,7 +443,7 @@ pub(crate) async fn handle_review_command(
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,

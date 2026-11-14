@@ -514,9 +514,13 @@ execution uses that provider's existing credential and isolation boundary; Serve
 credentials are never implicitly copied into a local shell.
 
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
-on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
-owner under the workspace writer lease. `enter` creates and selects a new
-worktree; it does not adopt a separately created worktree. Bash `workdir` selects
+on CLI and User Runner. It invokes the existing worktree lifecycle owner under
+the workspace writer lease. `enter` creates and selects a new
+worktree, or selects the existing linked worktree for the requested branch.
+Selecting an existing worktree does not take ownership of its branch; later
+removal of that checkout preserves the branch.
+If supplied for an existing worktree, `start_point` must match its current
+commit. Bash `workdir` selects
 only one invocation's directory. Local CLI/User Runner calls can use an existing
 external directory under their current sandbox policy, including already granted
 temporary worktrees; the selected session workspace and command permissions stay
@@ -551,6 +555,14 @@ repository, local tools wait for the user to restore it or explicitly leave it;
 they do not silently run in a different directory. `start_point` can select an existing commit or ref; the new branch is
 created at its resolved commit. Switching is rejected while workspace work is
 still active, and removal without `discard_changes` also preserves ignored files.
+Without `discard_changes`, removal uses Git's non-forced operation and refuses
+when the index marks tracked paths as assume-unchanged or skip-worktree, because
+their local contents cannot be verified by `git status`.
+With explicit discard, removal still requires settled process ownership but does
+not depend on enumerating worktree contents. Checkout hooks run in the new
+worktree: while its path is quarantined after a foreground process-group receipt,
+automatic removal is refused, while ordinary work and `keep` remain available.
+Manually moving a checkout does not prove that earlier work has stopped.
 Background work uses the existing invocation owner. An executor that cannot
 prove descendant settlement rejects managed background work before starting it;
 this currently includes macOS. If a started process cannot be settled, the
@@ -580,8 +592,9 @@ isolation governs that window. Non-Unix retains its existing canonical-path
 binding without claiming Unix descriptor guarantees.
 
 All synchronous Git commands, including validation and worktree inspection,
-share a timeout, fair nonblocking output collection and a 16 MiB output budget
-(validation uses 64 KiB). They retain invocation-owner cleanup and never parse
+share a timeout and fair nonblocking output collection. Captured output is limited
+to 16 MiB (validation uses 64 KiB); the cleanup index check instead consumes
+stdout incrementally and keeps stderr bounded. They retain invocation-owner cleanup and never parse
 truncated output as a complete result. Errors preserve whether failure occurred
 before launch or after possible effects. A detected runtime binding change
 invalidates attribution on the **captured original observation state**. Weak
@@ -591,13 +604,16 @@ filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
 
 On macOS, a Git checkout hook can leave a process behind even before Astra runs
-a command in the new worktree. Exiting therefore preserves the checkout and
-restores the original workspace. After checking for processes, the user may
-remove it with Git. A genuinely unsettled owner keeps the affected workspace
+a command in the new worktree. A request to remove it therefore returns a
+non-retryable, not-executed error without switching workspaces or discarding
+changes. The user may choose `keep`
+to restore the original workspace, then check for processes before removing the
+checkout with Git. A genuinely unsettled owner keeps the affected workspace
 fenced; after checking that its work stopped, the user can confirm and retry in
 the TUI or use `astra workspace confirm-stopped` from that workspace. A human
-confirmation is an explicit recovery decision, not proof that unrelated
-external processes stopped.
+confirmation lets later processes observe the same incident as resolved through
+equivalent path spellings without clearing later incidents. It is an explicit
+recovery decision, not proof that unrelated external processes stopped.
 
 Before a local tool chain starts, the shared permission engine evaluates each
 step using its resolved input. Steps requiring individual approval or depending
