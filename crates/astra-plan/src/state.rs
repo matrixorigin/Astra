@@ -66,13 +66,14 @@ impl PlanModeState {
             PlanPhase::Completed
         } else if self.plan.subtasks.is_empty() {
             PlanPhase::Planning
-        } else if self.plan.items_done() > 0
-            || self
-                .plan
-                .subtasks
-                .iter()
-                .any(|task| task.status == TaskStatus::InProgress)
+        } else if self
+            .plan
+            .subtasks
+            .iter()
+            .any(|task| task.status != TaskStatus::Pending)
         {
+            // Any step that has left Pending (running, paused, finished or
+            // failed) means execution started; never fall back to a draft.
             PlanPhase::Executing
         } else {
             PlanPhase::Refining
