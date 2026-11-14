@@ -1563,7 +1563,7 @@ mod tests {
         assert!(state.lock().await.pending_approvals.is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn blocked_output_does_not_block_the_async_executor() {
         let (started_tx, started_rx) = oneshot::channel();
         let mut started_tx = Some(started_tx);
@@ -1573,10 +1573,15 @@ mod tests {
             release_rx.recv().unwrap();
             Ok(())
         });
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             super::write_json_line(&writer, serde_json::json!({"id":1})).await
         });
-        started_rx.await.unwrap();
+        tokio::select! {
+            started = started_rx => started.unwrap(),
+            result = &mut task => panic!("write ended before the output thread started: {result:?}"),
+        }
+        // The output owner is a real thread; only pause once it has started.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(5)).await;
         let error = task
             .await
@@ -1601,20 +1606,29 @@ mod tests {
             output.lock().unwrap().push(line.to_owned());
             Ok(())
         });
-        let first_writer = writer.clone();
-        let first = tokio::spawn(async move {
-            super::write_json_line(&first_writer, serde_json::json!({"id":1})).await
-        });
+        let (first_reply, first_result) = oneshot::channel();
+        writer
+            .0
+            .send(("{\"id\":1}".into(), first_reply))
+            .await
+            .unwrap();
         started_rx.await.unwrap();
         let second_writer = writer.clone();
         let second = tokio::spawn(async move {
             super::write_json_line(&second_writer, serde_json::json!({"id":2})).await
         });
-        tokio::task::yield_now().await;
+        while writer.0.capacity() != 0 {
+            assert!(!second.is_finished(), "second write stopped before enqueue");
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert!(first.await.unwrap().is_err());
-        assert!(second.await.unwrap().is_err());
+        let error = second
+            .await
+            .unwrap()
+            .expect_err("queued output must time out");
+        assert!(error.contains("may still complete"));
         release_tx.send(()).unwrap();
+        first_result.await.unwrap().unwrap();
         // The output owner is a real OS thread; let it run without Tokio's
         // paused-clock auto-advance racing the next write's deadline.
         tokio::time::resume();

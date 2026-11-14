@@ -55,8 +55,12 @@ answer while it is still making progress.
 
 A delegated child must not consume the parent's final-answer reserve. The
 parent retains the runtime's existing text-only final-convergence window after
-the child settles. Optional parent verification can use time left when a child
-finishes early; it is not reserved by shortening every child's deadline. The
+the child settles. A terminal child result is available evidence, not authority
+for an immediate text-only boundary. The parent may continue permitted
+verification while its ordinary work budget remains; existing deadline and
+Work settlement owners decide when final convergence is required. Exact unread
+fanout pages retain their existing admission barrier until consumed. Optional
+parent verification is not reserved by shortening every child's deadline. The
 child receives the earlier absolute deadline and must retain one ordinary
 provider-action window plus its own final-convergence window. Fanout siblings
 share that child deadline; the runtime returns completed and usable partial

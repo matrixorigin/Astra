@@ -805,7 +805,7 @@ fn runtime_grant_requires_exact_installation_local_authority_and_portable_bounds
     let mut outside_policy = astra_sandbox::SandboxPolicy::for_project(other.path());
     // Temporary directories are normally authorized by the project policy.
     // Exercise an actually disjoint authority, independent of TMPDIR.
-    outside_policy.allowed_paths.clear();
+    outside_policy.clear_allowed_paths();
     assert!(
         validate_runtime_grant(&expected.read_paths, &expected, Some(&outside_policy)).is_err()
     );

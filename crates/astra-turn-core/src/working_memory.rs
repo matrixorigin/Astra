@@ -462,6 +462,20 @@ mod tests {
     }
 
     #[test]
+    fn unknown_rate_limit_delay_keeps_user_control_of_continuation() {
+        let (kind, action) =
+            crate::interruption::interruption_from_error_kind(astra_core::ErrorKind::RateLimit)
+                .unwrap();
+        let interruption =
+            crate::interruption::InterruptionRecord::new(kind, action, Default::default());
+        let mut memory = WorkingMemoryState::default();
+        memory.apply_turn_settlement(Some(&interruption));
+        let prompt = memory.render_prompt_section();
+        assert!(prompt.contains("If the user asks to continue"));
+        assert!(!prompt.contains("Blockers:"));
+    }
+
+    #[test]
     fn legacy_vec_encoded_snapshot_deserializes_into_vecdeque() {
         // Earlier revisions stored `decisions` / `blockers` as `Vec<String>`
         // and emitted JSON arrays for them. `VecDeque<T>` serializes as the

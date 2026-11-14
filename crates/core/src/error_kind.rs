@@ -110,6 +110,17 @@ pub enum ErrorKind {
     Unknown,
 }
 
+/// Classify only explicit provider-owned access codes, never provider prose.
+/// HTTP callers must still apply their own status/authority checks.
+#[must_use]
+pub fn provider_access_code_kind(code: &str) -> Option<ErrorKind> {
+    match code {
+        "insufficient_quota" | "insufficient_balance" => Some(ErrorKind::ProviderQuotaExhausted),
+        "invalid_api_key" | "invalid_token" | "authentication_error" => Some(ErrorKind::Auth),
+        _ => None,
+    }
+}
+
 /// Source-authored cause of a tool failure. This is evidence, not an execution
 /// command: downstream runtimes may render it for the model but must not turn
 /// advisory recovery actions into hidden retries, tool suppression, or aborts.
