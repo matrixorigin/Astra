@@ -801,6 +801,10 @@ async fn flush_host_event_gap_recovery(
 }
 
 fn record_unforwarded_host_event(gap: &server_loop_host::HostEventGapTracker, event: Value) {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        // No replay authority exists for a disposable execution observation.
+        return;
+    }
     if event.get("type").and_then(Value::as_str) == Some("explain_analyze") {
         gap.record_explain_analyze_drop(event);
     } else {
@@ -829,6 +833,18 @@ async fn send_attached_stream_event(
     event: Value,
     run_id: &str,
 ) {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        if let Some(attached) = delivery.sender.as_ref()
+            && matches!(
+                attached.try_send(event),
+                Err(mpsc::error::TrySendError::Closed(_))
+            )
+        {
+            delivery.sender = None;
+        }
+        // Saturation must not manufacture a repair gap for this lossy hint.
+        return;
+    }
     if attached_stream_event_requires_reliable_delivery(&event) {
         if attached_stream_event_is_terminal(&event) {
             // The terminal snapshot subsumes omitted progress. Never make its
@@ -1022,6 +1038,14 @@ async fn process_ordered_live_fanout_event(
     client_event_tx: &mut AttachedStreamDelivery,
     emitted_tool_terminals: &EmittedToolTerminalTracker,
 ) -> Result<(), LiveFanoutPersistenceError> {
+    if event.get("type").and_then(Value::as_str) == Some("runtime_wait") {
+        // Hints may be omitted behind a pending durable batch. Queuing them
+        // would change its flush threshold and create avoidable SQL writes.
+        if pending.is_empty() {
+            deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+        }
+        return Ok(());
+    }
     if let Some(object) = event.as_object_mut() {
         // The live delivery watermark is lifecycle-private, never a durable
         // receipt or public protocol field.
@@ -1759,7 +1783,7 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
-    executor.set_reply_obligations(Arc::clone(&state.messaging.reply_obligations));
+    executor.set_reply_obligations(Arc::clone(&state.messaging.question_correlations));
     let executor = std::sync::Arc::new(executor);
     state.runtime_tool_executor = Some(executor);
 }
@@ -3625,7 +3649,7 @@ async fn build_server_skill_resolver(
     }
 }
 
-fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
+pub(crate) fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
     let normalized = entry.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         Err(format!("{field} must not contain empty values"))
@@ -4635,7 +4659,7 @@ struct LoopExecutionFacts {
     charged_iterations: u64,
     stall: crate::turn::agentic_loop::host::StallTrackingState,
     user_intents: crate::turn::agentic_loop::host::UserIntentState,
-    reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     hooks: StopHookState,
     tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
     session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
@@ -4730,7 +4754,7 @@ impl LoopExecutionFacts {
             admitted_tool_policy,
             request_constraints: request_constraints.clone(),
             user_intents: Default::default(),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             hooks,
             tool_event_hooks,
             session_event_hooks,
@@ -4797,7 +4821,7 @@ impl LoopExecutionFacts {
         let astra_pipeline::step_protocol::RunExecutionControl::V4 {
             completion_settlement,
             hook_obligations,
-            reply_obligations,
+            question_correlations,
             budget_wrapup_injected,
             budget_wrapup_ignored_rounds,
         } = payload
@@ -4822,10 +4846,11 @@ impl LoopExecutionFacts {
                 chain,
             ).map_err(|_| invalid("adopted verification frontier cannot be restored"))?;
         hooks.completion_settlement = completion_settlement.clone();
-        let replies = Arc::new(crate::messaging::reply_obligations::ReplyObligations::default());
+        let replies =
+            Arc::new(crate::messaging::question_correlations::QuestionCorrelations::default());
         replies
             .restore(
-                reply_obligations,
+                question_correlations,
                 &receipt.run_id,
                 receipt.producer_generation,
             )
@@ -4894,7 +4919,7 @@ impl LoopExecutionFacts {
                 crate::turn::agentic_loop::host::UserIntentState::from_durable_continuation(
                     payload.user_intents,
                 ),
-            reply_obligations: replies,
+            question_correlations: replies,
             hooks,
             tool_event_hooks,
             session_event_hooks,
@@ -4976,7 +5001,6 @@ struct LoopEnvironment {
     agent_id: String,
     model_name: Option<String>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
-    compact_strategy: astra_turn_core::microcompact::CompactStrategy,
     inference_purpose: astra_turn_types::InferencePurpose,
     request_constraints: RequestConstraints,
     client_pipeline_skills: Vec<astra_turn_types::SkillCatalogIdentity>,
@@ -7262,7 +7286,7 @@ impl AgenticRunLifecycleService {
         let agent_context = AgentToolContext {
             parent_delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
             fanout_admission: entry.spawner.fanout_parent(run_id),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id: request
@@ -8793,7 +8817,11 @@ impl AgenticRunLifecycleService {
                     | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
             )
         );
-        if !edge_workspace || !edge_transport {
+        let edge_ledger = matches!(
+            executor.transport,
+            Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger)
+        );
+        if !edge_workspace || (!edge_transport && !edge_ledger) {
             return Err(
                 "runtime process authorization requires an edge_workspace and Edge WebSocket executor"
                     .to_string(),
@@ -8805,6 +8833,11 @@ impl AgenticRunLifecycleService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "runtime process authorization requires executor_id".to_string())?;
+        // Ledger callbacks execute under the CLI's local permission owner.
+        // Only a remote WebSocket executor receives the process grant.
+        if edge_ledger {
+            return Ok(None);
+        }
         let auth = request
             .runtime_auth
             .as_ref()
@@ -12133,16 +12166,6 @@ impl AgenticRunLifecycleService {
             agent_id: authorization.agent_id,
             model_name: authorization.model_name,
             thinking: authorization.thinking,
-            compact_strategy: authorization
-                .model_execution
-                .as_ref()
-                .map(|execution| {
-                    crate::turn::llm::context::compact_strategy_from_model_metadata(
-                        execution.cache_capability,
-                        &execution.provider,
-                    )
-                })
-                .unwrap_or_default(),
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             request_constraints: request_constraints.clone(),
             client_pipeline_skills: edge_context
@@ -12410,7 +12433,6 @@ impl AgenticRunLifecycleService {
             agent_id,
             model_name,
             thinking,
-            compact_strategy,
             inference_purpose,
             mut request_constraints,
             client_pipeline_skills,
@@ -12494,7 +12516,7 @@ impl AgenticRunLifecycleService {
             hooks: facts.hooks,
             user_intents: facts.user_intents,
             messaging: crate::turn::agentic_loop::host::MessagingState {
-                reply_obligations: facts.reply_obligations,
+                question_correlations: facts.question_correlations,
                 ..Default::default()
             },
             error_recovery: facts.original.error_recovery,
@@ -12513,7 +12535,6 @@ impl AgenticRunLifecycleService {
             thinking,
             permission_context: root_permission_context,
             memory_extraction_service,
-            compact_strategy,
             session_turn: facts.original.session_turn,
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
@@ -15526,24 +15547,173 @@ impl AgenticRunLifecycleService {
         Ok(())
     }
 
+    /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
+    async fn create_run_with_session_impl(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+        create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
+    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let NewRunPreparation::Owned { execution, .. } = self
+            .prepare_new_owned_execution(user_id, request, None, false, create_session)
+            .await?
+        else {
+            unreachable!("insert-only background start cannot replay")
+        };
+        let record = ChatRunRecord {
+            session_id: execution.session_id.clone(),
+            run_id: execution.run_id.clone(),
+            status: STATUS_RUNNING.to_string(),
+            explain: execution.explain.then(|| json!({"mode": "background"})),
+        };
+        self.launch_owned_background_execution(*execution).await;
+        Ok(record)
+    }
+
+    /// Stream chat (incremental SSE mode): spawns the agentic loop in a
+    /// background task and returns an event channel for incremental streaming.
+    /// Post-loop cleanup (persistence, learning state) runs inside the task.
+    async fn stream_chat_with_session_impl(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+        create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.require_invocation_composition()?;
+        self.authorize_fork_session_request(&user_id, &request)
+            .await?;
+        let start_identity = self.run_start_idempotency(&user_id, &request)?;
+        // Replays consume frozen execution facts before mutable admission.
+        if let Some(identity) = start_identity.as_ref()
+            && let Some(durable) = self
+                .load_durable_run_for_user(identity.run_id(), &user_id)
+                .await?
+        {
+            self.authorize_fork_session_id(
+                &user_id,
+                &durable.session_id,
+                request.provider_run_owner.as_ref(),
+            )
+            .await?;
+            if create_session.is_some() {
+                // This unbound request cannot reuse the Session generated for
+                // an earlier task. Previously it created another Session only
+                // to fail this same session-mismatch check.
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "provider task_ref is already bound to a different session",
+                    "provider_task_ref_session_mismatch",
+                ));
+            }
+            Self::validate_start_request_session(
+                identity,
+                request.session_id.as_deref(),
+                &durable.session_id,
+            )?;
+            Self::validate_start_request_fingerprint(
+                identity,
+                durable.start_request_fingerprint.as_deref(),
+            )?;
+            return self
+                .stream_run_live(identity.run_id().to_owned(), user_id, 0)
+                .await;
+        }
+        match self
+            .prepare_new_owned_execution(
+                user_id.clone(),
+                request,
+                start_identity,
+                true,
+                create_session,
+            )
+            .await?
+        {
+            NewRunPreparation::Existing { run_id } => {
+                self.stream_run_live(run_id, user_id, 0).await
+            }
+            NewRunPreparation::Owned {
+                execution,
+                event_rx,
+            } => {
+                let record = ChatStreamRecord {
+                    session_id: execution.session_id.clone(),
+                    run_id: execution.run_id.clone(),
+                    events: Vec::new(),
+                    event_rx,
+                };
+                self.launch_owned_background_execution(*execution).await;
+                Ok(record)
+            }
+        }
+    }
+
+    fn check_chat_session_creation_budget(
+        &self,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if self.execution_handoff_requested.is_cancelled() {
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is shutting down; retry on an available server",
+                "server_shutting_down",
+            ));
+        }
+        if request
+            .admitted_execution_deadline
+            .is_some_and(|deadline| deadline.remaining().is_zero())
+        {
+            return Err(error_response_coded(
+                StatusCode::REQUEST_TIMEOUT,
+                "execution deadline expired before Run admission",
+                "execution_deadline_expired",
+            ));
+        }
+        Ok(())
+    }
+
     async fn prepare_new_owned_execution(
         &self,
         user_id: String,
         request: ChatRequestData,
-        start_identity: Option<RunStartIdempotency>,
+        mut start_identity: Option<RunStartIdempotency>,
         streaming: bool,
+        create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<NewRunPreparation, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         if !streaming {
             self.authorize_fork_session_request(&user_id, &request)
                 .await?;
         }
+        // Provider task fingerprints describe the original request, not the
+        // model/input normalization performed below. Ordinary chat needs no copy.
+        let unprepared = (create_session.is_some()
+            && start_identity
+                .as_ref()
+                .is_some_and(|identity| identity.kind() == RunStartIdempotencyKind::ProviderTask))
+        .then(|| request.clone());
         let request = self.prepare_chat_request(&user_id, request).await?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
         let mut request = request;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
+        if let Some(create_session) = create_session {
+            if request.session_id.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "new chat Session creation requires an unbound request",
+                    "chat_request_invalid",
+                ));
+            }
+            self.check_chat_session_creation_budget(&request)?;
+            let resolved = create_session.await?;
+            if let Some(mut original) = unprepared {
+                resolved.apply_to(&mut original);
+                start_identity = self.run_start_idempotency(&user_id, &original)?;
+            }
+            resolved.apply_to(&mut request);
+            self.check_chat_session_creation_budget(&request)?;
+        }
 
         let idempotent_start = start_identity.is_some();
         let run_id = start_identity
@@ -16585,86 +16755,42 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.run_engine.execution_owner_pod_id()
     }
 
-    /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
     async fn create_run(
         &self,
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        let NewRunPreparation::Owned { execution, .. } = self
-            .prepare_new_owned_execution(user_id, request, None, false)
-            .await?
-        else {
-            unreachable!("insert-only background start cannot replay")
-        };
-        let record = ChatRunRecord {
-            session_id: execution.session_id.clone(),
-            run_id: execution.run_id.clone(),
-            status: STATUS_RUNNING.to_string(),
-            explain: execution.explain.then(|| json!({"mode": "background"})),
-        };
-        self.launch_owned_background_execution(*execution).await;
-        Ok(record)
+        self.create_run_with_session_impl(user_id, request, None)
+            .await
     }
 
-    /// Stream chat (incremental SSE mode): spawns the agentic loop in a
-    /// background task and returns an event channel for incremental streaming.
-    /// Post-loop cleanup (persistence, learning state) runs inside the task.
+    async fn create_run_with_session(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+        create_session: astra_services::runs::ChatSessionCreation<'_>,
+    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.create_run_with_session_impl(user_id, request, Some(create_session))
+            .await
+    }
+
     async fn stream_chat(
         &self,
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.require_invocation_composition()?;
-        self.authorize_fork_session_request(&user_id, &request)
-            .await?;
-        let start_identity = self.run_start_idempotency(&user_id, &request)?;
-        // Replays consume frozen execution facts before mutable admission.
-        if let Some(identity) = start_identity.as_ref()
-            && let Some(durable) = self
-                .load_durable_run_for_user(identity.run_id(), &user_id)
-                .await?
-        {
-            self.authorize_fork_session_id(
-                &user_id,
-                &durable.session_id,
-                request.provider_run_owner.as_ref(),
-            )
-            .await?;
-            Self::validate_start_request_session(
-                identity,
-                request.session_id.as_deref(),
-                &durable.session_id,
-            )?;
-            Self::validate_start_request_fingerprint(
-                identity,
-                durable.start_request_fingerprint.as_deref(),
-            )?;
-            return self
-                .stream_run_live(identity.run_id().to_owned(), user_id, 0)
-                .await;
-        }
-        match self
-            .prepare_new_owned_execution(user_id.clone(), request, start_identity, true)
-            .await?
-        {
-            NewRunPreparation::Existing { run_id } => {
-                self.stream_run_live(run_id, user_id, 0).await
-            }
-            NewRunPreparation::Owned {
-                execution,
-                event_rx,
-            } => {
-                let record = ChatStreamRecord {
-                    session_id: execution.session_id.clone(),
-                    run_id: execution.run_id.clone(),
-                    events: Vec::new(),
-                    event_rx,
-                };
-                self.launch_owned_background_execution(*execution).await;
-                Ok(record)
-            }
-        }
+        self.stream_chat_with_session_impl(user_id, request, None)
+            .await
+    }
+
+    async fn stream_chat_with_session(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+        create_session: astra_services::runs::ChatSessionCreation<'_>,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.stream_chat_with_session_impl(user_id, request, Some(create_session))
+            .await
     }
 
     async fn get_tool_callback_run_target(
@@ -24646,15 +24772,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
         });
 
         // Build edge profile from agent's system prompt and metadata.
-        let compact_strategy = admitted_model_execution
-            .as_ref()
-            .map(|execution| {
-                crate::turn::llm::context::compact_strategy_from_model_metadata(
-                    execution.cache_capability,
-                    &execution.provider,
-                )
-            })
-            .unwrap_or_default();
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(
@@ -24946,7 +25063,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             skill_executor: None,
             permission_context: Some(permission_context),
             memory_extraction_service,
-            compact_strategy,
             harness: {
                 #[cfg(feature = "harness")]
                 {
@@ -25160,7 +25276,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None => return Err("admitted child profile authority requires durable run facts".into()),
                     },
                     fanout_admission: spawner.fanout_parent(&config.run_id),
-                    reply_obligations: Arc::clone(&loop_state.messaging.reply_obligations),
+                    question_correlations: Arc::clone(&loop_state.messaging.question_correlations),
                     delegation_model_admission: None,
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),

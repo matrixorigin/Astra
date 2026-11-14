@@ -557,7 +557,7 @@ fn recovery_rejects_unpaired_or_foreign_execution_control() {
         heavy.run_execution_control = Some(RunExecutionControl::V4 {
             completion_settlement: Default::default(),
             hook_obligations: Default::default(),
-            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+            question_correlations: astra_turn_types::QuestionCorrelationsSnapshotV1 {
                 run_id: "control-run".into(),
                 producer_owner_generation: 3,
                 pending: Vec::new(),

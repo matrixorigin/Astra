@@ -500,6 +500,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             TuiAppEvent::RunInterrupted { user_message }
         }
         StreamEvent::SystemWarning(text) => TuiAppEvent::SystemWarning(text),
+        StreamEvent::RuntimeWait { waiting } => TuiAppEvent::RuntimeWait { waiting },
         StreamEvent::StatusLine(text) => TuiAppEvent::StatusLine(text),
         StreamEvent::UserIntentApplied {
             intent_id,

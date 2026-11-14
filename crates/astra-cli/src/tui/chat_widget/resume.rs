@@ -192,6 +192,24 @@ fn canonical_root_turn_events(
     use crate::tui::history_cell::{HistoryCell, turn_summary::TurnSummaryCell};
 
     let tool_names = super::super::event_loop::local_transcript_tool_names(&events, None);
+    // Reconcile the existing authenticated callback observation by exact scope.
+    // Missing delivery or historical prose cannot prove non-execution.
+    let mut rejected: HashSet<_> = events
+        .iter()
+        .filter_map(|event| event.tool_calls.as_ref())
+        .flatten()
+        .filter(|record| {
+            record.effective_disposition()
+                == astra_services::session_journal::ToolCallDisposition::Rejected
+                && record.error_kind != Some(astra_core::ErrorKind::Cancelled)
+                && !record.outcome_is_unknown()
+        })
+        .filter_map(|record| {
+            let identity = record.invocation_identity.as_ref()?;
+            (record.tool_call_id.as_deref() == Some(identity.invocation_id.as_str()))
+                .then(|| (identity.run_id.clone(), identity.invocation_id.clone()))
+        })
+        .collect();
     let mut last_item_seq_by_run = HashMap::new();
     for item in events
         .iter()
@@ -204,9 +222,60 @@ fn canonical_root_turn_events(
             .or_insert(item.item_seq);
     }
 
+    let transcript_tools: HashSet<_> = events
+        .iter()
+        .filter_map(|event| event.transcript_item.as_ref())
+        .filter(|item| item.agent_id == "root" && item.message["role"] == "tool")
+        .filter_map(|item| {
+            item.message
+                .get("tool_call_id")
+                .or_else(|| item.message.get("call_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (item.run_id.clone(), id.to_string()))
+        })
+        .collect();
     let mut seen_source_ids = HashSet::new();
     let mut runs_with_tools = HashSet::new();
     let mut out = Vec::new();
+    // Audit events are committed before transcript rows. Index their visual
+    // fallback now, then place it after the root user row, never before it.
+    let user_runs: HashSet<_> = events
+        .iter()
+        .filter_map(|event| event.transcript_item.as_ref())
+        .filter(|item| item.agent_id == "root" && item.message["role"] == "user")
+        .map(|item| item.run_id.clone())
+        .collect();
+    let mut audit_only: HashMap<String, Vec<TurnEvent>> = HashMap::new();
+    for event in &events {
+        for record in event.tool_calls.iter().flatten() {
+            let Some(identity) = record.invocation_identity.as_ref() else {
+                continue;
+            };
+            let key = (identity.run_id.clone(), identity.invocation_id.clone());
+            if last_item_seq_by_run.contains_key(&identity.run_id)
+                && !transcript_tools.contains(&key)
+                && rejected.remove(&key)
+            {
+                let output = record
+                    .result_full
+                    .clone()
+                    .or_else(|| record.result_preview.clone())
+                    .or_else(|| record.error.clone());
+                audit_only
+                    .entry(identity.run_id.clone())
+                    .or_default()
+                    .push(TurnEvent::Tool {
+                        ts: Some(event.ts.clone()),
+                        name: record.name.clone(),
+                        description: record.args_preview.clone().unwrap_or_default(),
+                        status: ToolStatus::Rejected,
+                        duration_ms: record.ms,
+                        output_summary: output.clone(),
+                        output,
+                    });
+            }
+        }
+    }
     for event in events {
         let Some(item) = event.transcript_item else {
             continue;
@@ -226,6 +295,11 @@ fn canonical_root_turn_events(
         let is_last_run_item = last_item_seq_by_run.get(&run_id) == Some(&item.item_seq);
         let message = item.message;
         let role = message.get("role").and_then(serde_json::Value::as_str);
+        if !user_runs.contains(&run_id)
+            && let Some(rows) = audit_only.remove(&run_id)
+        {
+            out.extend(rows);
+        }
         match role {
             Some("user") => {
                 if let Some(content) = message.get("content").and_then(serde_json::Value::as_str)
@@ -235,6 +309,9 @@ fn canonical_root_turn_events(
                         ts: Some(event.ts),
                         text: content.to_string(),
                     });
+                }
+                if let Some(rows) = audit_only.remove(&run_id) {
+                    out.extend(rows);
                 }
             }
             Some("assistant") => {
@@ -285,9 +362,21 @@ fn canonical_root_turn_events(
                         })
                         .unwrap_or_else(|| "tool".to_string()),
                     description: String::new(),
-                    status: match message.get("status").and_then(serde_json::Value::as_str) {
+                    status: match message
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| {
+                            message
+                                .get("tool_call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|id| {
+                                    rejected.contains(&(run_id.clone(), (*id).to_string()))
+                                })
+                                .map(|_| "rejected")
+                        }) {
                         Some("success" | "completed" | "ok") => ToolStatus::Success,
-                        Some("failed" | "error" | "rejected") => ToolStatus::Failed,
+                        Some("rejected") => ToolStatus::Rejected,
+                        Some("failed" | "error") => ToolStatus::Failed,
                         _ => ToolStatus::Uncertain,
                     },
                     duration_ms: message
@@ -486,6 +575,130 @@ mod tests {
         session_journal::set_journal_content_redact_override(None);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rejected_edge_result_survives_canonical_capture_and_resume() {
+        session_journal::set_journal_content_redact_override(Some(false));
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "rejected_canonical";
+        let args = serde_json::json!({"command":"printf forbidden > marker", "workdir":"missing"});
+        let executor = crate::edge_tools::ToolExecutor::new(tmp.path());
+        let outcome = executor.execute_with_metadata("bash", &args).await;
+        assert!(outcome.is_error);
+        let result = astra_turn_core::sse::stream_host::EdgeToolExecResult {
+            work_attribution: None,
+            execution_completion: None,
+            request_id: "rejected-call".into(),
+            tool: "bash".into(),
+            args,
+            output: outcome.output,
+            tool_result_fields: outcome.tool_result_fields,
+            status: "rejected".into(),
+            duration_ms: 0,
+        };
+        let scoped = astra_turn_core::sse_stream_host::ScopedEdgeToolExecResult {
+            session_id: session_id.into(),
+            run_id: "run".into(),
+            turn_chain_id: "chain".into(),
+            local_only: false,
+            result,
+        };
+        let record = astra_turn_core::headless_tool_journal::journal_record_scoped_edge_tool_result(
+            &scoped,
+            Some("user"),
+        );
+        assert_eq!(
+            record.effective_disposition(),
+            session_journal::ToolCallDisposition::Rejected
+        );
+        let (message, _) =
+            astra_turn_core::headless::assembly::openai_tool_roundtrip_values_with_result_fields(
+                &scoped.request_id,
+                &scoped.tool,
+                &scoped.output,
+                scoped.tool_result_fields.as_ref(),
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+            );
+        assert!(
+            message.get("status").is_none(),
+            "provider message remains unchanged"
+        );
+        let mut observed =
+            JournalEvent::sync_marker(Some(session_id), None, None, Some("callback observed"));
+        observed.tool_calls = Some(vec![record]);
+        let assistant = astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+            &[],
+            "No command ran.",
+            None,
+        )
+        .unwrap();
+        let events = vec![
+            observed,
+            JournalEvent::transcript_item(session_id, "run", "root", 1, &serde_json::json!({"role":"user", "content":"Run the requested command."})).unwrap(),
+            JournalEvent::transcript_item(session_id, "run", "root", 2, &assistant).unwrap(),
+            JournalEvent::transcript_item(session_id, "other-run", "root", 1, &serde_json::json!({"role":"assistant", "tool_calls":[{"id":"rejected-call", "type":"function", "function":{"name":"bash", "arguments":"{}"}}]})).unwrap(),
+            JournalEvent::transcript_item(session_id, "other-run", "root", 2, &message).unwrap(),
+        ];
+        session_journal::JournalWriter::new(session_id)
+            .unwrap()
+            .append_bulk(&events)
+            .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let widget = load(session_id, &api, None, false).await;
+        let text = widget
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(120))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert_eq!(text.matches("Did not run Bash").count(), 1, "{text}");
+        assert!(
+            text.find("Run the requested command.").unwrap()
+                < text.find("Did not run Bash").unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.find("Did not run Bash").unwrap() < text.find("No command ran.").unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.contains("Could not confirm Bash"),
+            "an unrelated run's matching call ID has no evidence: {text}"
+        );
+        assert!(!text.contains("Failed Bash"), "{text}");
+        assert!(!tmp.path().join("marker").exists());
+        let mut late = scoped.clone();
+        late.run_id = "other-run".into();
+        let mut observed =
+            JournalEvent::sync_marker(Some(session_id), None, None, Some("late callback"));
+        observed.tool_calls = Some(vec![
+            astra_turn_core::headless_tool_journal::journal_record_scoped_edge_tool_result(
+                &late,
+                Some("user"),
+            ),
+        ]);
+        session_journal::JournalWriter::new(session_id)
+            .unwrap()
+            .append(&observed)
+            .unwrap();
+        let restored = load(session_id, &api, None, false).await;
+        let text = restored
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(120))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert_eq!(
+            text.matches("Did not run Bash").count(),
+            2,
+            "one audit-only row and one transcript row, without duplication: {text}"
+        );
+        session_journal::set_journal_content_redact_override(None);
+    }
+
     #[test]
     fn journal_tool_status_requires_explicit_evidence() {
         let events = [
@@ -509,7 +722,7 @@ mod tests {
                 ToolStatus::Uncertain,
                 ToolStatus::Uncertain,
                 ToolStatus::Success,
-                ToolStatus::Failed
+                ToolStatus::Rejected
             ]
         );
     }

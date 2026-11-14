@@ -275,12 +275,14 @@ fn delegation_terminal_events(
     events
 }
 
+const RECOVERED_RUN_MESSAGE: &str = "The previous run was interrupted when its execution ownership ended. Send a new message in this session to continue.";
+
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     [
         serde_json::json!({
             "event_type": "run_error",
             "data": {
-                "error": "recovered from crash",
+                "error": RECOVERED_RUN_MESSAGE,
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
@@ -290,7 +292,7 @@ fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
             "event_type": "run_finished",
             "data": {
                 "status": STATUS_FAILED,
-                "error": "recovered from crash",
+                "error": RECOVERED_RUN_MESSAGE,
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
@@ -4175,7 +4177,7 @@ impl RunEngine {
             let events = crash_recovery_terminal_events();
             match self
                 .store
-                .settle_recovered_run(&run, STATUS_FAILED, Some("recovered from crash"), &events)
+                .settle_recovered_run(&run, STATUS_FAILED, Some(RECOVERED_RUN_MESSAGE), &events)
                 .await
             {
                 Ok(true) => {
@@ -4188,7 +4190,7 @@ impl RunEngine {
                     run.owner_pod_id = None;
                     run.owner_lease_expires_at = None;
                     run.waiting_for = None;
-                    run.error_message = Some("recovered from crash".to_string());
+                    run.error_message = Some(RECOVERED_RUN_MESSAGE.to_string());
                     run.error_code = Some("crash_recovery".to_string());
                     run.last_event_idx += events.len() as i64;
                     run.events.extend(events);
@@ -12176,8 +12178,8 @@ mod tests {
         );
         assert_eq!(
             crashed.error_message.as_deref(),
-            Some("recovered from crash"),
-            "error message must indicate crash recovery"
+            Some(RECOVERED_RUN_MESSAGE),
+            "error message must give a useful continuation rather than assume a crash"
         );
         assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
         let crashed_event_types = crashed

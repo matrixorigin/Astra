@@ -66,7 +66,7 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             })
         })
         .collect();
-    let replies = state.messaging.reply_obligations.pending(parent_run_id);
+    let replies = state.messaging.question_correlations.pending(parent_run_id);
     let reply_identities: Vec<_> = replies
         .iter()
         .map(|reply| {
@@ -340,12 +340,23 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
             })
             .sum()
     };
-    if pending_bytes(state).saturating_add(
-        serde_json::to_vec(&payload)
-            .expect("child notification must serialize")
-            .len(),
-    ) > budget
-    {
+    let payload_bytes = serde_json::to_vec(&payload)
+        .expect("child notification must serialize")
+        .len();
+    let mut retained_bytes = pending_bytes(state);
+    if retained_bytes.saturating_add(payload_bytes) > budget {
+        // Correlation notices are optional; producer-owned child results win
+        // even when another completion was staged in an earlier batch.
+        for entry in &mut state.volatile_pending {
+            if entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && let Some(object) = entry.payload.as_object_mut()
+            {
+                object.remove("unobserved_questions");
+            }
+        }
+        retained_bytes = pending_bytes(state);
+    }
+    if retained_bytes.saturating_add(payload_bytes) > budget {
         // Compact payloads in place: delivery counters, observation markers,
         // and parent identity belong to the existing injection, not this batch.
         for notification in state
@@ -392,6 +403,38 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
             ));
         }
     }
+    let questions: Vec<_> = state
+        .messaging
+        .question_correlations
+        .pending(owner.parent_run_id())
+        .into_iter()
+        .filter(|question| {
+            payload["children"].as_array().is_some_and(|children| {
+                children.iter().any(|child| {
+                    child["run_id"] == question.expected_responder.run_id
+                        && child["agent_id"] == question.expected_responder.agent_id
+                })
+            }) && !state.volatile_pending.iter().any(|entry| {
+                entry.payload["response_request_id"] == question.request_id
+                    && entry.payload["sender"]["run_id"] == question.expected_responder.run_id
+                    && entry.payload["sender"]["agent_id"] == question.expected_responder.agent_id
+                    && entry.payload["response_match"] != "not_adopted"
+            })
+        })
+        .collect();
+    if !questions.is_empty() {
+        payload["unobserved_questions"] = serde_json::json!({
+            "questions": questions,
+            "instruction": "No matching response was observed before this notification; it may have been sent or still be in transit. The terminal result is not an answer. Continue using the known outcome, or explicitly wait if an answer is needed.",
+        });
+        // This batch's optional notice may only use otherwise unused bytes.
+        if pending_bytes(state).saturating_add(payload.to_string().len()) > budget {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("unobserved_questions");
+        }
+    }
     state.push_volatile_payload(
         super::host::VolatileKind::BackgroundTaskNotification,
         payload,
@@ -416,14 +459,6 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    let run_id = state.current_run_id.as_deref().unwrap_or_default();
-    if state.messaging.reply_obligations.has_pending(run_id) {
-        finish_direct_child_barrier_incomplete(
-            state,
-            "agent finalization reached an unanswered question",
-        );
-        return;
-    }
     let Some(owner) = host.direct_child_completion_owner(state) else {
         return;
     };
@@ -507,7 +542,10 @@ pub(crate) enum RuntimeActivityOutcome {
 
 impl RuntimeActivityOutcome {
     pub(crate) fn should_continue(&self) -> bool {
-        matches!(self, Self::InputReady | Self::ObservationTimedOut)
+        matches!(
+            self,
+            Self::InputReady | Self::ObservationTimedOut | Self::NoPendingWork
+        )
     }
 }
 
@@ -531,13 +569,11 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
 ) -> Result<RuntimeActivityOutcome, astra_core::ClassifiedError> {
     let owner = host.direct_child_completion_owner(state);
     let run_id = state.current_run_id.clone().unwrap_or_default();
-    let replies = Arc::clone(&state.messaging.reply_obligations);
     let retained_runtime_input = has_retained_runtime_input(state);
     if observation_request.is_none()
         && !owner
             .as_ref()
             .is_some_and(|owner| owner.has_pending_direct_children())
-        && !replies.has_pending(&run_id)
         && !retained_runtime_input
     {
         return Ok(RuntimeActivityOutcome::NoPendingWork);
@@ -554,7 +590,8 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
     let authority_deadline = remaining.map(|remaining| admitted_now + remaining);
     let work_deadline = time_budget.map(|budget| admitted_now + budget.work_remaining);
     let paused_authority_live = || {
-        authority_deadline.is_none_or(|end| tokio::time::Instant::now() < end)
+        observation_request.is_none()
+            && authority_deadline.is_none_or(|end| tokio::time::Instant::now() < end)
             && owner
                 .as_ref()
                 .is_some_and(|owner| owner.paused_direct_child_reason().is_some())
@@ -700,7 +737,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         }
                     } => ReadySource::Mailbox(message),
                 };
-                let boundary = match source {
+                let mut boundary = match source {
                     ReadySource::Child => Some(RuntimeInputBoundary::ChildReady),
                     ReadySource::Intent(Some(index)) => {
                         checked_watermark = checked_watermark.max(index);
@@ -723,8 +760,13 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                     }
                     ReadySource::ObservationTimeout => None,
                 };
+                // The observation cutoff limits parking, not ownership of an
+                // admitted capacity request or input transaction. Those keep
+                // the original execution deadline and cancellation boundary.
                 let mut input_deadline = if boundary.is_none() || paused_authority_live() {
                     authority_deadline
+                } else if observation_request.is_some() {
+                    work_deadline
                 } else {
                     deadline
                 };
@@ -786,6 +828,12 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         observation_request.map(|request| request.tool_call_id.as_str()),
                     );
                     return Err(error);
+                }
+                if observation_deadline.is_some_and(|end| tokio::time::Instant::now() >= end) {
+                    // A wake can precede the cutoff but capacity arrive after
+                    // it. Leave ready input in its existing owner for the next
+                    // iteration; a tool timeout never cancels a child run.
+                    boundary = None;
                 }
                 let Some(boundary) = boundary else {
                     if paused_authority_live() {
@@ -849,7 +897,6 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         && !owner
                             .as_ref()
                             .is_some_and(|owner| owner.has_pending_direct_children())
-                        && !replies.has_pending(&run_id)
                 {
                     break 'waiting if matches!(source, ReadySource::Child) {
                         "synthesis_ready"
@@ -4599,10 +4646,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.rate_limit_cooldown.record_529(None);
             }
 
-            if is_rate_limit {
+            if is_rate_limit
+                && let Some((kind, action)) =
+                    astra_turn_core::interruption::interruption_from_error_kind(e.kind)
+            {
                 state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::RateLimited,
-                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    kind,
+                    action,
                     interruption_state_summary(
                         state,
                         Some(format!("Rate limit during streaming: {}", e.message)),
@@ -4806,10 +4856,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if host
                 .direct_child_completion_owner(state)
                 .is_some_and(|owner| owner.has_pending_direct_children())
-                || state
-                    .messaging
-                    .reply_obligations
-                    .has_pending(state.current_run_id.as_deref().unwrap_or_default())
             {
                 // Close provider timing before waiting. The wait is its own
                 // Explain interval, never part of model inference time.
@@ -5869,12 +5915,13 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
 
     // First attempt: compact-and-continue instead of hard-stopping.
-    // Two-tier strategy:
-    //   1. Aggressive compression pipeline (clear tool results)
-    //   2. If still over: persist old messages as a session artifact, keep an introspect reference
-    // Only if both fail do we inject the stop directive.
+    // Eliminate exact duplicate results first, then persist recoverable history
+    // only if pressure remains. A prior semantic summary does not disable safe
+    // deduplication of new observations.
     {
-        let rewrite_permit = state.begin_canonical_rewrite();
+        let rewrite_permit = state
+            .begin_canonical_rewrite()
+            .filter(|permit| permit.is_valid());
         let budget = super::super::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
@@ -5884,12 +5931,8 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .unwrap_or_default()
                 .as_secs(),
         };
-        // A pre-turn summary already replaced completed history; running the
-        // mechanical pipeline again would rewrite its retained rounds into
-        // `[Cleared]` tombstones. Artifact spill below remains an independent
-        // recovery path, so it stays available regardless of the tier.
         let (mut total_freed, mut total_messages_removed, mut layer_descriptions) =
-            if state.compact_tier_applied < CompactionTier::CompactHistory {
+            if rewrite_permit.is_some() {
                 let pipeline = super::super::CompactionEngine::aggressive_pipeline();
                 let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
                 (
@@ -5909,6 +5952,9 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 (0, 0, Vec::new())
             };
 
+        if total_freed > 0 {
+            state.finish_canonical_rewrite(rewrite_permit);
+        }
         // Commit an artifact-backed rewrite only after durable storage succeeds.
         if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
             if let Some((freed, removed)) = spill_old_messages_to_artifact(host, state).await {
@@ -5919,7 +5965,6 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         }
 
         if total_freed > 0 {
-            state.finish_canonical_rewrite(rewrite_permit);
             let pressure = measured as f64 / state.max_turn_input_tokens as f64;
             state.context_compression_triggered = true;
             state.step_recorder.record_compaction_with_kind(
@@ -6261,14 +6306,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn admitted_wait_parks_main_loop_without_provider_calls() {
+    #[tokio::test(start_paused = true)]
+    async fn admitted_wait_observes_timeout_without_bypassing_child_results() {
         for reply_pending in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let context =
                 crate::server::runtime_tool_executor::tests::test_agent_tool_context(dir.path());
             let owner = Arc::clone(&context.fanout_admission);
-            let replies = Arc::clone(&context.reply_obligations);
+            let replies = Arc::clone(&context.question_correlations);
             let responder = astra_messaging::AgentAddress::new("child-run", "child-agent");
             if reply_pending {
                 replies
@@ -6296,7 +6341,7 @@ mod tests {
             );
             executor.set_agent_tool_context(context);
             let mut state = make_state();
-            state.messaging.reply_obligations = Arc::clone(&replies);
+            state.messaging.question_correlations = Arc::clone(&replies);
             state.runtime_tool_executor = Some(Arc::new(executor));
             state.current_run_id = Some("test-run".into());
             state.current_session_id = Some("test-session".into());
@@ -6304,21 +6349,33 @@ mod tests {
             state.canonical_turn_chain_id = Some("test-chain".into());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let wait_started = Arc::new(tokio::sync::Notify::new());
-            let mut host = MockHost::new(vec![
-            server_tool_result(
-                vec![serde_json::json!({
-                    "id":"wait-call", "type":"function", "function":{
-                        "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1} else {10000}}).to_string(),
+            let mut turns = vec![
+                server_tool_result(
+                    vec![serde_json::json!({
+                        "id":"wait-call", "type":"function", "function":{
+                            "name":"agent", "arguments":serde_json::json!({"action":"wait", "timeout_ms":if reply_pending {1000} else {10000}}).to_string(),
+                        },
+                    })],
+                    vec![],
+                    10,
+                    5,
+                    None,
+                ),
+                text_result(
+                    if reply_pending {
+                        "child still running"
+                    } else {
+                        "42"
                     },
-                })],
-                vec![],
-                10,
-                5,
-                None,
-            ),
-            text_result("42", 10, 5, None),
-        ])
-        .with_valid_tools(&["agent"]);
+                    10,
+                    5,
+                    None,
+                ),
+            ];
+            if reply_pending {
+                turns.push(text_result("42", 10, 5, None));
+            }
+            let mut host = MockHost::new(turns).with_valid_tools(&["agent"]);
             host.provider_call_counter = Some(Arc::clone(&counter));
             host.child_wait_started = Some(Arc::clone(&wait_started));
             let task = tokio::spawn(async move {
@@ -6340,24 +6397,19 @@ mod tests {
                 "parked execution must not call provider"
             );
             if reply_pending {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::time::timeout(Duration::from_secs(2), wait_started.notified()).await
+                    .expect("the observation timeout resumes the model, then child custody parks it again");
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
                 assert!(
-                    replies.has_pending("test-run"),
-                    "observation timeout cannot settle question"
+                    !task.is_finished(),
+                    "an unanswered question does not replace the child-result fence"
                 );
-                assert!(replies.observe_response(
-                    "test-run",
-                    &astra_messaging::AgentMessage::new(
-                        responder,
-                        astra_messaging::MessageTarget::Direct {
-                            address: astra_messaging::AgentAddress::new("test-run", "test-agent")
-                        },
-                        astra_messaging::MessagePayload::Response {
-                            request_id: "question".into(),
-                            accepted: true,
-                            data: None
-                        },
-                    )
-                ));
+                assert!(owner.has_pending_direct_children());
+                assert!(
+                    !replies.pending("test-run").is_empty(),
+                    "timeout cannot settle question correlation"
+                );
             }
             owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
                 applied_user_intents: Vec::new(),
@@ -6383,8 +6435,16 @@ mod tests {
                 matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
                 "{outcome:?}"
             );
-            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                if reply_pending { 3 } else { 2 }
+            );
             assert_eq!(state.final_text, "42");
+            assert_eq!(
+                !replies.pending("test-run").is_empty(),
+                reply_pending,
+                "completion does not require manufacturing an answer"
+            );
             assert_eq!(
                 astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(
                     &state.stall.tool_call_records
@@ -6393,9 +6453,16 @@ mod tests {
                 "accepted waiting must not introduce a child execution failure"
             );
             assert!(
-                serde_json::to_string(&host.executed_volatile[1])
-                    .unwrap()
-                    .contains("42"),
+                host.executed_volatile.last().unwrap().iter().any(|entry| {
+                    entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                        && entry.payload["children"]
+                            .as_array()
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child["run_id"] == "child-run" && child["result"] == "42"
+                                })
+                            })
+                }),
                 "continuation must consume the canonical child result"
             );
             assert!(
@@ -6811,6 +6878,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
             grant.notify_one();
             tokio::time::sleep(Duration::from_millis(25)).await;
+            if observation_timeout {
+                let (host, state, result) = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.unwrap(), RuntimeActivityOutcome::ObservationTimedOut);
+                assert!(owner.has_pending_direct_children());
+                assert!(host.executed_messages.is_empty());
+                assert!(
+                    state
+                        .volatile_pending
+                        .iter()
+                        .any(|entry| entry.payload["agent_wait"] == "timed_out")
+                );
+                continue;
+            }
             assert!(!task.is_finished());
             assert!(owner.has_pending_direct_children());
             cancellation.cancel();
@@ -6831,6 +6914,136 @@ mod tests {
                     .volatile_pending
                     .iter()
                     .all(|entry| entry.payload["agent_wait"] != "timed_out")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_observation_cutoff_preserves_readmission_and_started_input() {
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            Arc::new(crate::messaging::InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
+        let mut ctx = crate::orchestration::agent_tool::tests::test_spawn_context(spawner, None);
+        ctx.run_id = "agent-run".into();
+        ctx.fanout_admission = ctx.spawner.fanout_parent("agent-run");
+        let output = crate::orchestration::agent_tool::handle_agent_tool(
+            &serde_json::json!({"action":"wait", "timeout_ms":15_000, "_tool_call_id":"wait-call"}),
+            Some(&ctx),
+        )
+        .await;
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["status"], "wait_admitted");
+        let receipt: astra_tools::agent_tool_contract::AgentWaitReceipt =
+            serde_json::from_value(output["wait_request"].clone()).unwrap();
+        for (phase, work_seconds) in [
+            ("capacity", 40),
+            ("poll", 40),
+            ("apply", 40),
+            ("capacity", 10),
+            ("apply", 10),
+        ] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "agent-run",
+                "child",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: vec![],
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "agent".into(),
+                status: crate::orchestration::AgentStatus::Paused {
+                    reason: "user pause".into(),
+                },
+            });
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut provider = StubRunControlProvider::new(vec![UserIntentPoll {
+                next_cursor: 1,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "guidance".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 0,
+                    input: serde_json::json!({"content":"Use the existing result."}),
+                }],
+                ..UserIntentPoll::default()
+            }]);
+            let mut host = MockHost::new(vec![]).with_execution_time_budget_remaining(
+                astra_turn_types::ExecutionTimeRemaining {
+                    work_remaining: Duration::from_secs(work_seconds),
+                    total_remaining: Duration::from_secs(60),
+                },
+            );
+            let gate = Some((entered.clone(), release.clone()));
+            match phase {
+                "capacity" => host.capacity_readmission_gate = gate,
+                "poll" => provider.poll_gate = gate,
+                "apply" => provider.apply_gate = gate,
+                _ => unreachable!(),
+            }
+            let provider = Arc::new(provider);
+            let (_wake_tx, wake_rx) = tokio::sync::watch::channel(0);
+            host.direct_child_owner = Some(owner.clone());
+            let mut state = make_state();
+            state.current_run_id = Some("agent-run".into());
+            state.current_session_id = Some("session".into());
+            state.owner_user_id = Some("user".into());
+            state.current_run_owner_generation = Some(3);
+            state.run_control = Some(provider.clone());
+            state.user_intents.bind_wake(Some(wake_rx));
+            let receipt = receipt.clone();
+            let task = tokio::spawn(async move {
+                let result = await_runtime_activity(&mut host, &mut state, Some(&receipt)).await;
+                (host, state, result)
+            });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("real input wake must reach the selected capacity/IO boundary");
+            tokio::time::advance(Duration::from_secs(16)).await;
+            tokio::task::yield_now().await;
+            if work_seconds > 15 {
+                assert!(
+                    !task.is_finished(),
+                    "{phase}: retain admitted ownership until capacity/input settles"
+                );
+            }
+            release.notify_one();
+            let (host, state, result) = task.await.unwrap();
+            assert_eq!(
+                result.unwrap(),
+                if work_seconds < 15 {
+                    RuntimeActivityOutcome::Incomplete
+                } else if phase == "capacity" {
+                    RuntimeActivityOutcome::ObservationTimedOut
+                } else {
+                    RuntimeActivityOutcome::InputReady
+                },
+                "{phase}"
+            );
+            assert!(owner.has_pending_direct_children(), "{phase}");
+            if work_seconds > 15 {
+                assert!(host.cancelled_agent_ids.is_empty(), "{phase}");
+                assert!(
+                    state.interruption.is_none(),
+                    "{phase}: {:?}",
+                    state.interruption
+                );
+            } else {
+                assert!(
+                    state.interruption.is_some(),
+                    "{phase}: real work cutoff remains authoritative"
+                );
+            }
+            assert_eq!(
+                provider.poll_call_count().await,
+                usize::from(phase != "capacity")
+            );
+            assert_eq!(
+                state.user_intents.user_intent_cursor(),
+                usize::from(phase != "capacity" && work_seconds > 15)
             );
         }
     }
@@ -6877,6 +7090,14 @@ mod tests {
             started.notified().await;
             tokio::time::advance(Duration::from_secs(16)).await;
             tokio::task::yield_now().await;
+            if observe {
+                let (host, state, result) = task.await.unwrap();
+                assert_eq!(result.unwrap(), RuntimeActivityOutcome::ObservationTimedOut);
+                assert!(owner.has_pending_direct_children());
+                assert!(host.executed_messages.is_empty());
+                assert!(state.interruption.is_none());
+                continue;
+            }
             assert!(
                 !task.is_finished(),
                 "soft cutoff must not retire live ownership"
@@ -7039,34 +7260,6 @@ mod tests {
             host.rendered_final_text,
             vec!["2024, from the child's workspace evidence."]
         );
-    }
-
-    #[tokio::test]
-    async fn textless_parent_waits_for_pending_reply_without_consuming_recovery() {
-        let mut state = make_state();
-        state.current_run_id = Some("parent-run".into());
-        state
-            .messaging
-            .reply_obligations
-            .reserve(
-                "parent-run",
-                "question",
-                astra_messaging::AgentAddress::new("child-run", "child-agent"),
-            )
-            .unwrap();
-        let mut host = MockHost::new(vec![text_result("", 10, 0, Some(1))]);
-
-        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .unwrap();
-
-        assert!(matches!(control, TurnExecutionControl::WaitForInput));
-        assert_eq!(
-            state.hooks.completion_settlement.textless_response_retries,
-            0
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(state.messaging.reply_obligations.has_pending("parent-run"));
     }
 
     #[tokio::test]
@@ -7726,6 +7919,86 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn optional_question_notice_cannot_displace_a_later_child_result() {
+        use crate::orchestration::spawner::DirectChildCompletion;
+        let budget = crate::orchestration::agent_tool::MAX_FANOUT_AGGREGATE_BYTES;
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-a",
+        );
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        for index in 0..16 {
+            state
+                .messaging
+                .question_correlations
+                .reserve(
+                    "parent-run",
+                    &format!("question-{index}"),
+                    astra_messaging::AgentAddress::new("run-a", "child-a"),
+                )
+                .unwrap();
+        }
+        let first = "\"".repeat(budget / 4);
+        owner.set_direct_child_for_test(DirectChildCompletion {
+            agent_id: "child-a".into(),
+            run_id: "run-a".into(),
+            parent_agent_id: "parent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: first.clone(),
+                finish_reason: None,
+            },
+            applied_user_intents: vec![],
+        });
+        stage_direct_child_results(&mut host, &mut state).unwrap();
+        let mut first_payload = state.volatile_pending[0].payload.clone();
+        assert!(
+            first_payload
+                .as_object_mut()
+                .unwrap()
+                .remove("unobserved_questions")
+                .is_some()
+        );
+        let mut second_child = DirectChildCompletion {
+            agent_id: "child-b".into(),
+            run_id: "run-b".into(),
+            parent_agent_id: "parent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: String::new(),
+                finish_reason: None,
+            },
+            applied_user_intents: vec![],
+        };
+        let mut empty_second = first_payload.clone();
+        empty_second["children"] = serde_json::json!([second_child.notification(budget)]);
+        let available =
+            budget - first_payload.to_string().len() - empty_second.to_string().len() - 128;
+        let second = "\"".repeat(available / 2);
+        second_child.status = crate::orchestration::AgentStatus::Completed {
+            result: second.clone(),
+            finish_reason: None,
+        };
+        owner.set_direct_child_for_test(second_child);
+        stage_direct_child_results(&mut host, &mut state).unwrap();
+        assert_eq!(state.volatile_pending.len(), 2);
+        for (entry, expected) in state.volatile_pending.iter().zip([first, second]) {
+            assert_eq!(entry.payload["children"][0]["result"], expected);
+            assert_ne!(entry.payload["children"][0]["result_truncated"], true);
+            assert!(entry.payload.get("unobserved_questions").is_none());
+        }
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .map(|entry| entry.payload.to_string().len())
+                .sum::<usize>()
+                <= budget
+        );
     }
 
     #[test]
@@ -11286,6 +11559,13 @@ mod tests {
             .as_ref()
             .expect("direct provider 429 must be represented as an interruption");
         assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(
+            interruption.resume_action,
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None
+            }
+        );
+        assert!(!interruption.user_message.contains("30s"));
         assert_eq!(state.llm_rounds_completed, 1);
         let metrics = state.rate_limit_cooldown.metrics();
         assert_eq!(metrics.total_429_errors, 1);
@@ -13415,6 +13695,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spilled_duplicate_evidence_survives_later_summary_and_resume() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.messages = vec![serde_json::json!({"role":"user","content":"Inspect the long task"})];
+        let bytes = "CONFIRMED_RESOURCE_BYTES".repeat(200);
+        for index in 0..24 {
+            let id = format!("duplicate-{index}");
+            state
+                .messages
+                .push(serde_json::json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                }]}));
+            state
+                .messages
+                .push(serde_json::json!({"role":"tool","tool_call_id":id,"content":bytes}));
+        }
+        assert!(
+            crate::turn::cloud::compaction::compact_duplicate_tool_outputs(&mut state.messages)
+                .estimated_tokens_freed
+                > 0
+        );
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+        assert!(
+            spill_old_messages_to_artifact(&mut host, &mut state)
+                .await
+                .is_some()
+        );
+        let artifact = host.history_artifacts[0].clone();
+        assert_eq!(
+            artifact
+                .transcript_json
+                .matches("CONFIRMED_RESOURCE_BYTES")
+                .count(),
+            200,
+            "the full target is stored once, not once per duplicate"
+        );
+        state.messages.extend([
+            serde_json::json!({"role":"assistant","tool_calls":[{"id":"next","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"next\"}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"next","content":"new observation"}),
+        ]);
+        let client = astra_turn_core::cloud_summary::test_support::MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nInspect\n### Current State\nIn progress",
+        );
+        let summary =
+            astra_turn_core::cloud_summary::generate_compact_summary(&state.messages, &client)
+                .await
+                .unwrap();
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &state.messages,
+            state.messages.len().saturating_sub(2),
+            astra_turn_core::cloud::history_summary::history_summary_message(summary),
+            0,
+            state.max_turn_input_tokens,
+            None,
+            None,
+        )
+        .unwrap();
+        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(candidate.messages).unwrap();
+        assert!(
+            !serde_json::to_string(&restored)
+                .unwrap()
+                .contains("CONFIRMED_RESOURCE_BYTES")
+        );
+        let handle = restored
+            .iter()
+            .filter_map(astra_turn_core::cloud::history_summary::history_summary_text)
+            .flat_map(astra_turn_core::cloud::history_summary::context_history_artifact_handles)
+            .next()
+            .unwrap();
+        let id = handle
+            .strip_prefix(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+            .unwrap();
+        let store = crate::server::explain_analyze_artifact::tests::MemoryStore::default();
+        let session = state.current_session_id.as_deref().unwrap();
+        crate::server::context_history_artifact::persist(&store, "owner", id, artifact)
+            .await
+            .unwrap();
+        let output = crate::server::context_history_artifact::resolve_request(
+            Some(&store),
+            "owner",
+            session,
+            &serde_json::json!({"artifact":handle,"max_bytes":65_536}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.contains(&bytes),
+            "the old target remains readable after it leaves live history"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_human_artifact_spill_preserves_public_evidence_and_rewrite_authority() {
+        for admitted in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 10_000;
+            state.current_run_id = Some("artifact-run".into());
+            state.messages =
+                vec![serde_json::json!({"role":"user","content":"Finish the long task"})];
+            for round in 0..24 {
+                state.messages.extend([
+                    serde_json::json!({"role":"assistant","reasoning_content":"private reasoning",
+                        "tool_calls":[{"id":format!("call-{round}"),"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                    serde_json::json!({"role":"tool","tool_call_id":format!("call-{round}"),
+                        "content":format!("CONFIRMED_RESOURCE_{round}: {}", "evidence ".repeat(200))}),
+                ]);
+            }
+            let original = state.messages.clone();
+            if admitted {
+                state.initialize_canonical_rewrite_proof(
+                    &original,
+                    &astra_turn_types::canonical_conversation_root(&original),
+                    0,
+                );
+            }
+            let result = spill_old_messages_to_artifact(&mut host, &mut state).await;
+            if admitted {
+                assert!(result.is_some());
+                assert_eq!(state.messages[0], original[0]);
+                assert!(state.canonical_rewrite_proof().is_some());
+                let stored = &host.history_artifacts[0].transcript_json;
+                assert!(stored.contains("CONFIRMED_RESOURCE_0:"));
+                assert!(!stored.contains("private reasoning"));
+                assert!(state.messages.iter().any(|message| {
+                    message["content"].as_str().is_some_and(|text| {
+                        text.contains(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+                    })
+                }));
+                astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+            } else {
+                assert!(result.is_none());
+                assert_eq!(state.messages, original);
+                assert!(host.history_artifacts.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn artifact_spill_carries_prior_summary_and_recovery_handles() {
         use astra_turn_core::cloud::history_summary::{
             history_summary_message, history_summary_text,
@@ -13434,6 +13855,11 @@ mod tests {
             }
             state.messages.push(serde_json::json!({"role":"user", "content":format!("current request {generation}")}));
             let before = state.messages.clone();
+            state.initialize_canonical_rewrite_proof(
+                &before,
+                &astra_turn_types::canonical_conversation_root(&before),
+                0,
+            );
             let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
                 .await
                 .unwrap();
@@ -13450,14 +13876,7 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
-        for condition in [
-            "failure",
-            "cancel",
-            "late-cancel",
-            "no-benefit",
-            "reasoning",
-            "success",
-        ] {
+        for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
             let mut host = MockHost::new(Vec::new());
             host.history_artifact_enabled = true;
             host.history_artifact_error = condition == "failure";
@@ -13478,6 +13897,11 @@ mod tests {
                 });
             }
             let original = state.messages.clone();
+            state.initialize_canonical_rewrite_proof(
+                &original,
+                &astra_turn_types::canonical_conversation_root(&original),
+                0,
+            );
             if condition == "cancel" || condition == "late-cancel" {
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
                 if condition == "cancel" {
@@ -13516,6 +13940,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prior_summary_allows_safe_dedup_but_does_not_authorize_rewrites() {
+        for (admitted, duplicates) in [(true, true), (false, true), (true, false)] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 32_000;
+            state.last_measured_prompt_tokens = Some(40_000);
+            state.compact_tier_applied = CompactionTier::CompactHistory;
+            state.messages = vec![serde_json::json!({"role":"user","content":"Continue"})];
+            for index in 0..6 {
+                let id = format!("read-{index}");
+                let content = format!(
+                    "receipt {}: {}",
+                    if duplicates { 0 } else { index },
+                    "evidence ".repeat(1000)
+                );
+                state.messages.extend([
+                    serde_json::json!({"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                    serde_json::json!({"role":"tool","tool_call_id":id,"content":content}),
+                ]);
+            }
+            let before = state.messages.clone();
+            if admitted {
+                super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+            }
+            // Isolate no-gain behavior when the optional durable reader is absent.
+            if !duplicates {
+                host.history_artifact_enabled = false;
+            }
+            handle_token_budget(
+                &mut host,
+                &mut state,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+                &text_result("working", 40_000, 20, None),
+            )
+            .await;
+            assert!(host.history_artifacts.is_empty());
+            if admitted && duplicates {
+                assert!(!state.budget_wrapup_injected);
+                assert!(state.context_compression_triggered);
+                let event = host
+                    .compaction_events
+                    .iter()
+                    .find(|event| event.kind == CompactionKind::ReactiveBudget)
+                    .unwrap();
+                assert!(
+                    event.tokens_before.saturating_sub(event.tokens_freed)
+                        <= state.max_turn_input_tokens,
+                    "dedup savings must actually relieve the admitted artifact path's pressure"
+                );
+                assert!(
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message["content"] == before[2]["content"])
+                );
+                for message in &state.messages {
+                    if let Some(target) =
+                        astra_turn_core::compression_types::duplicate_output_reference(message)
+                    {
+                        let retained = state
+                            .messages
+                            .iter()
+                            .find(|row| row["tool_call_id"] == target)
+                            .unwrap();
+                        assert_eq!(retained["content"], before[2]["content"]);
+                    }
+                }
+            } else {
+                assert_eq!(state.messages, before);
+                assert!(state.budget_wrapup_injected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn reactive_compaction_does_not_arm_wrapup_after_success() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
@@ -13525,16 +14028,14 @@ mod tests {
             .messages
             .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
         for i in 0..16 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("step {i}: {}", "x".repeat(240)),
-            }));
-            state.messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!("follow-up {i}: {}", "y".repeat(220)),
-            }));
+            let id = format!("read-{i}");
+            state.messages.extend([
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
+            ]);
         }
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let control = handle_token_budget(
             &mut host,
             &mut state,
@@ -13585,17 +14086,15 @@ mod tests {
             .messages
             .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
         for i in 0..24 {
-            state.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": format!("step {i}: {}", "x".repeat(240)),
-            }));
-            state.messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!("follow-up {i}: {}", "y".repeat(220)),
-            }));
+            let id = format!("read-{i}");
+            state.messages.extend([
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":id,"content":format!("unique result {i}: {}", "evidence ".repeat(300))}),
+            ]);
         }
 
         state.last_measured_prompt_tokens = Some(90_000);
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let first = handle_token_budget(
             &mut host,
             &mut state,
@@ -13617,7 +14116,7 @@ mod tests {
         for i in 0..12 {
             state.messages.push(serde_json::json!({
                 "role": "assistant",
-                "content": format!("new evidence {i}: {}", "z".repeat(240)),
+                "content": format!("new evidence {i}: {}", "z".repeat(2_000)),
             }));
         }
 
@@ -13644,27 +14143,36 @@ mod tests {
         assert_eq!(state.compaction_effectiveness.attempt_count, 2);
         assert!(state.compaction_effectiveness.cumulative_tokens_freed > first_savings);
 
-        // Without new history, another retry cannot claim progress from gross
-        // removed bytes while replacing them with an equally large boundary.
-        let compacted = state.messages.clone();
-        let savings = state.compaction_effectiveness.cumulative_tokens_freed;
-        let third = handle_token_budget(
-            &mut host,
-            &mut state,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            &text_result("still working", 88_000, 320, Some(20)),
-        )
-        .await;
-        assert!(matches!(third, Some(TurnExecutionControl::ContinueLoop)));
-        assert!(state.budget_wrapup_injected);
-        assert_eq!(state.messages, compacted);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 2);
-        assert_eq!(
-            state.compaction_effectiveness.cumulative_tokens_freed,
-            savings
+        // Repeated recovery can consume the retained completed tail, but every
+        // accepted rewrite must make real progress and converge to no benefit.
+        for _ in 0..6 {
+            let before = state.messages.clone();
+            let savings = state.compaction_effectiveness.cumulative_tokens_freed;
+            let control = handle_token_budget(
+                &mut host,
+                &mut state,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+                &text_result("still working", 88_000, 320, Some(20)),
+            )
+            .await;
+            assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
+            if state.budget_wrapup_injected {
+                assert_eq!(state.messages, before);
+                assert_eq!(
+                    state.compaction_effectiveness.cumulative_tokens_freed,
+                    savings
+                );
+                break;
+            }
+            assert!(state.messages.len() < before.len());
+            assert!(state.compaction_effectiveness.cumulative_tokens_freed > savings);
+        }
+        assert!(
+            state.budget_wrapup_injected,
+            "bounded history recovery must converge"
         );
     }
 
@@ -13685,6 +14193,7 @@ mod tests {
             }));
         }
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let control = handle_token_budget(
             &mut host,
             &mut state,
@@ -17063,31 +17572,44 @@ const SPILL_MIN_KEEP: usize = 6;
 const SPILL_MIN_TOTAL: usize = 10;
 const SPILL_MIN_SPILL: usize = 4;
 
-async fn spill_old_messages_to_artifact(
+pub(super) async fn spill_old_messages_to_artifact(
     host: &mut dyn AgenticLoopHost,
     state: &mut AgenticLoopState,
 ) -> Option<(u64, usize)> {
-    use crate::turn::cloud::compaction::{prepare_prefix_summary, protected_history_spill_count};
+    use crate::turn::cloud::compaction::{
+        adjust_spill_boundary_for_tool_pairs, prepare_conversation_summary,
+    };
     if state.messages.len() < SPILL_MIN_TOTAL || !host.context_history_artifacts_available(state) {
         return None;
     }
     let keep =
         (state.messages.len() * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
-    let count =
-        protected_history_spill_count(&state.messages, state.messages.len().saturating_sub(keep));
+    let count = adjust_spill_boundary_for_tool_pairs(
+        &state.messages,
+        state.messages.len().saturating_sub(keep),
+    );
     if count < SPILL_MIN_SPILL {
         return None;
     }
+    let rewrite_permit = state
+        .begin_canonical_rewrite()
+        .filter(|permit| permit.is_valid())?;
     let session_id = state.current_session_id.as_deref()?;
     let run_id = state.current_run_id.as_deref()?;
-    let transcript: Vec<_> = state.messages[..count]
-        .iter()
-        .map(astra_core::model_wire::responses::without_continuation)
-        .collect();
+    let transcript =
+        crate::turn::llm::model_origin::public_summary_history(&state.messages).ok()?;
+    // Keep the complete public snapshot: typed duplicate references in the
+    // spilled prefix may target a later retained result. That target must stay
+    // recoverable after a subsequent semantic summary replaces the live tail.
+    let message_count = transcript.len();
     let transcript = serde_json::to_string(&transcript).ok()?;
-    let history =
-        astra_turn_types::ContextHistoryArtifactV1::new(session_id, run_id, count, transcript)
-            .ok()?;
+    let history = astra_turn_types::ContextHistoryArtifactV1::new(
+        session_id,
+        run_id,
+        message_count,
+        transcript,
+    )
+    .ok()?;
     let id = uuid::Uuid::new_v4().to_string();
     let handle = format!(
         "{}{id}",
@@ -17100,9 +17622,9 @@ async fn spill_old_messages_to_artifact(
 {summary}
 
 Exact transcript: {handle}
-Use introspect(artifact=\"{handle}\") for earlier details."
+Recover earlier details through the authorized artifact reader in the current tool surface."
     ));
-    let candidate = prepare_prefix_summary(
+    let (candidate, sent_prefix) = prepare_conversation_summary(
         &state.messages,
         count,
         reference,
@@ -17111,6 +17633,7 @@ Use introspect(artifact=\"{handle}\") for earlier details."
         crate::prompts::measured_prompt_tokens_from_manifest(
             state.last_llm_context_manifest_trace.as_ref(),
         ),
+        state.last_request_message_count,
     )?;
     tokio::select! {
         biased;
@@ -17148,6 +17671,8 @@ Use introspect(artifact=\"{handle}\") for earlier details."
     let freed = candidate.tokens_freed();
     let removed = candidate.messages_removed;
     state.messages = candidate.messages;
+    state.last_request_message_count = sent_prefix;
+    state.finish_canonical_rewrite(Some(rewrite_permit));
     Some((freed, removed))
 }
 

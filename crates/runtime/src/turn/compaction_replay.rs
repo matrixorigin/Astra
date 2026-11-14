@@ -218,27 +218,16 @@ pub(crate) fn try_compact_for_retry_tiered(
         now_secs: 0,
     };
 
-    // Tiered escalation: default → aggressive → emergency.
-    let (pipeline, tier) = if retry_count <= 1 {
-        (
-            CompactionEngine::default_pipeline_for(max_tokens),
-            CompactionKind::RetryDefault,
-        )
-    } else if retry_count == 2 {
-        (
-            CompactionEngine::aggressive_pipeline(),
-            CompactionKind::RetryAggressive,
-        )
-    } else {
-        (
-            CompactionEngine::emergency_pipeline(),
-            CompactionKind::RetryEmergency,
-        )
+    // Attempt numbers are diagnostic; every retry uses the same exact
+    // duplicate rule and cannot escalate into dropping unique evidence.
+    let pipeline = CompactionEngine::aggressive_pipeline();
+    let tier = match retry_count {
+        0 | 1 => CompactionKind::RetryDefault,
+        2 => CompactionKind::RetryAggressive,
+        _ => CompactionKind::RetryEmergency,
     };
-    let mut candidate = messages.clone();
-    let outcome = pipeline.compress_if_needed(&mut candidate, &budget);
-
-    if outcome.total_tokens_freed == 0 || candidate == *messages {
+    let outcome = pipeline.compress_if_needed(messages, &budget);
+    if outcome.total_tokens_freed == 0 {
         return None; // Pipeline did nothing
     }
 
@@ -253,7 +242,6 @@ pub(crate) fn try_compact_for_retry_tiered(
         .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
         .collect();
 
-    *messages = candidate;
     Some(CompactionReplayResult {
         tokens_freed: outcome.total_tokens_freed,
         messages_removed,
@@ -296,13 +284,14 @@ pub fn try_compact_for_retry_checked(
     model_context_limit: u64,
     retry_count: u32,
 ) -> CompactionReplayOutcome {
-    for tier in retry_count.max(1)..=MAX_COMPACT_RETRIES {
-        if let Some(result) =
-            try_compact_for_retry_tiered(messages, last_measured_tokens, model_context_limit, tier)
-        {
-            tracker.record_compaction(result.tokens_freed);
-            return CompactionReplayOutcome::Compacted(result);
-        }
+    if let Some(result) = try_compact_for_retry_tiered(
+        messages,
+        last_measured_tokens,
+        model_context_limit,
+        retry_count.max(1),
+    ) {
+        tracker.record_compaction(result.tokens_freed);
+        return CompactionReplayOutcome::Compacted(result);
     }
     tracker.record_futile();
     CompactionReplayOutcome::Futile
@@ -315,17 +304,20 @@ mod tests {
     use serde_json::json;
 
     fn make_messages(n: usize) -> Vec<Value> {
-        let mut msgs = vec![json!({"role": "system", "content": "You are helpful."})];
-        for i in 0..n {
-            let long_content = "x".repeat(2000); // ~500 tokens each
-            msgs.push(json!({"role": "user", "content": format!("Question {i}")}));
-            msgs.push(json!({
-                "role": "assistant",
-                "content": format!("Answer {i}: {long_content}"),
-                "tool_calls": []
-            }));
+        let mut messages = vec![
+            json!({"role":"system","content":"You are helpful."}),
+            json!({"role":"user","content":"Inspect the files"}),
+        ];
+        for index in 0..n {
+            let id = format!("call-{index}");
+            messages.push(json!({"role":"assistant","tool_calls":[{
+                "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+            }]}));
+            messages
+                .push(json!({"role":"tool","tool_call_id":id,"content":"evidence ".repeat(500)}));
         }
-        msgs
+        messages.push(json!({"role":"assistant","content":"done","tool_calls":[]}));
+        messages
     }
 
     #[test]
@@ -373,22 +365,24 @@ mod tests {
         let r = result.unwrap();
         assert!(r.tokens_freed > 0);
         assert!(
-            msgs.len() < original_len || r.messages_removed > 0,
-            "expected fewer messages after compaction"
+            msgs.len() == original_len && r.messages_removed == 0,
+            "duplicate recovery preserves every invocation"
         );
     }
 
     #[test]
-    fn compaction_replay_sanitizes_empty_assistant_tool_calls() {
+    fn compaction_replay_leaves_empty_calls_to_the_wire_owner() {
         let mut msgs = make_messages(8);
         let result = try_compact_for_retry(&mut msgs, Some(200_000), 100_000);
         assert!(result.is_some(), "expected compaction to run");
         let first_assistant = msgs
             .iter()
-            .find(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("assistant message");
+            .find(|msg| msg["content"] == "done")
+            .expect("assistant text message");
         assert!(
-            first_assistant.get("tool_calls").is_none(),
+            first_assistant["tool_calls"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
             "{first_assistant:?}"
         );
     }
@@ -534,16 +528,17 @@ mod tests {
 
         // Model limit 100k, real cost is ~200k+ tokens from tool_calls alone.
         // Fallback (no measured_tokens) MUST detect overflow.
-        let result = try_compact_for_retry(&mut msgs, None, 100_000);
-        assert!(
-            result.is_some(),
-            "fallback estimate ignored tool_calls arguments \
-             and wrongly reported under-budget"
+        assert!(crate::prompts::estimate_tokens(&msgs, 0, 0) > 100_000);
+        let original = msgs.clone();
+        assert!(try_compact_for_retry(&mut msgs, None, 100_000).is_none());
+        assert_eq!(
+            msgs, original,
+            "unique call arguments cannot be deleted after overflow"
         );
     }
 
     #[test]
-    fn cjk_content_triggers_compaction_without_measured_tokens() {
+    fn cjk_overflow_preserves_unique_history_without_summary() {
         // Without measured tokens, fallback estimation must still account for
         // dense non-ASCII content well enough to detect an over-budget request.
         let cjk_content = "你好世界".repeat(2000);
@@ -556,10 +551,9 @@ mod tests {
             json!({"role": "user", "content": "完成"}),
             json!({"role": "assistant", "content": &cjk_content, "tool_calls": []}),
         ];
-        let result = try_compact_for_retry(&mut msgs, None, 15_000);
-        assert!(
-            result.is_some(),
-            "CJK content without measured tokens should trigger compaction"
-        );
+        assert!(crate::prompts::estimate_tokens(&msgs, 0, 0) > 15_000);
+        let original = msgs.clone();
+        assert!(try_compact_for_retry(&mut msgs, None, 15_000).is_none());
+        assert_eq!(msgs, original);
     }
 }

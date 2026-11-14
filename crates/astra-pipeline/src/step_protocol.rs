@@ -600,7 +600,9 @@ pub enum RunExecutionControl {
     V4 {
         completion_settlement: astra_turn_types::CompletionSettlementState,
         hook_obligations: astra_turn_types::StopHookObligations,
-        reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1,
+        // Keep the established V4 wire key; these bounded identities grant no wait authority.
+        #[serde(rename = "reply_obligations")]
+        question_correlations: astra_turn_types::QuestionCorrelationsSnapshotV1,
         budget_wrapup_injected: bool,
         budget_wrapup_ignored_rounds: u32,
     },
@@ -609,7 +611,7 @@ pub enum RunExecutionControl {
 impl RunExecutionControl {
     pub fn validate_budget(&self, budget: &RunExecutionBudget) -> Result<(), &'static str> {
         let Self::V4 {
-            reply_obligations,
+            question_correlations,
             hook_obligations,
             ..
         } = self;
@@ -620,7 +622,7 @@ impl RunExecutionControl {
         } = budget;
         astra_turn_types::validate_completion_check_declarations(&hook_obligations.declarations)
             .map_err(|_| "invalid completion check declarations")?;
-        reply_obligations.validate_owner(run_id, *producer_owner_generation)
+        question_correlations.validate_owner(run_id, *producer_owner_generation)
     }
 }
 
@@ -1503,7 +1505,7 @@ mod tests {
         let snapshot = RunExecutionControl::V4 {
             completion_settlement: astra_turn_types::CompletionSettlementState::default(),
             hook_obligations: astra_turn_types::StopHookObligations::default(),
-            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+            question_correlations: astra_turn_types::QuestionCorrelationsSnapshotV1 {
                 run_id: "control-run".into(),
                 producer_owner_generation: 3,
                 pending: Vec::new(),
@@ -1545,10 +1547,10 @@ mod tests {
         heavy.run_execution_control = Some(RunExecutionControl::V4 {
             completion_settlement: Default::default(),
             hook_obligations: Default::default(),
-            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+            question_correlations: astra_turn_types::QuestionCorrelationsSnapshotV1 {
                 run_id: "questioner".into(),
                 producer_owner_generation: 3,
-                pending: vec![astra_turn_types::PendingReply {
+                pending: vec![astra_turn_types::QuestionCorrelation {
                     request_id: "q1".into(),
                     expected_responder: astra_turn_types::AgentCommunicationParty {
                         run_id: "parent-mailbox".into(),

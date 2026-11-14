@@ -6,6 +6,8 @@
 //! dispatch, and result rendering here so Web/server cannot drift from CLI
 //! behavior.
 
+#[cfg(test)]
+use astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_SUCCESS;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -30,7 +32,7 @@ use astra_tools::agent_tool_contract::{
     has_malformed_tool_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
-    AGENT_RESULT_CLASS_SUCCESS, CHILD_OUTCOME_GUIDANCE, DecodedAgentToolResult,
+    CHILD_OUTCOME_GUIDANCE, DecodedAgentToolResult, agent_tool_normal_result_available,
     agent_tool_result_needs_recovery, agent_tool_structured_result_class, decode_agent_tool_result,
     fanout_slot_status_is_recoverable_issue, render_agent_tool_admission_error,
     render_agent_tool_admission_error_with_kind, render_agent_tool_error,
@@ -396,7 +398,7 @@ pub struct AgentToolContext {
     /// Keeps this parent admission fence alive across projection eviction.
     pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
     /// The current run's question obligations, shared with its receive loop.
-    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    pub question_correlations: Arc<crate::messaging::question_correlations::QuestionCorrelations>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -724,7 +726,7 @@ async fn handle_agent_send_message_action(
         router.as_ref(),
         &ctx.run_id,
         &ctx.agent_id,
-        ctx.reply_obligations.as_ref(),
+        ctx.question_correlations.as_ref(),
     )
     .await
 }
@@ -738,14 +740,14 @@ pub async fn handle_agent_send_message_with_router(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> String {
     handle_agent_send_message_with_router_observed(
         args,
         router,
         run_id,
         agent_id,
-        reply_obligations,
+        question_correlations,
     )
     .await
     .output
@@ -756,7 +758,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
-    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+    question_correlations: &crate::messaging::question_correlations::QuestionCorrelations,
 ) -> AgentToolOutcome {
     let content = match agent_message_content(args) {
         Ok(content) => content,
@@ -823,7 +825,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         message = message.with_correlation(request_id);
     }
     let message_id = message.id.clone();
-    let reply_obligation = if message_type == "question" {
+    let correlation = if message_type == "question" {
         let responder = match &message.to {
             MessageTarget::Direct { address } => address.clone(),
             MessageTarget::Broadcast { .. } | MessageTarget::Parent => {
@@ -833,10 +835,10 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 .into();
             }
         };
-        if let Err(error) = reply_obligations.reserve(run_id, &message_id, responder.clone()) {
+        if let Err(error) = question_correlations.reserve(run_id, &message_id, responder.clone()) {
             return rejected_agent_message(error).into();
         }
-        Some(astra_turn_types::PendingReply {
+        Some(astra_turn_types::QuestionCorrelation {
             request_id: message_id.clone(),
             expected_responder: astra_turn_types::AgentCommunicationParty {
                 run_id: responder.run_id,
@@ -864,7 +866,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 | astra_messaging::types::MailboxError::DeliveryRejected(_)
         );
         if message_type == "question" && definitely_rejected {
-            reply_obligations.reject(run_id, &message_id);
+            question_correlations.reject(run_id, &message_id);
         }
         return (if definitely_rejected {
             rejected_delivery_message(error.to_string())
@@ -879,7 +881,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 "message_id": message_id,
                 "target": target_display,
                 "message_type": message_type,
-                "reply_obligation": reply_obligation,
+                "reply_obligation": correlation,
                 "reason": error.to_string(),
                 "instruction": "Do not resend this message with a new identity; delivery may already have occurred.",
             })
@@ -897,9 +899,13 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         "target": target_display,
         "recipients": recipients,
         "message_type": message_type,
-        "reply_obligation": reply_obligation,
+        "reply_obligation": correlation,
     });
-    if message_type == "answer" {
+    if message_type == "question" {
+        result["instruction"] = json!(
+            "The question is queued asynchronously. Continue independent work, or call agent action wait for bounded observation when the answer is needed. A send does not suspend or prevent completion; transport acceptance does not prove observation, and a response still in transit may not reach a finished run."
+        );
+    } else if message_type == "answer" {
         result["instruction"] = json!(format!(
             "The answer is queued, not applied or completed. {CHILD_OUTCOME_GUIDANCE}"
         ));
@@ -2045,6 +2051,10 @@ async fn render_agent_fanout_results(
         futs.push(Box::pin(async move {
             let rendered = handle_agent_get_result_action_inner(&get_args, Some(ctx), false).await;
             let mut value = parsed_agent_output_or_bounded_error(rendered);
+            // Keep execution evidence before a byte window can contain no text.
+            let normal_result_available = agent_tool_normal_result_available(&value);
+            let needs_recovery = agent_tool_result_needs_recovery(&value);
+            let usable_partial = fanout_result_has_usable_partial(&value);
             let window = window_fanout_agent_result(
                 &mut value,
                 &group_id,
@@ -2063,7 +2073,6 @@ async fn render_agent_fanout_results(
             if let Some(object) = value.as_object_mut() {
                 object.remove("fanout");
             }
-            let needs_recovery = agent_tool_result_needs_recovery(&value);
             let mut item = json!({
                 "slot_index": slot_index,
                 "id": slot_id,
@@ -2097,36 +2106,36 @@ async fn render_agent_fanout_results(
                     object.insert("next_call".into(), json!(next_call));
                 }
             }
-            item
+            (
+                item,
+                normal_result_available,
+                needs_recovery,
+                usable_partial,
+            )
         }));
     }
 
-    // Query all agent results concurrently.
-    let mut concurrent: Vec<Value> = join_all(futs).await;
-    results.append(&mut concurrent);
-    // Restore slot-index order.
-    results.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
-
-    // Derive lifecycle/provenance from the structured results before any
-    // presentation-only byte windowing can replace a large result object with
-    // a string. Truncation must never erase the fact that usable partial
-    // evidence exists.
-    let incomplete_result_count = results
+    let mut incomplete_result_count = results
         .iter()
         .filter(|item| fanout_result_item_has_terminal_incomplete(item))
         .count();
-    let usable_partial_count = results
-        .iter()
-        .filter(|item| fanout_result_item_has_usable_partial(item))
-        .count();
-    let complete_deliverables = results
+    let mut usable_partial_count = results
         .iter()
         .filter(|item| {
             item.get("result")
-                .and_then(agent_tool_structured_result_class)
-                == Some(AGENT_RESULT_CLASS_SUCCESS)
+                .is_some_and(fanout_result_has_usable_partial)
         })
         .count();
+    let mut normal_results_available = 0;
+    // Retain only the bounded view and its original execution facts.
+    for (item, normal, incomplete, partial) in join_all(futs).await {
+        incomplete_result_count += usize::from(incomplete);
+        usable_partial_count += usize::from(partial);
+        normal_results_available += usize::from(normal);
+        results.push(item);
+    }
+    // Restore slot-index order.
+    results.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
 
     // Enforce total aggregate byte budget: if the combined results exceed
     // MAX_FANOUT_AGGREGATE_BYTES, re-truncate per-slot proportionally.
@@ -2203,12 +2212,14 @@ async fn render_agent_fanout_results(
     let summary = updated.summary();
     // An explicit slot read can cover the entire group too. Such a read
     // must not claim full delivery for a partial byte window or slot subset.
-    let all_slots_delivered = complete_deliverables == summary.target_count
+    let all_slots_delivered = normal_results_available == summary.target_count
         && (read_options.slot_index.is_none()
             || results
                 .iter()
                 .all(|item| item.get("result_truncated") == Some(&Value::Bool(false))));
-    let incomplete_slot_count = summary.target_count.saturating_sub(complete_deliverables);
+    let slots_without_normal_result = summary
+        .target_count
+        .saturating_sub(normal_results_available);
     let work_status = if summary.active == 0 && incomplete_result_count > 0 {
         WorkUnitStatus::CompletedWithIssues
     } else {
@@ -2268,12 +2279,12 @@ async fn render_agent_fanout_results(
         "provenance": {
             "source": "fanout_group",
             "target_count": summary.target_count,
-            "complete_deliverables": complete_deliverables,
-            "incomplete_slots": incomplete_slot_count,
+            "normal_results_available": normal_results_available,
+            "slots_without_normal_result": slots_without_normal_result,
             "all_slots_delivered": all_slots_delivered,
             "observed_terminal_incomplete_results": incomplete_result_count,
-            "usable_partial_deliverables": usable_partial_count,
-            "attribution_contract": "Attribute a finding to a child only when that child's returned result contains it. If all_slots_delivered is false, disclose the completion ratio and label any independent parent analysis as parent synthesis rather than fanout consensus.",
+            "usable_partial_results": usable_partial_count,
+            "attribution_contract": "Attribute a finding to a child only when that child's returned result contains it. If all_slots_delivered is false, disclose the result-availability ratio and label any independent parent analysis as parent synthesis rather than fanout consensus.",
         },
         "results": results,
     });
@@ -2308,15 +2319,15 @@ async fn render_agent_fanout_results(
         obj.insert(
             "instruction".into(),
             json!(format!(
-                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables; {} incomplete slots retained usable partial evidence. Attribute partial claims to their originating slots and do not discard a partial solely because its run was interrupted. Continue any unfulfilled part of the original task in this parent run with available tools while budget remains. If the final-answer window has begun, synthesize the retained evidence and clearly report what remains unverified; ask the user only when blocked by genuinely missing authority or required input.",
-                complete_deliverables, summary.target_count, usable_partial_count
+                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Normal results are available from {}/{} slots; {} slots retained usable partial evidence. Read each result to assess whether its assigned work is complete. Attribute partial claims to their originating slots and do not discard a partial solely because its run was interrupted. Continue any unfulfilled part of the original task in this parent run with available tools while budget remains. If the final-answer window has begun, synthesize the retained evidence and clearly report what remains unverified; ask the user only when blocked by genuinely missing authority or required input.",
+                normal_results_available, summary.target_count, usable_partial_count
             )),
         );
     } else if summary.active == 0 && summary.terminal == summary.target_count {
         obj.insert(
             "instruction".into(),
             json!(
-                "Fanout target_count is complete. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Present the collected results; ask the user before starting any additional fanout."
+                "Every fanout slot has terminated. Read the returned results to assess the assigned work, and continue any needed verification directly with permitted tools while the parent work budget remains. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Report the assessed results and any remaining gaps; ask the user before starting any additional fanout."
             ),
         );
     }
@@ -2802,10 +2813,7 @@ fn fanout_result_item_has_terminal_incomplete(item: &Value) -> bool {
             .is_some_and(agent_tool_result_needs_recovery)
 }
 
-fn fanout_result_item_has_usable_partial(item: &Value) -> bool {
-    let Some(result) = item.get("result") else {
-        return false;
-    };
+fn fanout_result_has_usable_partial(result: &Value) -> bool {
     matches!(
         decode_agent_tool_result(result),
         Some(DecodedAgentToolResult::ChildResult(_))
@@ -3759,7 +3767,6 @@ fn attach_fanout_to_agent_result(
             "active": summary.active,
             "terminal": summary.terminal,
             "completed": summary.completed,
-            "all_slots_delivered": summary.completed == summary.target_count,
             "interrupted": summary.interrupted,
             "failed": summary.failed,
             "cancelled_by_user": summary.cancelled_by_user,
@@ -3860,7 +3867,7 @@ pub(crate) mod tests {
                 MessagePayload::Request { .. }
             ));
         }
-        assert!(obligations.has_pending("parent-run"));
+        assert!(!obligations.pending("parent-run").is_empty());
     }
 
     #[tokio::test]
@@ -3884,7 +3891,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let obligations = crate::messaging::reply_obligations::ReplyObligations::default();
+        let obligations = crate::messaging::question_correlations::QuestionCorrelations::default();
 
         for message_type in ["question", "shutdown_request"] {
             let outcome = handle_agent_send_message_with_router_observed(
@@ -3899,7 +3906,7 @@ pub(crate) mod tests {
             assert_eq!(receipt["status"], "rejected", "{receipt}");
             assert_eq!(receipt["executed"], false, "{receipt}");
             assert!(outcome.accepted_send.is_none());
-            assert!(!obligations.has_pending("parent-run"));
+            assert!(obligations.pending("parent-run").is_empty());
             assert!(receiver.try_recv().is_none());
         }
         let outcome = handle_agent_send_message_with_router_observed(
@@ -3937,9 +3944,7 @@ pub(crate) mod tests {
             "wait_request":{"parent_run_id":"p", "tool_call_id":"c", "timeout_ms":1},
             "result":"not child evidence"
         });
-        assert!(!fanout_result_item_has_usable_partial(
-            &json!({"result": control})
-        ));
+        assert!(!fanout_result_has_usable_partial(&control));
         let child: Value = serde_json::from_str(&render_wait_for_agent_status(
             "a",
             &AgentStatus::Interrupted {
@@ -3948,9 +3953,7 @@ pub(crate) mod tests {
             },
         ))
         .unwrap();
-        assert!(fanout_result_item_has_usable_partial(
-            &json!({"result": child})
-        ));
+        assert!(fanout_result_has_usable_partial(&child));
     }
 
     #[tokio::test]
@@ -5006,7 +5009,7 @@ pub(crate) mod tests {
         AgentToolContext {
             parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             parent_model_reasoning: None,
             run_id: "run-parent".into(),
@@ -5927,7 +5930,7 @@ pub(crate) mod tests {
         assert!(
             value["instruction"]
                 .as_str()
-                .is_some_and(|text| text.contains("target_count is complete")
+                .is_some_and(|text| text.contains("Every fanout slot has terminated")
                     && text.contains("Do not call agent(action='spawn')")),
             "{value}"
         );
@@ -7571,6 +7574,71 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_normal_exit_exposes_result_availability_without_certifying_work() {
+        let output = "Review is incomplete; the remaining lead is unverified.".to_string();
+        let spawner = test_spawner(Arc::new(FixedOutputExecutor {
+            output: output.clone(),
+        }));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start: Value = serde_json::from_str(
+            &handle_agent_fanout_tool(
+                &json!({
+                    "action":"start", "group_id":"incomplete-review", "target_count":1,
+                    "slots":[{"id":"review", "description":"Review", "prompt":"Review"}]
+                }),
+                Some(&ctx),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(start["status"], "started");
+        let value: Value = serde_json::from_str(
+            &handle_agent_fanout_tool(
+                &json!({
+                    "action":"get_results", "group_id":"incomplete-review"
+                }),
+                Some(&ctx),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(value["results"][0]["result"]["status"], "completed");
+        assert_eq!(value["results"][0]["result"]["result"], output);
+        assert_eq!(value["provenance"]["normal_results_available"], 1);
+        assert!(value["provenance"].get("complete_deliverables").is_none());
+        assert!(
+            !value["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("produced complete deliverables")
+        );
+        assert!(
+            value["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("assess the assigned work")
+        );
+        let final_page: Value = serde_json::from_str(
+            &handle_agent_fanout_tool(
+                &json!({
+                    "action":"get_results", "group_id":"incomplete-review", "slot_index":0,
+                    "offset":10000, "max_bytes":1024
+                }),
+                Some(&ctx),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(final_page["results"][0]["result"]["result"], "");
+        assert_eq!(final_page["provenance"]["normal_results_available"], 1);
+        assert_eq!(
+            final_page["provenance"]["observed_terminal_incomplete_results"],
+            0
+        );
+        assert_eq!(final_page["provenance"]["all_slots_delivered"], false);
+    }
+
+    #[tokio::test]
     async fn agent_fanout_get_results_reads_requested_slot_window() {
         let output = format!("{}{}", "A".repeat(9000), "B".repeat(9000));
         let spawner = test_spawner(Arc::new(FixedOutputExecutor { output }));
@@ -8623,12 +8691,12 @@ pub(crate) mod tests {
             "budget_exhausted"
         );
         assert_eq!(collected_value["incomplete_results"], 1);
-        assert_eq!(collected_value["provenance"]["complete_deliverables"], 0);
-        assert_eq!(collected_value["provenance"]["incomplete_slots"], 1);
+        assert_eq!(collected_value["provenance"]["normal_results_available"], 0);
         assert_eq!(
-            collected_value["provenance"]["usable_partial_deliverables"],
+            collected_value["provenance"]["slots_without_normal_result"],
             1
         );
+        assert_eq!(collected_value["provenance"]["usable_partial_results"], 1);
         assert_eq!(collected_value["usable_partial_results"], 1);
         assert_eq!(collected_value["provenance"]["all_slots_delivered"], false);
         assert!(
@@ -8679,10 +8747,7 @@ pub(crate) mod tests {
             ),
             Some("fanout_incomplete")
         );
-        assert_eq!(
-            collected_value["provenance"]["usable_partial_deliverables"],
-            8
-        );
+        assert_eq!(collected_value["provenance"]["usable_partial_results"], 8);
         assert!(
             collected_value["results"]
                 .as_array()
@@ -8776,7 +8841,7 @@ pub(crate) mod tests {
         let value = collect_fanout_start(&result, &ctx).await;
 
         assert_eq!(value["status"], "completed_with_issues");
-        assert_eq!(value["provenance"]["complete_deliverables"], 0);
+        assert_eq!(value["provenance"]["normal_results_available"], 0);
         assert_eq!(value["provenance"]["all_slots_delivered"], false);
         assert_eq!(value["incomplete_results"], 1);
         assert!(
@@ -8881,7 +8946,7 @@ pub(crate) mod tests {
         assert_eq!(value["fanout"]["slot_index"], 1);
         assert_eq!(value["fanout"]["id"], "storage");
         assert_eq!(value["fanout"]["completed"], 1);
-        assert_eq!(value["fanout"]["all_slots_delivered"], false);
+        assert!(value["fanout"].get("all_slots_delivered").is_none());
         assert_eq!(value["fanout"]["collected"], 1);
     }
 
