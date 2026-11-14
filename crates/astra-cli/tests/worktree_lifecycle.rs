@@ -143,6 +143,17 @@ async fn worktree_lifecycle(temp: &Path) {
         );
     }
 
+    // Explicit discard does not need status inspection, which may itself be
+    // unavailable even though Git can remove this worktree.
+    let checkout = add_worktree(&repo, temp, "discard-with-broken-status");
+    let executor = enter(&repo, "discard-with-broken-status").await;
+    git(&repo, &["config", "status.showUntrackedFiles", "invalid"]);
+    let refused = remove(&executor, false).await;
+    assert!(refused.is_error && checkout.exists(), "{refused:?}");
+    let removed = remove(&executor, true).await;
+    assert!(!removed.is_error && !checkout.exists(), "{removed:?}");
+    git(&repo, &["config", "--unset", "status.showUntrackedFiles"]);
+
     let subrepo = temp.join("subrepo");
     init_repo(&subrepo);
     std::fs::write(subrepo.join(".gitignore"), "ignored.txt\n").unwrap();

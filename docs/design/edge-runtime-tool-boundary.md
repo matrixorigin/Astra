@@ -558,6 +558,8 @@ still active, and removal without `discard_changes` also preserves ignored files
 Without `discard_changes`, removal uses Git's non-forced operation and refuses
 when the index marks tracked paths as assume-unchanged or skip-worktree, because
 their local contents cannot be verified by `git status`.
+With explicit discard, removal still requires settled process ownership but does
+not depend on enumerating worktree contents.
 Background work uses the existing invocation owner. An executor that cannot
 prove descendant settlement rejects managed background work before starting it;
 this currently includes macOS. If a started process cannot be settled, the
@@ -605,8 +607,9 @@ to restore the original workspace, then check for processes before removing the
 checkout with Git. A genuinely unsettled owner keeps the affected workspace
 fenced; after checking that its work stopped, the user can confirm and retry in
 the TUI or use `astra workspace confirm-stopped` from that workspace. A human
-confirmation is an explicit recovery decision, not proof that unrelated
-external processes stopped.
+confirmation lets later processes observe the same incident as resolved through
+equivalent path spellings without clearing later incidents. It is an explicit
+recovery decision, not proof that unrelated external processes stopped.
 
 Before a local tool chain starts, the shared permission engine evaluates each
 step using its resolved input. Steps requiring individual approval or depending

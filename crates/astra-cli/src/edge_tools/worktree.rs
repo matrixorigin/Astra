@@ -223,7 +223,7 @@ fn count_worktree_changes(
     original_head: Option<&str>,
     branch: &str,
 ) -> Result<(usize, usize), WorktreeError> {
-    // Count uncommitted files
+    // A directory entry is enough to establish that untracked work exists.
     let status = astra_tools::git_gix::inspect_bound_git_worktree(
         worktree_path,
         &[
@@ -234,7 +234,7 @@ fn count_worktree_changes(
             "status",
             "--porcelain",
             "--ignored=matching",
-            "--untracked-files=all",
+            "--untracked-files=normal",
             "--ignore-submodules=none",
         ],
     )?;
@@ -773,9 +773,10 @@ impl ToolExecutor {
             return Err("A previous command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
         }
 
-        // Keeping the checkout needs no Git inspection and remains available
-        // even if Git is unavailable or the workspace is being repaired.
-        let (changed_files, commits) = if action == "remove" {
+        // Only an unconfirmed removal needs to inspect local work. Explicit
+        // discard must also work when the checkout is too large or damaged to
+        // inspect, provided its process ownership is settled.
+        if action == "remove" && !discard_changes {
             let (changed_files, commits) = count_worktree_changes(
                 &session.worktree_path,
                 session.original_head_commit.as_deref(),
@@ -784,28 +785,22 @@ impl ToolExecutor {
             if !workspace_safe_for_cleanup(&session.worktree_path) {
                 return Err("A command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
             }
-            (changed_files, commits)
-        } else {
-            (0, 0)
-        };
-
-        if action == "remove" && (changed_files > 0 || commits > 0) && !discard_changes {
-            let mut parts = Vec::new();
-            if changed_files > 0 {
-                parts.push(format!("{} uncommitted file(s)", changed_files));
+            if changed_files > 0 || commits > 0 {
+                let mut parts = Vec::new();
+                if changed_files > 0 {
+                    parts.push(format!("{} uncommitted path(s)", changed_files));
+                }
+                if commits > 0 {
+                    parts.push(format!(
+                        "{} changed commit(s) in {}",
+                        commits, session.branch_name
+                    ));
+                }
+                return Err((format!(
+                    "Worktree has {}. Set discard_changes=true to confirm removal, or use action='keep' to preserve.",
+                    parts.join(" and ")
+                )).into());
             }
-            if commits > 0 {
-                parts.push(format!(
-                    "{} changed commit(s) in {}",
-                    commits, session.branch_name
-                ));
-            }
-            return Err((format!(
-                "Worktree has {}. Set discard_changes=true to confirm removal, or use action='keep' to preserve.",
-                parts.join(" and ")
-            )).into());
-        }
-        if action == "remove" && !discard_changes {
             ensure_worktree_index_is_visible(&session.worktree_path)?;
             if !workspace_safe_for_cleanup(&session.worktree_path) {
                 return Err("A command may still be running; the worktree was kept. Choose keep to return to the original workspace.".into());
@@ -1007,11 +1002,15 @@ mod tests {
             git(&["update-index", clear, "tracked.txt"]);
         }
         git(&["config", "status.showUntrackedFiles", "no"]);
-        std::fs::write(repo.path().join("untracked.txt"), "local work\n").unwrap();
+        let untracked = repo.path().join("untracked");
+        std::fs::create_dir(&untracked).unwrap();
+        for index in 0..100 {
+            std::fs::write(untracked.join(index.to_string()), "local work\n").unwrap();
+        }
         let (files, _) = count_worktree_changes(repo.path(), None, "unused").unwrap();
         assert_eq!(
             files, 1,
-            "repository configuration must not hide untracked work"
+            "untracked directories must stay visible without expanding each file"
         );
     }
 }

@@ -238,9 +238,27 @@ fn ownership_unsettled_marker_exists(key: &Path) -> bool {
                 return true;
             };
             let mut cleared = false;
+            let digest = coordination_key_digest(key);
             for entry in entries {
                 match entry {
                     Ok(entry) if entry.file_name() == ".cleared" => cleared = true,
+                    Ok(entry) if cleared_alias_incident(&entry, &digest) => {
+                        // Keep an empty alias marker distinguishable from a
+                        // partially created fence after pruning its last entry.
+                        let completion = entry.path().with_file_name(".cleared");
+                        let marked = match fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(completion)
+                        {
+                            Ok(_) => true,
+                            Err(error) => error.kind() == std::io::ErrorKind::AlreadyExists,
+                        };
+                        if marked {
+                            let _ = fs::remove_file(entry.path());
+                        }
+                        cleared = true;
+                    }
                     _ => return true,
                 }
             }
@@ -248,6 +266,41 @@ fn ownership_unsettled_marker_exists(key: &Path) -> bool {
         }
         _ => true,
     }
+}
+
+/// An alias refers to the same incident in the canonical workspace marker.
+/// Only a confirmed canonical incident can make that reference inactive.
+fn cleared_alias_incident(entry: &fs::DirEntry, own_digest: &str) -> bool {
+    if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        return false;
+    }
+    let filename = entry.file_name();
+    let Some(filename) = filename.to_str() else {
+        return false;
+    };
+    let Some((canonical_digest, id)) = filename.split_once('_') else {
+        return false;
+    };
+    if canonical_digest.len() != 64
+        || !canonical_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || canonical_digest == own_digest
+        || uuid::Uuid::parse_str(id).is_err()
+    {
+        return false;
+    }
+    let Some(root) = stable_coordination_root() else {
+        return false;
+    };
+    let canonical = root.join(format!(
+        ".astra-workspace-{canonical_digest}-observation.unsettled"
+    ));
+    if !fs::symlink_metadata(&canonical).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    matches!(fs::symlink_metadata(canonical.join(filename)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && fs::symlink_metadata(canonical.join(".cleared")).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: &[PathBuf]) {
@@ -267,42 +320,49 @@ fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: 
 /// Each unsettled owner publishes its own incident so that an older
 /// confirmation cannot erase a later one from another process.
 fn persist_ownership_unsettled_markers(keys: &[PathBuf]) -> bool {
-    let mut all_persisted = true;
-    for key in keys {
-        let Some(path) = ownership_unsettled_marker_path(key) else {
-            all_persisted = false;
-            continue;
-        };
-        let incident = uuid::Uuid::new_v4().to_string();
-        if !path.exists() {
-            // Publish an already writable directory containing its first
-            // incident. Other UIDs must never observe a half-created fence.
-            let stage = path.with_extension(format!("init-{}", uuid::Uuid::new_v4()));
-            let initialized = (|| -> std::io::Result<()> {
-                fs::create_dir(&stage)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&stage, fs::Permissions::from_mode(0o1777))?;
-                }
-                create_unsettled_incident(&stage, &incident)?;
-                fs::rename(&stage, &path)
-            })();
-            if initialized.is_ok() {
-                continue;
+    let Some(canonical) = keys.first() else {
+        return false;
+    };
+    // The same incident is published for every spelling. Alias markers can
+    // then follow the canonical incident across processes and confirmations.
+    let id = uuid::Uuid::new_v4().to_string();
+    let incident = format!("{}_{id}", coordination_key_digest(canonical));
+    let canonical_persisted = persist_ownership_marker(canonical, &incident);
+    // If the canonical marker failed, an alias must remain independently
+    // fenced instead of referring to an incident that was never published.
+    let alias_incident = if canonical_persisted { &incident } else { &id };
+    // Try every alias even if an earlier write failed.
+    keys.iter().skip(1).fold(canonical_persisted, |all, key| {
+        persist_ownership_marker(key, alias_incident) && all
+    })
+}
+
+fn persist_ownership_marker(key: &Path, incident: &str) -> bool {
+    let Some(path) = ownership_unsettled_marker_path(key) else {
+        return false;
+    };
+    if !path.exists() {
+        // Publish an already writable directory containing its first
+        // incident. Other UIDs must never observe a half-created fence.
+        let stage = path.with_extension(format!("init-{}", uuid::Uuid::new_v4()));
+        let initialized = (|| -> std::io::Result<()> {
+            fs::create_dir(&stage)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&stage, fs::Permissions::from_mode(0o1777))?;
             }
-            let _ = fs::remove_file(stage.join(&incident));
-            let _ = fs::remove_dir(&stage);
+            create_unsettled_incident(&stage, incident)?;
+            fs::rename(&stage, &path)
+        })();
+        if initialized.is_ok() {
+            return true;
         }
-        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-            all_persisted = false;
-            continue;
-        }
-        if create_unsettled_incident(&path, &incident).is_err() {
-            all_persisted = false;
-        }
+        let _ = fs::remove_file(stage.join(incident));
+        let _ = fs::remove_dir(stage);
     }
-    all_persisted
+    fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        && create_unsettled_incident(&path, incident).is_ok()
 }
 
 fn create_unsettled_incident(directory: &Path, incident: &str) -> std::io::Result<()> {
@@ -377,25 +437,10 @@ impl WorkspaceAttributionState {
         {
             aliases.push(key);
         }
-        let state = writer_epoch_state(root)?;
-        // Recovery can be requested through a different spelling of the same
-        // directory; clear every still-bound alias recorded for this incident.
-        if state
-            .ownership_unsettled
-            .load(std::sync::atomic::Ordering::Acquire)
-            && let Some(quarantined) = QUARANTINED_WRITER_STATES.get()
-        {
-            let quarantined = recover_mutex(quarantined);
-            for (alias, candidate) in quarantined.iter() {
-                if Arc::ptr_eq(candidate, &state)
-                    && alias.canonicalize().ok().as_ref() == Some(&aliases[0])
-                    && !aliases.contains(alias)
-                {
-                    aliases.push(alias.clone());
-                }
-            }
-        }
-        Some(Self { state, aliases })
+        Some(Self {
+            state: writer_epoch_state(root)?,
+            aliases,
+        })
     }
     pub fn quarantine(&self) {
         quarantine_observation_state(&self.state, self.aliases.clone(), false);
@@ -5725,6 +5770,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert_eq!(workspace_ownership_is_unsettled(root), Some(false));
     }
 
     #[cfg(unix)]
@@ -5949,6 +5995,130 @@ mod tests {
         confirm_workspace_stopped(&root).await.unwrap();
         assert_eq!(workspace_ownership_is_unsettled(&root), Some(false));
         assert_eq!(workspace_ownership_is_unsettled(&alias), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmation_clears_alias_from_a_different_process() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let alias = parent.path().join("alias");
+        symlink(&root, &alias).unwrap();
+        let child = |test: &str, env: &str| {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &format!("workspace_observation::tests::{test}")])
+                    .env(env, &alias)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let mark_in_child = || {
+            child(
+                "add_unsettled_fence_in_child",
+                "ASTRA_TEST_ADD_UNSETTLED_ROOT",
+            )
+        };
+        let check_in_child = || {
+            child(
+                "confirmed_workspace_recovery_child",
+                "ASTRA_TEST_CONFIRMED_WORKSPACE_ROOT",
+            )
+        };
+        mark_in_child();
+        confirm_workspace_stopped(&root).await.unwrap();
+        check_in_child();
+
+        mark_in_child();
+        let old_confirmation = begin_workspace_recovery(&root).await.unwrap();
+        mark_in_child();
+        assert!(old_confirmation.confirm().await.is_err());
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
+        confirm_workspace_stopped(&root).await.unwrap();
+        check_in_child();
+
+        // A reused alias can carry incidents for two different workspaces.
+        // Confirming the old one must not clear the new one's incident.
+        mark_in_child();
+        let replacement = parent.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        let replacement = replacement.canonicalize().unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
+        mark_in_child();
+        confirm_workspace_stopped(&root).await.unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
+        confirm_workspace_stopped(&replacement).await.unwrap();
+        check_in_child();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_stays_fenced_if_canonical_marker_cannot_be_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical");
+        let alias = temp.path().join("alias");
+        let canonical_marker = ownership_unsettled_marker_path(&canonical).unwrap();
+        let alias_marker = ownership_unsettled_marker_path(&alias).unwrap();
+        fs::write(&canonical_marker, "not a directory").unwrap();
+        assert!(!persist_ownership_unsettled_markers(&[
+            canonical,
+            alias.clone()
+        ]));
+        assert!(ownership_unsettled_marker_exists(&alias));
+        fs::remove_file(canonical_marker).unwrap();
+        fs::remove_dir_all(alias_marker).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_stays_fenced_if_canonical_marker_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical");
+        let alias = temp.path().join("alias");
+        let canonical_marker = ownership_unsettled_marker_path(&canonical).unwrap();
+        let alias_marker = ownership_unsettled_marker_path(&alias).unwrap();
+        assert!(persist_ownership_unsettled_markers(&[
+            canonical,
+            alias.clone()
+        ]));
+        fs::remove_dir_all(canonical_marker).unwrap();
+        assert!(ownership_unsettled_marker_exists(&alias));
+        fs::remove_dir_all(alias_marker).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_alias_incident_stays_fenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical");
+        let alias = temp.path().join("alias");
+        let canonical_marker = ownership_unsettled_marker_path(&canonical).unwrap();
+        let alias_marker = ownership_unsettled_marker_path(&alias).unwrap();
+        assert!(persist_ownership_unsettled_markers(&[
+            canonical,
+            alias.clone()
+        ]));
+        let incident = fs::read_dir(&alias_marker)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let name = incident.file_name().unwrap();
+        fs::remove_file(canonical_marker.join(name)).unwrap();
+        fs::write(canonical_marker.join(".cleared"), "").unwrap();
+        fs::remove_file(&incident).unwrap();
+        fs::create_dir(&incident).unwrap();
+        assert!(ownership_unsettled_marker_exists(&alias));
+        fs::remove_dir_all(canonical_marker).unwrap();
+        fs::remove_dir_all(alias_marker).unwrap();
     }
 
     #[cfg(unix)]
