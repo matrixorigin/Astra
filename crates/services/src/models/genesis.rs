@@ -150,34 +150,7 @@ impl DatabaseModelService {
         subject: &str,
     ) -> Result<GenesisCatalog, (StatusCode, Json<ErrorResponse>)> {
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
-        let mut url = crate::auth::uc::validate_uc_url(&provider.settings.adapter_url)
-            .map_err(|_| unavailable())?;
-        url.path_segments_mut().map_err(|_| unavailable())?.extend([
-            "api",
-            "v1",
-            "uc",
-            "internal",
-            "accounts",
-            subject,
-            "aistudio-pat",
-        ]);
-        #[derive(Deserialize)]
-        struct RuntimePAT {
-            api_key: String,
-        }
-        let response = provider
-            .client
-            .get(url)
-            .bearer_auth(provider.service_bearer().await?)
-            .send()
-            .await
-            .map_err(|error| transport_failure("runtime_pat", error))?;
-        let pat: RuntimePAT = UcNativeProvider::json(response)
-            .await
-            .map_err(|_| unavailable())?;
-        if pat.api_key.is_empty() {
-            return Err(unavailable());
-        }
+        let pat = self.runtime_pat(subject).await?;
         // MOI owns product selection; Genesis owns account eligibility. The
         // runtime PAT remains server-side and uses MOI's existing PAT transport.
         // No workspace is needed to read this account-level product policy.
@@ -192,7 +165,7 @@ impl DatabaseModelService {
                 "{}/aistudio/model-policy",
                 provider.settings.moi_api_url
             ))
-            .header("X-API-Key", &pat.api_key)
+            .header("X-API-Key", &pat)
             .send()
             .await
             .map_err(|error| transport_failure("product_policy", error))?;
@@ -221,7 +194,7 @@ impl DatabaseModelService {
                     "{}/api/v1/taas/llm/model-offerings",
                     provider.settings.genesis_url
                 ))
-                .bearer_auth(&pat.api_key)
+                .bearer_auth(&pat)
                 // Override the UC client's 10s default. The outer deadline is
                 // authoritative, including preparation and all prior pages;
                 // this does NOT reserve another 20s for each page.
@@ -289,7 +262,7 @@ impl DatabaseModelService {
                 return Ok(GenesisCatalog {
                     items,
                     default_offering_id,
-                    api_key: pat.api_key,
+                    api_key: pat,
                 });
             }
             if !seen.insert(page.next_page_token.clone()) {
@@ -298,6 +271,42 @@ impl DatabaseModelService {
             cursor = page.next_page_token;
         }
         Err(unavailable())
+    }
+
+    pub(super) async fn runtime_pat(
+        &self,
+        subject: &str,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
+        let mut url = crate::auth::uc::validate_uc_url(&provider.settings.adapter_url)
+            .map_err(|_| unavailable())?;
+        url.path_segments_mut().map_err(|_| unavailable())?.extend([
+            "api",
+            "v1",
+            "uc",
+            "internal",
+            "accounts",
+            subject,
+            "aistudio-pat",
+        ]);
+        #[derive(Deserialize)]
+        struct RuntimePAT {
+            api_key: String,
+        }
+        let response = provider
+            .client
+            .get(url)
+            .bearer_auth(provider.service_bearer().await?)
+            .send()
+            .await
+            .map_err(|error| transport_failure("runtime_pat", error))?;
+        let pat: RuntimePAT = UcNativeProvider::json(response)
+            .await
+            .map_err(|_| unavailable())?;
+        if pat.api_key.is_empty() {
+            return Err(unavailable());
+        }
+        Ok(pat.api_key)
     }
 
     pub(super) async fn admit_genesis(
@@ -325,6 +334,7 @@ impl DatabaseModelService {
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,

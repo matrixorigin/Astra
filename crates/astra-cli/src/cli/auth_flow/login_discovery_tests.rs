@@ -76,6 +76,18 @@ fn uc() -> serde_json::Value {
 async fn login_discovery_routes_uc_memoria_password_and_legacy_profiles() {
     let _home = crate::test_utils::HomeGuard::temp();
     let _native_directory = crate::test_utils::ProcessEnvGuard::remove("MOI_AUTH_DIR");
+    let _credentials = crate::tests::isolate_credentials();
+    credential_store()
+        .mutate(|file| {
+            file.profiles.insert(
+                "self-hosted".into(),
+                Profile {
+                    account_id: Some("synthetic-standalone-account".into()),
+                    ..Profile::default()
+                },
+            );
+        })
+        .unwrap();
     let memoria = json!({"issuer":"https://memory.example.test", "authorization_url":"https://memory.example.test"});
     for (status, body, profile, expected) in [
         (
@@ -136,6 +148,26 @@ async fn login_discovery_routes_uc_memoria_password_and_legacy_profiles() {
         };
         assert_eq!(expected, actual, "status={status}, profile={profile:?}");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unbound_profile_cannot_implicitly_choose_password_on_a_moi_deployment() {
+    let _credentials = crate::tests::isolate_credentials();
+    let server = MockServer::start().await;
+    Mock::given(path("/auth/methods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"uc":uc(), "password":true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+    let error = discover_login_method(&api, Some("qa-gpt"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("omit --profile"));
+    assert!(error.contains("--username"));
+    assert!(credential_store().load().unwrap().profiles.is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -169,6 +169,55 @@ subscription does not imply every model or effort is available.
 See [Server configuration](configuration.md#chatgpt-subscription-connections)
 for deployment and rollback requirements.
 
+## Device ChatGPT with MOI
+
+On Linux/macOS, a native MOI login can use a personal ChatGPT connection from
+the user's computer. MOI/UC login remains the platform login; ChatGPT is a
+separate model source. The workspace must be explicitly enabled by its operator.
+The remote-Server/local-executor provider topology still needs production
+eligibility confirmation; local mock tests are not real-account acceptance.
+
+1. Install matching Astra and astra-edge binaries, then run `astra login` and
+   select a MOI workspace using the existing native login flow.
+2. Start `astra`, open `/model`, and choose **Continue with ChatGPT · this
+   device**. Complete authorization in the browser on this computer.
+3. Select a model from the actual provider inventory and supply its context
+   and maximum output limits. The device probes and saves that configuration,
+   starts the shared inference host, and selects the admitted Offering.
+4. Keep an Astra terminal attached while using the source. No manual Edge
+   terminal or Server VPN is needed for this source. Chat requests and results
+   still pass through Astra Server; OpenAI credential/network operations run
+   on the device using its proxy/CA policy.
+
+Native noninteractive connection commands use the same device owner:
+
+```bash
+astra model connect chatgpt
+astra model connect chatgpt --connection <local-connection-id>
+astra model connections
+astra model disconnect <local-connection-id>
+```
+
+`--retry` authorization IDs belong to the existing Server source and cannot
+be reused by a device connection. In this first version create/enable the
+device model from `/model`; native `model add` does not upload it to Server.
+An explicit standalone profile keeps the existing Server personal-model path.
+An unbound `--profile` label does not silently choose a local account. For MOI,
+omit `--profile` and use `astra login`; to initialize a standalone profile,
+explicitly use `login --username <user>`, `register`, or Memoria `login --manual`.
+Existing profiles with recorded identity keep their original account system;
+no credentials are converted or merged.
+
+Use `/login` for MOI authentication, and `/model` for ChatGPT authorization or
+device model reactivation. Re-login/workspace changes require an explicit
+device model choice. Ordinary terminal exit detaches its lease; platform logout
+does not disconnect ChatGPT, and disconnecting ChatGPT does not log out MOI.
+Revocation uncertainty is reported separately from successful local disconnect.
+Private local credential files rely on OS user permissions, not file encryption.
+
+See the [device source contract](../design/model-access-and-inference.md#native-moi-device-chatgpt-implementation)
+for supported purposes, durability, and the fresh-schema deployment boundary.
+
 ## Installation
 
 For day-to-day development builds:

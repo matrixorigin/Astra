@@ -1449,6 +1449,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        device_binding: None,
                         inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                         response_scope: Some(&scope),
                         subscription: None,

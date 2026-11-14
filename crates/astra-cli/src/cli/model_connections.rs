@@ -180,40 +180,7 @@ pub(crate) async fn connect_with_progress(
             .await;
         return Err(error);
     }
-    let (sender, receiver) = oneshot::channel();
-    let router = Router::new()
-        .route("/auth/callback", get(callback))
-        .with_state(Callback {
-            state,
-            sender: Arc::new(Mutex::new(Some(sender))),
-        });
-    let stop = CancellationToken::new();
-    let stop_server = stop.clone();
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(stop_server.cancelled_owned())
-            .await
-    });
-    if crate::cli::auth_flow::browser_launcher::launch_login_url(url.to_owned())
-        .await
-        .is_err()
-    {
-        let _ = progress(ConnectProgress::BrowserLaunchFailed);
-    }
-    let result = tokio::select! {
-        result=receiver=>result.map_err(|_| "Authorization callback closed".to_owned()),
-        _=tokio::time::sleep(Duration::from_secs(900))=>Err("ChatGPT authorization timed out".into()),
-        _=tokio::signal::ctrl_c()=>Err("ChatGPT authorization cancelled".into()),
-        _=cancel.cancelled()=>Err("ChatGPT authorization cancelled".into()),
-    };
-    stop.cancel();
-    if tokio::time::timeout(Duration::from_secs(2), &mut server)
-        .await
-        .is_err()
-    {
-        server.abort();
-        let _ = server.await;
-    }
+    let result = wait_for_browser_callback(listener, state, url, cancel, &mut progress).await;
     let complete = match result {
         Ok(value) => value,
         Err(error) => {
@@ -240,6 +207,50 @@ pub(crate) async fn connect_with_progress(
         .await
         .map_err(|failure| format!("{}; inspect `astra model connections`. For a failed code exchange retry with `astra model connect chatgpt --retry {id}`",map_thin_err(failure)))?;
     serde_json::from_str(&body).map_err(|_| "Invalid model connection response".into())
+}
+
+pub(crate) async fn wait_for_browser_callback(
+    listener: tokio::net::TcpListener,
+    state: String,
+    url: &str,
+    cancel: CancellationToken,
+    progress: &mut impl FnMut(ConnectProgress) -> Result<(), String>,
+) -> Result<Value, String> {
+    let (sender, receiver) = oneshot::channel();
+    let router = Router::new()
+        .route("/auth/callback", get(callback))
+        .with_state(Callback {
+            state,
+            sender: Arc::new(Mutex::new(Some(sender))),
+        });
+    let stop = CancellationToken::new();
+    let stop_server = stop.clone();
+    let mut server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(stop_server.cancelled_owned())
+            .await
+    }));
+    if crate::cli::auth_flow::browser_launcher::launch_login_url(url.to_owned())
+        .await
+        .is_err()
+    {
+        let _ = progress(ConnectProgress::BrowserLaunchFailed);
+    }
+    let result = tokio::select! {
+        result=receiver=>result.map_err(|_| "Authorization callback closed".to_owned()),
+        _=tokio::time::sleep(Duration::from_secs(900))=>Err("ChatGPT authorization timed out".into()),
+        _=tokio::signal::ctrl_c()=>Err("ChatGPT authorization cancelled".into()),
+        _=cancel.cancelled()=>Err("ChatGPT authorization cancelled".into()),
+    };
+    stop.cancel();
+    if tokio::time::timeout(Duration::from_secs(2), &mut server)
+        .await
+        .is_err()
+    {
+        server.abort();
+        let _ = server.await;
+    }
+    result
 }
 
 pub async fn select_connection(

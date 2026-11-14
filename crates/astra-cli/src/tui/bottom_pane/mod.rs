@@ -139,6 +139,7 @@ pub(crate) struct BottomPane {
     model_catalog: Option<ModelCatalogState>,
     /// One-shot model source/management read, dispatched by the existing setup task owner.
     pub(crate) pending_model_setup_read: Option<crate::tui::model_setup::Action>,
+    pub(crate) model_setup_after_login: Option<crate::tui::model_setup::Action>,
     /// True when the user pressed Esc/Ctrl+C to interrupt the current
     /// run and terminal settlement is pending. The queue panel reflects
     /// this intermediate state so the user isn't stuck wondering why
@@ -432,6 +433,7 @@ impl BottomPane {
             projection_actions: std::collections::VecDeque::new(),
             model_catalog: None,
             pending_model_setup_read: None,
+            model_setup_after_login: None,
             interrupt_pending: false,
             staged_permission_mode: None,
         }

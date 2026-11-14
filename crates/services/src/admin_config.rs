@@ -299,6 +299,7 @@ mod tests {
         fn new(provider: &str, api_key: &str) -> Self {
             Self {
                 admitted: AdmittedModelExecution {
+                    device_binding: None,
                     responses_reasoning_history: None,
                     inference_protocol: None,
                     response_scope: None,

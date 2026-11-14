@@ -90,6 +90,7 @@ async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
                 .unwrap(),
         );
         let route = LlmExecutionRoute {
+            device_binding: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("scope"),
             subscription: None,
@@ -160,6 +161,7 @@ async fn clean_eof_responses_requires_a_valid_semantic_terminal() {
                 .unwrap(),
         );
         let route = LlmExecutionRoute {
+            device_binding: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("scope"),
             subscription: None,
@@ -696,6 +698,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             tools,
             cache_capability: Some(cache_capability()),
             route: LlmExecutionRoute {
+                device_binding: None,
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                 response_scope: Some(scope),
                 subscription: None,

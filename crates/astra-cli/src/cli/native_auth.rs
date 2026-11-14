@@ -43,6 +43,10 @@ pub(crate) fn active() -> Option<Arc<Binding>> {
 }
 
 impl Binding {
+    pub(crate) fn store(&self) -> native::NativeStore {
+        self.store.clone()
+    }
+
     pub(crate) fn endpoint(&self) -> &str {
         &self.session.environment.astra_url
     }
@@ -133,6 +137,42 @@ impl astra_thin_client::client::BearerProvider for Binding {
                 astra_thin_client::ThinClientError::InvalidInput(error.to_string())
             })
         })
+    }
+}
+
+/// A profile label alone cannot choose an account system. Historical identity
+/// material is used only as an intent hint, never as authentication authority.
+pub(crate) fn require_known_profile_intent(profile: Option<&str>) -> Result<(), String> {
+    let Some(name) = profile else { return Ok(()) };
+    let credentials = crate::cli::cli_config::cli_utils::credential_store()
+        .load()
+        .map_err(|_| "Cannot inspect the selected profile; repair its local credential file before choosing an account system")?;
+    let known = credentials.profiles.get(name).is_some_and(|profile| {
+        profile
+            .account_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || profile
+                .username
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || profile
+                .access_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || profile
+                .refresh_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || profile
+                .memoria_api_key
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    });
+    if known {
+        Ok(())
+    } else {
+        Err("This profile has no recorded account system. For MOI, omit --profile and run astra login. For a standalone account, explicitly run astra --profile <name> login --username <user>, register, or login --manual for Memoria. No credentials have been converted or overwritten.".into())
     }
 }
 
@@ -398,6 +438,38 @@ pub(crate) fn test_session() -> native::NativeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_intent_requires_a_choice_without_converting_saved_credentials() {
+        let _credentials = crate::tests::isolate_credentials();
+        let store = crate::cli::cli_config::cli_utils::credential_store();
+        assert!(require_known_profile_intent(None).is_ok());
+        assert!(require_known_profile_intent(Some("new-label")).is_err());
+        store
+            .mutate(|file| {
+                file.profiles.insert("empty".into(), Default::default());
+                file.profiles.insert(
+                    "existing".into(),
+                    astra_credentials::Profile {
+                        account_id: Some("synthetic-standalone-account".into()),
+                        refresh_token: Some("synthetic-existing-refresh".into()),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        assert!(require_known_profile_intent(Some("empty")).is_err());
+        assert!(require_known_profile_intent(Some("existing")).is_ok());
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        std::fs::write(store.path(), "invalid fixture").unwrap();
+        assert!(
+            require_known_profile_intent(Some("existing"))
+                .unwrap_err()
+                .contains("Cannot inspect")
+        );
+    }
 
     #[test]
     fn status_respects_json_and_renders_all_human_states_without_credentials() {

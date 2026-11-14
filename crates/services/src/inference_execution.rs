@@ -1,8 +1,10 @@
 use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Row};
+
+pub mod runner;
+pub mod runner_wait;
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
@@ -16,6 +18,15 @@ use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_off
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
+
+fn require_server_ledger_path(input: &InferenceInvocationInput) -> ServiceResult<()> {
+    if input.offering_id.starts_with("runner-") {
+        return Err(ServiceError::invalid(
+            "Device inference requires exact remote grant and custody APIs",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
@@ -143,6 +154,11 @@ impl InferenceInvocationPlan {
         self.owner_generation
     }
 
+    #[must_use]
+    pub fn input(&self) -> &InferenceInvocationInput {
+        &self.input
+    }
+
     /// Stable attempt identity within the caller-owned inference round.
     ///
     /// The runtime may advance this once after conclusively settling an
@@ -258,26 +274,9 @@ impl InferenceProviderWireIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceTerminalStatus {
-    Succeeded,
-    Failed,
-    Cancelled,
-    DeliveryUnknown,
-}
-
-impl InferenceTerminalStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::DeliveryUnknown => "delivery_unknown",
-        }
-    }
-}
+pub use astra_turn_types::runner_inference::{
+    InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus,
+};
 
 /// Authoritative result of renewing one durable inference owner lease.
 ///
@@ -290,38 +289,6 @@ pub enum InferenceOwnerLeaseRenewal {
     Renewed,
     /// The same owner already committed an authoritative terminal fact.
     AlreadyTerminal,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InferenceUsage {
-    /// Provider-normalized input buckets. Fresh input, cache reads, and cache
-    /// creation are disjoint and have one shared representation everywhere.
-    pub input: astra_turn_types::NormalizedPromptCacheUsage,
-    pub output_tokens: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceUsageStatus {
-    /// The provider supplied terminal usage for the complete response.
-    ProviderExact,
-    /// The provider supplied usage before an interrupted/uncertain terminal.
-    ProviderPartial,
-    /// No provider usage fact was available. Numeric zeroes are placeholders,
-    /// not measured zero-token billing.
-    #[default]
-    Unavailable,
-}
-
-impl InferenceUsageStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProviderExact => "provider_exact",
-            Self::ProviderPartial => "provider_partial",
-            Self::Unavailable => "unavailable",
-        }
-    }
 }
 
 /// Provider-I/O authority at an exact-attempt settlement boundary.
@@ -371,30 +338,6 @@ impl InferenceProviderDeliveryState {
         match self {
             Self::PreDelivery => "pre_delivery",
             Self::DeliveryAuthorized => "delivery_authorized",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceInvocationTerminal {
-    pub status: InferenceTerminalStatus,
-    pub usage: InferenceUsage,
-    pub usage_status: InferenceUsageStatus,
-    pub provider_response_id: Option<String>,
-    pub error_kind: Option<String>,
-    pub error_message: Option<String>,
-}
-
-impl InferenceInvocationTerminal {
-    #[must_use]
-    pub fn succeeded(usage: InferenceUsage, provider_response_id: Option<String>) -> Self {
-        Self {
-            status: InferenceTerminalStatus::Succeeded,
-            usage,
-            usage_status: InferenceUsageStatus::ProviderExact,
-            provider_response_id,
-            error_kind: None,
-            error_message: None,
         }
     }
 }
@@ -1253,8 +1196,23 @@ fn classify_run_invocation_scope_authority(
 }
 
 async fn lock_invocation_scope_authority(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut impl crate::cancellation_safe_db::TransactionConnection,
     input: &InferenceInvocationInput,
+) -> ServiceResult<InvocationScopeAuthority> {
+    lock_inference_scope_authority(
+        tx,
+        &input.user_id,
+        &input.scope,
+        input.run_authority.as_ref(),
+    )
+    .await
+}
+
+async fn lock_inference_scope_authority(
+    tx: &mut impl crate::cancellation_safe_db::TransactionConnection,
+    user_id: &str,
+    scope: &InferenceInvocationScope,
+    run_authority: Option<&InferenceRunAdmissionAuthority>,
 ) -> ServiceResult<InvocationScopeAuthority> {
     // This is an ownership/lifecycle observation inside the admission
     // transaction. MatrixOne's supported row-lock primitive here is
@@ -1265,29 +1223,30 @@ async fn lock_invocation_scope_authority(
     // scope lock, but provider I/O never occurs inside the transaction, so the
     // execution topology remains parallel. The durable logical-invocation row
     // remains the idempotency authority.
-    let authority = match &input.scope {
+    let authority = match scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
         } => {
-            let expected = input.run_authority.as_ref().ok_or_else(|| {
+            let expected = run_authority.ok_or_else(|| {
                 ServiceError::invalid(
                     "run-scoped inference requires exact durable execution authority",
                 )
             })?;
-            let scope_admitted =
-                match crate::storage::admit_session_execution_write(tx, session_id, &input.user_id)
-                    .await
-                {
-                    Ok(()) => true,
-                    Err(sqlx::Error::RowNotFound) => false,
-                    Err(error) => {
-                        return Err(ServiceError::with_source(
-                            ServiceErrorKind::Persistence,
-                            "lock canonical inference session/run scope",
-                            error,
-                        ));
-                    }
-                };
+            let scope_admitted = match crate::storage::admit_session_execution_write(
+                tx, session_id, user_id,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(sqlx::Error::RowNotFound) => false,
+                Err(error) => {
+                    return Err(ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "lock canonical inference session/run scope",
+                        error,
+                    ));
+                }
+            };
             if !scope_admitted {
                 InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
             } else {
@@ -1302,7 +1261,7 @@ async fn lock_invocation_scope_authority(
                      WHERE user_id = ? AND session_id = ? AND run_id = ?
                      LIMIT 1 FOR UPDATE",
                 )
-                .bind(&input.user_id)
+                .bind(user_id)
                 .bind(session_id)
                 .bind(run_id)
                 .fetch_optional(&mut **tx)
@@ -1410,7 +1369,7 @@ async fn lock_invocation_scope_authority(
                            AND event_type = 'user_intent' AND event_idx > ?
                          ORDER BY event_idx ASC LIMIT 1",
                     )
-                    .bind(&input.user_id)
+                    .bind(user_id)
                     .bind(run_id)
                     .bind(expected.expected_control_epoch)
                     .fetch_optional(&mut **tx)
@@ -1431,9 +1390,7 @@ async fn lock_invocation_scope_authority(
             }
         }
         InferenceInvocationScope::Session { session_id, .. } => {
-            match crate::storage::admit_session_event_write(tx, session_id, &input.user_id, false)
-                .await
-            {
+            match crate::storage::admit_session_event_write(tx, session_id, user_id, false).await {
                 Ok(()) => InvocationScopeAuthority::Live,
                 Err(sqlx::Error::RowNotFound) => {
                     InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
@@ -1606,6 +1563,7 @@ pub async fn admit_inference_invocation(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let db = pool.get();
     let mut connection = CancellationSafePoolConnection::acquire(pool.get())
         .await
@@ -2350,6 +2308,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     invocation: &InferenceInvocationPlan,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&invocation.input)?;
     validate_first_provider_attempt_binding(invocation, attempt)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
@@ -2562,7 +2521,7 @@ impl LockedInferenceOwnerFact {
 }
 
 async fn lock_inference_owner_fact(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut impl crate::cancellation_safe_db::TransactionConnection,
     user_id: &str,
     invocation_id: &str,
 ) -> ServiceResult<Option<LockedInferenceOwnerFact>> {
@@ -2593,7 +2552,7 @@ async fn lock_inference_owner_fact(
 /// settlement. The lock is deliberately on the immutable invocation identity,
 /// not on a mutable status index.
 async fn lock_admitted_inference_invocation(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut impl crate::cancellation_safe_db::TransactionConnection,
     user_id: &str,
     invocation_id: &str,
     owner_token: &str,
@@ -2870,6 +2829,7 @@ pub async fn begin_inference_provider_attempt(
     pool: &SharedPool,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
     let mut connection = CancellationSafePoolConnection::acquire(db)
@@ -3249,6 +3209,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     validate_first_provider_attempt_binding(plan, attempt)?;
     if terminal.status != InferenceTerminalStatus::Succeeded {
         return Err(ServiceError::invalid(
@@ -3462,6 +3423,7 @@ pub async fn finish_inference_provider_attempt(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
@@ -5812,6 +5774,7 @@ pub async fn finish_inference_invocation(
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let db = pool.get();
