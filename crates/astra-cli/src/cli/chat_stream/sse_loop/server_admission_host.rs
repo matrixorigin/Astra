@@ -316,8 +316,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
     pub chat_turn_index: u32,
-    /// Cross-turn tool output cache for edge-path dedup.
-    pub tool_cache: crate::cli::stream::stream_render::EdgeToolCache,
     /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
     pub append_system_prompt: Option<String>,
     /// Original-deadline-backed source for a fresh request-local wall budget.
@@ -990,7 +988,6 @@ impl CliServerAdmissionHost<'_> {
                     skill_resolver: state.skills.resolver.clone(),
                     interaction_mode,
                     turn_policy: &mut turn_policy,
-                    tool_cache: &mut self.tool_cache,
                     session_turn: state.session_turn,
                     observability_hub: state.telemetry.observability_hub.as_ref(),
                     incremental_state: self.incremental_state.clone(),

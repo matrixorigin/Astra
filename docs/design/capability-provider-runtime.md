@@ -465,6 +465,18 @@ normal work than an earlier incorrect cross-invocation short circuit; it is
 not a zero-cost optimization claim. Database-cost acceptance must measure the
 canonical path and must not be achieved by skipping required accounting.
 
+CLI Edge execution does not keep a second cross-invocation output cache,
+argument counter, or provider-round witness. Each new request follows current
+permission, workspace, execution, and callback admission. Recursive directory
+reads observe the selected workspace afresh; file reads retain the executor's
+existing content/freshness and read-before-write tracking. The former sequential
+Edge identical-argument cap is retired intentionally; it also did not cover
+parallel batches. Native headless batch limits remain local to that dispatcher,
+not a guarantee of an equivalent Edge pre-dispatch cap. Existing run deadlines,
+round budgets, exact-request callback retry, and unknown-effect custody remain
+independent safeguards. Removing this output cache does not change prompt-cache
+keys or stable tool schemas.
+
 Semantic read caching requires enough freshness context:
 
 ```text

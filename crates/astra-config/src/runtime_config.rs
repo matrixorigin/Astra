@@ -588,13 +588,16 @@ pub enum MemoryStrategy {
 /// Configuration for per-turn tool execution guards.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolPolicyConfig {
-    /// Max times the same (tool, args) can execute across a session.
-    /// 0 = use default (3). Prevents infinite loops from ignored dedup hints.
+    /// Max identical (tool, args) calls dispatched by the native headless
+    /// pipeline within one provider batch. 0 = use default (3).
+    /// Already-delivered Edge receipts are not pre-execution policy decisions;
+    /// CLI Edge execution does not apply an argument-keyed repetition cap.
     #[serde(default)]
     pub max_identical_tool_calls: u32,
 
-    /// Max tool calls to execute in a single LLM turn (headless round).
-    /// 0 = use default (100). Excess calls are skipped with a budget stub.
+    /// Max fresh tool calls dispatched by the native headless pipeline in one
+    /// provider batch. 0 = use default (100). Excess calls receive a budget stub.
+    /// Already-delivered Edge receipts retain their actual execution outcome.
     #[serde(default)]
     pub max_tools_per_turn: u32,
 

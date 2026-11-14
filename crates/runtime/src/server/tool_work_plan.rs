@@ -312,11 +312,11 @@ pub(super) async fn inspect(
     if args
         .context_id
         .as_ref()
-        .is_some_and(|context_id| context_id.is_empty() || context_id.len() > 96)
+        .is_some_and(|context_id| !astra_services::work::WorkPlanContext::is_context_id(context_id))
     {
-        return work_plan_error(
+        return work_plan_rejection(
             "work_plan_arguments_invalid",
-            "inspect_work_plan context identity is invalid",
+            "context_id must be the exact value returned by inspect_work_plan; Work and branch identities are not context identities",
             false,
         );
     }
@@ -845,6 +845,15 @@ pub(super) async fn propose(
         return reconcile_retired_active_attempt(executor, &revised_bases, result);
     }
 
+    // Exact recorded receipts above win on replay. A new proposal must use
+    // the context namespace before its optimistic revision is compared.
+    if !astra_services::work::WorkPlanContext::is_context_id(&args.context_id) {
+        return work_plan_rejection(
+            "work_plan_arguments_invalid",
+            "context_id must be the exact value returned by inspect_work_plan. Inspect with empty arguments, then use its context_id; Work and branch identities are not context identities.",
+            false,
+        );
+    }
     let context = match load_context(binding).await {
         Ok(context) => context,
         Err(error) => return error,
@@ -1367,6 +1376,24 @@ mod tests {
             .expect("independent pool");
         closed_pool.close().await;
         executor.set_service_pool(closed_pool);
+        for invalid in [
+            work.as_str().to_string(),
+            branch.as_str().to_string(),
+            format!("work-plan-context:{}", "x".repeat(64)),
+        ] {
+            let result = inspect(&executor, &json!({"context_id":invalid}), None).await;
+            assert!(result.is_error);
+            assert_eq!(
+                serde_json::from_str::<Value>(&result.output).unwrap()["error"]["code"],
+                "work_plan_arguments_invalid",
+                "invalid identity must not touch the closed store"
+            );
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["execution_started"],
+                false
+            );
+        }
+
         let rejected = propose(&executor, &json!({"context_id":"context", "reason":"invalid empty mutation", "additions":[], "revisions":[], "dependencies":[], "dependency_removals":[]}), invocation("invalid-arguments"), None).await;
         assert!(rejected.is_error);
         assert_eq!(
@@ -1417,6 +1444,32 @@ mod tests {
             inspected["execution_contract"]["milestones_require_settlement"],
             false
         );
+        for (index, invalid) in [
+            work.as_str().to_string(),
+            branch.as_str().to_string(),
+            format!("work-plan-context:{}", "x".repeat(64)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invalid_context = propose(
+                &executor,
+                &proposal_args(&invalid, "wrong-context-task"),
+                invocation(&format!("wrong-context-{index}")),
+                None,
+            )
+            .await;
+            assert!(invalid_context.is_error);
+            assert_eq!(
+                serde_json::from_str::<Value>(&invalid_context.output).unwrap()["error"]["code"],
+                "work_plan_arguments_invalid",
+                "a Work identity is not a stale context revision"
+            );
+            assert_eq!(
+                invalid_context.metadata.as_ref().unwrap()["execution_started"],
+                false
+            );
+        }
         let first_context_id = inspected["context_id"].as_str().expect("context id");
         let first_args = proposal_args(first_context_id, "task-first");
         let missing_identity = propose(

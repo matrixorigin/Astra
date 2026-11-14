@@ -6005,3 +6005,169 @@ async fn workspace_package_bytes(
         .unwrap();
     (status, bytes.to_vec())
 }
+
+/// Actual HTTP/MatrixOne load probe for the two reads made by a bound CLI
+/// observer. The client-cadence test separately proves when these reads occur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn thousand_work_observer_refreshes_have_bounded_read_only_sql() {
+    use std::time::{Duration, Instant};
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(String, f64)>>>);
+    #[derive(Default)]
+    struct Statement(String, f64);
+    impl tracing::field::Visit for Statement {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "db.statement" {
+                self.0 = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+        }
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            if field.name() == "elapsed_secs" {
+                self.1 = value;
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                let mut statement = Statement::default();
+                event.record(&mut statement);
+                if !statement.0.is_empty() {
+                    self.0.lock().unwrap().push((statement.0, statement.1));
+                }
+            }
+        }
+    }
+    let capture = Capture::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(tracing_subscriber::EnvFilter::new("sqlx::query=debug")),
+    )
+    .expect("run this load probe in its own test process");
+    let (app, pool) = setup().await.expect("ASTRA_TEST_DB_IT=1 is required");
+    let owner = id("observer-load-owner");
+    let session = id("observer-load-session");
+    let work = id("observer-load-work");
+    let branch = WorkBranchId::parse("main").unwrap();
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    repository
+        .create_genesis(
+            WorkGenesis::new(WorkGenesisParts {
+                owner_id: WorkOwnerId::parse(&owner).unwrap(),
+                work_id: WorkId::parse(&work).unwrap(),
+                branch_id: branch,
+                session_id: InternalSessionId::parse(&session).unwrap(),
+                project_id: None,
+                original_intent_ref: OriginalIntentRef::parse(id("observer-load-intent")).unwrap(),
+                goal: WorkGoal::parse("Observe retained Work without writing it.").unwrap(),
+                criteria: vec![],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut connections = Vec::new();
+    for _ in 0..pool.get().options().get_max_connections() {
+        connections.push(pool.get().acquire().await.unwrap());
+    }
+    drop(connections);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .unwrap();
+    async fn refresh(
+        client: reqwest::Client,
+        base: String,
+        owner: String,
+        session: String,
+        work: String,
+    ) -> f64 {
+        let start = Instant::now();
+        let binding: Value = client
+            .get(format!("{base}/v1/works/session-bindings/{session}"))
+            .bearer_auth(&owner)
+            .header(WORK_API_MAJOR_HEADER, "1")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(binding["work_id"], work);
+        let revision = binding["graph_revision"].as_i64().unwrap();
+        let graph: Value = client.get(format!("{base}/v1/works/{work}/branches/main/task-graph?graph_revision={revision}&item_limit=8&dependency_limit=8"))
+            .bearer_auth(&owner).header(WORK_API_MAJOR_HEADER, "1").send().await.unwrap()
+            .error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(graph["basis"]["work_id"], work);
+        assert_eq!(graph["basis"]["graph_revision"], revision);
+        assert!(graph["items"]["entries"].as_array().unwrap().len() <= 8);
+        start.elapsed().as_secs_f64() * 1000.0
+    }
+    capture.0.lock().unwrap().clear();
+    refresh(
+        client.clone(),
+        base.clone(),
+        owner.clone(),
+        session.clone(),
+        work.clone(),
+    )
+    .await;
+    let per_refresh = capture.0.lock().unwrap().len();
+    assert!(per_refresh > 0, "empty SQL capture is not evidence");
+    capture.0.lock().unwrap().clear();
+    let start = Instant::now();
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..1000 {
+        readers.spawn(refresh(
+            client.clone(),
+            base.clone(),
+            owner.clone(),
+            session.clone(),
+            work.clone(),
+        ));
+    }
+    let mut latency = Vec::new();
+    while let Some(result) = readers.join_next().await {
+        latency.push(result.unwrap());
+    }
+    latency.sort_by(f64::total_cmp);
+    let statements = capture.0.lock().unwrap().clone();
+    assert_eq!(latency.len(), 1000);
+    assert_eq!(
+        statements.len(),
+        per_refresh * 1000,
+        "read load must scale with actual refreshes"
+    );
+    assert!(
+        statements.iter().all(|(sql, _)| sql.starts_with("SELECT ")),
+        "observation must not write"
+    );
+    let sql_ms: f64 = statements.iter().map(|(_, elapsed)| elapsed * 1000.0).sum();
+    eprintln!(
+        "WORK_OBSERVER_LOAD {}",
+        serde_json::json!({
+            "observers":1000,"http_requests":2000,"sql_statements":statements.len(),
+            "sql_per_refresh":per_refresh,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+            "refresh_p50_ms":latency[499],"refresh_p95_ms":latency[949],"refresh_max_ms":latency[999],
+            "sql_total_ms":sql_ms,"pool_connections":pool.get().size(),
+            "scope":"isolated MatrixOne, real HTTP, one retained root item; burst latency includes queueing"
+        })
+    );
+    server.abort();
+    let _ = server.await;
+    cleanup_owner(&pool, &owner).await;
+    pool.close().await;
+}
