@@ -67,6 +67,17 @@ describe('http helpers', () => {
     expect(extractJwtSubject('not-a-token')).toBeNull();
   });
 
+  test('extractJwtSubject rejects structurally invalid JWT strings', () => {
+    const payload = Buffer.from(JSON.stringify({ sub: 'user-1' })).toString('base64url');
+
+    // RFC 7519 section 3.1: exactly three base64url segments and a JOSE
+    // header that decodes to a JSON object. Anything else must yield null.
+    expect(extractJwtSubject(`data.${payload}.`)).toBeNull(); // header segment is not a JSON object
+    expect(extractJwtSubject(`e30.${payload}`)).toBeNull(); // missing third segment
+    expect(extractJwtSubject(`e30.${payload}..extra`)).toBeNull(); // extra segment
+    expect(extractJwtSubject(`.${payload}.`)).toBeNull(); // empty header segment
+  });
+
   test.each(['用户-张旭', 'café', 'user-🚀'])(
     'utf8HeaderByteString keeps UTF-8 wire bytes for %s',
     (subject) => {
