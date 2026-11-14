@@ -8,6 +8,12 @@ use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 use sqlx::Acquire;
 
+// Includes all fresh authority dependencies (MOI mapping, UC service token and
+// account status). A timeout releases the bounded worker; durable recovery
+// retains the observation and rechecks current authority on the next attempt.
+// The backend send retains its independent 30-second request timeout.
+const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
 
@@ -268,6 +274,10 @@ impl DatabaseTraceEventWriter {
 
 #[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         Ok(TurnObserverOutcome::NotConfigured)
     }
@@ -275,6 +285,20 @@ impl TurnObserverWorker for NoopTurnObserverWorker {
 
 #[async_trait]
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        self.memoria_port.is_some()
+    }
+
+    async fn admits_observation(&self, user_id: &str, session_id: &str) -> Result<bool, String> {
+        let Some(template) = &self.memoria_port else {
+            return Ok(false);
+        };
+        let port = template.bind_session(user_id, session_id)?;
+        tokio::time::timeout(OBSERVER_AUTHORITY_TIMEOUT, port.admits_operation(true))
+            .await
+            .map_err(|_| "memoria observer admission timed out".to_string())?
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
             return Ok(TurnObserverOutcome::Empty);
@@ -282,7 +306,7 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let Some(template) = self.memoria_port.as_ref() else {
             return Ok(TurnObserverOutcome::NotConfigured);
         };
-        let port = template.bind_owner(&request.user_id)?;
+        let port = template.bind_session(&request.user_id, &request.session_id)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -290,16 +314,22 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
+        // Resolve fresh write authority before serializing the optional body.
+        // A denied/revoked grant never falls back to deployment credentials.
+        let transport = tokio::time::timeout(
+            OBSERVER_AUTHORITY_TIMEOUT,
+            port.resolve_observer_transport(),
+        )
+        .await
+        .map_err(|_| "memoria observer authority lookup timed out".to_string())??;
+        let Some(transport) = transport else {
+            return Ok(TurnObserverOutcome::AccessDisabled);
+        };
         // Serialize exactly once, then retain and send that same byte buffer.
         // Calling `.json(...)` here as well would hide the queue's actual byte
         // weight behind a second serializer-owned allocation.
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
-        // Resolve fresh write authority after preparation, just as memory tools
-        // do. A denied/revoked grant never falls back to deployment credentials.
-        let Some(transport) = port.resolve_observer_transport().await? else {
-            return Ok(TurnObserverOutcome::AccessDisabled);
-        };
         let response = client
             .post(format!(
                 "{}/v1/observe",

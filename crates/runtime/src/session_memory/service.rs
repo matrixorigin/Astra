@@ -158,8 +158,9 @@ pub struct MemoryExtractionService {
     ingestion: IngestionSender,
     /// Authenticated owner for an executable service. The process-wide
     /// template is deliberately unbound and can only create owner-scoped
-    /// services through [`Self::scoped_to_owner`].
+    /// services through [`Self::scoped_to_session`].
     user_id: Option<Arc<str>>,
+    session_id: Option<Arc<str>>,
     health: Arc<SelectorHealth>,
     memoria_health: Arc<MemoriaHealth>,
     /// Per-session active fingerprint plus one latest-wins queued refresh.
@@ -189,12 +190,12 @@ pub struct MemoryExtractionService {
     /// known session through [`Self::forget_session`]; long-lived servers
     /// retain a bounded oldest-inactive cache.
     session_states: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionMemoryState>>>,
-    /// Request-owner scoped service handles. Each owner gets isolated
+    /// Owner-and-Session scoped service handles. Each Session gets isolated
     /// debounce/in-flight maps while endpoint health, shutdown accounting,
     /// ingestion, and the activity broker remain shared.
     owner_scoped_services: Arc<
         std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Weak<MemoryExtractionService>>,
+            std::collections::HashMap<(String, String), std::sync::Weak<MemoryExtractionService>>,
         >,
     >,
     local_event_sink: Option<Arc<LocalJournalEventSink>>,
@@ -213,14 +214,20 @@ impl std::fmt::Debug for MemoryExtractionService {
 
 impl MemoryExtractionService {
     /// Share the composition-owned memory provider with the run and its children.
-    pub fn memoria_client_for_owner(&self, user: &str) -> Result<Arc<dyn MemoriaPort>, String> {
-        self.memoria_client.bind_owner(user).inspect_err(|error| {
-            tracing::warn!(
-                user_id = user,
-                error = %error,
-                "failed to bind the composition-owned Memoria provider"
-            );
-        })
+    pub fn memoria_client_for_session(
+        &self,
+        user: &str,
+        session: &str,
+    ) -> Result<Arc<dyn MemoriaPort>, String> {
+        self.memoria_client
+            .bind_session(user, session)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    user_id = user,
+                    error = %error,
+                    "failed to bind the composition-owned Memoria provider"
+                );
+            })
     }
     /// Build a service. `memoria_client` is required — callers that
     /// can't produce one (offline CLI, no Memoria configured) should
@@ -266,6 +273,7 @@ impl MemoryExtractionService {
             memoria_client,
             ingestion,
             user_id,
+            session_id: None,
             health: Arc::new(SelectorHealth::new()),
             memoria_health: Arc::new(MemoriaHealth::new()),
             work: Arc::new(std::sync::Mutex::new(SessionWorkCoordinator::default())),
@@ -400,14 +408,20 @@ impl MemoryExtractionService {
 
     /// Bind a multi-tenant service to the authenticated request owner.
     ///
-    /// Repeated requests for the same owner share process-local admission and
+    /// Repeated requests for the same owner and Session share admission and
     /// debounce state; different owners cannot collide even if a client
     /// supplies the same session id. Unsupported transport rebinding fails
     /// closed, disabling extraction for that request rather than writing under
     /// a bootstrap/default tenant.
-    pub fn scoped_to_owner(self: &Arc<Self>, user_id: &str) -> Result<Arc<Self>, String> {
-        let scope = astra_memoria::MemoryScope::new(user_id, "owner-binding-validation")?;
-        if self.user_id.as_deref() == Some(scope.user_id.as_str()) {
+    pub fn scoped_to_session(
+        self: &Arc<Self>,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Arc<Self>, String> {
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+        if self.user_id.as_deref() == Some(scope.user_id.as_str())
+            && self.session_id.as_deref() == Some(scope.session_id.as_str())
+        {
             return Ok(Arc::clone(self));
         }
 
@@ -417,7 +431,7 @@ impl MemoryExtractionService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         scoped.retain(|_, service| service.strong_count() > 0);
         if let Some(existing) = scoped
-            .get(&scope.user_id)
+            .get(&(scope.user_id.clone(), scope.session_id.clone()))
             .and_then(std::sync::Weak::upgrade)
         {
             return Ok(existing);
@@ -426,9 +440,12 @@ impl MemoryExtractionService {
         let service = Arc::new(Self {
             durable_store: self.durable_store.clone(),
             inference_resolver: Arc::clone(&self.inference_resolver),
-            memoria_client: self.memoria_client.bind_owner(&scope.user_id)?,
+            memoria_client: self
+                .memoria_client
+                .bind_session(&scope.user_id, &scope.session_id)?,
             ingestion: self.ingestion.clone(),
             user_id: Some(Arc::from(scope.user_id.as_str())),
+            session_id: Some(Arc::from(scope.session_id.as_str())),
             health: Arc::clone(&self.health),
             // Memoria request failures may be owner-specific (binding, quota,
             // or request data). Without typed endpoint-failure evidence, one
@@ -445,7 +462,7 @@ impl MemoryExtractionService {
             require_local_current_snapshot: self.require_local_current_snapshot,
             extraction_work_timeout: self.extraction_work_timeout,
         });
-        scoped.insert(scope.user_id, Arc::downgrade(&service));
+        scoped.insert((scope.user_id, scope.session_id), Arc::downgrade(&service));
         Ok(service)
     }
 
@@ -707,6 +724,14 @@ impl MemoryExtractionService {
             return SpawnDecision::Skipped;
         };
         let session_id = session_id.to_string();
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|bound| bound != session_id)
+        {
+            tracing::error!("refusing session-memory extraction outside the bound Session");
+            return SpawnDecision::Skipped;
+        }
         let Some(user_id) = self.user_id.as_deref() else {
             tracing::error!(
                 session_id = %session_id,
@@ -1888,9 +1913,9 @@ mod tests {
             Arc::new(BackgroundActivityBroker::new()),
         ));
 
-        let alice_a = root.scoped_to_owner("alice").unwrap();
-        let alice_b = root.scoped_to_owner("alice").unwrap();
-        let bob = root.scoped_to_owner("bob").unwrap();
+        let alice_a = root.scoped_to_session("alice", "same-session").unwrap();
+        let alice_b = root.scoped_to_session("alice", "same-session").unwrap();
+        let bob = root.scoped_to_session("bob", "same-session").unwrap();
 
         assert!(Arc::ptr_eq(&alice_a, &alice_b));
         assert!(!Arc::ptr_eq(&alice_a, &bob));
@@ -1898,6 +1923,14 @@ mod tests {
         assert_eq!(alice_a.owner_user_id(), Some("alice"));
         assert_eq!(bob.owner_user_id(), Some("bob"));
         assert_eq!(&*bindings.lock().unwrap(), &["alice", "bob"]);
+
+        let alice_other = root.scoped_to_session("alice", "other-session").unwrap();
+        assert!(!Arc::ptr_eq(&alice_a, &alice_other));
+        assert_eq!(alice_other.session_id.as_deref(), Some("other-session"));
+        assert_eq!(
+            alice_other.maybe_spawn(sample_req("same-session", 1_000, false)),
+            SpawnDecision::Skipped
+        );
 
         alice_a.mark_session_extracted("same-session", 11, 2);
         assert!(alice_a.peek_state("same-session").is_some());
@@ -1925,8 +1958,12 @@ mod tests {
             ingestion,
             Arc::new(BackgroundActivityBroker::new()),
         ));
-        let alice = template.scoped_to_owner("alice").expect("bind alice");
-        let bob = template.scoped_to_owner("bob").expect("bind bob");
+        let alice = template
+            .scoped_to_session("alice", "alice-pending-memory")
+            .expect("bind alice");
+        let bob = template
+            .scoped_to_session("bob", "bob-pending-memory")
+            .expect("bind bob");
         assert_eq!(
             alice.maybe_spawn(sample_req("alice-pending-memory", 1_000, false)),
             SpawnDecision::Spawned
@@ -1963,7 +2000,7 @@ mod tests {
             Arc::new(BackgroundActivityBroker::new()),
         ));
 
-        let alice = root.scoped_to_owner("alice").unwrap();
+        let alice = root.scoped_to_session("alice", "same-session").unwrap();
         assert_eq!(
             root.owner_scoped_services
                 .lock()
@@ -1973,14 +2010,14 @@ mod tests {
         );
         drop(alice);
 
-        let _bob = root.scoped_to_owner("bob").unwrap();
+        let _bob = root.scoped_to_session("bob", "same-session").unwrap();
         let scoped = root
             .owner_scoped_services
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(scoped.len(), 1, "dead owner keys must not accumulate");
-        assert!(scoped.contains_key("bob"));
-        assert!(!scoped.contains_key("alice"));
+        assert!(scoped.contains_key(&("bob".into(), "same-session".into())));
+        assert!(!scoped.contains_key(&("alice".into(), "same-session".into())));
     }
 
     #[test]

@@ -4,6 +4,29 @@ This repository is validated through Rust-first checks, contract tests (fast, ma
 
 ## Primary Commands
 
+For the canonical observation extractor boundary, run the ignored
+`chat_sql_budget::canonical_observation_backlog_resumes_only_accepted_extractor_windows`
+case with an isolated MatrixOne. It drives the production recovery owner and
+HTTP worker, checks all three extraction limits, partial failure/restart and a
+newer completion while the previous capture is partial. The default HTTP fixture
+models the published input limits; it is not a live Memoria or model-quality test.
+
+An additional offline check can run the *exact supplied Memoria extraction method*
+with a controlled LLM stub, after building the services tests:
+
+```bash
+python3 scripts/memoria_extractor_boundary.py \
+  --memoria-service-source /path/to/memoria-service/src/service.rs \
+  --deps target/debug/deps
+```
+
+The script compiles the production Astra window planner and supplied upstream
+method without rewriting either, reproduces the old 20-of-30 selection and checks
+that windowed Unicode/long-message input reaches the extraction method intact.
+It reports the method hash for provenance. It uses no network, credentials,
+database or live model; it does not exercise the complete Memoria API/persistence.
+Run it only with trusted source and build artifacts.
+
 ```bash
 # Full suite: workspace + e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne and Memoria for the online portion)
 make test
@@ -616,36 +639,169 @@ EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ### Ordinary-chat SQL budget
 
-`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
-uses the same isolated MatrixOne setup and scripted loopback provider as the
-system HTTP journeys. Run this test by exact name in its own process because
-it owns the global SQL tracing subscriber:
+The `ordinary`, `warm`, and `held` variants of
+`chat_sql_budget::*_chat_and_readonly_rounds_have_bounded_total_sql` use the
+same isolated MatrixOne setup and scripted loopback provider as the system HTTP
+journeys. All nine scenarios remain covered, with a paired ordinary baseline in
+each group. Nextest gives each group its own SQL subscriber and unchanged
+60-second test budget, avoiding nine fixture lifecycles in one timed process:
 
 ```bash
 MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
-cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
-  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+cargo nextest run --locked --profile strict-online-ci -p astra-runtime \
+  --features e2e-hooks --test chat_sql_budget -j 1 --run-ignored only \
+  -E 'test(/(ordinary|warm|held)_chat_and_readonly_rounds_have_bounded_total_sql/)'
 ```
 
-The 20-statement limit measures each request on an initialized server pool,
-including transactions, periodic control reads and the real observer's SQL.
-Pool initialization happens before capture; no statements are filtered out
-inside the measured interval. Warm-context setup consumes its complete SSE
-response and waits for observer completion before the next request starts;
-it must not use shutdown drain, which closes admission for that next request.
-Capture ends only after
-both the measured run and its observer finish: the detached observer is not
-owned by `drain_background_runs`. The authorized probe requires the exact expected
-number of both `scheduled` dispatches and `success` outcomes. An extra scheduled
-observer fails even if it is still pending when the expected successes finish.
-Errors, dropped work, missing completions, and skipped
-outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
-successful observations are also present. Disabled access is covered separately;
-it cannot satisfy this HTTP-path SQL measurement.
+The scoped nonperiodic limits are 23 statements for a cold ordinary chat, 24
+for a warm chat, 33 for Auto and 20 with observation unconfigured. Warm chat
+restores prior canonical Context once in addition to the observer's captured-head
+read; the test asserts those reads explicitly. Every SQL statement remains in the raw
+total. At most one exact account/session authentication snapshot is allowed;
+exact control reads have a separate bound of `ceil(measured_elapsed_ms / 2000)`.
+These core limits describe one-window observation. Longer canonical text/tool
+results add exactly three statements per extra window: fresh authority plus the
+fenced progress UPDATE/read-back. The test independently counts authenticated
+HTTP windows (at most eight), validates extraction limits and matches exact SQL
+shapes/cardinalities. The raw envelope includes this explicit window cost, the
+core limit, the authentication snapshot and the elapsed timer allowance. Extra
+business SQL, duplicate authentication reads or polling faster
+than the two-second contract still fail. This avoids assuming a loaded CI host
+will always finish before the second control tick.
+
+These are **scoped request-plus-attempt budgets**, not fleet totals. The Router
+fixture drives one Session through the production claim, authority,
+materialization, dispatch and receipt path. Pool setup and warm-up finish before
+capture; it ends only after the expected success and durable receipt. Denial,
+error and dispatch metrics alone cannot pass.
+
+Observation adds no job insertion or synchronous SQL statement to chat settlement.
+The existing canonical completion write marks its head due, preserving active
+leases and retry deadlines. Changing that due time does update the physical key
+and indexes, so equal SQL counts are not a claim of identical database work.
+Unconfigured deployments do not poll or dispatch observations, but retain the
+canonical due fact for later recovery.
+
+`canonical_observation_burst_recovers_without_chat_job_writes` separately measures
+the actual managed loop with two owners, 128 canonical Sessions, a held slow
+observer, 16 paced arrivals and 4,096 deleted historical identities. Raw active
+capture includes **all** observation-recovery statements with the synthetic
+observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
+covered by the scoped integration probes; unrelated Server maintenance loops
+are outside this observation scheduler fixture. It then restarts two idle owners for 5.2 seconds, first with the
+observed history retained and then deleted. Observation SQL must contain only due
+reads (at most eight total), with no lease writes or transcript reads. The HTTP
+fixture's exact 30-second test-account heartbeat is reported separately (at most
+one per interval) and remains in the bounded raw total. No SQL is discarded. This makes
+idle fleet cost visible independently of the marginal per-Session attempt.
+The test first verifies named independent Sessions progress while a call remains
+held, then cancels that owner and separately waits for all 144 backlog/arrival
+receipts. Two full discovery pages plus arrivals exercise pagination without
+turning canonical fixture construction into a throughput test. The complete
+fixture, recovery, both idle intervals and cleanup must fit the unchanged
+60-second online budget. Phase timing logs distinguish setup, recovery and
+cleanup stalls. The test also verifies the eight-attempt bound, non-overlapping
+claims and handoff. It does not establish 1,000-Session throughput; large-catalog
+query selectivity is checked separately below.
+`shared_observer_failure_pauses_backlog_sql_then_recovers` separately starts
+128 canonical Sessions with a persistent shared authority failure. After eight
+failed attempts, the shared pause must stop further
+observation SQL and callbacks across the remaining backlog. Restoring the
+dependency must drain all retained work with fresh admission. A virtual-time
+unit test separately covers single-probe exclusion, exponential delay/cap,
+cancelled normal/probe reservations and the bounded initial failure cohort.
+
+The ignored services test
+`session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
+uses the real schema with 100,000 retained heads. Prepared `EXPLAIN ANALYZE`
+checks actual storage input for empty and sparse due work, a selected head,
+claim/index-maintenance writes and canonical materialization. The due timestamp leads the primary key; a nullable
+secondary index was tested and rejected because it scanned retained history.
+The full SessionKey remains UNIQUE. The regression also covers a live Session
+with 100 generations of 1,000 nodes, bounding current-generation reads. Valid
+Append/Replace commits separately exercise captured-head materialization and
+acknowledging an older turn while a newer one remains pending. Expired claims and
+stale receipts must fail rather than appear acknowledged. Synthetic plan bodies
+are never decoded as application content.
+
+`repeated_chat_observation_has_linear_history_work` complements those scoped and
+catalog probes with 8 concurrent public `/chat/stream` Sessions over 8 rounds,
+two real unscoped recovery owners, and the production HTTP observer talking to
+an authenticated loopback Memoria stub. Capture starts before discovery and ends
+after every observation has a durable receipt. All request, discovery, competing
+claim, materialization, authority, checkpoint, fixture-heartbeat and verification
+SQL remains in the raw total.
+The workload creates its own database so unscoped owners cannot process another
+test's Sessions in a shared catalog. It does not scope discovery to the test user.
+The profile uses the supported static self-hosted
+authority port; the existing scoped probe separately measures database-resolved
+authority. It is not an MOI/UC network latency benchmark.
+
+Each round asserts 8 new observation manifest rows plus at most four prior
+canonical turns per Session for the stateless extractor. After the four-turn
+context window fills, read rows and HTTP payload bytes must plateau with these
+fixed-size synthetic facts. The probe includes three steady-state rounds beyond window warmup. The complete
+workload uses one 50-second deadline inside the unchanged 60-second nextest
+budget. Long-history behavior is separately covered by the 100,000-node plans
+and 20 valid coordinator commits; this CI fixture is not a throughput benchmark.
+The stub checks current-turn content, so repeatedly sending an old or empty
+payload cannot satisfy the budget.
+`CanonicalObservationRead` counts serialized manifest/content JSON returned by
+storage, excluding claim/checkpoint metadata, fork-lineage metadata, physical disk
+or MySQL protocol bytes. Prepared plans separately
+check actual storage scan input for the same-generation suffix predicate. The
+report includes complete raw SQL and SQLx returned rows, separately identified verification/control/
+fixture and exact SQLx pool-initialization queries, summed SQL time, response completion time and receipt completion
+time. A separate frontend bound retains at most 17 core statements per warm
+request in this static-authority profile, plus bounded exact authentication reads. Pool
+initialization has its own connection-count bound and remains in raw totals. The
+four claim/checkpoint statements, one content read, discovery and competing
+claims are disclosed separately and remain in the complete raw ceiling.
+Its raw ceiling is deliberately above the former volatile 20-statement
+budget: this test bounds and discloses coordination cost, not a claim that durable
+recovery reduces statement counts. No captured SQL is discarded.
+
+Run the exact ignored test in its own process. The services regression also
+checks 20 valid turns, coalesced unacknowledged suffixes, concurrent completions,
+replacement, divergent roots/totals/owners and stale/expired acknowledgements.
+The HMAC fork journey checks the first inherited snapshot, incremental child
+observation, and recovery after ancestor deletion and collection.
+The services case also checks that an oversized old turn is excluded by SQL,
+with bounded returned JSON bytes, and that later context resumes after it.
+A 1,000-node fork result-shape check returns exactly one 2 KiB lineage value;
+this is a result-value measurement, not a network benchmark.
+
+`canonical_observation_preserves_cross_turn_antecedent` sends two public chat
+turns (Pixel the cat, then “He had surgery yesterday”) through production
+canonical recovery and HTTP encoding. Deterministic CI checks the actual second
+request contains both turns. It does **not** assert LLM extraction quality.
+For a separately configured local Memoria with an extraction LLM, the explicit
+`ASTRA_TEST_MEMORIA_EXTRACTOR_URL` (HTTP loopback only) and
+`ASTRA_TEST_MEMORIA_EXTRACTOR_MASTER_KEY` enable forwarding that exact request
+through `/v1/observe`; this mode requires a returned fact naming Pixel and
+surgery and rejects raw fallback. Do not provide live credentials to fork CI.
+
+Run it with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
+session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
+-- --exact --ignored --nocapture` against a dedicated local database.
+
+`observer_expiry_during_dispatch_does_not_acknowledge_progress` expires a claim
+while the backend is held. `denied_recovery_never_reads_manifest_payloads` captures
+SQL and history counters, requiring denial before manifest loading or payload
+serialization. Run each exact ignored test in its own process, including the
+managed-loop test, because SQL tracing uses a global subscriber.
+
+The offline `ephemeral_burst_does_not_hold_cleanup_and_cancellation_releases_capacity`
+and `ephemeral_observer_burst_delivers_terminal_and_releases_run_resources` tests
+hold optional observers while verifying process capacity, explicit overload,
+terminal delivery, run-resource cleanup and shutdown cancellation. They use no
+database or live model provider.
+
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
-expires. Those statements still count toward the raw 20-statement limit;
-repeated authentication snapshots or any other extra readonly-round SQL fail.
+expires. Those statements still count toward the measured raw total and its
+time-bounded envelope; repeated authentication snapshots or any other extra
+readonly-round SQL fail.
 The HTTP fixture binds both the Memoria URL and its master credential to the
 strict local mock. Enabling self-hosted access exercises the authenticated
 observer request, including its authority queries; a run with access disabled

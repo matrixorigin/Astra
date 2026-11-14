@@ -13,6 +13,7 @@ pub const ACCESS_TTL_SECONDS: u32 = 900;
 pub enum MemoryAccess {
     None,
     ReadOnly,
+    WriteOnly,
     ReadWrite,
 }
 impl MemoryAccess {
@@ -25,16 +26,22 @@ impl MemoryAccess {
             (Self::ReadOnly, true) => Some(
                 "Memory sharing is read-only. Reading memories is allowed, but saving or modifying them requires read/write access. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings to change access.",
             ),
+            (Self::WriteOnly, false) => Some(
+                "Memory access is write-only. Reading memories requires a separate memory read grant.",
+            ),
             _ => None,
         }
     }
     pub fn allows(self, write: bool) -> bool {
-        self == Self::ReadWrite || (!write && self == Self::ReadOnly)
+        self == Self::ReadWrite
+            || (!write && self == Self::ReadOnly)
+            || (write && self == Self::WriteOnly)
     }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::ReadOnly => "read_only",
+            Self::WriteOnly => "write_only",
             Self::ReadWrite => "read_write",
         }
     }
@@ -252,6 +259,8 @@ pub struct MemoriaCredentialResolver {
     pool: SharedPool,
     encryptor: FernetTokenEncryptor,
     uc_provider: Option<super::uc::UcNativeProvider>,
+    external_providers: Vec<super::ExternalAuthProviderConfig>,
+    external_client: std::sync::Arc<dyn super::ExternalProviderClient>,
 }
 
 // One statement snapshot; never cached or reused as an operation grant.
@@ -352,27 +361,38 @@ impl MemoriaCredentialResolver {
             (1, Some(subject)) if !subject.is_empty() => subject,
             _ => return Err("UC memory identity is ambiguous".into()),
         };
-        if self.provider.web_url.is_some() {
+        Self::uc_builtin_credential(&self.provider, uc, subject, MemoryAccess::ReadWrite)
+            .await
+            .map(Some)
+    }
+
+    async fn uc_builtin_credential(
+        memoria: &MemoriaProvider,
+        uc: &super::uc::UcNativeProvider,
+        subject: &str,
+        access: MemoryAccess,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        if access == MemoryAccess::None {
+            return Ok(MemoriaCredentialResolution::Denied);
+        }
+        if memoria.web_url.is_some() {
             return Err("UC built-in memory cannot use a Memoria login website".into());
         }
-        let key = self
-            .provider
+        let key = memoria
             .deployment_key
             .as_ref()
             .ok_or("UC built-in memory is not configured")?;
         if !uc.memory_account_active(subject).await? {
-            return Ok(Some(MemoriaCredentialResolution::Denied));
+            return Ok(MemoriaCredentialResolution::Denied);
         }
-        Ok(Some(MemoriaCredentialResolution::Scoped(
-            MemoriaCredential {
-                key: key.clone(),
-                owner: uc.memory_owner(subject),
-                generation: format!("uc:{}", uc.settings.issuer),
-                access: MemoryAccess::ReadWrite,
-                owner_scoped_master: true,
-                connection_generation: None,
-            },
-        )))
+        Ok(MemoriaCredentialResolution::Scoped(MemoriaCredential {
+            key: key.clone(),
+            owner: uc.memory_owner(subject),
+            generation: format!("uc:{}", uc.settings.issuer),
+            access,
+            owner_scoped_master: true,
+            connection_generation: None,
+        }))
     }
 
     pub fn new(
@@ -385,6 +405,8 @@ impl MemoriaCredentialResolver {
             pool,
             encryptor,
             uc_provider: None,
+            external_providers: Vec::new(),
+            external_client: super::HttpExternalProviderClient::shared(),
         }
     }
     fn token_id(&self, user: &str) -> String {
@@ -423,6 +445,79 @@ impl MemoriaCredentialResolver {
         self.scoped_credential(&snapshot)
     }
 
+    async fn resolve_moi_builtin(
+        memoria: &MemoriaProvider,
+        uc: Option<&super::uc::UcNativeProvider>,
+        external_providers: &[super::ExternalAuthProviderConfig],
+        external_client: &dyn super::ExternalProviderClient,
+        subject: &str,
+        workspace: &str,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        let Some(uc) = uc.filter(|uc| uc.settings.builtin_memory) else {
+            return Ok(MemoriaCredentialResolution::Denied);
+        };
+        if memoria.web_url.is_some() {
+            return Err("UC built-in memory cannot use a Memoria login website".into());
+        }
+        let provider = external_providers
+            .iter()
+            .find(|p| p.id == "moi")
+            .filter(|p| !p.auth_key.is_empty())
+            .ok_or("MOI memory identity service is not configured")?;
+        let identity = match external_client
+            .resolve_memory_identity(provider, workspace, subject)
+            .await
+        {
+            Ok(identity) => identity,
+            Err((status, error))
+                if status == StatusCode::FORBIDDEN
+                    && error.error_code.as_deref() == Some("moi_memory_identity_denied") =>
+            {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
+            Err((status, error)) => {
+                // Use only locally allowlisted categories. Provider text, URLs,
+                // subjects and credentials must never reach tool errors or logs.
+                let kind = match (status, error.error_code.as_deref()) {
+                    (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _) => "service_credentials",
+                    (_, Some("external_provider_request_timeout")) => "timeout",
+                    (_, Some("external_provider_response_invalid")) => "invalid_response",
+                    (_, Some("external_provider_request_failed")) => "transport",
+                    (StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT, _) => {
+                        "unavailable"
+                    }
+                    _ => "upstream_rejected",
+                };
+                tracing::warn!(
+                    phase = "moi_memory_identity",
+                    error_kind = kind,
+                    status = status.as_u16(),
+                    "memory authority lookup failed"
+                );
+                return Err(format!("MOI memory identity lookup failed: {kind}"));
+            }
+        };
+        if identity.external_subject != subject
+            || identity.provider_scope_id != workspace
+            || identity.issuer != uc.settings.issuer
+            || identity.uc_subject.is_empty()
+            || identity.uc_subject.len() > 128
+            || identity.uc_subject.trim() != identity.uc_subject
+            || identity.uc_subject.chars().any(char::is_control)
+        {
+            return Err("MOI memory identity mismatch".into());
+        }
+        let mut resolution =
+            Self::uc_builtin_credential(memoria, uc, &identity.uc_subject, identity.memory_access)
+                .await?;
+        if let MemoriaCredentialResolution::Scoped(credential) = &mut resolution {
+            credential.owner =
+                uc.workspace_memory_owner(&provider.id, workspace, &identity.uc_subject);
+            credential.generation = format!("moi-workspace:{}", credential.owner);
+        }
+        Ok(resolution)
+    }
+
     /// Resolve both the current credential and whether an absent credential
     /// represents an active, genuinely local account that is eligible for the
     /// opt-in self-hosted fallback.
@@ -430,6 +525,51 @@ impl MemoriaCredentialResolver {
         &self,
         user: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        self.resolve_runtime_for_session(user, None).await
+    }
+
+    pub async fn resolve_runtime_for_session(
+        &self,
+        user: &str,
+        session_id: Option<&str>,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        // MOI request principals have no local account row. Resolve through the
+        // pinned provider's authenticated identity service, never by guessing UC IDs.
+        if let Some(subject) = moi_request_subject(user) {
+            if self
+                .uc_provider
+                .as_ref()
+                .is_none_or(|uc| !uc.settings.builtin_memory)
+            {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
+            let Some(session) = session_id.filter(|id| !id.is_empty()) else {
+                return Ok(MemoriaCredentialResolution::Denied);
+            };
+            let Some(scope) = crate::session_fork_coordinator::retained_provider_session_owner(
+                self.pool.get(),
+                user,
+                session,
+                &self.encryptor,
+            )
+            .await
+            .map_err(|_| "MOI memory workspace binding cannot be verified")?
+            else {
+                return Ok(MemoriaCredentialResolution::Denied);
+            };
+            if scope.provider_id != "moi" || scope.provider_scope_id.is_empty() {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
+            return Self::resolve_moi_builtin(
+                &self.provider,
+                self.uc_provider.as_ref(),
+                &self.external_providers,
+                self.external_client.as_ref(),
+                subject,
+                &scope.provider_scope_id,
+            )
+            .await;
+        }
         let Some(snapshot) = self.load_authority_snapshot(user).await? else {
             return Ok(MemoriaCredentialResolution::Denied);
         };
@@ -610,6 +750,8 @@ impl DatabaseAuthService {
             self.encryptor.as_ref()?.clone(),
         );
         resolver.uc_provider = self.uc_provider.clone();
+        resolver.external_providers = self.ext_providers.clone();
+        resolver.external_client = self.external_client.clone();
         Some(resolver)
     }
     pub(super) async fn memoria_owner(
@@ -1088,6 +1230,8 @@ mod provider_contract_tests {
         assert!(!MemoryAccess::None.allows(true));
         assert!(MemoryAccess::ReadOnly.allows(false));
         assert!(!MemoryAccess::ReadOnly.allows(true));
+        assert!(!MemoryAccess::WriteOnly.allows(false));
+        assert!(MemoryAccess::WriteOnly.allows(true));
         assert!(MemoryAccess::ReadWrite.allows(true));
         for scopes in [
             vec![],
@@ -1101,5 +1245,389 @@ mod provider_contract_tests {
                 .is_none()
             );
         }
+    }
+}
+
+// Only server-generated MOI request namespaces enter the product-owned UC path.
+// The trusted provider still resolves and echoes the complete external subject.
+fn moi_request_subject(user: &str) -> Option<&str> {
+    ["provider_authorized:moi:", "external_authorized:moi:"]
+        .iter()
+        .find_map(|prefix| user.strip_prefix(prefix))
+        .filter(|subject| {
+            !subject.is_empty()
+                && subject.len() <= 128
+                && subject.trim() == *subject
+                && !subject.chars().any(char::is_control)
+        })
+}
+
+#[cfg(test)]
+mod moi_memory_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::Path,
+        http::HeaderMap,
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    };
+
+    #[test]
+    fn only_moi_request_namespaces_select_builtin_identity() {
+        for id in [
+            "provider_authorized:moi:iam-1",
+            "external_authorized:moi:iam-1",
+        ] {
+            assert_eq!(moi_request_subject(id), Some("iam-1"));
+        }
+        for id in [
+            "local-user",
+            "provider_authorized:other:iam-1",
+            "external_authorized:moi:",
+            "provider_authorized:moi: iam-1",
+        ] {
+            assert_eq!(moi_request_subject(id), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn moi_memory_identity_http_contract() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = format!("{origin}/realm");
+        let callback_mode = mode.clone();
+        let callback_issuer = issuer.clone();
+        let status_mode = mode.clone();
+        let status_called = Arc::new(AtomicBool::new(false));
+        let status_observed = status_called.clone();
+        let app = Router::new()
+            .route("/callback", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let mode = callback_mode.load(Ordering::SeqCst);
+                let issuer = callback_issuer.clone();
+                async move {
+                    if mode == 21 { tokio::time::sleep(std::time::Duration::from_secs(3)).await; }
+                    assert_eq!(headers["authorization"], "Bearer test-callback-key");
+                    assert_eq!(body, serde_json::json!({"action":"resolve_memory_identity", "provider_id":"moi", "provider_scope_id":"ws-1", "external_subject":"iam-1"}));
+                    let status = match mode {
+                        4 => StatusCode::SERVICE_UNAVAILABLE,
+                        6 | 7 => StatusCode::FORBIDDEN,
+                        8 => StatusCode::UNAUTHORIZED,
+                        _ => StatusCode::OK,
+                    };
+                    let mut body = match mode {
+                        6 | 10 => serde_json::json!({"error":{"code":"moi_memory_identity_denied","message":"identity access denied"}}),
+                        7 => serde_json::json!({"code":403,"message":"unclassified upstream rejection"}),
+                        8 => serde_json::json!({"code":401,"message":"invalid service credential"}),
+                        9 => serde_json::json!({"code":0,"data":null}),
+                        _ => serde_json::json!({"code":0,"data":{
+                            "provider_scope_id": if mode == 22 { "ws-other" } else { "ws-1" },
+                            "memory_access": match mode { 17 => "read_only", 18 => "none", 19 => "invalid", 24 => "write_only", _ => "read_write" },
+                            "external_subject": if mode == 3 { "another-user" } else { "iam-1" },
+                            "issuer": match mode {
+                                2 => "https://wrong.example/realm".to_string(),
+                                11 => format!("{issuer}/"),
+                                _ => issuer,
+                            },
+                            "uc_subject": match mode {
+                                12 => String::new(),
+                                13 => " uc-1".to_string(),
+                                14 => "uc-1\n".to_string(),
+                                15 => "u".repeat(129),
+                                16 => "uc-2".to_string(),
+                                _ => "uc-1".to_string(),
+                            }
+                        }}),
+                    };
+                    if mode == 23 { body["data"].as_object_mut().unwrap().remove("provider_scope_id"); }
+                    if mode == 20 {
+                        body["data"].as_object_mut().unwrap().remove("memory_access");
+                    }
+                    (status, Json(body))
+                }
+            }))
+            .route("/realm/protocol/openid-connect/token", post(|| async {
+                Json(serde_json::json!({"access_token":"test-uc-service", "expires_in":300, "token_type":"Bearer"}))
+            }))
+            .route("/api/v1/uc/internal/users/{subject}/status", get(move |Path(subject): Path<String>, headers: HeaderMap| {
+                let mode = status_mode.load(Ordering::SeqCst);
+                status_observed.store(true, Ordering::SeqCst);
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer test-uc-service");
+                    (if mode == 5 {StatusCode::SERVICE_UNAVAILABLE} else {StatusCode::OK}, Json(serde_json::json!({"code":"OK","data":{
+                        "uc_sub":subject, "status": if mode == 1 {"disabled"} else {"active"}
+                    }})))
+                }
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut uc =
+            super::super::uc::UcNativeProvider::new(astra_core::config::UcNativeSettings {
+                issuer,
+                adapter_url: origin.clone(),
+                moi_api_url: origin.clone(),
+                genesis_url: origin.clone(),
+                client_secret: "test-uc-secret".into(),
+                builtin_memory: true,
+            })
+            .unwrap();
+        let memoria = MemoriaProvider::new(&MemoriaSettings {
+            base_url: "https://memory.example.test".into(),
+            master_key: Some("test-deployment-key".into()),
+            self_hosted_master_access: false,
+            issuer: None,
+            web_url: None,
+        })
+        .unwrap();
+        let client = super::super::HttpExternalProviderClient::default();
+        let providers = vec![super::super::ExternalAuthProviderConfig {
+            id: "moi".into(),
+            display_name: "MOI".into(),
+            external_auth_endpoint: format!("{origin}/callback"),
+            auth_key: "test-callback-key".into(),
+        }];
+        for id in [
+            "provider_authorized:moi:iam-1",
+            "external_authorized:moi:iam-1",
+        ] {
+            let resolved = MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                moi_request_subject(id).unwrap(),
+                "ws-1",
+            )
+            .await
+            .unwrap();
+            let MemoriaCredentialResolution::Scoped(credential) = resolved else {
+                panic!("expected scoped credential")
+            };
+            assert_eq!(
+                credential.owner,
+                uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+            );
+            assert_eq!(credential.access, MemoryAccess::ReadWrite);
+            assert!(credential.owner_scoped_master);
+        }
+        mode.store(16, Ordering::SeqCst);
+        let MemoriaCredentialResolution::Scoped(other) =
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected scoped credential for the changed UC mapping")
+        };
+        assert_eq!(
+            other.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-2")
+        );
+        assert_ne!(
+            other.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+        );
+        mode.store(17, Ordering::SeqCst);
+        let MemoriaCredentialResolution::Scoped(read_only) =
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected an explicit read-only grant")
+        };
+        assert_eq!(read_only.access, MemoryAccess::ReadOnly);
+        assert_eq!(
+            read_only.owner,
+            uc.workspace_memory_owner("moi", "ws-1", "uc-1")
+        );
+        mode.store(24, Ordering::SeqCst);
+        let MemoriaCredentialResolution::Scoped(write_only) =
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected explicit write-only access")
+        };
+        assert!(!write_only.access.allows(false));
+        assert!(write_only.access.allows(true));
+        assert_eq!(write_only.owner, read_only.owner);
+        mode.store(18, Ordering::SeqCst);
+        status_called.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        assert!(!status_called.load(Ordering::SeqCst));
+        mode.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        // The MOI identity owner explicitly denies unknown/inactive accounts.
+        // A service-auth failure or an unclassified 403 is not that contract.
+        mode.store(6, Ordering::SeqCst);
+        status_called.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        assert!(
+            !status_called.load(Ordering::SeqCst),
+            "explicit MOI denial must stop before UC access"
+        );
+        for invalid in [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 22, 23] {
+            mode.store(invalid, Ordering::SeqCst);
+            status_called.store(false, Ordering::SeqCst);
+            assert!(
+                MemoriaCredentialResolver::resolve_moi_builtin(
+                    &memoria,
+                    Some(&uc),
+                    &providers,
+                    &client,
+                    "iam-1",
+                    "ws-1",
+                )
+                .await
+                .is_err(),
+                "invalid callback/status mode {invalid} must fail closed"
+            );
+            if invalid != 5 {
+                assert!(
+                    !status_called.load(Ordering::SeqCst),
+                    "invalid identity mode {invalid} must stop before UC access"
+                );
+            }
+        }
+        for (mode_value, category) in [
+            (8, "service_credentials"),
+            (4, "unavailable"),
+            (9, "invalid_response"),
+            (20, "invalid_response"),
+            (21, "timeout"),
+        ] {
+            mode.store(mode_value, Ordering::SeqCst);
+            let error = MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .err()
+            .expect("authority failure");
+            assert_eq!(
+                error,
+                format!("MOI memory identity lookup failed: {category}")
+            );
+            assert!(!error.contains(&origin));
+            assert!(!error.contains("test-callback-key"));
+        }
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_endpoint = format!("http://{}/callback", closed.local_addr().unwrap());
+        drop(closed);
+        let mut unavailable_providers = providers.clone();
+        unavailable_providers[0].external_auth_endpoint = closed_endpoint;
+        let error = MemoriaCredentialResolver::resolve_moi_builtin(
+            &memoria,
+            Some(&uc),
+            &unavailable_providers,
+            &client,
+            "iam-1",
+            "ws-1",
+        )
+        .await
+        .err()
+        .expect("closed endpoint must not grant access");
+        assert_eq!(error, "MOI memory identity lookup failed: transport");
+        assert!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &[],
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .is_err(),
+            "missing MOI provider configuration must not grant fallback access"
+        );
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria, None, &providers, &client, "iam-1", "ws-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        uc.settings.builtin_memory = false;
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &[],
+                &client,
+                "iam-1",
+                "ws-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        server.abort();
     }
 }

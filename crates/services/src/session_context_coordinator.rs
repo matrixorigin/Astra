@@ -514,7 +514,27 @@ pub struct MaterializedConversationV1 {
     pub authorized_session_ids: HashSet<String>,
     pub logical_segment_count: u64,
     pub canonical_segment_bytes: u64,
+    pub loaded_manifest_count: u64,
+    /// Serialized manifest/content JSON returned by storage, excluding protocol overhead.
+    pub loaded_manifest_json_bytes: u64,
 }
+
+/// Validated content after an acknowledged canonical head. A generation reset
+/// returns the current complete generation, including its retained fork prefix.
+/// Unlike MaterializedConversationV1, messages and byte counts may be a suffix.
+pub struct MaterializedConversationDeltaV1 {
+    pub head: SessionContextHeadV1,
+    pub messages: Vec<Value>,
+    /// Optional bounded, already-acknowledged context for reference resolution.
+    /// These are canonical reads, never another persisted transcript.
+    pub prior_context: Vec<Value>,
+    pub canonical_segment_bytes: u64,
+    pub loaded_manifest_count: u64,
+    pub loaded_manifest_json_bytes: u64,
+}
+
+const OBSERVATION_CONTEXT_MAX_TURNS: u64 = 4;
+const OBSERVATION_CONTEXT_MAX_BYTES: u64 = 32 * 1024;
 
 /// Read-only facts used to prepare a canonical turn. Mutating admission still
 /// revalidates the writer, cursor, epochs, and reservation while holding the
@@ -1291,8 +1311,11 @@ impl DatabaseSessionContextCoordinator {
         };
         let head_json = database_to_json("Run context head", &head)?;
         let mut write = if authority.row_exists {
-            let mut write =
-                QueryBuilder::<MySql>::new("UPDATE session_context_heads SET head_json = ");
+            let mut write = QueryBuilder::<MySql>::new(
+                "UPDATE session_context_heads SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ",
+            );
+            write.push_bind(i64::from(head.cursor.completed_turn))
+                .push(" THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END, head_json = ");
             write
                 .push_bind(&head_json)
                 .push(", canonical_root_hash = ")
@@ -1389,7 +1412,7 @@ impl DatabaseSessionContextCoordinator {
             let mut write = QueryBuilder::<MySql>::new("INSERT INTO session_context_heads
                 (isolation_domain,owner_user_id,session_id,branch_id,head_json,canonical_root_hash,latest_manifest_root,
                  total_canonical_bytes,total_message_count,completed_turn,journal_event_seq,conversation_seq,
-                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch)
+                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch,observation_due_at)
                  SELECT ");
             let mut fields = write.separated(", ");
             fields
@@ -1429,6 +1452,16 @@ impl DatabaseSessionContextCoordinator {
                     "permission epoch",
                     authority.authority_epochs.permission_epoch,
                 )?);
+            write.push(
+                if key.isolation_domain == "server"
+                    && key.branch_id == "main"
+                    && head.cursor.completed_turn > 0
+                {
+                    ", NOW(6)"
+                } else {
+                    ", '9999-12-31 00:00:00'"
+                },
+            );
             write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
                 .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
                 .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id).push(")");
@@ -2533,42 +2566,35 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let mut nodes = std::collections::HashMap::new();
-        self.load_manifest_contents_through(
-            &head.key,
-            head.cursor.compaction_generation,
-            head.cursor.conversation_seq,
-            &mut nodes,
-        )
-        .await?;
-        let mut scope = head.key.clone();
-        let mut through = head.cursor.conversation_seq;
-        let mut visited = HashSet::from([scope.clone()]);
-        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
-            if prefix.parent_cursor.compaction_generation != head.cursor.compaction_generation {
-                break;
-            }
-            if !visited.insert(prefix.parent_key.clone()) {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "cyclic fork lineage".into(),
-                ));
-            }
-            through = through.min(prefix.parent_cursor.conversation_seq);
-            self.load_manifest_contents_through(
-                &prefix.parent_key,
-                prefix.parent_cursor.compaction_generation,
-                through,
-                &mut nodes,
-            )
-            .await?;
-            scope = prefix.parent_key;
+        let sql = canonical_materialization_sql();
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&head.key.isolation_domain)
+            .bind(&head.key.owner_user_id)
+            .bind(&head.key.session_id)
+            .bind(&head.key.branch_id)
+            .bind(i64_from_u64(
+                "head compaction generation",
+                head.cursor.compaction_generation,
+            )?)
+            .bind(i64_from_u64(
+                "head conversation sequence",
+                head.cursor.conversation_seq,
+            )?)
+            .bind(&head.key.isolation_domain)
+            .bind(&head.key.owner_user_id)
+            .bind(&head.key.session_id)
+            .bind(&head.key.branch_id);
+        let mut rows = query.fetch(self.pool.get());
+        let mut loaded = LoadedCanonicalContext::default();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|source| database_error("load_manifest_contents", source))?
+        {
+            loaded.push_row(head, &row)?;
         }
-        let authorized_session_ids = visited.into_iter().map(|key| key.session_id).collect();
-        materialize_nodes(
-            head,
-            order_manifest_chain(head, nodes)?,
-            authorized_session_ids,
-        )
+        drop(rows);
+        self.materialize_loaded(head, loaded).await
     }
 
     async fn load_manifest_delta(
@@ -2867,16 +2893,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             let json: String = row
                 .try_get("manifest_json")
                 .map_err(|source| database_error("decode_fork_prefix", source))?;
-            let manifest: SessionForkManifestV1 = database_json("fork_prefix", &json)?;
-            manifest
-                .validate()
-                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "fork lineage identity or state mismatch".into(),
-                ));
-            }
-            Ok(manifest.shared_prefix())
+            decode_fork_prefix(key, &json)
         })
         .transpose()
     }
@@ -3953,6 +3970,302 @@ impl DatabaseSessionContextCoordinator {
             .transpose()
     }
 
+    /// Materialize a captured head relative to a previously acknowledged head.
+    /// The boundary is durable metadata, never an independently cached transcript.
+    /// Same-generation reads validate the exact parent-root chain and cumulative
+    /// totals against that boundary without loading its content or fork ancestors.
+    pub async fn materialize_after(
+        &self,
+        head: &SessionContextHeadV1,
+        after: Option<&SessionContextHeadV1>,
+    ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
+        self.materialize_after_with_context(head, after, false)
+            .await
+    }
+
+    /// Include at most four preceding canonical turns / 32 KiB for extraction.
+    /// The same selective read returns both the new suffix and bounded overlap.
+    pub async fn materialize_observation(
+        &self,
+        head: &SessionContextHeadV1,
+        after: Option<&SessionContextHeadV1>,
+    ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
+        self.materialize_after_with_context(head, after, true).await
+    }
+
+    async fn materialize_after_with_context(
+        &self,
+        head: &SessionContextHeadV1,
+        after: Option<&SessionContextHeadV1>,
+        include_context: bool,
+    ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
+        validate_head(head)?;
+        if let Some(base) = after {
+            validate_head(base)?;
+            if base.key != head.key
+                || base.cursor.compaction_generation > head.cursor.compaction_generation
+                || base.cursor.completed_turn >= head.cursor.completed_turn
+                || base.cursor.conversation_seq >= head.cursor.conversation_seq
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+            if base.cursor.compaction_generation == head.cursor.compaction_generation {
+                let sql = if include_context {
+                    canonical_observation_materialization_sql()
+                } else {
+                    canonical_suffix_materialization_sql()
+                };
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&head.key.isolation_domain)
+                    .bind(&head.key.owner_user_id)
+                    .bind(&head.key.session_id)
+                    .bind(&head.key.branch_id)
+                    .bind(i64_from_u64(
+                        "suffix generation",
+                        head.cursor.compaction_generation,
+                    )?)
+                    .bind(i64_from_u64(
+                        "suffix lower bound",
+                        if include_context {
+                            base.cursor
+                                .conversation_seq
+                                .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS)
+                        } else {
+                            base.cursor.conversation_seq
+                        },
+                    )?)
+                    .bind(i64_from_u64(
+                        "suffix upper bound",
+                        head.cursor.conversation_seq,
+                    )?);
+                if include_context {
+                    query = query
+                        .bind(i64_from_u64(
+                            "context boundary",
+                            base.cursor.conversation_seq,
+                        )?)
+                        .bind(i64_from_u64(
+                            "context byte boundary",
+                            base.total_canonical_bytes
+                                .saturating_sub(OBSERVATION_CONTEXT_MAX_BYTES),
+                        )?);
+                }
+                let mut rows = query.fetch(self.pool.get());
+                let mut nodes = std::collections::HashMap::new();
+                let mut context_nodes = std::collections::HashMap::new();
+                while let Some(row) = rows
+                    .try_next()
+                    .await
+                    .map_err(|source| database_error("load_manifest_suffix_contents", source))?
+                {
+                    let content = decode_stored_manifest_content(&row, &head.key)?;
+                    let destination =
+                        if content.node.conversation_seq <= base.cursor.conversation_seq {
+                            &mut context_nodes
+                        } else {
+                            &mut nodes
+                        };
+                    if destination
+                        .insert(content.node.manifest_root.clone(), content)
+                        .is_some()
+                    {
+                        return Err(SessionContextCoordinatorError::NeedsRepair(
+                            "duplicate manifest identity".into(),
+                        ));
+                    }
+                }
+                drop(rows);
+                let mut context = materialize_bounded_context(base, context_nodes)?;
+                if include_context {
+                    self.extend_observation_fork_context(base, &mut context)
+                        .await?;
+                }
+                return materialize_nodes_after(
+                    head,
+                    order_manifest_chain_after(head, nodes, Some(&base.latest_manifest_root))?,
+                    HashSet::from([head.key.session_id.clone()]),
+                    Some(base),
+                )
+                .map(|value| MaterializedConversationDeltaV1 {
+                    head: value.head,
+                    messages: value.messages,
+                    prior_context: context.messages,
+                    canonical_segment_bytes: value.canonical_segment_bytes,
+                    loaded_manifest_count: value.loaded_manifest_count + context.loaded_count,
+                    loaded_manifest_json_bytes: value.loaded_manifest_json_bytes
+                        + context.loaded_bytes,
+                });
+            }
+        }
+        // Replacement invalidates the old chain. Reconstruct the new generation
+        // once through the canonical fork-aware owner, then resume suffix reads.
+        self.materialize(head)
+            .await
+            .map(|value| MaterializedConversationDeltaV1 {
+                head: value.head,
+                messages: value.messages,
+                prior_context: Vec::new(),
+                canonical_segment_bytes: value.canonical_segment_bytes,
+                loaded_manifest_count: value.loaded_manifest_count,
+                loaded_manifest_json_bytes: value.loaded_manifest_json_bytes,
+            })
+    }
+
+    async fn extend_observation_fork_context(
+        &self,
+        base: &SessionContextHeadV1,
+        context: &mut BoundedObservationContext,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let mut boundary = base.clone();
+        let mut visited = HashSet::from([base.key.clone()]);
+        // Empty nested forks consume hops too: context lookback must never
+        // turn into an unbounded lineage traversal. Four hops is an explicit
+        // semantic window, not a promise to resolve arbitrary old antecedents.
+        for _ in 0..OBSERVATION_CONTEXT_MAX_TURNS {
+            if context.remaining_root.is_none()
+                || context.loaded_count >= OBSERVATION_CONTEXT_MAX_TURNS
+            {
+                break;
+            }
+            let Some(prefix) = self.load_fork_prefix(&boundary.key).await? else {
+                break;
+            };
+            if context.remaining_root.as_deref() != Some(prefix.parent_manifest_root.as_str()) {
+                // A byte-limited local tail stopped before an oversized node,
+                // rather than at this Session's inherited boundary.
+                break;
+            }
+            if prefix.parent_cursor.compaction_generation != base.cursor.compaction_generation {
+                break;
+            }
+            if prefix.parent_cursor.conversation_seq
+                <= base
+                    .cursor
+                    .conversation_seq
+                    .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS)
+            {
+                break;
+            }
+            if !visited.insert(prefix.parent_key.clone())
+                || context.remaining_bytes != prefix.total_canonical_bytes
+                || context.remaining_messages != prefix.total_message_count
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+            if let Some(node) = &context.first_node {
+                validate_manifest_advance(Some(&prefix.parent_cursor), node)?;
+            } else if !cursor_projection_matches_head(&boundary.cursor, &prefix.parent_cursor) {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+            boundary = SessionContextHeadV1 {
+                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                key: prefix.parent_key,
+                cursor: prefix.parent_cursor,
+                latest_manifest_root: prefix.parent_manifest_root,
+                total_canonical_bytes: prefix.total_canonical_bytes,
+                total_message_count: prefix.total_message_count,
+                // Read-only immutable boundary, never a writer/admission grant.
+                writer_epoch: 0,
+            };
+            let rows = sqlx::query(sqlx::AssertSqlSafe(
+                canonical_observation_materialization_sql(),
+            ))
+            .bind(&boundary.key.isolation_domain)
+            .bind(&boundary.key.owner_user_id)
+            .bind(&boundary.key.session_id)
+            .bind(&boundary.key.branch_id)
+            .bind(i64_from_u64(
+                "context generation",
+                boundary.cursor.compaction_generation,
+            )?)
+            .bind(i64_from_u64(
+                "context lower bound",
+                base.cursor
+                    .conversation_seq
+                    .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS),
+            )?)
+            .bind(i64_from_u64(
+                "context upper bound",
+                boundary.cursor.conversation_seq,
+            )?)
+            .bind(i64_from_u64(
+                "context boundary",
+                boundary.cursor.conversation_seq,
+            )?)
+            .bind(i64_from_u64(
+                "context byte boundary",
+                base.total_canonical_bytes
+                    .saturating_sub(OBSERVATION_CONTEXT_MAX_BYTES),
+            )?)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_observation_fork_context", source))?;
+            let mut nodes = std::collections::HashMap::new();
+            for row in rows {
+                let content = decode_stored_manifest_content(&row, &boundary.key)?;
+                if nodes
+                    .insert(content.node.manifest_root.clone(), content)
+                    .is_some()
+                {
+                    return Err(SessionContextCoordinatorError::DivergentManifest);
+                }
+            }
+            let mut ancestor = materialize_bounded_context(&boundary, nodes)?;
+            ancestor.messages.append(&mut context.messages);
+            ancestor.loaded_count += context.loaded_count;
+            ancestor.loaded_bytes += context.loaded_bytes;
+            *context = ancestor;
+            if context.loaded_count > OBSERVATION_CONTEXT_MAX_TURNS
+                || base.total_canonical_bytes - context.remaining_bytes
+                    > OBSERVATION_CONTEXT_MAX_BYTES
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the immutable nodes selected for a captured canonical head.
+    /// Background consumers use the same public materialization entrypoint.
+    async fn materialize_loaded(
+        &self,
+        head: &SessionContextHeadV1,
+        loaded: LoadedCanonicalContext,
+    ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+        validate_head(head)?;
+        let LoadedCanonicalContext {
+            mut nodes,
+            mut prefix,
+            ..
+        } = loaded;
+        let mut through = head.cursor.conversation_seq;
+        let mut visited = HashSet::from([head.key.clone()]);
+        while let Some(current) = prefix {
+            if current.parent_cursor.compaction_generation != head.cursor.compaction_generation {
+                break;
+            }
+            if !visited.insert(current.parent_key.clone()) {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "cyclic fork lineage".into(),
+                ));
+            }
+            through = through.min(current.parent_cursor.conversation_seq);
+            self.load_manifest_contents_through(
+                &current.parent_key,
+                current.parent_cursor.compaction_generation,
+                through,
+                &mut nodes,
+            )
+            .await?;
+            prefix = self.load_fork_prefix(&current.parent_key).await?;
+        }
+        materialize_nodes(
+            head,
+            order_manifest_chain(head, nodes)?,
+            visited.into_iter().map(|key| key.session_id).collect(),
+        )
+    }
+
     async fn load_manifest_contents_through(
         &self,
         key: &SessionKeyV1,
@@ -4096,12 +4409,21 @@ impl DatabaseSessionContextCoordinator {
 
 fn order_manifest_chain(
     head: &SessionContextHeadV1,
+    nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
+    order_manifest_chain_after(head, nodes, None)
+}
+
+fn order_manifest_chain_after(
+    head: &SessionContextHeadV1,
     mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+    boundary: Option<&str>,
 ) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
     let mut root = Some(head.latest_manifest_root.clone());
     let mut seen = HashSet::new();
     let mut reverse = Vec::new();
-    while let Some(current) = root {
+    while root.as_deref() != boundary {
+        let current = root.ok_or(SessionContextCoordinatorError::DivergentManifest)?;
         if !seen.insert(current.clone()) {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "manifest cycle detected".into(),
@@ -4235,10 +4557,25 @@ fn materialize_nodes(
     nodes: Vec<StoredManifestContent>,
     authorized_session_ids: HashSet<String>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+    materialize_nodes_after(head, nodes, authorized_session_ids, None)
+}
+
+// Private accumulator: only the complete-view wrapper above exposes this as a
+// MaterializedConversationV1; incremental callers return the explicit delta type.
+fn materialize_nodes_after(
+    head: &SessionContextHeadV1,
+    nodes: Vec<StoredManifestContent>,
+    authorized_session_ids: HashSet<String>,
+    base: Option<&SessionContextHeadV1>,
+) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+    let loaded_manifest_count = nodes.len() as u64;
+    let loaded_manifest_json_bytes = nodes.iter().map(|node| node.serialized_bytes).sum();
     let mut messages = Vec::new();
     let mut logical_segment_count = 0_u64;
-    let mut canonical_segment_bytes = 0_u64;
-    let mut prior_cursor = None;
+    let base_bytes = base.map_or(0, |head| head.total_canonical_bytes);
+    let base_messages = base.map_or(0, |head| head.total_message_count);
+    let mut canonical_segment_bytes = base_bytes;
+    let mut prior_cursor = base.map(|head| head.cursor.clone());
     for content in nodes {
         validate_manifest_advance(prior_cursor.as_ref(), &content.node)?;
         for segment in content.segments {
@@ -4257,7 +4594,8 @@ fn materialize_nodes(
             messages.extend(segment.messages);
         }
         if content.total_canonical_bytes != canonical_segment_bytes
-            || content.total_message_count != u64::try_from(messages.len()).unwrap_or(u64::MAX)
+            || Some(content.total_message_count)
+                != base_messages.checked_add(u64::try_from(messages.len()).unwrap_or(u64::MAX))
         {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "manifest totals do not match its content".into(),
@@ -4266,7 +4604,8 @@ fn materialize_nodes(
         prior_cursor = Some(content.node.cursor());
     }
     if canonical_segment_bytes != head.total_canonical_bytes
-        || u64::try_from(messages.len()).ok() != Some(head.total_message_count)
+        || base_messages.checked_add(u64::try_from(messages.len()).unwrap_or(u64::MAX))
+            != Some(head.total_message_count)
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "materialized totals do not match the canonical head".into(),
@@ -4277,7 +4616,9 @@ fn materialize_nodes(
         messages,
         authorized_session_ids,
         logical_segment_count,
-        canonical_segment_bytes,
+        canonical_segment_bytes: canonical_segment_bytes - base_bytes,
+        loaded_manifest_count,
+        loaded_manifest_json_bytes,
     })
 }
 
@@ -5852,7 +6193,9 @@ async fn update_database_state(
     })?;
     let update_sql = matrixone_statement_with_null_shape(
         "UPDATE session_context_heads
-         SET head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
+         SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ?
+                 THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END,
+             head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
              total_canonical_bytes = ?, total_message_count = ?,
              completed_turn = ?, journal_event_seq = ?, conversation_seq = ?,
              projection_schema = ?, compaction_generation = ?, writer_epoch = ?,
@@ -5875,6 +6218,7 @@ async fn update_database_state(
         ],
     );
     let result = sqlx::query(update_sql)
+        .bind(completed_turn)
         .bind(head_json)
         .bind(canonical_root)
         .bind(manifest_root)
@@ -6415,11 +6759,206 @@ fn validate_stored_manifest(
     Ok(())
 }
 
+/// Keep direct storage predicates: a derived key joined to the catalog does
+/// not receive selective predicate pushdown on MatrixOne.
+pub(crate) fn canonical_suffix_materialization_sql() -> String {
+    format!(
+        "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+        WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+          AND compaction_generation = ? AND reachable = 1
+          AND conversation_seq > ? AND conversation_seq <= ?"
+    )
+}
+
+pub(crate) fn canonical_observation_materialization_sql() -> String {
+    format!(
+        "{} AND (conversation_seq > ? OR total_canonical_bytes - canonical_segment_bytes >= ?)",
+        canonical_suffix_materialization_sql()
+    )
+}
+
+/// Validate a bounded tail backwards against the acknowledged immutable head.
+/// Its older boundary may be outside this window (or in an inherited fork),
+/// but every returned node must link to the head with matching cursor/totals.
+struct BoundedObservationContext {
+    messages: Vec<Value>,
+    first_node: Option<ContextManifestNodeV1>,
+    remaining_root: Option<String>,
+    remaining_bytes: u64,
+    remaining_messages: u64,
+    loaded_count: u64,
+    loaded_bytes: u64,
+}
+fn materialize_bounded_context(
+    base: &SessionContextHeadV1,
+    mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<BoundedObservationContext, SessionContextCoordinatorError> {
+    let loaded_count = nodes.len() as u64;
+    let loaded_bytes = nodes.values().map(|node| node.serialized_bytes).sum();
+    let mut root = Some(base.latest_manifest_root.clone());
+    let mut bytes = base.total_canonical_bytes;
+    let mut messages = base.total_message_count;
+    let mut reverse = Vec::new();
+    while let Some(node) = root.as_ref().and_then(|root| nodes.remove(root)) {
+        if reverse.is_empty() && !cursor_projection_matches_head(&node.node.cursor(), &base.cursor)
+            || node.total_canonical_bytes != bytes
+            || node.total_message_count != messages
+        {
+            return Err(SessionContextCoordinatorError::DivergentManifest);
+        }
+        let node_bytes = node.segments.iter().map(|s| s.canonical_bytes).sum::<u64>();
+        let node_messages = node
+            .segments
+            .iter()
+            .map(|s| s.messages.len() as u64)
+            .sum::<u64>();
+        bytes = bytes
+            .checked_sub(node_bytes)
+            .ok_or(SessionContextCoordinatorError::DivergentManifest)?;
+        messages = messages
+            .checked_sub(node_messages)
+            .ok_or(SessionContextCoordinatorError::DivergentManifest)?;
+        root = if node.node.replaces_history {
+            None
+        } else {
+            node.node.parent_manifest_root.clone()
+        };
+        if root.is_none() && (bytes != 0 || messages != 0) {
+            return Err(SessionContextCoordinatorError::DivergentManifest);
+        }
+        if root.is_none() {
+            validate_manifest_advance(None, &node.node)?;
+        }
+        reverse.push(node);
+    }
+    if !nodes.is_empty()
+        || reverse.len() as u64 > OBSERVATION_CONTEXT_MAX_TURNS
+        || base.total_canonical_bytes - bytes > OBSERVATION_CONTEXT_MAX_BYTES
+    {
+        return Err(SessionContextCoordinatorError::DivergentManifest);
+    }
+    reverse.reverse();
+    for pair in reverse.windows(2) {
+        validate_manifest_advance(Some(&pair[0].node.cursor()), &pair[1].node)?;
+    }
+    Ok(BoundedObservationContext {
+        first_node: reverse.first().map(|node| node.node.clone()),
+        messages: reverse
+            .into_iter()
+            .flat_map(|node| node.segments)
+            .flat_map(|segment| segment.messages)
+            .collect(),
+        remaining_root: root,
+        remaining_bytes: bytes,
+        remaining_messages: messages,
+        loaded_count,
+        loaded_bytes,
+    })
+}
+
+pub(crate) fn canonical_materialization_sql() -> String {
+    let columns = qualified_manifest_content_columns("m");
+    format!(
+        "SELECT {columns}, CAST(NULL AS CHAR) AS fork_manifest_json
+               FROM conversation_manifest_nodes m
+               WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+                 AND compaction_generation = ? AND reachable = 1 AND conversation_seq <= ?
+             UNION ALL
+               SELECT {}, manifest_json AS fork_manifest_json
+               FROM session_forks FORCE INDEX (uq_session_forks_child)
+               WHERE isolation_domain = ? AND owner_user_id = ? AND child_session_id = ?
+                 AND child_branch_id = ? AND state = 'active'",
+        MANIFEST_CONTENT_COLUMNS
+            .split(',')
+            // MatrixOne otherwise promotes nullable UNION integer columns to
+            // VARCHAR, which breaks the canonical typed row decoder.
+            .map(|column| match column.trim() {
+                "manifest_root" | "parent_manifest_root" | "manifest_json" | "content_json" =>
+                    "CAST(NULL AS CHAR)",
+                _ => "CAST(NULL AS SIGNED)",
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn qualified_manifest_content_columns(alias: &str) -> String {
+    MANIFEST_CONTENT_COLUMNS
+        .split(',')
+        .map(|column| format!("{alias}.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decode_fork_prefix(
+    key: &SessionKeyV1,
+    json: &str,
+) -> Result<SharedManifestPrefixV1, SessionContextCoordinatorError> {
+    let manifest: SessionForkManifestV1 = database_json("fork_prefix", json)?;
+    manifest
+        .validate()
+        .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
+    if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "fork lineage identity or state mismatch".into(),
+        ));
+    }
+    Ok(manifest.shared_prefix())
+}
+
 const MANIFEST_CONTENT_COLUMNS: &str = "manifest_root, parent_manifest_root, completed_turn,
     conversation_seq, compaction_generation, canonical_segment_bytes,
     total_canonical_bytes, total_message_count, manifest_json, content_json, reachable";
 
+/// Validated manifest content, without retaining another copy of SQL bodies.
+#[derive(Default)]
+struct LoadedCanonicalContext {
+    nodes: std::collections::HashMap<String, StoredManifestContent>,
+    prefix: Option<SharedManifestPrefixV1>,
+}
+impl LoadedCanonicalContext {
+    fn push_row(
+        &mut self,
+        head: &SessionContextHeadV1,
+        row: &sqlx::mysql::MySqlRow,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        if let Some(json) = row
+            .try_get::<Option<String>, _>("fork_manifest_json")
+            .map_err(|source| database_error("decode_fork_prefix", source))?
+        {
+            validate_head(head)?;
+            if self
+                .prefix
+                .replace(decode_fork_prefix(&head.key, &json)?)
+                .is_some()
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "duplicate fork lineage".into(),
+                ));
+            }
+        }
+        if row
+            .try_get::<Option<String>, _>("manifest_root")
+            .map_err(|source| database_error("decode_manifest_root", source))?
+            .is_some()
+        {
+            let content = decode_stored_manifest_content(row, &head.key)?;
+            if self
+                .nodes
+                .insert(content.node.manifest_root.clone(), content)
+                .is_some()
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "duplicate manifest identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 struct StoredManifestContent {
+    serialized_bytes: u64,
     node: ContextManifestNodeV1,
     segments: Vec<ConversationSegmentV1>,
     total_canonical_bytes: u64,
@@ -6541,6 +7080,7 @@ fn decode_stored_manifest_content(
         total_message_count,
     )?;
     Ok(StoredManifestContent {
+        serialized_bytes: (json.len() + content_json.len()) as u64,
         node,
         segments,
         total_canonical_bytes,

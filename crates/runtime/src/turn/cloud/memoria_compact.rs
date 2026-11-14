@@ -530,6 +530,7 @@ pub(crate) fn select_memoria_authority<T>(
 pub struct UserScopedMemoriaPort {
     resolver: astra_services::auth::memoria::MemoriaCredentialResolver,
     owner_user_id: Option<String>,
+    session_id: Option<String>,
     self_hosted_fallback: Option<SelfHostedMemoriaFallback>,
 }
 
@@ -547,6 +548,7 @@ impl UserScopedMemoriaPort {
         Self {
             resolver,
             owner_user_id: Some(owner_user_id),
+            session_id: None,
             self_hosted_fallback: None,
         }
     }
@@ -554,8 +556,14 @@ impl UserScopedMemoriaPort {
         Self {
             resolver,
             owner_user_id: None,
+            session_id: None,
             self_hosted_fallback: None,
         }
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     /// Allow owner-scoped master access only when authentication explicitly
@@ -576,19 +584,39 @@ impl UserScopedMemoriaPort {
     // Resolve fresh authority without constructing an HTTP client. Transport
     // consumers such as the observer own their request-specific client policy.
     async fn transport(&self, write: bool) -> Result<MemoriaToolTransport, MemoriaOperationError> {
+        self.transport_for_operations(&[write]).await
+    }
+
+    // Compound operations check independent grants against one fresh identity
+    // and workspace resolution. No grant or transport is cached between calls.
+    async fn transport_for_operations(
+        &self,
+        operations: &[bool],
+    ) -> Result<MemoriaToolTransport, MemoriaOperationError> {
         let owner_user_id = self
             .owner_user_id()
             .map_err(MemoriaOperationError::AuthorityUnavailable)?;
         match select_memoria_authority(
             self.resolver
-                .resolve_runtime(owner_user_id)
+                .resolve_runtime_for_session(owner_user_id, self.session_id.as_deref())
                 .await
                 .map_err(MemoriaOperationError::AuthorityUnavailable)?,
             self.self_hosted_fallback.is_some(),
         ) {
             MemoriaAuthoritySelection::Scoped(credential) => {
-                if let Some(message) = credential.access.denial_message(write) {
-                    return Err(MemoriaOperationError::Disabled(message.into()));
+                for &write in operations {
+                    if let Some(message) = credential.access.denial_message(write) {
+                        // Built-in grants belong to the hosting product, not to
+                        // the separate Memoria website's Connected apps page.
+                        let message = if credential.owner_scoped_master && write {
+                            "Memory access is read-only. Ask your workspace memory administrator to grant memory.write before saving or modifying memories."
+                        } else if credential.owner_scoped_master {
+                            "Memory read access is not enabled. Ask your workspace memory administrator to grant memory.read."
+                        } else {
+                            message
+                        };
+                        return Err(MemoriaOperationError::Disabled(message.into()));
+                    }
                 }
                 Ok(MemoriaToolTransport {
                     base_url: self.resolver.provider.base_url.clone(),
@@ -632,7 +660,9 @@ impl MemoriaPort for UserScopedMemoriaPort {
     async fn admits_operation(&self, write: bool) -> Result<bool, String> {
         Ok(
             match select_memoria_authority(
-                self.resolver.resolve_runtime(self.owner_user_id()?).await?,
+                self.resolver
+                    .resolve_runtime_for_session(self.owner_user_id()?, self.session_id.as_deref())
+                    .await?,
                 self.self_hosted_fallback.is_some(),
             ) {
                 MemoriaAuthoritySelection::Scoped(credential) => credential.access.allows(write),
@@ -654,6 +684,25 @@ impl MemoriaPort for UserScopedMemoriaPort {
         Ok(std::sync::Arc::new(bound))
     }
 
+    fn bind_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<std::sync::Arc<dyn MemoriaPort>, String> {
+        astra_memoria::MemoryScope::new(user_id, session_id)?;
+        if self
+            .owner_user_id
+            .as_deref()
+            .is_some_and(|owner| owner != user_id)
+        {
+            return Err("memory_scope_violation: requested owner differs from bound owner".into());
+        }
+        let mut bound = self.clone();
+        bound.owner_user_id = Some(user_id.to_string());
+        bound.session_id = Some(session_id.to_string());
+        Ok(std::sync::Arc::new(bound))
+    }
+
     async fn resolve_tool_transport(
         &self,
         write: bool,
@@ -663,6 +712,13 @@ impl MemoriaPort for UserScopedMemoriaPort {
             .await
             .map_err(|error| error.to_string())?;
         Ok(Some(transport))
+    }
+
+    async fn resolve_read_write_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        self.transport_for_operations(&[false, true])
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
@@ -791,10 +847,11 @@ impl MemoriaPort for UserScopedMemoriaPort {
         session_id: &str,
         force: bool,
     ) -> Result<ReflectSummary, String> {
-        self.client(true)
-            .await
-            .map_err(|error| error.to_string())?
-            .0
+        let transport = self
+            .resolve_read_write_transport()
+            .await?
+            .ok_or("reflection requires a read/write memory transport")?;
+        HttpMemoriaPort::from_transport(transport)
             .reflect_session(session_id, force)
             .await
     }

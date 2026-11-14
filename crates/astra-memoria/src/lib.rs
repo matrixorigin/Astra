@@ -387,6 +387,16 @@ pub trait MemoriaPort: Send + Sync {
         Err("Memoria transport does not support authenticated owner rebinding".to_string())
     }
 
+    /// Bind the canonical Session identity as well as its authenticated user.
+    /// User-scoped providers resolve any retained workspace binding afresh.
+    fn bind_session(
+        &self,
+        user_id: &str,
+        _session_id: &str,
+    ) -> Result<Arc<dyn MemoriaPort>, String> {
+        self.bind_owner(user_id)
+    }
+
     /// Resolve the authority used by a prompt-facing memory tool operation.
     /// Runtime-only ports may leave this unsupported; concrete HTTP and
     /// user-scoped ports return an owner-bound transport.
@@ -395,6 +405,25 @@ pub trait MemoriaPort: Send + Sync {
         _write: bool,
     ) -> Result<Option<MemoriaToolTransport>, String> {
         Ok(None)
+    }
+
+    /// Resolve compound operations that both reveal stored memory and mutate it.
+    /// Providers may override this to check both grants in one fresh snapshot.
+    /// The default requires matching owner/backend identities across both checks.
+    async fn resolve_read_write_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        let Some(read) = self.resolve_tool_transport(false).await? else {
+            return Ok(None);
+        };
+        let Some(write) = self.resolve_tool_transport(true).await? else {
+            return Ok(None);
+        };
+        if read.owner_user_id != write.owner_user_id
+            || read.base_url != write.base_url
+            || read.owner_scoped_master != write.owner_scoped_master
+        {
+            return Err("memory_scope_violation: read and write authority differ".into());
+        }
+        Ok(Some(write))
     }
 
     /// Resolve observer write authority at dispatch. Implementations may

@@ -755,6 +755,17 @@ history policy to the existing personal model row. It rejects earlier databases 
 fresh-database contract; no implicit migration runs. Operators must make an
 explicit data and deployment decision before moving an existing database.
 
+Fresh schema contract `2026-11-11-v125` gives `session_context_heads` a due-time
+leading physical key and a UNIQUE full SessionKey. The existing completion write
+marks observation due; the same row owns per-Session claim, retry and checkpoint
+state. Idle heads use a far-future due timestamp, so storage can prune completed
+history. Nullable secondary-index plans did not provide that guarantee on
+MatrixOne. This removes the earlier allocated-ID sweep, its shard leases and
+observation's journal projection. It adds no synchronous SQL statement, job row
+or transcript copy, but changing a due time updates the physical key and indexes.
+Existing databases require an explicitly reviewed migration or fresh-schema
+cutover, including handling retained pending facts; bootstrap does not migrate.
+
 Personal API-key and connection model fields are declared together in the canonical
 `user_llm_models` CREATE. Startup checks their types, nullability and declaration
 fingerprint on both completed and interrupted bootstrap paths; it rejects drift

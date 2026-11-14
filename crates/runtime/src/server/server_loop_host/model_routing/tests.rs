@@ -1988,3 +1988,60 @@ async fn retired_decisions_fail_before_recovery_or_child_resolution() {
         );
     }
 }
+
+#[tokio::test]
+async fn absent_auto_decision_is_reused_only_for_the_same_owned_run() {
+    let (catalog, engine, mut publisher, mut state) = fixture().await;
+    let mut next_owner = host(catalog.clone(), engine.clone());
+    let mut reader = host(catalog, engine);
+    assert!(!reader.restore_model_routing(&state).await.unwrap());
+    assert!(!next_owner.restore_model_routing(&state).await.unwrap());
+    // A duplicate preflight in this same owned invocation need not repeat a
+    // missing immutable-event read. Publishing still owns the generation CAS.
+    publisher
+        .prepare_auto_model_selection(&mut state)
+        .await
+        .unwrap();
+    assert!(!reader.restore_model_routing(&state).await.unwrap());
+    assert!(
+        reader.restore_model_routing(&state).await.unwrap(),
+        "a retry after uncertain publication must re-read the durable decision"
+    );
+    // A new owner generation must read the durable decision rather than reuse
+    // the previous generation's absence. No model request is dispatched here.
+    state.current_run_owner_generation = state
+        .current_run_owner_generation
+        .map(|generation| generation + 1);
+    assert!(next_owner.restore_model_routing(&state).await.unwrap());
+    assert!(
+        next_owner
+            .model_routing
+            .as_ref()
+            .unwrap()
+            .decision
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn failed_auto_publication_does_not_retain_a_missing_decision_snapshot() {
+    let (_, _, mut publisher, mut state) = fixture().await;
+    state.current_run_owner_generation = state
+        .current_run_owner_generation
+        .map(|generation| generation + 1);
+    assert!(
+        publisher
+            .prepare_auto_model_selection(&mut state)
+            .await
+            .is_err()
+    );
+    assert!(
+        publisher
+            .model_routing
+            .as_ref()
+            .unwrap()
+            .missing_decision_for
+            .is_none(),
+        "retry must re-read storage after a publication attempt"
+    );
+}

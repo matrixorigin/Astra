@@ -576,6 +576,120 @@ async fn public_exit_close_and_status_routes_preserve_ownership_and_durable_hand
     );
 }
 
+struct ReadGrantPort {
+    inner: Arc<dyn MemoriaPort>,
+    read_allowed: std::sync::atomic::AtomicBool,
+    resolutions: Mutex<Vec<bool>>,
+}
+
+#[async_trait::async_trait]
+impl MemoriaPort for ReadGrantPort {
+    async fn resolve_tool_transport(
+        &self,
+        write: bool,
+    ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
+        self.resolutions.lock().unwrap().push(write);
+        if !write && !self.read_allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("memory.read is disabled".into());
+        }
+        self.inner.resolve_tool_transport(write).await
+    }
+
+    async fn retrieve_ext(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+        _: bool,
+    ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
+        panic!("finalization reads through the resolved HTTP transport")
+    }
+    async fn store(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<String, String> {
+        panic!("plan preparation must not write memories")
+    }
+    async fn purge_working(&self, _: &str) -> Result<u64, String> {
+        panic!("plan preparation must not purge memories")
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn finalization_snapshot_requires_read_grant_before_inventory_and_cached_plan() {
+    use std::sync::atomic::Ordering;
+    let f = fixture().await;
+    f.store
+        .request_finalization(&f.user, &f.session)
+        .await
+        .unwrap();
+    let claim = f.store.claim(&f.user, &f.session).await.unwrap().unwrap();
+    let authority = Arc::new(ReadGrantPort {
+        inner: f.inner.clone(),
+        read_allowed: false.into(),
+        resolutions: Mutex::new(Vec::new()),
+    });
+    // A write-only owner retains its write transport; it cannot use that
+    // owner-scoped deployment credential for an implicit snapshot read.
+    assert!(
+        authority
+            .resolve_tool_transport(true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    authority.resolutions.lock().unwrap().clear();
+    let port = DurableMemoriaPort {
+        inner: authority.clone(),
+        store: f.store.clone(),
+        claim,
+    };
+    assert!(
+        port.prepare_plan().await.is_err(),
+        "write-only access cannot read an inventory"
+    );
+    assert!(f.backend.lock().unwrap().calls.is_empty());
+    assert!(
+        f.store
+            .load_claim_work(&port.claim)
+            .await
+            .unwrap()
+            .plan
+            .is_none()
+    );
+    assert_eq!(*authority.resolutions.lock().unwrap(), vec![false]);
+
+    authority.read_allowed.store(true, Ordering::SeqCst);
+    let plan = port.prepare_plan().await.unwrap();
+    assert_eq!(plan.memories.len(), 1);
+    assert!(
+        f.store
+            .load_claim_work(&port.claim)
+            .await
+            .unwrap()
+            .plan
+            .is_some()
+    );
+    assert_eq!(f.backend.lock().unwrap().calls.get("list"), Some(&1));
+
+    authority.read_allowed.store(false, Ordering::SeqCst);
+    assert!(
+        port.prepare_plan().await.is_err(),
+        "a frozen plan cannot bypass a revoked read grant"
+    );
+    assert_eq!(f.backend.lock().unwrap().calls.get("list"), Some(&1));
+    assert!(port.reflect_session(&f.session, false).await.is_err());
+    assert!(!f.backend.lock().unwrap().calls.contains_key("reflect"));
+    assert_eq!(
+        *authority.resolutions.lock().unwrap(),
+        vec![false, false, false, false]
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn stale_canonical_watermark_and_old_backend_never_authorize_working_cleanup() {

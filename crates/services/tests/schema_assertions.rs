@@ -1681,6 +1681,9 @@ async fn phase1_run_durability_schema_contract() {
     );
     let context_heads = column_names(&pool, &schema, "session_context_heads").await;
     for expected in [
+        "observation_json",
+        "observation_due_at",
+        "observation_lease_token",
         "head_json",
         "canonical_root_hash",
         "latest_manifest_root",
@@ -1701,6 +1704,23 @@ async fn phase1_run_durability_schema_contract() {
     }
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_heads").await,
+        [
+            "observation_due_at",
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "idle recovery must physically exclude completed history"
+    );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "session_context_heads",
+            "uq_session_context_identity"
+        )
+        .await,
         [
             "isolation_domain",
             "owner_user_id",

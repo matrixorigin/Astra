@@ -80,6 +80,25 @@ impl UcNativeProvider {
         format!("uc_{}", URL_SAFE_NO_PAD.encode(digest))
     }
 
+    /// Workspace personal memory has a separate domain from native UC memory.
+    pub(crate) fn workspace_memory_owner(
+        &self,
+        provider: &str,
+        workspace: &str,
+        subject: &str,
+    ) -> String {
+        use sha2::Digest;
+        let identity = serde_json::json!([
+            "astra.workspace-memory.v1",
+            provider,
+            workspace,
+            self.settings.issuer,
+            subject
+        ]);
+        let digest = sha2::Sha256::digest(identity.to_string());
+        format!("mws_{}", URL_SAFE_NO_PAD.encode(digest))
+    }
+
     /// Memory authority is account-scoped, not a retained CLI session token.
     /// Recheck UC on each operation, including background writes after login.
     pub(crate) async fn memory_account_active(&self, subject: &str) -> Result<bool, String> {
@@ -358,6 +377,47 @@ mod memory_tests {
         assert_ne!(owner, first.memory_owner("bob"));
         assert_ne!(owner, second.memory_owner("alice"));
         assert_eq!(first.memory_owner(&"a".repeat(128)).len(), 46);
+    }
+
+    #[test]
+    fn workspace_memory_namespace_isolated_from_other_workspaces_users_and_native_login() {
+        let uc = provider("https://uc.example.test/realms/one");
+        let owner = uc.workspace_memory_owner("moi", "workspace-a", "alice");
+        assert_eq!(owner.len(), 47);
+        assert_eq!(
+            owner,
+            uc.workspace_memory_owner("moi", "workspace-a", "alice")
+        );
+        assert_ne!(
+            owner,
+            uc.workspace_memory_owner("moi", "workspace-b", "alice")
+        );
+        assert_ne!(
+            owner,
+            uc.workspace_memory_owner("moi", "workspace-a", "bob")
+        );
+        assert_ne!(
+            owner,
+            uc.workspace_memory_owner("other", "workspace-a", "alice")
+        );
+        assert_ne!(
+            owner,
+            provider("https://uc.example.test/realms/two").workspace_memory_owner(
+                "moi",
+                "workspace-a",
+                "alice"
+            )
+        );
+        assert_ne!(owner, uc.memory_owner("alice"));
+        assert_ne!(
+            uc.workspace_memory_owner("moi", "ab", "c"),
+            uc.workspace_memory_owner("moi", "a", "bc")
+        );
+        assert!(
+            owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
     }
 
     #[test]

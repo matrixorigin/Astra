@@ -8,7 +8,7 @@
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 #[path = "../support/memoria_observer_auth.rs"]
-mod memoria_observer_auth;
+pub(super) mod memoria_observer_auth;
 
 use std::sync::Arc;
 
@@ -213,6 +213,8 @@ async fn build_state(
 #[derive(Clone, Default)]
 pub struct E2eMemoriaStub {
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Authenticated HTTP observer payloads, separate from explicit-tool calls.
+    pub observations: Arc<Mutex<Vec<Value>>>,
     /// When true, [`MemoriaForwarder::forward`] returns an error (simulates Memoria outage).
     pub fail_forward: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -261,19 +263,29 @@ impl MemoriaForwarder for E2eMemoriaStub {
     }
 }
 
-async fn start_mock_memoria() -> String {
+async fn start_mock_memoria(memoria: Arc<E2eMemoriaStub>) -> String {
     let app = Router::new()
         .route(
             "/v1/observe",
-            post(|headers: axum::http::HeaderMap| async move {
-                memoria_observer_auth::validate_observer_auth(
-                    &headers,
-                    MOCK_MEMORIA_MASTER_KEY,
-                    None,
-                )
-                .err()
-                .unwrap_or(StatusCode::NO_CONTENT)
-            }),
+            post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let memoria = memoria.clone();
+                    async move {
+                        if let Err(status) = memoria_observer_auth::validate_observer_auth(
+                            &headers,
+                            MOCK_MEMORIA_MASTER_KEY,
+                            None,
+                        ) {
+                            return status;
+                        }
+                        let Ok(payload) = serde_json::from_slice(&body) else {
+                            return StatusCode::BAD_REQUEST;
+                        };
+                        memoria.observations.lock().await.push(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
         )
         .route(
             "/v1/health/storage",
@@ -329,7 +341,8 @@ async fn start_mock_memoria() -> String {
 async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     use astra_runtime::{DatabaseTurnObserverWorker, TurnObserverRequest, TurnObserverWorker};
 
-    let base_url = start_mock_memoria().await;
+    let memoria = Arc::new(E2eMemoriaStub::default());
+    let base_url = start_mock_memoria(memoria.clone()).await;
     // Mirror build_state: credentials inherited from CI/developer settings
     // belong to the replaced upstream, not to this strict local mock.
     let mut settings = astra_core::MemoriaSettings {
@@ -365,6 +378,7 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     .expect("local observer deadline")
     .expect("production observer reaches fixture");
 
+    assert_eq!(memoria.observations.lock().await.len(), 1);
     let rejected = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -391,6 +405,7 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
         .await
         .unwrap();
     assert_eq!(foreign_credential.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(memoria.observations.lock().await.len(), 1);
 
     let response = reqwest::Client::builder()
         .no_proxy()
@@ -754,7 +769,7 @@ impl MatrixE2eCtx {
         self.app_state.close_database_pools().await;
         let (state, database, _) = build_state(
             self.memoria.clone(),
-            start_mock_memoria().await,
+            start_mock_memoria(self.memoria.clone()).await,
             self.isolated_database.as_deref(),
         )
         .await;
@@ -1113,7 +1128,7 @@ pub async fn bootstrap_isolated_execution_handoff(database: String) -> Bootstrap
 
 async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
-    let memoria_base_url = start_mock_memoria().await;
+    let memoria_base_url = start_mock_memoria(memoria.clone()).await;
     let (state, matrixone_database, url) = build_state(
         memoria.clone(),
         memoria_base_url.clone(),
