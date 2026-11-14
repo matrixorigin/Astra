@@ -3,7 +3,6 @@ use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
-use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::{JournalEvent, ToolCallDisposition};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -18,15 +17,13 @@ use astra_turn_core::sse_stream_host::{
     consume_sse_stream_cancellable, stream_idle_timeout,
 };
 use astra_turn_core::tool_policy::is_tool_concurrency_safe;
-use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 use crossterm::{cursor, execute, style::Stylize, terminal};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -1080,161 +1077,6 @@ impl RenderPolicy {
     }
 }
 
-/// Cross-turn tool output cache for the CLI edge tool execution path.
-///
-/// Mirrors the headless round's `InMemoryIdempotencyCache` + `call_counts`, but
-/// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
-/// (read_file, list_dir, …) get their output stored and replayed on repeat.
-/// All tools get a hard call-count limit to prevent runaway repetition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum EdgeToolCacheValidation {
-    FileMtime {
-        path: PathBuf,
-        timestamp_ms: u128,
-        content_sha256: [u8; 32],
-    },
-    DirectoryMtime {
-        path: PathBuf,
-        timestamp_ms: u128,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EdgeToolCacheEntry {
-    output: String,
-    status: String,
-    validation: EdgeToolCacheValidation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EdgeProviderRoundBoundary {
-    session_turn: u32,
-    llm_rounds_completed: u32,
-    request: astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
-}
-
-impl EdgeProviderRoundBoundary {
-    fn from_feedback(
-        frame: &astra_turn_core::context_feedback::RuntimeFeedbackFrame,
-    ) -> Option<Self> {
-        let request = frame.identity.request.as_ref()?;
-        (request.round == frame.progress.agentic_round_index).then(|| Self {
-            session_turn: frame.progress.session_turn,
-            llm_rounds_completed: frame.progress.llm_rounds_completed,
-            request: request.clone(),
-        })
-    }
-}
-
-pub(crate) struct EdgeToolCache {
-    /// `dedup_signature → cached output + validity contract` for safe replay.
-    output_cache: std::collections::HashMap<String, EdgeToolCacheEntry>,
-    /// `dedup_signature → count` within the current provider round.
-    call_counts: std::collections::HashMap<String, u32>,
-    /// Hard cap on identical calls (same tool + same args).
-    max_identical_calls: u32,
-    /// Latest server-authoritative provider round observed on this SSE stream.
-    /// Repeated frames for the same round do not reset the local batch guard.
-    provider_round: Option<EdgeProviderRoundBoundary>,
-}
-
-impl EdgeToolCache {
-    pub fn new(max_identical_calls: u32) -> Self {
-        Self {
-            output_cache: std::collections::HashMap::new(),
-            call_counts: std::collections::HashMap::new(),
-            max_identical_calls,
-            provider_round: None,
-        }
-    }
-
-    fn observe_provider_round(&mut self, next: EdgeProviderRoundBoundary) -> bool {
-        if let Some(current) = self.provider_round.as_ref() {
-            let current_key = (current.session_turn, current.llm_rounds_completed);
-            let next_key = (next.session_turn, next.llm_rounds_completed);
-            if next_key <= current_key || next.request == current.request {
-                return false;
-            }
-        }
-        self.provider_round = Some(next);
-        self.call_counts.clear();
-        true
-    }
-
-    fn reset_read_only_after_workspace_mutation(&mut self) {
-        self.output_cache.clear();
-        self.call_counts
-            .retain(|sig, _| !dedup_signature_is_cacheable_read(sig));
-    }
-}
-
-fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
-    if matches!(
-        tool,
-        "bash" | "powershell" | "web_search" | "web_fetch" | "memory" | "agent" | "mo_query"
-    ) {
-        return false;
-    }
-
-    astra_turn_core::tool::categories::classify(tool, Some(args))
-        .category
-        .is_read_only()
-}
-
-fn dedup_signature_is_cacheable_read(signature: &str) -> bool {
-    let Some((tool, args_json)) = signature.split_once(':') else {
-        return false;
-    };
-    serde_json::from_str::<Value>(args_json)
-        .ok()
-        .is_some_and(|args| edge_tool_is_cacheable_read(tool, &args))
-}
-
-fn path_mtime_ms(path: &Path) -> u128 {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Some(hasher.finalize().into())
-}
-
-impl EdgeToolCacheValidation {
-    fn path(&self) -> &Path {
-        match self {
-            Self::FileMtime { path, .. } | Self::DirectoryMtime { path, .. } => path,
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        match self {
-            Self::FileMtime {
-                path,
-                timestamp_ms,
-                content_sha256,
-            } => {
-                path_mtime_ms(path) == *timestamp_ms
-                    && file_content_sha256(path).as_ref() == Some(content_sha256)
-            }
-            Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
-        }
-    }
-}
-
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(crate) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
@@ -1258,8 +1100,6 @@ pub(crate) struct EdgeSseContext<'a> {
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Plan subtasks retain their existing non-file compensation boundary.
     pub compensate_non_file_on_failure: bool,
-    /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
-    pub tool_cache: &'a mut EdgeToolCache,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
     /// cancellation can recover partial text, ids, usage, and tool audit data.
     pub incremental_state:
@@ -1362,7 +1202,6 @@ struct CliSseEdgeHost<'a> {
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
     non_file_rollback: Option<(u32, u64, u64)>,
-    tool_cache: &'a mut EdgeToolCache,
     auth_failure: bool,
     callback_failure: Option<EdgeCallbackFailure>,
     callback_failure_run_id: Option<String>,
@@ -1409,7 +1248,6 @@ enum CliSseControl {
         run_id: String,
         selection: astra_turn_types::RunPermissionModeSelection,
     },
-    ProviderRound(EdgeProviderRoundBoundary),
 }
 
 fn request_token_usage_from_accum(
@@ -2515,7 +2353,6 @@ impl<'a> CliSseStreamHost<'a> {
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             non_file_rollback,
-            tool_cache: ctx.tool_cache,
             auth_failure: false,
             callback_failure: None,
             callback_failure_run_id: None,
@@ -3683,60 +3520,6 @@ impl CliSseEdgeHost<'_> {
                     edge_callback_error_details(&e),
                 ))
             }
-        }
-    }
-
-    fn cached_tool_path(&self, tool: &str, args: &Value) -> Option<PathBuf> {
-        match (tool, args.get("path").and_then(Value::as_str)) {
-            ("read_file" | "list_dir", Some(path)) => self.executor.resolve_checked(path).ok(),
-            ("list_dir", None) => Some(self.executor.effective_project_root()),
-            _ => None,
-        }
-    }
-
-    fn validated_cache_entry(
-        &self,
-        dedup_sig: &str,
-        tool: &str,
-        args: &Value,
-    ) -> Option<(String, String)> {
-        let entry = self.tool_cache.output_cache.get(dedup_sig)?;
-        let current = self.cached_tool_path(tool, args)?;
-        let cached = entry.validation.path();
-        let same_path = current == cached
-            || current
-                .canonicalize()
-                .ok()
-                .zip(cached.canonicalize().ok())
-                .is_some_and(|(current, cached)| current == cached);
-        (same_path && entry.validation.is_valid())
-            .then_some((entry.output.clone(), entry.status.clone()))
-    }
-
-    fn cache_validation_for_tool(
-        &self,
-        tool: &str,
-        args: &Value,
-    ) -> Option<EdgeToolCacheValidation> {
-        match tool {
-            "read_file" => {
-                let path = self.cached_tool_path(tool, args)?;
-                let timestamp_ms = path_mtime_ms(&path);
-                let content_sha256 = file_content_sha256(&path)?;
-                (timestamp_ms > 0).then_some(EdgeToolCacheValidation::FileMtime {
-                    path,
-                    timestamp_ms,
-                    content_sha256,
-                })
-            }
-            "list_dir" => {
-                let path = self.cached_tool_path(tool, args)?;
-                let timestamp_ms = path_mtime_ms(&path);
-                (timestamp_ms > 0)
-                    .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
-            }
-
-            _ => None,
         }
     }
 
@@ -5064,9 +4847,6 @@ impl SseStreamObserver for CliSseObserver<'_> {
             if let Some(incremental_state) = self.incremental_state.as_ref() {
                 incremental_state.record_runtime_feedback(&frame);
             }
-            if let Some(boundary) = EdgeProviderRoundBoundary::from_feedback(&frame) {
-                control = Some(CliSseControl::ProviderRound(boundary));
-            }
             self.emit_stream_event(chat_stream::StreamEvent::RuntimeFeedback(Box::new(frame)))
                 .await;
         }
@@ -5579,9 +5359,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 }
                 self.last_permission_selection = Some(selection);
             }
-            CliSseControl::ProviderRound(boundary) => {
-                self.tool_cache.observe_provider_round(boundary);
-            }
         }
     }
 
@@ -5672,99 +5449,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         } else {
             None
         };
-
-        // ── Edge-path dedup: call-count limit + output cache ───────────
-        let dedup_sig = tool_dedup_signature(tool, args);
-        let call_count = {
-            let count = self
-                .tool_cache
-                .call_counts
-                .entry(dedup_sig.clone())
-                .or_insert(0);
-            *count += 1;
-            *count
-        };
-        let max_calls = self.tool_cache.max_identical_calls;
-
-        if call_count > max_calls {
-            // Hard cap exceeded — return a stub telling the LLM to stop.
-            let mut body = if let Some((cached_out, _)) =
-                self.validated_cache_entry(&dedup_sig, tool, args)
-            {
-                format!(
-                    "Cached repeat skipped (call #{} for identical args, limit: {}). \
-                     The result is already in this conversation from an earlier call. \
-                     Do NOT call this tool again with the same arguments.\n\n{}",
-                    call_count,
-                    max_calls,
-                    cached_out.chars().take(200).collect::<String>(),
-                )
-            } else {
-                format!(
-                    "Duplicate call skipped (#{}; limit: {}). This tool has already been called \
-                     too many times with the same arguments. Use the results from earlier calls instead.",
-                    call_count, max_calls,
-                )
-            };
-            body.push_str("\nThis suppressed attempt did not run.");
-            if let Some(workdir) = args.get("workdir").and_then(Value::as_str) {
-                let requested =
-                    astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
-                        workdir, 512,
-                    );
-                let active = self.executor.effective_project_root();
-                let active =
-                    astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
-                        &active.to_string_lossy(),
-                        512,
-                    );
-                body.push_str(&format!(" Requested workdir: `{requested}`; active workspace: `{active}`. Check the intended directory and the original rejection before another attempt."));
-            }
-            let status = "rejected";
-            let result = self
-                .finish_edge_tool_with_fields(
-                    request,
-                    body,
-                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                        astra_services::session_journal::ToolCallDisposition::Suppressed,
-                    )),
-                    status.to_string(),
-                    0,
-                )
-                .await;
-            if self.callback_failure.is_none()
-                && let Some(idx) = tool_idx
-            {
-                self.render()
-                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
-            }
-            return result;
-        }
-
-        // Cache hit for read-only (cacheable) tools
-        if edge_tool_is_cacheable_read(tool, args)
-            && let Some((cached_output, cached_status)) =
-                self.validated_cache_entry(&dedup_sig, tool, args)
-        {
-            let result = self
-                .finish_edge_tool_with_fields(
-                    request,
-                    cached_output,
-                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                        astra_services::session_journal::ToolCallDisposition::Reused,
-                    )),
-                    cached_status,
-                    0,
-                )
-                .await;
-            if self.callback_failure.is_none()
-                && let Some(idx) = tool_idx
-            {
-                self.render()
-                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
-            }
-            return result;
-        }
 
         // Skip local permission check if this tool was already approved through
         // the cloud approval gate (approval_required → user approved → tool_request).
@@ -6363,41 +6047,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 .insert("non_file_recovery".into(), recovery);
         }
 
-        // Mutation tools: clear cached read-only outputs before processing
-        // the result. Disjoint from the read-only branch below.
-        if allowed
-            && !tool_result_status_is_failure(&status)
-            && tool_call_invalidates_read_cache(tool, Some(args))
-        {
-            // A successful mutation changes the workspace baseline, so cached
-            // read-only outputs and duplicate-call counts are no longer valid.
-            // Keep mutation-tool counters so runaway write loops still trip the
-            // identical-call guard.
-            self.tool_cache.reset_read_only_after_workspace_mutation();
-        }
-        // Compute the cache validation before callback delivery; insert only
-        // after the existing finish owner has sanitized the result.
-        let cache_validation = if allowed
-            && !tool_result_status_is_failure(&status)
-            && edge_tool_is_cacheable_read(tool, args)
-        {
-            self.cache_validation_for_tool(tool, args)
-        } else {
-            None
-        };
         let result = self
             .finish_edge_tool_with_fields(request, output, tool_result_fields, status, duration_ms)
             .await;
-        if let Some(validation) = cache_validation {
-            self.tool_cache.output_cache.insert(
-                dedup_sig,
-                EdgeToolCacheEntry {
-                    output: result.output.clone(),
-                    status: result.status.clone(),
-                    validation,
-                },
-            );
-        }
         // Do not let terminal presentation prevent callback failure reporting.
         if self.callback_failure.is_none()
             && let Some(idx) = tool_idx
@@ -9654,30 +9306,27 @@ mod mcp_result_tests;
 mod tests {
     use super::{
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
-        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeProviderRoundBoundary,
-        EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
-        EdgeToolExecResult, PostApprovalError, PostToolResultError, RecordedApprovalDecision,
-        RenderPolicy, SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
+        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeSseContext, EdgeToolExecResult,
+        PostApprovalError, PostToolResultError, RecordedApprovalDecision, RenderPolicy,
+        SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
         ToolOutputSummaryKind, ToolResultIdentity, TurnResult, acquire_tool_permit_or_cancel,
         append_skill_loaded_marker, apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
         approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
         durable_allow_was_acknowledged, edge_callback_detach_message, edge_callback_error_kind,
-        edge_tool_is_cacheable_read, edge_tool_outcome_status,
-        execute_with_invocation_metadata_responsive, extract_cli_diff_block, file_content_sha256,
-        finalize_cli_skill_execution, format_terminal_tool_summary,
+        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
+        extract_cli_diff_block, finalize_cli_skill_execution, format_terminal_tool_summary,
         format_tool_display_from_preview, is_edge_auth_failure, normalize_sandbox_denied_outcome,
-        path_mtime_ms, recorded_approval_decision, request_token_usage_from_accum,
-        sanitize_final_stream_text, server_context_window_policy_from_accum,
-        server_tool_completion_id, server_tool_completion_is_authoritative,
-        server_tool_completion_output, server_tool_completion_status,
-        server_tool_event_is_client_owned, server_tool_event_owner,
+        recorded_approval_decision, request_token_usage_from_accum, sanitize_final_stream_text,
+        server_context_window_policy_from_accum, server_tool_completion_id,
+        server_tool_completion_is_authoritative, server_tool_completion_output,
+        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
-        tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
-        turn_has_tool_work, work_task_board_update_from_server_event,
+        tool_completion_is_authoritative, tool_output_event_text, turn_has_tool_work,
+        work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -9687,7 +9336,6 @@ mod tests {
     use astra_turn_core::sse_stream_host::{SseEdgeWork, SseStreamHost, SseStreamObserver};
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
     use serde_json::Value;
-    use std::path::PathBuf;
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -9805,7 +9453,6 @@ mod tests {
             tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
                 .await
                 .unwrap();
-            let mut cache = EdgeToolCache::new(8);
             let mut host = CliSseStreamHost::from_edge_ctx(
                 EdgeSseContext {
                     api: &api,
@@ -9823,7 +9470,6 @@ mod tests {
                     ask_user_request_tx: None,
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
-                    tool_cache: &mut cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -9899,7 +9545,6 @@ mod tests {
                     .unwrap();
                 Some(rx)
             };
-            let mut cache = EdgeToolCache::new(8);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let mut host = CliSseStreamHost::from_edge_ctx(
                 EdgeSseContext {
@@ -9918,7 +9563,6 @@ mod tests {
                     ask_user_request_tx: None,
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
-                    tool_cache: &mut cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -9960,7 +9604,6 @@ mod tests {
         tx.send(chat_stream::StreamEvent::StatusLine("two".into()))
             .await
             .unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -9976,7 +9619,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10024,7 +9666,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let root = tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -10040,7 +9681,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10120,7 +9760,6 @@ mod tests {
         tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
             .await
             .unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -10137,7 +9776,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10228,7 +9866,6 @@ mod tests {
             let cancel = tokio_util::sync::CancellationToken::new();
             let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
             let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
-            let mut cache = EdgeToolCache::new(2);
             let mut execution = std::pin::pin!(async {
                 let response = api
                     .http_client()
@@ -10259,7 +9896,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut cache,
                         incremental_state: Some(incremental.clone()),
                         request_session_execution_lease: None,
                     }),
@@ -10322,7 +9958,6 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut cache = EdgeToolCache::new(2);
         let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10340,7 +9975,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10406,7 +10040,6 @@ mod tests {
         for render_policy in [RenderPolicy::Silent, RenderPolicy::Stream] {
             let executor =
                 std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-            let mut tool_cache = EdgeToolCache::new(2);
             let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
                 false,
                 workspace.path(),
@@ -10427,7 +10060,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -10641,7 +10273,6 @@ mod tests {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("thin client");
         let workspace = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(1);
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10659,7 +10290,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10736,7 +10366,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let workspace = tempdir().unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(1);
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10754,7 +10383,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10965,7 +10593,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let ctx = EdgeSseContext {
             api: &api,
@@ -10982,7 +10609,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -11679,7 +11305,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let fill_tx = tx.clone();
         let ctx = EdgeSseContext {
@@ -11697,7 +11322,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -12659,7 +12283,6 @@ mod tests {
             let parent_cancel = tokio_util::sync::CancellationToken::new();
             for is_approval in [false, true] {
                 let physical_cancel = parent_cancel.child_token();
-                let mut tool_cache = EdgeToolCache::new(10);
                 let ctx = EdgeSseContext {
                     api: &api,
                     token: "test-token",
@@ -12679,7 +12302,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 };
@@ -12844,7 +12466,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -12862,7 +12483,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13266,7 +12886,6 @@ mod tests {
                 let temp = tempdir().expect("tempdir");
                 let executor =
                     std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-                let mut tool_cache = EdgeToolCache::new(8);
                 let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
                     false,
                     temp.path(),
@@ -13291,7 +12910,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -13340,7 +12958,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let signal = pm.permission_control_signal();
@@ -13365,7 +12982,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13433,7 +13049,6 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(temp.path())
                 .with_active_session_id("session-mode-change"),
         );
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let mirror = pm.mode_mirror_handle();
@@ -13457,7 +13072,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13512,7 +13126,6 @@ mod tests {
             crate::cli::chat_stream::PlanReviewRequest,
         >(chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
         executor.set_plan_review_request_tx(Some(plan_tx));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -13531,7 +13144,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13582,7 +13194,6 @@ mod tests {
             .expect_err("external path should start outside the sandbox");
         assert!(crate::sandbox_retry::is_sandbox_denied(&before), "{before}");
 
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
@@ -13602,7 +13213,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13652,7 +13262,6 @@ mod tests {
         std::fs::write(&target, "outside\n").expect("target");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
 
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Deny);
@@ -13672,7 +13281,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13774,7 +13382,6 @@ mod tests {
         fn host<'a>(
             &'a self,
             workspace: &std::path::Path,
-            cache: &'a mut EdgeToolCache,
             cancel: Option<&'a tokio_util::sync::CancellationToken>,
         ) -> CliSseStreamHost<'a> {
             let host = CliSseStreamHost::from_edge_ctx(
@@ -13796,7 +13403,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -13869,64 +13475,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_cache_follows_selected_worktree_and_external_changes() {
+    async fn directory_reads_follow_worktree_and_nested_external_changes() {
         use crate::edge_tools::tests::worktree_tests::{
             init_temp_git_repo, remove_preserved_test_worktree,
         };
         let repo = init_temp_git_repo();
-        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(repo.path(), &mut cache, None);
-        let args = serde_json::json!({});
-        let before = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(!before.is_error, "{before:?}");
-        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
-        host.tool_cache.output_cache.insert(
-            "listing".into(),
-            EdgeToolCacheEntry {
-                output: before.output,
-                status: "completed".into(),
-                validation,
-            },
-        );
-
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut host = fixture.host(repo.path(), None);
+        let args = serde_json::json!({"depth": 3});
+        let first = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-1",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
+        assert_eq!(first.status, "completed", "{}", first.output);
         let selected = host
             .executor
-            .enter_worktree("cache-worktree")
+            .enter_worktree("fresh-listing")
             .unwrap()
             .worktree_path;
+        std::fs::create_dir_all(selected.join("nested/child")).unwrap();
+        std::fs::write(selected.join("nested/child/first.txt"), "one").unwrap();
+        let listing = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-2",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
+        assert!(listing.output.contains("first.txt"), "{}", listing.output);
+        let root_mtime = std::fs::metadata(&selected).unwrap().modified().unwrap();
+        std::fs::remove_file(selected.join("nested/child/first.txt")).unwrap();
+        std::fs::write(selected.join("nested/child/second.txt"), "two").unwrap();
+        assert_eq!(
+            std::fs::metadata(&selected).unwrap().modified().unwrap(),
+            root_mtime
+        );
+        let refreshed = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-3",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
         assert!(
-            host.validated_cache_entry("listing", "list_dir", &args)
-                .is_none()
+            refreshed.output.contains("second.txt"),
+            "{}",
+            refreshed.output
         );
-        let listing = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(!listing.is_error, "{listing:?}");
-        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
-        host.tool_cache.output_cache.insert(
-            "listing".into(),
-            EdgeToolCacheEntry {
-                output: listing.output,
-                status: "completed".into(),
-                validation,
-            },
-        );
-        let old_mtime = std::fs::metadata(&selected).unwrap().modified().unwrap();
-        std::fs::write(selected.join("created-elsewhere"), "new").unwrap();
-        std::fs::File::open(&selected)
-            .unwrap()
-            .set_modified(old_mtime + std::time::Duration::from_secs(2))
-            .unwrap();
         assert!(
-            host.validated_cache_entry("listing", "list_dir", &args)
-                .is_none()
+            !refreshed.output.contains("first.txt"),
+            "{}",
+            refreshed.output
         );
-        let refreshed = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(
-            refreshed.output.contains("created-elsewhere"),
-            "{refreshed:?}"
-        );
-
         host.executor.exit_worktree("keep", false).unwrap();
+        let original = host
+            .execute_tool(&parallel_batch_request(
+                "direct", "list-4", "list_dir", args,
+            ))
+            .await;
+        assert!(
+            !original.output.contains("second.txt"),
+            "worktree output must not leak: {}",
+            original.output
+        );
         remove_preserved_test_worktree(repo.path(), &selected);
     }
 
@@ -13983,8 +13600,7 @@ mod tests {
                 permissions.set_mode(PermissionMode::Auto);
             }
             let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(&workspace, &mut cache, None);
+            let mut host = fixture.host(&workspace, None);
             host.perm_manager = Some(&mut permissions);
             host.approval_request_tx = Some(approval_tx);
             let requests = vec![
@@ -14059,8 +13675,7 @@ mod tests {
     async fn observer_closure_before_parallel_dispatch_settles_unexecuted_requests() {
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         host.stream_event_tx = Some(tx);
@@ -14087,8 +13702,7 @@ mod tests {
     async fn observer_closure_after_tool_execution_preserves_the_result_callback() {
         let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx);
         let mut request = parallel_batch_request(
@@ -14120,9 +13734,8 @@ mod tests {
     async fn observer_closure_settles_waiting_ask_user_without_cancelling_run() {
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.executor
             .accept_server_tool_surface_admission("ask_user")
             .unwrap();
@@ -14166,9 +13779,8 @@ mod tests {
     async fn approval_response_wins_when_observer_closes_at_the_same_time() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(stream_tx);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -14262,8 +13874,7 @@ mod tests {
                     tool_result_fields: outcome.tool_result_fields,
                 },
             );
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, None);
+            let mut host = fixture.host(workspace.path(), None);
             host.executor = executor;
             assert_eq!(
                 host.deliver_tool_result("task_output", &body).await.is_ok(),
@@ -14304,8 +13915,7 @@ mod tests {
                 .with_observability_session(observability.clone()),
         );
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         host.executor = executor.clone();
         host.non_file_rollback = Some((
             0,
@@ -14360,14 +13970,13 @@ mod tests {
             let workspace = tempdir().unwrap();
             let marker = workspace.path().join("approved-command-ran");
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut cache = EdgeToolCache::new(8);
             let mut permissions = crate::cli::permission_manager::PermissionManager::with_project(
                 false,
                 workspace.path(),
             );
             let (approval_tx, mut approval_rx) =
                 tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             host.perm_manager = Some(&mut permissions);
             host.approval_request_tx = Some(approval_tx);
             let mut request = parallel_batch_request(
@@ -14454,8 +14063,7 @@ mod tests {
                 .with_priority(1)
                 .mount(&fixture.callbacks)
                 .await;
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             host.skill_resolver = Some(std::sync::Arc::new(
                 astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                     registry,
@@ -14508,9 +14116,8 @@ mod tests {
     async fn conflicting_callback_owner_stops_admission_without_reattribution() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let request = parallel_batch_request(
             "identity",
             "same-id",
@@ -14540,8 +14147,7 @@ mod tests {
     async fn server_bash_budget_does_not_change_invocation_arguments() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let mut requests = Vec::new();
         let mut settled = Vec::new();
         for (id, args) in [
@@ -14641,10 +14247,8 @@ mod tests {
         let (sem, mut held, capacity) = reserve_shared_tool_capacity().await;
         let slots = capacity.min(2);
         drop(held.split(slots).unwrap());
-        let mut cache_a = EdgeToolCache::new(8);
-        let mut cache_b = EdgeToolCache::new(8);
-        let mut host_a = fixture.host(workspace.path(), &mut cache_a, None);
-        let mut host_b = fixture.host(workspace.path(), &mut cache_b, None);
+        let mut host_a = fixture.host(workspace.path(), None);
+        let mut host_b = fixture.host(workspace.path(), None);
         let requests_a = vec![
             parallel_recall("a", "capacity-a-first"),
             parallel_batch_request(
@@ -14745,8 +14349,7 @@ mod tests {
         for deadline in [false, true] {
             let owner = if deadline { "deadline" } else { "cancel" };
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             let mut requests = vec![
                 parallel_recall(owner, &format!("{owner}-root")),
                 parallel_recall(owner, &format!("{owner}-child")),
@@ -14843,9 +14446,8 @@ mod tests {
         .unwrap();
         let (sem, held, capacity) = reserve_shared_tool_capacity().await;
         drop(held);
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let requests = vec![
             parallel_recall("failure", "failure-held-sibling"),
             parallel_batch_request(
@@ -14923,7 +14525,6 @@ mod tests {
                     let cwd = base.path().join(format!("review{suffix}"));
                     std::fs::create_dir(&project).unwrap();
                     std::fs::create_dir(&cwd).unwrap();
-                    let mut cache = EdgeToolCache::new(8);
                     let mut manager =
                         crate::cli::permission_manager::PermissionManager::with_project(
                             false, &project,
@@ -14943,7 +14544,7 @@ mod tests {
                                 .unwrap();
                         }
                     });
-                    let mut host = fixture.host(&project, &mut cache, None);
+                    let mut host = fixture.host(&project, None);
                     host.perm_manager = Some(&mut manager);
                     host.approval_request_tx = Some(approval_tx);
                     let results = host
@@ -15006,7 +14607,6 @@ mod tests {
                     sensitive.join("alias")
                 };
                 std::os::unix::fs::symlink(&target, &alias).unwrap();
-                let mut cache = EdgeToolCache::new(8);
                 let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
                     false, &project,
                 );
@@ -15016,7 +14616,7 @@ mod tests {
                     crate::cli::permission_manager::PermissionMode::Prompt
                 });
                 let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
-                let mut host = fixture.host(&project, &mut cache, None);
+                let mut host = fixture.host(&project, None);
                 host.perm_manager = Some(&mut manager);
                 host.approval_request_tx = Some(tx);
                 let results = tokio::time::timeout(
@@ -15082,7 +14682,6 @@ mod tests {
             let link = project.join("current.txt");
             retarget_symlink(&link, &inside);
             let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-            let mut cache = EdgeToolCache::new(8);
             let mut manager =
                 crate::cli::permission_manager::PermissionManager::with_project(false, &project);
             manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
@@ -15095,7 +14694,7 @@ mod tests {
             if cause == "closed" {
                 approvals.close();
             }
-            let mut host = fixture.host(&project, &mut cache, None);
+            let mut host = fixture.host(&project, None);
             host.perm_manager = Some(&mut manager);
             host.approval_request_tx = Some(tx);
             let executor = host.executor.clone();
@@ -15202,7 +14801,6 @@ mod tests {
                     .mount(&fixture.callbacks)
                     .await;
                 let workspace = tempdir().unwrap();
-                let mut cache = EdgeToolCache::new(8);
                 let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
                     false,
                     workspace.path(),
@@ -15218,7 +14816,7 @@ mod tests {
                 if cause == "closed" {
                     approvals.close();
                 }
-                let mut host = fixture.host(workspace.path(), &mut cache, None);
+                let mut host = fixture.host(workspace.path(), None);
                 host.perm_manager = Some(&mut manager);
                 host.approval_request_tx = Some(tx);
                 let requests: Vec<_> = (0..count)
@@ -15351,12 +14949,11 @@ mod tests {
             for path in [&project, &first, &second] {
                 std::fs::create_dir(path).unwrap();
             }
-            let mut cache = EdgeToolCache::new(8);
             let mut manager =
                 crate::cli::permission_manager::PermissionManager::with_project(false, &project);
             manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
             let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
-            let mut host = fixture.host(&project, &mut cache, None);
+            let mut host = fixture.host(&project, None);
             host.perm_manager = Some(&mut manager);
             host.approval_request_tx = Some(tx);
             let mut request = parallel_batch_request(
@@ -15463,12 +15060,11 @@ mod tests {
             }
             std::fs::write(approved.join("note"), "original-must-not-run").unwrap();
             std::fs::write(other.join("note"), "replacement-must-not-run").unwrap();
-            let mut cache = EdgeToolCache::new(8);
             let mut manager =
                 crate::cli::permission_manager::PermissionManager::with_project(false, &project);
             manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
             let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
-            let mut host = fixture.host(&project, &mut cache, None);
+            let mut host = fixture.host(&project, None);
             let executor = host.executor.clone();
             host.perm_manager = Some(&mut manager);
             host.approval_request_tx = Some(tx);
@@ -15543,12 +15139,11 @@ mod tests {
         std::fs::write(second.join("new.txt"), "must-not-read-after-retarget").unwrap();
         let link = project.join("link");
         std::os::unix::fs::symlink(&first, &link).unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let mut manager =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         let executor = host.executor.clone();
         host.perm_manager = Some(&mut manager);
         host.approval_request_tx = Some(approval_tx);
@@ -15602,7 +15197,6 @@ mod tests {
                 let target = denied.join("input");
                 std::fs::write(&target, "authorized-after-approval").unwrap();
                 std::os::unix::fs::symlink(&target, cwd.join("link")).unwrap();
-                let mut cache = EdgeToolCache::new(8);
                 let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
                     false, &project,
                 );
@@ -15611,7 +15205,7 @@ mod tests {
                 } else {
                     crate::cli::permission_manager::PermissionMode::Prompt
                 });
-                let mut host = fixture.host(&project, &mut cache, None);
+                let mut host = fixture.host(&project, None);
                 host.executor.expand_sandbox_path(cwd.clone()).unwrap();
                 host.perm_manager = Some(&mut manager);
                 let request = parallel_batch_request(
@@ -15699,7 +15293,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let incremental =
             std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
@@ -15719,7 +15312,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental.clone()),
                 request_session_execution_lease: None,
             },
@@ -15829,15 +15421,12 @@ mod tests {
             assert_eq!(results[0].status, "completed");
             let scoped = scoped_test_result(&host, &results[0]);
             host.on_tool_result(&scoped);
-            if request_id == "serial-child" {
-                let fields = results[0]
-                    .tool_result_fields
-                    .as_ref()
-                    .expect("cache evidence");
-                assert_eq!(fields.get("executed"), Some(&Value::Bool(false)));
-                assert_eq!(
-                    fields.get("disposition"),
-                    Some(&Value::String("reused".into()))
+            if request_id == "serial-root" {
+                std::fs::write(project.join("fresh-child-view"), "new").unwrap();
+            } else {
+                assert!(
+                    results[0].output.contains("fresh-child-view"),
+                    "a distinct child request must observe current workspace contents"
                 );
             }
             let mut count = 0;
@@ -15934,7 +15523,6 @@ mod tests {
                 ),
             ),
         );
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -15951,7 +15539,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16114,7 +15701,6 @@ mod tests {
         std::fs::write(temp.path().join("one.txt"), "one").unwrap();
         std::fs::write(temp.path().join("two.txt"), "two").unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -16133,7 +15719,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16283,11 +15868,10 @@ mod tests {
         let target = project.join("current.txt");
         retarget_symlink(&target, &inside_target);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut pm);
         host.owner_auth_snapshot = Some(owner);
         let executor = host.executor.clone();
@@ -16342,8 +15926,7 @@ mod tests {
     async fn callback_deadline_is_not_extended_by_repeated_admission() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let received = tokio::time::Instant::now();
         let mut request =
             parallel_batch_request("owner", "clock-skew", "read_file", serde_json::json!({}));
@@ -16403,10 +15986,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let (tx, mut events) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.stream_event_tx = Some(tx);
         let requests = ["one", "two", "three", "four"]
             .into_iter()
@@ -16519,9 +16101,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (observer, edge) = host.split();
         let requests = ["one", "two", "three", "four"]
             .into_iter()
@@ -16638,12 +16219,11 @@ mod tests {
             // Leave one slot for the memory sibling. The file tool cannot execute
             // until the symlink is retargeted after batch preflight.
             let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-            let mut cache = EdgeToolCache::new(8);
             let mut pm =
                 crate::cli::permission_manager::PermissionManager::with_project(false, &project);
             pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
             let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-            let mut host = fixture.host(&project, &mut cache, None);
+            let mut host = fixture.host(&project, None);
             host.perm_manager = Some(&mut pm);
             host.approval_request_tx = Some(approval_tx);
             let executor = host.executor.clone();
@@ -16743,12 +16323,11 @@ mod tests {
         let link = project.join("current.txt");
         retarget_symlink(&link, &inside_path);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut manager =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut manager);
         host.approval_request_tx = Some(approval_tx);
         let executor = host.executor.clone();
@@ -16828,12 +16407,11 @@ mod tests {
         retarget_symlink(&first_link, &inside_first);
         retarget_symlink(&second_link, &inside_second);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut pm);
         host.approval_request_tx = Some(approval_tx);
         let denied = parallel_batch_request(
@@ -16930,8 +16508,7 @@ mod tests {
         for earlier_deadline in [false, true] {
             let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
             let workspace = tempdir().unwrap();
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, None);
+            let mut host = fixture.host(workspace.path(), None);
             let slow = parallel_recall("first", "slow-child");
             let mut later = parallel_recall("first", "same-run-later");
             later.run_id = slow.run_id.clone();
@@ -16989,9 +16566,8 @@ mod tests {
     async fn cancelled_batch_delivers_sibling_that_finishes_after_cancellation() {
         let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let slow = parallel_recall("first", "slow-cancelled");
         let mut later = parallel_recall("first", "later-cancelled");
         later.run_id = slow.run_id.clone();
@@ -17057,12 +16633,11 @@ mod tests {
         let target = project.join("current.txt");
         retarget_symlink(&target, &inside_target);
         let mut held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
-        let mut host = fixture.host(&project, &mut cache, Some(&cancel));
+        let mut host = fixture.host(&project, Some(&cancel));
         host.perm_manager = Some(&mut pm);
         let denied = parallel_batch_request(
             "first",
@@ -17148,8 +16723,7 @@ mod tests {
     async fn successive_callback_failures_keep_identity_and_strongest_category() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         for (run, request, status, body, expected) in [
             (
                 "run-unknown",
@@ -17212,10 +16786,9 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let parent = tokio_util::sync::CancellationToken::new();
         let physical = parent.child_token();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&physical));
+        let mut host = fixture.host(workspace.path(), Some(&physical));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "session".into(),
@@ -17283,7 +16856,6 @@ mod tests {
         std::fs::write(workspace.path().join("two.txt"), "two").unwrap();
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut cache = EdgeToolCache::new(8);
         let parent = tokio_util::sync::CancellationToken::new();
         let physical = parent.child_token();
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -17301,7 +16873,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17406,8 +16977,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let first = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
             "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
@@ -17491,8 +17061,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let first = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
             "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
@@ -17908,9 +17477,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx.clone());
         host.last_bound_run_id = Some("root".into());
@@ -18021,9 +17589,8 @@ mod tests {
                 .mount(&fixture.callbacks)
                 .await;
             let workspace = tempdir().unwrap();
-            let mut cache = EdgeToolCache::new(8);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             host.stream_event_tx = Some(tx.clone());
             host.last_bound_run_id = Some("root".into());
@@ -18110,9 +17677,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx.clone());
         host.last_bound_run_id = Some("root".into());
@@ -18242,9 +17808,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.edge.shared.render_policy = RenderPolicy::Stream;
         host.render().md = Some(streaming_md::StreamingMarkdown::new(80));
         let requests: Vec<_> = (0..count)
@@ -18423,8 +17988,7 @@ mod tests {
         assert!(after_ack.contains("server acknowledged"));
         assert!(!after_ack.contains("before acknowledgement"));
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         host.record_tool_result_callback_failures(&[(
             "child-run".into(),
             "child-request".into(),
@@ -18445,10 +18009,9 @@ mod tests {
     async fn cancelled_batch_still_attempts_to_deliver_completed_results() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let host = fixture.host(workspace.path(), Some(&cancel));
         let target = super::EdgeCallbackTarget {
             api: fixture.api.clone(),
             token: "tok".into(),
@@ -18508,9 +18071,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let host = fixture.host(workspace.path(), Some(&cancel));
         let target = super::EdgeCallbackTarget {
             api: fixture.api.clone(),
             token: "tok".into(),
@@ -18606,7 +18168,6 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -18623,7 +18184,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -18677,7 +18237,6 @@ mod tests {
             crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
                 .unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -18694,7 +18253,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: Some(request_lease.clone()),
             },
@@ -18757,7 +18315,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -18775,7 +18332,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -18812,7 +18368,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let incremental_state =
             std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -18831,7 +18386,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental_state.clone()),
                 request_session_execution_lease: None,
             },
@@ -18923,7 +18477,6 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
             let temp = tempdir().expect("tempdir");
             let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-            let mut tool_cache = EdgeToolCache::new(8);
             let mut pm =
                 crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
             let (approval_tx, mut approval_rx) =
@@ -18961,7 +18514,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -19064,7 +18616,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
@@ -19089,7 +18640,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -19156,7 +18706,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
@@ -19182,7 +18731,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -19525,7 +19073,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let parent_cancel = tokio_util::sync::CancellationToken::new();
         let physical_cancel = parent_cancel.child_token();
         let ctx = EdgeSseContext {
@@ -19543,7 +19090,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -19825,7 +19371,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let ctx = EdgeSseContext {
             api: &api,
             token: "expired-token",
@@ -19841,7 +19386,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -20853,8 +20397,7 @@ mod tests {
         ));
         registry.discover_all().await.unwrap();
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         host.skill_resolver = Some(std::sync::Arc::new(
             astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                 registry,
@@ -21053,121 +20596,6 @@ mod tests {
         assert_eq!(topology, None);
     }
 
-    // ── EdgeToolCache unit tests ─────────────────────────────────────────
-
-    #[test]
-    fn edge_tool_cache_basics() {
-        // new with correct limit
-        let cache = EdgeToolCache::new(5);
-        assert_eq!(cache.max_identical_calls, 5);
-        assert!(cache.output_cache.is_empty());
-        assert!(cache.call_counts.is_empty());
-        assert_eq!(cache.provider_round, None);
-
-        // stores and retrieves
-        let mut cache = EdgeToolCache::new(3);
-        let sig = "read_file:{\"path\":\"/tmp/foo\"}".to_string();
-        cache.output_cache.insert(
-            sig.clone(),
-            EdgeToolCacheEntry {
-                output: "file content".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: PathBuf::from("/tmp/foo"),
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let hit = cache.output_cache.get(&sig).unwrap();
-        assert_eq!(hit.output, "file content");
-        assert_eq!(hit.status, "completed");
-
-        // call count increments
-        let sig2 = "grep:{\"pattern\":\"foo\"}".to_string();
-        let count = cache.call_counts.entry(sig2.clone()).or_insert(0);
-        *count += 1;
-        assert_eq!(cache.call_counts[&sig2], 1);
-        *cache.call_counts.get_mut(&sig2).unwrap() += 1;
-        assert_eq!(cache.call_counts[&sig2], 2);
-
-        // call count exceeds limit
-        let mut cache2 = EdgeToolCache::new(2);
-        let sig3 = "bash:{\"command\":\"ls\"}".to_string();
-        let count = cache2.call_counts.entry(sig3.clone()).or_insert(0);
-        *count += 1;
-        assert!(*count <= cache2.max_identical_calls);
-        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
-        assert!(*cache2.call_counts.get(&sig3).unwrap() <= cache2.max_identical_calls);
-        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
-        assert!(*cache2.call_counts.get(&sig3).unwrap() > cache2.max_identical_calls);
-    }
-
-    #[test]
-    fn edge_tool_call_limit_resets_only_when_authoritative_provider_round_advances() {
-        let mut cache = EdgeToolCache::new(2);
-        let signature = "write_file:{\"path\":\"src/output.txt\"}".to_string();
-        let request =
-            |round, id: &str| astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity {
-                request_id: id.to_string(),
-                request_hash: format!("hash-{id}"),
-                round,
-                attempt: 0,
-                provider_response_id: None,
-            };
-        let round = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 7,
-            request: request(6, "request-round-7"),
-        };
-
-        assert!(cache.observe_provider_round(round.clone()));
-        cache.call_counts.insert(signature.clone(), 2);
-        assert!(!cache.observe_provider_round(round.clone()));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // Replayed or out-of-order feedback cannot reopen the same batch.
-        let stale = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 6,
-            request: request(5, "request-round-6"),
-        };
-        assert!(!cache.observe_provider_round(stale));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // A later server-authoritative provider boundary permits a fresh
-        // attempt while leaving the independently validated output cache intact.
-        let next = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 8,
-            request: request(7, "request-next-round"),
-        };
-        assert!(cache.observe_provider_round(next.clone()));
-        assert!(cache.call_counts.is_empty());
-        assert_eq!(
-            cache
-                .provider_round
-                .as_ref()
-                .map(|boundary| boundary.llm_rounds_completed),
-            Some(8)
-        );
-
-        cache.call_counts.insert(signature.clone(), 2);
-        let mut conflicting = next.clone();
-        conflicting.request = request(7, "conflict");
-        assert!(!cache.observe_provider_round(conflicting));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // A repeated request identity cannot claim a later provider boundary.
-        let replayed_request = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 9,
-            request: next.request,
-        };
-        assert!(!cache.observe_provider_round(replayed_request));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-    }
-
     fn provider_round_feedback_event(
         session_id: &str,
         run_id: &str,
@@ -21237,7 +20665,6 @@ mod tests {
         manager.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
         let signal = manager.permission_control_signal();
         let mirror = manager.mode_mirror_handle();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -21253,7 +20680,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21337,7 +20763,6 @@ mod tests {
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path()));
         let mut manager =
             crate::cli::permission_manager::PermissionManager::with_project(false, root.path());
-        let mut cache = EdgeToolCache::new(8);
         let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21354,7 +20779,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21394,8 +20818,7 @@ mod tests {
     async fn sampled_live_event_reports_gap_to_the_backpressured_consumer() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let root = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(root.path(), &mut cache, None);
+        let mut host = fixture.host(root.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
         tx.try_send(chat_stream::StreamEvent::StatusLine("occupied".into()))
             .unwrap();
@@ -21426,8 +20849,7 @@ mod tests {
     async fn callback_warning_uses_reserved_channel_capacity() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let root = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(root.path(), &mut cache, None);
+        let mut host = fixture.host(root.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
         tx.try_send(chat_stream::StreamEvent::StatusLine("occupied".into()))
             .unwrap();
@@ -21469,7 +20891,6 @@ mod tests {
         );
         let mut manager = crate::cli::permission_manager::PermissionManager::new(false);
         let mirror = manager.mode_mirror_handle();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -21486,7 +20907,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21530,7 +20950,6 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id("session"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -21546,7 +20965,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21581,230 +20999,48 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[tokio::test]
-    async fn accepted_provider_feedback_scopes_edge_writer_limit_to_one_round() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let workspace = tempdir().expect("workspace");
-        let cached_path = workspace.path().join("cached.txt");
-        std::fs::write(&cached_path, "cached\n").expect("seed cache source");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        executor.set_active_session_id("session-1".to_string());
-        let mut tool_cache = EdgeToolCache::new(2);
-        tool_cache.output_cache.insert(
-            "read_file:cached".to_string(),
-            EdgeToolCacheEntry {
-                output: "cached\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: cached_path,
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor,
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                compensate_non_file_on_failure: false,
-
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-        host.last_bound_run_id = Some("run-1".to_string());
-        for request_id in [
-            "write-1", "write-2", "write-3", "write-4", "write-5", "write-6", "write-7", "write-8",
-        ] {
-            host.tool_result_identities.insert(
-                request_id.to_string(),
-                ToolResultIdentity {
-                    work_attribution: None,
-                    session_id: "session-1".to_string(),
-                    run_id: "run-1".to_string(),
-                    turn_chain_id: "turn-1".to_string(),
-                    request_id: request_id.to_string(),
-                    execution_deadline_unix_ms: u64::MAX,
-                    execution_deadline_at: tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(300),
-                },
-            );
+    async fn repeated_edge_requests_keep_their_own_execution_and_callback() {
+        let workspace = tempdir().unwrap();
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut host = fixture.host(workspace.path(), None);
+        host.observer.accepted_session_id = Some("session-1".into());
+        host.last_bound_run_id = Some("run-1".into());
+        let feedback = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
+        host.on_accepted_sse_event(&feedback).await.unwrap();
+        let args = serde_json::json!({"path": "output.txt"});
+        for index in 0..6 {
+            let current = format!("version-{index}");
+            std::fs::write(workspace.path().join("output.txt"), &current).unwrap();
+            let result = host
+                .execute_tools_batch(vec![parallel_batch_request(
+                    "direct",
+                    &format!("read-{index}"),
+                    "read_file",
+                    args.clone(),
+                )])
+                .await
+                .remove(0);
+            assert_eq!(result.status, "completed", "{}", result.output);
+            assert!(result.output.contains(&current), "{}", result.output);
         }
-
-        let round_one = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
-        host.on_accepted_sse_event(&round_one)
-            .await
-            .expect("round one feedback");
-        assert!(
-            host.tool_cache
-                .output_cache
-                .contains_key("read_file:cached")
-        );
-
-        let args = serde_json::json!({"path": "output.txt", "content": "same bytes\n"});
-        let first = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-1",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        let second = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-2",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        let third = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-3",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(first.status, "completed", "{}", first.output);
-        assert_eq!(second.status, "completed", "{}", second.output);
-        assert_eq!(third.status, "rejected");
-        assert!(third.output.contains("Duplicate call skipped"));
-
-        host.tool_cache.output_cache.insert(
-            "read_file:cached".to_string(),
-            EdgeToolCacheEntry {
-                output: "cached\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: workspace.path().join("cached.txt"),
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let round_two = provider_round_feedback_event("session-1", "run-1", 2, Some("request-2"));
-        host.on_accepted_sse_event(&round_two)
-            .await
-            .expect("round two feedback");
-        assert!(
-            host.tool_cache
-                .output_cache
-                .contains_key("read_file:cached")
-        );
-        let next = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-4",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
+        let callbacks = fixture.callbacks.received_requests().await.unwrap();
         assert_eq!(
-            next.status, "completed",
-            "new provider round must reopen the call"
+            callbacks.len(),
+            6,
+            "each fresh request receives its own callback"
         );
-        host.on_accepted_sse_event(&round_two)
-            .await
-            .expect("same feedback replay");
-        let same_round_second = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-5",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(same_round_second.status, "completed");
-        host.on_accepted_sse_event(&round_one)
-            .await
-            .expect("stale feedback replay");
-        let same_round_third = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-6",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(same_round_third.status, "rejected");
-
-        let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
-        host.on_accepted_sse_event(&missing_request)
-            .await
-            .expect("request-less feedback remains presentation evidence only");
-        let after_missing = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-7",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(after_missing.status, "rejected");
-
-        let mismatched =
-            provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
-        assert!(host.on_accepted_sse_event(&mismatched).await.is_err());
-        let after_mismatch = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-8",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(after_mismatch.status, "rejected");
-    }
-
-    #[test]
-    fn edge_tool_cache_read_only_and_dedup() {
-        // read-only tools lookup
-        assert!(edge_tool_is_cacheable_read(
-            "read_file",
-            &serde_json::json!({"path": "/tmp/foo"})
-        ));
-        assert!(edge_tool_is_cacheable_read(
-            "grep",
-            &serde_json::json!({"pattern": "foo"})
-        ));
-        assert!(edge_tool_is_cacheable_read(
-            "glob",
-            &serde_json::json!({"pattern": "*.rs"})
-        ));
-        assert!(!edge_tool_is_cacheable_read(
-            "bash",
-            &serde_json::json!({"command": "ls"})
-        ));
-
-        // dedup signature deterministic
-        let args = serde_json::json!({"path": "/tmp/foo", "pattern": "bar"});
-        let sig1 = tool_dedup_signature("grep", &args);
-        let sig2 = tool_dedup_signature("grep", &args);
-        assert_eq!(sig1, sig2);
-        let sig3 = tool_dedup_signature("read_file", &args);
-        assert_ne!(sig1, sig3);
+        for (index, request) in callbacks.iter().enumerate() {
+            let result: astra_thin_client::ToolResultRequest =
+                serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(result.request_id, format!("read-{index}"));
+            assert_eq!(result.status, "completed");
+        }
+        let wrong = provider_round_feedback_event("other-session", "run-1", 2, Some("request-2"));
+        assert!(
+            host.on_accepted_sse_event(&wrong).await.is_err(),
+            "feedback still validates stream identity"
+        );
     }
 
     #[serial_test::serial]
@@ -21820,7 +21056,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -21841,7 +21076,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21953,7 +21187,6 @@ mod tests {
         executor
             .journal_turn_index
             .store(21, std::sync::atomic::Ordering::Relaxed);
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -21970,7 +21203,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -22259,7 +21491,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_invalidates_read_file_after_file_change() {
+    async fn repeated_read_file_observes_same_mtime_content_change() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -22272,7 +21504,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -22290,7 +21521,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -22317,23 +21547,10 @@ mod tests {
             .open(&file)
             .and_then(|file| file.set_modified(original_mtime))
             .expect("restore mtime to exercise content validation");
-        let cached_timestamp = match &host
-            .tool_cache
-            .output_cache
-            .get(&tool_dedup_signature(
-                "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            ))
-            .expect("cached read")
-            .validation
-        {
-            EdgeToolCacheValidation::FileMtime { timestamp_ms, .. } => *timestamp_ms,
-            _ => panic!("read_file must use file validation"),
-        };
         assert_eq!(
-            path_mtime_ms(&file),
-            cached_timestamp,
-            "test setup must keep metadata validation unchanged"
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            original_mtime,
+            "metadata is unchanged while file contents changed"
         );
 
         let second = host
@@ -22354,7 +21571,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_hit_emits_matching_tool_completed_event() {
+    async fn edge_read_emits_matching_tool_completed_event() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -22367,22 +21584,7 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let read_args = serde_json::json!({"path": "cached.txt"});
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        tool_cache.output_cache.insert(
-            read_sig,
-            EdgeToolCacheEntry {
-                output: "v1\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms: path_mtime_ms(&file),
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -22400,7 +21602,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -22433,7 +21634,7 @@ mod tests {
             .await
             .remove(0);
         assert_eq!(result.status, "completed");
-        assert_eq!(result.output, "v1\n");
+        assert!(result.output.contains("v1"), "{}", result.output);
 
         let started = event_rx.try_recv().expect("tool started event");
         let completed = event_rx.try_recv().expect("tool completed event");
@@ -22463,25 +21664,13 @@ mod tests {
         }
         assert!(
             event_rx.try_recv().is_err(),
-            "cache hit should emit exactly start and completion"
+            "read should emit exactly start and completion"
         );
-
-        // A cached result can end its preview inside a multi-byte character.
-        let args = serde_json::json!({"path": "cached.txt"});
-        let sig = tool_dedup_signature("read_file", &args);
-        host.tool_cache.output_cache.get_mut(&sig).unwrap().output =
-            format!("{}界", "x".repeat(199));
-        host.tool_cache.max_identical_calls = 1;
-        let mut request = parallel_batch_request("direct", "cache-limit", "read_file", args);
-        request.run_id = "cache-root".into();
-        let result = host.execute_tools_batch(vec![request]).await.remove(0);
-        assert!(result.output.contains("Cached repeat skipped"));
-        assert!(result.output.contains('界'));
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
+    async fn successful_write_file_is_visible_to_repeated_read() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -22494,7 +21683,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(2);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -22512,7 +21700,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -22530,26 +21717,6 @@ mod tests {
             ))
             .await;
         assert!(initial.output.contains("v1"), "{}", initial.output);
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        let write_sig = tool_dedup_signature(
-            "write_file",
-            &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
-        );
-        let timestamp_ms = path_mtime_ms(&file);
-        host.tool_cache.output_cache.insert(
-            read_sig.clone(),
-            EdgeToolCacheEntry {
-                output: "v1\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms,
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
-
         let write = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -22559,20 +21726,6 @@ mod tests {
             ))
             .await;
         assert_eq!(write.status, "completed", "{}", write.output);
-        assert!(
-            host.tool_cache.output_cache.is_empty(),
-            "successful write_file must clear stale read cache"
-        );
-        assert!(
-            !host.tool_cache.call_counts.contains_key(&read_sig),
-            "successful write_file must reset stale read duplicate-call counters"
-        );
-        assert_eq!(
-            host.tool_cache.call_counts.get(&write_sig),
-            Some(&1),
-            "successful write_file must preserve mutation-tool counters"
-        );
-
         let reread = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -22582,12 +21735,11 @@ mod tests {
             ))
             .await;
         assert!(reread.output.contains("v2"), "{}", reread.output);
-        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn successful_str_replace_clears_cross_turn_read_cache_and_call_counts() {
+    async fn successful_str_replace_is_visible_to_repeated_read() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -22600,7 +21752,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "alpha\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(2);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -22618,7 +21769,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -22636,30 +21786,6 @@ mod tests {
             ))
             .await;
         assert!(initial.output.contains("alpha"), "{}", initial.output);
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        let replace_sig = tool_dedup_signature(
-            "str_replace",
-            &serde_json::json!({
-                "path": "cached.txt",
-                "old_str": "alpha",
-                "new_str": "omega"
-            }),
-        );
-        let timestamp_ms = path_mtime_ms(&file);
-        host.tool_cache.output_cache.insert(
-            read_sig.clone(),
-            EdgeToolCacheEntry {
-                output: "alpha\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms,
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
-
         let replace = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -22674,20 +21800,6 @@ mod tests {
             ))
             .await;
         assert_eq!(replace.status, "completed", "{}", replace.output);
-        assert!(
-            host.tool_cache.output_cache.is_empty(),
-            "successful str_replace must clear stale read cache"
-        );
-        assert!(
-            !host.tool_cache.call_counts.contains_key(&read_sig),
-            "successful str_replace must reset stale read duplicate-call counters"
-        );
-        assert_eq!(
-            host.tool_cache.call_counts.get(&replace_sig),
-            Some(&1),
-            "successful str_replace must preserve mutation-tool counters"
-        );
-
         let reread = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -22697,7 +21809,6 @@ mod tests {
             ))
             .await;
         assert!(reread.output.contains("omega"), "{}", reread.output);
-        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
     #[serial_test::serial]
@@ -22713,7 +21824,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -22731,7 +21841,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },

@@ -2406,7 +2406,8 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    static TEST_POOL: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+    static TEST_SETTINGS: tokio::sync::OnceCell<MatrixOneSettings> =
+        tokio::sync::OnceCell::const_new();
 
     pub(super) async fn setup_pool() -> SharedPool {
         let _ = dotenvy::dotenv();
@@ -2415,7 +2416,10 @@ mod tests {
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored Work lifecycle integration tests"
         );
-        TEST_POOL
+        // Pool workers belong to the current test runtime. Cache only schema
+        // readiness/settings; a pool cached across #[tokio::test] runtimes can
+        // retain workers from a runtime that has already shut down.
+        let settings = TEST_SETTINGS
             .get_or_init(|| async {
                 let settings = MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
@@ -2423,45 +2427,13 @@ mod tests {
                 ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure canonical schema");
-                SharedPool::new(&settings).await.expect("MatrixOne pool")
+                settings
             })
-            .await
-            .clone()
+            .await;
+        SharedPool::new(settings).await.expect("MatrixOne pool")
     }
 
-    pub(super) async fn admit_running_test_session(
-        pool: &SharedPool,
-        owner: &WorkOwnerId,
-        session: &InternalSessionId,
-        run_id: &str,
-        title: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-             VALUES (?, ?, ?, 'active', 0)",
-        )
-        .bind(session.as_str())
-        .bind(owner.as_str())
-        .bind(title)
-        .execute(pool.get())
-        .await
-        .expect("canonical session admission fence");
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, root_run_id, ancestor_path, status,
-              owner_pod_id, owner_lease_expires_at, run_generation)
-             VALUES (?, ?, ?, ?, ?, 'running',
-                     'work-lifecycle-test-owner', TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
-        )
-        .bind(run_id)
-        .bind(owner.as_str())
-        .bind(session.as_str())
-        .bind(run_id)
-        .bind(run_id)
-        .execute(pool.get())
-        .await
-        .expect("active run authority");
-    }
+    pub(super) use crate::server::work_test_support::admit_running_test_session;
 
     fn replacement_start_work_args(goal: &str) -> Value {
         json!({

@@ -263,12 +263,6 @@ async fn stream_chat_sse_inner(
         .map(|emitter| emitter.execution_id().to_string())
         .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
     let term_width = terminal_width_usize();
-    // Tool policy and cache behavior follow the resolved model name, never the
-    // opaque Offering identity used for admission.
-    let model_for_policy = p.model;
-    let tool_policy_config = &p.runtime_config.tool_policy;
-    let resolved_tool_policy = tool_policy_config.resolve_for_model(model_for_policy);
-
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
     let show_early_hint = !p.render_policy.suppress_text()
@@ -598,9 +592,6 @@ async fn stream_chat_sse_inner(
         plan_review_request_tx: p.plan_review_request_tx,
         agent_spawner: p.agent_spawner.clone(),
         chat_turn_index: current_session_turn,
-        tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
-            resolved_tool_policy.max_identical_tool_calls,
-        ),
         append_system_prompt: p.append_system_prompt.take(),
         execution_time_budget: p.execution_time_budget.take(),
         incremental_state: p.incremental_state.take(),
@@ -658,7 +649,7 @@ async fn stream_chat_sse_inner(
         current_session_id,
         current_run_id: None,
         owner_user_id: persist_session_artifacts.then_some(current_user_id),
-        policy_model_name: model_for_policy.map(str::to_string),
+        policy_model_name: p.model.map(str::to_string),
         final_text: String::new(),
         final_text_model_item_id: None,
         total_prompt: 0,

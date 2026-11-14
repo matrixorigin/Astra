@@ -1839,8 +1839,15 @@ async fn session_continuation_restores_primary_attempt_after_run_recovery() {
     exercise_primary_attempt_continuation(ContinuationFixture::Recovered).await;
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn explicit_new_turn_continues_unassigned_durable_work_without_cached_binding() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Unassigned).await;
+}
+
 #[derive(Clone, Copy)]
 enum ContinuationFixture {
+    Unassigned,
     Direct,
     NewTurn,
     Compacted,
@@ -1981,6 +1988,23 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         })
         .await
         .expect("accept continuation plan");
+
+    if matches!(fixture, ContinuationFixture::Unassigned) {
+        exercise_primary_continuation_entry(
+            &pool,
+            &owner,
+            &session,
+            &work,
+            &branch,
+            "",
+            "",
+            ContinuationFixture::Unassigned,
+        )
+        .await;
+        cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
+        crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
+        return;
+    }
 
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let old_authority = engine
@@ -2274,9 +2298,31 @@ async fn exercise_primary_continuation_entry(
                     .cloned()
                     .collect();
             }
-            let row: (String, String, Option<String>) = sqlx::query_as(
-            "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
-        ).bind(&probe.owner).bind(&probe.attempt).fetch_one(probe.pool.get()).await.expect("observe attempt at provider boundary");
+            let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)",
+            ).bind(&probe.owner).bind(&probe.attempt).bind(&probe.attempt)
+                .fetch_optional(probe.pool.get()).await.expect("observe attempt at provider boundary");
+            let Some(row) = row else {
+                assert!(
+                    probe.attempt.is_empty(),
+                    "a restored attempt must already exist"
+                );
+                let calls = request["tools"].as_array().expect("provider tools");
+                assert!(
+                    calls
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "run_next_work_item"),
+                    "explicit continuation remains discoverable"
+                );
+                return provider_response(
+                    &request,
+                    prompt_tokens,
+                    json!({"role":"assistant","content":null,"tool_calls":[{
+                        "id":"continue-unassigned-work","type":"function",
+                        "function":{"name":"run_next_work_item","arguments":"{}"}
+                    }]}),
+                );
+            };
             probe.observations.lock().await.push(row.clone());
             let can_settle = request["tools"].as_array().is_some_and(|tools| {
                 tools
@@ -2334,6 +2380,13 @@ async fn exercise_primary_continuation_entry(
                 json!({"role":"assistant","content":"Review delivered."})
             }
         };
+        provider_response(&request, prompt_tokens, message)
+    }
+    fn provider_response(
+        request: &Value,
+        prompt_tokens: u64,
+        message: Value,
+    ) -> axum::response::Response {
         let reason = if message.get("tool_calls").is_some() {
             "tool_calls"
         } else {
@@ -2498,16 +2551,31 @@ async fn exercise_primary_continuation_entry(
             offering_id: offering_id.clone(),
         });
         request.session_id = Some(session.into());
-        request.work_binding = Some(astra_services::runs::WorkRuntimeBindingRequest {
-            work_id: work.into(),
-            branch_id: branch.into(),
-            item: None,
-        });
+        if attempt.is_empty() {
+            // Select the existing native Server provider, without supplying a
+            // Work binding or preloading the new executor's Work cache.
+            let binding = astra_services::SessionExecutionBindingV1::server_work_default(format!(
+                "session:{session}:branch:{}",
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            ));
+            request.workspace_binding = Some(binding.workspace);
+            request.executor_binding = Some(binding.executor);
+            request.execution_binding_generation = Some(binding.generation);
+        }
+        request.work_binding =
+            (!attempt.is_empty()).then(|| astra_services::runs::WorkRuntimeBindingRequest {
+                work_id: work.into(),
+                branch_id: branch.into(),
+                item: None,
+            });
         let run = service
             .create_run(owner.into(), request)
             .await
             .expect("new turn entry");
-        let settled = tokio::time::timeout(Duration::from_secs(15), async {
+        // This is a multi-round correctness/watchdog bound, not a latency
+        // assertion. Instrumented builds also drain the real invocation and
+        // canonical-writer owners before inspecting the durable result.
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
             // Terminal status precedes conversation commit and writer release.
             // Await this fixture's existing task accounting without repeatedly
             // loading event history from the pool used by turn settlement.
@@ -2768,8 +2836,8 @@ async fn exercise_primary_continuation_entry(
                 );
             }
         }
-        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
-            .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
+        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)")
+            .bind(owner).bind(attempt).bind(attempt).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
             terminal.0,
             if turn == 0 { &run.run_id } else { &created[0] }.as_str()
@@ -2785,6 +2853,65 @@ async fn exercise_primary_continuation_entry(
         .await
         .unwrap();
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        if attempt.is_empty() {
+            let admission_scope: (Option<String>,Option<String>,Option<String>) = sqlx::query_as(
+                "SELECT work_id, work_branch_id, work_item_attempt_id FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                admission_scope,
+                (None, None, None),
+                "dynamic task assignment does not rewrite the run's admission scope"
+            );
+            if turn == 0 {
+                let graph = astra_services::work::DatabaseWorkRepository::new(pool.clone())
+                    .load_task_execution_snapshot_for_session(
+                        &astra_services::work::WorkOwnerId::parse(owner).unwrap(),
+                        &astra_services::work::InternalSessionId::parse(session).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let expected = graph
+                    .items()
+                    .iter()
+                    .find(|item| {
+                        item.kind == astra_services::work::WorkItemKind::Task
+                            && item.objective.as_str()
+                                == "Read the current continuation live runtime overview."
+                    })
+                    .expect("the existing declared task");
+                let durable:(String,String,String,i64,String)=sqlx::query_as(
+                    "SELECT work_id, branch_id, work_item_id, work_item_revision, attempt_id FROM work_item_attempts WHERE owner_id=? AND executor_run_id=?")
+                    .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+                assert_eq!(durable.0, work);
+                assert_eq!(durable.1, branch);
+                assert_eq!(durable.2, expected.item_id.as_str());
+                assert_eq!(durable.3, expected.revision.get());
+                assert!(
+                    !durable.4.is_empty(),
+                    "the declared task owns its durable attempt"
+                );
+            }
+        }
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM works WHERE owner_id = ?")
+            .bind(owner)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            works, 1,
+            "continuation must not synthesize a replacement Work"
+        );
+        let genesis_operations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_establishment_operations WHERE owner_id = ?",
+        )
+        .bind(owner)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            genesis_operations, 0,
+            "continuation must not leave speculative genesis operations"
+        );
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
         created.push(run.run_id);
