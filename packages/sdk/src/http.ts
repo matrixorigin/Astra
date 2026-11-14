@@ -34,6 +34,22 @@ export function isHeadersLike(headers: unknown): headers is Headers {
   );
 }
 
+/**
+ * Map a Unicode string to a Fetch/undici ByteString that preserves UTF-8 wire
+ * bytes. `Headers` encodes values as Latin-1, so passing a decoded JS string
+ * such as "café" would send 0xe9 instead of UTF-8 0xc3 0xa9, and Chinese or
+ * emoji subjects would throw. This is a header encoding helper, not a second
+ * identity decoder: callers still use extractJwtSubject as the identity owner.
+ */
+export function utf8HeaderByteString(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let encoded = "";
+  for (const byte of bytes) {
+    encoded += String.fromCharCode(byte);
+  }
+  return encoded;
+}
+
 /** Merge headers case-insensitively; later values replace earlier values. */
 export function headersInitToRecord(
   base: Record<string, string>,
@@ -115,9 +131,10 @@ export function extractJwtSubject(token: string): string | null {
     }
     const normalized = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
     const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
-    const decoded = typeof atob === 'function'
-      ? atob(padded)
-      : Buffer.from(padded, 'base64').toString('utf8');
+    const bytes = typeof atob === 'function'
+      ? Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
+      : Buffer.from(padded, 'base64');
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const payload = JSON.parse(decoded) as {
       sub?: unknown;
     };

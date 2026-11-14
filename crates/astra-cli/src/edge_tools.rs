@@ -44,6 +44,8 @@ pub(super) struct EdgeMcpRuntimeSnapshot {
 /// instead of a generic "denied".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SandboxExpansionError {
+    #[error("sandbox expansion path cannot be resolved or changed while approval was pending")]
+    UnresolvedPath,
     /// The path was not absolute. Only absolute, concrete paths are expandable.
     #[error("sandbox expansion requires an absolute path")]
     NotAbsolute,
@@ -460,6 +462,7 @@ pub(crate) fn nonexecuted_tool_result_fields(
 fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
     let message = crate::sandbox_retry::sandbox_denied_message(output)?.into_owned();
     Some(ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: format!("Error: {message}"),
         tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
             &message,
@@ -486,6 +489,7 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
 fn cancelled_tool_execution_outcome(name: &str, execution_started: bool) -> ToolExecutionOutcome {
     let result = astra_tools::cancelled_tool_result(name, execution_started);
     ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
@@ -579,6 +583,7 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
 
 #[derive(Default)]
 struct ToolExecutionFacts {
+    sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
     fields: Option<serde_json::Map<String, Value>>,
     is_error: Option<bool>,
 }
@@ -592,6 +597,7 @@ impl ToolExecutionFacts {
 }
 
 struct EdgeToolRun {
+    sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
     output: String,
     is_error: bool,
     error_kind: Option<astra_core::ErrorKind>,
@@ -601,6 +607,7 @@ struct EdgeToolRun {
 impl EdgeToolRun {
     fn ok(output: String) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: false,
             error_kind: None,
@@ -610,6 +617,7 @@ impl EdgeToolRun {
 
     fn error(output: String) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: None,
@@ -619,6 +627,7 @@ impl EdgeToolRun {
 
     fn from_tool_result(result: astra_tools::ToolResult) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output: result.output,
             is_error: result.is_error,
             error_kind: None,
@@ -637,6 +646,7 @@ impl EdgeToolRun {
             fields.insert("recovery_evidence".to_string(), value);
         }
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: Some(kind),
@@ -656,6 +666,7 @@ impl EdgeToolRun {
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         fields.insert("side_effects_maybe".into(), Value::Bool(false));
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: Some(evidence.kind),
@@ -672,11 +683,20 @@ impl EdgeToolRun {
         self
     }
 
+    fn with_sandbox_approval_scope(
+        mut self,
+        scope: Option<astra_sandbox::SandboxApprovalScope>,
+    ) -> Self {
+        self.sandbox_approval_scope = scope;
+        self
+    }
+
     fn into_outcome(self) -> ToolExecutionOutcome {
         let EdgeToolRun {
             output,
             is_error,
             error_kind,
+            sandbox_approval_scope,
             tool_result_fields,
         } = self;
 
@@ -700,6 +720,7 @@ impl EdgeToolRun {
                 Value::String(kind.as_str().to_string()),
             );
         }
+        outcome.sandbox_approval_scope = sandbox_approval_scope;
         outcome
     }
 }
@@ -707,6 +728,7 @@ impl EdgeToolRun {
 fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
     let result = astra_tools::cancelled_tool_result(name, execution_started);
     EdgeToolRun {
+        sandbox_approval_scope: None,
         output: result.output,
         is_error: true,
         error_kind: Some(astra_core::ErrorKind::Cancelled),
@@ -721,6 +743,7 @@ pub(crate) fn workspace_lease_failure_tool_execution_outcome(
 ) -> ToolExecutionOutcome {
     let result = local_workspace_lease_failure(name, failure, root);
     ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
@@ -4564,6 +4587,20 @@ impl ToolExecutor {
     /// user-supplied inputs (e.g. `--add-dir`, `ASTRA_CLI_ADD_DIRS`)
     /// cannot open `/` or `/etc`.
     pub fn expand_sandbox_path(&self, dir: PathBuf) -> Result<PathBuf, SandboxExpansionError> {
+        Self::validate_sandbox_expansion(&dir)?;
+        let dir = astra_sandbox::canonicalize_parent_and_append(&dir)
+            .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
+        self.commit_sandbox_expansion(dir, None)
+    }
+
+    pub(crate) fn expand_approved_sandbox_scope(
+        &self,
+        scope: &astra_sandbox::SandboxApprovalScope,
+    ) -> Result<PathBuf, SandboxExpansionError> {
+        self.commit_sandbox_expansion(scope.path().to_path_buf(), Some(scope))
+    }
+
+    fn validate_sandbox_expansion(dir: &Path) -> Result<(), SandboxExpansionError> {
         if !dir.is_absolute() {
             return Err(SandboxExpansionError::NotAbsolute);
         }
@@ -4576,28 +4613,41 @@ impl ToolExecutor {
         {
             return Err(SandboxExpansionError::TraversalEscape);
         }
-        if astra_sandbox::is_sensitive_system_dir(&dir)
-            || astra_sandbox::is_never_readable_path(&dir)
-        {
+        if astra_sandbox::is_never_readable_path(dir) {
             return Err(SandboxExpansionError::SystemSensitivePath);
         }
+        Ok(())
+    }
+
+    fn commit_sandbox_expansion(
+        &self,
+        dir: PathBuf,
+        scope: Option<&astra_sandbox::SandboxApprovalScope>,
+    ) -> Result<PathBuf, SandboxExpansionError> {
+        Self::validate_sandbox_expansion(&dir)?;
         let mut basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
-        if let Ok(mut guard) = self.sandbox_policy.write() {
-            match *guard {
-                Some(ref mut policy) => {
-                    policy.allowed_paths.push(dir.clone());
-                    if let Some(basis) = basis.as_mut() {
-                        if basis.skill_policy.is_some() {
-                            basis.skill_policy = Some(policy.clone());
-                        } else {
-                            basis.baseline = Some(policy.clone());
-                        }
-                    }
-                }
-                None => return Err(SandboxExpansionError::NoSandboxPolicy),
-            }
+        let mut guard = self
+            .sandbox_policy
+            .write()
+            .map_err(|_| SandboxExpansionError::PolicyLockPoisoned)?;
+        let policy = guard
+            .as_mut()
+            .ok_or(SandboxExpansionError::NoSandboxPolicy)?;
+        if let Some(scope) = scope {
+            policy
+                .add_approved_scope(scope)
+                .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
         } else {
-            return Err(SandboxExpansionError::PolicyLockPoisoned);
+            policy
+                .add_canonical_allowed_path(dir.clone())
+                .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
+        }
+        if let Some(basis) = basis.as_mut() {
+            if basis.skill_policy.is_some() {
+                basis.skill_policy = Some(policy.clone());
+            } else {
+                basis.baseline = Some(policy.clone());
+            }
         }
         Ok(dir)
     }
@@ -5437,6 +5487,7 @@ impl ToolExecutor {
         let ToolExecutionFacts {
             fields: mut tool_result_fields,
             is_error: source_is_error,
+            sandbox_approval_scope,
         } = facts;
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
@@ -5628,6 +5679,7 @@ impl ToolExecutor {
             EdgeToolRun::ok(output)
         }
         .with_tool_result_fields(tool_result_fields)
+        .with_sandbox_approval_scope(sandbox_approval_scope)
     }
 
     // This execution boundary receives prepared capability and authority facts explicitly.
@@ -5654,6 +5706,7 @@ impl ToolExecutor {
         let ToolExecutionFacts {
             fields: tool_result_fields,
             is_error: source_is_error,
+            sandbox_approval_scope,
         } = facts;
         let output = if let Some(protocol) = native_protocol {
             let result = match protocol {
@@ -5683,6 +5736,7 @@ impl ToolExecutor {
                         .await;
                     *tool_result_fields = outcome.tool_result_fields.clone();
                     *source_is_error = Some(outcome.is_error);
+                    *sandbox_approval_scope = outcome.sandbox_approval_scope;
                     outcome.output
                 }
                 #[cfg(windows)]
@@ -6441,6 +6495,7 @@ impl ToolExecutor {
             let mut result = Value::Object(result);
             astra_text_utils::credential_redaction::redact_credentials_in_json(&mut result);
             ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: result.to_string(),
                 tool_result_fields: fields,
                 is_error: failed,
@@ -7377,7 +7432,7 @@ pub(crate) mod tests {
         astra_runtime::orchestration::AgentToolContext {
             parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
@@ -8226,7 +8281,7 @@ pub(crate) mod tests {
         .unwrap();
         let args = serde_json::json!({"path":external.path(), "pattern":"approved-external"});
         let mut restricted = super::SandboxPolicy::for_project(root.path());
-        restricted.allowed_paths.clear();
+        restricted.clear_allowed_paths();
         *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
         let denied = executor.execute_with_metadata("grep", &args).await;
         let denial = denied.tool_result_fields.as_ref().expect("denial facts");

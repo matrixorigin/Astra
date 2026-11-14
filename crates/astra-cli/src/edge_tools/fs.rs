@@ -3916,8 +3916,7 @@ mod tests {
             .unwrap()
             .as_mut()
             .unwrap()
-            .allowed_paths
-            .clear();
+            .clear_allowed_paths();
         let args = json!({"path": path, "content": "alpha\r\n"});
         let (denied, applied, converged) = exe.write_file_with_applied(&args);
         assert_eq!(
@@ -3965,8 +3964,7 @@ mod tests {
             .unwrap()
             .as_mut()
             .unwrap()
-            .allowed_paths
-            .clear();
+            .clear_allowed_paths();
         let arguments = json!({"edits":[
             {"path":first,"old_str":"before","new_str":"after"},
             {"path":second,"old_str":"before","new_str":"after"}
@@ -4011,8 +4009,7 @@ mod tests {
             .unwrap()
             .as_mut()
             .unwrap()
-            .allowed_paths
-            .clear();
+            .clear_allowed_paths();
         let denied = executor
             .execute_with_metadata(
                 "str_replace",

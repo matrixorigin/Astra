@@ -71,12 +71,19 @@ impl SlashItem {
     }
 }
 
+/// A draft that could still become a command once submitted: it starts
+/// with a slash and is not the escaped-literal form. Menu discovery
+/// deliberately skips the command registry so unknown, fuzzy, or
+/// case-variant prefixes keep completions on screen while typing; the
+/// registry-aware submission classification only applies to submitted
+/// text.
+fn is_prospective_command(buffer: &str) -> bool {
+    buffer.starts_with('/') && !buffer.starts_with("//")
+}
+
 /// Should the menu be open for the given composer buffer?
 pub(crate) fn is_open_for(buffer: &str, items: &[SlashItem]) -> bool {
-    if !buffer.starts_with('/')
-        || !crate::tui::slash_dispatch::parse_submission(buffer).is_command()
-        || buffer.contains(['\n', '\r'])
-    {
+    if !is_prospective_command(buffer) || buffer.contains(['\n', '\r']) {
         return false;
     }
     let Some((command, suffix)) = buffer.split_once(char::is_whitespace) else {

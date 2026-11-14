@@ -323,6 +323,7 @@ where
                         "status": "rejected",
                         "error_kind": "deferred_tool_activation_invalid",
                         "retryable": true,
+                        "executed": false,
                         "error": error.as_str(),
                     })
                     .to_string(),
@@ -356,6 +357,7 @@ where
                     "status": "rejected",
                     "error_kind": "deferred_tool_activation_invalid",
                     "retryable": true,
+                    "executed": false,
                     "error": error.as_str(),
                 })
                 .to_string(),
@@ -2782,6 +2784,15 @@ mod tests {
             ),
             Some("web_fetch")
         );
+
+        let inactive = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(std::slice::from_ref(&carrier), Some("tool_calls")),
+            &[],
+            |_| None,
+        );
+        let feedback: Value = serde_json::from_str(&inactive.rejected[0].result).unwrap();
+        assert_eq!(feedback["executed"], false);
+        assert!(feedback["error"].as_str().unwrap().contains("select:NAME"));
 
         let resident = super::resolve_carrier_tool_admission_with_identity(
             super::admit_tool_calls(

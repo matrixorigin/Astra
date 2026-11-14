@@ -68,6 +68,7 @@ export type {
   StreamGapEvent,
   AgentWaitingEvent,
   AgentProgressEvent,
+  RuntimeWaitEvent,
   AgentCompletedEvent,
   AgentFailedEvent,
   AgentCancelledEvent,
@@ -521,6 +522,7 @@ export {
   isHeadersLike,
   methodCanHaveJson,
   readAstraErrorDetail,
+  utf8HeaderByteString,
 } from "./http";
 export { AstraWebSocket } from "./websocket";
 export type { AstraWebSocketOptions, ToolApproval, UserPromptAnswer } from "./websocket";

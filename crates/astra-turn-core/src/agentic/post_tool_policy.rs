@@ -375,7 +375,7 @@ mod tests {
 
         let control = astra_pipeline::step_protocol::RunExecutionControl::V4 {
             hook_obligations: astra_turn_types::StopHookObligations::default(),
-            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+            question_correlations: astra_turn_types::QuestionCorrelationsSnapshotV1 {
                 run_id: "test-run".into(),
                 producer_owner_generation: 3,
                 pending: Vec::new(),

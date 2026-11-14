@@ -13,7 +13,7 @@ mod e2e_loop_tests;
 mod integration_tests;
 #[cfg(test)]
 mod orchestrator_mailbox_tests;
-pub mod reply_obligations;
+pub mod question_correlations;
 
 // Re-export key types for convenience.
 pub use astra_messaging::{

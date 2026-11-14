@@ -28,7 +28,8 @@ identity so presentation compaction cannot leave an accepted tool call open.
 
 Malformed, unknown, rejected, or uncertain-delivery receipts must not gain
 accepted-control authority. Existing run/call ownership checks, child completion
-barriers, reply obligations, and Work settlement remain authoritative. Evaluation,
+barriers and Work settlement remain authoritative. Question correlation is
+advisory and does not create another lifecycle dependency. Evaluation,
 recovery, and Server result projection consume the same classification; a later
 control receipt cannot erase an unrelated failed verification.
 An observation error does not establish child termination or release ownership.
@@ -54,8 +55,12 @@ answer while it is still making progress.
 
 A delegated child must not consume the parent's final-answer reserve. The
 parent retains the runtime's existing text-only final-convergence window after
-the child settles. Optional parent verification can use time left when a child
-finishes early; it is not reserved by shortening every child's deadline. The
+the child settles. A terminal child result is available evidence, not authority
+for an immediate text-only boundary. The parent may continue permitted
+verification while its ordinary work budget remains; existing deadline and
+Work settlement owners decide when final convergence is required. Exact unread
+fanout pages retain their existing admission barrier until consumed. Optional
+parent verification is not reserved by shortening every child's deadline. The
 child receives the earlier absolute deadline and must retain one ordinary
 provider-action window plus its own final-convergence window. Fanout siblings
 share that child deadline; the runtime returns completed and usable partial
