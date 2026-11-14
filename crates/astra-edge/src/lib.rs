@@ -108,6 +108,29 @@ fn normalized_edge_ws_path(path: &str) -> String {
 
 pub type EdgeConnectionError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Startup stopped because an older invocation record cannot be attributed to
+/// this server. The message names the files and the recovery move.
+#[derive(Debug)]
+pub struct EdgeJournalCustodyError {
+    message: String,
+}
+
+impl EdgeJournalCustodyError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EdgeJournalCustodyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EdgeJournalCustodyError {}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeAuthenticationError {
     #[error("Server rejected Edge authentication")]
@@ -225,6 +248,10 @@ pub struct EdgeConnectionContext {
     pub edge_agent_id: String,
     pub workspace_dir: PathBuf,
     pub journal_path: PathBuf,
+    /// Journal path used before `server_url` joined the key. While that file
+    /// still has records, startup stops and names both paths. `None` means
+    /// this journal never used that older name.
+    pub legacy_journal_path: Option<PathBuf>,
     /// Signals installed consumer readiness after journal recovery/replay.
     pub ready: Option<oneshot::Sender<()>>,
 }
@@ -515,7 +542,19 @@ impl EdgeInvocationOwner {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
             mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
-        let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
+        let journal = match EdgeInvocationJournal::open_inheriting(
+            context.journal_path.clone(),
+            context.legacy_journal_path.clone(),
+        )
+        .await
+        {
+            Ok(journal) => journal,
+            Err(
+                error @ (JournalError::AmbiguousCustody { .. }
+                | JournalError::UnattributedLegacy { .. }),
+            ) => return Err(Box::new(EdgeJournalCustodyError::new(error.to_string()))),
+            Err(error) => return Err(Box::new(error)),
+        };
         let journal_status = journal.status();
         tracing::info!(
             target: "astra.edge.invocation_journal",
@@ -1333,6 +1372,7 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: workspace.clone(),
                 journal_path: journal_path.clone(),
+                legacy_journal_path: None,
                 ready: None,
             };
             let mut owner =
@@ -1503,6 +1543,7 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: server_workspace.clone(),
                 journal_path: server_journal.clone(),
+                legacy_journal_path: None,
                 ready: None,
             };
             let mut owner = EdgeInvocationOwner::open(&context(), server_executor)
@@ -1648,6 +1689,7 @@ mod tests {
                         edge_agent_id: "edge".into(),
                         workspace_dir: workspace,
                         journal_path,
+                        legacy_journal_path: None,
                         ready: Some(ready),
                     },
                     executor,
@@ -1820,6 +1862,7 @@ mod tests {
                     edge_agent_id: "edge".into(),
                     workspace_dir: directory.path().to_owned(),
                     journal_path,
+                    legacy_journal_path: None,
                     ready: Some(ready),
                 },
                 Arc::new(NoDispatchExecutor),

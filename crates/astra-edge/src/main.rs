@@ -10,6 +10,7 @@
 //! ```
 
 mod capacity_provider;
+mod managed_background;
 mod runtime_process_authorization;
 mod token_manager;
 mod token_renewal;
@@ -184,7 +185,13 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
     // Prefer a valid persisted moi-user-token-v1 (written by a prior renewal)
     // over the env/flag token; astra JWT flows are untouched.
-    let token_file = token_renewal::resolve_token_file_path(&workspace_dir);
+    let token_file_override = token_renewal::explicit_token_file_override();
+    let managed_dir = managed_background::credential_handoff_dir();
+    let token_file = token_renewal::runner_token_file(
+        &workspace_dir,
+        token_file_override.as_deref(),
+        managed_dir.as_deref(),
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -302,6 +309,25 @@ use astra_runtime_env::{
 };
 
 fn edge_invocation_journal_path_in_root(
+    edge_id: &str,
+    server_url: &str,
+    workspace_dir: &Path,
+    state_root: Option<PathBuf>,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(edge_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(server_url.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace_dir.to_string_lossy().as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    let base = state_root.unwrap_or_else(astra_core::local_state::local_state_root);
+    base.join("edge-invocations").join(format!("{key}.json"))
+}
+
+/// Journal key from before `server_url` was part of the identity. Opening the
+/// server-scoped path stops while this file still holds records.
+fn legacy_edge_invocation_journal_path_in_root(
     edge_id: &str,
     workspace_dir: &Path,
     state_root: Option<PathBuf>,
@@ -699,6 +725,28 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
+fn managed_ready_sender() -> Option<tokio::sync::oneshot::Sender<()>> {
+    if !managed_background::is_managed_child() {
+        return None;
+    }
+    // Capture the phase generation before this connection can disconnect.
+    // The callback may run after the loop has already recorded reconnecting.
+    let epoch = managed_background::current_phase_epoch();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if receiver.await.is_ok() {
+            // The acknowledgement read waits for the starting command. Keep
+            // that wait off the runtime so a suspended parent cannot stall
+            // connection timers, and so shutdown can end it.
+            let _ = tokio::task::spawn_blocking(move || {
+                managed_background::signal_ready_for_epoch(epoch);
+            })
+            .await;
+        }
+    });
+    Some(sender)
+}
+
 async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
@@ -734,40 +782,48 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     // Snapshot the live token per connection attempt: the renewal task may
     // have replaced it since the previous (re)connect.
     let token_snapshot = config.token_manager.snapshot().await;
-    let ws_stream = if let Some(ref proxy_url) = proxy {
-        connect_via_proxy(&url, proxy_url, &token_snapshot)
+    let shutdown = managed_background::connection_shutdown();
+    let ws_stream = match managed_background::until_cancelled(&shutdown, async {
+        if let Some(ref proxy_url) = proxy {
+            connect_via_proxy(&url, proxy_url, &token_snapshot)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        target: "astra.edge",
+                        edge_id = %config.edge_id,
+                        url = %url,
+                        proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
+                        error = %error,
+                        "WebSocket connect via proxy failed"
+                    );
+                    error
+                })
+        } else {
+            let request = edge_ws_request(&url, &token_snapshot)?;
+            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+            )
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 tracing::error!(
                     target: "astra.edge",
                     edge_id = %config.edge_id,
                     url = %url,
-                    proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
-                    error = %e,
-                    "WebSocket connect via proxy failed"
+                    error = %error,
+                    "WebSocket connect failed"
                 );
-                e
-            })?
-    } else {
-        let request = edge_ws_request(&url, &token_snapshot)?;
-        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "astra.edge",
-                edge_id = %config.edge_id,
-                url = %url,
-                error = %e,
-                "WebSocket connect failed"
-            );
-            e
-        })?;
-        ws
+                Box::new(error) as Box<dyn std::error::Error>
+            })?;
+            Ok(ws)
+        }
+    })
+    .await
+    {
+        Err(()) => return Err("runner stopping".into()),
+        Ok(result) => result?,
     };
     let (write, read) = ws_stream.split();
 
@@ -802,8 +858,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         .reunite(read)
         .map_err(|_| "Edge socket halves could not be reunited")?;
     let (socket, authenticated_account, _authenticated_edge_id) =
-        astra_edge::authenticate_connection(socket, auth_msg, None, &CancellationToken::new())
-            .await?;
+        astra_edge::authenticate_connection(socket, auth_msg, None, &shutdown).await?;
     // Only the token snapshot proven by this connection may advance persistence.
     config.token_manager.mark_proven(&token_snapshot).await;
 
@@ -824,16 +879,22 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             workspace_dir: workspace.clone(),
             journal_path: edge_invocation_journal_path_in_root(
                 &config.edge_id,
+                &config.server_url,
                 &workspace,
                 config.invocation_journal_root.clone(),
             ),
-            ready: None,
+            legacy_journal_path: Some(legacy_edge_invocation_journal_path_in_root(
+                &config.edge_id,
+                &workspace,
+                config.invocation_journal_root.clone(),
+            )),
+            ready: managed_ready_sender(),
         },
         Arc::new(DefaultInvocationExecutor(
             executor,
             config.capacity_providers.clone(),
         )),
-        CancellationToken::new(),
+        shutdown,
     )
     .await
     .map_err(|error| error as Box<dyn std::error::Error>)
@@ -907,15 +968,23 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
-    // The release builds CLI and Edge together, unifying ring and aws-lc
-    // features. Select the Edge provider before constructing any TLS client.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Edge installs its TLS provider before any TLS client");
-    // Image-managed runners have no MOI installation marker and remain outside
-    // the local update lifecycle. Local managed Edge holds a lease until exit.
+/// Reject argv that the canonical parser rejects, before a managed connect
+/// command can hand a credential to a running runner or start one.
+pub(crate) fn validate_managed_command(args: &[String]) -> Result<(), i32> {
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(env!("CARGO_PKG_NAME").to_string());
+    full.extend(args.iter().cloned());
+    match Args::try_parse_from(full) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = error.print();
+            Err(error.exit_code())
+        }
+    }
+}
+
+fn main() {
+    // Protocol probes stay ahead of the runtime and of background startup.
     let executable = std::env::current_exe().expect("current executable");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match astra_core::client_installation::early_command(&executable, &args, false) {
@@ -925,6 +994,42 @@ async fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+    let state_root = astra_core::local_state::local_state_root();
+    if let Some(code) = managed_background::management_exit_code(&args, &state_root) {
+        std::process::exit(code);
+    }
+    if managed_background::is_managed_child() {
+        if let Err(error) = managed_background::prepare_child() {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    } else if managed_background::should_detach(
+        &args,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    ) {
+        std::process::exit(managed_background::supervise(
+            &executable,
+            &args,
+            &state_root,
+        ));
+    }
+    runtime();
+}
+
+#[tokio::main]
+async fn runtime() {
+    // The release builds CLI and Edge together, unifying ring and aws-lc
+    // features. Select the Edge provider before constructing any TLS client.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Edge installs its TLS provider before any TLS client");
+    // Image-managed runners have no MOI installation marker and remain outside
+    // the local update lifecycle. Local managed Edge holds a lease until exit.
+    let executable = std::env::current_exe().expect("current executable");
+    if managed_background::is_managed_child() {
+        managed_background::install_shutdown_listener();
+        managed_background::spawn_log_rotator();
     }
     let _installation_lease = match astra_core::client_installation::acquire(&executable) {
         Ok(lease) => lease,
@@ -969,60 +1074,8 @@ async fn main() {
     // Background self-renewal of moi-user-token-v1 edge-registration tokens.
     token_renewal::spawn_renewal_task(config.token_manager.clone());
 
-    let mut exit_with_error = false;
-    let mut reconnect_delay_secs: u64 = 1;
-    let max_reconnect_delay_secs: u64 = 60;
-    loop {
-        let edge_span = tracing::info_span!(
-            "edge.agent",
-            edge_id = %config.edge_id,
-            server_url = %config.server_url,
-        );
-        match run_edge_connection(&config).instrument(edge_span).await {
-            Ok(()) => {
-                reconnect_delay_secs = 1; // reset on clean disconnect
-                if !config.reconnect {
-                    break;
-                }
-                tracing::info!(
-                    delay = reconnect_delay_secs,
-                    "Disconnected, reconnecting..."
-                );
-            }
-            Err(e) => {
-                if is_permanent_connection_error(e.as_ref()) {
-                    // The chosen startup token may be revoked (e.g. a renewal
-                    // rotated it away but the persist was lost). Before giving
-                    // up, try the other startup candidate once.
-                    if config.token_manager.swap_to_fallback().await {
-                        tracing::warn!(
-                            error = %e,
-                            "Authentication failed with the selected token — retrying with the alternate startup token"
-                        );
-                        reconnect_delay_secs = 1;
-                        continue;
-                    }
-                    tracing::error!(
-                        error = %e,
-                        "Permanent authentication failure — not retrying"
-                    );
-                    exit_with_error = true;
-                    break;
-                }
-                tracing::error!(error = %e, "Connection error");
-                if !config.reconnect {
-                    exit_with_error = true;
-                    break;
-                }
-                tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
-            }
-        }
-        // Exponential backoff with jitter
-        // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
-        let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
-        tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
-        reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
-    }
+    let handoff = managed_background::credential_handoff_dir();
+    let mut exit_with_error = run_connection_loop(&config, handoff.as_deref()).await;
 
     astra_logging::shutdown_otel();
     if let Some(process_capture) = process_capture
@@ -1033,6 +1086,193 @@ async fn main() {
     }
     if exit_with_error {
         std::process::exit(1);
+    }
+}
+
+/// Stage a credential that a later connect command handed to this runner.
+/// The open connection and its admitted work are untouched; the credential is
+/// used by the next attempt. One that cannot authenticate falls back to the
+/// working credential through the token manager's one-shot swap.
+async fn adopt_handed_off_credential(config: &EdgeConfig, handoff: Option<&Path>) -> Handoff {
+    let Some(dir) = handoff else {
+        return Handoff::None;
+    };
+    match managed_background::claim_pending_credential(dir) {
+        Ok(Some(token)) => {
+            let changed = config.token_manager.stage_unproven_candidate(token).await;
+            managed_background::finish_claim(dir);
+            if changed {
+                Handoff::Adopted
+            } else {
+                Handoff::None
+            }
+        }
+        Ok(None) => Handoff::None,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra.edge",
+                error = %error,
+                "cannot read the credential handed to this runner; it is kept for the next attempt"
+            );
+            Handoff::Unreadable
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Handoff {
+    None,
+    Adopted,
+    /// A credential was handed over but could not be read yet.
+    Unreadable,
+}
+
+/// Returns true when the runner must exit with an error.
+async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> bool {
+    let mut reconnect_delay_secs: u64 = 1;
+    let max_reconnect_delay_secs: u64 = 60;
+    loop {
+        if managed_background::shutdown_requested() {
+            return false;
+        }
+        adopt_handed_off_credential(config, handoff).await;
+        let edge_span = tracing::info_span!(
+            "edge.agent",
+            edge_id = %config.edge_id,
+            server_url = %config.server_url,
+        );
+        let connection = run_edge_connection(config).instrument(edge_span);
+        tokio::pin!(connection);
+        let mut startup_lost = false;
+        let connect_result = loop {
+            tokio::select! {
+                biased;
+                // Keep polling the connection after this fires. Dropping it
+                // abandons admitted work instead of letting its owner settle.
+                _ = managed_background::until_starting_command_lost(), if !startup_lost => {
+                    startup_lost = true;
+                    managed_background::shutdown_token().cancel();
+                }
+                result = &mut connection => break result,
+            }
+        };
+        if startup_lost {
+            eprintln!("Error: the starting command is gone; runner startup was not accepted.");
+            return true;
+        }
+        match connect_result {
+            Ok(()) => {
+                reconnect_delay_secs = 1; // reset on clean disconnect
+                if !config.reconnect || managed_background::shutdown_requested() {
+                    return false;
+                }
+                if abandon_unaccepted("reconnecting") {
+                    return true;
+                }
+                tracing::info!(
+                    delay = reconnect_delay_secs,
+                    "Disconnected, reconnecting..."
+                );
+            }
+            Err(e) => {
+                if managed_background::shutdown_requested() {
+                    return false;
+                }
+                if e.downcast_ref::<astra_edge::EdgeJournalCustodyError>()
+                    .is_some()
+                {
+                    eprintln!("Error: {e}");
+                    return true;
+                }
+                if is_permanent_connection_error(e.as_ref()) {
+                    // A connect command either hands its credential over
+                    // before this decision or, once the lock is released by
+                    // exit, starts a new runner itself.
+                    let handoff_lock = managed_background::lock_credential_handoff(handoff);
+                    match adopt_handed_off_credential(config, handoff).await {
+                        Handoff::Adopted => {
+                            tracing::warn!(
+                                error = %e,
+                                "Authentication failed — retrying with the credential handed to this runner"
+                            );
+                            reconnect_delay_secs = 1;
+                            continue;
+                        }
+                        // Never exit while an accepted handoff is untried.
+                        Handoff::Unreadable => {
+                            drop(handoff_lock);
+                            tracing::warn!(
+                                error = %e,
+                                delay = reconnect_delay_secs,
+                                "Authentication failed — retrying once the handed-off credential is readable"
+                            );
+                            if abandon_unaccepted("reconnecting") {
+                                return true;
+                            }
+                        }
+                        Handoff::None => {
+                            // The previous credential may be revoked (e.g. a
+                            // renewal rotated it away but the persist was
+                            // lost, or a handed-off candidate was rejected).
+                            // Before giving up, try the credential that last
+                            // authenticated, or the other startup candidate.
+                            if config.token_manager.swap_to_fallback().await {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Authentication failed — retrying with the fallback credential"
+                                );
+                                reconnect_delay_secs = 1;
+                                continue;
+                            }
+                            tracing::error!(
+                                error = %e,
+                                "Permanent authentication failure — not retrying"
+                            );
+                            managed_background::note_phase("authentication-failure");
+                            if let Some(lock) = handoff_lock {
+                                lock.keep_until_exit();
+                            }
+                            return true;
+                        }
+                    }
+                } else {
+                    tracing::error!(error = %e, "Connection error");
+                    if !config.reconnect {
+                        return true;
+                    }
+                    if abandon_unaccepted("reconnecting") {
+                        return true;
+                    }
+                    tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
+                }
+            }
+        }
+        // Exponential backoff with jitter
+        // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
+        let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
+        let shutdown = managed_background::connection_shutdown();
+        tokio::select! {
+            biased;
+            _ = managed_background::until_starting_command_lost() => {
+                eprintln!(
+                    "Error: the starting command is gone; runner startup was not accepted."
+                );
+                return true;
+            }
+            _ = shutdown.cancelled() => return false,
+            _ = tokio::time::sleep(Duration::from_secs_f64(jitter)) => {}
+        }
+        reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
+    }
+}
+
+fn abandon_unaccepted(phase: &str) -> bool {
+    managed_background::note_phase(phase);
+    if managed_background::readiness_abandoned() {
+        eprintln!("Error: the connection ended before startup was accepted.");
+        true
+    } else {
+        false
     }
 }
 
@@ -1397,8 +1637,12 @@ mod tests {
     fn invocation_journal_honors_the_explicit_local_state_root() {
         let root = std::env::temp_dir().join("astra-edge-isolated-state");
         let workspace = std::env::temp_dir().join("astra-edge-workspace");
-        let path =
-            edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root.clone()));
+        let path = edge_invocation_journal_path_in_root(
+            "edge-test",
+            "wss://example.test",
+            &workspace,
+            Some(root.clone()),
+        );
 
         assert_eq!(path.parent().and_then(Path::parent), Some(root.as_path()));
         assert_eq!(
@@ -1406,6 +1650,360 @@ mod tests {
             Some(std::ffi::OsStr::new("edge-invocations"))
         );
         assert_eq!(path.extension(), Some(std::ffi::OsStr::new("json")));
+        let other_server = edge_invocation_journal_path_in_root(
+            "edge-test",
+            "wss://other.example.test",
+            &workspace,
+            Some(root.clone()),
+        );
+        assert_ne!(path, other_server);
+        let legacy =
+            legacy_edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root));
+        let mut hasher = Sha256::new();
+        hasher.update(b"edge-test");
+        hasher.update([0]);
+        hasher.update(workspace.to_string_lossy().as_bytes());
+        let key = format!("{:x}.json", hasher.finalize());
+        assert_eq!(
+            legacy.file_name().and_then(|name| name.to_str()),
+            Some(key.as_str())
+        );
+        assert_ne!(legacy, path);
+    }
+
+    fn edge_config(
+        server_url: String,
+        edge_id: &str,
+        workspace: &Path,
+        state: &Path,
+        token_name: &str,
+    ) -> EdgeConfig {
+        EdgeConfig {
+            capacity_providers: Vec::new(),
+            server_url,
+            token_manager: token_manager::TokenManager::new(
+                "test-token".into(),
+                None,
+                state.join(token_name),
+            ),
+            workspace_dir: workspace.to_path_buf(),
+            edge_id: edge_id.to_string(),
+            materialization_id: format!("{edge_id}-materialization"),
+            reconnect: false,
+            invocation_journal_root: Some(state.to_path_buf()),
+        }
+    }
+
+    async fn accept_plain_socket(
+        listener: &tokio::net::TcpListener,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_servers_with_one_edge_id_open_distinct_journals() {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let workspace = workspace.canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap().keep();
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url_a = format!("ws://{}/edge/ws", listener_a.local_addr().unwrap());
+        let url_b = format!("ws://{}/edge/ws", listener_b.local_addr().unwrap());
+        assert_ne!(
+            edge_invocation_journal_path_in_root(
+                "runner-abc",
+                &url_a,
+                &workspace,
+                Some(state.clone())
+            ),
+            edge_invocation_journal_path_in_root(
+                "runner-abc",
+                &url_b,
+                &workspace,
+                Some(state.clone())
+            ),
+        );
+        let hold = |listener: tokio::net::TcpListener| async move {
+            let mut socket = accept_plain_socket(&listener).await;
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::AuthOk {
+                        user_id: "user".into(),
+                        edge_id: "runner-abc".into(),
+                        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR
+                            .into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
+        };
+        let config_a = edge_config(url_a, "runner-abc", &workspace, &state, "server-a.token");
+        let config_b = edge_config(url_b, "runner-abc", &workspace, &state, "server-b.token");
+        let ((), (), first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                hold(listener_a),
+                hold(listener_b),
+                run_edge_connection(&config_a),
+                run_edge_connection(&config_b),
+            )
+        })
+        .await
+        .expect("the two servers did not both open their journals");
+        for result in [first, second] {
+            if let Err(error) = result {
+                let message = error.to_string();
+                assert!(
+                    !message.contains("json.lock"),
+                    "two servers opened one journal: {message}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_loss_after_tool_admission_replays_cancellation() {
+        if std::env::var("ASTRA_EDGE_TEST_PARENT_LOSS").ok().as_deref() == Some("1") {
+            let workspace = PathBuf::from(std::env::var("ASTRA_EDGE_TEST_WORKSPACE").unwrap());
+            let state = PathBuf::from(std::env::var("ASTRA_EDGE_TEST_STATE").unwrap());
+            let config = edge_config(
+                std::env::var("ASTRA_EDGE_TEST_SERVER").unwrap(),
+                "runner-parent-loss",
+                &workspace,
+                &state,
+                "parent-loss.token",
+            );
+            let handoff = managed_background::credential_handoff_dir();
+            let _ = run_connection_loop(&config, handoff.as_deref()).await;
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let workspace = workspace.canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap().keep();
+        let state = state.canonicalize().unwrap();
+        let runner_dir = state.join("runner");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
+        let journal = edge_invocation_journal_path_in_root(
+            "runner-parent-loss",
+            &server_url,
+            &workspace,
+            Some(state.clone()),
+        );
+        let (mut parent_ready, child_ready) = std::os::unix::net::UnixStream::pair().unwrap();
+        parent_ready
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let child_fd = std::os::fd::AsRawFd::as_raw_fd(&child_ready);
+        nix::fcntl::fcntl(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(child_fd) },
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::parent_loss_after_tool_admission_replays_cancellation",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRA_EDGE_TEST_PARENT_LOSS", "1")
+            .env("ASTRA_EDGE_MANAGED", "1")
+            .env("ASTRA_EDGE_STATE_DIR", &runner_dir)
+            .env("ASTRA_EDGE_READY_FD", child_fd.to_string())
+            .env("ASTRA_EDGE_TEST_SERVER", &server_url)
+            .env("ASTRA_EDGE_TEST_WORKSPACE", &workspace)
+            .env("ASTRA_EDGE_TEST_STATE", &state)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        drop(child_ready);
+
+        let mut socket = accept_plain_socket(&listener).await;
+        assert!(socket.next().await.unwrap().unwrap().is_text());
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::AuthOk {
+                    user_id: "user".into(),
+                    edge_id: "runner-parent-loss".into(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "chain",
+            "parent-loss-call",
+        )
+        .unwrap();
+        let request = EdgeServerMessage::ToolRequest {
+            request_id: identity.storage_key(),
+            identity: Box::new(identity),
+            delivery_generation: 1,
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "sleep 30"}),
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: Some(30),
+            execution_deadline_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 120_000,
+            ),
+            execution_timeout_ms: Some(120_000),
+            command_timeout_cap_ms: None,
+            execution_ceiling: None,
+            traceparent: None,
+            tracestate: None,
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut ready = [0u8; 1];
+            parent_ready.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"1");
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                let recorded = [&journal, &journal.with_extension("json.wal")]
+                    .iter()
+                    .any(|path| {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .is_some_and(|body| body.contains("\"state\":\"running\""))
+                    });
+                if recorded {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("admitted bash was not durable before the starting command disappeared");
+        })
+        .await
+        .unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .expect("admitted work did not settle after the starting command disappeared")
+        .unwrap()
+        .unwrap();
+        assert!(
+            status.success(),
+            "runner exited before settlement: {status}"
+        );
+        while let Some(frame) = socket.next().await {
+            if frame.is_err() {
+                break;
+            }
+        }
+
+        let replay_config = edge_config(
+            server_url,
+            "runner-parent-loss",
+            &workspace,
+            &state,
+            "replay.token",
+        );
+        let replay = run_edge_connection(&replay_config);
+        let replay_server = async {
+            let mut socket = accept_plain_socket(&listener).await;
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::AuthOk {
+                        user_id: "user".into(),
+                        edge_id: "runner-parent-loss".into(),
+                        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR
+                            .into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = tokio::time::timeout_at(deadline, socket.next())
+                    .await
+                    .expect("replay did not deliver the settled result")
+                    .unwrap()
+                    .unwrap();
+                if !frame.is_text() {
+                    continue;
+                }
+                let message: EdgeClientMessage =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if let EdgeClientMessage::ToolResult {
+                    is_error,
+                    output,
+                    tool_result_fields,
+                    ..
+                } = message
+                {
+                    socket
+                        .send(Message::Text(
+                            serde_json::to_string(&EdgeServerMessage::Closing {
+                                reason: "replayed".into(),
+                            })
+                            .unwrap()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    while let Some(frame) = socket.next().await {
+                        if frame.is_err() {
+                            break;
+                        }
+                    }
+                    return (is_error, output, tool_result_fields);
+                }
+            }
+        };
+        let ((is_error, output, fields), replayed) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(replay_server, replay)
+            })
+            .await
+            .expect("replaying the settled invocation timed out");
+        replayed.expect("replay connection failed");
+        let fields = fields.expect("settled result had no tool fields");
+        assert!(is_error);
+        assert_ne!(
+            fields.get("outcome_certainty").and_then(Value::as_str),
+            Some("unknown"),
+            "parent loss was replayed as an unknown outcome: {output}"
+        );
+        assert!(
+            !output.contains("dispatched without a durable completion"),
+            "{output}"
+        );
+        let cancelled = fields.get("cancelled").and_then(Value::as_bool) == Some(true)
+            || fields.get("exit_semantics").and_then(Value::as_str) == Some("cancelled");
+        assert!(
+            cancelled,
+            "settled result was not cancellation evidence: {fields:?} {output}"
+        );
     }
 
     #[test]
@@ -1718,6 +2316,296 @@ mod tests {
         assert_eq!(
             token_from_credentials(&creds, Some("other")).unwrap(),
             ("other".to_string(), "other-token".to_string())
+        );
+    }
+
+    fn handoff_config(
+        listener: &tokio::net::TcpListener,
+        state: &Path,
+        workspace: &Path,
+        reconnect: bool,
+    ) -> EdgeConfig {
+        EdgeConfig {
+            capacity_providers: Vec::new(),
+            server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
+            token_manager: token_manager::TokenManager::new(
+                "old-token".into(),
+                None,
+                state.join("token"),
+            ),
+            workspace_dir: workspace.to_owned(),
+            edge_id: "handoff-test".into(),
+            materialization_id: "handoff-materialization".into(),
+            reconnect,
+            invocation_journal_root: Some(state.to_owned()),
+        }
+    }
+
+    // The handshake callback's error type is fixed by tokio-tungstenite.
+    #[allow(clippy::result_large_err)]
+    async fn accept_edge(
+        listener: &tokio::net::TcpListener,
+    ) -> (WebSocketStream<tokio::net::TcpStream>, String) {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut authorization = String::new();
+        let mut ws =
+            tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
+                authorization = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(response)
+            })
+            .await
+            .unwrap();
+        assert!(ws.next().await.unwrap().unwrap().is_text());
+        (ws, authorization)
+    }
+
+    async fn send_server(
+        ws: &mut WebSocketStream<tokio::net::TcpStream>,
+        message: &EdgeServerMessage,
+    ) {
+        ws.send(Message::Text(
+            serde_json::to_string(message).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn auth_ok() -> EdgeServerMessage {
+        EdgeServerMessage::AuthOk {
+            user_id: "user".into(),
+            edge_id: "ws-handoff-test".into(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_handed_off_during_authentication_is_tried_before_exiting() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let handoff = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = handoff_config(&listener, state.path(), workspace.path(), false);
+        let (in_flight, queued) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        let (in_flight_sender, in_flight_receiver) = in_flight;
+        let (queued_sender, queued_receiver) = queued;
+        let server = async {
+            let (mut ws, first) = accept_edge(&listener).await;
+            in_flight_sender.send(()).unwrap();
+            queued_receiver.await.unwrap();
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::AuthError {
+                    message: "revoked".into(),
+                },
+            )
+            .await;
+            drop(ws);
+            let (mut ws, second) = accept_edge(&listener).await;
+            send_server(&mut ws, &auth_ok()).await;
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::Closing {
+                    reason: "handoff test complete".into(),
+                },
+            )
+            .await;
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+            (first, second)
+        };
+        let connect_command = async {
+            in_flight_receiver.await.unwrap();
+            managed_background::queue_pending_credential(handoff.path(), "fresh-token").unwrap();
+            queued_sender.send(()).unwrap();
+        };
+        let ((first, second), exit_with_error, ()) =
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::join!(
+                    server,
+                    run_connection_loop(&config, Some(handoff.path())),
+                    connect_command
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(first, "Bearer old-token");
+        assert_eq!(second, "Bearer fresh-token");
+        assert!(!exit_with_error);
+        assert_eq!(
+            managed_background::claim_pending_credential(handoff.path()).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_handoffs_still_fall_back_to_the_proven_credential() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let handoff = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = handoff_config(&listener, state.path(), workspace.path(), true);
+        let rejected = EdgeServerMessage::AuthError {
+            message: "rejected".into(),
+        };
+        let server = async {
+            let mut seen = Vec::new();
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            send_server(&mut ws, &auth_ok()).await;
+            managed_background::queue_pending_credential(handoff.path(), "bad-one").unwrap();
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::Closing {
+                    reason: "server restart".into(),
+                },
+            )
+            .await;
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            // A second handoff arrives while the first is authenticating.
+            managed_background::queue_pending_credential(handoff.path(), "bad-two").unwrap();
+            send_server(&mut ws, &rejected).await;
+            drop(ws);
+
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            send_server(&mut ws, &rejected).await;
+            drop(ws);
+
+            let (_ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            seen
+        };
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                exit_with_error = run_connection_loop(&config, Some(handoff.path())) => {
+                    panic!("runner exited before trying the proven credential (error: {exit_with_error})")
+                }
+                seen = server => seen,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                "Bearer old-token",
+                "Bearer bad-one",
+                "Bearer bad-two",
+                "Bearer old-token"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handed_off_credential_reconnects_without_interrupting_admitted_work() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let handoff = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = handoff_config(&listener, state.path(), workspace.path(), true);
+        let server = async {
+            let (mut ws, first) = accept_edge(&listener).await;
+            assert_eq!(first, "Bearer old-token");
+            send_server(&mut ws, &auth_ok()).await;
+            let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                "user", "session", "run", "turn", "call",
+            )
+            .unwrap();
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::ToolRequest {
+                    request_id: identity.storage_key(),
+                    identity: Box::new(identity),
+                    delivery_generation: 1,
+                    tool: "bash".into(),
+                    args: serde_json::json!({
+                        "command": "touch started; sleep 2; echo finished"
+                    }),
+                    runtime_process_authorization: None,
+                    runtime_process_authorization_required: false,
+                    timeout_secs: Some(30),
+                    execution_deadline_unix_ms: None,
+                    execution_timeout_ms: None,
+                    command_timeout_cap_ms: None,
+                    execution_ceiling: None,
+                    traceparent: None,
+                    tracestate: None,
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !workspace.path().join("started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("admitted work did not start");
+
+            managed_background::queue_pending_credential(handoff.path(), "fresh-token").unwrap();
+            let (request_id, delivery_generation, is_error, output) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let frame = ws.next().await.unwrap().unwrap();
+                        if let Ok(EdgeClientMessage::ToolResult {
+                            request_id,
+                            delivery_generation,
+                            is_error,
+                            output,
+                            ..
+                        }) = serde_json::from_str(frame.to_text().unwrap())
+                        {
+                            return (request_id, delivery_generation, is_error, output);
+                        }
+                    }
+                })
+                .await
+                .expect("admitted work did not report a result");
+            assert!(!is_error, "admitted work was interrupted: {output}");
+            assert!(output.contains("finished"), "unexpected output: {output}");
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::ToolResultAck {
+                    request_id,
+                    delivery_generation,
+                },
+            )
+            .await;
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::Closing {
+                    reason: "server restart".into(),
+                },
+            )
+            .await;
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+
+            let (_ws, second) =
+                tokio::time::timeout(Duration::from_secs(10), accept_edge(&listener))
+                    .await
+                    .expect("runner did not reconnect");
+            second
+        };
+        let second = tokio::select! {
+            exit_with_error = run_connection_loop(&config, Some(handoff.path())) => {
+                panic!("runner exited before reconnecting (error: {exit_with_error})")
+            }
+            second = server => second,
+        };
+        assert_eq!(second, "Bearer fresh-token");
+        assert_eq!(
+            managed_background::claim_pending_credential(handoff.path()).unwrap(),
+            None
         );
     }
 }

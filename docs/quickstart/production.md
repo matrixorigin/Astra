@@ -71,3 +71,35 @@ Keep workspace and private-network execution outside the Server deployment.
 Connect `astra-edge` as a separate User Runner only for the workspaces or
 networks that should be exposed, using a dedicated identity and token for each
 Runner boundary.
+
+The MOI connect command (`astra-edge --edge-id runner-… --server-url … --token … --reconnect true`)
+detaches when it is started from a terminal. After it returns, the terminal can
+be closed. `ASTRA_EDGE_FOREGROUND=1` (also `true` or `yes`) keeps that same
+command in the foreground. Containers, sandbox processes, and non-interactive
+starts stay in the foreground.
+
+The command prints `status`, `logs`, and `stop` with the installed executable
+path and shell quoting. Run those printed commands; a later shell does not need
+`astra-edge` on `PATH`. Running the connect command again leaves the background
+runner in place and hands it the command's credential, which is used from its
+next connection attempt, including an attempt whose old credential was just
+rejected; work already admitted keeps running. If a new credential cannot
+authenticate, the runner continues with the credential that last authenticated,
+and the same command can be run again later. A runner that is stopping does not
+accept a new credential, including before it has finished leaving the connected
+state; run the command again after it stops. `stop` waits for a start that has
+not recorded its metadata yet. Once the runner process exists, `stop` stops it
+without waiting for authentication. The runner stays up only after the starting
+command accepts a connection that is still up. Closing the terminal, or losing
+that command before it accepts, cancels the startup, including while the runner
+is still trying to reach the server. Work the runner has already started is
+cancelled and its result is kept for the next connection. The token is not
+written to the runner metadata. Each background runner keeps the credential it
+last authenticated for its own identity, and the execution record for its own
+server, so another runner in the same workspace does not replace either. A
+record written before records were separated by server does not name a server.
+Startup stops and names that file and this server's file instead of giving the
+record to whichever server starts first, or starting from an empty history.
+Move its snapshot and WAL onto the server that owns the work, then start again.
+If that older record and a server-specific record both exist, startup stops
+and names both files as well.
