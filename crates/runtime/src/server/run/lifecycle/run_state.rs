@@ -749,6 +749,7 @@ mod tests {
 
     fn waiting_run_state() -> RunState {
         let (input_wake, _) = watch::channel(-1);
+        let (guidance_wake, _) = watch::channel(-1);
         let (live_tx, _) = broadcast::channel(1);
         RunState {
             run_id: "waiting-run".into(),
@@ -760,6 +761,7 @@ mod tests {
             pause_flag: Arc::new(AtomicBool::new(false)),
             llm_cancel_token: Arc::new(CancellationToken::new()),
             input_wake,
+            guidance_wake,
             live_tx: Some(live_tx),
             attached_event_tx: None,
             waiting_for: Some("ask_user".into()),
