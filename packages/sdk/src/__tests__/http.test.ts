@@ -78,6 +78,18 @@ describe('http helpers', () => {
     expect(extractJwtSubject(`.${payload}.`)).toBeNull(); // empty header segment
   });
 
+  test('extractJwtSubject rejects JSON array JOSE headers', () => {
+    const payload = Buffer.from(JSON.stringify({ sub: 'user-1' })).toString('base64url');
+    const arrayHeader = Buffer.from('[]').toString('base64url');
+    const objectArrayHeader = Buffer.from('[{"alg":"none"}]').toString('base64url');
+
+    // RFC 7519 section 3.1: the JOSE header is a JSON object, not an array.
+    // JSON.parse yields typeof 'object' for arrays too, so they must be
+    // rejected explicitly to keep the fail-closed contract.
+    expect(extractJwtSubject(`${arrayHeader}.${payload}.`)).toBeNull();
+    expect(extractJwtSubject(`${objectArrayHeader}.${payload}.`)).toBeNull();
+  });
+
   test.each(['用户-张旭', 'café', 'user-🚀'])(
     'utf8HeaderByteString keeps UTF-8 wire bytes for %s',
     (subject) => {

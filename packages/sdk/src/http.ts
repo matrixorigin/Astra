@@ -147,7 +147,10 @@ export function extractJwtSubject(token: string): string | null {
       return null;
     }
     const header = JSON.parse(decodeBase64UrlSegment(headerSegment)) as unknown;
-    if (typeof header !== 'object' || header === null) {
+    // RFC 7519 section 3.1: the JOSE header is a single JSON object.
+    // JSON.parse yields typeof 'object' for arrays too, so reject them
+    // explicitly to keep the fail-closed contract.
+    if (typeof header !== 'object' || header === null || Array.isArray(header)) {
       return null;
     }
     const payload = JSON.parse(decodeBase64UrlSegment(payloadSegment)) as {
