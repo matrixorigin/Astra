@@ -97,9 +97,24 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 "TOKEN_ARGUMENT",
                 Some("secret")
             ),
+            // Command-line password flags are explicit secrets even when short.
+            pat_min!(
+                r#"(?i)--password(?:\s+|=)\s*(?:\\*['"])?(?P<secret>[A-Za-z0-9._\-/+=]{{{},}})"#,
+                1,
+                "PASSWORD_ARGUMENT",
+                Some("secret")
+            ),
             pat_stream!(
                 r"gh[pousr]_[A-Za-z0-9_]{36,}",
                 r"gh[pousr]_[A-Za-z0-9_]+",
+                "GITHUB_TOKEN"
+            ),
+            // GitHub fine-grained personal access tokens use a different prefix.
+            // Keep the production minimum bounded; streaming may see partial
+            // tokens before the remainder of the chunk arrives.
+            pat_stream!(
+                r"github_pat_[A-Za-z0-9_]{36,}",
+                r"github_pat_[A-Za-z0-9_]+",
                 "GITHUB_TOKEN"
             ),
             // Hugging Face user-access tokens are opaque bearer credentials.
@@ -111,6 +126,40 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 r"hf_[A-Za-z0-9]{34,}",
                 r"hf_[A-Za-z0-9]+",
                 "HUGGINGFACE_TOKEN"
+            ),
+            // OpenAI project API keys are often printed without an assignment
+            // context. Recognize their high-confidence provider prefix.
+            pat_stream!(
+                r"sk-proj-[A-Za-z0-9_-]{20,}",
+                r"sk-proj-[A-Za-z0-9_-]+",
+                "OPENAI_API_KEY"
+            ),
+            // Anthropic API keys have a distinctive provider prefix and
+            // may appear as bare values in tool output.
+            pat_stream!(
+                r"sk-ant-[A-Za-z0-9_-]{20,}",
+                r"sk-ant-[A-Za-z0-9_-]+",
+                "ANTHROPIC_API_KEY"
+            ),
+            // Slack bot/user tokens have a distinctive xoxb/xoxp prefix.
+            pat_stream!(
+                r"xox[bp]-[A-Za-z0-9-]{20,}",
+                r"xox[bp]-[A-Za-z0-9-]+",
+                "SLACK_TOKEN"
+            ),
+            // GitLab personal access tokens have a distinct glpat prefix.
+            pat_stream!(
+                r"glpat-[A-Za-z0-9_-]{20,}",
+                r"glpat-[A-Za-z0-9_-]+",
+                "GITLAB_TOKEN"
+            ),
+            // HTTP Basic credentials are base64-encoded user:password.
+            // Redact only the value, retaining the header name and scheme.
+            pat_min!(
+                r"(?i)Authorization:\s*Basic\s+(?P<secret>[A-Za-z0-9+/=]{{{},}})",
+                8,
+                "BASIC_AUTH",
+                Some("secret")
             ),
             pat_min!(
                 r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{{{},}}",
@@ -233,26 +282,30 @@ const PEM_MAX_BYTES: usize = 64 * 1024;
 fn pem_header_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY-----").expect("PEM header regex")
+        Regex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM header regex")
     })
 }
 
 fn pem_end_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY-----").expect("PEM end regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----").expect("PEM end regex")
+    })
 }
 
 fn pem_header_bytes_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
     RE.get_or_init(|| {
-        BytesRegex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY-----").expect("PEM header bytes regex")
+        BytesRegex::new(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+            .expect("PEM header bytes regex")
     })
 }
 
 fn pem_end_bytes_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
     RE.get_or_init(|| {
-        BytesRegex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY-----").expect("PEM end bytes regex")
+        BytesRegex::new(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+            .expect("PEM end bytes regex")
     })
 }
 
@@ -334,7 +387,7 @@ fn pem_marker_kind<'a>(marker: &'a str, prefix: &str) -> Option<&'a str> {
                 && value
                     .chars()
                     .all(|character| character.is_ascii_uppercase() || character == ' ')
-                && value.ends_with("PRIVATE KEY")
+                && (value.ends_with("PRIVATE KEY") || *value == "PGP PRIVATE KEY BLOCK")
         })
 }
 
@@ -2893,5 +2946,186 @@ mod tests {
         let (redacted, count) = redact_credentials_for_display(forged);
         assert!(count > 0);
         assert!(!redacted.contains("0123456789abcdef0123456789abcdef"));
+    }
+}
+
+#[cfg(test)]
+mod fine_grained_github_pat_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_fine_grained_github_personal_access_tokens() {
+        let token = format!("github_pat_{}", "A".repeat(64));
+        let (redacted, count) = redact_credentials_for_display(&format!("token: {token}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&token));
+        assert!(redacted.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn does_not_hide_short_prefix_without_token_body() {
+        let (redacted, count) = redact_credentials_for_display("github_pat_abc");
+        assert_eq!(count, 0);
+        assert_eq!(redacted, "github_pat_abc");
+    }
+}
+
+#[cfg(test)]
+mod basic_auth_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_basic_auth_header_value() {
+        let secret = "dXNlcjpzM2NyZXRQYXNzd29yZA==";
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("Authorization: Basic {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("BASIC_AUTH"));
+        assert!(redacted.contains("Authorization: Basic "));
+    }
+
+    #[test]
+    fn leaves_unrelated_basic_word_unchanged() {
+        let text = "Basic authentication is supported";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod pgp_private_key_regression_tests {
+    use super::{
+        private_key_end_markers, private_key_header_markers, redact_credentials_for_display,
+    };
+
+    #[test]
+    fn recognizes_pgp_armor_as_private_key() {
+        let secret = "lQOYBF7xQbkBCADQ";
+        let input = format!(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n{secret}\n-----END PGP PRIVATE KEY BLOCK-----"
+        );
+        assert_eq!(private_key_header_markers(&input).len(), 1);
+        assert_eq!(private_key_end_markers(&input).len(), 1);
+        let (redacted, count) = redact_credentials_for_display(&input);
+        assert!(count > 0);
+        assert!(!redacted.contains(secret));
+    }
+}
+
+#[cfg(test)]
+mod password_flag_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_mysql_password_argument() {
+        let secret = "S3cretPassw0rd123";
+        let (redacted, count) =
+            redact_credentials_for_display(&format!("mysql --password {secret} -h db"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("PASSWORD_ARGUMENT"));
+    }
+
+    #[test]
+    fn hides_short_explicit_password_value() {
+        let (redacted, count) = redact_credentials_for_display("mysql --password=abc -h db");
+        assert_eq!(count, 1);
+        assert!(!redacted.contains("password=abc"));
+    }
+}
+
+#[cfg(test)]
+mod openai_project_key_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_project_api_key() {
+        let secret = format!("sk-proj-{}", "A".repeat(48));
+        let (redacted, count) = redact_credentials_for_display(&format!("key is {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn does_not_hide_short_project_key_prefix() {
+        let text = "sk-proj-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod anthropic_api_key_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_anthropic_api_key() {
+        let secret = format!("sk-ant-api03-{}", "B".repeat(48));
+        let (redacted, count) = redact_credentials_for_display(&format!("provider key: {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn leaves_short_anthropic_prefix_unchanged() {
+        let text = "sk-ant-api03-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod slack_token_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_slack_bot_token() {
+        let secret = format!(
+            "{}-{}-{}-{}",
+            "xoxb",
+            "1".repeat(12),
+            "2".repeat(12),
+            "a".repeat(24)
+        );
+        let (redacted, count) = redact_credentials_for_display(&format!("slack token: {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("SLACK_TOKEN"));
+    }
+
+    #[test]
+    fn leaves_short_slack_prefix_unchanged() {
+        let text = "xoxb-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod gitlab_token_redaction_regression_tests {
+    use super::redact_credentials_for_display;
+
+    #[test]
+    fn hides_bare_gitlab_personal_access_token() {
+        let secret = format!("{}-{}", "glpat", "A".repeat(32));
+        let (redacted, count) = redact_credentials_for_display(&format!("gitlab token: {secret}"));
+        assert_eq!(count, 1);
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("GITLAB_TOKEN"));
+    }
+
+    #[test]
+    fn leaves_short_gitlab_prefix_unchanged() {
+        let text = "glpat-demo";
+        let (redacted, count) = redact_credentials_for_display(text);
+        assert_eq!(count, 0);
+        assert_eq!(redacted, text);
     }
 }
