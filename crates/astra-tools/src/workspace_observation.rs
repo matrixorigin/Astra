@@ -377,10 +377,25 @@ impl WorkspaceAttributionState {
         {
             aliases.push(key);
         }
-        Some(Self {
-            state: writer_epoch_state(root)?,
-            aliases,
-        })
+        let state = writer_epoch_state(root)?;
+        // Recovery can be requested through a different spelling of the same
+        // directory; clear every still-bound alias recorded for this incident.
+        if state
+            .ownership_unsettled
+            .load(std::sync::atomic::Ordering::Acquire)
+            && let Some(quarantined) = QUARANTINED_WRITER_STATES.get()
+        {
+            let quarantined = recover_mutex(quarantined);
+            for (alias, candidate) in quarantined.iter() {
+                if Arc::ptr_eq(candidate, &state)
+                    && alias.canonicalize().ok().as_ref() == Some(&aliases[0])
+                    && !aliases.contains(alias)
+                {
+                    aliases.push(alias.clone());
+                }
+            }
+        }
+        Some(Self { state, aliases })
     }
     pub fn quarantine(&self) {
         quarantine_observation_state(&self.state, self.aliases.clone(), false);
@@ -5918,6 +5933,22 @@ mod tests {
             workspace_observation_is_quarantined(other.path()),
             Some(false)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmation_clears_known_aliases_of_same_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        let alias = parent.path().join("alias");
+        fs::create_dir(&root).unwrap();
+        symlink(&root, &alias).unwrap();
+        assert!(mark_workspace_observation_unsettled(&alias));
+        confirm_workspace_stopped(&root).await.unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&root), Some(false));
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(false));
     }
 
     #[cfg(unix)]
