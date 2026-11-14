@@ -185,18 +185,6 @@ pub(crate) fn cache_capability_from_model_metadata(
     })
 }
 
-pub(crate) fn compact_strategy_from_model_metadata(
-    value: Option<astra_services::PromptCacheCapabilityData>,
-    provider: &str,
-) -> astra_turn_core::microcompact::CompactStrategy {
-    let explicit = cache_capability_from_model_metadata(value);
-    astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider(
-        explicit,
-        Some(provider),
-    )
-    .compact_strategy
-}
-
 fn estimate_json_tokens(value: &Value) -> u32 {
     estimate_json_tokens_u64(value).min(u32::MAX as u64) as u32
 }

@@ -608,7 +608,10 @@ async fn consume_remote_turn_inner(
     for callback in &turn.edge_tool_round {
         if seen.insert(callback.request_id.clone()) {
             state.stall.tool_call_records.push(
-                astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(callback),
+                astra_turn_core::headless_tool_journal::journal_record_scoped_edge_tool_result(
+                    callback,
+                    state.owner_user_id.as_deref(),
+                ),
             );
         }
     }

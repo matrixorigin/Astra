@@ -497,7 +497,27 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
     };
 
     const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
-    for (admitted, closed) in [(true, true), (true, false), (false, false)] {
+    for (admitted, closed, rate_limited) in [
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (true, true, true),
+    ] {
+        let kind = if rate_limited {
+            "rate_limit"
+        } else {
+            "stream_transport"
+        };
+        let interruption_kind = if rate_limited {
+            "rate_limited"
+        } else {
+            "stream_transport"
+        };
+        let message = if rate_limited {
+            "[rate_limit] The model provider reported a token rate limit. Requests include conversation context and tools. Try again later, check the provider limit, or choose another model."
+        } else {
+            "provider stream stopped"
+        };
         let requests = Arc::new(AtomicUsize::new(0));
         let observed_requests = requests.clone();
         let reads = Arc::new(AtomicUsize::new(0));
@@ -529,10 +549,18 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                     events.push(json!({"type": "text_done", "full_text": "Observed partial output", "model_item_id":"partial-model-item", "partial":true}));
                     events.push(json!({"type": "usage", "usage_scope":"run_total", "input_tokens": 10, "output_tokens": 5, "qualified_usage":{"input_tokens":10,"output_tokens":5}}));
                 }
-                events.push(json!({"type": "error", "message": "provider stream stopped", "error_code": "stream_transport", "error_kind":"stream_transport", "metadata":{"interruption":{"kind":"stream_transport","resumable":true}}}));
+                if !rate_limited {
+                    events.push(json!({"type": "error", "message": message, "error_code": kind, "error_kind": kind, "metadata":{"interruption":{"kind":interruption_kind,"resumable":true}}}));
+                }
                 if closed {
-                    events.push(json!({"type":"run_error", "run_id":"failure-root", "error":"provider stream stopped", "error_code":"stream_transport"}));
-                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": "stream_transport", "error": "provider stream stopped"}));
+                    events.push(if rate_limited {
+                        astra_services::runs::transform_run_event_for_client(json!({
+                            "event_type":"run_error", "data":{"run_id":"failure-root", "error":message, "error_code":kind, "error_kind":kind}
+                        }))
+                    } else {
+                        json!({"type":"run_error", "run_id":"failure-root", "error":message, "error_code":kind, "error_kind":kind})
+                    });
+                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": kind, "error": message}));
                 }
                 let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
                 ([
@@ -605,17 +633,24 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 .unwrap()
                 .unwrap();
             let stdout = String::from_utf8(output.stdout).unwrap();
+            let diagnostic = if !admitted && mode == "stream-json" {
+                "without a bridge run_id"
+            } else if rate_limited {
+                "token rate limit"
+            } else {
+                "stream stopped"
+            };
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains(
-                    if !admitted && mode == "stream-json" {
-                        "without a bridge run_id"
-                    } else {
-                        "stream stopped"
-                    }
-                ),
+                String::from_utf8_lossy(&output.stderr).contains(diagnostic),
                 "{mode}, admitted={admitted}: stdout={stdout}; stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            if rate_limited {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("Try again later"));
+                assert!(stderr.contains("check the provider limit"));
+                assert!(stderr.contains("choose another model"));
+            }
             assert_eq!(
                 output.status.code(),
                 Some(3),
@@ -649,11 +684,6 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);
                 continue;
             }
-            let diagnostic = if !admitted && mode == "stream-json" {
-                "without a bridge run_id"
-            } else {
-                "stream stopped"
-            };
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr)
                     .matches(diagnostic)
@@ -686,6 +716,16 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                             .all(|record| record["server_run_id"].is_null())
                     );
                 }
+                if rate_limited {
+                    let event = &records
+                        .iter()
+                        .find(|record| {
+                            record["type"] == "sse_event" && record["event"]["type"] == "run_error"
+                        })
+                        .expect("classified failure must reach stream-json")["event"];
+                    assert_eq!(event["error_kind"], "rate_limit");
+                    assert!(event.get("retry_after_ms").is_none());
+                }
                 results[0]["result"].clone()
             } else {
                 let result: Value = serde_json::from_str(&stdout).unwrap();
@@ -702,20 +742,24 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
             };
             assert_eq!(result["final_state"], "failed");
             assert_eq!(result["exit_code"], 3);
-            assert_eq!(result["error_kind"], "api_error");
+            assert_eq!(result["error_kind"], kind);
             assert_eq!(result["success"], false);
             assert_eq!(result["completion_disposition"], "failed");
             assert_eq!(result["server_terminal_unverified"], !closed);
             assert_eq!(result["server_terminal_authoritative"], closed);
             assert_eq!(result["tool_record_coverage"], "partial");
-            assert_eq!(result["error_code"], "stream_transport");
-            assert!(result["error"].as_str().unwrap().contains(
-                if !admitted && mode == "stream-json" {
-                    "without a bridge run_id"
-                } else {
-                    "stream stopped"
-                }
-            ));
+            assert_eq!(result["error_code"], kind);
+            assert!(result["error"].as_str().unwrap().contains(diagnostic));
+            if rate_limited {
+                assert_eq!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .matches("[rate_limit]")
+                        .count(),
+                    1
+                );
+            }
             assert_eq!(
                 result["text"],
                 if admitted {

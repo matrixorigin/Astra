@@ -387,25 +387,11 @@ fn work_unit_observation(
     astra_core::work_unit::WorkUnitObservation::from_fields(result.tool_result_fields.as_ref()?)
 }
 
-/// A clean foreground fanout is a complete evidence-producing action. If any
-/// slot has a recoverable issue, preserve the normal parent work path while
-/// budget remains; the fixed group contract still prevents replacement runs.
-/// Keep this decision on typed tool/action/result fields, not result prose.
-#[cfg(test)]
-fn foreground_fanout_reached_synthesis_boundary(result: &EdgeToolExecResult) -> bool {
-    result.tool == "agent_fanout"
-        && fanout_completion_observation(&result.args, &result.output)
-            == FanoutCompletionObservation::Synthesize
-        && serde_json::from_str::<Value>(&result.output)
-            .ok()
-            .is_some_and(|output| !agent_fanout_result_has_recoverable_issue(&output))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FanoutCompletionObservation {
+enum FanoutResultObservation {
     None,
     PaginationPending(BTreeMap<u64, u64>),
-    Synthesize,
+    Terminal,
 }
 
 fn all_fanout_slots_from_zero(target_count: u64) -> BTreeMap<u64, u64> {
@@ -510,13 +496,13 @@ fn fanout_result_page_next_offset(args: &Value, output: &Value) -> Option<Option
     (!has_next).then_some(None)
 }
 
-fn fanout_completion_observation(args: &Value, output: &str) -> FanoutCompletionObservation {
+fn fanout_result_observation(args: &Value, output: &str) -> FanoutResultObservation {
     let action = args.get("action").and_then(Value::as_str);
     if !matches!(action, Some("start" | "get_results")) {
-        return FanoutCompletionObservation::None;
+        return FanoutResultObservation::None;
     }
     let Ok(output) = serde_json::from_str::<Value>(output) else {
-        return FanoutCompletionObservation::None;
+        return FanoutResultObservation::None;
     };
     let output_target_count = output
         .get("target_count")
@@ -533,18 +519,18 @@ fn fanout_completion_observation(args: &Value, output: &str) -> FanoutCompletion
     // `result_truncated` describes the bounded projection of the complete
     // slot result and remains true on later windows. Only an explicit
     // `next_call` grants another read; otherwise the current window is the
-    // terminal page and the parent must synthesize.
+    // terminal page, without deciding whether the parent is done.
     let terminal_group = output_target_count > 0
         && output_target_count <= MAX_FANOUT_TARGET_COUNT as u64
         && active == Some(0)
         && terminal.is_some_and(|count| count >= output_target_count);
     if !terminal_group {
-        return FanoutCompletionObservation::None;
+        return FanoutResultObservation::None;
     }
     if action == Some("get_results") {
         // The existing carrier owns full-group coverage. A slot-specific page
         // must never allocate or re-derive that map from untrusted output.
-        return FanoutCompletionObservation::Synthesize;
+        return FanoutResultObservation::Terminal;
     }
     let requested_group = args
         .get("group_id")
@@ -559,7 +545,7 @@ fn fanout_completion_observation(args: &Value, output: &str) -> FanoutCompletion
     if output_group.is_none()
         || requested_group.is_some_and(|requested| output_group != Some(requested))
     {
-        return FanoutCompletionObservation::None;
+        return FanoutResultObservation::None;
     }
     let requested_target_count = args
         .get("target_count")
@@ -569,23 +555,22 @@ fn fanout_completion_observation(args: &Value, output: &str) -> FanoutCompletion
         || requested_target_count > MAX_FANOUT_TARGET_COUNT as u64
         || requested_target_count != output_target_count
     {
-        return FanoutCompletionObservation::None;
+        return FanoutResultObservation::None;
     }
     let pending_pages = fanout_pending_pages(&output, requested_target_count);
     if !pending_pages.is_empty() {
-        FanoutCompletionObservation::PaginationPending(pending_pages)
+        FanoutResultObservation::PaginationPending(pending_pages)
     } else {
-        FanoutCompletionObservation::Synthesize
+        FanoutResultObservation::Terminal
     }
 }
 
-fn observe_foreground_fanout_completion(
+fn observe_foreground_fanout_pagination(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
     pre_resolved_results: &[HeadlessPreResolvedToolResult],
     edge_tool_round: &[EdgeToolExecResult],
-) -> bool {
-    let mut synthesize = false;
+) {
     let mut observe = |args: &Value, output: &str| {
         let action = args.get("action").and_then(Value::as_str);
         let parsed_output = serde_json::from_str::<Value>(output).ok();
@@ -603,8 +588,8 @@ fn observe_foreground_fanout_completion(
                     .filter(|group| !group.is_empty())
             })
             .map(ToString::to_string);
-        match (action, fanout_completion_observation(args, output)) {
-            (Some("start"), FanoutCompletionObservation::PaginationPending(pending_slots)) => {
+        match (action, fanout_result_observation(args, output)) {
+            (Some("start"), FanoutResultObservation::PaginationPending(pending_slots)) => {
                 let Some(group_id) = group_id else {
                     return;
                 };
@@ -622,11 +607,6 @@ fn observe_foreground_fanout_completion(
                         .as_ref()
                         .is_some_and(agent_fanout_result_has_recoverable_issue),
                 });
-            }
-            (Some("start"), FanoutCompletionObservation::Synthesize) => {
-                synthesize = parsed_output
-                    .as_ref()
-                    .is_some_and(|output| !agent_fanout_result_has_recoverable_issue(output));
             }
             (Some("get_results"), observation) => {
                 let Some(parsed_output) = parsed_output.as_ref() else {
@@ -656,7 +636,7 @@ fn observe_foreground_fanout_completion(
                     return;
                 };
                 let slot = requested_slot.expect("validated paginated slot");
-                if observation == FanoutCompletionObservation::None {
+                if observation == FanoutResultObservation::None {
                     return;
                 }
                 carrier.had_recoverable_issues |=
@@ -674,12 +654,10 @@ fn observe_foreground_fanout_completion(
                     }
                 }
                 if carrier.pending_slots.is_empty() {
-                    let clean_results = !carrier.had_recoverable_issues;
                     state
                         .hooks
                         .completion_settlement
                         .foreground_fanout_pagination = None;
-                    synthesize = clean_results;
                 }
             }
             _ => {}
@@ -708,7 +686,6 @@ fn observe_foreground_fanout_completion(
         }
         observe(&tool_call_arguments_value(call), &result.content);
     }
-    synthesize
 }
 
 #[cfg(test)]
@@ -2256,26 +2233,12 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 );
             }
         }
-        let foreground_fanout_completed = observe_foreground_fanout_completion(
+        observe_foreground_fanout_pagination(
             state,
             all_tool_calls,
             &pre_resolved_results,
             &edge_tool_round,
         );
-        if foreground_fanout_completed && !settled_round_has_failure {
-            state.hooks.completion_settlement.text_only = true;
-            state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "fanout_completion_carrier.v1",
-                "mode": "synthesize_only",
-                "execution_authority": "none",
-                "attempts_remaining": 1,
-                "instruction": "The foreground fanout has delivered its fixed group evidence. Produce the parent synthesis now. Do not call tools, create replacement agents, or resume an earlier objective.",
-                "authority": "runtime_fanout_lifecycle",
-            }),
-        );
-        }
 
         super::execution_phase::advance_completion_action_window_after_tool_round(state);
 
@@ -4300,7 +4263,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_foreground_fanout_receipt_opens_synthesis_boundary() {
+    fn terminal_foreground_fanout_receipt_tracks_unread_pages() {
         let result = EdgeToolExecResult {
 work_attribution: None,
             execution_completion: None,
@@ -4325,7 +4288,10 @@ work_attribution: None,
             duration_ms: 1,
         };
 
-        assert!(foreground_fanout_reached_synthesis_boundary(&result));
+        assert_eq!(
+            fanout_result_observation(&result.args, &result.output),
+            FanoutResultObservation::Terminal
+        );
 
         let mut paginated = result;
         paginated.output = json!({
@@ -4344,10 +4310,6 @@ work_attribution: None,
             }]
         })
         .to_string();
-        assert!(
-            !foreground_fanout_reached_synthesis_boundary(&paginated),
-            "pagination must remain executable before synthesis becomes text-only"
-        );
 
         let mut missing_end = paginated.clone();
         missing_end.args = json!({"action":"start","target_count":1,"slots":[]});
@@ -4361,8 +4323,8 @@ work_attribution: None,
         })
         .to_string();
         assert_eq!(
-            fanout_completion_observation(&missing_end.args, &missing_end.output),
-            FanoutCompletionObservation::PaginationPending(BTreeMap::from([(0, 0)])),
+            fanout_result_observation(&missing_end.args, &missing_end.output),
+            FanoutResultObservation::PaginationPending(BTreeMap::from([(0, 0)])),
             "a malformed start receipt must conservatively restart the bounded slot read"
         );
 
@@ -4378,8 +4340,8 @@ work_attribution: None,
         })
         .to_string();
         assert_eq!(
-            fanout_completion_observation(&missing_next.args, &missing_next.output),
-            FanoutCompletionObservation::PaginationPending(BTreeMap::from([(0, 4096)])),
+            fanout_result_observation(&missing_next.args, &missing_next.output),
+            FanoutResultObservation::PaginationPending(BTreeMap::from([(0, 4096)])),
             "typed byte bounds retain recovery authority even when display guidance is lost"
         );
 
@@ -4412,8 +4374,8 @@ work_attribution: None,
             })
             .to_string();
             assert_eq!(
-                fanout_completion_observation(&json!({"action":"start","target_count":2}), &output,),
-                FanoutCompletionObservation::PaginationPending(expected),
+                fanout_result_observation(&json!({"action":"start","target_count":2}), &output,),
+                FanoutResultObservation::PaginationPending(expected),
                 "{label} must recover from byte zero instead of granting synthesis"
             );
         }
@@ -4424,11 +4386,11 @@ work_attribution: None,
         })
         .to_string();
         assert_eq!(
-            fanout_completion_observation(
+            fanout_result_observation(
                 &json!({"action":"start","target_count":2,"slots":[]}),
                 &adversarial_target,
             ),
-            FanoutCompletionObservation::None,
+            FanoutResultObservation::None,
             "untrusted output cannot amplify a bounded admitted fanout"
         );
 
@@ -4450,18 +4412,18 @@ work_attribution: None,
             ),
         ] {
             assert_eq!(
-                fanout_completion_observation(
+                fanout_result_observation(
                     &json!({"action":"start","group_id":"group-a","target_count":1}),
                     &output.to_string(),
                 ),
-                FanoutCompletionObservation::None,
+                FanoutResultObservation::None,
                 "{label} cannot establish completion authority"
             );
         }
     }
 
     #[test]
-    fn recovered_paginated_fanout_closes_only_after_same_group_final_page() {
+    fn recovered_paginated_fanout_clears_only_after_same_group_final_page() {
         let mut state = make_state();
         let start_args = json!({
             "action":"start","group_id":" group-paged ","target_count":2,"slots":[]
@@ -4480,7 +4442,7 @@ work_attribution: None,
             ]
         })
         .to_string();
-        assert!(!observe_foreground_fanout_completion(
+        observe_foreground_fanout_pagination(
             &mut state,
             &[start_call],
             &[HeadlessPreResolvedToolResult::new(
@@ -4490,7 +4452,7 @@ work_attribution: None,
                 ToolResultStatus::Completed,
             )],
             &[],
-        ));
+        );
         assert_eq!(
             state
                 .hooks
@@ -4520,12 +4482,7 @@ work_attribution: None,
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert!(!observe_foreground_fanout_completion(
-            &mut state,
-            &[],
-            &[],
-            &[unrelated],
-        ));
+        observe_foreground_fanout_pagination(&mut state, &[], &[], &[unrelated]);
         assert!(
             state
                 .hooks
@@ -4571,12 +4528,7 @@ work_attribution: None,
                 status: "completed".into(),
                 duration_ms: 1,
             };
-            assert!(!observe_foreground_fanout_completion(
-                &mut state,
-                &[],
-                &[],
-                &[invalid_page],
-            ));
+            observe_foreground_fanout_pagination(&mut state, &[], &[], &[invalid_page]);
             assert_eq!(
                 state
                     .hooks
@@ -4605,12 +4557,7 @@ work_attribution: None,
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert!(!observe_foreground_fanout_completion(
-            &mut state,
-            &[],
-            &[],
-            &[first_final_page],
-        ));
+        observe_foreground_fanout_pagination(&mut state, &[], &[], &[first_final_page]);
         assert_eq!(
             state
                 .hooks
@@ -4638,12 +4585,7 @@ work_attribution: None,
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert!(observe_foreground_fanout_completion(
-            &mut state,
-            &[],
-            &[],
-            &[second_final_page],
-        ));
+        observe_foreground_fanout_pagination(&mut state, &[], &[], &[second_final_page]);
         assert!(
             state
                 .hooks
@@ -4674,12 +4616,7 @@ work_attribution: None,
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert!(!observe_foreground_fanout_completion(
-            &mut state,
-            &[],
-            &[],
-            &[start],
-        ));
+        observe_foreground_fanout_pagination(&mut state, &[], &[], &[start]);
         assert!(
             state
                 .hooks
@@ -4707,12 +4644,7 @@ work_attribution: None,
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert!(!observe_foreground_fanout_completion(
-            &mut state,
-            &[],
-            &[],
-            &[final_page],
-        ));
+        observe_foreground_fanout_pagination(&mut state, &[], &[], &[final_page]);
         assert!(
             state
                 .hooks

@@ -5419,3 +5419,54 @@ async fn unavailable_provider_routes_preserve_pre_dispatch_cancellation() {
         assert_eq!(metadata["side_effects_maybe"], false);
     }
 }
+
+#[tokio::test]
+async fn issue_1275_ledger_without_callback_never_uses_remote_edge() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("CLI".into()),
+        Some("/Users/test/project".into()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "CLI",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "CLI",
+                    ToolTransportKind::EdgeLedger,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.unwrap();
+    assert_eq!(
+        metadata["error_kind"],
+        TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE
+    );
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["executor"]["transport"], "edge_ledger");
+    assert!(dispatch.inserted_edge_agent_ids.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+    assert_eq!(local.calls(), 0);
+}

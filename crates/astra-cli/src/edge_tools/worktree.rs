@@ -1279,6 +1279,7 @@ impl ToolExecutor {
                             );
                         }
                         super::ToolExecutionOutcome {
+                            sandbox_approval_scope: None,
                             output: format!(
                                 "✓ Entered worktree\n  Branch: {}\n  Commit: {}\n  Path: {}\n  Session is now working in the worktree. Use `worktree` action=`exit` to leave.",
                                 session.branch_name,
@@ -1313,6 +1314,7 @@ impl ToolExecutor {
                             self.remove_git_worktree_rollback(&session.worktree_path);
                         }
                         super::ToolExecutionOutcome {
+                            sandbox_approval_scope: None,
                             output: msg,
                             tool_result_fields: None,
                             is_error: false,

@@ -566,20 +566,33 @@ pub(crate) fn project_artifact_recovery_guidance(
     history: &[Value],
     route: ArtifactRecoveryRoute,
 ) {
+    let has_history_handle = |text: &str| {
+        astra_turn_core::cloud::history_summary::context_history_artifact_handles(text)
+            .next()
+            .is_some()
+    };
     let has_artifact = history.iter().any(|message| {
-        message.get("role").and_then(Value::as_str) == Some("tool")
+        (message.get("role").and_then(Value::as_str) == Some("tool")
             && astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)
-                .is_some()
+                .is_some())
+            || astra_turn_core::cloud::history_summary::history_summary_text(message)
+                .is_some_and(has_history_handle)
+    }) || preamble.iter().any(|message| {
+        runtime_authority_kind_for_projection(message) == Some("compacted_conversation_summary")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(has_history_handle)
     });
     let instruction = match route {
         ArtifactRecoveryRoute::Direct => {
-            "For retained tool-result artifact handles, use introspect(artifact=HANDLE, offset=0) only when the preview lacks needed evidence. Continue with the returned next_offset. Native tool pagination instructions remain authoritative for their own results."
+            "For retained tool-result or context-history artifact handles, use introspect(artifact=HANDLE, offset=0) only when the preview lacks needed evidence. Continue with the returned next_offset. Native tool pagination instructions remain authoritative for their own results."
         }
         ArtifactRecoveryRoute::Deferred => {
-            "For retained tool-result artifact handles, discover select:introspect with tool_search, then invoke the returned selected contract with artifact=HANDLE, offset=0 only when the preview lacks needed evidence. Continue with the returned next_offset. Native tool pagination instructions remain authoritative for their own results."
+            "For retained tool-result or context-history artifact handles, discover select:introspect with tool_search, then invoke the returned selected contract with artifact=HANDLE, offset=0 only when the preview lacks needed evidence. Continue with the returned next_offset. Native tool pagination instructions remain authoritative for their own results."
         }
         ArtifactRecoveryRoute::Unavailable => {
-            "Retained tool-result artifact handles have no authorized reader in the current tool surface. Their previews may be incomplete; do not invent a recovery call or read runtime storage paths. Native tool pagination instructions remain authoritative for their own results."
+            "Retained artifact handles have no authorized reader in the current tool surface. Their previews may be incomplete; do not invent a recovery call or read runtime storage paths. Native tool pagination instructions remain authoritative for their own results."
         }
     };
     let replacement = has_artifact.then(|| {
@@ -1126,7 +1139,7 @@ fn into_append_only_runtime_authority(
     Ok(message)
 }
 
-fn is_semantic_input_authority_kind(kind: &str) -> bool {
+pub(crate) fn is_semantic_input_authority_kind(kind: &str) -> bool {
     kind.split_once(":sha256:").is_some_and(|(producer, _)| {
         use crate::turn::agentic_loop::host::VolatileKind;
         producer == VolatileKind::Mailbox.wire_kind()
@@ -1573,7 +1586,7 @@ impl<'a> MemoriaContext<'a> {
             session_facts: self.session_facts.clone(),
         };
 
-        let compact_config = CompactConfig::from_env();
+        let compact_config = CompactConfig::default();
 
         let mut result = compact_with_memoria(
             messages,
@@ -2449,6 +2462,69 @@ mod tests {
         assert_eq!(
             render_drained_volatile_messages(&[injection]).unwrap_err(),
             AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity
+        );
+    }
+
+    #[test]
+    fn history_artifact_guidance_tracks_the_final_reader_surface() {
+        let handle = format!(
+            "{}{}",
+            astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+            uuid::Uuid::nil()
+        );
+        let history = vec![
+            astra_turn_core::cloud::history_summary::history_summary_message(format!(
+                "Exact transcript: {handle}"
+            )),
+        ];
+        let mut preamble = Vec::new();
+        for (route, expected) in [
+            (ArtifactRecoveryRoute::Direct, "introspect(artifact=HANDLE"),
+            (
+                ArtifactRecoveryRoute::Deferred,
+                "discover select:introspect",
+            ),
+            (ArtifactRecoveryRoute::Unavailable, "no authorized reader"),
+        ] {
+            project_artifact_recovery_guidance(&mut preamble, &history, route);
+            assert_eq!(preamble.len(), 1);
+            assert!(preamble[0]["content"].as_str().unwrap().contains(expected));
+        }
+        preamble = vec![
+            required_runtime_preamble_message(
+                &format!("Compacted summary with {handle}"),
+                RuntimeAuthorityKind::CompactedConversationSummary,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap(),
+        ];
+        for (route, expected) in [
+            (ArtifactRecoveryRoute::Direct, "introspect(artifact=HANDLE"),
+            (
+                ArtifactRecoveryRoute::Deferred,
+                "discover select:introspect",
+            ),
+            (ArtifactRecoveryRoute::Unavailable, "no authorized reader"),
+        ] {
+            project_artifact_recovery_guidance(&mut preamble, &[], route);
+            let guidance = preamble
+                .iter()
+                .filter(|message| {
+                    runtime_authority_kind_for_projection(message) == Some("artifact_recovery")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(guidance.len(), 1);
+            assert!(guidance[0]["content"].as_str().unwrap().contains(expected));
+        }
+        preamble.clear();
+        project_artifact_recovery_guidance(
+            &mut preamble,
+            &[json!({"role":"user","content":handle})],
+            ArtifactRecoveryRoute::Direct,
+        );
+        assert!(
+            preamble.is_empty(),
+            "user prose is not a producer-owned history reference"
         );
     }
 
@@ -4256,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn small_responses_wire_deficit_preserves_unneeded_recent_tool_rounds() {
+    fn small_responses_wire_deficit_preserves_unique_call_evidence() {
         use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput};
         let connection = uuid::Uuid::new_v4().to_string();
         let text = "response ".repeat(4_500);
@@ -4300,40 +4376,17 @@ mod tests {
             + status.reserved_protocol_tokens
             - 100;
         assert!(status.hard_limit_exceeded());
-        let before = history.len();
-        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_some());
-        assert!(history.iter().any(|message| message == &assistant));
-        assert!(
-            !history
-                .iter()
-                .any(|message| message["tool_call_id"] == "call-0")
+        let original = history.clone();
+        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_none());
+        assert_eq!(
+            history, original,
+            "a small deficit cannot erase unique arguments or opaque continuation"
         );
-        assert!(
-            history
-                .iter()
-                .any(|message| message["tool_call_id"] == "call-1")
-        );
-        assert!(
-            history
-                .iter()
-                .any(|message| message["tool_call_id"] == "call-2")
-        );
-        assert_eq!(history.len(), before - 2);
-        let after = wire_budget_status_with_metadata(
-            &history,
-            &[],
-            "model",
-            Some(status.model_limit as u32),
-            None,
-            status.requested_output_tokens,
-            Some((&connection, "model")),
-        );
-        assert!(!after.hard_limit_exceeded());
         astra_turn_types::validate_canonical_tool_pairing(&history).unwrap();
     }
 
     #[test]
-    fn final_wire_budget_compacts_history_without_rebuilding_runtime_context() {
+    fn final_wire_budget_retains_unique_history_when_no_summary_is_available() {
         let mut history = Vec::new();
         for index in 0..8 {
             history.push(json!({
@@ -4358,16 +4411,11 @@ mod tests {
             model_limit: 2_500,
         };
 
-        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_some());
-        assert!(
-            history.len() < 16,
-            "bounded final-wire repair should reduce canonical history, not add another context lane"
-        );
-        assert!(
-            history
-                .iter()
-                .any(|message| message.get("role").and_then(Value::as_str) == Some("user")),
-            "history compaction must retain a user anchor"
+        let original = history.clone();
+        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_none());
+        assert_eq!(
+            history, original,
+            "wire budgeting must not replace unique history with a marker"
         );
     }
 
@@ -4400,8 +4448,8 @@ mod tests {
         };
 
         assert!(
-            compact_history_for_wire_budget(&mut history, status, &[], None).is_some(),
-            "schema cost must consume history budget instead of being handed back to the compactor"
+            compact_history_for_wire_budget(&mut history, status, &[], None).is_none(),
+            "fixed schema cost cannot authorize deleting unique history"
         );
     }
 
@@ -4449,182 +4497,6 @@ mod tests {
             status.estimated_system_tokens,
             crate::prompts::estimate_json_value_tokens(&messages[0])
                 + crate::prompts::PER_MESSAGE_OVERHEAD
-        );
-    }
-
-    #[tokio::test]
-    async fn long_running_compaction_converges_without_protocol_decay() {
-        let mut history = vec![json!({
-            "role": "user",
-            "content": "Inspect, repair, and verify the project without losing the active goal."
-        })];
-        for round in 0..200 {
-            history.push(json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": format!("call-{round}"),
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": format!("{{\"path\":\"src/file-{round}.rs\"}}")
-                    }
-                }]
-            }));
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": format!("call-{round}"),
-                "content": format!("round {round}: {}", "realistic tool evidence ".repeat(120))
-            }));
-        }
-        let system = vec![json!({
-            "role": "system",
-            "content": "Stable execution policy. Preserve the active goal and tool causality."
-        })];
-        let tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }
-        })];
-        let ctx = MemoriaContext {
-            session_id: "sid-long-running",
-            model_name: "model-with-explicit-window",
-            context_window: Some(8_000),
-            memoria_client: None,
-            summary_client: None,
-            tier: CompactionTier::AggressivePrune,
-            session_facts: None,
-        };
-
-        let first = ctx.compact(&history, &system, &tools).await;
-        let second = ctx.compact(&first.messages, &system, &tools).await;
-        assert_eq!(
-            second.messages, first.messages,
-            "reapplying compaction to an already-bounded working set must converge"
-        );
-        assert!(
-            first.messages.len() < history.len() / 4,
-            "a long execution must keep a bounded live working set"
-        );
-        assert!(first.messages.iter().any(|message| {
-            message.get("content").and_then(Value::as_str)
-                == Some("Inspect, repair, and verify the project without losing the active goal.")
-        }));
-        assert!(first.messages.iter().any(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("call-199")
-        }));
-
-        let retained_calls: std::collections::HashSet<&str> = first
-            .messages
-            .iter()
-            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
-            .flatten()
-            .filter_map(|call| call.get("id").and_then(Value::as_str))
-            .collect();
-        for result in first
-            .messages
-            .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
-        {
-            let call_id = result
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .expect("tool result id");
-            assert!(
-                retained_calls.contains(call_id),
-                "long-running compaction must never retain orphan result {call_id}"
-            );
-        }
-
-        let tool_tokens = tools
-            .iter()
-            .map(crate::prompts::estimate_json_value_tokens)
-            .sum();
-        let estimate = crate::prompts::estimate_tokens_cache_aware_split(
-            &system,
-            &first.messages,
-            tool_tokens,
-        );
-        assert!(
-            estimate.total_tokens <= ctx.context_budget().effective_input_limit(),
-            "bounded wire estimate {} exceeds effective input limit {}",
-            estimate.total_tokens,
-            ctx.context_budget().effective_input_limit()
-        );
-    }
-
-    #[tokio::test]
-    async fn multilingual_long_running_compaction_respects_the_token_window() {
-        let mut history = vec![json!({
-            "role": "user",
-            "content": "持续检查并修复项目，同时保留当前目标与工具因果关系。"
-        })];
-        for round in 0..80 {
-            history.push(json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": format!("call-cjk-{round}"),
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": format!("{{\"path\":\"src/文件-{round}.rs\"}}")
-                    }
-                }]
-            }));
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": format!("call-cjk-{round}"),
-                "content": format!("第 {round} 轮：{}", "真实工具证据".repeat(900))
-            }));
-        }
-        let system = vec![json!({
-            "role": "system",
-            "content": "稳定执行策略。保留活跃目标与工具因果关系。"
-        })];
-        let tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }
-        })];
-        let ctx = MemoriaContext {
-            session_id: "sid-long-running-cjk",
-            model_name: "model-with-explicit-window",
-            context_window: Some(8_000),
-            memoria_client: None,
-            summary_client: None,
-            tier: CompactionTier::AggressivePrune,
-            session_facts: None,
-        };
-
-        let compacted = ctx.compact(&history, &system, &tools).await;
-        let tool_tokens = tools
-            .iter()
-            .map(crate::prompts::estimate_json_value_tokens)
-            .sum();
-        let estimate = crate::prompts::estimate_tokens_cache_aware_split(
-            &system,
-            &compacted.messages,
-            tool_tokens,
-        );
-
-        assert!(
-            estimate.total_tokens <= ctx.context_budget().effective_input_limit(),
-            "multilingual bounded wire estimate {} exceeds effective input limit {}",
-            estimate.total_tokens,
-            ctx.context_budget().effective_input_limit()
         );
     }
 

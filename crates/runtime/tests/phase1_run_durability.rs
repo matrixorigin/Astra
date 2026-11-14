@@ -542,10 +542,17 @@ async fn l2_crash_recovery_marks_running_failed() {
     assert!(recovered.iter().any(|run| run.run_id == run_id));
     let loaded = engine.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.status, "failed");
-    assert_eq!(
-        loaded.error_message.as_deref(),
-        Some("recovered from crash")
-    );
+    assert_eq!(loaded.error_code.as_deref(), Some("crash_recovery"));
+    let message = loaded.error_message.as_deref().expect("recovery message");
+    assert!(message.contains("interrupted"), "{message}");
+    assert!(message.contains("Send a new message"), "{message}");
+    let terminal = loaded
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "run_finished")
+        .expect("recovery terminal event");
+    assert_eq!(terminal["data"]["error_code"], "crash_recovery");
+    assert_eq!(terminal["data"]["error"], message);
     assert!(loaded.owner_pod_id.is_none());
     assert!(loaded.owner_lease_expires_at.is_none());
     engine

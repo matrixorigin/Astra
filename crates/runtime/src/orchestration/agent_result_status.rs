@@ -40,9 +40,9 @@ pub struct AgentToolBudgetRecordProjection {
     pub outcome: AgentToolWireOutcomeKind,
     /// A terminal child has released its execution ownership even when its
     /// outcome is failed/cancelled/interrupted.  This is deliberately
-    /// independent from `successful`.
+    /// independent from `normal_result_available`.
     pub terminal: bool,
-    pub successful: bool,
+    pub normal_result_available: bool,
     pub completed_result: Option<String>,
     pub partial_result: Option<String>,
     pub incomplete_reason: Option<String>,
@@ -118,15 +118,8 @@ pub fn project_agent_tool_budget_record(
     if let Some(parsed) = projection.parsed_result.as_ref() {
         match wire.outcome {
             AgentToolWireOutcomeKind::Completed => {
-                if let Some(result) = agent_tool_completed_result_text(parsed)
-                    .filter(|result| !result.trim().is_empty())
-                {
-                    completed_result = Some(result);
-                } else {
-                    incomplete_reason = Some(
-                        "child reported a completed status without a non-empty result".to_string(),
-                    );
-                }
+                // The canonical projection requires a nonempty normal result.
+                completed_result = agent_tool_completed_result_text(parsed);
             }
             AgentToolWireOutcomeKind::Interrupted => {
                 partial_result = agent_tool_completed_result_text(parsed)
@@ -152,7 +145,7 @@ pub fn project_agent_tool_budget_record(
         display_name_hint: projection.display_name_hint,
         outcome: wire.outcome,
         terminal,
-        successful: terminal && completed_result.is_some(),
+        normal_result_available: terminal && completed_result.is_some(),
         completed_result,
         partial_result,
         incomplete_reason,
@@ -616,7 +609,7 @@ mod tests {
         );
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
         assert!(!projection.terminal);
-        assert!(!projection.successful);
+        assert!(!projection.normal_result_available);
         assert!(projection.completed_result.is_none());
         assert!(projection.partial_result.is_none());
         assert_eq!(
@@ -656,7 +649,7 @@ mod tests {
         let projection = project_agent_tool_budget_record(&failed);
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
         assert!(projection.terminal);
-        assert!(!projection.successful);
+        assert!(!projection.normal_result_available);
         assert_eq!(
             projection.incomplete_reason.as_deref(),
             Some("child exploded")
@@ -679,7 +672,7 @@ mod tests {
         let projection = project_agent_tool_budget_record(&retry_error);
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
         assert!(!projection.terminal);
-        assert!(!projection.successful);
+        assert!(!projection.normal_result_available);
         for result in [
             json!({"error":"observation rejected", "agent_id":"failed-child"}),
             json!({"result_family":"child_result", "status":"unknown", "agent_id":"failed-child"}),
@@ -722,7 +715,7 @@ mod tests {
         let projection = project_agent_tool_budget_record(&record);
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Interrupted);
         assert!(projection.terminal);
-        assert!(!projection.successful);
+        assert!(!projection.normal_result_available);
         assert_eq!(
             projection.partial_result.as_deref(),
             Some("partial findings")

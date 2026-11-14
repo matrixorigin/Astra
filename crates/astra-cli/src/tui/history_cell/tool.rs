@@ -161,6 +161,7 @@ impl ToolCell {
             PersistStatus::Success => ToolStatus::Success,
             PersistStatus::Uncertain => ToolStatus::Uncertain,
             PersistStatus::Failed => ToolStatus::Failed,
+            PersistStatus::Rejected => ToolStatus::Rejected,
         };
         let started_at = Instant::now()
             .checked_sub(std::time::Duration::from_millis(duration_ms))
@@ -769,7 +770,8 @@ impl HistoryCell for ToolCell {
         let status = match self.status {
             ToolStatus::Success => PersistStatus::Success,
             ToolStatus::Uncertain => PersistStatus::Uncertain,
-            ToolStatus::Failed | ToolStatus::Rejected => PersistStatus::Failed,
+            ToolStatus::Failed => PersistStatus::Failed,
+            ToolStatus::Rejected => PersistStatus::Rejected,
             ToolStatus::Running => return None,
         };
         Some(TurnEvent::Tool {
@@ -1360,6 +1362,27 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("Ran Agent Fanout"), "{output}");
+    }
+
+    #[test]
+    fn bash_rejection_remains_not_run_after_journal_restore() {
+        let mut live = ToolCell::new_running("bash", "$ git diff --name-only");
+        live.complete(
+            "rejected",
+            8,
+            String::new(),
+            Some("Error: workdir is not authorized; no command was run".into()),
+            None,
+        );
+        let persisted = live.to_persist().unwrap();
+        let serialized = serde_json::to_string(&persisted).unwrap();
+        let restored = ToolCell::from_persist(serde_json::from_str(&serialized).unwrap()).unwrap();
+        for cell in [&live, &restored] {
+            let output = render(cell, 120, 5);
+            assert!(output.contains("Did not run Bash"), "{output}");
+            assert!(!output.contains("Failed Bash"), "{output}");
+            assert!(output.contains("no command was run"), "{output}");
+        }
     }
 
     #[test]
