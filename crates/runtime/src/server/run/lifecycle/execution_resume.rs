@@ -789,7 +789,7 @@ impl AgenticRunLifecycleService {
         let agent_context = AgentToolContext {
             parent_delegation_authority: delegation_authority,
             fanout_admission: entry.spawner.fanout_parent(&run.run_id),
-            reply_obligations: state.messaging.reply_obligations.clone(),
+            question_correlations: state.messaging.question_correlations.clone(),
             delegation_model_admission: None,
             run_id: run.run_id.clone(),
             agent_id: state.self_agent_id.clone(),

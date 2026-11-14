@@ -265,7 +265,7 @@ mod tests {
             SandboxPolicy::for_project(&root),
             SandboxPolicy::strict(&root),
         ] {
-            policy.allowed_paths.push(outside.clone());
+            policy.add_allowed_path(&outside).unwrap();
             for input in ["../outside/marker", "../outside/new/deep/file"] {
                 assert!(
                     matches!(

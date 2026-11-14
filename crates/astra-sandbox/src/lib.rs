@@ -57,3 +57,5 @@ mod sync_process;
 pub use sync_process::{
     SyncProcessError, SyncProcessOutput, run_sync_process, run_sync_process_with_cancel,
 };
+
+pub use policy::SandboxApprovalScope;

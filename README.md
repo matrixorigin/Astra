@@ -301,9 +301,12 @@ astra chat -y --explain verbose -m "Count the .sh files here with a shell comman
 ```
 
 File and shell tools run on this machine inside the current directory;
-the Server only sees tool results. One-shot `chat` cannot ask for approval,
-so pass `-y` (or `--permission-mode auto`) when the task needs tools; the
-TUI prompts instead. `--explain verbose` prints the runtime-recorded Explain
+the Server only sees tool results. Headless one-shot `chat` requires an explicit
+permission mode even for a plain prompt: use `--permission-mode deny` to reject
+write/execute tools without prompting, or `-y` (`--permission-mode auto`) to
+auto-resolve ordinary approvals while retaining hard safety denies. Interactive
+clients can prompt. A separate `astra-edge` WebSocket runner is not required:
+ordinary CLI tools use the CLI's own authenticated callback transport. `--explain verbose` prints the runtime-recorded Explain
 Analyze execution tree for the turn, with known unmeasured boundaries shown.
 
 If a command returns `401`, the access token has expired: run

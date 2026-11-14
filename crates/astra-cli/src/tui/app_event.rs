@@ -94,6 +94,9 @@ pub(crate) enum TuiAppEvent {
     },
     WaitingForModel,
     ModelResponding,
+    RuntimeWait {
+        waiting: bool,
+    },
     StatusLine(String),
     /// Restore a user submission that never reached admission. The TUI keeps
     /// it in the composer while the user chooses an explicit recovery action.

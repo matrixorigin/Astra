@@ -46,7 +46,7 @@ async fn hydrate_edge_registration_runtime_context(
                 "model_selection_missing",
             )
         })?;
-    let context = state
+    let mut context = state
         .auth_service
         .external_runtime_context_by_scope(
             principal,
@@ -58,6 +58,23 @@ async fn hydrate_edge_registration_runtime_context(
             },
         )
         .await?;
+    if let Some(requested) = request.allow_tools.as_deref() {
+        request.allow_tools = Some(effective_allowed_tool_ids(
+            requested,
+            context
+                .runtime_scope
+                .allowed_tools
+                .iter()
+                .map(|tool| tool.id.as_str()),
+        ));
+    }
+    if request.executor_binding.as_ref().is_some_and(|binding| {
+        binding.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            && binding.transport == Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger)
+    }) {
+        // Optional WS capacity is not authority for the selected CLI lane.
+        context.capability_descriptors.edge_agent = None;
+    }
     let authorization = context.runtime_auth.authorization.clone();
     request.model_selection = Some(context.selected_model.to_model_selection());
     request.resolved_model_selection = Some(context.selected_model.to_resolved_model_selection());
@@ -222,17 +239,25 @@ async fn inject_edge_registration_runtime_context_body(
         .map_err(internal_error)
 }
 
-#[cfg(test)]
 fn effective_allowed_tool_ids<'a>(
     requested_tool_ids: &[String],
     provider_allowed_tool_ids: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
+    use crate::server::run::lifecycle::normalize_allowlist_entry;
     let provider_allowed_tool_ids = provider_allowed_tool_ids
         .into_iter()
+        .filter_map(|id| normalize_allowlist_entry(id, "allow_tools").ok())
         .collect::<std::collections::HashSet<_>>();
     requested_tool_ids
         .iter()
-        .filter(|tool_id| provider_allowed_tool_ids.contains(tool_id.as_str()))
+        .filter(
+            |tool_id| match normalize_allowlist_entry(tool_id, "allow_tools") {
+                Ok(id) => provider_allowed_tool_ids.contains(&id),
+                // Preserve malformed input for canonical validation; do not erase
+                // its original error by silently turning it into an empty grant.
+                Err(_) => true,
+            },
+        )
         .cloned()
         .collect()
 }
@@ -430,6 +455,16 @@ mod tests {
                     expires_at: "2026-07-21T00:00:00Z".to_string(),
                 },
                 capability_descriptors: ExternalRuntimeCapabilityDescriptors {
+                    model_gateway: Some(ExternalRuntimeCapabilityDescriptor {
+                        id: "model-gateway".into(),
+                        descriptor_type: "model_gateway".into(),
+                        transport: "http".into(),
+                        endpoint_url: "http://127.0.0.1:9/v1/chat/completions".into(),
+                        protocol: "openai_chat_completions".into(),
+                        semantic_read: None,
+                        model_context_window: Some(128_000),
+                        metadata: Default::default(),
+                    }),
                     edge_agent: Some(ExternalRuntimeCapabilityDescriptor {
                         id: "edge-test".to_string(),
                         descriptor_type: "edge_agent".to_string(),
@@ -670,5 +705,69 @@ mod tests {
             .expect("trusted resolution must survive wire mapping and provider injection");
         assert_eq!(resolved.offering_id, "model-requested");
         assert_eq!(resolved.model_name, "provider-model");
+    }
+    #[test]
+    fn issue_1275_grant_projection_keeps_normalized_ids_and_invalid_input() {
+        let requested = vec![" READ_FILE ".into(), "BASH".into(), " ".into()];
+        assert_eq!(
+            effective_allowed_tool_ids(&requested, ["read_file"]),
+            vec![" READ_FILE ", " "]
+        );
+        assert!(effective_allowed_tool_ids(&[], ["read_file"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_1275_hydrated_cli_ledger_preserves_grant_and_selected_transport() {
+        for transport in ["edge_ledger", "edge_ws_authorized"] {
+            let wire: astra_server_types::ChatRequest = serde_json::from_value(serde_json::json!({
+                "message":"hello", "model_selection":{"offering_id":"model-requested"},
+                "allow_tools":["bash","read_file"],
+                "workspace_binding":{"kind":"edge_workspace","root":"/workspace","authority":"read_write"},
+                "executor_binding":{"kind":"edge_agent","executor_id":"edge-test","transport":transport,"status":"online"}
+            })).unwrap();
+            let mut request = astra_server_types::chat_request_into_data(wire);
+            inject_effective_runtime_context(&test_state(), &edge_principal(), &mut request)
+                .await
+                .unwrap();
+            assert_eq!(
+                request.allow_tools.as_deref(),
+                Some(["read_file".to_string()].as_slice())
+            );
+            assert_eq!(
+                request.runtime_auth.as_ref().unwrap().authorization,
+                "Bearer runtime-grant"
+            );
+            assert_eq!(
+                request
+                    .capability_descriptors
+                    .as_ref()
+                    .unwrap()
+                    .edge_agent
+                    .is_some(),
+                transport != "edge_ledger"
+            );
+            if transport == "edge_ledger" {
+                let service = crate::server::run::lifecycle::tests::test_service();
+                let error = service
+                    .stream_chat_with_session(
+                        "u1".into(),
+                        request,
+                        Box::pin(async {
+                            Err(error_response_coded(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "controlled Session owner",
+                                "test_session_owner_reached",
+                            ))
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.1.0.error_code.as_deref(),
+                    Some("test_session_owner_reached"),
+                    "{error:?}"
+                );
+            }
+        }
     }
 }

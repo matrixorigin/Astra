@@ -13337,6 +13337,9 @@ impl ServerAgenticLoopHost {
     }
 
     fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
+        if event["type"] == "runtime_wait" {
+            return;
+        }
         // Streaming deltas are already delivered on the live lane. Retaining
         // every tiny text/reasoning fragment in the bounded settlement buffer
         // lets a verbose provider evict tool and lifecycle evidence before
@@ -18209,7 +18212,7 @@ impl ServerAgenticLoopHost {
         tier: CompactionTier,
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
-        let compact_config = crate::prompts::CompactConfig::from_env();
+        let compact_config = crate::prompts::CompactConfig::default();
         let mut summary_client = self.summary_client(
             llm_cfg,
             compact_config.summary_token_budget,
@@ -19345,6 +19348,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         child_count: usize,
         started_at: Instant,
     ) {
+        if matches!(outcome, "wait_started" | "wait_finished")
+            && let Some(sender) = &self.event_tx
+        {
+            // Display-only facts never enter retained events, delivery-gap
+            // repair or durable SQL. A dropped hint carries no authority.
+            let _ = sender.tx.try_send(json!({
+                "type":"runtime_wait", "run_id":state.current_run_id,
+                "reason":"agent_input", "waiting":outcome == "wait_started",
+            }));
+        }
         use astra_turn_types::{
             ExplainAnalyzeNodeKindV1 as Kind, ExplainAnalyzeOutcomeV1 as Outcome,
         };
@@ -25327,7 +25340,7 @@ mod tests {
     }
 
     #[test]
-    fn final_wire_budget_reinjects_invoked_skill_after_emergency_history_rewrite() {
+    fn final_wire_budget_reinjects_invoked_skill_after_non_destructive_budget_rejection() {
         let mut host = test_host_builder("u-skill-boundary", "s-skill-boundary").build();
         let mut state = create_test_state();
         state.skills.execution.invoked.insert(
@@ -25354,6 +25367,22 @@ mod tests {
         llm_cfg.context_window = Some(4_000);
         llm_cfg.max_completion_tokens = Some(256);
 
+        let original_history = state.messages.clone();
+        let error = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role": "system", "content": "stable"})],
+                Vec::new(),
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                256,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(state.messages, original_history);
+        llm_cfg.context_window = Some(128_000);
         let (wire, _output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role": "system", "content": "stable"})],
@@ -25365,11 +25394,11 @@ mod tests {
                 &[],
                 256,
             )
-            .expect("bounded emergency history rewrite should settle");
+            .expect("an explicitly selected larger context preserves the same history");
 
         assert!(
-            boundary.is_some(),
-            "the first candidate must cross the wire budget"
+            boundary.is_none(),
+            "a larger context fits without an invented rewrite"
         );
         let skill_attachments = wire
             .iter()
@@ -25387,7 +25416,7 @@ mod tests {
     }
 
     #[test]
-    fn final_wire_compacts_long_active_turn_without_losing_required_context() {
+    fn final_wire_retains_long_active_turn_without_losing_required_context() {
         use crate::turn::wire_assembly::{
             RuntimeAuthorityKind, required_append_only_runtime_authority_message,
         };
@@ -25425,6 +25454,22 @@ mod tests {
         llm_cfg.context_window = Some(4_000);
         llm_cfg.max_completion_tokens = Some(256);
 
+        let original_history = state.messages.clone();
+        let error = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                Vec::new(),
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                256,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(state.messages, original_history);
+        llm_cfg.context_window = Some(128_000);
         let (wire, output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
@@ -25436,9 +25481,9 @@ mod tests {
                 &[],
                 256,
             )
-            .expect("a long active turn should compact before provider dispatch");
+            .expect("an explicitly selected larger context preserves the same history");
 
-        assert!(boundary.is_some());
+        assert!(boundary.is_none());
         assert!(output_tokens > 0);
         assert!(wire.contains(&work));
         assert!(wire.iter().any(|message| {
@@ -25690,6 +25735,22 @@ mod tests {
                 )
                 .unwrap();
                 let original_len = wire.len();
+                let error = fit_physical_retry_wire_budget(
+                    &mut wire,
+                    &[],
+                    &cfg,
+                    256,
+                    &create_test_state(),
+                    |_| Ok(None),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+                assert_eq!(
+                    wire.len(),
+                    original_len,
+                    "unique calls are not dropped to hide a small overflow"
+                );
+                cfg.context_window = Some(128_000);
                 let (status, output, boundary) = fit_physical_retry_wire_budget(
                     &mut wire,
                     &[],
@@ -25706,10 +25767,8 @@ mod tests {
                     "{placement:?} {kind:?}, status={status:?}, wire length={}",
                     wire.len()
                 );
-                let boundary = boundary.expect("retry compaction boundary");
-                assert_eq!(boundary.messages_before, original_len);
-                assert_eq!(boundary.messages_after, wire.len());
-                assert!(wire.len() < original_len);
+                assert!(boundary.is_none());
+                assert_eq!(wire.len(), original_len);
                 assert_eq!(
                     wire.iter().rfind(|message| message["role"] == "assistant"),
                     Some(&assistant)
@@ -25757,7 +25816,7 @@ mod tests {
         };
         let mut cfg = summary_test_config(String::new());
         cfg.cache_capability = Some(append_only_test_cache_capability());
-        cfg.context_window = Some(4_000);
+        cfg.context_window = Some(16_000);
         let work = required_append_only_runtime_authority_message(
             &"Work details ".repeat(100),
             RuntimeAuthorityKind::ActiveWorkAttemptStart,
@@ -25792,6 +25851,13 @@ mod tests {
         assert_eq!(output, 256);
         assert!(boundary.is_some());
         assert_eq!(wire.iter().filter(|message| **message == work).count(), 1);
+        assert_eq!(
+            wire.iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            100,
+            "releasing repeated control frames must not delete the observed calls"
+        );
         astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
     }
 
@@ -25802,7 +25868,7 @@ mod tests {
         };
         let mut cfg = summary_test_config(String::new());
         cfg.cache_capability = Some(append_only_test_cache_capability());
-        cfg.context_window = Some(4_000);
+        cfg.context_window = Some(5_000);
         let mut state = create_test_state();
         let instructions = "review instructions ".repeat(100);
         state.skills.execution.invoked.insert(
@@ -25858,7 +25924,10 @@ mod tests {
             assert!(!status.hard_limit_exceeded());
             assert_eq!(output, 256);
             assert!(boundary.is_some());
-            assert!(candidate.len() < original.len());
+            assert!(
+                crate::turn::cloud::compaction::serialized_message_chars(&candidate)
+                    < crate::turn::cloud::compaction::serialized_message_chars(&original)
+            );
             assert_eq!(candidate.contains(&work), preserve_work);
             assert!(candidate.iter().any(|message| {
                 message["role"] == "tool"
@@ -27748,10 +27817,14 @@ mod tests {
             "output={} fields={:?}",
             outcome.results[0].output, outcome.results[0].tool_result_fields
         );
+        let denial: serde_json::Value = serde_json::from_str(&outcome.results[0].output)
+            .expect("durable denial is a structured result");
+        assert_eq!(denial["error"], "approval_denied");
         assert!(
-            outcome.results[0].output.contains("REJECTED"),
-            "tool result must follow the durable denial, got {}",
-            outcome.results[0].output
+            denial["directive"]
+                .as_str()
+                .unwrap()
+                .contains("NOT executed")
         );
         assert!(
             !outcome.results[0].output.contains("timed out waiting"),
@@ -34698,7 +34771,7 @@ mod tests {
             parent_delegation_authority:
                 crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run1"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "run1".into(),
             agent_id: "agent1".into(),
@@ -35680,7 +35753,7 @@ mod tests {
                     responses.into_iter().map(ProviderResponse::OpenAi).collect()),
                 ProviderScript::optional_background_json("compaction summary",
                     |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body.get("tools").is_none() && request.body["messages"].is_array(),
-                    json!({"choices":[{"message":{"content":"bounded compaction summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
+                    json!({"choices":[{"message":{"content":"### Primary Request\nInspect the repository\n### Pending Tasks\nContinue the selected capability\n### Current Work\nRepository inspection\n### Current State\nEarlier observations retained"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
             ]).await;
             let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
             let sessions = tempfile::tempdir().unwrap();
@@ -39711,8 +39784,8 @@ mod tests {
             } else {
                 let result = call.await;
                 assert!(
-                    result.boundary.is_some(),
-                    "mechanical fallback remains available"
+                    result.boundary.is_none(),
+                    "failed summary does not authorize discarding unique history"
                 );
                 assert!(result.history_summary.is_none());
             }
@@ -39888,7 +39961,10 @@ mod tests {
                 );
                 assert_eq!(state.messages.last(), Some(&authority));
                 assert!(
-                    history_summary_text(&state.messages[0])
+                    state
+                        .messages
+                        .iter()
+                        .find_map(history_summary_text)
                         .unwrap()
                         .contains(CONTINUITY_FACT)
                 );
@@ -39932,16 +40008,22 @@ mod tests {
                 .unwrap();
                 assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
                 let mut committed: Vec<Value> = packs.into_iter().flatten().collect();
-                assert_eq!(committed[0][HISTORY_SUMMARY_FIELD], 1);
+                let summary_row = committed
+                    .iter_mut()
+                    .find(|row| history_summary_text(row).is_some())
+                    .unwrap();
+                assert_eq!(summary_row[HISTORY_SUMMARY_FIELD], 1);
                 if generation == 0 {
-                    committed[0]
+                    summary_row
                         .as_object_mut()
                         .unwrap()
                         .remove(HISTORY_SUMMARY_FIELD);
                 }
                 let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
                 assert!(
-                    history_summary_text(&restored[0])
+                    restored
+                        .iter()
+                        .find_map(history_summary_text)
                         .unwrap()
                         .contains(CONTINUITY_FACT)
                 );
@@ -40062,7 +40144,7 @@ mod tests {
         assert!(new_prefix < old_prefix);
 
         let stats = astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
-            &mut state.messages, 0.0, state.compact_strategy, None, state.last_request_message_count,
+            &mut state.messages, 0.0, Default::default(), None, state.last_request_message_count,
         );
         assert!(stats.results_compacted >= 2);
         let sent = state
@@ -41747,7 +41829,7 @@ mod tests {
             } else {
                 assert!(request.is_none());
                 assert_eq!(outcome.results[0].status, "denied");
-                assert!(outcome.results[0].output.contains("user_denied"));
+                assert!(outcome.results[0].output.contains("approval_denied"));
                 assert!(outcome.results[0].output.contains("user declined removal"));
                 assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
                     &ledger,
@@ -41924,7 +42006,7 @@ mod tests {
                 } else {
                     assert_eq!(write.status, "denied");
                     assert!(
-                        write.output.contains("user_denied") && write.output.contains("policy")
+                        write.output.contains("approval_denied") && write.output.contains("policy")
                     );
                     assert!(
                         !committed
@@ -47854,6 +47936,10 @@ mod tests {
             .with_provider_observations(observations.clone())
             .with_admitted_model_execution(Some(execution))
             .build();
+        host.test_compaction_client = Some(Box::new(InterruptedCompactionSummary {
+            started: Arc::new(tokio::sync::Notify::new()),
+            pending: false,
+        }));
         let mut state = create_durable_execution_test_state(session_id);
         state.message = "complete several independently verifiable outcomes".into();
         state.user_intent = state.message.clone();
@@ -48707,7 +48793,7 @@ mod tests {
                 responses.into_iter().map(ProviderResponse::OpenAi).collect()),
             ProviderScript::optional_background_json("compaction summary",
                 |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body.get("tools").is_none() && request.body["messages"].is_array(),
-                json!({"choices":[{"message":{"content":"bounded compaction summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
+                json!({"choices":[{"message":{"content":"### Primary Request\nInspect the repository\n### Pending Tasks\nContinue the selected capability\n### Current Work\nRepository inspection\n### Current State\nEarlier observations retained"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
         ]).await;
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let requests = provider.requests.clone();
@@ -48762,11 +48848,11 @@ mod tests {
         for index in 0..24 {
             first_state.messages.push(json!({
                 "role": "user",
-                "content": format!("historical request {index}: {}", "context ".repeat(320)),
+                "content": format!("historical request {index}"),
             }));
             first_state.messages.push(json!({
                 "role": "assistant",
-                "content": format!("historical result {index}: {}", "evidence ".repeat(320)),
+                "content": format!("historical result {index}: {}", "evidence ".repeat(640)),
             }));
         }
         first_state
@@ -48897,10 +48983,10 @@ mod tests {
         restored_state.session_turn = 2;
         // Do not supply the old objective/constraint again: their only source
         // in the next provider request must be the restored conversation.
-        let restored_user_text = format!(
-            "Continue using the selected tool. Additional task data:\n{}",
-            "bounded input data ".repeat(5_000)
-        );
+        let restored_user_text = "Continue using the selected tool.".to_string();
+        for index in 0..16 {
+            restored_state.messages.push(json!({"role":"assistant", "content":format!("completed analysis {index}: {}", "bounded evidence ".repeat(500))}));
+        }
         restored_state
             .messages
             .push(json!({"role": "user", "content": restored_user_text}));
@@ -49601,6 +49687,18 @@ mod tests {
             serde_json::from_str::<Value>(&rejection.result)
                 .is_ok_and(|value| value["error_kind"] == "fanout_result_pagination_pending")
         }));
+
+        // The shared observer clears this carrier after all exact tails arrive.
+        state
+            .hooks
+            .completion_settlement
+            .foreground_fanout_pagination = None;
+        let admitted = host.admit_terminal_tool_calls(&state, &calls[..1], Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"], "read-stale");
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut host, &calls[..1], Some("tool_calls"));
+        assert!(admission.rejected.is_empty());
     }
 
     #[test]
@@ -54140,6 +54238,51 @@ mod tests {
     }
 
     // ── progress_event_to_sse tests ──
+
+    #[test]
+    fn agent_input_wait_hint_is_live_only_and_does_not_create_repair_work() {
+        let mut host = test_host_builder("user1", "sess1").build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        let recovery_before = host
+            .event_tx
+            .as_ref()
+            .unwrap()
+            .gap
+            .pending_recovery_snapshot();
+        let mut state = create_test_state();
+        state.current_run_id = Some("root".into());
+        for outcome in ["wait_started", "wait_finished"] {
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_direct_child_completion_boundary(
+                &mut host, &state, outcome, 0, Instant::now());
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event["type"], "runtime_wait");
+            assert_eq!(event["run_id"], "root");
+            assert_eq!(event["waiting"], outcome == "wait_started");
+            assert!(
+                !crate::server::run::lifecycle::run_state::live_delta_event_for_persistence(&event)
+            );
+        }
+        // A saturated display channel must neither block execution nor queue
+        // a durable repair for this disposable observation.
+        for outcome in ["wait_started", "wait_finished"] {
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_direct_child_completion_boundary(
+                &mut host, &state, outcome, 0, Instant::now());
+        }
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| event["type"] != "runtime_wait")
+        );
+        assert_eq!(
+            host.event_tx
+                .as_ref()
+                .unwrap()
+                .gap
+                .pending_recovery_snapshot(),
+            recovery_before
+        );
+    }
 
     #[test]
     fn set_event_tx_disables_host_progress_subscription() {
