@@ -289,8 +289,8 @@ async fn stream_chat_sse_inner(
             .with_memory_attribution_id(parent_turn_run_id.clone());
         // Bind the shared owner before restoring the session so a selected
         // checkout is validated once per session, not once per turn.
-        let ex = if let Some(ref journal) = p.git_worktree_journal {
-            ex.with_shared_git_worktree_journal(journal.clone())
+        let ex = if let Some(ref journal) = p.worktree_owner {
+            ex.with_shared_worktree_owner(journal.clone())
         } else {
             ex
         };

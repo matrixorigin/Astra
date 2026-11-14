@@ -2346,10 +2346,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
-                        "branch": {"type": "string", "description": "New branch name; required for enter."},
-                        "start_point": {"type": "string", "minLength": 1, "description": "Optional existing Git commit or ref for enter; defaults to the current HEAD."},
-                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. On macOS the worktree is always kept."},
-                        "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
+                        "branch": {"type": "string", "description": "Branch to create or select in an existing linked worktree; required for enter."},
+                        "start_point": {"type": "string", "minLength": 1, "description": "Optional commit or ref for a new branch; defaults to HEAD. For an existing worktree it must match its current commit."},
+                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. Removal is unavailable on macOS and returns an error without exiting."},
+                        "discard_changes": {"type": "boolean", "description": "Allow discarding local work when exiting with remove, including when Git cannot verify it is clean; defaults to false."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {"enter": ["branch"]},

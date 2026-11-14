@@ -326,8 +326,8 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
 #[path = "edge_tools/worktree.rs"]
 pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
-pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
+pub(crate) use worktree::WorktreeSessionOwner;
 
 /// Permission admission for one provider-owned collaborator declaration.
 /// This is a receipt from the existing CLI permission owner; it is not a
@@ -1417,10 +1417,8 @@ pub struct ToolExecutor {
     pub(crate) database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
 
-    /// Git worktree rollback journal — records newly created worktrees so bounded
-    /// turn/batch rollback can remove them again while they are still clean.
-    pub(crate) git_worktree_journal:
-        std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+    /// Shared session workspace selection and transition guard.
+    pub(crate) worktree_owner: std::sync::Arc<std::sync::Mutex<worktree::WorktreeSessionOwner>>,
     /// Session-state rollback journal — records bounded self-mod mutations so
     /// same-turn rollback can restore prior in-memory session state.
     session_state_journal:
@@ -1624,11 +1622,11 @@ impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
-        let worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            worktree::GitWorktreeRollbackJournal::default(),
+        let worktree_owner = std::sync::Arc::new(std::sync::Mutex::new(
+            worktree::WorktreeSessionOwner::default(),
         ));
         let (worktree_session, worktree_transition) = {
-            let owner = worktree_journal
+            let owner = worktree_owner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (owner.active_session.clone(), owner.transition.clone())
@@ -1675,7 +1673,7 @@ impl ToolExecutor {
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: worktree_journal,
+            worktree_owner,
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 session_state::SessionStateRollbackJournal::default(),
             )),
@@ -2916,10 +2914,10 @@ impl ToolExecutor {
         self
     }
 
-    /// Use a shared git worktree rollback journal (session-scoped) instead of the default.
-    pub(crate) fn with_shared_git_worktree_journal(
+    /// Share the session workspace selection across executors.
+    pub(crate) fn with_shared_worktree_owner(
         mut self,
-        journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+        journal: std::sync::Arc<std::sync::Mutex<worktree::WorktreeSessionOwner>>,
     ) -> Self {
         {
             let owner = journal
@@ -2928,7 +2926,7 @@ impl ToolExecutor {
             self.worktree_session = owner.active_session.clone();
             self.worktree_transition = owner.transition.clone();
         }
-        self.git_worktree_journal = journal;
+        self.worktree_owner = journal;
         self.restore_selected_worktree();
         self
     }
@@ -5221,7 +5219,7 @@ impl ToolExecutor {
         // The worktree lifecycle mutates the original repository and may
         // remove the selected checkout; its coordination root must survive
         // the operation itself.
-        let execution_root = if matches!(name, "worktree" | "rollback_git_worktrees") {
+        let execution_root = if name == "worktree" {
             self.session_project_root()
         } else {
             self.effective_project_root()
@@ -5277,10 +5275,7 @@ impl ToolExecutor {
         {
             // Worktree operations acquire checkout leases below. File
             // rollback acquires its target scopes separately after admission.
-            let mut additional_roots = if matches!(
-                name,
-                "worktree" | "rollback_git_worktrees" | "rollback_file_edits"
-            ) {
+            let mut additional_roots = if matches!(name, "worktree" | "rollback_file_edits") {
                 Vec::new()
             } else {
                 self.additional_workspace_paths()
@@ -5376,26 +5371,6 @@ impl ToolExecutor {
             }
         } else {
             None
-        };
-        let _rollback_checkout_leases = if name == "rollback_git_worktrees" {
-            let Some(parent) = _workspace_mutation_lease.as_ref() else {
-                return EdgeToolRun::from_tool_result(astra_tools::workspace_lease_failure_tool_result(
-                    name, astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
-                ));
-            };
-            match self
-                .acquire_git_worktree_rollback_leases(args, None, parent, cancel_token)
-                .await
-            {
-                Ok(leases) => leases,
-                Err(failure) => {
-                    return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_failure_tool_result(name, failure),
-                    );
-                }
-            }
-        } else {
-            Vec::new()
         };
         if let Some(validate) = validate_dispatch
             && let Err(result) = validate()

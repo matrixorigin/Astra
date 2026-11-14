@@ -1256,7 +1256,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1439,7 +1439,7 @@ async fn stream_chat_sse_simple_text_response() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1564,7 +1564,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1714,7 +1714,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -1819,7 +1819,7 @@ async fn stream_chat_sse_api_error_propagated() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1937,7 +1937,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -2129,7 +2129,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2270,7 +2270,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2436,7 +2436,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,

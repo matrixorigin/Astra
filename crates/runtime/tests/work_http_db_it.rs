@@ -6009,7 +6009,7 @@ async fn workspace_package_bytes(
 /// Actual HTTP/MatrixOne load probe for the two reads made by a bound CLI
 /// observer. The client-cadence test separately proves when these reads occur.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+#[ignore = "1000-reader load probe; requires isolated MatrixOne and FD >= 8192; see docs/guides/testing.md"]
 async fn thousand_work_observer_refreshes_have_bounded_read_only_sql() {
     use std::time::{Duration, Instant};
     use tracing_subscriber::prelude::*;

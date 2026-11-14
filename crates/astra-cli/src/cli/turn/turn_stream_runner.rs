@@ -232,7 +232,7 @@ fn build_turn_stream_params<'a>(
         file_state: Some(state.file_state.clone()),
         database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
 
-        git_worktree_journal: Some(state.git_worktree_journal.clone()),
+        worktree_owner: Some(state.worktree_owner.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
         background_tasks: Some(state.background_tasks.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
