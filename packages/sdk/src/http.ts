@@ -123,19 +123,37 @@ export async function readAstraErrorDetail(response: Response): Promise<string> 
   return (await readAstraError(response)).detail;
 }
 
+function decodeBase64UrlSegment(segment: string): string {
+  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
+  const bytes = typeof atob === 'function'
+    ? Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
+    : Buffer.from(padded, 'base64');
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
 export function extractJwtSubject(token: string): string | null {
   try {
-    const payloadSegment = token.split('.')[1];
-    if (!payloadSegment) {
+    // RFC 7519 section 3.1: a JWT is exactly three base64url segments
+    // (header.payload.signature) and the first segment is the encoded JOSE
+    // header JSON object. Strings with any other shape are not JWTs and must
+    // not report a subject.
+    const segments = token.split('.');
+    if (segments.length !== 3) {
       return null;
     }
-    const normalized = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
-    const bytes = typeof atob === 'function'
-      ? Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
-      : Buffer.from(padded, 'base64');
-    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    const payload = JSON.parse(decoded) as {
+    const [headerSegment, payloadSegment] = segments;
+    if (!headerSegment || !payloadSegment) {
+      return null;
+    }
+    const header = JSON.parse(decodeBase64UrlSegment(headerSegment)) as unknown;
+    // RFC 7519 section 3.1: the JOSE header is a single JSON object.
+    // JSON.parse yields typeof 'object' for arrays too, so reject them
+    // explicitly to keep the fail-closed contract.
+    if (typeof header !== 'object' || header === null || Array.isArray(header)) {
+      return null;
+    }
+    const payload = JSON.parse(decodeBase64UrlSegment(payloadSegment)) as {
       sub?: unknown;
     };
     return typeof payload.sub === 'string' && payload.sub ? payload.sub : null;
