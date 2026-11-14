@@ -559,7 +559,10 @@ Without `discard_changes`, removal uses Git's non-forced operation and refuses
 when the index marks tracked paths as assume-unchanged or skip-worktree, because
 their local contents cannot be verified by `git status`.
 With explicit discard, removal still requires settled process ownership but does
-not depend on enumerating worktree contents.
+not depend on enumerating worktree contents. Checkout hooks run in the new
+worktree: while its path is quarantined after a foreground process-group receipt,
+automatic removal is refused, while ordinary work and `keep` remain available.
+Manually moving a checkout does not prove that earlier work has stopped.
 Background work uses the existing invocation owner. An executor that cannot
 prove descendant settlement rejects managed background work before starting it;
 this currently includes macOS. If a started process cannot be settled, the
@@ -589,8 +592,9 @@ isolation governs that window. Non-Unix retains its existing canonical-path
 binding without claiming Unix descriptor guarantees.
 
 All synchronous Git commands, including validation and worktree inspection,
-share a timeout, fair nonblocking output collection and a 16 MiB output budget
-(validation uses 64 KiB). They retain invocation-owner cleanup and never parse
+share a timeout and fair nonblocking output collection. Captured output is limited
+to 16 MiB (validation uses 64 KiB); the cleanup index check instead consumes
+stdout incrementally and keeps stderr bounded. They retain invocation-owner cleanup and never parse
 truncated output as a complete result. Errors preserve whether failure occurred
 before launch or after possible effects. A detected runtime binding change
 invalidates attribution on the **captured original observation state**. Weak

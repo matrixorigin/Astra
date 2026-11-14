@@ -65,25 +65,29 @@ async fn exit_and_clean_test_worktree(
     repo: &std::path::Path,
     checkout: &std::path::Path,
 ) {
+    // A recovered or re-selected checkout need not retain the uncertainty of
+    // an earlier command, even when this host cannot provide strong ownership.
+    let cleanup_is_safe = crate::edge_tools::worktree::workspace_safe_for_cleanup(checkout);
     let result = exe
         .execute_with_metadata(
             "worktree",
             &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
         )
         .await;
-    if cfg!(target_os = "macos") || !has_authoritative_worktree_owner() {
+    if cfg!(target_os = "macos") || !cleanup_is_safe {
         assert!(
-            result.is_error
-                && (result.output.contains("may still be running")
-                    || result.output.contains("unavailable on macOS")),
+            result.is_error && checkout.exists() && exe.in_worktree_session(),
             "{result:?}"
         );
+        if cfg!(target_os = "macos") {
+            assert!(result.output.contains("unavailable on macOS"), "{result:?}");
+        }
         let kept = exe
             .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
             .await;
         assert!(!kept.is_error, "{kept:?}");
     } else {
-        assert!(!result.is_error, "{result:?}");
+        assert!(!result.is_error && !checkout.exists(), "{result:?}");
     }
     assert!(!exe.in_worktree_session());
     if checkout.exists() {
@@ -526,6 +530,16 @@ async fn checkout_hook_child_does_not_block_keeping_worktree() {
         .await;
     assert!(!entered.is_error, "{entered:?}");
     let checkout = exe.get_worktree_session().unwrap().worktree_path;
+    assert_eq!(
+        astra_tools::workspace_observation::workspace_observation_is_quarantined(&checkout),
+        Some(true),
+        "a checkout hook with weak process ownership cannot authorize cleanup"
+    );
+    assert_eq!(
+        astra_tools::workspace_observation::workspace_ownership_is_unsettled(&checkout),
+        Some(false),
+        "a weak receipt must still allow the user to work in the checkout"
+    );
     let pid: i32 = std::fs::read_to_string(checkout.join(".hook-child.pid"))
         .unwrap()
         .parse()

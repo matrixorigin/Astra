@@ -10,7 +10,7 @@ pub use git::{GitWorkspaceObservationError, observe_git_worktree_revision};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -268,8 +268,8 @@ fn ownership_unsettled_marker_exists(key: &Path) -> bool {
     }
 }
 
-/// An alias refers to the same incident in the canonical workspace marker.
-/// Only a confirmed canonical incident can make that reference inactive.
+/// Aliases share the incident file, so only confirmation of this exact
+/// incident can make an alias inactive, even if a marker directory is replaced.
 fn cleared_alias_incident(entry: &fs::DirEntry, own_digest: &str) -> bool {
     if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
         return false;
@@ -278,29 +278,86 @@ fn cleared_alias_incident(entry: &fs::DirEntry, own_digest: &str) -> bool {
     let Some(filename) = filename.to_str() else {
         return false;
     };
-    let Some((canonical_digest, id)) = filename.split_once('_') else {
+    let Some((canonical_digest, _)) = incident_identity(filename) else {
         return false;
     };
-    if canonical_digest.len() != 64
-        || !canonical_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        || canonical_digest == own_digest
+    if canonical_digest == own_digest {
+        return false;
+    }
+    read_incident(&entry.path()).is_ok_and(|state| state == b'C')
+}
+
+fn incident_identity(name: &str) -> Option<(&str, u32)> {
+    let (digest, rest) = name.split_once('_')?;
+    let (owner, id) = rest.split_once('_')?;
+    if digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         || uuid::Uuid::parse_str(id).is_err()
     {
-        return false;
+        return None;
     }
-    let Some(root) = stable_coordination_root() else {
-        return false;
-    };
-    let canonical = root.join(format!(
-        ".astra-workspace-{canonical_digest}-observation.unsettled"
-    ));
-    if !fs::symlink_metadata(&canonical).is_ok_and(|metadata| metadata.is_dir()) {
-        return false;
+    Some((digest, owner.parse().ok()?))
+}
+
+fn open_incident(path: &Path, write: bool) -> std::io::Result<(fs::File, u8)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid workspace incident",
+            )
+        })?;
+    let (_, owner) = incident_identity(name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid workspace incident",
+        )
+    })?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    matches!(fs::symlink_metadata(canonical.join(filename)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-        && fs::symlink_metadata(canonical.join(".cleared")).is_ok_and(|metadata| metadata.is_file())
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != name.len() as u64 + 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid workspace incident",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o022 != 0
+            || metadata.uid() != owner
+            || (write && metadata.uid() != unsafe { libc::geteuid() })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "workspace incident is not owned by this user",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    let mut contents = vec![0; name.len() + 1];
+    file.read_exact(&mut contents)?;
+    if !matches!(contents[0], b'U' | b'C') || &contents[1..] != name.as_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workspace incident identity does not match",
+        ));
+    }
+    Ok((file, contents[0]))
+}
+
+fn read_incident(path: &Path) -> std::io::Result<u8> {
+    open_incident(path, false).map(|(_, state)| state)
 }
 
 fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: &[PathBuf]) {
@@ -326,18 +383,27 @@ fn persist_ownership_unsettled_markers(keys: &[PathBuf]) -> bool {
     // The same incident is published for every spelling. Alias markers can
     // then follow the canonical incident across processes and confirmations.
     let id = uuid::Uuid::new_v4().to_string();
-    let incident = format!("{}_{id}", coordination_key_digest(canonical));
-    let canonical_persisted = persist_ownership_marker(canonical, &incident);
-    // If the canonical marker failed, an alias must remain independently
-    // fenced instead of referring to an incident that was never published.
-    let alias_incident = if canonical_persisted { &incident } else { &id };
+    #[cfg(unix)]
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let owner = 0;
+    let incident = format!("{}_{owner}_{id}", coordination_key_digest(canonical));
+    let canonical_persisted = persist_ownership_marker(canonical, &incident, None);
+    let source = ownership_unsettled_marker_path(canonical).map(|path| path.join(&incident));
     // Try every alias even if an earlier write failed.
     keys.iter().skip(1).fold(canonical_persisted, |all, key| {
-        persist_ownership_marker(key, alias_incident) && all
+        let linked =
+            canonical_persisted && persist_ownership_marker(key, &incident, source.as_deref());
+        if !linked {
+            // An independent unresolved marker still fences this alias if a
+            // hard link could not be published.
+            let _ = persist_ownership_marker(key, &incident, None);
+        }
+        linked && all
     })
 }
 
-fn persist_ownership_marker(key: &Path, incident: &str) -> bool {
+fn persist_ownership_marker(key: &Path, incident: &str, source: Option<&Path>) -> bool {
     let Some(path) = ownership_unsettled_marker_path(key) else {
         return false;
     };
@@ -352,7 +418,7 @@ fn persist_ownership_marker(key: &Path, incident: &str) -> bool {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&stage, fs::Permissions::from_mode(0o1777))?;
             }
-            create_unsettled_incident(&stage, incident)?;
+            create_unsettled_incident(&stage, incident, source)?;
             fs::rename(&stage, &path)
         })();
         if initialized.is_ok() {
@@ -362,15 +428,32 @@ fn persist_ownership_marker(key: &Path, incident: &str) -> bool {
         let _ = fs::remove_dir(stage);
     }
     fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
-        && create_unsettled_incident(&path, incident).is_ok()
+        && create_unsettled_incident(&path, incident, source).is_ok()
 }
 
-fn create_unsettled_incident(directory: &Path, incident: &str) -> std::io::Result<()> {
+fn create_unsettled_incident(
+    directory: &Path,
+    incident: &str,
+    source: Option<&Path>,
+) -> std::io::Result<()> {
+    if let Some(source) = source {
+        return fs::hard_link(source, directory.join(incident));
+    }
     let mut options = fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
-    options.open(directory.join(incident))?.sync_all()
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(directory.join(incident))?;
+    file.write_all(b"U")?;
+    file.write_all(incident.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Alias readers on another UID must be able to validate completion,
+        // even if the creator's umask normally makes files private.
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    file.sync_all()
 }
 
 /// Resolve a stable binding key even when an invocation has removed or
@@ -1816,6 +1899,10 @@ impl WorkspacePathIdentity {
         let Ok(metadata) = fs::symlink_metadata(&self.path) else {
             return false;
         };
+        self.matches_metadata(&metadata)
+    }
+
+    fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -2476,7 +2563,7 @@ pub struct WorkspaceRecovery {
 struct UnsettledMarkerSnapshot {
     path: PathBuf,
     identity: Option<WorkspacePathIdentity>,
-    incidents: Vec<std::ffi::OsString>,
+    incidents: Vec<WorkspacePathIdentity>,
 }
 
 impl WorkspaceRecovery {
@@ -2514,6 +2601,7 @@ impl WorkspaceRecovery {
             {
                 return Err("workspace changed during confirmation; retry".into());
             }
+            let canonical_digest = coordination_key_digest(&binding.canonical);
             for marker in &markers {
                 let Some(identity) = &marker.identity else {
                     if fs::symlink_metadata(&marker.path).is_ok() {
@@ -2536,7 +2624,33 @@ impl WorkspaceRecovery {
                     Err(error) => return Err(format!("could not clear workspace fence: {error}")),
                 }
                 for incident in &marker.incidents {
-                    match fs::remove_file(marker.path.join(incident)) {
+                    let name = incident.path.file_name().and_then(|name| name.to_str());
+                    let Some((digest, _)) = name.and_then(incident_identity) else {
+                        return Err("invalid workspace incident".into());
+                    };
+                    // A retargeted alias may still refer to a different
+                    // workspace. Confirming this workspace cannot settle it.
+                    if digest != canonical_digest {
+                        continue;
+                    }
+                    if !incident.is_unchanged() {
+                        return Err("workspace activity changed during confirmation; retry".into());
+                    }
+                    let (mut file, _) = open_incident(&incident.path, true).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::PermissionDenied {
+                            "The system user who started the earlier work must confirm it stopped, or ask the host administrator for help.".to_string()
+                        } else {
+                            format!("could not confirm workspace incident: {error}")
+                        }
+                    })?;
+                    if !incident.matches_metadata(&file.metadata().map_err(|error| error.to_string())?) {
+                        return Err("workspace activity changed during confirmation; retry".into());
+                    }
+                    file.seek(SeekFrom::Start(0)).and_then(|_| file.write_all(b"C")).and_then(|_| file.sync_all()).map_err(|error| format!("could not confirm workspace incident: {error}"))?;
+                    if !incident.is_unchanged() {
+                        return Err("workspace activity changed during confirmation; retry".into());
+                    }
+                    match fs::remove_file(&incident.path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -2635,7 +2749,10 @@ fn snapshot_unsettled_marker(path: PathBuf) -> Result<UnsettledMarkerSnapshot, S
         .map_err(|error| format!("cannot read workspace fence: {error}"))?
         .filter_map(|entry| match entry {
             Ok(entry) if entry.file_name() == ".cleared" => None,
-            Ok(entry) => Some(Ok(entry.file_name())),
+            Ok(entry) => Some(
+                WorkspacePathIdentity::capture(entry.path())
+                    .ok_or_else(|| "workspace incident changed during recovery".to_string()),
+            ),
             Err(error) => Some(Err(format!("cannot read workspace fence: {error}"))),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -6056,6 +6173,19 @@ mod tests {
         assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
         confirm_workspace_stopped(&replacement).await.unwrap();
         check_in_child();
+
+        // Confirming the new target first must not settle the old target.
+        fs::remove_file(&alias).unwrap();
+        symlink(&root, &alias).unwrap();
+        mark_in_child();
+        fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        mark_in_child();
+        confirm_workspace_stopped(&replacement).await.unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&root), Some(true));
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
+        confirm_workspace_stopped(&root).await.unwrap();
+        check_in_child();
     }
 
     #[cfg(unix)]
@@ -6094,6 +6224,31 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn unrelated_confirmation_cannot_release_an_alias_after_marker_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let alias = parent.path().join("alias");
+        symlink(&root, &alias).unwrap();
+
+        assert!(mark_workspace_observation_unsettled(&alias));
+        fs::remove_dir_all(ownership_unsettled_marker_path(&root).unwrap()).unwrap();
+        assert!(persist_ownership_unsettled_markers(std::slice::from_ref(
+            &root
+        )));
+        confirm_workspace_stopped(&root).await.unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(true));
+
+        // Explicit confirmation through the surviving alias still recovers it.
+        confirm_workspace_stopped(&alias).await.unwrap();
+        assert_eq!(workspace_ownership_is_unsettled(&alias), Some(false));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn malformed_alias_incident_stays_fenced() {
         let temp = tempfile::tempdir().unwrap();
@@ -6118,6 +6273,48 @@ mod tests {
         fs::create_dir(&incident).unwrap();
         assert!(ownership_unsettled_marker_exists(&alias));
         fs::remove_dir_all(canonical_marker).unwrap();
+        fs::remove_dir_all(alias_marker).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_or_foreign_incident_cannot_forge_alias_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical");
+        let alias = temp.path().join("alias");
+        let canonical_marker = ownership_unsettled_marker_path(&canonical).unwrap();
+        let alias_marker = ownership_unsettled_marker_path(&alias).unwrap();
+        assert!(persist_ownership_unsettled_markers(&[
+            canonical,
+            alias.clone()
+        ]));
+        let alias_file = fs::read_dir(&alias_marker)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let expected_name = alias_file.file_name().unwrap().to_str().unwrap();
+        let (digest, owner) = incident_identity(expected_name).unwrap();
+
+        // A confirmed file for another incident must not be reusable by renaming.
+        let other_name = format!("{digest}_{owner}_{}", uuid::Uuid::new_v4());
+        let other = temp.path().join(&other_name);
+        fs::write(&other, format!("C{other_name}")).unwrap();
+        fs::remove_file(&alias_file).unwrap();
+        fs::hard_link(&other, &alias_file).unwrap();
+        fs::remove_dir_all(&canonical_marker).unwrap();
+        assert!(ownership_unsettled_marker_exists(&alias));
+
+        // A different UID cannot pre-create a completed record for this UID.
+        let foreign_name = format!(
+            "{digest}_{}_{}",
+            owner.wrapping_add(1),
+            uuid::Uuid::new_v4()
+        );
+        let foreign_file = alias_marker.join(&foreign_name);
+        fs::write(&foreign_file, format!("C{foreign_name}")).unwrap();
+        assert!(read_incident(&foreign_file).is_err());
         fs::remove_dir_all(alias_marker).unwrap();
     }
 

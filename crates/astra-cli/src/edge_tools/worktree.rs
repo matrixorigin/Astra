@@ -15,6 +15,23 @@ pub(super) fn workspace_safe_for_cleanup(path: &Path) -> bool {
             == Some(false)
 }
 
+// Checkout hooks run in the new worktree, so their ownership applies there
+// as well as to the repository where `git worktree add` was invoked.
+fn record_checkout_ownership(path: &Path, ownership: Option<astra_sandbox::ScopeOwnership>) {
+    match ownership {
+        None => {
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(path);
+        }
+        Some(owner) if !owner.is_authoritative() => {
+            astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                path,
+                Some(owner.as_str()),
+            );
+        }
+        Some(_) => {}
+    }
+}
+
 #[derive(Debug)]
 enum WorktreeError {
     Domain(String),
@@ -298,9 +315,14 @@ fn count_worktree_changes(
 }
 
 fn ensure_worktree_index_is_visible(worktree_path: &Path) -> Result<(), WorktreeError> {
-    let output =
-        astra_tools::git_gix::inspect_bound_git_worktree(worktree_path, &["ls-files", "-v", "-z"])?;
-    if !output.status.success() || !output.stderr.is_empty() {
+    let mut command = astra_tools::git_gix::prepare_bound_git_command(worktree_path)
+        .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?;
+    let mut index = IndexVisibility::default();
+    let output = command
+        .args(["ls-files", "-v", "-z"])
+        .output_with_stdout(&mut |chunk| index.feed(chunk))
+        .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
+    if !output.status.success() || !output.stderr.is_empty() || !index.complete() {
         return Err(astra_tools::git_gix::GitProcessError::Exit(
             "failed to inspect the worktree index".to_string(),
         )
@@ -308,12 +330,45 @@ fn ensure_worktree_index_is_visible(worktree_path: &Path) -> Result<(), Worktree
     }
     // Git status ignores paths marked assume-unchanged or skip-worktree, so a
     // clean status cannot establish that removing their files is safe.
-    if output.stdout.split(|byte| *byte == 0).any(|entry| {
-        entry.len() >= 2 && entry[1] == b' ' && (entry[0].is_ascii_lowercase() || entry[0] == b'S')
-    }) {
+    if index.hidden {
         return Err("Git skips checking some tracked files in this worktree; they may contain changes. Inspect them before setting discard_changes=true, or use exit_action=keep.".into());
     }
     Ok(())
+}
+
+/// `git ls-files -v -z` emits a tag, space, path and NUL for each entry.
+/// Paths may contain arbitrary bytes, and need not be retained.
+#[derive(Default)]
+struct IndexVisibility {
+    position: u8,
+    hidden: bool,
+    invalid: bool,
+}
+
+impl IndexVisibility {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.position {
+                0 if matches!(
+                    byte.to_ascii_uppercase(),
+                    b'H' | b'S' | b'M' | b'R' | b'C' | b'K' | b'?'
+                ) =>
+                {
+                    self.hidden |= byte.is_ascii_lowercase() || byte == b'S';
+                    self.position = 1;
+                }
+                1 if byte == b' ' => self.position = 2,
+                2 if byte != 0 => self.position = 3,
+                3 if byte == 0 => self.position = 0,
+                3 => {}
+                _ => self.invalid = true,
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        !self.invalid && self.position == 0
+    }
 }
 
 impl ToolExecutor {
@@ -657,12 +712,13 @@ impl ToolExecutor {
             command.args(["worktree", "add", "-b", branch]);
             command.arg(&path).arg(&original_head);
             let output = match command.output_with_ownership() {
-                Ok(output) => output,
+                Ok(output) => {
+                    record_checkout_ownership(&path, output.ownership);
+                    output
+                }
                 Err(error) => {
-                    if error.started && error.ownership.is_none() {
-                        astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                            &path,
-                        );
+                    if error.started {
+                        record_checkout_ownership(&path, error.ownership);
                     }
                     return Err(astra_tools::git_gix::GitProcessError::Execution(error).into());
                 }
@@ -978,8 +1034,69 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_worktree_changes, ensure_worktree_index_is_visible};
+    use super::{IndexVisibility, count_worktree_changes, ensure_worktree_index_is_visible};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{record_checkout_ownership, workspace_safe_for_cleanup};
     use std::process::Command;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn weak_checkout_ownership_allows_work_but_not_cleanup_until_confirmed() {
+        use serde_json::json;
+
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let executor = super::ToolExecutor::new(repo.path());
+        let entered = executor
+            .execute_with_metadata(
+                "worktree",
+                &json!({"action":"enter", "branch":"weak-owner"}),
+            )
+            .await;
+        assert!(!entered.is_error, "{entered:?}");
+        let checkout = executor.get_worktree_session().unwrap().worktree_path;
+        astra_tools::workspace_observation::confirm_workspace_stopped(&checkout)
+            .await
+            .unwrap();
+        assert!(workspace_safe_for_cleanup(&checkout));
+        record_checkout_ownership(
+            &checkout,
+            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
+        );
+        assert_eq!(
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(&checkout),
+            Some(false)
+        );
+        assert!(!workspace_safe_for_cleanup(&checkout));
+        let written = executor
+            .execute_with_metadata("write_file", &json!({"path":"kept.txt", "content":"keep"}))
+            .await;
+        assert!(!written.is_error, "{written:?}");
+        if !cfg!(target_os = "macos") {
+            let refused = executor
+                .execute_with_metadata(
+                    "worktree",
+                    &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+                )
+                .await;
+            assert!(
+                refused.is_error && refused.output.contains("may still be running"),
+                "{refused:?}"
+            );
+            assert!(checkout.exists() && executor.in_worktree_session());
+        }
+        astra_tools::workspace_observation::confirm_workspace_stopped(&checkout)
+            .await
+            .unwrap();
+        assert!(workspace_safe_for_cleanup(&checkout));
+        let kept = executor
+            .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+            .await;
+        assert!(!kept.is_error, "{kept:?}");
+        crate::edge_tools::tests::worktree_tests::remove_preserved_test_worktree(
+            repo.path(),
+            &checkout,
+        );
+    }
 
     #[test]
     fn cleanup_inspection_does_not_trust_hidden_git_index_flags() {
@@ -1012,5 +1129,88 @@ mod tests {
             files, 1,
             "untracked directories must stay visible without expanding each file"
         );
+    }
+
+    #[test]
+    fn index_visibility_handles_fragmented_and_non_utf8_names() {
+        let mut index = IndexVisibility::default();
+        for chunk in [&b"H "[..], &b"a\xff\n\0s"[..], &b" hidden\0"[..]] {
+            index.feed(chunk);
+        }
+        assert!(index.complete());
+        assert!(index.hidden);
+        for incomplete in [
+            &b"H name"[..],
+            &b"H \0"[..],
+            &b"Hname\0"[..],
+            &b"X name\0"[..],
+        ] {
+            let mut index = IndexVisibility::default();
+            index.feed(incomplete);
+            assert!(!index.complete());
+        }
+    }
+
+    #[test]
+    fn index_inspection_streams_beyond_the_capture_limit() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let hash = Command::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD:tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        let mut update = Command::new("git")
+            .current_dir(repo.path())
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = update.stdin.take().unwrap();
+        let directory = format!("{}/", "d".repeat(80)).repeat(10);
+        for index in 0..21_000 {
+            write!(input, "100644 {}\t{directory}{index:05}\0", hash.trim()).unwrap();
+        }
+        drop(input);
+        assert!(update.wait().unwrap().success());
+        let mut listing = Command::new("git")
+            .current_dir(repo.path())
+            .args(["ls-files", "-v", "-z"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let bytes =
+            std::io::copy(&mut listing.stdout.take().unwrap(), &mut std::io::sink()).unwrap();
+        assert!(listing.wait().unwrap().success());
+        assert!(bytes > 16 * 1024 * 1024);
+        assert!(ensure_worktree_index_is_visible(repo.path()).is_ok());
+
+        let last = format!("{directory}20999");
+        for (set, clear) in [
+            ("--skip-worktree", "--no-skip-worktree"),
+            ("--assume-unchanged", "--no-assume-unchanged"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["update-index", set, "--", &last])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(ensure_worktree_index_is_visible(repo.path()).is_err());
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["update-index", clear, "--", &last])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 }
