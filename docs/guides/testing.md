@@ -50,6 +50,24 @@ root and workspace ancestors, and checks pinned Bash execution, source inspectio
 and rejection of outside-workspace access. It fails if Landlock is unavailable;
 ordinary offline runs leave this kernel-specific test ignored.
 
+The 1000-viewer Work observer load probe is opt-in. Ordinary CLI unit tests
+retain the functional observer cases; the load probe opens thousands of sockets
+in one process and requires a soft file-descriptor limit of at least 8192.
+Run it from the repository root:
+
+```bash
+(
+  ulimit -Sn 8192 || exit 1
+  cargo test --locked -p astra-cli --lib \
+    tui::plan_task_observer::tests::thousand_observers_reconcile_missed_changes_without_two_second_polling \
+    -- --ignored --exact --nocapture --test-threads=1
+)
+```
+
+The subshell fails before Cargo starts if it cannot establish the FD limit and
+leaves the parent shell's limits unchanged. This probe uses a local mock HTTP
+server and needs no database or provider credentials.
+
 MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
 `make test-offline` builds this fixture before the workspace tests. For direct
 `cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run

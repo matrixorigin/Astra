@@ -1415,6 +1415,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "1000-viewer load probe; requires FD limit >= 8192; see docs/guides/testing.md"]
     async fn thousand_observers_reconcile_missed_changes_without_two_second_polling() {
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
