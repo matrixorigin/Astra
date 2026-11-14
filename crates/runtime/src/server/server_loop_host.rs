@@ -10373,11 +10373,9 @@ impl ServerAgenticLoopHost {
             .and_then(Value::as_str)
             .expect("validated provider Work carrier has an id")
             .to_string();
-        // Keep the exact physical call as the handoff latch until a successful
-        // typed receipt arrives. If the handler returns an error, the next
-        // provider round is unable to complete or execute a sibling effect:
-        // the common lifecycle path emits at most one fresh-id retry of this
-        // carrier.
+        // Retain the exact carrier until its outcome is known. A definite
+        // pre-mutation argument rejection returns control to the model;
+        // ambiguous failures retain the bounded exact-operation replay.
         self.pending_work_establishment = Some(PendingWorkEstablishment {
             call: explicit_call.clone(),
             call_id,
@@ -10495,19 +10493,36 @@ impl ServerAgenticLoopHost {
         admission.admitted = retained;
     }
 
-    /// Complete the semantic-to-lifecycle handoff only after the exact
-    /// host- or provider-selected call has a successful executed receipt. Binding alone is
-    /// insufficient: `start_work` installs the binding before initial graph
-    /// proposal/dispatch, so a later handler error must remain retryable.
-    /// Likewise, a name-only record cannot settle the handoff; the provider
-    /// call id is the immutable cross-boundary identity.
+    /// Reconcile the exact carrier's outcome. An unadmitted argument rejection
+    /// retires only that invalid proposal; the model must submit a corrected
+    /// call through ordinary admission. Once an operation is admitted or Work
+    /// is bound, retain its recovery authority until a successful receipt.
     fn reconcile_pending_work_establishment(&mut self, state: &AgenticLoopState) -> bool {
         let Some(pending) = self.pending_work_establishment.as_ref() else {
             return false;
         };
+        let work_bound = self.work_binding_evidence_for_recovery(state);
         if pending.control == WorkEstablishmentCarrierControl::Establish
-            && !self.work_binding_evidence_for_recovery(state)
+            && pending.operation_id.is_none()
+            && !work_bound
+            && state.stall.tool_call_records.iter().any(|record| {
+                record.tool_call_id.as_deref() == Some(pending.call_id.as_str())
+                    && record.name == "start_work"
+                    && !record.ok
+                    && record.error_kind == Some(astra_core::ErrorKind::ToolInvalidArgs)
+                    && record.disposition
+                        == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+            })
         {
+            tracing::info!(
+                target: "astra::work",
+                call_id = %pending.call_id,
+                "retiring an unadmitted Work carrier rejected before execution"
+            );
+            self.pending_work_establishment = None;
+            return false;
+        }
+        if pending.control == WorkEstablishmentCarrierControl::Establish && !work_bound {
             return false;
         }
         let settled = state.stall.tool_call_records.iter().any(|record| {
@@ -11360,18 +11375,13 @@ impl ServerAgenticLoopHost {
         self.apply_classified_work_admission(assessment);
     }
 
-    fn reconcile_work_boundary_after_provider(
-        &mut self,
-        state: &mut AgenticLoopState,
-        provider_tool_calls: &[Value],
-    ) {
+    fn reconcile_work_establishment_outcome(&mut self, state: &mut AgenticLoopState) {
         // A terminal receipt is an already-committed fact and therefore wins
         // over a newer control proposal. Only an operation that remains
         // pending after exact receipt reconciliation may be deferred.
         if self.reconcile_pending_work_establishment(state) {
             self.close_current_turn_effect_obligation_after_work_defer(state);
         }
-        self.reconcile_work_activation_from_primary(state, provider_tool_calls);
     }
 
     fn canonical_work_establishment_retry_preamble(retry_count: u32) -> Value {
@@ -22596,6 +22606,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 self.abort_pending_work_admission().await;
             }
         }
+        // Consume the previous carrier's exact outcome before selecting a new
+        // provider proposal, so a known-invalid call cannot overwrite its correction.
+        self.reconcile_work_establishment_outcome(state);
         // A provider-selected `start_work` is a typed payload, not user
         // authorization. Settle available semantic admission first, retaining
         // the carrier on Required or no usable result. Reliable NotRequired
@@ -22662,11 +22675,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // selection digest and the next invoke_tool admission agree.
             self.refresh_executor_deferred_projection_after_admission(&final_tools, state);
         }
-        // Consume the exact outcome of an already-issued carrier before
-        // admitting or hydrating anything. Reinstalling an Existing operation
-        // here would replace its call identity and reset the bounded retry
-        // counter before reconciliation could observe success or failure.
-        self.reconcile_work_boundary_after_provider(state, &logical_provider_tool_calls);
+        // Reconcile new activation proposals against the remaining pending
+        // operation before admission or hydration can change its authority.
+        self.reconcile_work_activation_from_primary(state, &logical_provider_tool_calls);
         if let Some(carrier) = self
             .pending_work_establishment
             .as_ref()
@@ -44544,6 +44555,137 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn work_input_rejection_releases_only_an_exact_unadmitted_carrier() {
+        use WorkEstablishmentCarrierControl::{DeferPending, Establish};
+        use astra_core::ErrorKind;
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+        for (disposition, kind, operation, bound, receipt_id, control, released) in [
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                false,
+                "invalid-work",
+                Establish,
+                true,
+            ),
+            (
+                ToolCallDisposition::Executed,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                false,
+                "invalid-work",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Unknown,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                false,
+                "invalid-work",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolUnavailable,
+                None,
+                false,
+                "invalid-work",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolInvalidArgs,
+                Some("admitted-op"),
+                false,
+                "invalid-work",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                true,
+                "invalid-work",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                false,
+                "other-call",
+                Establish,
+                false,
+            ),
+            (
+                ToolCallDisposition::Rejected,
+                ErrorKind::ToolInvalidArgs,
+                None,
+                false,
+                "invalid-work",
+                DeferPending,
+                false,
+            ),
+        ] {
+            let mut host =
+                test_host_builder("input-recovery-owner", "input-recovery-session").build();
+            let mut state = create_test_state();
+            state.turn_intent = Some(
+                astra_config::user_profile::TurnIntent::default()
+                    .with_work_lifecycle(WorkLifecycleIntent::Required),
+            );
+            host.initial_work_planning_bound = bound;
+            host.pending_work_establishment = Some(PendingWorkEstablishment {
+                call: json!({"id":"invalid-work","type":"function","function":{"name":"start_work","arguments":"{}"}}),
+                call_id: "invalid-work".into(),
+                operation_id: operation.map(str::to_string),
+                activation: astra_services::work::WorkEstablishmentActivation::Start,
+                control,
+                attempts: 1,
+            });
+            state.stall.tool_call_records.push(ToolCallRecord {
+                tool_call_id: Some(receipt_id.into()),
+                name: "start_work".into(),
+                ok: false,
+                disposition: Some(disposition),
+                error_kind: Some(kind),
+                ..Default::default()
+            });
+            host.reconcile_work_establishment_outcome(&mut state);
+            assert_eq!(
+                host.pending_work_establishment.is_none(),
+                released,
+                "{disposition:?} {kind:?} {operation:?} bound={bound} {receipt_id} {control:?}"
+            );
+            if released {
+                assert!(
+                    host.canonical_work_establishment_pending(&state),
+                    "rejecting a proposal must preserve the required Work policy"
+                );
+                let corrected = json!({"id":"corrected-work","type":"function","function":{
+                    "name":"start_work",
+                    "arguments":json!({"activation":"start","goal":"Observe","tasks":[{"objective":"Observe","expected_result":"One observation"}]}).to_string()
+                }});
+                host.prefer_explicit_work_carrier_for_state(
+                    &state,
+                    std::slice::from_ref(&corrected),
+                )
+                .await;
+                assert_eq!(
+                    host.take_admitted_work_establishment_call(&state),
+                    Some(corrected)
+                );
+            }
+        }
+    }
+
     #[test]
     fn work_admission_is_committed_only_by_exact_successful_establishment_receipt() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -45906,7 +46048,8 @@ mod tests {
                 ..Default::default()
             });
 
-        host.reconcile_work_boundary_after_provider(&mut state, &[]);
+        host.reconcile_work_establishment_outcome(&mut state);
+        host.reconcile_work_activation_from_primary(&mut state, &[]);
 
         assert!(host.pending_work_establishment.is_none());
         assert_eq!(
@@ -46689,7 +46832,8 @@ mod tests {
             }
         });
 
-        host.reconcile_work_boundary_after_provider(&mut state, &[new_defer]);
+        host.reconcile_work_establishment_outcome(&mut state);
+        host.reconcile_work_activation_from_primary(&mut state, &[new_defer]);
 
         assert!(host.pending_work_establishment.is_none());
     }

@@ -17,6 +17,9 @@ mod skill_ledger_tests;
 
 #[path = "provider_rejection_tests.rs"]
 mod provider_rejection_tests;
+
+#[path = "work_input_recovery_tests.rs"]
+mod work_input_recovery_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1868,6 +1871,36 @@ async fn provider_overflow_recovers_unique_history_through_authorized_artifact()
     exercise_primary_attempt_continuation(ContinuationFixture::ContextWindowRecovered).await;
 }
 
+fn native_work_provider_response(
+    request: &Value,
+    prompt_tokens: u64,
+    message: Value,
+) -> axum::response::Response {
+    use axum::{Json, response::IntoResponse};
+    let reason = if message.get("tool_calls").is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    if request["stream"].as_bool() == Some(true) {
+        let mut delta = message.clone();
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = json!(index);
+            }
+        }
+        let chunk = json!({"choices":[{"index":0,"delta":delta}]});
+        let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}});
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    } else {
+        Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}})).into_response()
+    }
+}
+
 async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     let through_new_turn = !matches!(fixture, ContinuationFixture::Direct);
     use astra_services::work::{
@@ -2314,7 +2347,7 @@ async fn exercise_primary_continuation_entry(
                         .any(|tool| tool["function"]["name"] == "run_next_work_item"),
                     "explicit continuation remains discoverable"
                 );
-                return provider_response(
+                return native_work_provider_response(
                     &request,
                     prompt_tokens,
                     json!({"role":"assistant","content":null,"tool_calls":[{
@@ -2380,35 +2413,7 @@ async fn exercise_primary_continuation_entry(
                 json!({"role":"assistant","content":"Review delivered."})
             }
         };
-        provider_response(&request, prompt_tokens, message)
-    }
-    fn provider_response(
-        request: &Value,
-        prompt_tokens: u64,
-        message: Value,
-    ) -> axum::response::Response {
-        let reason = if message.get("tool_calls").is_some() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        if request["stream"].as_bool() == Some(true) {
-            let mut delta = message.clone();
-            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                for (index, call) in calls.iter_mut().enumerate() {
-                    call["index"] = json!(index);
-                }
-            }
-            let chunk = json!({"choices":[{"index":0,"delta":delta}]});
-            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}});
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
-            )
-                .into_response()
-        } else {
-            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}})).into_response()
-        }
+        native_work_provider_response(&request, prompt_tokens, message)
     }
     let observations = Arc::new(TokioMutex::new(Vec::new()));
     let settlements = Arc::new(AtomicUsize::new(0));

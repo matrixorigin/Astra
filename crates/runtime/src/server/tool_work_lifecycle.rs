@@ -972,6 +972,18 @@ fn binding_matches_establishment_operation(
         && binding.branch_id == request.branch_id
 }
 
+/// Only the argument owner can attest that no Work mutation was attempted.
+fn invalid_start_work_input(message: impl Into<String>) -> ToolResult {
+    ToolResult::error(message.into())
+        .with_failure_evidence(astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ToolFailureCause::InvalidArguments,
+            false,
+            vec![astra_core::ToolRecoveryAction::CorrectArguments],
+        ))
+        .with_execution_not_started()
+}
+
 pub(super) async fn execute_start_work(
     executor: &RuntimeToolExecutor,
     args: &Value,
@@ -979,19 +991,21 @@ pub(super) async fn execute_start_work(
 ) -> ToolResult {
     let args: StartWorkArgs = match serde_json::from_value(args.clone()) {
         Ok(args) => args,
-        Err(error) => return ToolResult::error(format!("Invalid start_work input: {error}")),
+        Err(error) => {
+            return invalid_start_work_input(format!("Invalid start_work input: {error}"));
+        }
     };
     if args.tasks.is_empty() || args.tasks.len() > 8 {
-        return ToolResult::error(
-            "start_work task list exceeds the bounded lifecycle contract".to_string(),
+        return invalid_start_work_input(
+            "start_work task list exceeds the bounded lifecycle contract",
         );
     }
     if let Err(message) = validate_initial_task_list(&args.tasks) {
-        return ToolResult::error(message.to_string());
+        return invalid_start_work_input(message);
     }
     let (mut initial_items, initial_dependencies) = match compile_initial_task_graph(&args.tasks) {
         Ok(graph) => graph,
-        Err(error) => return ToolResult::error(error),
+        Err(error) => return invalid_start_work_input(error),
     };
     let activation = args.activation;
     let Some(run_id) = invocation.run_id.map(str::trim).filter(|id| !id.is_empty()) else {
@@ -1038,7 +1052,7 @@ pub(super) async fn execute_start_work(
     };
     let mut creation = match super::work_handlers::derive_work_creation(&owner_id, request) {
         Ok(creation) => creation,
-        Err(_) => return ToolResult::error("start_work goal is invalid or too large".to_string()),
+        Err(_) => return invalid_start_work_input("start_work goal is invalid or too large"),
     };
     let repository = astra_services::work::DatabaseWorkRepository::new(pool.clone());
     // Resolve an already durable session binding before admitting the
@@ -3006,38 +3020,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_task_list_bounds_fail_before_identity_or_storage_side_effects() {
+    async fn invalid_start_work_input_is_actionable_before_identity_or_storage() {
         let temp = TempDir::new().expect("workspace");
         let executor = RuntimeToolExecutor::new(
             temp.path().to_path_buf(),
-            "owner".to_string(),
-            "session".to_string(),
+            "owner".into(),
+            "session".into(),
             None,
             None,
         );
-        for tasks in [
-            Vec::new(),
-            (0..9)
-                .map(|_| {
-                    json!({
-                        "objective": "Do one bounded thing",
-                        "expected_result": "One verifiable result"
-                    })
-                })
-                .collect(),
+        let task = json!({"objective":"Read one observation","expected_result":"One observation"});
+        for (args, message) in [
+            (
+                json!({"activation":"start","goal":"Observe","tasks":"invalid"}),
+                "Invalid start_work input",
+            ),
+            (
+                json!({"activation":"start","goal":"Observe","tasks":[]}),
+                "bounded lifecycle contract",
+            ),
+            (
+                json!({"activation":"start","goal":"Observe","tasks":vec![task.clone();9]}),
+                "bounded lifecycle contract",
+            ),
+            (
+                json!({"activation":"start","goal":"Observe","tasks":[{"objective":" ","expected_result":"One observation"}]}),
+                "invalid task",
+            ),
+            (
+                json!({"activation":"start","goal":"Observe","tasks":[{"objective":"Observe","expected_result":"One observation","after_initial_tasks":[1]}]}),
+                "cannot depend on itself",
+            ),
         ] {
-            let result = execute_start_work(
-                &executor,
-                &json!({
-                    "goal": "Track a bounded goal",
-                    "activation": "start",
-                    "tasks": tasks
-                }),
-                ToolInvocationMetadata::default(),
-            )
-            .await;
+            let result =
+                execute_start_work(&executor, &args, ToolInvocationMetadata::default()).await;
             assert!(result.is_error);
-            assert!(result.output.contains("bounded lifecycle contract"));
+            assert!(result.output.contains(message), "{}", result.output);
+            let fields = result.metadata.expect("source-owned argument evidence");
+            assert_eq!(
+                fields["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["disposition"], "rejected");
+            let evidence: astra_core::ToolFailureEvidence =
+                serde_json::from_value(fields["recovery_evidence"].clone()).unwrap();
+            assert_eq!(
+                evidence.cause,
+                astra_core::ToolFailureCause::InvalidArguments
+            );
+            assert_eq!(
+                evidence.recovery_actions,
+                vec![astra_core::ToolRecoveryAction::CorrectArguments]
+            );
         }
     }
 
