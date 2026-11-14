@@ -1,9 +1,29 @@
 # Docker Deployment
 
+Docker is the default. Set `ASTRA_CONTAINER_ENGINE=podman` to use native Podman.
+For development, build HEAD with the command below. See
+[container runtimes](../guides/container-runtimes.md) for requirements.
+
 Run Astra with the all-in-one Docker Compose stack.
 
-The guided setup requires a current Docker Compose v2 with `--dry-run` support,
-OpenSSL, and Python 3.9 or newer.
+The guided setup requires OpenSSL and Python 3.9 or newer. The Docker backend
+requires Compose v2 with `--dry-run`; native Podman requires `podman-compose`
+1.6.0 or newer.
+
+## Build from HEAD
+
+For development, build and verify the current checkout:
+
+```bash
+ASTRA_CONTAINER_ENGINE=podman MEMORIA_EMBEDDING_PROVIDER=mock make stack-start-head
+```
+
+This builds the canonical Dockerfile, saves the local image tagged with HEAD's
+full commit SHA in the stack descriptor, and runs the ordinary readiness and
+memory checks. Local source changes are included and recorded in build metadata.
+Later `make stack-up` uses the saved image; rerun `stack-start-head` to rebuild.
+Use `ASTRA_CONTAINER_ENGINE=docker` for Docker. See
+[container runtimes](../guides/container-runtimes.md) for details.
 
 ## Quick Start
 
@@ -143,14 +163,14 @@ docker compose down
 For development, keep dependency services from `make dev-deps-up` and run only the API container:
 
 ```bash
-# Build image
-make dev-api-docker-build
+# Build this checkout's image
+make dev-api-docker-build IMAGE_NAME=localhost/astra IMAGE_TAG=head
 
 # Start MatrixOne + Memoria deps
 make dev-deps-up
 
 # Start API container
-make dev-api-docker-up
+ASTRA_IMAGE=localhost/astra:head make dev-api-docker-up
 
 # Stop API container
 make dev-api-docker-down

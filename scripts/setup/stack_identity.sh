@@ -1,21 +1,13 @@
 # Installation identity, isolation, port, and plan helpers for stack-setup.sh.
 # The caller owns prompting, env-file access, and port probing primitives.
 
-compose_plan_keeps_service() {
-    local plan="$1"
-    if grep -Eq ' (Create|Created|Recreate|Recreated|Remove|Removed)( |$)' <<< "$plan"; then
-        return 1
-    fi
-    grep -Eq ' Container .* Running( |$)' <<< "$plan"
-}
-
 project_name_exists() {
     local name="$1"
-    [[ -n "$(docker ps -a -q --filter "label=com.docker.compose.project=$name" 2>/dev/null)" ]]
+    [[ -n "$(container_run ps -a -q --filter "label=$container_label.project=$name" 2>/dev/null)" ]]
 }
 
 volume_name_exists() {
-    docker volume inspect "$1" >/dev/null 2>&1
+    container_run volume inspect "$1" >/dev/null 2>&1
 }
 
 isolated_stack_env_path() {
@@ -124,6 +116,7 @@ configure_isolated_stack() {
         die "could not copy the existing installation descriptor"
     fi
     if ! set_env_value ASTRA_STACK_NAME "$name" "$temporary_env" ||
+        ! set_env_value ASTRA_CONTAINER_ENGINE "${container_engine:-docker}" "$temporary_env" ||
         ! set_env_value MATRIXONE_DATA_VOLUME "${name}-matrixone-data" "$temporary_env" ||
         ! set_env_value MATRIXONE_LOG_DIR "./data/stacks/${name}/matrixone/logs" "$temporary_env" ||
         ! set_env_value MEMORIA_LOG_DIR "./data/stacks/${name}/memoria/logs" "$temporary_env"; then
@@ -263,11 +256,11 @@ ensure_data_volume_is_not_shared() {
             die "ASTRA_STACK_NAME must start with a lowercase letter or number and contain only lowercase letters, numbers, hyphens, or underscores"
             ;;
     esac
-    if ! docker volume inspect "$volume_name" >/dev/null 2>&1; then
+    if ! container_run volume inspect "$volume_name" >/dev/null 2>&1; then
         return 0
     fi
 
-    owner="$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$volume_name" 2>/dev/null || true)"
+    owner="$(container_run volume inspect --format "{{index .Labels \"$container_label.project\"}}" "$volume_name" 2>/dev/null || true)"
     if [[ "$owner" == "$stack_name" ]]; then
         return 0
     fi

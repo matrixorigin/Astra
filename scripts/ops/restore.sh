@@ -23,22 +23,7 @@ if [ ! -f "${BACKUP_FILE}" ]; then
     exit 1
 fi
 
-# Load .env if present so local dev scripts pick up the same explicit secrets.
-if [ -f .env ]; then
-    set -a; source .env; set +a
-fi
-
-if [ -z "${MATRIXONE_PASSWORD:-}" ]; then
-    echo "❌ Error: MATRIXONE_PASSWORD is required (set it explicitly or source .env)"
-    exit 1
-fi
-
-# Database connection
-DB_HOST="${MATRIXONE_HOST:-localhost}"
-DB_PORT="${MATRIXONE_PORT:-6001}"
-DB_USER="${MATRIXONE_USER:-root}"
-DB_PASSWORD="${MATRIXONE_PASSWORD}"
-DB_NAME="${ASTRA_DATABASE:-astra_runtime}"
+. "$(dirname "${BASH_SOURCE[0]}")/database_runtime.sh"
 
 echo "⚠️  WARNING: This will replace all data in database '${DB_NAME}'"
 echo "   Host: ${DB_HOST}:${DB_PORT}"
@@ -66,33 +51,9 @@ else
     RESTORE_FILE="${BACKUP_FILE}"
 fi
 
-matrixone_container_ids=""
-if command -v docker >/dev/null 2>&1 && \
-   { [ "${DB_HOST}" = "localhost" ] || [ "${DB_HOST}" = "127.0.0.1" ]; }; then
-    matrixone_container_ids="$(docker ps \
-        --filter label=com.docker.compose.service=matrixone \
-        --format '{{.ID}}' 2>/dev/null || true)"
-fi
-matrixone_container_count="$(printf '%s\n' "${matrixone_container_ids}" | sed '/^$/d' | wc -l | tr -d ' ')"
+ops_find_matrixone
 
-# Perform restore
-if [ "${matrixone_container_count}" -eq 1 ]; then
-    echo "   Using local Compose MatrixOne service..."
-    MYSQL_PWD="${DB_PASSWORD}" docker exec -e MYSQL_PWD -i "${matrixone_container_ids}" \
-        mysql -h127.0.0.1 -P6001 -u"${DB_USER}" "${DB_NAME}" < "${RESTORE_FILE}"
-elif [ "${matrixone_container_count}" -gt 1 ]; then
-    echo "Error: multiple local MatrixOne Compose containers found; stop unused stacks." >&2
-    exit 1
-else
-    if ! command -v mysql >/dev/null 2>&1; then
-        echo "Error: mysql is required when no local Compose MatrixOne service is available." >&2
-        exit 1
-    fi
-    echo "   Using local mysql..."
-    MYSQL_PWD="${DB_PASSWORD}" mysql \
-        -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" \
-        "${DB_NAME}" < "${RESTORE_FILE}"
-fi
+ops_database_command mysql "$DB_NAME" < "$RESTORE_FILE"
 
 echo "✅ Restore completed successfully!"
 echo ""

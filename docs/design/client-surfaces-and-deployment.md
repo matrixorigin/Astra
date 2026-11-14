@@ -24,6 +24,13 @@ the committed transcript cursor and item commitment fields to assess publication
 
 ## Deployment responsibilities
 
+Container deployments support Docker by default and explicit native Podman
+through shared deployment tooling. Container engine selection does not change
+Server, CLI, User Runner, or capacity-provider semantics.
+Development container verification builds the current checkout with revision
+and tracked-change metadata, saves the local image selection, and uses the
+same stack lifecycle and readiness checks as configured image deployments.
+
 Deployment may provide:
 
 - cloud API server;

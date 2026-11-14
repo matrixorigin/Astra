@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+unset ASTRA_MYSQL_TLS_MODE
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 client_script="$repo_root/scripts/dev/mysql-client.sh"
@@ -15,6 +16,7 @@ printf '%s\n' \
     '  [[ "${MYSQL_STUB_SUPPORTS_SKIP_SSL:-}" == "1" ]] && printf "%s\\n" "  --skip-ssl"' \
     '  exit 0' \
     'fi' \
+    'printf "%s" "${MYSQL_PWD:-}" >"${ARGS_FILE}.password"' \
     'count_file="${ARGS_FILE}.count"' \
     'count=$(cat "$count_file" 2>/dev/null || printf "0")' \
     'count=$((count + 1))' \
@@ -37,7 +39,7 @@ assert_args() {
     fi
 }
 
-base_args=(--protocol=TCP -hdb.example -P6601 -uuser -psecret)
+base_args=(--protocol=TCP -hdb.example -P6601 -uuser)
 
 ARGS_FILE="$tmp_dir/default.args" \
 MYSQL_STUB_SUPPORTS_SSL_MODE=1 \
@@ -95,7 +97,7 @@ MATRIXONE_PORT=6601 \
 MATRIXONE_USER=user \
 MATRIXONE_PASSWORD=secret \
 "$client_script" -e 'DROP DATABASE test_db'
-assert_args "$tmp_dir/fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser -psecret --ssl-mode=DISABLED -e 'DROP DATABASE test_db'
+assert_args "$tmp_dir/fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser --ssl-mode=DISABLED -e 'DROP DATABASE test_db'
 if [[ $(<"$tmp_dir/fallback.args.count") != 3 ]]; then
     echo "auto TLS fallback must make two probes and one caller request" >&2
     exit 1
@@ -113,7 +115,7 @@ MATRIXONE_PORT=6601 \
 MATRIXONE_USER=user \
 MATRIXONE_PASSWORD=secret \
 "$client_script" -e 'SELECT 1'
-assert_args "$tmp_dir/legacy-fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser -psecret --skip-ssl -e 'SELECT 1'
+assert_args "$tmp_dir/legacy-fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser --skip-ssl -e 'SELECT 1'
 
 if ARGS_FILE="$tmp_dir/unsupported.args" \
     ASTRA_MYSQL_CLIENT="$stub" \
@@ -126,5 +128,18 @@ if ARGS_FILE="$tmp_dir/unsupported.args" \
     echo "expected disabled TLS mode to reject a client with no TLS controls" >&2
     exit 1
 fi
+
+ARGS_FILE="$tmp_dir/legacy-auto.args" \
+ASTRA_MYSQL_CLIENT="$stub" \
+MATRIXONE_HOST=127.0.0.1 MATRIXONE_PORT=6601 MATRIXONE_USER=user MATRIXONE_PASSWORD=secret \
+"$client_script" -e 'SELECT 1'
+assert_args "$tmp_dir/legacy-auto.args.2" --protocol=TCP -h127.0.0.1 -P6601 -uuser -e 'SELECT 1'
+
+for name in default disabled required fallback legacy-fallback legacy-auto; do
+    [[ "$(<"$tmp_dir/$name.args.password")" == secret ]] || {
+        echo "mysql client did not pass credentials through the environment" >&2
+        exit 1
+    }
+done
 
 echo "mysql client TLS option tests passed"
