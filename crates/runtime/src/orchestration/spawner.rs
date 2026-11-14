@@ -7548,7 +7548,7 @@ impl DynamicAgentSpawner {
                 .await
             {
                 return Err(SpawnError::InvalidInput(format!(
-                    "parent run '{}' already used agent_fanout group '{}' with fixed target_count {} (status: {}). Do not call agent(action='spawn') to add, retry, or replace agents in the same turn. Present the fanout results, use agent_fanout(action='get_results', group_id='{}') if needed, or ask the user before starting another fanout.",
+                    "parent run '{}' already used agent_fanout group '{}' with fixed target_count {} (status: {}). Do not call agent(action='spawn') to add, retry, or replace agents in the same turn. Read the fanout results with agent_fanout(action='get_results', group_id='{}') if needed; continue verification directly with permitted parent tools while the work budget remains. Ask the user before starting another fanout.",
                     context.parent_run_id,
                     group.group_id,
                     group.target_count,

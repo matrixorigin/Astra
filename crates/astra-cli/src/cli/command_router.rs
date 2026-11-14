@@ -4137,9 +4137,9 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let mut output = final_json_output(&result, exit_code);
     if partial.server_admission_not_dispatched {
         output["server_admission_not_dispatched"] = serde_json::json!(true);
-        if let Some(kind) = partial.failure_kind {
-            output["error_kind"] = serde_json::json!(kind.as_str());
-        }
+    }
+    if let Some(kind) = partial.failure_kind {
+        output["error_kind"] = serde_json::json!(kind.as_str());
     }
     if let Some(model_item_id) = model_item_id {
         output["model_item_id"] = serde_json::json!(model_item_id);
@@ -4802,6 +4802,23 @@ mod exit_code_tests {
         assert!(output["run_id"].is_null());
         assert_eq!(output["prompt_tokens"], 0);
         assert_eq!(output["tool_calls_count"], 0);
+    }
+
+    #[test]
+    fn post_admission_failure_json_retains_the_typed_cause() {
+        let failure = crate::TurnFailure {
+            error: "[rate_limit] provider limit reached".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::RateLimit),
+                error_code: Some("rate_limit".into()),
+                ..Default::default()
+            },
+        };
+        let output = super::hard_failure_json_output(failure);
+        assert_eq!(output["error_kind"], "rate_limit");
+        assert_eq!(output["error_code"], "rate_limit");
+        assert_eq!(output["exit_code"], 3);
+        assert_eq!(output["success"], false);
     }
 
     fn empty_stream_result() -> StreamResult {

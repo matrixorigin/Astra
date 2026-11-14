@@ -291,7 +291,7 @@ impl DeferredToolInvocationError {
             Self::Malformed => "invoke_tool arguments do not match the carrier contract",
             Self::InvalidArguments(reason) => reason,
             Self::NotActivated => {
-                "invoke_tool target was not selected from this session's deferred catalog"
+                "invoke_tool target is not selected. If it is listed in <deferred-tools>, select it with tool_search(query=\"select:NAME\"), then call invoke_tool with its selected schema."
             }
             Self::ActivationStale => {
                 "invoke_tool target schema changed or is no longer available; select it again"
@@ -810,9 +810,8 @@ pub fn tool_not_admitted_message(name: &str, deferred_select_allowed: bool) -> S
         format!(
             "Error: Tool '{name}' is not available in this turn yet. It appears \
              in `<deferred-tools>`, so first call `tool_search` with \
-             `query=\"select:{name}\"` to activate its full schema for the \
-             next model request. Call `{name}` only after it appears in \
-             `tools[]`, using the schema's exact fields."
+             `query=\"select:{name}\"` to obtain its full schema, then call \
+             `invoke_tool` with name `{name}` and arguments matching that schema."
         )
     } else {
         format!(
@@ -839,19 +838,11 @@ pub fn deferred_tool_not_activatable_message(name: &str) -> String {
 /// Outcome of a direct call to a tool name that is not in the visible
 /// `tools[]` surface but may be advertised in `<deferred-tools>`.
 ///
-/// First-principle: a direct call to a deferred tool is an *activation intent*,
-/// not an executable request. The model has not seen the tool's full schema, so
-/// the supplied arguments cannot be trusted. When the name is advertised in
-/// `<deferred-tools>` and the runtime can execute it, we record the activation
-/// and ask the model to retry on the next model request once the schema is
-/// visible.
+/// A direct deferred call is not executable: the model has not yet selected
+/// the target's schema. Admission can direct it to select the tool instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectDeferredCallAdmission {
-    /// The name is in the deferred manifest AND has a runtime binding. Treat
-    /// the direct call as an activation intent: record the name so the next
-    /// model request's `tools[]` includes the full schema, then ask the model
-    /// to retry with the schema's exact fields. Do NOT execute the supplied
-    /// args.
+    /// The target has a runtime binding and can be selected explicitly.
     Activate { name: String },
     /// The name is in the deferred manifest but has no runtime binding on this
     /// runtime. Cannot activate; the not-admitted hint lets the model
@@ -883,21 +874,6 @@ where
     } else {
         DirectDeferredCallAdmission::NotAdmitted
     }
-}
-
-/// Message returned when a direct deferred call is treated as an activation
-/// intent. The message is deliberately non-immediate: the failed direct call
-/// must not become a same-batch retry loop while the schema is still absent.
-#[must_use]
-pub fn direct_deferred_call_activation_message(name: &str) -> String {
-    format!(
-        "Tool '{name}' is deferred and is not currently present in `tools[]`. \
-         If `tool_search` is available, call `tool_search(query=\"select:{name}\")` \
-         once to request activation. The direct call was not executed and its \
-         arguments were ignored. Do not call `{name}` again in the same \
-         tool-call batch; only invoke it after a later model request shows \
-         `{name}` in `tools[]`."
-    )
 }
 
 #[cfg(test)]
@@ -1430,32 +1406,6 @@ mod tests {
             classify_direct_deferred_call("hallucinated_tool", false, |_| true),
             DirectDeferredCallAdmission::Unknown,
             "a name not advertised in <deferred-tools> must not be activated even if a binding exists"
-        );
-    }
-
-    #[test]
-    fn direct_deferred_call_activation_message_names_the_tool_and_forbids_execution() {
-        let msg = direct_deferred_call_activation_message("run_script");
-        assert!(msg.contains("run_script"), "message must name the tool");
-        assert!(
-            msg.contains("select:run_script"),
-            "message must frame the call as a select intent"
-        );
-        assert!(
-            msg.contains("not executed"),
-            "message must state the args were not executed"
-        );
-        assert!(
-            msg.contains("arguments were ignored"),
-            "message must state direct-call args are not reused"
-        );
-        assert!(
-            msg.contains("Do not call `run_script` again in the same tool-call batch"),
-            "message must prevent same-batch retry loops"
-        );
-        assert!(
-            msg.contains("later model request"),
-            "message must require a later request with the full schema"
         );
     }
 

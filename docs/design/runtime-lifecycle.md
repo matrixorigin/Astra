@@ -49,7 +49,9 @@ actual partial assistant text in the canonical transcript and Context. Diagnosti
 interruption hints do not grant durable resume authority. Failed settlement uses
 the existing C0 transaction, including cancellation arbitration, accepted-input
 disposition and exact owner retirement; it adds no separate pause protocol or
-query. An explicit new user message starts a new Run. Real input/approval waits,
+query. A `wait_and_retry` hint has a nullable `delay_seconds`: null means the
+provider's recovery time is unknown; a number describes a known local delay.
+An explicit new user message starts a new Run. Real input/approval waits,
 debugger pauses, confirmed handoff custody and ownership fencing retain their
 existing owners. A failed Run does not confirm unknown external effects or clear
 their admission debt. Shared stream consumers retain observed partial text and

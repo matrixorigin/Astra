@@ -1024,7 +1024,7 @@ struct ParallelAgentSummary {
     /// Terminality is ownership state, not outcome quality.  A failed or
     /// cancelled child is no longer live and must not block parent synthesis.
     terminal: bool,
-    successful: bool,
+    normal_result_available: bool,
     completed_result: Option<String>,
     partial_result: Option<String>,
     incomplete_reason: Option<String>,
@@ -1034,7 +1034,7 @@ struct ParallelAgentSummary {
 struct CompletedParallelAgent {
     label: String,
     /// The provider-observed terminal result may have been compacted from the
-    /// bounded required-context lane after repeated leases. Terminal success
+    /// bounded required-context lane after repeated leases. Result observation
     /// remains authoritative even when this presentation copy is gone.
     result: Option<String>,
 }
@@ -1089,7 +1089,7 @@ fn apply_parallel_agent_budget_projection(
     }
     if projection.terminal {
         entry.terminal = true;
-        entry.successful = projection.successful;
+        entry.normal_result_available = projection.normal_result_available;
         entry.completed_result = projection.completed_result.clone();
         entry.partial_result = projection.partial_result.clone();
         entry.incomplete_reason = projection.incomplete_reason.clone();
@@ -1136,7 +1136,7 @@ fn collect_parallel_agent_budget_rollup(
                     // provider observation. After two provider leases the
                     // host deliberately compacts the presentation result,
                     // so missing `result` is not a child failure.
-                    entry.successful = true;
+                    entry.normal_result_available = true;
                     entry.completed_result = observed_result;
                     entry.partial_result = None;
                     entry.incomplete_reason = None;
@@ -1150,10 +1150,12 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                entry.successful.then_some(CompletedParallelAgent {
-                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
-                    result: entry.completed_result.clone(),
-                })
+                entry
+                    .normal_result_available
+                    .then_some(CompletedParallelAgent {
+                        label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                        result: entry.completed_result.clone(),
+                    })
             })
         })
         .collect();
@@ -1161,7 +1163,7 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                if !entry.terminal || entry.successful {
+                if !entry.terminal || entry.normal_result_available {
                     return None;
                 }
                 Some(TerminalParallelAgentIssue {
@@ -1220,7 +1222,7 @@ fn parallel_agent_budget_exhaustion_summary(
         " You can continue in the next message."
     };
     let mut lines = vec![format!(
-        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated without a result; {} remain live. Check each result to determine whether its work is complete.{}]",
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated with an execution issue or without an available normal result; {} remain live. Check each result to determine whether its work is complete.{}]",
         current_agentic_step(state),
         rollup.completed.len(),
         rollup.terminal_issues.len(),
@@ -2000,10 +2002,9 @@ fn approximate_context_window_from_effective_input_budget(
 
 /// Run the compaction pipeline and record results (event + audit).
 ///
-/// Shared by pre-turn proactive compression and resume-time compression to
-/// avoid ~30 lines of duplicated TokenBudget → pipeline selection → compress →
-/// event → audit logic.
-fn run_proactive_compaction<H: AgenticLoopHost>(
+/// Shared by pre-turn and resume. Exact deduplication runs first; the existing
+/// durable artifact owner is used only if pressure remains.
+async fn run_proactive_compaction<H: AgenticLoopHost>(
     pressure: f64,
     tokens_measured: u64,
     state: &mut AgenticLoopState,
@@ -2027,13 +2028,40 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
         CompactionEngine::default_pipeline_for(max_tokens)
     };
     let messages_before = state.messages.len();
-    let rewrite_permit = state.begin_canonical_rewrite();
-    let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+    let Some(rewrite_permit) = state
+        .begin_canonical_rewrite()
+        .filter(|permit| permit.is_valid())
+    else {
+        return;
+    };
+    let mut outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+    if outcome.total_tokens_freed > 0 {
+        state.finish_canonical_rewrite(Some(rewrite_permit));
+    }
+    let remaining = budget
+        .last_measured_tokens
+        .saturating_sub(outcome.total_tokens_freed);
+    let still_under_pressure = budget.max_prompt_tokens > 0
+        && remaining as f64 / budget.max_prompt_tokens as f64
+            >= CompactionTier::pre_turn_trigger(budget.max_prompt_tokens);
+    if still_under_pressure
+        && let Some((freed, removed)) =
+            super::execution_phase::spill_old_messages_to_artifact(host, state).await
+    {
+        outcome.total_tokens_freed += freed;
+        outcome.layer_results.push((
+            "history_artifact".into(),
+            astra_turn_core::compression_types::CompressionResult {
+                estimated_tokens_freed: freed,
+                messages_removed: removed,
+                ..Default::default()
+            },
+        ));
+    }
     state
         .compaction_effectiveness
         .record_compaction(outcome.total_tokens_freed);
     if outcome.total_tokens_freed > 0 {
-        state.finish_canonical_rewrite(rewrite_permit);
         let messages_after = state.messages.len();
         let messages_removed = messages_before.saturating_sub(messages_after);
         let layer_descriptions: Vec<String> = outcome
@@ -2310,7 +2338,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CooldownRejected,
                     ResumeAction::WaitAndRetry {
-                        delay_seconds: reset_in_ms / 1000,
+                        delay_seconds: Some(reset_in_ms / 1000),
                     },
                     interruption_state_summary(
                         state,
@@ -2324,7 +2352,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             state.interruption = Some(InterruptionRecord::new(
                 InterruptionKind::CooldownRejected,
                 ResumeAction::WaitAndRetry {
-                    delay_seconds: reset_in_ms / 1000,
+                    delay_seconds: Some(reset_in_ms / 1000),
                 },
                 interruption_state_summary(state, Some(format!("Rate limit: {}", reason.as_str()))),
             ));
@@ -2598,90 +2626,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             host.on_compaction(warning);
         }
 
-        // Adaptive microcompact: scale aggressiveness with context pressure.
-        // When pipeline_session is active, cascade detection suppresses clearing
-        // to break infinite compaction loops.
-        let pipeline_allows_clearing = state
-            .pipeline_session
-            .as_ref()
-            .map(|sess| !sess.stats.has_compaction_cascade())
-            .unwrap_or(true);
-
-        let strategy = state.compact_strategy;
-        let session_dir = state.current_session_id.as_deref().and_then(|sid| {
-            match state.owner_user_id.as_deref() {
-                Some(user_id) => astra_services::OwnerScope::user(user_id).and_then(|owner| {
-                    astra_services::local_session_artifact_store()
-                        .session_dir_for_owner(&owner, sid)
-                }),
-                None => astra_services::local_session_artifact_store().session_dir(sid),
-            }
-            .ok()
-        });
-        let rewrite_permit = state.begin_canonical_rewrite();
-        let mc = if !pipeline_allows_clearing {
-            // Cascade detected: skip clearing this turn to break the loop.
-            astra_turn_core::microcompact::CompactStats::default()
-        } else if !state.session_facts.active_files.is_empty() {
-            astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence_protected_prefix(
-                &mut state.messages,
-                pressure,
-                &state.session_facts,
-                5,
-                strategy,
-                session_dir.as_deref(),
-                state.last_request_message_count,
-            )
-        } else {
-            astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
-                &mut state.messages,
-                pressure,
-                strategy,
-                session_dir.as_deref(),
-                state.last_request_message_count,
-            )
-        };
-        if mc.results_compacted > 0 {
-            measured_floor = measured_floor.saturating_sub(mc.tokens_saved as u64);
-            state.finish_canonical_rewrite(rewrite_permit);
-            state.context_compression_triggered = true;
-            let event = CompactionEvent::new(
-                CompactionKind::Microcompact,
-                pressure,
-                mc.tokens_saved as u64,
-                pressure_estimate_tokens,
-                state.max_turn_input_tokens,
-                mc.results_compacted,
-                state.messages.len(),
-                vec![format!("microcompact: ~{} tokens", mc.tokens_saved)],
-            );
-            host.on_compaction(event);
-            state.step_recorder.record_compaction_with_kind(
-                "microcompact",
-                mc.results_compacted as u32,
-                mc.tokens_saved as u64,
-                pressure,
-            );
-            if let Some(ref mut sess) = state.pipeline_session {
-                sess.record_compaction_audit(
-                    "tool_result_clearing",
-                    mc.results_compacted.min(u32::MAX as usize) as u32,
-                    mc.tokens_saved.min(u32::MAX as usize) as u32,
-                );
-                sess.stats.record_compaction(mc.tokens_saved as u64);
-            }
-        }
-
-        // Re-estimate pressure after microcompact (messages may have shrunk).
-        // Use the same precise estimation as the pre-microcompact check
-        // above so that always-load tool schema tokens are included — without
-        // them, the guard under-estimates pressure and skips compaction
-        // (observed in session 540c37d1 where budget_pressure=0.887 but
-        // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
+        // Canonical history is shortened by the semantic-summary or durable
+        // history-artifact owner. A local tool-result file does not establish
+        // that another Server instance can retrieve the omitted evidence.
+        // Re-estimate pressure after the semantic-summary attempt.
+        // Include selected schema and measured system overhead in this check.
         let (post_mc_pressure, post_mc_tokens) = pressure_with_measurement(state, measured_floor);
 
-        // Proactive compression gate: if pressure is still high after
-        // microcompact, run the full compression pipeline *before* calling
+        // Proactive compression gate: if pressure is still high,
+        // try a recoverable history rewrite *before* calling
         // the LLM, preventing 413 errors instead of reacting to them.
         if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
             let is_aggressive =
@@ -2693,7 +2646,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
-            run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label);
+            run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label)
+                .await;
         }
     }
 
@@ -2721,6 +2675,81 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn exact_duplicates_relieving_pressure_do_not_write_a_history_artifact() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 32_000;
+        state.messages = vec![json!({"role":"user","content":"Inspect the same file"})];
+        for index in 0..32 {
+            let id = format!("call-{index}");
+            state
+                .messages
+                .push(json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                }]}));
+            state.messages.push(
+                json!({"role":"tool","tool_call_id":id,"content":"same evidence ".repeat(200)}),
+            );
+        }
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert!(state.context_compression_triggered);
+        assert!(
+            host.history_artifacts.is_empty(),
+            "sufficient dedup must not schedule a database write"
+        );
+        assert!(
+            estimate_context_pressure_for_state(&state).0
+                < CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pre_turn_summary_keeps_unsummarized_tool_facts() {
+        let mut state = make_state();
+        state.messages = vec![
+            json!({"role":"user","content":"Continue the long task using the confirmed resource receipts."}),
+        ];
+        for round in 0..32 {
+            state.messages.push(json!({"role":"assistant","content":"", "tool_calls":[{"id":format!("receipt-{round}"),"type":"function","function":{"name":"read_file","arguments":"{}"}}]}));
+            state.messages.push(json!({"role":"tool","tool_call_id":format!("receipt-{round}"),"content":format!("confirmed-resource-{round}: {}", "abcdefghij".repeat(12))}));
+        }
+        state.initialize_canonical_rewrite_proof(
+            &state.messages.clone(),
+            &astra_turn_types::canonical_conversation_root(&state.messages),
+            0,
+        );
+        let prior = state.messages.clone();
+        state.max_turn_input_tokens = 2_000;
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert!(
+            state.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("confirmed-resource-3:"))),
+            "failed summary deleted an unsummarized confirmed resource: {}",
+            serde_json::to_string(&state.messages).unwrap()
+        );
+        let mut terminal = state.messages.clone();
+        terminal
+            .push(json!({"role":"assistant","content":"Continue after preserving the evidence"}));
+        let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+            &prior,
+            true,
+            &terminal,
+            state.canonical_rewrite_proof(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+    }
 
     #[tokio::test]
     async fn hook_config_diagnostics_reach_loop_output_once_without_execution() {
@@ -4056,9 +4085,11 @@ mod tests {
         assert!(unfinished_parallel_agent_ids(&state).is_empty());
         let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new())
             .expect("compacted completion summary");
-        assert!(summary.contains(
-            "1 sub-agent(s) exited with a result; 0 terminated without a result; 0 remain live."
-        ));
+        assert!(summary.contains("Compacted child"), "{summary}");
+        assert!(
+            summary.contains("exited; result was already observed"),
+            "{summary}"
+        );
     }
 
     #[test]
@@ -6181,19 +6212,20 @@ mod tests {
 
     // ── Full pipeline integration test ─────────────────────────────
     //
-    // Verifies that prepare_turn_iteration runs the complete compaction
-    // pipeline — pressure estimation → warning emission → microcompact
-    // → re-estimation → proactive compression — without panicking.
+    // Exercise pressure, durable recovery and quiet-mode telemetry together.
 
     fn high_pressure_cjk_state(max_tokens: u64, schema_tokens: usize) -> AgenticLoopState {
         let mut state = make_state();
         state.max_turn_input_tokens = max_tokens;
         state.pinned_tool_schema_tokens = schema_tokens as u64;
-        state.messages = (0..150)
-            .map(|i| {
-                json!({"role": "user", "content": format!("这是第{}条测试消息，用于模拟高压力场景，包含足够多的中文字符来产生真实的token估算。会话540c37d1显示CJK文本的token估算往往被低估，这个测试确保修复后不会退化。", i)})
-            })
-            .collect();
+        state.messages = vec![json!({"role":"user", "content":"继续检查中文工具证据"})];
+        for index in 0..75 {
+            let id = format!("cjk-{index}");
+            state.messages.extend([
+                json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+                json!({"role":"tool", "tool_call_id":id, "content":format!("证据{index}: {}", "已确认的文件内容与任务进展，不能无依据地丢失。".repeat(10))}),
+            ]);
+        }
         state
     }
 
@@ -6204,6 +6236,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = high_pressure_cjk_state(32_000, 10_000);
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let result = prepare_turn_iteration(&mut host, &mut state, 1).await;
         assert!(
             result.is_ok(),
@@ -6211,7 +6244,7 @@ mod tests {
             result.err()
         );
 
-        // Messages should have been compacted (count reduced from 150).
+        // Durable recovery reduces the live set without dropping evidence.
         assert!(
             state.messages.len() < 150,
             "messages must be compacted under high pressure; got {}",
@@ -6282,7 +6315,13 @@ mod tests {
         let mut captures = Vec::new();
         for quiet in [true, false] {
             let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
-            let mut state = high_pressure_cjk_state(32_000, 10_000);
+            let mut state = high_pressure_cjk_state(50_000, 10_000);
+            for message in &mut state.messages {
+                if message["role"] == "tool" {
+                    message["content"] = json!("完全相同的中文文件证据。".repeat(160));
+                }
+            }
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
 
             let prepared = prepare_turn_iteration(&mut host, &mut state, 1)
                 .await
@@ -6324,7 +6363,7 @@ mod tests {
 
         let quiet = &captures[0];
         let rendered = &captures[1];
-        assert!(!quiet.callbacks.is_empty(), "fixture must actually compact");
+        assert!(quiet.compression_triggered, "fixture must actually compact");
         assert_eq!(quiet.callbacks, rendered.callbacks);
         assert_eq!(quiet.durable_facts, rendered.durable_facts);
         assert_eq!(quiet.effectiveness, rendered.effectiveness);
@@ -6354,7 +6393,7 @@ mod tests {
     /// messages (e.g. restored from checkpoint), pressure estimation
     /// should trigger proactive compression before the first LLM call.
     #[tokio::test]
-    async fn prepare_turn_resume_compacts_high_pressure() {
+    async fn prepare_turn_resume_pressure_preserves_uncovered_user_requests() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.max_turn_input_tokens = 32_000;
@@ -6372,10 +6411,10 @@ mod tests {
             "resume compaction must not fail: {:?}",
             result.err()
         );
-        assert!(
-            state.messages.len() < 100,
-            "resume compaction must reduce message count from 100; got {}",
-            state.messages.len()
+        assert_eq!(
+            state.messages.len(),
+            100,
+            "pressure cannot drop unique user requests without a covering summary"
         );
     }
 
@@ -6392,6 +6431,7 @@ mod tests {
             assert!(estimate_context_pressure_for_state(&state).0 < 0.5);
             state.last_measured_prompt_tokens = Some(195_000);
 
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
             prepare_turn_iteration(&mut host, &mut state, turn_index)
                 .await
                 .unwrap();

@@ -2725,7 +2725,11 @@ impl ToolExecutor {
                 if astra_sandbox::is_never_readable_path(std::path::Path::new(path)) {
                     return failure("native runtime approval includes a forbidden path");
                 }
-                local_policy.allowed_paths.push(path.into());
+                if let Err(error) = local_policy.add_allowed_path(std::path::Path::new(path)) {
+                    let mut result = failure("native runtime grant cannot be resolved");
+                    result.output.push_str(&format!(": {error}"));
+                    return result;
+                }
             }
         }
         if let Err(reason) =

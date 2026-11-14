@@ -977,6 +977,9 @@ pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&
         Some("model_probe_credentials_or_access") => {
             return Some("Check the API key and the account's access to this model.");
         }
+        Some("model_probe_quota_exhausted") => {
+            return Some("Ask the model provider account owner to check its balance and quota.");
+        }
         Some("model_probe_request_rejected" | "model_probe_configuration") => {
             return Some("Check the model ID, API format and endpoint.");
         }
@@ -1830,6 +1833,13 @@ mod tests {
         // Also works with 503
         let hint = status_hint_for(503, Some("database_pool_timeout"));
         assert!(hint.unwrap().contains("Database pool timeout"));
+    }
+
+    #[test]
+    fn model_probe_quota_hint_does_not_suggest_reauthentication() {
+        let hint = status_hint_for(400, Some("model_probe_quota_exhausted")).unwrap();
+        assert!(hint.contains("balance and quota"));
+        assert!(!hint.contains("API key"));
     }
 
     #[test]

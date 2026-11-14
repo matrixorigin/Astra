@@ -69,6 +69,27 @@ pub fn journal_record_edge_tool_result(
     record
 }
 
+/// Retain authenticated callback equality for transcript presentation. This
+/// is observed scope only, never execution or invocation-ledger authority.
+#[must_use]
+pub fn journal_record_scoped_edge_tool_result(
+    result: &crate::sse_stream_host::ScopedEdgeToolExecResult,
+    user_id: Option<&str>,
+) -> ToolCallRecord {
+    let mut record = journal_record_edge_tool_result(result);
+    record.invocation_identity = user_id.and_then(|user_id| {
+        astra_turn_types::ToolInvocationIdentity::new(
+            user_id,
+            &result.session_id,
+            &result.run_id,
+            &result.turn_chain_id,
+            &result.request_id,
+        )
+        .ok()
+    });
+    record
+}
+
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
     tool_call_id: String,

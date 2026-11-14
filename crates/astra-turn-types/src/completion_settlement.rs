@@ -89,6 +89,8 @@ pub struct ForegroundFanoutPagination {
     pub group_id: String,
     pub target_count: u64,
     pub pending_slots: BTreeMap<u64, u64>,
+    /// Retained with its existing meaning for the strict checkpoint wire
+    /// contract. This observation never closes the parent's tool authority.
     pub had_recoverable_issues: bool,
 }
 
@@ -223,6 +225,20 @@ mod tests {
                 serde_json::from_value::<CompletionSettlementState>(incomplete).is_err(),
                 "missing {field}"
             );
+        }
+        for had_issues in [false, true] {
+            let mut pending = wire.clone();
+            pending["foreground_fanout_pagination"]["had_recoverable_issues"] =
+                serde_json::json!(had_issues);
+            let restored: CompletionSettlementState = serde_json::from_value(pending).unwrap();
+            assert_eq!(
+                restored
+                    .foreground_fanout_pagination
+                    .unwrap()
+                    .had_recoverable_issues,
+                had_issues
+            );
+            assert_eq!(restored.text_only, state.text_only);
         }
         let mut unknown = wire.clone();
         unknown["completion_action_window"]["action"] = serde_json::json!("future_action");

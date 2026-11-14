@@ -80,20 +80,6 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
         "lsp" | "hover_info" | "extract_members" => {
             push_explicit_arg_path(&mut paths, args, "file");
         }
-        "bash" => {
-            if args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only)
-                && let Some(path) = sandbox_expand_dir_from_args(args)
-            {
-                push_unique_explicit_path(
-                    &mut paths,
-                    Cow::Owned(path.to_string_lossy().into_owned()),
-                );
-            }
-        }
         "git"
             if args.get("action").and_then(Value::as_str) == Some("worktree")
                 && matches!(
@@ -200,36 +186,6 @@ pub(crate) fn glob_preflight_base_from_absolute_pattern(pattern: &str) -> Option
             )
         }
     }
-}
-
-/// Derive which directory should be added to the sandbox's allow-list
-/// when a tool returned SANDBOX_DENIED for the given arguments.
-///
-/// Priority:
-/// 1. Explicit file path-like argument fields (`path`, `file_path`, `file`,
-///    `notebook_path`) - take parent, the path itself when it is an existing
-///    directory, or the file itself when the parent would be `/`.
-/// 2. Explicit working-directory fields (`cwd`, `workdir`, `working_dir`) -
-///    take the directory itself.
-/// 3. `args.command` (bash shape) - extract the first concrete path token
-///    (`/abs/path`, `~/path`, `$HOME/path`, or `${HOME}/path`) and apply the
-///    same parent logic.
-///
-/// Returns `None` when no safe concrete path can be derived (e.g. relative
-/// paths, traversal, ambiguous shell syntax, or protected credential paths).
-///
-/// **Never returns `/` or a protected sensitive path** - widening either would
-/// defeat the sandbox contract.
-#[must_use]
-pub fn sandbox_expand_dir_from_args(args: &Value) -> Option<PathBuf> {
-    if let Some(dir) = sandbox_expand_dir_from_path_args(args) {
-        return Some(dir);
-    }
-
-    args.get("command")
-        .and_then(Value::as_str)
-        .and_then(extract_first_sandbox_expand_path)
-        .and_then(|p| sandbox_expand_dir_from_pathish(&p))
 }
 
 /// Derive a sandbox expansion directory from tool arguments and, when the
@@ -365,7 +321,7 @@ fn quoted_segment_is_sensitive_path(segment: &str) -> bool {
 }
 
 pub(crate) fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> {
-    let token = trim_shell_path_token(pathish);
+    let token = pathish;
     if pathish_has_forbidden_segment(token) {
         return None;
     }
@@ -374,7 +330,7 @@ pub(crate) fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> 
 }
 
 fn sandbox_expand_dir_from_dir_pathish(pathish: &str) -> Option<PathBuf> {
-    let token = trim_shell_path_token(pathish);
+    let token = pathish;
     if pathish_has_forbidden_segment(token) {
         return None;
     }
@@ -464,6 +420,9 @@ pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 /// The visible output should be a human-readable `Error: ...` message; this
 /// metadata is the machine-readable retry signal.
 pub const SANDBOX_DENIED_ERROR_KIND: &str = "sandbox_denied";
+
+/// Exact producer-known target; human error text is not path authority.
+pub const SANDBOX_APPROVAL_DIRECTORY_FIELD: &str = "sandbox_approval_directory";
 
 const ERROR_KIND_FIELD: &str = "error_kind";
 const MESSAGE_FIELD: &str = "message";
@@ -572,7 +531,12 @@ pub fn merge_sandbox_denied_tool_result_fields(
         MESSAGE_FIELD.to_string(),
         Value::String(normalize_sandbox_denied_message(message).into_owned()),
     );
-    fields.insert("status".to_string(), Value::String("failed".to_string()));
+    let status = if astra_tools::execution_outcome::execution_was_not_started(Some(&fields)) {
+        "rejected"
+    } else {
+        "failed"
+    };
+    fields.insert("status".to_string(), Value::String(status.to_string()));
     fields.insert("retryable".to_string(), Value::Bool(false));
     fields.insert(
         "recovery_evidence".to_string(),
@@ -655,13 +619,11 @@ mod tests {
         explicit_file_tool_path_targets, glob_preflight_base_from_absolute_pattern,
         is_sandbox_denied, is_sandbox_denied_result, sandbox_denied_message,
         sandbox_denied_message_from_result, sandbox_denied_tool_result_fields,
-        sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
-        sandbox_expand_dir_from_denial_or_workspace, sandbox_retry_no_expand_dir_output,
+        sandbox_expand_dir_from_denial, sandbox_expand_dir_from_denial_or_workspace,
+        sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
     use std::path::PathBuf;
-
-    // ── sandbox_expand_dir_from_args ─────────────────────────────────────
 
     #[test]
     fn glob_preflight_base_splits_absolute_pattern_like_glob_tool() {
@@ -804,185 +766,6 @@ mod tests {
             dynamic_targets[0].path,
             "/home/user/external-workspace/static.md"
         );
-    }
-
-    #[test]
-    fn expand_dir_from_read_file_path() {
-        let args = json!({"path": "/home/user/project/src/main.rs"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/home/user/project/src"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_from_str_replace_file_path() {
-        // Some tools use `file_path` instead of `path`.
-        let args = json!({"file_path": "/home/user/project/Cargo.toml"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/home/user/project"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_from_bash_cat_command() {
-        // This is the 3b7ac18f session's exact shape: `cat ~/foo/bar.ts`
-        // is normalized to an absolute path by the shell wrapper before
-        // it ever reaches sandbox validation; the denial message echoes
-        // the absolute form.
-        let args = json!({"command": "cat /home/user/outside/file.ts"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/home/user/outside"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_from_home_reference_path_arg() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let args = json!({"path": "~/astra-review-guide.md"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), Some(home));
-    }
-
-    #[test]
-    fn expand_dir_from_bash_home_env_reference() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let args = json!({"command": "cat ${HOME}/external-workspace/Tool.ts"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(home.join("external-workspace"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_from_bash_with_flags_and_pipes() {
-        // Scanner must pick the path token regardless of position — not
-        // just `parts[1]`. Real commands have flags before the path.
-        let args = json!({"command": "head -n 50 /tmp/hosts | grep localhost"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/tmp"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_root_level_file_stays_as_file() {
-        // `/passwd` → parent is `/` — never widen to `/`; expand exactly
-        // the file instead. Pinned because widening to `/` is a security
-        // hazard the original inline logic was careful about.
-        let args = json!({"path": "/passwd"});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/passwd"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_command_path_boundaries() {
-        for (command, expected) in [
-            ("grep -n foo /tmp/a /var/b", Some("/tmp")),
-            ("cat '/tmp/hosts'", Some("/tmp")),
-            ("cat src/main.rs /tmp/hosts;", Some("/tmp")),
-            ("cat //server/share", None),
-            ("cat /tmp/$UNEXPANDED/file", None),
-            ("", None),
-        ] {
-            assert_eq!(
-                sandbox_expand_dir_from_args(&json!({"command": command})),
-                expected.map(PathBuf::from),
-                "command: {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn expand_dir_none_for_relative_only() {
-        // Relative paths don't escape the project root; nothing to expand.
-        let args = json!({"path": "src/main.rs"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), None);
-    }
-
-    #[test]
-    fn expand_dir_none_for_bash_without_absolute_token() {
-        let args = json!({"command": "git status --short"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), None);
-    }
-
-    #[test]
-    fn expand_dir_prefers_path_over_command() {
-        // `path` field is authoritative — `command` would be wrong to
-        // consult when both are present (shouldn't happen, but defensive).
-        let args = json!({
-            "path": "/a/b.txt",
-            "command": "cat /c/d.txt"
-        });
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/a"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_handles_quoted_paths_in_command() {
-        let args = json!({"command": "cat \"/tmp/hosts\""});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/tmp"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_handles_shell_escaped_spaces_in_command_paths() {
-        let args = json!({"command": r#"cat /home/user/My\ Project/report.md"#});
-        assert_eq!(
-            sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/home/user/My Project"))
-        );
-    }
-
-    #[test]
-    fn expand_dir_rejects_parent_traversal_in_path() {
-        // `/allowed/../etc/passwd` lexically has parent `/allowed/..`, which
-        // Path::parent reports as `/allowed` — but after `..` resolution the
-        // real parent is `/etc`. We can't canonicalize unresolved paths
-        // safely (target may not exist yet), so the only correct answer is
-        // to refuse to auto-widen. Pinned as a sandbox-escape guard.
-        let args = json!({"path": "/allowed/../etc/passwd"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), None);
-    }
-
-    #[test]
-    fn expand_dir_rejects_parent_traversal_in_command() {
-        let args = json!({"command": "cat /allowed/../etc/passwd"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), None);
-    }
-
-    #[test]
-    fn expand_dir_rejects_curdir_component() {
-        // `/./etc/hosts` is harmless but non-canonical; rejecting is the
-        // simpler contract than trying to partially-normalize.
-        let args = json!({"path": "/./etc/hosts"});
-        assert_eq!(sandbox_expand_dir_from_args(&args), None);
-    }
-
-    #[test]
-    fn expand_dir_rejects_sensitive_path_args() {
-        for args in [
-            json!({"path": "/home/user/.ssh/id_rsa"}),
-            json!({"path": "/etc/shadow"}),
-            json!({"cwd": "/home/user/.ssh"}),
-        ] {
-            assert_eq!(
-                sandbox_expand_dir_from_args(&args),
-                None,
-                "sandbox expansion must not derive a directory for sensitive path args: {args}"
-            );
-        }
     }
 
     #[test]
@@ -1203,31 +986,6 @@ mod tests {
     // path (the check only ran in the sequential path). These tests
     // pin the helpers so whichever call site uses them gets the same
     // contract.
-
-    #[test]
-    fn auto_mode_contract_detects_denial_and_derives_dir() {
-        // Simulate the exact tool output + args shape from session 3b7ac18f.
-        let tool_output = "SANDBOX_DENIED: The command references \
-                           '/home/user/reference-agent/tools/FileReadTool/limits.ts' \
-                           which is outside the project directory …";
-        let tool_args = json!({
-            "command": "cat /home/user/reference-agent/tools/FileReadTool/limits.ts"
-        });
-
-        // Step 1: the prefix detector sees the denial.
-        assert!(is_sandbox_denied(tool_output));
-
-        // Step 2: the expand dir is derived from args.
-        let dir = sandbox_expand_dir_from_args(&tool_args).expect("expand dir");
-        assert_eq!(
-            dir,
-            PathBuf::from("/home/user/reference-agent/tools/FileReadTool")
-        );
-
-        // Step 3: the message body survives stripping.
-        let body = sandbox_denied_message(tool_output).expect("body");
-        assert!(body.contains("outside the project directory"));
-    }
 
     // ── apply_patch must participate in preflight path extraction ──
     // (Review C1-sandbox). Without this arm, sandbox denials for

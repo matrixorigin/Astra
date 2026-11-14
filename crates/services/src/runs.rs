@@ -70,6 +70,29 @@ pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResp
         && error.error_code.as_deref() == Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
 }
 
+/// Trusted Session facts resolved by the existing Session service.
+/// This is not a second Session lifecycle or persistence record.
+pub struct ResolvedChatSession {
+    pub session_id: Option<String>,
+    pub full_llm_capture: bool,
+    pub session_admission_facts: Option<crate::SessionAdmissionFacts>,
+}
+
+impl ResolvedChatSession {
+    pub fn apply_to(&self, request: &mut ChatRequestData) {
+        request.session_id = self.session_id.clone();
+        request.full_llm_capture = self.full_llm_capture;
+        request.session_admission_facts = self.session_admission_facts.clone();
+    }
+}
+
+/// One-shot Session creation, polled only after Run request preparation succeeds.
+/// Kept outside the cloneable request; it may borrow HTTP diagnostic state.
+pub type ChatSessionCreation<'a> = futures_util::future::BoxFuture<
+    'a,
+    Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)>,
+>;
+
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
     /// Verify the provider's Session scope before exposing or controlling a Run.
@@ -172,6 +195,34 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Admit a fresh HTTP chat before polling its Session creator. Services
+    /// without this ordering must reject without creating a Session.
+    async fn create_run_with_session(
+        &self,
+        _user_id: String,
+        _request: ChatRequestData,
+        _create_session: ChatSessionCreation<'_>,
+    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run lifecycle service not configured for chat Session creation",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
+        ))
+    }
+
+    async fn stream_chat_with_session(
+        &self,
+        _user_id: String,
+        _request: ChatRequestData,
+        _create_session: ChatSessionCreation<'_>,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run lifecycle service not configured for chat Session creation",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
+        ))
+    }
 
     async fn get_run_status(
         &self,
@@ -26192,8 +26243,8 @@ fn is_external_client_event_type(event_type: &str) -> bool {
 
 fn run_error_client_surface(error_kind: &str) -> Option<(&'static str, bool, Option<u64>)> {
     match error_kind {
-        "rate_limit" => Some(("LLM_RATE_LIMIT", true, Some(5_000))),
-        "server_error" => Some(("SERVER_ERROR", true, Some(2_000))),
+        "rate_limit" => Some(("LLM_RATE_LIMIT", true, None)),
+        "server_error" => Some(("SERVER_ERROR", true, None)),
         "stream_idle" | "tool_timeout" => Some(("LLM_TIMEOUT", true, Some(0))),
         "stream_transport" => Some(("LLM_TRANSPORT_ERROR", true, Some(1_000))),
         "network" => Some(("LLM_TRANSPORT_ERROR", true, Some(3_000))),
@@ -42501,7 +42552,7 @@ mod tests {
                 &|o| {
                     assert_eq!(o["code"], "LLM_RATE_LIMIT");
                     assert_eq!(o["retryable"], true);
-                    assert_eq!(o["retry_after_ms"], 5_000);
+                    assert!(o.get("retry_after_ms").is_none());
                 },
             ),
             (
@@ -42513,7 +42564,7 @@ mod tests {
                 &|o| {
                     assert_eq!(o["code"], "SERVER_ERROR");
                     assert_eq!(o["retryable"], true);
-                    assert_eq!(o["retry_after_ms"], 2_000);
+                    assert!(o.get("retry_after_ms").is_none());
                 },
             ),
             (
@@ -42965,8 +43016,7 @@ mod tests {
                     "error_kind": "rate_limit",
                     "error_code": "rate_limit",
                     "code": "LLM_RATE_LIMIT",
-                    "retryable": true,
-                    "retry_after_ms": 5_000
+                    "retryable": true
                 }),
             ),
         ];

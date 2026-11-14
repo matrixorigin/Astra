@@ -408,7 +408,7 @@ pub(crate) struct ServeHttpArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra chat -m \"总结当前仓库结构\"\n  echo \"修复测试失败\" | astra chat --stdin --json"
+    after_help = "Examples:\n  astra chat -m \"总结当前仓库结构\"\n  echo \"解释当前配置\" | astra chat --stdin --json --permission-mode deny"
 )]
 pub(crate) struct ChatArgs {
     /// Chat message text
