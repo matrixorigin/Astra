@@ -1,7 +1,6 @@
 //! Shape of generated plan ids: a lowercase slug of the first three words of
-//! the goal plus a hex suffix, or a `plan-` id when the goal has no usable
-//! characters. Uniqueness within one second is tracked in #1173 and is not
-//! asserted here.
+//! the goal plus a unique 32-character lowercase hex suffix (UUID v4 simple),
+//! or a `plan-` id when the goal has no usable characters.
 
 use astra_plan::PlanModeState;
 
@@ -19,7 +18,7 @@ fn slug_uses_first_three_words_lowercased() {
     let id = PlanModeState::generate_plan_id("Refactor The Parser module today");
     let (slug, suffix) = split_suffix(&id);
     assert_eq!(slug, "refactor-the-parser");
-    assert_eq!(suffix.len(), 4, "{id}");
+    assert_eq!(suffix.len(), 32, "{id}");
     assert!(is_lower_hex(suffix), "{id}");
 }
 
@@ -42,11 +41,11 @@ fn unicode_words_are_kept() {
 }
 
 #[test]
-fn empty_goal_uses_plan_prefix_with_eight_hex_digits() {
+fn empty_goal_uses_plan_prefix_with_unique_hex_suffix() {
     for goal in ["", "   ", "\n\t"] {
         let id = PlanModeState::generate_plan_id(goal);
         let suffix = id.strip_prefix("plan-").unwrap_or_else(|| panic!("{id}"));
-        assert_eq!(suffix.len(), 8, "{id}");
+        assert_eq!(suffix.len(), 32, "{id}");
         assert!(is_lower_hex(suffix), "{id}");
     }
 }
