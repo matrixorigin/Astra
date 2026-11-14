@@ -71,9 +71,11 @@ async fn exit_and_clean_test_worktree(
             &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
         )
         .await;
-    if !cfg!(target_os = "macos") && !has_authoritative_worktree_owner() {
+    if cfg!(target_os = "macos") || !has_authoritative_worktree_owner() {
         assert!(
-            result.is_error && result.output.contains("may still be running"),
+            result.is_error
+                && (result.output.contains("may still be running")
+                    || result.output.contains("unavailable on macOS")),
             "{result:?}"
         );
         let kept = exe
@@ -116,13 +118,9 @@ fn enter_and_exit_worktree_error_paths() {
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("required"));
 
-    // shell injection
-    for dangerous in &["test;rm", "test|cat", "test&", "test`id`", "$(whoami)"] {
-        let result = exe.enter_worktree(dangerous);
-        assert!(
-            result.is_err(),
-            "should reject dangerous branch: {dangerous}"
-        );
+    for invalid in &["-option", "HEAD", "bad..branch", "branch name", "@{1}"] {
+        let result = exe.enter_worktree(invalid);
+        assert!(result.is_err(), "should reject invalid branch: {invalid}");
         assert!(result.unwrap_err().contains("Invalid"));
     }
 
@@ -130,6 +128,31 @@ fn enter_and_exit_worktree_error_paths() {
     let result = exe.exit_worktree("keep", false);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Not in a worktree session"));
+}
+
+#[tokio::test]
+async fn worktree_accepts_valid_branch_names_without_shell_interpretation() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+    let branch = "fix/$(touch${IFS}injected)";
+    let args = json!({"action":"enter", "branch":branch});
+    let entered = exe.execute_with_metadata("worktree", &args).await;
+    assert!(!entered.is_error, "{entered:?}");
+    let checkout = exe.get_worktree_session().unwrap().worktree_path;
+    assert!(!dir.path().join("injected").exists());
+    let kept = exe
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    let reentered = exe.execute_with_metadata("worktree", &args).await;
+    assert!(!reentered.is_error, "{reentered:?}");
+    assert_eq!(exe.get_worktree_session().unwrap().worktree_path, checkout);
+    assert!(!dir.path().join("injected").exists());
+    let kept = exe
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    remove_preserved_test_worktree(dir.path(), &checkout);
 }
 
 #[test]
@@ -146,40 +169,6 @@ fn git_worktree_error_paths() {
     let result = exe.worktree(&json!({"action": "exit"}));
     assert!(result.contains("Error"));
     assert!(result.contains("Not in a worktree session"));
-}
-
-#[tokio::test]
-async fn git_worktree_enter_records_rollback_handle() {
-    let dir = init_temp_git_repo();
-    let exe = ToolExecutor::new(dir.path());
-    exe.journal_turn_index
-        .store(7, std::sync::atomic::Ordering::Relaxed);
-
-    let outcome = exe.worktree_with_metadata(&json!({
-        "action": "enter",
-        "branch": "session-demo",
-    }));
-    assert!(
-        !outcome.output.starts_with("Error:"),
-        "enter failed: {}",
-        outcome.output
-    );
-    assert!(exe.in_worktree_session(), "should enter worktree session");
-    let checkout = exe.get_worktree_session().unwrap().worktree_path;
-
-    let listed = exe.rollback_git_worktrees(&json!({"scope": "list"}));
-    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
-    assert_eq!(listed_json["entries"].as_array().map(Vec::len), Some(1));
-
-    let cleanup = exe.worktree(&json!({
-        "action": "exit",
-        "exit_action": if cfg!(target_os = "macos") || has_authoritative_worktree_owner() { "remove" } else { "keep" },
-        "discard_changes": true,
-    }));
-    assert!(!cleanup.starts_with("Error:"), "cleanup failed: {cleanup}");
-    if checkout.exists() {
-        remove_preserved_test_worktree(dir.path(), &checkout);
-    }
 }
 
 #[tokio::test]
@@ -204,13 +193,24 @@ async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
         )
         .await;
     if cfg!(target_os = "macos") {
-        assert!(!denied.is_error, "{denied:?}");
-        assert!(denied.output.contains("preserved"), "{denied:?}");
-        assert!(!exe.in_worktree_session());
+        assert!(denied.is_error, "{denied:?}");
+        assert!(
+            denied.output.contains("Nothing was removed or discarded"),
+            "{denied:?}"
+        );
+        let fields = denied.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["error_kind"], "tool_unavailable");
+        assert_eq!(fields["recovery_evidence"]["retryable"], false);
+        assert!(exe.in_worktree_session());
         assert_eq!(
             std::fs::read_to_string(session.worktree_path.join("tracked.txt")).unwrap(),
             "changed\n"
         );
+        let kept = exe
+            .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+            .await;
+        assert!(!kept.is_error, "{kept:?}");
         remove_preserved_test_worktree(dir.path(), &session.worktree_path);
     } else {
         assert!(denied.is_error, "{denied:?}");
@@ -224,6 +224,150 @@ async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
         .execute_with_metadata("worktree", &json!({"action":"push", "branch":"main"}))
         .await;
     assert!(invalid.is_error);
+}
+
+#[tokio::test]
+async fn kept_worktree_can_be_reentered_after_it_is_moved() {
+    let dir = init_temp_git_repo();
+    let first = ToolExecutor::new(dir.path());
+    let entered = first
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"kept/branch", "start_point":"HEAD"}),
+        )
+        .await;
+    assert!(!entered.is_error, "{entered:?}");
+    let original = first.get_worktree_session().unwrap().worktree_path;
+    std::fs::write(original.join("untracked.txt"), "preserve me\n").unwrap();
+    let kept = first
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    drop(first);
+
+    let moved = original.with_file_name(format!(
+        "{} moved 空间",
+        original.file_name().unwrap().to_string_lossy()
+    ));
+    let moved_result = std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["worktree", "move"])
+        .arg(&original)
+        .arg(&moved)
+        .output()
+        .unwrap();
+    assert!(moved_result.status.success(), "{moved_result:?}");
+
+    // A fresh executor has no in-memory record of the earlier creation.
+    let next = ToolExecutor::new(dir.path());
+    let reentered = next
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"kept/branch", "start_point":"HEAD"}),
+        )
+        .await;
+    assert!(!reentered.is_error, "{reentered:?}");
+    let selected = next.get_worktree_session().unwrap();
+    assert_eq!(
+        selected.worktree_path.canonicalize().unwrap(),
+        moved.canonicalize().unwrap()
+    );
+    assert_eq!(selected.original_head_commit, None);
+    assert_eq!(
+        std::fs::read_to_string(selected.worktree_path.join("untracked.txt")).unwrap(),
+        "preserve me\n"
+    );
+    let read = next
+        .execute_with_metadata("read_file", &json!({"path":"untracked.txt"}))
+        .await;
+    assert!(
+        !read.is_error && read.output.contains("preserve me"),
+        "{read:?}"
+    );
+    exit_and_clean_test_worktree(&next, dir.path(), &moved).await;
+    let branch = std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["show-ref", "--verify", "refs/heads/kept/branch"])
+        .output()
+        .unwrap();
+    assert!(branch.status.success(), "existing branch must be preserved");
+}
+
+#[tokio::test]
+async fn reenter_does_not_move_an_existing_branch_to_a_different_start_point() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+    let entered = exe
+        .execute_with_metadata("worktree", &json!({"action":"enter", "branch":"advanced"}))
+        .await;
+    assert!(!entered.is_error, "{entered:?}");
+    let checkout = exe.get_worktree_session().unwrap().worktree_path;
+    std::fs::write(checkout.join("tracked.txt"), "advanced\n").unwrap();
+    let commit = std::process::Command::new("git")
+        .current_dir(&checkout)
+        .args(["commit", "-am", "advance branch"])
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "{commit:?}");
+    let kept = exe
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+
+    let wrong_base = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"advanced", "start_point":"HEAD"}),
+        )
+        .await;
+    assert!(
+        wrong_base.is_error && wrong_base.output.contains("different commit"),
+        "{wrong_base:?}"
+    );
+    assert!(!exe.in_worktree_session());
+    let reentered = exe
+        .execute_with_metadata("worktree", &json!({"action":"enter", "branch":"advanced"}))
+        .await;
+    assert!(!reentered.is_error, "{reentered:?}");
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+        "advanced\n"
+    );
+    let kept = exe
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    remove_preserved_test_worktree(dir.path(), &checkout);
+    let head = std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["show", "advanced:tracked.txt"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(head.stdout, b"advanced\n");
+}
+
+#[tokio::test]
+async fn entering_the_current_branch_does_not_create_a_nested_session() {
+    let dir = init_temp_git_repo();
+    let current = std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    let branch = String::from_utf8(current.stdout).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    let result = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":branch.trim()}),
+        )
+        .await;
+    assert!(
+        result.is_error && result.output.contains("already checked out"),
+        "{result:?}"
+    );
+    assert!(!exe.in_worktree_session());
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -402,10 +546,7 @@ async fn checkout_hook_child_does_not_block_keeping_worktree() {
     .unwrap();
     let exited = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        exe.execute_with_metadata(
-            "worktree",
-            &json!({"action":"exit", "exit_action":"remove"}),
-        ),
+        exe.execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"})),
     )
     .await
     .expect("keeping a checkout should not wait for its lease");
@@ -454,14 +595,18 @@ async fn session_worktree_preserves_checkout_for_escaped_foreground_child() {
         )
         .await;
     assert!(
-        !removed.is_error && removed.output.contains("preserved"),
+        removed.is_error && removed.output.contains("Nothing was removed or discarded"),
         "{removed:?}"
     );
     assert!(
         selected.exists(),
         "a possibly active checkout must be retained"
     );
-    assert!(!exe.in_worktree_session());
+    assert!(exe.in_worktree_session());
+    let kept = exe
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
     drop(_child);
     assert!(
         std::process::Command::new("git")
@@ -648,11 +793,26 @@ async fn resumed_session_keeps_its_selected_worktree() {
     assert!(!entered.is_error, "{entered:?}");
     let selected = first.get_worktree_session().unwrap().worktree_path;
     std::fs::write(selected.join("tracked.txt"), "worktree content\n").unwrap();
+    let kept = first
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    let reentered = first
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"resume-selected"}),
+        )
+        .await;
+    assert!(!reentered.is_error, "{reentered:?}");
 
     // A new executor with no shared in-memory owner is what a resumed process
     // sees; it must not silently return to the original project directory.
     let resumed = ToolExecutor::new(repo.path()).with_active_session_id(&session_id);
     let resumed_root = resumed.effective_project_root();
+    assert_eq!(
+        resumed.get_worktree_session().unwrap().original_head_commit,
+        None
+    );
     let read = resumed
         .execute_with_metadata("read_file", &json!({"path": "tracked.txt"}))
         .await;
@@ -974,7 +1134,7 @@ async fn active_session_reuses_loaded_workspace_state_across_turns() {
     std::fs::write(workspace, "invalid: [").unwrap();
 
     let next = ToolExecutor::new(root.path())
-        .with_shared_git_worktree_journal(first.git_worktree_journal.clone())
+        .with_shared_worktree_owner(first.worktree_owner.clone())
         .with_active_session_id(&session_id);
     let read = next
         .execute_with_metadata("read_file", &json!({"path":"file.txt"}))
@@ -1710,8 +1870,8 @@ async fn session_worktree_is_the_workspace_for_file_tools() {
         .execute_with_metadata("find_definition", &json!({"symbol":"worktree_symbol"}))
         .await;
     let canonical_active = active.canonicalize().unwrap();
-    let next_turn = ToolExecutor::new(dir.path())
-        .with_shared_git_worktree_journal(exe.git_worktree_journal.clone());
+    let next_turn =
+        ToolExecutor::new(dir.path()).with_shared_worktree_owner(exe.worktree_owner.clone());
     let next_turn_root = next_turn.effective_project_root();
     let next_read = next_turn
         .execute_with_metadata("read_file", &json!({"path":"tracked.txt"}))

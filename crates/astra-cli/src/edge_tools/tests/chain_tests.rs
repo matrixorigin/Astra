@@ -238,12 +238,11 @@ async fn agent_chain_can_enter_use_and_leave_worktree() {
     let dir = super::worktree_tests::init_temp_git_repo();
     let executor =
         ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
-    let exit_action =
-        if cfg!(target_os = "macos") || super::worktree_tests::has_authoritative_worktree_owner() {
-            "remove"
-        } else {
-            "keep"
-        };
+    let exit_action = if super::worktree_tests::has_authoritative_worktree_owner() {
+        "remove"
+    } else {
+        "keep"
+    };
     let result = executor
         .execute_with_metadata(
             "agent",
@@ -270,10 +269,13 @@ async fn agent_chain_can_enter_use_and_leave_worktree() {
     assert!(!dir.path().join("created.txt").exists());
     assert!(!executor.in_worktree_session());
     if !super::worktree_tests::has_authoritative_worktree_owner() {
-        let list: serde_json::Value =
-            serde_json::from_str(&executor.rollback_git_worktrees(&json!({"scope":"list"})))
-                .unwrap();
-        let checkout = std::path::Path::new(list["entries"][0]["worktree_path"].as_str().unwrap());
+        let checkout = body["steps"][0]["output"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Path: "))
+            .map(std::path::Path::new)
+            .expect("worktree entry reports its checkout");
         assert!(checkout.join("created.txt").exists());
         super::worktree_tests::remove_preserved_test_worktree(dir.path(), checkout);
     }

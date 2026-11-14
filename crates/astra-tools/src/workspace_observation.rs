@@ -4118,10 +4118,10 @@ fn structured_targets_are_bound(
     args: &serde_json::Value,
     workspace_root: &Path,
 ) -> bool {
-    // Patch/rollback commands can contain paths in an opaque patch or a
-    // journal handle; guessing those paths would turn scope into a lexical
+    // Patch commands can contain paths in an opaque patch; guessing those
+    // paths would turn scope into a lexical
     // claim. Their executor may add a richer receipt later.
-    if matches!(name, "apply_patch" | "rollback_git_worktrees") {
+    if name == "apply_patch" {
         return false;
     }
 

@@ -819,7 +819,6 @@ fn workspace_mutation_tool_with_args(name: &str, args: Option<&Value>) -> bool {
         | "delete_file"
         | "notebook_edit"
         | "rollback_file_edits"
-        | "rollback_git_worktrees"
         | "worktree"
         | "rename_symbol" => true,
         "lsp" => {
