@@ -1171,22 +1171,26 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             get_u("stall_count"),
     ));
     out.push_str(&format!(
-        "      root_tokens_in={} root_tokens_out={} root_duration_ms={}\n",
+        "      known_root_tokens_in={} known_root_tokens_out={} root_duration_ms={}\n",
         get_u("total_tokens_in"),
         get_u("total_tokens_out"),
         get_u("total_duration_ms"),
     ));
     out.push_str(&format!(
-        "      subruns={} inclusive_tokens_in={} inclusive_tokens_out={} inclusive_tool_calls={}\n",
+        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} inclusive_tool_calls={}\n",
         get_u("subrun_count"),
         get_u("inclusive_total_tokens_in"),
         get_u("inclusive_total_tokens_out"),
         get_u("inclusive_total_tool_calls"),
     ));
     out.push_str(&format!(
-        "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
-        get_f("avg_tokens_in"),
-        get_f("avg_tokens_out"),
+        "      avg_tokens_in={} avg_tokens_out={} avg_duration_ms={:.1}\n",
+        a.get("avg_tokens_in")
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "unknown".to_owned(), |v| format!("{v:.1}")),
+        a.get("avg_tokens_out")
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "unknown".to_owned(), |v| format!("{v:.1}")),
         get_f("avg_duration_ms"),
     ));
     // Point the reviewer at the full digest — if and only if the
@@ -1619,7 +1623,7 @@ mod tests {
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "sess",
                 "journal_file": "/tmp/sess.jsonl",
                 "journal_lines_non_empty": 3,
@@ -1665,17 +1669,24 @@ mod tests {
         assert!(out.contains("inclusive_tokens_in=12000"));
         assert!(out.contains("avg_tokens_in=4000.0"));
         assert!(out.contains("astra journal digest sess"));
+
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["avg_tokens_in"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_tokens_out"] = serde_json::Value::Null;
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("avg_tokens_in=unknown avg_tokens_out=unknown"));
+        assert!(!out.contains("digest_error"));
     }
 
     #[test]
-    fn text_report_renders_v2_digest_aggregate_names_without_false_zeroes() {
+    fn text_report_renders_v3_digest_aggregate_names_without_false_zeroes() {
         use crate::digest::DigestArtifact;
         let mut r = mk_report_passed();
         r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess-v2".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "sess-v2",
                 "journal_file": "/tmp/sess-v2.jsonl",
                 "journal_lines_non_empty": 2,
@@ -1717,8 +1728,10 @@ mod tests {
         let out = render(&r, Format::Text, false);
         assert!(out.contains("attempts=2 turns=1 turn_errors=1"));
         assert!(out.contains("tool_calls=14 tool_failures=2"));
-        assert!(out.contains("root_tokens_in=60147 root_tokens_out=7112 root_duration_ms=116320"));
-        assert!(out.contains("subruns=3 inclusive_tokens_in=189908"));
+        assert!(out.contains(
+            "known_root_tokens_in=60147 known_root_tokens_out=7112 root_duration_ms=116320"
+        ));
+        assert!(out.contains("subruns=3 known_inclusive_tokens_in=189908"));
         assert!(
             out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
         );
@@ -1732,7 +1745,7 @@ mod tests {
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "requested".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "foreign",
                 "journal_file": "/tmp/foreign.jsonl",
                 "journal_lines_non_empty": 1,

@@ -3141,7 +3141,9 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
     let mut interactive = Vec::new();
     for entry in entries {
         match entry {
-            NextTurnSubmission::Interactive(text) => interactive.push(text),
+            NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => {
+                interactive.push(text)
+            }
             NextTurnSubmission::Guidance(intent) => {
                 bottom_pane.retain_returned_root_guidance(intent);
             }
@@ -3867,13 +3869,9 @@ async fn submit_active_run_guidance(
                         });
                     }
                     GuidanceSubmissionError::GuidanceClosed(notice) => {
-                        return Err(if let Some(previous) = last_unconfirmed {
-                            GuidanceSubmissionError::Unconfirmed(format!(
-                                "{previous} The retry found that the run had finished."
-                            ))
-                        } else {
-                            GuidanceSubmissionError::GuidanceClosed(notice)
-                        });
+                        // Exact duplicates are checked before terminal status;
+                        // this response proves that this input was not admitted.
+                        return Err(GuidanceSubmissionError::GuidanceClosed(notice));
                     }
                     GuidanceSubmissionError::Unconfirmed(error) => {
                         last_unconfirmed = Some(error);
@@ -8152,7 +8150,11 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::DismissUnconfirmedRootGuidance { intent_id } => {
-            bottom_pane.dismiss_unconfirmed_root_guidance(&intent_id);
+            if bottom_pane.dismiss_unconfirmed_root_guidance(&intent_id) {
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                    "The local message was discarded; the run may still apply it.",
+                ));
+            }
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::OpenReturnedAgentGuide => {
@@ -10128,7 +10130,7 @@ pub(crate) async fn run_tui_session(
                                     continue;
                                 };
                                 match next {
-                                    NextTurnSubmission::Interactive(text) => (None, BottomPaneAction::SubmitInput(text)),
+                                    NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => (None, BottomPaneAction::SubmitInput(text)),
                                     NextTurnSubmission::Guidance(intent) => (None, BottomPaneAction::SubmitInput(
                                         slash_dispatch::conversation_for_composer(&intent.text).into_owned())),
                                     NextTurnSubmission::Conversation { target, content } => (Some(target), BottomPaneAction::SubmitInput(content)),
@@ -10923,9 +10925,7 @@ pub(crate) async fn run_tui_session(
                                     >(1);
                                     let mut guidance_submission_in_flight = false;
                                     let mut guidance_dispatch_needed = false;
-                                    // The server has definitively closed current-run guidance.
-                                    // Later input stays queued for the next turn. This does not
-                                    // mean the visible reply has settled.
+                                    // The server has closed current-run guidance.
                                     let mut guidance_admission_closed = false;
                                     // Queue length when the in-flight guidance was submitted.
                                     // A delayed fence inserts there, ahead of messages queued
@@ -11401,8 +11401,6 @@ pub(crate) async fn run_tui_session(
                                                                 &submission.intent_id,
                                                             );
                                                             bottom_pane.mark_user_intent_unconfirmed(&submission.intent_id);
-                                                            guidance_admission_closed = true;
-                                                            guidance_handoff_blocked = true;
                                                             chat_widget.commit_concurrent_system(
                                                                 history_cell::system::SystemCell::info(format!(
                                                                     "Couldn't confirm whether your message was received. It won't be sent again automatically. ({error})"
@@ -11727,6 +11725,17 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
+                                                                        if active_plan_command(&queued_text).is_some()
+                                                                            && (bottom_pane.has_pending_turn_guidance(&turn_submission_id) || bottom_pane.has_deferred_plan())
+                                                                        {
+                                                                            bottom_pane.queue_deferred_plan(queued_text);
+                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                                                                                "Command queued until the current task finishes."
+                                                                            ));
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
                                                                         if let Some(goal) = active_plan_command(&queued_text)
                                                                             && output_settled_at.is_none()
                                                                             && !guidance_admission_closed
@@ -11838,9 +11847,9 @@ pub(crate) async fn run_tui_session(
                                                                         if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
-                                                                            guidance_admission_closed,
+                                                                            guidance_admission_closed || bottom_pane.has_deferred_plan(),
                                                                         ) {
-                                                                            // The current run no longer accepts guidance.
+                                                                            // Preserve order behind a deferred plan or closed run.
                                                                             if slash_dispatch::parse_submission(&queued_text).is_command() {
                                                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                                     "Command queued until the current task finishes."
@@ -11915,6 +11924,7 @@ pub(crate) async fn run_tui_session(
                                                                             terminal_height,
                                                                         )
                                                                         .await;
+                                                                        guidance_dispatch_needed = true;
                                                                     }
                                                                     BottomPaneAction::ViewCompleted {
                                                                         result: Some(result @ (bottom_pane::view::ViewResult::Model { .. }
@@ -12330,16 +12340,20 @@ pub(crate) async fn run_tui_session(
                                                             &frame_requester,
                                                         );
                                                     }
-                                                    if apply_active_turn_tui_control_event(
+                                                    match apply_active_turn_tui_control_event(
                                                         &ae,
                                                         &mut bottom_pane,
                                                         &mut chat_widget,
                                                         &preinstalled_run_control,
                                                         live_session_attachment_epoch,
                                                         &turn_submission_id,
-                                                    ) == UserIntentProjection::Returned {
-                                                        guidance_admission_closed = true;
-                                                        guidance_handoff_blocked = true;
+                                                    ) {
+                                                        UserIntentProjection::Applied => guidance_dispatch_needed = true,
+                                                        UserIntentProjection::Returned => {
+                                                            guidance_admission_closed = true;
+                                                            guidance_handoff_blocked = true;
+                                                        }
+                                                        UserIntentProjection::None => {}
                                                     }
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -12840,7 +12854,9 @@ pub(crate) async fn run_tui_session(
                                         turn_result,
                                         Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(_))
                                     );
-                                    let should_start_followups = !guidance_handoff_blocked && should_start_queued_followups(
+                                    let should_start_followups = !guidance_handoff_blocked
+                                        && !bottom_pane.has_unconfirmed_turn_guidance(&turn_submission_id)
+                                        && should_start_queued_followups(
                                         turn_succeeded,
                                         state.last_turn_interrupted,
                                                                     exit_after_turn_settlement,
@@ -14915,7 +14931,9 @@ mod tests {
         items
             .into_iter()
             .map(|item| match item {
-                NextTurnSubmission::Interactive(text) => text,
+                NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => {
+                    text
+                }
                 NextTurnSubmission::Guidance(intent) => {
                     slash_dispatch::conversation_for_composer(&intent.text).into_owned()
                 }
@@ -16352,6 +16370,69 @@ mod tests {
         assert!(pane.composer.is_empty());
         assert!(!rendered_transcript_overlay(&widget, 80).contains("old message"));
         assert!(control.pending_remote_disposition_ids().is_empty());
+    }
+
+    #[test]
+    fn late_applied_guidance_releases_the_same_turn_fifo() {
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        pane.accept_turn_user_intent("turn", "first".into(), "first message".into())
+            .unwrap();
+        pane.accept_turn_user_intent("turn", "second".into(), "second message".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("first"));
+        assert!(pane.has_unconfirmed_turn_guidance("turn"));
+        assert!(pane.next_unsent_guidance("turn").is_none());
+
+        let applied = TuiAppEvent::UserIntentApplied {
+            intent_id: "first".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            event_index: 7,
+            content: "first message".into(),
+        };
+        assert_eq!(
+            apply_active_turn_tui_control_event(
+                &applied,
+                &mut pane,
+                &mut widget,
+                &control,
+                1,
+                "turn"
+            ),
+            UserIntentProjection::Applied
+        );
+        assert!(!pane.has_unconfirmed_turn_guidance("turn"));
+        assert_eq!(
+            pane.next_unsent_guidance("turn").unwrap().text,
+            "second message"
+        );
+    }
+
+    #[test]
+    fn deferred_plan_and_later_input_keep_their_next_turn_order() {
+        let mut pane = BottomPane::new();
+        pane.queue_deferred_plan("/plan inspect first".into());
+        assert!(pane.has_deferred_plan());
+        pane.queue_next_turn_submission("later question".into());
+        let mut post_output = pane.take_queued_next_turn_submissions();
+        let mut followups = VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut post_output, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.pop_front(),
+            Some(NextTurnSubmission::DeferredPlan(
+                "/plan inspect first".into()
+            ))
+        );
+        assert_eq!(
+            followups.pop_front(),
+            Some(NextTurnSubmission::Interactive("later question".into()))
+        );
+        assert!(followups.is_empty());
     }
 
     #[tokio::test]
@@ -22408,7 +22489,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn active_guidance_retry_keeps_earlier_ambiguous_delivery() {
+    async fn active_guidance_retry_reconciles_exact_terminal_admission() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let _credentials = crate::tests::isolate_credentials();
@@ -22421,7 +22502,7 @@ mod tests {
         }
         for (responses, expected) in [
             (vec![503, 403], "unknown"),
-            (vec![503, 409], "unknown"),
+            (vec![503, 409], "closed"),
             (vec![503, 200], "accepted"),
             (vec![403], "rejected"),
             (vec![409], "closed"),

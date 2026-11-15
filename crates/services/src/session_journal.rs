@@ -3392,6 +3392,9 @@ impl TurnEventBuffer {
     pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
         for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !meta.is_object() {
+                *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+            }
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
@@ -3417,6 +3420,9 @@ fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64
     let meta = events[0]
         .metadata
         .get_or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+    }
     if let Some(obj) = meta.as_object_mut() {
         obj.insert(
             TURN_EVENT_DROPPED_META_KEY.into(),
@@ -11951,6 +11957,31 @@ mod turn_event_buffer_tests {
             Some(5)
         );
         assert_eq!(buf.dropped_events(), 0);
+    }
+
+    #[test]
+    fn interrupted_flush_preserves_non_object_metadata_and_retention_loss() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 1);
+        for _ in 0..=TURN_EVENT_BUFFER_CAP {
+            let mut event = JournalEvent::base_public(JournalEventType::LlmRound, Some("s"));
+            event.metadata = Some(serde_json::json!("original"));
+            buf.record(event);
+        }
+        let events = buf.prepare_flush(true);
+        assert_eq!(events.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
+        assert_eq!(events[0].metadata.as_ref().unwrap()["partial"], true);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()[TURN_EVENT_DROPPED_META_KEY],
+            1
+        );
+        assert_eq!(
+            buf.prepare_flush(true)[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
     }
 
     #[test]

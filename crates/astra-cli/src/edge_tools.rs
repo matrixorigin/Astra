@@ -1177,6 +1177,11 @@ fn format_background_task_output(
             "The failure cause is unverified. Search captured output before assigning a cause; a failed status alone does not establish a flaky test."
         );
     }
+    if snapshot.status == BgTaskOutputStatus::Unavailable {
+        result["status_note"] = json!(
+            "Live observation and control are unavailable. Terminal means waiting cannot continue, not that the underlying work exited; its outcome is unknown. Only retained output is available."
+        );
+    }
     if live_shell
         && (snapshot.output.contains("[REDACTED:")
             || snapshot.output.contains("[Live output withheld:"))
@@ -9682,6 +9687,16 @@ pub(crate) mod tests {
             assert_eq!(result["status"], status);
             assert_eq!(result["terminal"], terminal);
             assert_eq!(result["output"], "latest bounded chunk");
+            if status == "unavailable" {
+                assert!(
+                    result["status_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("outcome is unknown")
+                );
+            } else {
+                assert!(result.get("status_note").is_none());
+            }
             if !terminal {
                 assert!(result.get("next_offset").is_none(), "{result}");
             }

@@ -593,17 +593,19 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
                         let index = (n as u64) * 2 + 1;
                         let rejected = text == "needs correction";
                         if !rejected {
-                            received
-                                .lock()
-                                .unwrap()
-                                .push((intent_id.clone(), text.clone(), index));
+                            let mut received = received.lock().unwrap();
+                            if !received.iter().any(|(id, _, _)| id == &intent_id) {
+                                received.push((intent_id.clone(), text.clone(), index));
+                            }
                         }
                         let bearer = headers.get("authorization").unwrap().to_str().unwrap().to_owned();
-                        sent_tx.send((run_id.clone(), text, bearer)).unwrap();
+                        sent_tx.send((run_id.clone(), text.clone(), bearer)).unwrap();
                         if n == 0 {
                             release_first.notified().await;
                         }
-                        if rejected {
+                        if matches!(text.as_str(), "ambiguous instruction" | "discarded uncertain") {
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"detail":"ack unavailable"})))
+                        } else if rejected {
                             release_rejection.notified().await;
                             (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail": "Please correct this message"})))
                         } else {
@@ -739,6 +741,92 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         "live disposition must not wait for the terminal lookup"
     );
     assert_eq!(mock.received_requests().len(), 1, "the turn remains open");
+
+    // The server admitted this input but both POST acknowledgements were
+    // lost. A later stream disposition must unblock the same-turn FIFO.
+    astra.paste_and_submit("ambiguous instruction");
+    for _ in 0..2 {
+        let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.1, "ambiguous instruction");
+    }
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("later live question");
+    astra.wait_for("later live question", UI_TRANSITION_TIMEOUT);
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "an unknown prior message must retain FIFO order"
+    );
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "ambiguous instruction")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    let later = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.1, "later live question");
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "later live question")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "the original turn is still running"
+    );
+
+    astra.paste_and_submit("discarded uncertain");
+    for _ in 0..2 {
+        let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.1, "discarded uncertain");
+    }
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("after discard");
+    astra.wait_for("after discard", UI_TRANSITION_TIMEOUT);
+    assert!(sent_rx.try_recv().is_err());
+    astra.write(b"\x1bu"); // Open the existing recovery view.
+    astra.wait_for("delivery unknown", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1bd"); // Discard the local copy explicitly.
+    astra.wait_for("may still apply it", UI_TRANSITION_TIMEOUT);
+    let after_discard = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_discard.1, "after discard");
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "after discard")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
     astra.paste_and_submit("needs correction");
     let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -830,6 +918,9 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         [
             "first instruction",
             "second instruction",
+            "ambiguous instruction",
+            "later live question",
+            "after discard",
             "corrected instruction"
         ]
     );
@@ -887,6 +978,123 @@ fn seed_account(home: &std::path::Path) {
             );
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
+    use axum::{Json, extract::Path, http::StatusCode, routing::post};
+    use std::sync::Arc;
+    let _journey = pty_journey_lock().lock().await;
+    for uncertain in [false, true] {
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let routes = axum::Router::new().route("/chat/runs/{run_id}/intents", post({
+            let release = release.clone();
+            move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let release = release.clone();
+                let sent_tx = sent_tx.clone();
+                async move {
+                    sent_tx.send(body.clone()).unwrap();
+                    let first_message = body["input"]["content"] == "first instruction";
+                    if uncertain && first_message {
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})))
+                    } else {
+                        if first_message {
+                            release.notified().await;
+                        }
+                        (StatusCode::OK, Json(serde_json::json!({"run_id":run_id,
+                            "intent_id":body["intent_id"], "status":"accepted_remote", "duplicate":false,
+                            "event_index": if first_message {1} else {3}})))
+                    }
+                }
+            }
+        }));
+        let mock =
+            astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+                astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+                true,
+                routes,
+            )
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        seed_trusted_workspace(home.path());
+        seed_account(home.path());
+        let mut astra = PtyAstra::spawn_with_config(
+            home.path(),
+            &mock.base_url,
+            "mock-model",
+            "gateway-token",
+            &[],
+        );
+        astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("Start a task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().is_empty() {
+            assert!(Instant::now() < deadline);
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.paste_and_submit("first instruction");
+        let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if uncertain {
+            let retry = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry, first);
+            astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+        }
+        astra.paste_and_submit("earlier guidance");
+        astra.wait_for("earlier guidance", UI_TRANSITION_TIMEOUT);
+        assert!(sent_rx.try_recv().is_err());
+        astra.paste_and_submit("/plan inspect first");
+        astra.wait_for(
+            "Command queued until the current task finishes",
+            UI_TRANSITION_TIMEOUT,
+        );
+        astra.paste_and_submit("later question");
+        astra.wait_for("later question", UI_TRANSITION_TIMEOUT);
+        release.notify_one();
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":first["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":1, "content":"first instruction",
+        }));
+        astra.wait_for_screen("first message applied", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("› first instruction") && !screen.contains("delivery is unknown")
+        });
+        let earlier = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(earlier["input"]["content"], "earlier guidance");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":earlier["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":3, "content":"earlier guidance",
+        }));
+        astra.wait_for_screen(
+            "earlier guidance applied",
+            UI_TRANSITION_TIMEOUT,
+            |screen| screen.contains("› earlier guidance"),
+        );
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "later question overtook deferred /plan"
+        );
+        assert_eq!(
+            mock.received_requests().len(),
+            1,
+            "original run must still be active"
+        );
+        astra.signal(nix::sys::signal::Signal::SIGHUP);
+        assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

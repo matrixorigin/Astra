@@ -6,7 +6,7 @@ use astra_turn_core::token_accounting::TokenAccounting;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub const SCHEMA_VERSION: &str = "astra-journal-digest-v2";
+pub const SCHEMA_VERSION: &str = "astra-journal-digest-v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestFocus {
@@ -69,6 +69,9 @@ pub struct JournalDigest {
     /// Structured accounting provenance; never treat mixed root/child totals
     /// as an invoice or a complete provider ledger.
     pub usage_coverage: UsageCoverage,
+    /// Observed loss or partial flushes, before linked sources are filtered.
+    /// Absence of a marker does not prove the source is complete.
+    pub journal_source_coverage: Vec<JournalSourceCoverage>,
     /// Additional journal for the authenticated account attached to this CLI
     /// profile. The conversation cursor is lineage, not read authorization.
     /// Root turn durability remains in `journal_file`;
@@ -115,6 +118,21 @@ pub struct UsageCoverage {
     pub account_journal_attached: bool,
     pub inclusive_totals_are_billing: bool,
     pub conflicting_rounds_excluded: usize,
+}
+
+#[derive(Serialize)]
+pub struct JournalSourceCoverage {
+    pub path: String,
+    pub available: bool,
+    pub partial_flush_seen: bool,
+    pub retained_event_losses: Vec<RetainedEventLoss>,
+}
+
+#[derive(Serialize)]
+pub struct RetainedEventLoss {
+    pub turn: Option<u32>,
+    pub producer_scope: Option<session_journal::JournalProducerScope>,
+    pub dropped_events_before: u64,
 }
 
 #[derive(Serialize)]
@@ -168,8 +186,8 @@ pub struct Aggregates {
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
     /// Subset of `tool_calls_failed`. Non-zero means the agent hit safety walls.
     pub safety_guard_blocks: u64,
-    pub avg_tokens_in: f64,
-    pub avg_tokens_out: f64,
+    pub avg_tokens_in: Option<f64>,
+    pub avg_tokens_out: Option<f64>,
     pub avg_duration_ms: f64,
     /// Average LLM rounds per turn (how many LLM→tool cycles).
     pub avg_llm_rounds: f64,
@@ -324,6 +342,10 @@ pub struct SideEvent {
     pub turn: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agentic_step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_scope: Option<session_journal::JournalProducerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub detail: serde_json::Value,
 }
 
@@ -655,23 +677,24 @@ pub(super) fn producer_run_id(ev: &session_journal::JournalEvent) -> Option<&str
         .filter(|run| !run.trim().is_empty())
 }
 
-fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
+pub(super) fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
     ev.producer_scope.as_ref().is_some_and(|scope| {
         scope.parent_run_id.is_some()
             || scope
                 .agent_id
                 .as_deref()
                 .is_some_and(|agent| agent != "root")
-            || ev.metadata.as_ref().is_some_and(|metadata| {
-                metadata.get("purpose").and_then(serde_json::Value::as_str) == Some("sub_agent")
-                    || metadata.get("source").and_then(serde_json::Value::as_str)
-                        == Some("child_agent")
-            })
+    }) || ev.metadata.as_ref().is_some_and(|metadata| {
+        metadata.get("purpose").and_then(serde_json::Value::as_str) == Some("sub_agent")
+            || metadata.get("source").and_then(serde_json::Value::as_str) == Some("child_agent")
     })
 }
 
 fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
-    let scope = ev.producer_scope.as_ref()?;
+    let scope = ev
+        .producer_scope
+        .as_ref()
+        .filter(|scope| !scope.run_id.trim().is_empty())?;
     is_child_producer(ev).then(|| SubrunIdentity {
         run_id: scope.run_id.clone(),
         parent_run_id: scope.parent_run_id.clone(),
@@ -788,21 +811,92 @@ pub(super) fn is_root_terminal(event: &session_journal::JournalEvent) -> bool {
     ) && !is_child_producer(event)
 }
 
-/// Known root terminal buckets, shared by the offline journal projections.
-/// Round observations never replace or add to qualified terminal accounting.
-pub(crate) fn root_terminal_usage(events: &[session_journal::JournalEvent]) -> TokenAccounting {
-    events.iter().filter(|event| is_root_terminal(event)).fold(
-        TokenAccounting::default(),
-        |mut total, event| {
-            total.accumulate(&TokenAccounting::from_fields(
-                event.tokens_in.unwrap_or(0),
-                event.cache_read_tokens.unwrap_or(0),
-                event.cache_creation_tokens.unwrap_or(0),
-                event.tokens_out.unwrap_or(0),
-            ));
-            total
-        },
-    )
+/// Known root terminal buckets and whether every observed terminal reported
+/// each bucket. Round observations are not qualified terminal accounting.
+pub(crate) struct RootTerminalUsage {
+    pub known: TokenAccounting,
+    pub prompt_complete: bool,
+    pub completion_complete: bool,
+    pub cache_read_complete: bool,
+    pub cache_creation_complete: bool,
+}
+
+pub(crate) fn has_incomplete_observation(events: &[session_journal::JournalEvent]) -> bool {
+    events.iter().any(|event| {
+        let Some(metadata) = event.metadata.as_ref() else {
+            return false;
+        };
+        metadata.get("partial").and_then(serde_json::Value::as_bool) == Some(true)
+            || metadata
+                .get("dropped_events_before")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0)
+    })
+}
+
+/// A later or unscoped model round cannot be covered by an unrelated terminal.
+pub(crate) fn has_unmatched_root_rounds(events: &[session_journal::JournalEvent]) -> bool {
+    let terminals: std::collections::HashSet<_> = events
+        .iter()
+        .filter(|event| is_root_terminal(event))
+        .filter_map(|event| Some((event.turn?, producer_run_id(event)?)))
+        .collect();
+    events
+        .iter()
+        .filter(|event| event.event_type == JournalEventType::LlmRound && !is_child_producer(event))
+        .any(|event| match (event.turn, producer_run_id(event)) {
+            (Some(turn), Some(run)) => !terminals.contains(&(turn, run)),
+            _ => true,
+        })
+}
+
+pub(crate) fn display_known(
+    value: impl std::fmt::Display + PartialEq + Default,
+    complete: bool,
+) -> String {
+    if complete {
+        value.to_string()
+    } else if value == Default::default() {
+        "?".to_owned()
+    } else {
+        format!("partial({value})")
+    }
+}
+
+pub(crate) fn root_terminal_usage(
+    events: &[session_journal::JournalEvent],
+    observation_incomplete: bool,
+) -> RootTerminalUsage {
+    let mut known = TokenAccounting::default();
+    let mut complete = [true; 4];
+    let mut seen = false;
+    for event in events.iter().filter(|event| is_root_terminal(event)) {
+        seen = true;
+        known.accumulate(&TokenAccounting::from_fields(
+            event.tokens_in.unwrap_or(0),
+            event.cache_read_tokens.unwrap_or(0),
+            event.cache_creation_tokens.unwrap_or(0),
+            event.tokens_out.unwrap_or(0),
+        ));
+        for (complete, value) in complete.iter_mut().zip([
+            event.tokens_in,
+            event.tokens_out,
+            event.cache_read_tokens,
+            event.cache_creation_tokens,
+        ]) {
+            *complete &= value.is_some();
+        }
+    }
+    if !seen || observation_incomplete {
+        complete = [false; 4];
+    }
+    RootTerminalUsage {
+        known,
+        prompt_complete: complete[0],
+        completion_complete: complete[1],
+        cache_read_complete: complete[2],
+        cache_creation_complete: complete[3],
+    }
 }
 
 fn usage_source(event: &session_journal::JournalEvent) -> &'static str {
@@ -1060,6 +1154,43 @@ struct LinkedDigestJournals {
     primary_path: String,
     supplemental_paths: Vec<String>,
     conflicting_round_count: usize,
+    source_coverage: Vec<JournalSourceCoverage>,
+}
+
+fn source_coverage(
+    path: String,
+    events: &[session_journal::JournalEvent],
+    available: bool,
+) -> JournalSourceCoverage {
+    let partial_flush_seen = events.iter().any(|event| {
+        event
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("partial"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    let retained_event_losses = events
+        .iter()
+        .filter_map(|event| {
+            let dropped = event
+                .metadata
+                .as_ref()?
+                .get("dropped_events_before")?
+                .as_u64()?;
+            (dropped > 0).then(|| RetainedEventLoss {
+                turn: event.turn,
+                producer_scope: event.producer_scope.clone(),
+                dropped_events_before: dropped,
+            })
+        })
+        .collect();
+    JournalSourceCoverage {
+        path,
+        available,
+        partial_flush_seen,
+        retained_event_losses,
+    }
 }
 
 pub(crate) struct AttachedJournalSource {
@@ -1122,17 +1253,24 @@ fn read_linked_digest_journals(
     session_id: &str,
     local_owner: &astra_services::OwnerScope,
     account_owner: Option<&astra_services::OwnerScope>,
+    require_primary: bool,
+    include_supplemental: fn(&JournalEventType) -> bool,
 ) -> Result<LinkedDigestJournals, String> {
     let mut sources =
         read_attached_journal_sources_with_owners(session_id, local_owner, account_owner)?
             .into_iter();
     let primary = sources.next().expect("the local source is always present");
-    if !primary.available {
+    if require_primary && !primary.available {
         return Err(format!(
             "session journal not found: {}",
             primary.path.display()
         ));
     }
+    let mut coverage = vec![source_coverage(
+        primary.path.to_string_lossy().into_owned(),
+        &primary.events,
+        primary.available,
+    )];
     let mut events = primary.events;
     session_journal::stabilize_event_order(&mut events);
     let mut non_empty = primary.non_empty;
@@ -1146,13 +1284,15 @@ fn read_linked_digest_journals(
         if source.available {
             supplemental_paths.push(source.path.to_string_lossy().into_owned());
         }
+        coverage.push(source_coverage(
+            source.path.to_string_lossy().into_owned(),
+            &source.events,
+            source.available,
+        ));
         supplemental_events.extend(source.events);
     }
-    let conflicting_round_count = merge_attached_events(
-        &mut events,
-        supplemental_events,
-        contributes_runtime_digest_detail,
-    );
+    let conflicting_round_count =
+        merge_attached_events(&mut events, supplemental_events, include_supplemental);
     Ok(LinkedDigestJournals {
         events,
         non_empty,
@@ -1160,7 +1300,40 @@ fn read_linked_digest_journals(
         primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
         conflicting_round_count,
+        source_coverage: coverage,
     })
+}
+
+/// Reuse the digest's authorized source join for other offline projections.
+pub(crate) fn read_journal_for_analysis(
+    session_id: &str,
+) -> Result<(Vec<session_journal::JournalEvent>, bool), String> {
+    let (local, account) = crate::cli::cli_config::cli_utils::attached_journal_owners()?;
+    read_journal_for_analysis_with_owners(session_id, &local, account.as_ref())
+}
+
+fn read_journal_for_analysis_with_owners(
+    session_id: &str,
+    local: &astra_services::OwnerScope,
+    account: Option<&astra_services::OwnerScope>,
+) -> Result<(Vec<session_journal::JournalEvent>, bool), String> {
+    let joined = read_linked_digest_journals(session_id, local, account, false, |kind| {
+        contributes_runtime_digest_detail(kind)
+            || matches!(
+                kind,
+                JournalEventType::DelegationStarted
+                    | JournalEventType::DelegationSubRunStarted
+                    | JournalEventType::DelegationSubRunCompleted
+            )
+    })?;
+    let incomplete = joined.malformed > 0
+        || joined.conflicting_round_count > 0
+        || joined.source_coverage.iter().any(|source| {
+            !source.available
+                || source.partial_flush_seen
+                || !source.retained_event_losses.is_empty()
+        });
+    Ok((joined.events, incomplete))
 }
 
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
@@ -1182,7 +1355,14 @@ fn build_digest_with_owners(
         primary_path: journal_file,
         supplemental_paths: supplemental_journal_files,
         conflicting_round_count,
-    } = read_linked_digest_journals(session_id, local_owner, account_owner)?;
+        source_coverage: journal_source_coverage,
+    } = read_linked_digest_journals(
+        session_id,
+        local_owner,
+        account_owner,
+        true,
+        contributes_runtime_digest_detail,
+    )?;
 
     let mut turns_out: Vec<TurnRow> = Vec::new();
     let mut compaction_events = Vec::new();
@@ -1191,12 +1371,25 @@ fn build_digest_with_owners(
     let mut turn_errors = Vec::new();
     let mut other_errors = Vec::new();
 
+    let source_incomplete = journal_lines_malformed > 0
+        || conflicting_round_count > 0
+        || journal_source_coverage.iter().any(|source| {
+            !source.available
+                || source.partial_flush_seen
+                || !source.retained_event_losses.is_empty()
+        });
+    let root_usage = root_terminal_usage(
+        &events,
+        source_incomplete
+            || has_incomplete_observation(&events)
+            || has_unmatched_root_rounds(&events),
+    );
     let TokenAccounting {
         prompt: total_tokens_in,
         cache_read: total_cache_read_tokens,
         cache_creation: total_cache_creation_tokens,
         completion: total_tokens_out,
-    } = root_terminal_usage(&events);
+    } = root_usage.known;
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
     let mut tool_calls_unknown: u64 = 0;
@@ -1222,8 +1415,11 @@ fn build_digest_with_owners(
     let mut subrun_total_tokens_out = 0u64;
     let mut subrun_total_duration_ms = 0u64;
     let mut subrun_total_tool_calls = 0u64;
-    let mut root_terminal_buckets_complete = true;
-    let mut observed_child_round_buckets_complete = true;
+    let root_terminal_buckets_complete = root_usage.prompt_complete
+        && root_usage.completion_complete
+        && root_usage.cache_read_complete
+        && root_usage.cache_creation_complete;
+    let mut observed_child_round_buckets_complete = !source_incomplete;
 
     // Index the whole authorized snapshot before projecting terminals. A
     // server round can appear after a CLI terminal with the same timestamp;
@@ -1232,7 +1428,7 @@ fn build_digest_with_owners(
         std::collections::HashMap::new();
     for event in &events {
         if event.event_type == JournalEventType::LlmRound
-            && subrun_identity(event).is_none()
+            && !is_child_producer(event)
             && let Some(turn) = event.turn
         {
             llm_rounds_by_turn
@@ -1246,10 +1442,6 @@ fn build_digest_with_owners(
     for ev in &events {
         match ev.event_type {
             JournalEventType::Turn if is_root_terminal(ev) => {
-                root_terminal_buckets_complete &= ev.tokens_in.is_some()
-                    && ev.cache_read_tokens.is_some()
-                    && ev.cache_creation_tokens.is_some()
-                    && ev.tokens_out.is_some();
                 seq += 1;
                 let pending_rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
                 let observed_round_usage = observed_runtime_round_usage(ev, &pending_rounds);
@@ -1411,10 +1603,6 @@ fn build_digest_with_owners(
                 turns_out.push(row);
             }
             JournalEventType::TurnError if is_root_terminal(ev) => {
-                root_terminal_buckets_complete &= ev.tokens_in.is_some()
-                    && ev.cache_read_tokens.is_some()
-                    && ev.cache_creation_tokens.is_some()
-                    && ev.tokens_out.is_some();
                 seq += 1;
                 turn_error_count += 1;
                 let pending_rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
@@ -1525,6 +1713,8 @@ fn build_digest_with_owners(
                     kind: "compact".to_string(),
                     turn: ev.turn,
                     agentic_step: ev.agentic_step,
+                    producer_scope: ev.producer_scope.clone(),
+                    source: None,
                     detail,
                 });
             }
@@ -1535,6 +1725,8 @@ fn build_digest_with_owners(
                     kind: "stall".to_string(),
                     turn: ev.turn,
                     agentic_step: ev.agentic_step,
+                    producer_scope: ev.producer_scope.clone(),
+                    source: None,
                     detail: json!({
                         "stall_type": ev.stall_type,
                         "error": ev.error,
@@ -1547,6 +1739,13 @@ fn build_digest_with_owners(
                     kind: "interruption".to_string(),
                     turn: ev.turn,
                     agentic_step: ev.agentic_step,
+                    producer_scope: ev.producer_scope.clone(),
+                    source: ev
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("source"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     detail: ev
                         .metadata
                         .as_ref()
@@ -1562,6 +1761,8 @@ fn build_digest_with_owners(
                     kind: "error".to_string(),
                     turn: ev.turn,
                     agentic_step: ev.agentic_step,
+                    producer_scope: ev.producer_scope.clone(),
+                    source: None,
                     detail: json!({ "message": ev.error }),
                 });
             }
@@ -1595,6 +1796,10 @@ fn build_digest_with_owners(
                             .llm_round_details
                             .push(round);
                     }
+                } else if is_child_producer(ev) {
+                    // Child evidence without its producer identity cannot be
+                    // joined or counted as a complete child observation.
+                    observed_child_round_buckets_complete = false;
                 }
             }
             _ => {}
@@ -1605,12 +1810,16 @@ fn build_digest_with_owners(
     let unattributed_root_round_count = llm_rounds_by_turn.values().map(Vec::len).sum();
     let attempt_count = turn_count + turn_error_count;
     let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if attempt_count == 0 {
-        (0.0, 0.0, 0.0)
+        (None, None, 0.0)
     } else {
         let n = attempt_count as f64;
         (
-            total_tokens_in as f64 / n,
-            total_tokens_out as f64 / n,
+            root_usage
+                .prompt_complete
+                .then_some(total_tokens_in as f64 / n),
+            root_usage
+                .completion_complete
+                .then_some(total_tokens_out as f64 / n),
             total_duration_ms as f64 / n,
         )
     };
@@ -1644,6 +1853,7 @@ fn build_digest_with_owners(
             inclusive_totals_are_billing: false,
             conflicting_rounds_excluded: conflicting_round_count,
         },
+        journal_source_coverage,
         supplemental_journal_files,
         journal_lines_non_empty,
         journal_lines_malformed,
@@ -1714,6 +1924,24 @@ fn build_digest_with_owners(
     })
 }
 
+fn interruption_text(event: &SideEvent) -> String {
+    let scope = event.producer_scope.as_ref();
+    format!(
+        "{} turn={:?} step={:?} source={} run={} agent={} {}",
+        event.ts,
+        event.turn,
+        event.agentic_step,
+        event.source.as_deref().unwrap_or("unknown"),
+        scope
+            .map(|scope| scope.run_id.as_str())
+            .unwrap_or("unknown"),
+        scope
+            .and_then(|scope| scope.agent_id.as_deref())
+            .unwrap_or("unknown"),
+        event.detail,
+    )
+}
+
 pub fn print_text(d: &JournalDigest) {
     use crossterm::style::Stylize;
     stdout_println!("  {} {}", "schema_version:".dim(), d.schema_version);
@@ -1730,6 +1958,30 @@ pub fn print_text(d: &JournalDigest) {
     );
     for file in &d.supplemental_journal_files {
         stdout_println!("  {} {}", "runtime_journal:".dim(), file);
+    }
+    for source in &d.journal_source_coverage {
+        if !source.available
+            || source.partial_flush_seen
+            || !source.retained_event_losses.is_empty()
+        {
+            stdout_println!("  journal observation is partial: {}", source.path);
+            if !source.available {
+                stdout_println!("    source unavailable");
+            }
+            for loss in &source.retained_event_losses {
+                let run = loss
+                    .producer_scope
+                    .as_ref()
+                    .map(|scope| scope.run_id.as_str())
+                    .unwrap_or("unknown");
+                stdout_println!(
+                    "    dropped_events_before={} turn={:?} run={}",
+                    loss.dropped_events_before,
+                    loss.turn,
+                    run
+                );
+            }
+        }
     }
     stdout_println!(
         "  {} non_empty={} malformed={}",
@@ -1765,7 +2017,7 @@ pub fn print_text(d: &JournalDigest) {
         a.error_event_count
     );
     stdout_println!(
-        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={} tool_outcomes_unknown={}",
+        "  known_tokens_in={} known_tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={} tool_outcomes_unknown={}",
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
@@ -1804,9 +2056,11 @@ pub fn print_text(d: &JournalDigest) {
     }
     stdout_println!("\n  {}", "Averages (per root attempt)".bold().magenta());
     stdout_println!(
-        "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
-        a.avg_tokens_in,
-        a.avg_tokens_out,
+        "  tokens_in={} tokens_out={} duration_ms={:.1}",
+        a.avg_tokens_in
+            .map_or_else(|| "unknown".to_string(), |v| format!("{v:.1}")),
+        a.avg_tokens_out
+            .map_or_else(|| "unknown".to_string(), |v| format!("{v:.1}")),
         a.avg_duration_ms
     );
     if a.avg_llm_rounds > 0.0 {
@@ -1940,17 +2194,7 @@ pub fn print_text(d: &JournalDigest) {
             d.interruptions.len().to_string().magenta()
         );
         for e in &d.interruptions {
-            let step = e
-                .agentic_step
-                .map(|step| format!(" step={step}"))
-                .unwrap_or_default();
-            stdout_println!(
-                "    {} {}{} {}",
-                e.ts.as_str().dim(),
-                format!("turn={:?}", e.turn).dim(),
-                step.dim(),
-                e.detail
-            );
+            stdout_println!("    {}", interruption_text(e));
         }
     }
     if !d.stalls.is_empty() {
@@ -2208,7 +2452,7 @@ mod tests {
         let sid = "test-digest-telemetry-00000000-0000-0000-0000-000000000004";
         write_test_journal(journal_path_for_test(sid),
             r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"server_loop","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
-{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
+{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"producer_scope":{"run_id":"run-1","agent_id":"worker"},"metadata":{"source":"agentic_loop","interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
 {"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":3,"metadata":{"run_id":"run-1"},"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"continue","tool_calls":[{"name":"bash","ok":true,"ms":10}],"llm_rounds":1}
 "#,
         )
@@ -2219,6 +2463,11 @@ mod tests {
         assert_eq!(d.interruptions[0].turn, Some(3));
         assert_eq!(d.interruptions[0].agentic_step, Some(5));
         assert_eq!(d.interruptions[0].detail["tool_calls_completed"], 2);
+        let text = super::interruption_text(&d.interruptions[0]);
+        assert!(
+            text.contains("source=agentic_loop run=run-1 agent=worker"),
+            "{text}"
+        );
 
         assert_eq!(d.turns.len(), 1);
         assert_eq!(d.turns[0].llm_round_details.len(), 1);
@@ -2334,6 +2583,99 @@ mod tests {
             digest.journal_lines_non_empty, 3,
             "physical line count spans both journals even when a mirrored event is de-duplicated"
         );
+    }
+
+    #[test]
+    fn digest_retains_supplemental_loss_before_filtering_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-digest-supplemental-loss";
+        let (local, _) = crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
+        let account = astra_services::OwnerScope::user("loss-owner").unwrap();
+        write_test_journal(journal_path_for_test(sid), format!(
+            r#"{{"type":"turn","ts":"t1","session_id":"{sid}","turn":1,"tokens_in":0,"tokens_out":8,"cache_read_tokens":0,"cache_creation_tokens":0}}"#
+        )).unwrap();
+        let path =
+            astra_services::session_journal::journal_file_path_for_user(account.id(), sid).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let account_events = [
+            serde_json::json!({"type":"session_start","ts":"t0","session_id":sid,
+                "turn":1,"producer_scope":{"run_id":"run-a"},
+                "metadata":{"dropped_events_before":545,"partial":true}}),
+            serde_json::json!({"type":"delegation_sub_run_started","ts":"t1","session_id":sid,
+                "metadata":{"run_id":"child","agent_type":"worker"}}),
+            serde_json::json!({"type":"delegation_sub_run_completed","ts":"t2","session_id":sid,
+                "tokens_in":12,"tokens_out":3,"tool_count":0,"metadata":{"run_id":"child"}}),
+        ];
+        fs::write(
+            &path,
+            account_events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let digest =
+            build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account)).unwrap();
+        let source = digest
+            .journal_source_coverage
+            .iter()
+            .find(|source| source.path == path.to_string_lossy())
+            .unwrap();
+        assert!(source.partial_flush_seen);
+        assert_eq!(source.retained_event_losses.len(), 1);
+        assert_eq!(source.retained_event_losses[0].dropped_events_before, 545);
+        assert_eq!(
+            source.retained_event_losses[0]
+                .producer_scope
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-a"
+        );
+        assert!(!digest.usage_coverage.root_terminal_buckets_complete);
+        assert_eq!(digest.aggregates.avg_tokens_in, None);
+        assert_eq!(digest.aggregates.total_tokens_in, 0);
+        let (events, incomplete) =
+            super::read_journal_for_analysis_with_owners(sid, &local, Some(&account)).unwrap();
+        assert!(incomplete);
+        let (tree, _, _) =
+            crate::cli::journal_tree::fold_events_with_coverage(sid, &events, incomplete);
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].prompt_tokens, 12);
+        assert!(!tree.prompt_tokens_complete);
+        let diff = crate::cli::journal_diff::diff_events_with_coverage(
+            sid, sid, &events, &events, incomplete, incomplete,
+        );
+        assert!(diff.a_observation_incomplete);
+        assert_eq!(diff.token_deltas.total, None);
+    }
+
+    #[test]
+    fn unscoped_child_round_is_not_counted_as_root_or_complete_child_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "unscoped-child-round";
+        let events = [
+            serde_json::json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+                "tokens_in":2,"tokens_out":1,"cache_read_tokens":0,"cache_creation_tokens":0}),
+            serde_json::json!({"type":"llm_round","ts":"t2","session_id":sid,
+                "tokens_in":20,"tokens_out":3,"metadata":{"purpose":"sub_agent"}}),
+        ];
+        write_test_journal(
+            journal_path_for_test(sid),
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let digest = build_digest(sid, DigestFocus::All).unwrap();
+        assert_eq!(digest.aggregates.total_tokens_in, 2);
+        assert_eq!(digest.aggregates.subrun_count, 0);
+        assert!(!digest.usage_coverage.observed_child_round_buckets_complete);
+        assert_eq!(digest.unattributed_root_round_count, 0);
     }
 
     #[test]

@@ -43643,6 +43643,21 @@ mod tests {
                 .unwrap(),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         );
+        let never_admitted = user_intent_event("intent-never-admitted");
+        assert_eq!(
+            store
+                .admit_run_guidance(guidance_admission_request(
+                    "guidance-duplicate",
+                    "intent-never-admitted",
+                    &never_admitted,
+                    false,
+                ))
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::Inactive {
+                status: STATUS_COMPLETED.into()
+            }
+        );
         let mut conflicting = event.clone();
         conflicting["data"]["input"] = json!({"content": "different immutable guidance"});
         assert_eq!(

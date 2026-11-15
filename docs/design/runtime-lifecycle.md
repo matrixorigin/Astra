@@ -837,7 +837,11 @@ already observed through the existing wake path; the atomic terminal
 transaction returns any later accepted but unapplied input to its submitting
 client. The client keeps its original identity and can queue it for the next
 turn. A terminal Run rejects new guidance while exact retries still reconcile
-an earlier committed acceptance.
+an earlier committed acceptance. If both same-identity submissions remain
+unconfirmed, later messages stay in the existing turn FIFO. A matching Applied
+event releases that FIFO; uncertainty alone neither closes Run admission nor
+permits replay under a new identity. At turn settlement, an unresolved message
+remains visible for explicit recovery.
 
 ## Cancellation
 

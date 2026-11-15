@@ -25,13 +25,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// The dashboard and report renderer consume the v2 summary wire, not an
+/// The dashboard and report renderer consume the v3 summary wire, not an
 /// arbitrary JSON object. Keep this literal aligned with the producer's
 /// `astra-cli::journal_digest::SCHEMA_VERSION`.
-pub const JOURNAL_DIGEST_SCHEMA_VERSION: &str = "astra-journal-digest-v2";
+pub const JOURNAL_DIGEST_SCHEMA_VERSION: &str = "astra-journal-digest-v3";
 
 /// Collected, validated digest blob. The `json` field retains the producer's
-/// exact v2 summary wire for downstream JSON reports without reshaping it.
+/// exact v3 summary wire for downstream JSON reports without reshaping it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DigestArtifact {
@@ -130,9 +130,14 @@ pub(crate) fn validate_digest_json(
         "avg_llm_rounds",
         "avg_tool_calls_per_round",
     ] {
-        let value = aggregates
+        let raw = aggregates
             .get(key)
-            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("digest aggregates is missing {key}"))?;
+        if raw.is_null() && matches!(key, "avg_tokens_in" | "avg_tokens_out") {
+            continue;
+        }
+        let value = raw
+            .as_f64()
             .ok_or_else(|| format!("digest aggregates is missing numeric {key}"))?;
         if !value.is_finite() || value < 0.0 {
             return Err(format!(
@@ -331,6 +336,22 @@ mod tests {
                 "avg_llm_rounds": 1.0, "avg_tool_calls_per_round": 1.0
             }
         })
+    }
+
+    #[test]
+    fn digest_accepts_unknown_token_averages_without_accepting_missing_or_invalid_values() {
+        let mut digest = valid_digest_json("session");
+        assert!(validate_digest_json(&digest, "session").is_ok());
+        digest["aggregates"]["avg_tokens_in"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_tokens_out"] = serde_json::Value::Null;
+        assert!(validate_digest_json(&digest, "session").is_ok());
+        digest["aggregates"]["avg_tokens_in"] = serde_json::json!(-1);
+        assert!(validate_digest_json(&digest, "session").is_err());
+        digest["aggregates"]
+            .as_object_mut()
+            .unwrap()
+            .remove("avg_tokens_in");
+        assert!(validate_digest_json(&digest, "session").is_err());
     }
 
     #[tokio::test]

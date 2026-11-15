@@ -80,6 +80,8 @@ enum ModelCatalogState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NextTurnSubmission {
     Interactive(String),
+    /// A plan command deferred behind earlier current-run guidance.
+    DeferredPlan(String),
     Guidance(PendingUserIntent),
     Conversation {
         target: crate::tui::event_loop::SessionContinuationTarget,
@@ -90,7 +92,7 @@ pub(crate) enum NextTurnSubmission {
 impl NextTurnSubmission {
     pub(crate) fn text(&self) -> &str {
         match self {
-            Self::Interactive(text) => text,
+            Self::Interactive(text) | Self::DeferredPlan(text) => text,
             Self::Guidance(intent) => &intent.text,
             Self::Conversation { content, .. } => content,
         }
@@ -819,6 +821,21 @@ impl BottomPane {
         None
     }
 
+    pub(crate) fn has_unconfirmed_turn_guidance(&self, turn_id: &str) -> bool {
+        self.pending_user_intents.iter().any(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+        })
+    }
+
+    pub(crate) fn has_pending_turn_guidance(&self, turn_id: &str) -> bool {
+        self.pending_user_intents.iter().any(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+        })
+    }
+
     pub(crate) fn accepted_turn_guidance(&self, turn_id: &str) -> Vec<PendingUserIntent> {
         self.pending_user_intents
             .iter()
@@ -1479,6 +1496,16 @@ impl BottomPane {
         self.queued_next_turn_submissions
             .push_back(NextTurnSubmission::Interactive(text));
         true
+    }
+
+    pub(crate) fn queue_deferred_plan(&mut self, text: String) {
+        self.queued_next_turn_submissions
+            .push_back(NextTurnSubmission::DeferredPlan(text));
+    }
+
+    pub(crate) fn has_deferred_plan(&self) -> bool {
+        self.visible_next_turn_submissions()
+            .any(|entry| matches!(entry, NextTurnSubmission::DeferredPlan(_)))
     }
 
     pub(crate) fn queue_session_continuation(

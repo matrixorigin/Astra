@@ -911,29 +911,18 @@ fn check_bash_sensitive_path_boundary(
     };
 
     let hit = sensitive_path_match_for_shell_command(command)?;
-    match hit.sensitivity {
-        PathSensitivity::Sensitive => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as a sensitive credential path",
-                hit.token
-            )));
-        }
-        PathSensitivity::WriteSensitive => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state",
-                hit.token
-            )));
-        }
+    let reason = match hit.sensitivity {
+        PathSensitivity::Sensitive => "a sensitive credential path",
+        PathSensitivity::WriteSensitive => "write-sensitive app/runtime state",
         PathSensitivity::InternalArtifactReadOnly(_) => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as an internal runtime artifact path. \
-                 Use the `read_file` tool instead of bash to read session artifacts.",
-                hit.token
-            )));
+            "an internal runtime artifact path; use `read_file` to read session artifacts"
         }
-        PathSensitivity::Normal => { /* not sensitive */ }
-    }
-    None
+        PathSensitivity::Normal => return None,
+    };
+    Some(ShellRunError::from(format!(
+        "Sandbox: Path '{}' is blocked as {reason}. This is a pre-execution inference from the command; the command was not run. Check the path and execution scope.",
+        hit.token
+    )))
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -7549,6 +7538,8 @@ mod tests {
             .expect("permissive should still block sensitive credential paths");
 
         assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(result.contains("pre-execution inference"), "{result}");
+        assert!(result.contains("command was not run"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"

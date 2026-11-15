@@ -22,15 +22,19 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType, ToolCallRecord};
+use astra_services::session_journal::{JournalEvent, JournalEventType, ToolCallRecord};
 
 use crate::cli::cli_config::cli_args;
-use crate::cli::journal_digest::{self, producer_run_id as run_id_of};
+use crate::cli::journal_digest::{self, display_known, producer_run_id as run_id_of};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalDiff {
     pub a_session: String,
     pub b_session: String,
+    /// Known loss, malformed records or unmatched activity; false means only
+    /// that no such gap was observed, not that absence is proven.
+    pub a_observation_incomplete: bool,
+    pub b_observation_incomplete: bool,
     /// Per-event-type counts for A (sorted by type name for stable diff).
     pub a_event_counts: BTreeMap<String, u32>,
     /// Per-event-type counts for B.
@@ -61,34 +65,73 @@ pub struct JournalDiff {
     pub b_tokens: TokenTotals,
     /// b - a, signed. Negative = B used fewer tokens (usually good).
     pub token_deltas: TokenDeltas,
-    /// Whether each run produced a non-empty final assistant output.
-    pub a_has_final_text: bool,
-    pub b_has_final_text: bool,
+    /// Whether non-empty final text is present in the retained observation.
+    pub a_final_text_observed: bool,
+    pub b_final_text_observed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TokenTotals {
     pub prompt: u64,
+    pub prompt_complete: bool,
     pub completion: u64,
+    pub completion_complete: bool,
     pub total: u64,
+    pub total_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TokenDeltas {
-    pub prompt: i64,
-    pub completion: i64,
-    pub total: i64,
+    pub prompt: Option<i64>,
+    pub completion: Option<i64>,
+    pub total: Option<i64>,
 }
 
 /// Load two journals + compute the diff. Returns `Err` only for fatal
 /// io / parse failures on either session; structural differences are
 /// always returned as Ok.
 pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, String> {
-    let a_events =
-        session_journal::read_journal(a_session).map_err(|e| format!("{a_session}: {e}"))?;
-    let b_events =
-        session_journal::read_journal(b_session).map_err(|e| format!("{b_session}: {e}"))?;
-    Ok(diff_events(a_session, b_session, &a_events, &b_events))
+    let (a_events, a_incomplete) = journal_digest::read_journal_for_analysis(a_session)
+        .map_err(|e| format!("{a_session}: {e}"))?;
+    let (b_events, b_incomplete) = journal_digest::read_journal_for_analysis(b_session)
+        .map_err(|e| format!("{b_session}: {e}"))?;
+    Ok(diff_events_with_coverage(
+        a_session,
+        b_session,
+        &a_events,
+        &b_events,
+        a_incomplete,
+        b_incomplete,
+    ))
+}
+
+pub(crate) fn diff_events_with_coverage(
+    a_session: &str,
+    b_session: &str,
+    a_events: &[JournalEvent],
+    b_events: &[JournalEvent],
+    a_incomplete: bool,
+    b_incomplete: bool,
+) -> JournalDiff {
+    let mut diff = diff_events(a_session, b_session, a_events, b_events);
+    if a_incomplete || b_incomplete {
+        if a_incomplete {
+            diff.a_observation_incomplete = true;
+            diff.a_tokens.prompt_complete = false;
+            diff.a_tokens.completion_complete = false;
+            diff.a_tokens.total_complete = false;
+            diff.a_tool_sequence_complete = false;
+        }
+        if b_incomplete {
+            diff.b_observation_incomplete = true;
+            diff.b_tokens.prompt_complete = false;
+            diff.b_tokens.completion_complete = false;
+            diff.b_tokens.total_complete = false;
+            diff.b_tool_sequence_complete = false;
+        }
+        diff.token_deltas = TokenDeltas::default();
+    }
+    diff
 }
 
 /// Pure fold: no filesystem IO. Exposed as pub(crate) for tests.
@@ -123,20 +166,29 @@ pub(crate) fn diff_events(
         }
     }
 
-    let a_tokens = token_totals(a_events);
-    let b_tokens = token_totals(b_events);
+    let a_gap = journal_digest::has_incomplete_observation(a_events)
+        || journal_digest::has_unmatched_root_rounds(a_events);
+    let b_gap = journal_digest::has_incomplete_observation(b_events)
+        || journal_digest::has_unmatched_root_rounds(b_events);
+    let a_tokens = token_totals(a_events, a_gap);
+    let b_tokens = token_totals(b_events, b_gap);
     let token_deltas = TokenDeltas {
-        prompt: saturating_delta(a_tokens.prompt, b_tokens.prompt),
-        completion: saturating_delta(a_tokens.completion, b_tokens.completion),
-        total: saturating_delta(a_tokens.total, b_tokens.total),
+        prompt: (a_tokens.prompt_complete && b_tokens.prompt_complete)
+            .then(|| saturating_delta(a_tokens.prompt, b_tokens.prompt)),
+        completion: (a_tokens.completion_complete && b_tokens.completion_complete)
+            .then(|| saturating_delta(a_tokens.completion, b_tokens.completion)),
+        total: (a_tokens.total_complete && b_tokens.total_complete)
+            .then(|| saturating_delta(a_tokens.total, b_tokens.total)),
     };
 
-    let a_tools = tool_activity(a_events);
-    let b_tools = tool_activity(b_events);
+    let a_tools = tool_activity(a_events, a_gap);
+    let b_tools = tool_activity(b_events, b_gap);
 
     JournalDiff {
         a_session: a_session.to_string(),
         b_session: b_session.to_string(),
+        a_observation_incomplete: !a_events.iter().any(is_terminal) || a_gap,
+        b_observation_incomplete: !b_events.iter().any(is_terminal) || b_gap,
         a_event_counts: a_counts,
         b_event_counts: b_counts,
         only_in_a,
@@ -151,8 +203,8 @@ pub(crate) fn diff_events(
         a_tokens,
         b_tokens,
         token_deltas,
-        a_has_final_text: has_final_text(a_events),
-        b_has_final_text: has_final_text(b_events),
+        a_final_text_observed: has_final_text(a_events),
+        b_final_text_observed: has_final_text(b_events),
     }
 }
 
@@ -173,12 +225,18 @@ fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
     out
 }
 
-fn token_totals(events: &[JournalEvent]) -> TokenTotals {
-    let usage = journal_digest::root_terminal_usage(events);
+fn token_totals(events: &[JournalEvent], observation_incomplete: bool) -> TokenTotals {
+    let usage = journal_digest::root_terminal_usage(events, observation_incomplete);
     TokenTotals {
-        prompt: usage.prompt,
-        completion: usage.completion,
-        total: usage.prompt.saturating_add(usage.completion),
+        prompt: usage.known.prompt,
+        prompt_complete: usage.prompt_complete,
+        completion: usage.known.completion,
+        completion_complete: usage.completion_complete,
+        total: usage.known.total(),
+        total_complete: usage.prompt_complete
+            && usage.completion_complete
+            && usage.cache_read_complete
+            && usage.cache_creation_complete,
     }
 }
 
@@ -315,14 +373,14 @@ fn normalized_error<'a>(
     Some(((round, offset), representative))
 }
 
-fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
+fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolActivity {
     // Terminals own aggregate counts. Only explicit attempt/call identities
     // reconcile projections; unproven or contradictory execution evidence is
     // retained with incomplete coverage, never silently consumed by an aggregate.
     let mut out = ToolActivity {
         sequence: Vec::new(),
         executed: 0,
-        complete: true,
+        complete: events.iter().any(is_terminal) && !observation_incomplete,
     };
     let mut index = TerminalIndex::new(events);
     let mut owned: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -382,6 +440,9 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         }
     }
     for (idx, event) in events.iter().enumerate().filter(|(_, e)| is_terminal(e)) {
+        if event.tool_count.is_none() {
+            out.complete = false;
+        }
         if event
             .tool_outcomes
             .as_ref()
@@ -535,7 +596,7 @@ fn has_final_text(events: &[JournalEvent]) -> bool {
         .find(|e| {
             matches!(
                 e.event_type,
-                JournalEventType::Turn | JournalEventType::LlmRound
+                JournalEventType::Turn | JournalEventType::TurnError | JournalEventType::LlmRound
             )
         })
         .and_then(|e| e.assistant_output.as_deref())
@@ -560,6 +621,7 @@ fn event_type_str(t: &JournalEventType) -> String {
 }
 
 pub fn render_text(diff: &JournalDiff) -> String {
+    let delta = |value: Option<i64>| value.map_or_else(|| "?".to_string(), |v| v.to_string());
     let mut s = String::new();
     s.push_str(&format!(
         "=== journal diff ===\n  A: {}\n  B: {}\n",
@@ -573,28 +635,34 @@ pub fn render_text(diff: &JournalDiff) -> String {
     s.push_str("token totals  (A → B,  Δ = B - A)\n");
     s.push_str(&format!(
         "  prompt:     {} → {}  (Δ {})\n",
-        diff.a_tokens.prompt, diff.b_tokens.prompt, diff.token_deltas.prompt
+        display_known(diff.a_tokens.prompt, diff.a_tokens.prompt_complete),
+        display_known(diff.b_tokens.prompt, diff.b_tokens.prompt_complete),
+        delta(diff.token_deltas.prompt)
     ));
     s.push_str(&format!(
         "  completion: {} → {}  (Δ {})\n",
-        diff.a_tokens.completion, diff.b_tokens.completion, diff.token_deltas.completion
+        display_known(diff.a_tokens.completion, diff.a_tokens.completion_complete),
+        display_known(diff.b_tokens.completion, diff.b_tokens.completion_complete),
+        delta(diff.token_deltas.completion)
     ));
     s.push_str(&format!(
         "  total:      {} → {}  (Δ {})\n\n",
-        diff.a_tokens.total, diff.b_tokens.total, diff.token_deltas.total
+        display_known(diff.a_tokens.total, diff.a_tokens.total_complete),
+        display_known(diff.b_tokens.total, diff.b_tokens.total_complete),
+        delta(diff.token_deltas.total)
     ));
 
-    s.push_str("final text: ");
-    match (diff.a_has_final_text, diff.b_has_final_text) {
-        (true, true) => s.push_str("both runs produced output\n\n"),
-        (false, false) => s.push_str("NEITHER run produced output\n\n"),
-        (true, false) => s.push_str("A produced output; B did NOT\n\n"),
-        (false, true) => s.push_str("B produced output; A did NOT\n\n"),
-    }
+    s.push_str(&format!(
+        "final text observed: A={} B={}\n\n",
+        diff.a_final_text_observed, diff.b_final_text_observed
+    ));
 
-    s.push_str("event-type counts (Δ non-zero only):\n");
+    s.push_str("observed event-type counts (Δ non-zero only):\n");
+    if diff.a_observation_incomplete || diff.b_observation_incomplete {
+        s.push_str("  observation is incomplete; missing events are unknown\n");
+    }
     if diff.count_deltas.is_empty() {
-        s.push_str("  (no differences)\n");
+        s.push_str("  (no observed differences)\n");
     } else {
         for (k, d) in &diff.count_deltas {
             let a = diff.a_event_counts.get(k).copied().unwrap_or(0);
@@ -603,10 +671,10 @@ pub fn render_text(diff: &JournalDiff) -> String {
         }
     }
     if !diff.only_in_a.is_empty() {
-        s.push_str(&format!("  only in A: {:?}\n", diff.only_in_a));
+        s.push_str(&format!("  only observed in A: {:?}\n", diff.only_in_a));
     }
     if !diff.only_in_b.is_empty() {
-        s.push_str(&format!("  only in B: {:?}\n", diff.only_in_b));
+        s.push_str(&format!("  only observed in B: {:?}\n", diff.only_in_b));
     }
 
     s.push('\n');
@@ -628,7 +696,7 @@ pub fn render_text(diff: &JournalDiff) -> String {
         }
     } else if diff.a_tool_calls_executed != diff.b_tool_calls_executed {
         s.push_str(&format!(
-            "  → confirmed executed counts differ ({} → {}); full counts may be higher; sequences not comparable\n",
+            "  → known recorded counts differ ({} → {}); full counts may be higher; sequences not comparable\n",
             diff.a_tool_calls_executed, diff.b_tool_calls_executed
         ));
     } else {
@@ -713,7 +781,10 @@ mod tests {
             let d = diff_events("a", "b", &[error("original", 0), error(chain, 1)], &[]);
             assert_eq!(d.a_tool_calls_executed, expected);
             assert_eq!(d.a_tool_sequence.len() as u64, expected);
-            assert!(d.a_tool_sequence_complete);
+            assert!(
+                !d.a_tool_sequence_complete,
+                "standalone observations have no terminal"
+            );
         }
     }
 
@@ -782,11 +853,7 @@ mod tests {
                 let d = diff_events("a", "b", &[evt(raw.clone()), evt(changed)], &[]);
                 assert_eq!(d.a_tool_calls_executed, 2, "{field}={value:?}");
                 assert_eq!(d.a_tool_sequence, ["bash", "bash"]);
-                let conflict = ["session_id", "run_id", "invocation_id"].contains(&field);
-                assert_eq!(
-                    d.a_tool_sequence_complete,
-                    value == "different" && !conflict
-                );
+                assert!(!d.a_tool_sequence_complete, "the run has no terminal");
             }
         }
         let mut missing = raw;
@@ -886,6 +953,7 @@ mod tests {
                 }
             }
             let diff = super::compute_diff(&sid, &empty).unwrap();
+            let complete = complete && !matches!(shape, Shape::Orphan);
             assert_eq!(diff.a_tool_calls_executed, expected_count, "{label}");
             assert_eq!(diff.a_tool_sequence_complete, complete, "{label}");
             let names = if first_executed {
@@ -1165,13 +1233,13 @@ mod tests {
         )];
         let b = a.clone();
         let d = diff_events("a", "b", &a, &b);
-        assert_eq!(d.token_deltas.prompt, 0);
-        assert_eq!(d.token_deltas.completion, 0);
+        assert_eq!(d.token_deltas.prompt, Some(0));
+        assert_eq!(d.token_deltas.completion, Some(0));
         assert!(d.count_deltas.is_empty());
         assert!(d.only_in_a.is_empty());
         assert!(d.only_in_b.is_empty());
-        assert!(d.a_has_final_text);
-        assert!(d.b_has_final_text);
+        assert!(d.a_final_text_observed);
+        assert!(d.b_final_text_observed);
     }
 
     #[test]
@@ -1227,15 +1295,88 @@ mod tests {
     #[test]
     fn token_deltas_are_signed_b_minus_a() {
         let a = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50}),
+            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50,"cache_read_tokens":0,"cache_creation_tokens":0}),
         )];
         let b = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80}),
+            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80,"cache_read_tokens":0,"cache_creation_tokens":0}),
         )];
         let d = diff_events("a", "b", &a, &b);
-        assert_eq!(d.token_deltas.prompt, -200); // B used fewer prompt tokens
-        assert_eq!(d.token_deltas.completion, 30);
-        assert_eq!(d.token_deltas.total, -170);
+        assert_eq!(d.token_deltas.prompt, Some(-200)); // B used fewer prompt tokens
+        assert_eq!(d.token_deltas.completion, Some(30));
+        assert_eq!(d.token_deltas.total, Some(-170));
+    }
+
+    #[test]
+    fn total_includes_cache_and_requires_each_bucket() {
+        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":900,"cache_creation_tokens":0}))];
+        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":1000,"cache_creation_tokens":0}))];
+        let diff = diff_events("a", "b", &a, &b);
+        assert_eq!(diff.a_tokens.total, 1020);
+        assert!(diff.a_tokens.total_complete);
+        assert_eq!(diff.token_deltas.total, Some(100));
+
+        let missing_cache = vec![evt(json!({"type":"turn","ts":"t","session_id":"b",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":1000}))];
+        let diff = diff_events("a", "b", &a, &missing_cache);
+        assert!(!diff.b_tokens.total_complete);
+        assert_eq!(diff.token_deltas.total, None);
+    }
+
+    #[test]
+    fn unattributed_running_round_and_dropped_events_keep_counts_partial() {
+        let events = vec![
+            evt(json!({"type":"turn","ts":"t1","session_id":"a","turn":1,
+                "tokens_in":100,"tokens_out":20,"cache_read_tokens":0,"cache_creation_tokens":0,
+                "tool_count":0,"metadata":{"run_id":"finished"}})),
+            evt(
+                json!({"type":"llm_round","ts":"t2","session_id":"a","turn":2,
+                "producer_scope":{"run_id":"running"},"tokens_in":50,"tokens_out":3}),
+            ),
+        ];
+        let diff = diff_events("a", "b", &events, &events);
+        assert!(!diff.a_tokens.prompt_complete);
+        assert_eq!(diff.token_deltas.total, None);
+        assert!(!diff.a_tool_sequence_complete);
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
+        assert!(!tree.prompt_tokens_complete);
+        assert!(!tree.tool_calls_complete);
+
+        let dropped = vec![evt(json!({"type":"turn","ts":"t","session_id":"a",
+            "metadata":{"dropped_events_before":545}}))];
+        let diff = diff_events("a", "b", &dropped, &dropped);
+        assert!(!diff.a_tool_sequence_complete);
+        assert!(render_text(&diff).contains("unavailable/incomplete"));
+    }
+
+    #[test]
+    fn missing_usage_is_partial_not_zero_in_tree_and_diff() {
+        let partial = vec![
+            evt(json!({"type":"turn","ts":"t1","session_id":"a","tokens_out":34162})),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","tokens_in":7,"tokens_out":0})),
+        ];
+        let complete = vec![evt(json!({
+            "type":"turn","ts":"t3","session_id":"b","tokens_in":0,"tokens_out":34162
+        }))];
+        let diff = diff_events("a", "b", &partial, &complete);
+        assert_eq!(diff.a_tokens.prompt, 7);
+        assert!(!diff.a_tokens.prompt_complete);
+        assert_eq!(diff.token_deltas.prompt, None);
+        assert_eq!(diff.token_deltas.completion, Some(0));
+        assert_eq!(diff.token_deltas.total, None);
+        assert!(render_text(&diff).contains("partial(7) → 0  (Δ ?)"));
+        let json = serde_json::to_value(&diff).unwrap();
+        assert_eq!(json["a_tokens"]["prompt_complete"], false);
+        assert!(json["token_deltas"]["prompt"].is_null());
+
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &partial);
+        assert!(crate::cli::journal_tree::render_text(&tree).contains("tokens=partial(7)/34162"));
+        assert!(!tree.prompt_tokens_complete);
+        assert!(tree.completion_tokens_complete);
+        let (zero, _, _) = crate::cli::journal_tree::fold_events_into_tree("b", &complete);
+        assert!(zero.prompt_tokens_complete);
+        assert!(crate::cli::journal_tree::render_text(&zero).contains("tokens=0/34162"));
     }
 
     #[test]
@@ -1690,13 +1831,16 @@ mod tests {
             "tool_count":0,"metadata":{"run_id":"later-run"}}));
         for events in [vec![error.clone()], vec![error, terminal]] {
             let diff = diff_events("a", "b", &events, &[]);
+            let complete = events.iter().any(super::is_terminal);
             assert_eq!(diff.a_tool_calls_executed, 0);
             assert!(diff.a_tool_sequence.is_empty());
-            assert!(diff.a_tool_sequence_complete);
+            assert_eq!(diff.a_tool_sequence_complete, complete);
             let encoded = serde_json::to_value(&diff).unwrap();
             assert_eq!(encoded["a_tool_sequence"], json!([]));
-            assert_eq!(encoded["a_tool_sequence_complete"], true);
-            assert!(render_text(&diff).contains("tool sequence A (0 calls): []"));
+            assert_eq!(encoded["a_tool_sequence_complete"], complete);
+            if complete {
+                assert!(render_text(&diff).contains("tool sequence A (0 calls): []"));
+            }
         }
     }
 
@@ -1798,11 +1942,11 @@ mod tests {
                     );
                     assert_eq!(diff.a_tool_sequence, diff.b_tool_sequence);
                     assert_eq!(diff.a_tool_calls_executed, 2);
-                    assert!(diff.a_tool_sequence_complete);
+                    assert_eq!(diff.a_tool_sequence_complete, terminal.is_some());
                     let json = serde_json::to_value(&diff).unwrap();
                     assert_eq!(json["a_tool_sequence"], json!(["read_file", "bash"]));
                     assert_eq!(json["a_tool_calls_executed"], 2);
-                    assert_eq!(json["a_tool_sequence_complete"], true);
+                    assert_eq!(json["a_tool_sequence_complete"], terminal.is_some());
                     assert!(!render_text(&diff).contains("tool sequence DIFFERS"));
                 }
             }
@@ -1845,7 +1989,10 @@ mod tests {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_sequence, ["bash"]);
             assert_eq!(diff.a_tool_calls_executed, 1);
-            assert!(diff.a_tool_sequence_complete);
+            assert_eq!(
+                diff.a_tool_sequence_complete,
+                events.iter().any(super::is_terminal)
+            );
         }
         // Missing IDs and multi-call errors cannot inherit a round's identity.
         let failed = round.tool_calls.as_ref().unwrap()[0].clone();
@@ -2020,7 +2167,7 @@ mod tests {
             let d = diff_events("a", "b", &a, &[]);
             assert_eq!(d.a_tool_sequence, vec!["bash"]);
             assert_eq!(d.a_tool_calls_executed, 1);
-            assert!(d.a_tool_sequence_complete);
+            assert_eq!(d.a_tool_sequence_complete, a.iter().any(super::is_terminal));
         }
     }
 
@@ -2134,7 +2281,7 @@ mod tests {
         let txt = render_text(&d);
         assert!(txt.contains("tool sequence B (0 calls): []"), "{txt}");
         assert!(
-            txt.contains("confirmed executed counts differ (3 → 0)"),
+            txt.contains("known recorded counts differ (3 → 0)"),
             "{txt}"
         );
     }
@@ -2147,8 +2294,8 @@ mod tests {
         // B has a turn but no assistant output — crash / empty run.
         let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b"}))];
         let d = diff_events("a", "b", &a, &b);
-        assert!(d.a_has_final_text);
-        assert!(!d.b_has_final_text);
+        assert!(d.a_final_text_observed);
+        assert!(!d.b_final_text_observed);
     }
 
     #[test]
@@ -2163,7 +2310,7 @@ mod tests {
         let txt = render_text(&d);
         assert!(txt.contains("100 → 120"));
         assert!(txt.contains("(Δ 20)"));
-        assert!(txt.contains("both runs produced output"));
+        assert!(txt.contains("final text observed: A=true B=true"));
     }
 
     #[test]
@@ -2179,8 +2326,8 @@ mod tests {
         let d = diff_events("a", "b", &a, &b);
         // Delta should be clamped, not wrapped to a positive number.
         assert!(
-            d.token_deltas.prompt <= 0,
-            "prompt delta must not wrap positive; got {}",
+            d.token_deltas.prompt.is_some_and(|delta| delta <= 0),
+            "prompt delta must not wrap positive; got {:?}",
             d.token_deltas.prompt
         );
     }
@@ -2191,7 +2338,7 @@ mod tests {
         let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b"}))];
         let d = diff_events("a", "b", &a, &b);
         let txt = render_text(&d);
-        assert!(txt.contains("(no differences)"));
+        assert!(txt.contains("(no observed differences)"));
     }
 
     #[test]
@@ -2208,7 +2355,7 @@ mod tests {
         let b: Vec<JournalEvent> = vec![];
         let d = diff_events("a", "b", &a, &b);
         assert!(
-            !d.a_has_final_text,
+            !d.a_final_text_observed,
             "has_final_text must check the LAST event with potential output, \
              not any event. A run whose last turn has no output crashed."
         );

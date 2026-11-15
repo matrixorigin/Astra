@@ -32,10 +32,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+use astra_services::session_journal::{JournalEvent, JournalEventType};
 
 use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
+use crate::cli::journal_digest::display_known;
 use crate::cli::surface::delegation_event_surface::{
     project_delegation_started, project_delegation_sub_run_completed,
     project_delegation_sub_run_started,
@@ -70,29 +71,23 @@ pub struct DelegationNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// Aggregated prompt tokens on the sub-run (includes children for root).
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub prompt_tokens: u64,
+    /// False means the value is only the known subtotal.
+    pub prompt_tokens_complete: bool,
     /// Aggregated completion tokens on the sub-run (includes children for root).
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub completion_tokens: u64,
+    pub completion_tokens_complete: bool,
     /// Root's own known terminal prompt tokens (excludes children).
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_prompt_tokens: u64,
+    pub self_prompt_tokens_complete: bool,
     /// Root's own known terminal completion tokens (excludes children).
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_completion_tokens: u64,
+    pub self_completion_tokens_complete: bool,
     /// Known executed tool invocations, including children for the root.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub tool_calls: u32,
+    pub tool_calls_complete: bool,
     /// Nested sub-runs.
     pub children: Vec<DelegationNode>,
-}
-
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
 }
 
 /// Load a session journal, fold its delegation events into a tree.
@@ -100,8 +95,31 @@ fn is_zero_u32(v: &u32) -> bool {
 /// whose metadata couldn't be parsed to fit the tree shape — counted,
 /// not errored, so a rogue line doesn't break the whole command.
 pub fn build_tree(session_id: &str) -> Result<(DelegationNode, u32, u32), String> {
-    let events = session_journal::read_journal(session_id).map_err(|e| e.to_string())?;
-    Ok(fold_events_into_tree(session_id, &events))
+    let (events, incomplete) = journal_digest::read_journal_for_analysis(session_id)?;
+    Ok(fold_events_with_coverage(session_id, &events, incomplete))
+}
+
+pub(crate) fn fold_events_with_coverage(
+    session_id: &str,
+    events: &[JournalEvent],
+    incomplete: bool,
+) -> (DelegationNode, u32, u32) {
+    let (mut root, total, skipped) = fold_events_into_tree(session_id, events);
+    if incomplete {
+        mark_coverage_incomplete(&mut root);
+    }
+    (root, total, skipped)
+}
+
+fn mark_coverage_incomplete(node: &mut DelegationNode) {
+    node.prompt_tokens_complete = false;
+    node.completion_tokens_complete = false;
+    node.self_prompt_tokens_complete = false;
+    node.self_completion_tokens_complete = false;
+    node.tool_calls_complete = false;
+    for child in &mut node.children {
+        mark_coverage_incomplete(child);
+    }
 }
 
 /// Pure fold: takes a session_id + event list, returns the tree.
@@ -111,7 +129,9 @@ pub(crate) fn fold_events_into_tree(
     session_id: &str,
     events: &[JournalEvent],
 ) -> (DelegationNode, u32, u32) {
-    let usage = journal_digest::root_terminal_usage(events);
+    let observation_incomplete = journal_digest::has_incomplete_observation(events)
+        || journal_digest::has_unmatched_root_rounds(events);
+    let usage = journal_digest::root_terminal_usage(events, observation_incomplete);
     let mut root = DelegationNode {
         id: session_id.to_string(),
         label: "root".to_string(),
@@ -120,11 +140,21 @@ pub(crate) fn fold_events_into_tree(
         model: None,
         agent_type: None,
         task: None,
-        prompt_tokens: usage.prompt,
-        completion_tokens: usage.completion,
+        prompt_tokens: usage.known.prompt,
+        prompt_tokens_complete: usage.prompt_complete,
+        completion_tokens: usage.known.completion,
+        completion_tokens_complete: usage.completion_complete,
         self_prompt_tokens: 0,
+        self_prompt_tokens_complete: usage.prompt_complete,
         self_completion_tokens: 0,
+        self_completion_tokens_complete: usage.completion_complete,
         tool_calls: 0,
+        tool_calls_complete: events.iter().any(journal_digest::is_root_terminal)
+            && events
+                .iter()
+                .filter(|event| journal_digest::is_root_terminal(event))
+                .all(|event| event.tool_count.is_some())
+            && !observation_incomplete,
         children: Vec::new(),
     };
     let mut seq: u32 = 0;
@@ -186,10 +216,15 @@ pub(crate) fn fold_events_into_tree(
                     agent_type,
                     task,
                     prompt_tokens: 0,
+                    prompt_tokens_complete: false,
                     completion_tokens: 0,
+                    completion_tokens_complete: false,
                     self_prompt_tokens: 0,
+                    self_prompt_tokens_complete: false,
                     self_completion_tokens: 0,
+                    self_completion_tokens_complete: false,
                     tool_calls: 0,
+                    tool_calls_complete: false,
                     children: Vec::new(),
                 };
                 match by_run_id.entry(run_id) {
@@ -215,7 +250,14 @@ pub(crate) fn fold_events_into_tree(
                     continue;
                 };
                 let child = &mut root.children[idx];
+                if child.ended_at.is_some() {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
                 child.ended_at = Some(ev.ts.clone());
+                child.prompt_tokens_complete = ev.tokens_in.is_some();
+                child.completion_tokens_complete = ev.tokens_out.is_some();
+                child.tool_calls_complete = ev.tool_count.is_some();
                 if let Some(p) = ev.tokens_in {
                     child.prompt_tokens = child.prompt_tokens.saturating_add(p);
                 }
@@ -241,6 +283,26 @@ pub(crate) fn fold_events_into_tree(
             .completion_tokens
             .saturating_add(child.completion_tokens);
         root.tool_calls = root.tool_calls.saturating_add(child.tool_calls);
+        root.prompt_tokens_complete &= child.prompt_tokens_complete;
+        root.completion_tokens_complete &= child.completion_tokens_complete;
+        root.tool_calls_complete &= child.tool_calls_complete;
+    }
+    // A child producer without a completed delegation contributes to neither
+    // the root's terminal totals nor any child aggregate in this view.
+    let unaccounted_child = events.iter().any(|event| {
+        journal_digest::is_child_producer(event)
+            && matches!(
+                event.event_type,
+                JournalEventType::LlmRound | JournalEventType::Turn | JournalEventType::TurnError
+            )
+            && journal_digest::producer_run_id(event)
+                .and_then(|run_id| by_run_id.get(run_id))
+                .is_none_or(|&index| root.children[index].ended_at.is_none())
+    });
+    if skipped > 0 || unaccounted_child {
+        root.prompt_tokens_complete = false;
+        root.completion_tokens_complete = false;
+        root.tool_calls_complete = false;
     }
 
     (root, events.len() as u32, skipped)
@@ -265,15 +327,19 @@ fn render_node_text(
     if is_root {
         out.push_str(&format!(
             "{} [{}] tokens={}/{} tool_calls={}\n",
-            node.label, node.id, node.prompt_tokens, node.completion_tokens, node.tool_calls
+            node.label,
+            node.id,
+            display_known(node.prompt_tokens, node.prompt_tokens_complete),
+            display_known(node.completion_tokens, node.completion_tokens_complete),
+            display_known(node.tool_calls, node.tool_calls_complete)
         ));
     } else {
         let connector = if is_last { "└── " } else { "├── " };
         out.push_str(&format!(
             "{prefix}{connector}{label}  tokens={}/{} tool_calls={}\n",
-            node.prompt_tokens,
-            node.completion_tokens,
-            node.tool_calls,
+            display_known(node.prompt_tokens, node.prompt_tokens_complete),
+            display_known(node.completion_tokens, node.completion_tokens_complete),
+            display_known(node.tool_calls, node.tool_calls_complete),
             label = node.label
         ));
         let extra_prefix = if is_last { "    " } else { "│   " };
@@ -442,7 +508,38 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(root.tool_calls, 554);
         assert_eq!(root.children[0].tool_calls, 4);
-        assert!(render_text(&root).contains("tool_calls=554\n"));
+        assert!(render_text(&root).contains("tool_calls=partial(554)\n"));
+    }
+
+    #[test]
+    fn unaccounted_child_does_not_make_root_inclusive_totals_complete() {
+        let mut turn = turn_event("t1", 100, 10, "sonnet");
+        turn.tool_count = Some(1);
+        let mut child = turn.clone();
+        child.event_type = astra_services::session_journal::JournalEventType::LlmRound;
+        child.metadata = Some(json!({"purpose": "sub_agent"}));
+        let (root, _, _) = fold_events_into_tree("sess-1", &[turn.clone(), child.clone()]);
+        assert_eq!(root.self_prompt_tokens, 100);
+        assert!(root.self_prompt_tokens_complete);
+        assert!(root.self_completion_tokens_complete);
+        assert!(!root.prompt_tokens_complete);
+        assert!(!root.completion_tokens_complete);
+        assert!(!root.tool_calls_complete);
+
+        child.metadata = Some(json!({"purpose": "sub_agent", "run_id": "run-A"}));
+        let (root, _, _) = fold_events_into_tree(
+            "sess-1",
+            &[
+                turn,
+                sub_started("t2", "run-A", "coder", "task"),
+                child,
+                sub_completed("t3", "run-A", 20, 2, 1),
+            ],
+        );
+        assert!(root.prompt_tokens_complete);
+        assert!(root.completion_tokens_complete);
+        assert!(root.tool_calls_complete);
+        assert_eq!(root.prompt_tokens, 120);
     }
 
     #[test]

@@ -528,7 +528,7 @@ fn delivered_shell_outcome(
             }) {
                 if registry.retain_completed_output(&task.id) {
                     delivered.output = format!(
-                        "[Captured output: task_output(task_id=\"{}\") while retained; output may expire or be incomplete.]\n{}",
+                        "[Captured output: task_output(task_id=\"{}\") while retained; if deferred, select task_output with tool_search before invoke_tool. Output may expire or be incomplete.]\n{}",
                         task.id, delivered.output
                     );
                     delivered

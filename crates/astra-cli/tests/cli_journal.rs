@@ -102,7 +102,8 @@ fn journal_commands_share_terminal_accounting_through_the_cli() {
         );
         assert_eq!(diff["a_tokens"]["prompt"], input);
         assert_eq!(diff["a_tokens"]["completion"], output);
-        assert_eq!(diff["token_deltas"]["total"], 0);
+        assert!(diff["token_deltas"]["total"].is_null());
+        assert_eq!(diff["a_tokens"]["prompt_complete"], false);
         assert_eq!(
             tree["root"]["self_prompt_tokens"].as_u64().unwrap_or(0),
             input
@@ -112,10 +113,33 @@ fn journal_commands_share_terminal_accounting_through_the_cli() {
             output
         );
         assert_eq!(tree["root"]["tool_calls"].as_u64().unwrap_or(0), tools);
+        assert_eq!(tree["root"]["self_prompt_tokens_complete"], false);
         let text = run_journal(root.path(), &["tree", sid]);
         assert!(text.status.success(), "{text:?}");
-        assert!(String::from_utf8_lossy(&text.stdout).contains(&format!("tool_calls={tools}\n")));
+        let displayed = if tools == 0 {
+            "?".to_owned()
+        } else {
+            format!("partial({tools})")
+        };
+        assert!(
+            String::from_utf8_lossy(&text.stdout).contains(&format!("tool_calls={displayed}\n"))
+        );
     }
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({"type":"turn", "ts":"t", "session_id":sid,
+        "turn":1, "tokens_in":0, "tokens_out":0, "cache_read_tokens":0,
+        "cache_creation_tokens":0, "tool_count":0})
+        ),
+    )
+    .unwrap();
+    let clean = run_journal(root.path(), &["diff", sid, sid, "--format", "json"]);
+    assert!(clean.status.success(), "{clean:?}");
+    let clean: Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean["token_deltas"]["total"], 0);
+    assert_eq!(clean["a_tokens"]["total_complete"], true);
     let foreign = json!({"type":"llm_round", "ts":"t", "session_id":"foreign-session"});
     std::fs::write(&path, format!("{}\n{foreign}\n", original[0])).unwrap();
     let output = run_journal(root.path(), &["digest", sid, "--format", "json"]);

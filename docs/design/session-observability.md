@@ -116,8 +116,9 @@ attributed child completions. An explicit terminal zero is authoritative;
 round mirrors and child terminals do not add to the root's own count. Missing
 scalars contribute no known executions. Digest's outcome counts may also include
 rejected or reused requests, so they need not equal tree's execution count.
-Diff's `prompt` and `completion` are fresh input and output; its `total` is
-their sum, excluding prompt-cache buckets. Known terminal totals do not
+Diff's `prompt` and `completion` are fresh input and output; its `total`
+also includes cache reads and writes and is complete only when all four
+buckets are known. Known terminal totals do not
 reconstruct missing usage or upgrade a historical last-round snapshot into
 a complete attempt total. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
@@ -128,6 +129,13 @@ attached profile/account source authorization. Each source retains its own turns
 checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
+
+Journal tree and diff label incomplete token and tool counts as unknown or
+partial; diff emits no numeric delta for an incomplete bucket. Digest records
+observed ring-buffer loss and interrupted flushes per authorized source before
+filtering supplemental events. A missing loss marker does not prove complete
+coverage. Interruption records include the run and producing layer when known;
+older unscoped records remain unattributed.
 
 `journal diff` reports known executed tool calls from terminal `tool_count`,
 with unowned per-call execution evidence retained separately. Its ordered tool

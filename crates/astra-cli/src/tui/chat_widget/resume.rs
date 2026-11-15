@@ -707,7 +707,22 @@ mod tests {
             serde_json::json!({"role":"tool", "tool_call_id":"c", "content":"succeeded"}),
             serde_json::json!({"role":"tool", "tool_call_id":"d", "status":"completed", "content":"ok"}),
             serde_json::json!({"role":"tool", "tool_call_id":"e", "status":"rejected", "content":"no"}),
-        ].into_iter().enumerate().map(|(n, message)| JournalEvent::transcript_item("session", "run", "root", n as u64 + 1, &message).unwrap()).collect();
+        ].into_iter().enumerate().map(|(n, message)| {
+            // This tests projection of already-recorded messages; constructing
+            // a fresh transcript would also apply the process-wide redaction setting.
+            let mut event = JournalEvent::base_public(
+                session_journal::JournalEventType::TranscriptItem, Some("session"),
+            );
+            event.transcript_item = Some(session_journal::JournalTranscriptItem {
+                model_item_id: None,
+                source_event_id: format!("event-{n}"),
+                run_id: "run".into(),
+                agent_id: "root".into(),
+                item_seq: n as u64 + 1,
+                message,
+            });
+            event
+        }).collect();
         let statuses: Vec<_> = canonical_root_turn_events(events, HashMap::new())
             .into_iter()
             .filter_map(|event| match event {
