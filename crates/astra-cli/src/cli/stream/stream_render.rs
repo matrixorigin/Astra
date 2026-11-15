@@ -1380,7 +1380,12 @@ fn apply_edge_callback_failure_result(
                 accum.error_message = Some(failure.message);
             }
         } else {
-            let prior = accum.error_message.take();
+            // Callback detachment cancels the local observer. That synthetic
+            // cancellation is not an additional execution failure.
+            let prior = accum
+                .error_message
+                .take()
+                .filter(|_| accum.error_kind != Some(astra_core::ErrorKind::Cancelled));
             accum.error_message = Some(match prior {
                 Some(prior) => format!("{}\n{prior}", failure.message),
                 None => failure.message,

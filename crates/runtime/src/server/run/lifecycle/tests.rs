@@ -18954,7 +18954,11 @@ async fn native_edge_execution_reports_capability_schema_errors() {
                 .await
                 .unwrap();
             let text = std::str::from_utf8(&body).unwrap();
-            let data = text.strip_prefix("data: ").unwrap().trim();
+            assert!(text.ends_with("data: [DONE]\n\n"));
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("capability rejection SSE data frame");
             let event =
                 astra_thin_client::classify_stream_event(serde_json::from_str(data).unwrap())
                     .unwrap();
