@@ -653,30 +653,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        "/plan" => {
-            let trimmed = args.trim();
-            if !trimmed.is_empty() {
-                ctx.show_error(
-                    "Usage: /plan — then describe the plan in the composer.".to_string(),
-                );
-                return SlashResult::Handled;
-            }
-
-            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(ctx.state);
-            if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            if ctx.state.cloud_plan_mirror.is_some() {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            crate::cli::slash::slash_plan::enter_local_plan_mode(ctx.state);
-            SlashResult::Handled
-        }
-
         // ── Stats ───────────────────────────────────────────────────
         "/stats" => {
             if !args.is_empty() {

@@ -1181,15 +1181,17 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             get_u("turn_count"),
             get_u("turn_error_count"),
             if counts_complete { get_u("reported_root_tool_calls").to_string() } else { "?".to_owned() },
-            tool_total("reported_root_tool_failures"),
+            tool_total("observed_root_tool_failures"),
             get_u("error_event_count"),
             get_u("compact_count"),
             get_u("stall_count"),
     ));
     if !tools_complete && get_u("reported_root_tool_calls") > 0 {
         out.push_str(&format!(
-            "      terminal_tool_reports={} (observations may overlap)\n",
-            get_u("reported_root_tool_calls")
+            "      terminal_tool_reports={} ledger_failed_executions={} observed_failures={} (observations may overlap)\n",
+            get_u("reported_root_tool_calls"),
+            get_u("reported_root_ledger_failed_executions"),
+            get_u("observed_root_tool_failures")
         ));
     }
     out.push_str(&format!(
@@ -1659,7 +1661,7 @@ mod tests {
                     "turn_count": 3,
                     "turn_error_count": 0,
                     "reported_root_tool_calls": 5, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
-                    "reported_root_tool_failures": 1,
+                    "observed_root_tool_failures": 1, "reported_root_ledger_failed_executions": 1,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1721,7 +1723,7 @@ mod tests {
                     "turn_count": 1,
                     "turn_error_count": 1,
                     "reported_root_tool_calls": 14, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
-                    "reported_root_tool_failures": 2,
+                    "observed_root_tool_failures": 2, "reported_root_ledger_failed_executions": 2,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1765,7 +1767,7 @@ mod tests {
         digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
         let partial = render(&r, Format::Text, false);
         assert!(partial.contains("tool_calls=? tool_failures=?"));
-        assert!(partial.contains("terminal_tool_reports=14 (observations may overlap)"));
+        assert!(partial.contains("terminal_tool_reports=14 ledger_failed_executions=2 observed_failures=2 (observations may overlap)"));
         assert!(!partial.contains("tool_calls=14"));
     }
 

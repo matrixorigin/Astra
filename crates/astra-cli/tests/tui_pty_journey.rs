@@ -992,6 +992,216 @@ fn seed_account(home: &std::path::Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_plan_guidance_can_be_recovered_without_exiting_plan_mode() {
+    use axum::{Json, extract::Path, http::StatusCode, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    let _journey = pty_journey_lock().lock().await;
+    for scenario in ["active", "changed-mode", "closed", "permission-failure"] {
+        let closed = scenario == "closed";
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::unbounded_channel();
+        let submissions = Arc::new(AtomicU64::new(0));
+        let revision = Arc::new(AtomicU64::new(0));
+        let routes = axum::Router::new()
+        .route("/chat/runs/{run_id}/intents", post(move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+            let sent_tx = sent_tx.clone();
+            let submissions = submissions.clone();
+            async move {
+                sent_tx.send(body.clone()).unwrap();
+                    if submissions.fetch_add(1, Ordering::SeqCst) == 0 && scenario != "permission-failure" {
+                    if closed {
+                        (StatusCode::CONFLICT, Json(serde_json::json!({"error_code":"run_intent_run_terminal"})))
+                    } else {
+                        (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail":"not admitted"})))
+                    }
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({"run_id":run_id,
+                        "intent_id":body["intent_id"], "status":"accepted_remote", "duplicate":false,
+                        "event_index": 2})))
+                }
+            }
+        }))
+        .route("/chat/runs/{run_id}/permission-mode", post(move |Path(_run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+            let permission_tx = permission_tx.clone();
+            let revision = revision.clone();
+            async move {
+                let revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut observed = body.clone();
+                observed["revision"] = revision.into();
+                permission_tx.send(observed).unwrap();
+                if scenario == "permission-failure" && revision == 1 {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail":"could not confirm"})))
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({"request_id":body["request_id"], "mode":body["mode"], "revision":revision})))
+                }
+            }
+        }));
+        let mock =
+            astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+                astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+                true,
+                routes,
+            )
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        seed_trusted_workspace(home.path());
+        seed_account(home.path());
+        let mut astra = PtyAstra::spawn_with_config(
+            home.path(),
+            &mock.base_url,
+            "mock-model",
+            "gateway-token",
+            &[],
+        );
+        astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("Start a task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().is_empty() {
+            assert!(Instant::now() < deadline);
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.paste_and_submit("/plan");
+        let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["mode"], "plan");
+        if scenario == "permission-failure" {
+            astra.wait_for("could not confirm", UI_TRANSITION_TIMEOUT);
+            astra.paste_and_submit("continue the current task");
+            let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sent["input"]["content"], "continue the current task");
+            mock.send_held_stream_event(serde_json::json!({
+                "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                "request_id":first["request_id"], "mode":"plan", "revision":1,
+                "round_index":1, "owner_generation":1
+            }));
+            astra.wait_for_screen(
+                "late permission application",
+                UI_TRANSITION_TIMEOUT,
+                |screen| {
+                    screen
+                        .lines()
+                        .any(|line| line.contains("Read-only") && !line.contains("requested"))
+                },
+            );
+            assert!(
+                sent_rx.try_recv().is_err(),
+                "failed plan must not be replayed automatically"
+            );
+            astra.signal(nix::sys::signal::Signal::SIGHUP);
+            assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+            continue;
+        }
+        mock.send_held_stream_event(serde_json::json!({
+        "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+        "request_id":first["request_id"], "mode":"plan", "revision":1,
+        "round_index":1, "owner_generation":1
+    }));
+        let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rejected["input"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+        astra.wait_for("Alt+U", UI_TRANSITION_TIMEOUT);
+        if scenario == "changed-mode" {
+            astra.paste_and_submit("/allow auto");
+            let changed = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(changed["mode"], "auto");
+            mock.send_held_stream_event(serde_json::json!({
+                "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                "request_id":changed["request_id"], "mode":"auto", "revision":changed["revision"],
+                "round_index":2, "owner_generation":1
+            }));
+        }
+        if closed {
+            mock.release_held_response();
+            astra.wait_for("total ·", UI_TRANSITION_TIMEOUT);
+        }
+        astra.write(b"\x1bu");
+        astra.wait_for_screen("recovered plan draft", UI_TRANSITION_TIMEOUT, |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains('›') && line.contains("plan"))
+        });
+        astra.write(b"\r");
+        if closed {
+            let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+            while mock.received_requests().len() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "recovered plan did not start a new turn\n{}",
+                    astra.screen_diagnostic()
+                );
+                astra.receive(Duration::from_millis(25));
+                tokio::task::yield_now().await;
+            }
+            let requests = mock.received_requests();
+            let retry = &requests[1];
+            assert_eq!(retry["message"], rejected["input"]["content"]);
+            assert!(
+                retry["context"]["edge_tools"]
+                    .as_array()
+                    .is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["function"]["name"] == "exit_plan_mode")
+                    }),
+                "the new turn did not expose the Plan-mode tool surface: {retry}"
+            );
+            astra.wait_for("Read-only", UI_TRANSITION_TIMEOUT);
+            assert!(permission_rx.try_recv().is_err());
+            astra.signal(nix::sys::signal::Signal::SIGHUP);
+            assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+            continue;
+        }
+        let retried = tokio::time::timeout(UI_TRANSITION_TIMEOUT, async {
+        tokio::select! {
+            permission = permission_rx.recv() => {
+                let permission = permission.unwrap();
+                assert_eq!(permission["mode"], "plan", "retry must never exit Plan mode");
+                mock.send_held_stream_event(serde_json::json!({
+                    "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                    "request_id":permission["request_id"], "mode":"plan", "revision":permission["revision"],
+                    "round_index":2, "owner_generation":1
+                }));
+                sent_rx.recv().await.unwrap()
+            }
+            sent = sent_rx.recv() => sent.unwrap(),
+        }
+    }).await.unwrap();
+        assert!(
+            retried["input"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+        assert_eq!(retried["input"]["content"], rejected["input"]["content"]);
+        assert!(permission_rx.try_recv().is_err());
+        astra.signal(nix::sys::signal::Signal::SIGHUP);
+        assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
     use axum::{Json, extract::Path, http::StatusCode, routing::post};
     use std::sync::Arc;
@@ -1160,7 +1370,7 @@ async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
         astra.wait_for_screen("later guidance applied", UI_TRANSITION_TIMEOUT, |screen| {
             screen.contains("› later question")
         });
-        astra.paste_and_submit("/plan");
+        astra.paste_and_submit("/allow auto");
         let exit_plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
             .await
             .unwrap()
@@ -1517,7 +1727,12 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     );
     mock.release_held_response();
     astra.wait_for("planning request was delivered", UI_TRANSITION_TIMEOUT);
-    assert!(astra.current_screen().contains("/plan inspect the failure"));
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("undelivered plan draft", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.contains('›') && line.contains("/plan inspect the failure"))
+    });
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }

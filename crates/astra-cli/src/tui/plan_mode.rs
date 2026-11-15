@@ -34,26 +34,22 @@ pub(crate) fn summarize_plan_goal(goal: &str) -> String {
 pub(crate) fn plan_transition_notice(
     before: &PlanModeUiSnapshot,
     after: &PlanModeUiSnapshot,
-    _triggered_by_plan_request: bool,
 ) -> Option<String> {
     match (before.active, after.active) {
         (false, true) => {
             if after.goal.is_empty() {
-                Some(
-                    "Plan mode active - describe your goal. Execution begins only after you approve the plan review; use `/plan` to exit.".into(),
-                )
+                Some("Plan mode active - planning the current task. Execution begins only after you approve the plan review; use `/allow auto` to exit.".into())
             } else {
                 Some(format!(
-                    "Plan mode active - goal: {}. Send refinements; execution begins only after you approve the plan review. Use `/plan` to exit.",
+                    "Plan mode active - goal: {}. Send refinements; execution begins only after you approve the plan review. Use `/allow auto` to exit.",
                     summarize_plan_goal(&after.goal)
                 ))
             }
         }
         (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
-            "Plan goal set - {}. Send refinements; execution begins only after you approve the plan review. Use `/plan` to exit.",
+            "Plan goal set - {}. Send refinements; execution begins only after you approve the plan review. Use `/allow auto` to exit.",
             summarize_plan_goal(&after.goal)
         )),
-        (true, false) => Some("Plan mode closed - back to normal chat.".into()),
         _ => None,
     }
 }
@@ -62,10 +58,9 @@ pub(crate) fn commit_plan_transition_notice(
     chat_widget: &mut super::chat_widget::ChatWidget,
     before: &PlanModeUiSnapshot,
     state: &crate::cli::session::session_state::SessionState,
-    triggered_by_plan_request: bool,
 ) {
     let after = capture_plan_mode_ui_snapshot(state);
-    if let Some(msg) = plan_transition_notice(before, &after, triggered_by_plan_request) {
+    if let Some(msg) = plan_transition_notice(before, &after) {
         chat_widget.commit_system(super::history_cell::system::SystemCell::response(msg));
     }
 }

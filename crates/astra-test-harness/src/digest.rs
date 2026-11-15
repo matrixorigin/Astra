@@ -109,7 +109,8 @@ pub(crate) fn validate_digest_json(
         "inclusive_total_tokens_out",
         "reported_root_fresh_tool_calls",
         "reported_root_noop_or_cached_tool_calls",
-        "reported_root_tool_failures",
+        "reported_root_ledger_failed_executions",
+        "observed_root_tool_failures",
         "reported_root_tool_outcomes_unknown",
         "safety_guard_blocks",
     ];
@@ -345,7 +346,8 @@ mod tests {
                 "subrun_total_duration_ms": 0, "observed_child_tool_requests": 0,
                 "inclusive_total_tokens_in": 10, "inclusive_total_tokens_out": 5,
                 "reported_root_fresh_tool_calls": 1,
-                "reported_root_noop_or_cached_tool_calls": 0, "reported_root_tool_failures": 0,
+                "reported_root_noop_or_cached_tool_calls": 0, "observed_root_tool_failures": 0,
+                "reported_root_ledger_failed_executions": 0,
                 "safety_guard_blocks": 0, "avg_tokens_in": 10.0,
                 "avg_tokens_out": 5.0, "avg_duration_ms": 20.0,
                 "avg_llm_rounds": 1.0, "avg_tool_calls_per_round": 1.0

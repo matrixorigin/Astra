@@ -324,13 +324,10 @@ impl<'a> TerminalIndex<'a> {
 
 /// Per-call observations, including callback results with uncertain delivery.
 fn observed_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
-    matches!(
-        e.event_type,
-        JournalEventType::LlmRound | JournalEventType::ToolCallError | JournalEventType::SyncMarker
-    )
-    .then_some(e.tool_calls.as_ref())
-    .flatten()
-    .filter(|calls| !calls.is_empty())
+    (!is_terminal(e))
+        .then_some(e.tool_calls.as_ref())
+        .flatten()
+        .filter(|calls| !calls.is_empty())
 }
 
 type CallKey<'a> = &'a astra_turn_types::ToolInvocationIdentity;
@@ -418,18 +415,7 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         executed: 0,
         complete: has_terminal
             && !observation_incomplete
-            && !events.iter().any(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::DelegationStarted
-                        | JournalEventType::DelegationSubRunStarted
-                        | JournalEventType::DelegationSubRunCompleted
-                ) || (journal_digest::is_child_producer(event)
-                    && matches!(
-                        event.event_type,
-                        JournalEventType::LlmRound | JournalEventType::ToolCallError
-                    ))
-            }),
+            && !journal_digest::has_child_observation(events),
     };
     let mut index = TerminalIndex::new(events);
     let mut owned: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();

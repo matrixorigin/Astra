@@ -185,18 +185,49 @@ fn unavailable_account_journal_preserves_local_analysis_and_reports_error() {
         OwnerScope::user(local_profile_owner_id("default", Some(account)).unwrap()).unwrap();
     let local_path = journal_file_path_for_owner(&local, sid).unwrap();
     std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-    std::fs::write(&local_path, format!(
-        "{{\"type\":\"turn\",\"ts\":\"t1\",\"session_id\":\"{sid}\",\"turn\":1,\"tokens_in\":100,\"tokens_out\":10,\"tool_count\":0}}\n"
-    )).unwrap();
+    let terminal = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root"},"tokens_in":100,"tokens_out":10,
+        "cache_read_tokens":0,"cache_creation_tokens":0,"tool_count":0,
+        "tool_outcomes":{"requested":0,"executed":0,"succeeded":0,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}});
+    std::fs::write(&local_path, format!("{terminal}\n")).unwrap();
     let account_owner = OwnerScope::user(account).unwrap();
     let account_path = journal_file_path_for_owner(&account_owner, sid).unwrap();
-    std::fs::create_dir_all(&account_path).unwrap();
+    std::fs::create_dir_all(account_path.parent().unwrap()).unwrap();
 
     let parse = |args: &[&str]| {
         let output = run_journal(root.path(), args);
         assert!(output.status.success(), "{args:?}: {output:?}");
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
+    // The callback was retained by the supplemental owner. It remains an
+    // observed child execution after the authorized journal join.
+    let callback = json!({"type":"sync_marker","ts":"t2","session_id":sid,
+        "producer_scope":{"run_id":"child"},"metadata":{"source":"child_agent"},
+        "tool_calls":[{"name":"read_file","ok":true,"ms":1,"tool_call_id":"request",
+            "invocation_identity":{"user_id":account,"session_id":sid,"run_id":"child",
+                "turn_chain_id":"chain","invocation_id":"request"}}]});
+    std::fs::write(&account_path, format!("{callback}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["self_prompt_tokens_complete"], true);
+    assert_eq!(tree["root"]["prompt_tokens_complete"], false);
+    assert_eq!(tree["root"]["tool_calls"], 1);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    let mut duplicate = callback.clone();
+    duplicate["ts"] = json!("t3");
+    std::fs::write(&local_path, format!("{terminal}\n{duplicate}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+
+    std::fs::write(&local_path, format!("{terminal}\n")).unwrap();
+    std::fs::remove_file(&account_path).unwrap();
+    std::fs::create_dir(&account_path).unwrap();
     let tree = parse(&["tree", sid, "--format", "json"]);
     assert_eq!(tree["root"]["self_prompt_tokens"], 100);
     assert_eq!(tree["root"]["self_prompt_tokens_complete"], false);
@@ -407,7 +438,7 @@ fn digest_reports_only_observed_semantics_and_complete_round_averages() {
             digest["aggregates"]["root_tool_totals_complete"], true,
             "body={body:?}"
         );
-        assert_eq!(digest["aggregates"]["reported_root_tool_failures"], 0);
+        assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 0);
         let group = &digest["turns"][0]["tool_groups"][0];
         assert_eq!(group["fail_count"], 0);
         assert_eq!(group["ok_count"], 1);
@@ -430,7 +461,7 @@ fn digest_reports_only_observed_semantics_and_complete_round_averages() {
                 digest["aggregates"]["reported_root_tool_outcomes_unknown"],
                 1
             );
-            assert_eq!(digest["aggregates"]["reported_root_tool_failures"], 0);
+            assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 0);
             assert_eq!(digest["aggregates"]["root_tool_totals_complete"], false);
             assert_eq!(
                 digest["aggregates"]["root_tool_counts_complete"],
@@ -458,7 +489,7 @@ fn digest_reports_only_observed_semantics_and_complete_round_averages() {
         "tool_count":1,"tool_calls":[{"name":"bash","ok":true,"execution_ok":false,"ms":1,
             "result_full":success,"output_bytes":success.len()}],"tool_outcomes":outcomes,"llm_rounds":1});
     std::fs::write(&path, format!("{event}\n")).unwrap();
-    assert_eq!(parse()["aggregates"]["reported_root_tool_failures"], 1);
+    assert_eq!(parse()["aggregates"]["observed_root_tool_failures"], 1);
 
     // A partial list retains its observed producer facts, without claiming
     // the missing records are known, for both successful and failed turns.
@@ -479,6 +510,61 @@ fn digest_reports_only_observed_semantics_and_complete_round_averages() {
             0
         );
     }
+
+    // Server-owned turns can retain the complete ledger without retaining
+    // per-call details. Keep ledger failures and observed failures separate.
+    for kind in ["turn", "turn_error"] {
+        for (succeeded, failed) in [(1, 0), (0, 1)] {
+            let event = json!({"type":kind,"ts":"t1","session_id":sid,"turn":1,
+                "tool_count":1,"tool_outcomes":{"requested":1,"executed":1,
+                    "succeeded":succeeded,"failed":failed,"started_unknown":0,"unknown":0,
+                    "rejected":0,"reused":0,"suppressed":0,"deferred":0}});
+            std::fs::write(&path, format!("{event}\n")).unwrap();
+            let digest = parse();
+            assert_eq!(
+                digest["aggregates"]["reported_root_ledger_failed_executions"],
+                failed
+            );
+            assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 0);
+            assert_eq!(digest["aggregates"]["root_tool_totals_complete"], false);
+            let text = run_journal(
+                root.path(),
+                &["digest", sid, "--format", "text", "--focus", "all"],
+            );
+            assert!(text.status.success());
+            assert!(String::from_utf8_lossy(&text.stdout).contains(&format!(
+                "ledger_failed_executions={failed} observed_failures=0"
+            )));
+        }
+    }
+    let mut ledger_and_detail = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "tool_count":2,"tool_outcomes":{"requested":2,"executed":2,"succeeded":1,
+            "failed":1,"started_unknown":0,"unknown":0,"rejected":0,"reused":0,
+            "suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":false,"ms":1}]});
+    std::fs::write(&path, format!("{ledger_and_detail}\n")).unwrap();
+    let digest = parse();
+    assert_eq!(
+        digest["aggregates"]["reported_root_ledger_failed_executions"],
+        1
+    );
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 1);
+    ledger_and_detail["tool_outcomes"]["failed"] = json!(0);
+    ledger_and_detail["tool_outcomes"]["succeeded"] = json!(2);
+    std::fs::write(&path, format!("{ledger_and_detail}\n")).unwrap();
+    let contradictory = parse();
+    assert_eq!(
+        contradictory["aggregates"]["reported_root_ledger_failed_executions"],
+        0
+    );
+    assert_eq!(
+        contradictory["aggregates"]["observed_root_tool_failures"],
+        1
+    );
+    assert_eq!(
+        contradictory["aggregates"]["root_tool_counts_complete"],
+        false
+    );
 
     let failed_outcomes = json!({"requested":1,"executed":1,"succeeded":0,"failed":1,
         "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
@@ -600,7 +686,7 @@ fn execution_counts_agree_across_commands_with_nonexecuted_requests() {
             digest["aggregates"]["reported_root_noop_or_cached_tool_calls"],
             2
         );
-        assert_eq!(digest["aggregates"]["reported_root_tool_failures"], 2);
+        assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 2);
         assert_eq!(digest["aggregates"]["root_tool_counts_complete"], true);
         assert_eq!(digest["aggregates"]["avg_tool_calls_per_round"], 1.0);
         assert_eq!(tree["root"]["tool_calls"], 1);

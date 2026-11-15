@@ -290,12 +290,7 @@ pub(crate) fn fold_events_into_tree(
 
     // Child LLM rounds are observations, not terminal accounting. A delegated
     // completion does not report usage, so no child total can be certified.
-    let mut has_child_observation = events.iter().any(|event| {
-        matches!(
-            event.event_type,
-            JournalEventType::DelegationStarted | JournalEventType::DelegationSubRunCompleted
-        )
-    });
+    let has_child_observation = journal_digest::has_child_observation(events);
     for event in events
         .iter()
         .filter(|event| journal_digest::is_child_producer(event))
@@ -309,7 +304,6 @@ pub(crate) fn fold_events_into_tree(
         ) {
             continue;
         }
-        has_child_observation = true;
         let Some(run_id) = journal_digest::producer_run_id(event) else {
             skipped = skipped.saturating_add(1);
             continue;

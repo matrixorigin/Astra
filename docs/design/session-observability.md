@@ -146,6 +146,12 @@ counted once; contradictory terminals for an attempt are excluded. A scalar
 execution count does not establish success, failure, or cache outcomes.
 Raw terminal reports can overlap or contradict their outcome summaries; they
 are shown as reports, not as confirmed execution totals.
+Digest reports the validated ledger's failed-execution bucket separately from
+semantic failures observed in retained tool records. They can describe the
+same calls and must not be added together; a ledger-only failure remains visible
+even when individual results are unavailable. Child callback observations
+retain their producer scope across authorized journal joins. They do not imply
+a parent or make inclusive usage complete.
 Incomplete outcome totals report retained producer facts, not inferred
 success or failure from tool output. Truncation, redaction or missing output
 does not erase a typed outcome; explicit execution uncertainty remains unknown.

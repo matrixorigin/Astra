@@ -1659,6 +1659,54 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn server_ledger_failure_survives_journal_projection_without_details() {
+        use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
+        use astra_turn_types::tool_ledger_receipt::{
+            ToolLedgerCanonicalAggregate, ToolLedgerResultClassCounts,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let _journal = ProcessJournalDirGuard::new(root.path());
+        for failed in [false, true] {
+            let session = if failed {
+                "failed-ledger"
+            } else {
+                "successful-ledger"
+            };
+            let result = super::StreamResult {
+                tool_calls_count: 1,
+                tool_ledger_aggregate: ToolLedgerCanonicalAggregate {
+                    attempted: 1,
+                    terminal: 1,
+                    unresolved: 0,
+                    result_classes: ToolLedgerResultClassCounts {
+                        succeeded: u32::from(!failed),
+                        failed: u32::from(failed),
+                        ..Default::default()
+                    },
+                    consistent: true,
+                },
+                ..Default::default()
+            };
+            let mut event = JournalEvent::turn(Some(session), 1, None, "task", "done", 0, 0, 0, 0);
+            result.apply_canonical_tool_outcomes(&mut event);
+            JournalWriter::new(session).unwrap().append(&event).unwrap();
+            let digest = crate::cli::journal_digest::build_digest(
+                session,
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(
+                digest.aggregates.reported_root_ledger_failed_executions,
+                u64::from(failed)
+            );
+            assert_eq!(digest.aggregates.observed_root_tool_failures, 0);
+            assert!(!digest.aggregates.root_tool_totals_complete);
+        }
+    }
+
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.into(),

@@ -840,6 +840,12 @@ impl BottomPane {
             .then_some(first)
     }
 
+    pub(crate) fn is_plan_user_intent(&self, intent_id: &str) -> bool {
+        self.pending_user_intents
+            .iter()
+            .any(|intent| intent.intent_id == intent_id && intent.wire_text.is_some())
+    }
+
     pub(crate) fn has_turn_guidance_needing_attention(&self, turn_id: &str) -> bool {
         self.pending_user_intents.iter().any(|intent| {
             intent.turn_id.as_deref() == Some(turn_id)

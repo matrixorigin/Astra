@@ -189,12 +189,14 @@ pub struct Aggregates {
     /// Tool records that did not execute fresh work because the runtime reused
     /// or pointed back to an already-known result.
     pub reported_root_noop_or_cached_tool_calls: u64,
-    pub reported_root_tool_failures: u64,
+    /// Sum of validated terminal ledger failure buckets; reports may overlap.
+    pub reported_root_ledger_failed_executions: u64,
+    pub observed_root_tool_failures: u64,
     /// Observed tool responses whose effective outcomes are unknown (a lower
     /// bound when not all records were retained).
     pub reported_root_tool_outcomes_unknown: u64,
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
-    /// Subset of `reported_root_tool_failures`. Non-zero means the agent hit safety walls.
+    /// Subset of `observed_root_tool_failures`. Non-zero means the agent hit safety walls.
     pub safety_guard_blocks: u64,
     pub avg_tokens_in: Option<f64>,
     pub avg_tokens_out: Option<f64>,
@@ -467,35 +469,6 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
         }
     }
     stats
-}
-
-fn authoritative_tool_call_stats(
-    event: &session_journal::JournalEvent,
-    record_stats: ToolCallStats,
-) -> ToolCallStats {
-    let record_count = event.tool_calls.as_ref().map_or(0, Vec::len);
-    let Some(outcomes) = event
-        .tool_outcomes
-        .as_ref()
-        .filter(|outcomes| outcomes.is_consistent())
-        .filter(|outcomes| outcomes.requested as usize > record_count)
-    else {
-        return record_stats;
-    };
-
-    ToolCallStats {
-        ok: outcomes
-            .succeeded
-            .saturating_add(outcomes.reused)
-            .saturating_add(outcomes.suppressed),
-        fail: outcomes
-            .failed
-            .saturating_add(outcomes.rejected)
-            .saturating_add(outcomes.deferred),
-        unknown: outcomes.unknown.saturating_add(outcomes.started_unknown),
-        fresh: outcomes.succeeded,
-        noop_or_cached: outcomes.reused.saturating_add(outcomes.suppressed),
-    }
 }
 
 /// A scalar execution count contains no success, failure, or reuse outcomes.
@@ -806,6 +779,18 @@ pub(super) fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
     }) || ev.metadata.as_ref().is_some_and(|metadata| {
         metadata.get("purpose").and_then(serde_json::Value::as_str) == Some("sub_agent")
             || metadata.get("source").and_then(serde_json::Value::as_str) == Some("child_agent")
+    })
+}
+
+pub(super) fn has_child_observation(events: &[session_journal::JournalEvent]) -> bool {
+    events.iter().any(|event| {
+        is_child_producer(event)
+            || matches!(
+                event.event_type,
+                JournalEventType::DelegationStarted
+                    | JournalEventType::DelegationSubRunStarted
+                    | JournalEventType::DelegationSubRunCompleted
+            )
     })
 }
 
@@ -1236,6 +1221,17 @@ fn merge_attached_events(
     supplemental: Vec<session_journal::JournalEvent>,
     include: fn(&JournalEventType) -> bool,
 ) -> usize {
+    // Child callbacks are recorded by the Edge even when the primary journal
+    // comes from another authorized owner. Preserve the actual observations;
+    // an event's type alone does not establish whether it contains tool facts.
+    let includes = |event: &session_journal::JournalEvent| {
+        include(&event.event_type)
+            || (is_child_producer(event)
+                && event
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()))
+    };
     let mut known_rounds = std::collections::BTreeMap::new();
     let mut conflicts = std::collections::BTreeSet::new();
     for event in events.iter().chain(supplemental.iter()) {
@@ -1271,13 +1267,13 @@ fn merge_attached_events(
         if let Some(identity) = round_identity(event) {
             return !conflicts.contains(&identity) && seen_rounds.insert(identity);
         }
-        !include(&event.event_type)
+        !includes(event)
             || serde_json::to_string(event)
                 .map(|payload| seen_exact.insert(payload))
                 .unwrap_or(true)
     });
     events.extend(supplemental.into_iter().filter(|event| {
-        if !include(&event.event_type) {
+        if !includes(event) {
             return false;
         }
         if let Some(identity) = round_identity(event) {
@@ -1623,7 +1619,8 @@ fn build_digest_with_owners(
     let mut reported_root_tool_outcomes_unknown: u64 = 0;
     let mut reported_root_fresh_tool_calls: u64 = 0;
     let mut reported_root_noop_or_cached_tool_calls: u64 = 0;
-    let mut reported_root_tool_failures: u64 = 0;
+    let mut observed_root_tool_failures: u64 = 0;
+    let mut reported_root_ledger_failed_executions: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut total_root_llm_rounds: u64 = 0;
     let mut root_round_observations_consistent = true;
@@ -1694,11 +1691,25 @@ fn build_digest_with_owners(
         let terminal_stats = if is_root_terminal(ev) {
             saw_root_terminal = true;
             let semantic = tool_call_stats(ev.tool_calls.as_ref());
-            let stats = authoritative_tool_call_stats(ev, semantic);
-            let known = tool_outcomes_known(ev, stats);
+            let known = tool_outcomes_known(ev, semantic);
             root_tool_totals_complete &= known;
-            root_tool_counts_complete &= tool_count_known(ev);
-            Some((stats, semantic, known))
+            let counts_known = tool_count_known(ev);
+            root_tool_counts_complete &= counts_known;
+            let ledger = ev
+                .tool_outcomes
+                .as_ref()
+                .filter(|_| counts_known || terminal_execution_consistent(ev));
+            let ledger_unknown = ledger.map_or(0, |outcomes| {
+                outcomes.unknown.saturating_add(outcomes.started_unknown)
+            });
+            reported_root_tool_outcomes_unknown += u64::from(semantic.unknown.max(ledger_unknown));
+            reported_root_tool_calls += reported_executions(ev);
+            reported_root_fresh_tool_calls += u64::from(semantic.fresh);
+            reported_root_noop_or_cached_tool_calls += u64::from(semantic.noop_or_cached);
+            observed_root_tool_failures += u64::from(semantic.fail);
+            reported_root_ledger_failed_executions +=
+                u64::from(ledger.map_or(0, |outcomes| outcomes.failed));
+            Some((semantic, known))
         } else {
             None
         };
@@ -1718,15 +1729,8 @@ fn build_digest_with_owners(
                 if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
                 }
-                let (stats, semantic_stats, outcomes_known) =
-                    terminal_stats.expect("root terminal");
-                reported_root_tool_outcomes_unknown +=
-                    u64::from(stats.unknown.max(semantic_stats.unknown));
+                let (stats, outcomes_known) = terminal_stats.expect("root terminal");
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
-                reported_root_tool_calls += reported_executions(ev);
-                reported_root_fresh_tool_calls += u64::from(semantic_stats.fresh);
-                reported_root_noop_or_cached_tool_calls += u64::from(semantic_stats.noop_or_cached);
-                reported_root_tool_failures += u64::from(semantic_stats.fail);
                 // Count safety guard blocks regardless of focus level.
                 if let Some(calls) = ev.tool_calls.as_ref() {
                     for call in calls.iter().filter(|c| is_effective_failure(c)) {
@@ -1856,14 +1860,7 @@ fn build_digest_with_owners(
                 if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
                 }
-                let (stats, semantic_stats, outcomes_known) =
-                    terminal_stats.expect("root terminal");
-                reported_root_tool_outcomes_unknown +=
-                    u64::from(stats.unknown.max(semantic_stats.unknown));
-                reported_root_tool_calls += reported_executions(ev);
-                reported_root_fresh_tool_calls += u64::from(semantic_stats.fresh);
-                reported_root_noop_or_cached_tool_calls += u64::from(semantic_stats.noop_or_cached);
-                reported_root_tool_failures += u64::from(semantic_stats.fail);
+                let (stats, outcomes_known) = terminal_stats.expect("root terminal");
                 if let Some(calls) = ev.tool_calls.as_ref() {
                     for call in calls.iter().filter(|call| is_effective_failure(call)) {
                         let error = effective_error_text(call);
@@ -2169,7 +2166,8 @@ fn build_digest_with_owners(
             inclusive_total_tokens_out: total_tokens_out + subrun_total_tokens_out,
             reported_root_fresh_tool_calls,
             reported_root_noop_or_cached_tool_calls,
-            reported_root_tool_failures,
+            reported_root_ledger_failed_executions,
+            observed_root_tool_failures,
             reported_root_tool_outcomes_unknown,
             safety_guard_blocks,
             avg_tokens_in,
@@ -2317,14 +2315,15 @@ pub fn print_text(d: &JournalDigest) {
         },
         tool_total(a.reported_root_fresh_tool_calls),
         tool_total(a.reported_root_noop_or_cached_tool_calls),
-        tool_total(a.reported_root_tool_failures),
+        tool_total(a.observed_root_tool_failures),
         tool_total(a.reported_root_tool_outcomes_unknown)
     );
     if !a.root_tool_totals_complete && a.reported_root_tool_calls > 0 {
         stdout_println!(
-            "  terminal_tool_reports: calls={} observed_failures={} unknown={} (observations may overlap)",
+            "  terminal_tool_reports: calls={} ledger_failed_executions={} observed_failures={} unknown={} (observations may overlap)",
             a.reported_root_tool_calls,
-            a.reported_root_tool_failures,
+            a.reported_root_ledger_failed_executions,
+            a.observed_root_tool_failures,
             a.reported_root_tool_outcomes_unknown
         );
     }
@@ -3659,7 +3658,7 @@ mod tests {
             );
             assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 1);
             assert!(!digest.aggregates.root_tool_totals_complete);
-            assert_eq!(digest.aggregates.reported_root_tool_failures, 0);
+            assert_eq!(digest.aggregates.observed_root_tool_failures, 0);
         }
     }
 
@@ -3836,7 +3835,7 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(d.aggregates.reported_root_tool_failures, 2);
+        assert_eq!(d.aggregates.observed_root_tool_failures, 2);
         assert_eq!(d.aggregates.safety_guard_blocks, 1);
         assert_eq!(d.failed_tool_calls.len(), 2);
 
@@ -3886,7 +3885,7 @@ mod tests {
         write_test_journal(journal_path_for_test(sid),
             r#"{"type":"turn","ts":"t","session_id":"S","turn":1,"tool_calls":[{"name":"agent","ok":false,"ms":0,"error":"Invalid input: missing field description"},{"name":"bash","ok":true,"ms":5,"result_preview":"{\"ok\":false}"}]}"#).unwrap();
         let digest = build_digest(sid, DigestFocus::All).unwrap();
-        assert_eq!(digest.aggregates.reported_root_tool_failures, 1);
+        assert_eq!(digest.aggregates.observed_root_tool_failures, 1);
         assert_eq!(digest.failed_tool_calls.len(), 1);
         assert_eq!(digest.failed_tool_calls[0].tool, "agent");
         assert!(
@@ -3921,7 +3920,7 @@ mod tests {
         assert_eq!(d.turns[0].tool_calls_fresh, None);
         assert_eq!(d.turns[0].tool_calls_noop_or_cached, None);
         assert_eq!(
-            d.aggregates.reported_root_tool_failures, 0,
+            d.aggregates.observed_root_tool_failures, 0,
             "same-invocation replays must not count as failures"
         );
         assert!(
@@ -3943,7 +3942,7 @@ mod tests {
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(
-            d.aggregates.reported_root_tool_failures, 1,
+            d.aggregates.observed_root_tool_failures, 1,
             "deferred activation misses are protocol failures and must be visible"
         );
         assert!(
@@ -3970,7 +3969,7 @@ mod tests {
         // Summary focus omits per-call details
         assert!(d.failed_tool_calls.is_empty());
         // But aggregate counts still work
-        assert_eq!(d.aggregates.reported_root_tool_failures, 1);
+        assert_eq!(d.aggregates.observed_root_tool_failures, 1);
     }
 
     #[test]
@@ -3987,7 +3986,7 @@ mod tests {
         let d = build_digest(sid, DigestFocus::Summary).expect("digest");
         assert_eq!(d.aggregates.reported_root_tool_calls, 3);
         assert_eq!(d.aggregates.reported_root_fresh_tool_calls, 0);
-        assert_eq!(d.aggregates.reported_root_tool_failures, 0);
+        assert_eq!(d.aggregates.observed_root_tool_failures, 0);
         assert_eq!(d.turns[0].tool_calls_ok, None);
         assert_eq!(d.turns[0].tool_calls_fail, None);
         assert!(!d.aggregates.root_tool_totals_complete);
@@ -4004,7 +4003,7 @@ mod tests {
         assert_eq!(digest.turns[0].tool_calls_ok, None);
         assert_eq!(digest.turns[0].tool_calls_fail, None);
         assert!(!digest.aggregates.root_tool_totals_complete);
-        assert_eq!(digest.aggregates.reported_root_tool_failures, 1);
+        assert_eq!(digest.aggregates.observed_root_tool_failures, 1);
         assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 0);
         assert!(
             digest
@@ -4023,7 +4022,7 @@ mod tests {
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":1,"tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,"started_unknown":0,"unknown":1,"rejected":0,"reused":0,"suppressed":0,"deferred":0}}"#).unwrap();
         let digest = build_digest(sid, DigestFocus::Summary).unwrap();
         assert_eq!(digest.aggregates.reported_root_tool_calls, 1);
-        assert_eq!(digest.aggregates.reported_root_tool_failures, 0);
+        assert_eq!(digest.aggregates.observed_root_tool_failures, 0);
         assert_eq!(digest.aggregates.reported_root_tool_outcomes_unknown, 1);
     }
 

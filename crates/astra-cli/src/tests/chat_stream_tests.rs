@@ -410,6 +410,32 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             let unexecuted_child = expired_child || admission_rejected;
             assert_eq!(records[1].ok, !unexecuted_child);
             assert_eq!(records[1].was_executed(), !unexecuted_child);
+            // The actual callback producer, rather than a hand-built child
+            // event, must make inclusive accounting incomplete even when the
+            // root's own terminal reports no tool calls.
+            let mut root = session_journal::JournalEvent::turn(
+                Some("partial-session"),
+                1,
+                None,
+                "task",
+                "done",
+                0,
+                12,
+                3,
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            root.cache_read_tokens = Some(0);
+            root.cache_creation_tokens = Some(0);
+            root.tool_outcomes = Some(Default::default());
+            let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree(
+                "partial-session",
+                &[root, observation.clone()],
+            );
+            assert!(tree.self_prompt_tokens_complete);
+            assert!(!tree.prompt_tokens_complete);
+            assert!(!tree.tool_calls_complete);
+            assert_eq!(tree.tool_calls, 1);
             assert!(
                 records[1]
                     .result_full
