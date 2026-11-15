@@ -1159,17 +1159,35 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             .and_then(|v| v.as_f64())
             .expect("validated average")
     };
+    let tools_complete = a
+        .get("root_tool_totals_complete")
+        .and_then(|v| v.as_bool())
+        .expect("validated coverage");
+    let tool_total = |key: &str| {
+        let value = get_u(key);
+        if tools_complete {
+            value.to_string()
+        } else {
+            "?".to_owned()
+        }
+    };
     out.push_str(&format!(
             "      attempts={} turns={} turn_errors={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
             get_u("attempt_count"),
             get_u("turn_count"),
             get_u("turn_error_count"),
-            get_u("total_tool_calls"),
-            get_u("tool_calls_failed"),
+            tool_total("reported_root_tool_calls"),
+            tool_total("reported_root_tool_failures"),
             get_u("error_event_count"),
             get_u("compact_count"),
             get_u("stall_count"),
     ));
+    if !tools_complete && get_u("reported_root_tool_calls") > 0 {
+        out.push_str(&format!(
+            "      terminal_tool_reports={} (observations may overlap)\n",
+            get_u("reported_root_tool_calls")
+        ));
+    }
     out.push_str(&format!(
         "      known_root_tokens_in={} known_root_tokens_out={} root_duration_ms={}\n",
         get_u("total_tokens_in"),
@@ -1177,11 +1195,15 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
         get_u("total_duration_ms"),
     ));
     out.push_str(&format!(
-        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} inclusive_tool_calls={}\n",
+        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} observed_child_tool_requests={}\n",
         get_u("subrun_count"),
         get_u("inclusive_total_tokens_in"),
         get_u("inclusive_total_tokens_out"),
-        get_u("inclusive_total_tool_calls"),
+        get_u("observed_child_tool_requests"),
+    ));
+    out.push_str(&format!(
+        "      observed_root_tool_requests={} (not an execution count)\n",
+        get_u("observed_root_tool_requests")
     ));
     out.push_str(&format!(
         "      avg_tokens_in={} avg_tokens_out={} avg_duration_ms={:.1}\n",
@@ -1632,8 +1654,8 @@ mod tests {
                     "attempt_count": 3,
                     "turn_count": 3,
                     "turn_error_count": 0,
-                    "total_tool_calls": 5,
-                    "tool_calls_failed": 1,
+                    "reported_root_tool_calls": 5, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "reported_root_tool_failures": 1,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1643,16 +1665,15 @@ mod tests {
                     "subrun_count": 0,
                     "inclusive_total_tokens_in": 12000,
                     "inclusive_total_tokens_out": 450,
-                    "inclusive_total_tool_calls": 5,
-                    "total_fresh_tool_calls": 5,
-                    "total_noop_or_cached_tool_calls": 0,
+                    "reported_root_fresh_tool_calls": 5,
+                    "reported_root_noop_or_cached_tool_calls": 0,
                     "safety_guard_blocks": 0,
                     "session_start_count": 1,
                     "session_end_count": 1,
                     "subrun_total_tokens_in": 0,
                     "subrun_total_tokens_out": 0,
                     "subrun_total_duration_ms": 0,
-                    "subrun_total_tool_calls": 0,
+                    "observed_child_tool_requests": 0,
                     "avg_tokens_in": 4000.0,
                     "avg_tokens_out": 150.0,
                     "avg_duration_ms": 2733.33,
@@ -1695,8 +1716,8 @@ mod tests {
                     "attempt_count": 2,
                     "turn_count": 1,
                     "turn_error_count": 1,
-                    "total_tool_calls": 14,
-                    "tool_calls_failed": 2,
+                    "reported_root_tool_calls": 14, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "reported_root_tool_failures": 2,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1706,16 +1727,15 @@ mod tests {
                     "subrun_count": 3,
                     "inclusive_total_tokens_in": 189908,
                     "inclusive_total_tokens_out": 29610,
-                    "inclusive_total_tool_calls": 96,
-                    "total_fresh_tool_calls": 12,
-                    "total_noop_or_cached_tool_calls": 2,
+                    "reported_root_fresh_tool_calls": 12,
+                    "reported_root_noop_or_cached_tool_calls": 2,
                     "safety_guard_blocks": 0,
                     "session_start_count": 1,
                     "session_end_count": 1,
                     "subrun_total_tokens_in": 129761,
                     "subrun_total_tokens_out": 22498,
                     "subrun_total_duration_ms": 0,
-                    "subrun_total_tool_calls": 82,
+                    "observed_child_tool_requests": 82,
                     "avg_tokens_in": 30073.5,
                     "avg_tokens_out": 3556.0,
                     "avg_duration_ms": 58160.0,
@@ -1735,6 +1755,13 @@ mod tests {
         assert!(
             out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
         );
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["root_tool_totals_complete"] = false.into();
+        digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
+        let partial = render(&r, Format::Text, false);
+        assert!(partial.contains("tool_calls=? tool_failures=?"));
+        assert!(partial.contains("terminal_tool_reports=14 (observations may overlap)"));
+        assert!(!partial.contains("tool_calls=14"));
     }
 
     #[test]

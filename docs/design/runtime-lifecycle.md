@@ -841,7 +841,10 @@ an earlier committed acceptance. If both same-identity submissions remain
 unconfirmed, later messages stay in the existing turn FIFO. A matching Applied
 event releases that FIFO; uncertainty alone neither closes Run admission nor
 permits replay under a new identity. At turn settlement, an unresolved message
-remains visible for explicit recovery.
+remains visible for explicit recovery. A Plan command deferred behind earlier
+guidance becomes eligible after that guidance is applied; its permission change
+must apply before its planning instruction. Explicit next-turn entries remain
+ordered barriers, and later input does not overtake the deferred command.
 
 ## Cancellation
 

@@ -3141,9 +3141,7 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
     let mut interactive = Vec::new();
     for entry in entries {
         match entry {
-            NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => {
-                interactive.push(text)
-            }
+            NextTurnSubmission::Interactive(text) => interactive.push(text),
             NextTurnSubmission::Guidance(intent) => {
                 bottom_pane.retain_returned_root_guidance(intent);
             }
@@ -6078,7 +6076,11 @@ impl PendingActivePlan {
     }
 
     fn blocks_intent(&self, intent_id: &str) -> bool {
-        !self.permission_applied && self.intent_id.as_deref() == Some(intent_id)
+        !self.permission_applied
+            && self
+                .intent_id
+                .as_deref()
+                .is_none_or(|plan_id| plan_id == intent_id)
     }
 }
 
@@ -6105,6 +6107,32 @@ fn active_plan_guidance(text: &str) -> Option<String> {
     })
 }
 
+fn start_active_plan(
+    intent: &bottom_pane::PendingUserIntent,
+    planning: bool,
+    current_mode: crate::cli::permission_manager::PermissionMode,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    permission_control: &mut super::permission_control::ActivePermissionControl,
+) -> PendingActivePlan {
+    let goal = active_plan_command(&intent.text).expect("parsed plan command");
+    let entering = !goal.is_empty() || !planning;
+    let mode = if entering {
+        crate::cli::permission_manager::PermissionMode::Plan
+    } else {
+        crate::cli::permission_manager::PermissionMode::Auto
+    };
+    stage_permission_mode_for_next_round(bottom_pane, chat_widget, mode, current_mode);
+    let request_id = permission_control.request(mode);
+    PendingActivePlan {
+        request_id,
+        intent_id: Some(intent.intent_id.clone()),
+        original: intent.text.clone(),
+        entering,
+        permission_applied: false,
+    }
+}
+
 fn restore_pending_active_plan(
     plan: PendingActivePlan,
     bottom_pane: &mut BottomPane,
@@ -6120,48 +6148,25 @@ fn restore_pending_active_plan(
 
 fn restore_active_plan_command(
     intent_id: Option<&str>,
-    original: String,
+    _original: String,
     bottom_pane: &mut BottomPane,
     same_turn_scope: bool,
 ) -> bool {
-    if let Some(intent_id) = intent_id {
-        if !bottom_pane.root_intent_is_visible(intent_id) || !same_turn_scope {
-            bottom_pane.retain_unsent_detached_plan(intent_id);
-            return false;
-        }
-        bottom_pane.remove_local_user_intent(intent_id);
-    } else if !same_turn_scope {
+    let Some(intent_id) = intent_id else {
         return false;
-    }
-    bottom_pane.restore_into_composer(&original);
-    true
+    };
+    let visible = same_turn_scope && bottom_pane.root_intent_is_visible(intent_id);
+    bottom_pane.retain_unsent_detached_plan(intent_id);
+    visible
 }
 
 fn restore_rejected_active_guidance(
     bottom_pane: &mut BottomPane,
     turn_id: &str,
-    intent_id: &str,
-    text: &str,
-    plan_command: Option<String>,
     pending_plan: &mut Option<PendingActivePlan>,
 ) {
-    bottom_pane.remove_local_user_intent(intent_id);
-    let unsent = bottom_pane.take_unsent_turn_guidance(turn_id);
-    if pending_plan
-        .as_ref()
-        .and_then(|plan| plan.intent_id.as_ref())
-        .is_some_and(|id| unsent.iter().any(|intent| &intent.intent_id == id))
-    {
-        *pending_plan = None;
-    }
-    let first = plan_command
-        .unwrap_or_else(|| slash_dispatch::conversation_for_composer(text).into_owned());
-    bottom_pane.start_composer_draft(&first);
-    bottom_pane.restore_inputs_into_composer(
-        unsent
-            .into_iter()
-            .map(|intent| intent.composer_text().into_owned()),
-    );
+    bottom_pane.retain_unsent_detached_turn(turn_id);
+    *pending_plan = None;
 }
 
 fn stage_permission_mode_for_next_round(
@@ -10130,9 +10135,9 @@ pub(crate) async fn run_tui_session(
                                     continue;
                                 };
                                 match next {
-                                    NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => (None, BottomPaneAction::SubmitInput(text)),
+                                    NextTurnSubmission::Interactive(text) => (None, BottomPaneAction::SubmitInput(text)),
                                     NextTurnSubmission::Guidance(intent) => (None, BottomPaneAction::SubmitInput(
-                                        slash_dispatch::conversation_for_composer(&intent.text).into_owned())),
+                                        intent.composer_text().into_owned())),
                                     NextTurnSubmission::Conversation { target, content } => (Some(target), BottomPaneAction::SubmitInput(content)),
                                 }
                             }
@@ -10970,7 +10975,7 @@ pub(crate) async fn run_tui_session(
                                     let (turn_tx, turn_stream_bridge_control) = stream_bridge::create_scoped_per_turn_bridge(tui_tx.clone(), turn_scope.clone());
                                     state.tui_stream_event_tx = Some(turn_tx);
                                     state.tui_agent_live_event_sink = Some(stream_bridge::create_scoped_agent_live_sink(tui_tx.clone(), turn_scope.clone()));
-                                    bottom_pane.set_root_intent_scope(turn_scope);
+                                    bottom_pane.set_root_intent_scope(turn_scope.clone());
                                     let turn_result = {
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
@@ -11112,12 +11117,36 @@ pub(crate) async fn run_tui_session(
                                                     !permission_control.is_current_request(&plan.request_id)
                                                 }
                                             }) {
-                                                let restored = restore_pending_active_plan(pending_active_plan.take().unwrap(), &mut bottom_pane, turn_model_owner.is_current());
+                                                let same_scope = turn_scope.attached_in(Some(chat_widget.session_id()).filter(|id| !id.is_empty()), live_session_attachment_epoch);
+                                                let restored = restore_pending_active_plan(pending_active_plan.take().unwrap(), &mut bottom_pane, same_scope);
+                                                bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
-                                                    if restored { "The plan change was superseded. The original command is available for editing." }
-                                                    else { "The plan change was superseded. The command was not restored here; retry if needed." }
+                                                    if restored { "The plan change was superseded. Press Alt+U to review unsent input." }
+                                                    else { "The plan change was superseded. Unsent input remains with its original session." }
                                                 ));
                                                 guidance_dispatch_needed = true;
+                                            }
+                                            // The plan keeps its position among current-run
+                                            // guidance and explicit next-turn submissions.
+                                            if pending_active_plan.is_none()
+                                                && !guidance_submission_in_flight
+                                                && !guidance_admission_closed
+                                                && !interrupt_pending
+                                                && !exit_after_turn_settlement
+                                                && output_settled_at.is_none()
+                                                && turn_result_ready.is_none()
+                                                && turn_scope.attached_in(Some(chat_widget.session_id()).filter(|id| !id.is_empty()), live_session_attachment_epoch)
+                                                && let Some(intent) = bottom_pane.next_startable_plan(&turn_submission_id).cloned()
+                                            {
+                                                let planning = applied_active_plan.unwrap_or(plan_workflow_at_turn_start)
+                                                    && perm_mode_mirror.current() == crate::cli::permission_manager::PermissionMode::Plan;
+                                                pending_active_plan = Some(start_active_plan(
+                                                    &intent, planning, perm_mode_mirror.current(),
+                                                    &mut bottom_pane, &mut chat_widget, &mut permission_control,
+                                                ));
+                                                foreground_wait_control_for_ctrl_b.release();
+                                                guidance_dispatch_needed = true;
+                                                frame_requester.schedule_frame();
                                             }
                                             if guidance_dispatch_needed {
                                                 guidance_dispatch_needed = false;
@@ -11130,6 +11159,7 @@ pub(crate) async fn run_tui_session(
                                                 && let Some(intent) =
                                                     bottom_pane.next_unsent_guidance(&turn_submission_id)
                                                 && pending_active_plan.as_ref().is_none_or(|plan| !plan.blocks_intent(&intent.intent_id))
+                                                && (intent.wire_text.is_none() || pending_active_plan.as_ref().is_some_and(|plan| plan.permission_applied && plan.intent_id.as_deref() == Some(intent.intent_id.as_str())))
                                                 && active_remote_run_rx.borrow().as_deref().is_some_and(|id| !id.trim().is_empty())
                                                 && let Some(auth) = preinstalled_run_control.admitted_auth().borrow().clone()
                                             {
@@ -11334,14 +11364,13 @@ pub(crate) async fn run_tui_session(
                                                             preinstalled_run_control.release_remote_user_intent_submission(
                                                                 &submission.intent_id,
                                                             );
-                                                            if turn_model_owner.is_current()
+                                                            if turn_scope.attached_in(Some(chat_widget.session_id()).filter(|id| !id.is_empty()), live_session_attachment_epoch)
                                                                 && bottom_pane.root_intent_is_visible(&submission.intent_id) {
                                                                 restore_rejected_active_guidance(
-                                                                    &mut bottom_pane, &turn_submission_id, &submission.intent_id,
-                                                                    &submission.text, submission.plan_command, &mut pending_active_plan,
+                                                                    &mut bottom_pane, &turn_submission_id, &mut pending_active_plan,
                                                                 );
                                                                 chat_widget.commit_concurrent_system(
-                                                                    history_cell::system::SystemCell::error(error),
+                                                                    history_cell::system::SystemCell::error(format!("{error} Press Alt+U to review unsent input.")),
                                                                 );
                                                             } else {
                                                                 guidance_admission_closed = true;
@@ -11361,8 +11390,8 @@ pub(crate) async fn run_tui_session(
                                                                 guidance_admission_closed = true;
                                                                 guidance_handoff_blocked = true;
                                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
-                                                                    if restored { "The task ended before the plan request was sent. The original command is available for editing." }
-                                                                    else { "The task ended before the plan request was sent. The command was not restored here; retry if needed." }
+                                                                    if restored { "The task ended before the plan request was sent. Press Alt+U to review unsent input." }
+                                                                    else { "The task ended before the plan request was sent. Unsent input remains with its original session." }
                                                                 ));
                                                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -11725,58 +11754,26 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        if active_plan_command(&queued_text).is_some()
-                                                                            && (bottom_pane.has_pending_turn_guidance(&turn_submission_id) || bottom_pane.has_deferred_plan())
-                                                                        {
-                                                                            bottom_pane.queue_deferred_plan(queued_text);
-                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-                                                                                "Command queued until the current task finishes."
-                                                                            ));
-                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                                            frame_requester.schedule_frame();
-                                                                            continue;
-                                                                        }
-                                                                        if let Some(goal) = active_plan_command(&queued_text)
-                                                                            && output_settled_at.is_none()
-                                                                            && !guidance_admission_closed
-                                                                        {
-                                                                            if pending_active_plan.is_some() {
-                                                                                bottom_pane.restore_into_composer(&queued_text);
-                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
-                                                                                    "A plan change is already pending. The command is available for editing."
-                                                                                ));
-                                                                                frame_requester.schedule_frame();
-                                                                                continue;
-                                                                            }
-                                                                            let planning = applied_active_plan.unwrap_or(plan_workflow_at_turn_start)
-                                                                                && perm_mode_mirror.current() == crate::cli::permission_manager::PermissionMode::Plan;
-                                                                            let entering = !goal.is_empty() || !planning;
-                                                                            let intent_id = if entering {
-                                                                                let intent_id = format!("intent_{}", uuid::Uuid::now_v7().simple());
-                                                                                let wire_text = active_plan_guidance(&queued_text).expect("parsed plan command");
-                                                                                if let Err(reason) = bottom_pane.accept_turn_plan_intent(&turn_submission_id, intent_id.clone(), queued_text.clone(), wire_text) {
+                                                                        if let Some(wire_text) = active_plan_guidance(&queued_text) {
+                                                                            let waits_for_earlier = bottom_pane.has_pending_turn_guidance(&turn_submission_id)
+                                                                                || bottom_pane.queued_next_turn_submission_count() > 0;
+                                                                            let intent_id = format!("intent_{}", uuid::Uuid::now_v7().simple());
+                                                                            match bottom_pane.accept_turn_plan_intent(
+                                                                                &turn_submission_id, intent_id, queued_text.clone(), wire_text,
+                                                                            ) {
+                                                                                Ok(()) => {},
+                                                                                Err(reason) => {
                                                                                     bottom_pane.restore_into_composer(&queued_text);
                                                                                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(reason.message()));
                                                                                     frame_requester.schedule_frame();
                                                                                     continue;
                                                                                 }
-                                                                                Some(intent_id)
-                                                                            } else {
-                                                                                None
-                                                                            };
-                                                                            let mode = if entering {
-                                                                                crate::cli::permission_manager::PermissionMode::Plan
-                                                                            } else {
-                                                                                crate::cli::permission_manager::PermissionMode::Auto
-                                                                            };
-                                                                            // Release only the wait that exists at the user's gesture.
-                                                                            // Permission still gates the planning message until applied.
-                                                                            foreground_wait_control_for_ctrl_b.release();
-                                                                            stage_permission_mode_for_next_round(&mut bottom_pane, &mut chat_widget, mode, perm_mode_mirror.current());
-                                                                            let request_id = permission_control.request(mode);
-                                                                            pending_active_plan = Some(PendingActivePlan {
-                                                                                request_id, intent_id, original: queued_text, entering, permission_applied: false,
-                                                                            });
+                                                                            }
+                                                                            if waits_for_earlier {
+                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                                                                                    "Plan queued behind earlier input."
+                                                                                ));
+                                                                            }
                                                                             guidance_dispatch_needed = true;
                                                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                             frame_requester.schedule_frame();
@@ -11847,7 +11844,7 @@ pub(crate) async fn run_tui_session(
                                                                         if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
-                                                                            guidance_admission_closed || bottom_pane.has_deferred_plan(),
+                                                                            guidance_admission_closed,
                                                                         ) {
                                                                             // Preserve order behind a deferred plan or closed run.
                                                                             if slash_dispatch::parse_submission(&queued_text).is_command() {
@@ -12657,27 +12654,33 @@ pub(crate) async fn run_tui_session(
                                                                 if let Some(mut plan) = pending_active_plan.take() {
                                                                     if plan.matches_applied(mode, perm_mode_mirror.applied_request_id().as_deref()) {
                                                                         applied_active_plan = Some(plan.entering);
+                                                                        guidance_dispatch_needed = true;
                                                                         if plan.entering {
                                                                             plan.permission_applied = true;
                                                                             pending_active_plan = Some(plan);
-                                                                            guidance_dispatch_needed = true;
                                                                             chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                                 "Plan mode active · planning request queued."
                                                                             ));
+                                                                        } else if let Some(intent_id) = plan.intent_id.as_deref() {
+                                                                            bottom_pane.remove_local_user_intent(intent_id);
                                                                         }
                                                                     } else {
-                                                                        let restored = restore_pending_active_plan(plan, &mut bottom_pane, turn_model_owner.is_current());
+                                                                        let same_scope = turn_scope.attached_in(Some(chat_widget.session_id()).filter(|id| !id.is_empty()), live_session_attachment_epoch);
+                                                                        let restored = restore_pending_active_plan(plan, &mut bottom_pane, same_scope);
+                                                                        bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
                                                                         guidance_dispatch_needed = true;
                                                                         chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
-                                                                            if restored { "The plan change was superseded. The original command is available for editing." }
-                                                                            else { "The plan change was superseded. The command was not restored here; retry if needed." }
+                                                                            if restored { "The plan change was superseded. Press Alt+U to review unsent input." }
+                                                                            else { "The plan change was superseded. Unsent input remains with its original session." }
                                                                         ));
                                                                     }
                                                                 }
                                                             }
                                                             Err(error) => {
                                                                 if let Some(plan) = pending_active_plan.take() {
-                                                                    let _ = restore_pending_active_plan(plan, &mut bottom_pane, turn_model_owner.is_current());
+                                                                    let same_scope = turn_scope.attached_in(Some(chat_widget.session_id()).filter(|id| !id.is_empty()), live_session_attachment_epoch);
+                                                                    let _ = restore_pending_active_plan(plan, &mut bottom_pane, same_scope);
+                                                                    bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
                                                                     bottom_pane.clear_staged_permission_mode();
                                                                     guidance_dispatch_needed = true;
                                                                 }
@@ -12751,14 +12754,19 @@ pub(crate) async fn run_tui_session(
                                     }
                                     if let Some(plan) = pending_active_plan.take() {
                                         let exit_confirmed = !plan.entering && applied_active_plan == Some(false);
-                                        if !exit_confirmed {
+                                        if exit_confirmed {
+                                            if let Some(intent_id) = plan.intent_id.as_deref() {
+                                                bottom_pane.remove_local_user_intent(intent_id);
+                                            }
+                                        } else {
                                             if permission_control.is_current_request(&plan.request_id) {
                                                 bottom_pane.clear_staged_permission_mode();
                                             }
                                             let restored = restore_pending_active_plan(plan, &mut bottom_pane, same_turn_scope);
+                                            bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
                                             chat_widget.commit_system(history_cell::system::SystemCell::warning(
-                                                if restored { "The task ended before its planning request was delivered. The command is available for editing." }
-                                                else { "The task ended before its planning request was delivered. The command was not restored here; retry if needed." }
+                                                if restored { "The task ended before its planning request was delivered. Press Alt+U to review unsent input." }
+                                                else { "The task ended before its planning request was delivered. Unsent input remains with its original session." }
                                             ));
                                         }
                                     }
@@ -12855,7 +12863,7 @@ pub(crate) async fn run_tui_session(
                                         Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(_))
                                     );
                                     let should_start_followups = !guidance_handoff_blocked
-                                        && !bottom_pane.has_unconfirmed_turn_guidance(&turn_submission_id)
+                                        && !bottom_pane.has_turn_guidance_needing_attention(&turn_submission_id)
                                         && should_start_queued_followups(
                                         turn_succeeded,
                                         state.last_turn_interrupted,
@@ -12883,7 +12891,7 @@ pub(crate) async fn run_tui_session(
                                         restore_queued_input(restored, &mut bottom_pane);
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::info(
-                                                "Queued input was not started because the run did not settle normally; input kept for editing.",
+                                                "Queued input was not started; review the retained messages before continuing.",
                                             ),
                                         );
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -14931,12 +14939,8 @@ mod tests {
         items
             .into_iter()
             .map(|item| match item {
-                NextTurnSubmission::Interactive(text) | NextTurnSubmission::DeferredPlan(text) => {
-                    text
-                }
-                NextTurnSubmission::Guidance(intent) => {
-                    slash_dispatch::conversation_for_composer(&intent.text).into_owned()
-                }
+                NextTurnSubmission::Interactive(text) => text,
+                NextTurnSubmission::Guidance(intent) => intent.composer_text().into_owned(),
                 NextTurnSubmission::Conversation { .. } => panic!("expected interactive custody"),
             })
             .collect()
@@ -16382,7 +16386,7 @@ mod tests {
         pane.accept_turn_user_intent("turn", "second".into(), "second message".into())
             .unwrap();
         assert!(pane.mark_user_intent_unconfirmed("first"));
-        assert!(pane.has_unconfirmed_turn_guidance("turn"));
+        assert!(pane.has_turn_guidance_needing_attention("turn"));
         assert!(pane.next_unsent_guidance("turn").is_none());
 
         let applied = TuiAppEvent::UserIntentApplied {
@@ -16403,7 +16407,7 @@ mod tests {
             ),
             UserIntentProjection::Applied
         );
-        assert!(!pane.has_unconfirmed_turn_guidance("turn"));
+        assert!(!pane.has_turn_guidance_needing_attention("turn"));
         assert_eq!(
             pane.next_unsent_guidance("turn").unwrap().text,
             "second message"
@@ -16411,28 +16415,76 @@ mod tests {
     }
 
     #[test]
-    fn deferred_plan_and_later_input_keep_their_next_turn_order() {
+    fn plan_and_guidance_respect_explicit_next_turn_barrier() {
         let mut pane = BottomPane::new();
-        pane.queue_deferred_plan("/plan inspect first".into());
-        assert!(pane.has_deferred_plan());
-        pane.queue_next_turn_submission("later question".into());
-        let mut post_output = pane.take_queued_next_turn_submissions();
-        let mut followups = VecDeque::new();
+        pane.accept_turn_user_intent("turn", "first".into(), "first".into())
+            .unwrap();
+        pane.accept_turn_plan_intent(
+            "turn",
+            "plan".into(),
+            "/plan inspect".into(),
+            "plan inspect".into(),
+        )
+        .unwrap();
+        pane.queue_next_turn_submission("/session".into());
+        pane.accept_turn_user_intent("turn", "later".into(), "later question".into())
+            .unwrap();
+        assert_eq!(
+            pane.next_unsent_guidance("turn").unwrap().intent_id,
+            "first"
+        );
+        assert!(pane.promote_user_intent_accepted("first"));
+        assert!(pane.next_startable_plan("turn").is_none());
+        pane.apply_user_intent(
+            "first",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "first",
+        )
+        .unwrap();
+        assert_eq!(pane.next_startable_plan("turn").unwrap().intent_id, "plan");
+        assert!(pane.promote_user_intent_accepted("plan"));
+        assert!(pane.next_unsent_guidance("turn").is_none());
+        pane.apply_user_intent(
+            "plan",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "plan inspect",
+        )
+        .unwrap();
+        assert!(pane.next_unsent_guidance("turn").is_none());
+        let mut queued = pane.take_queued_next_turn_submissions();
+        merge_unsubmitted_guidance(&mut queued, pane.finish_turn_user_intents("turn"));
+        assert_eq!(
+            queued.pop_front(),
+            Some(NextTurnSubmission::Interactive("/session".into()))
+        );
         assert!(
-            settle_followup_submissions(&mut followups, std::iter::empty(), &mut post_output, true)
-                .is_none()
+            matches!(queued.pop_front(), Some(NextTurnSubmission::Guidance(intent)) if intent.text == "later question")
         );
-        assert_eq!(
-            followups.pop_front(),
-            Some(NextTurnSubmission::DeferredPlan(
-                "/plan inspect first".into()
-            ))
-        );
-        assert_eq!(
-            followups.pop_front(),
-            Some(NextTurnSubmission::Interactive("later question".into()))
-        );
-        assert!(followups.is_empty());
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn rejected_guidance_keeps_following_plan_and_input_recoverable() {
+        let mut pane = explicit_followup_pane();
+        pane.accept_turn_user_intent("turn", "first".into(), "first".into())
+            .unwrap();
+        pane.accept_turn_plan_intent(
+            "turn",
+            "plan".into(),
+            "/plan inspect".into(),
+            "plan inspect".into(),
+        )
+        .unwrap();
+        pane.accept_turn_user_intent("turn", "later".into(), "later question".into())
+            .unwrap();
+        restore_rejected_active_guidance(&mut pane, "turn", &mut None);
+        assert!(pane.composer.is_empty());
+        assert!(pane.has_turn_guidance_needing_attention("turn"));
+        assert!(pane.next_unsent_guidance("turn").is_none());
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "first");
     }
 
     #[tokio::test]
@@ -18131,7 +18183,9 @@ mod tests {
             .unwrap();
         assert!(restore_pending_active_plan(plan, &mut pane, true));
         assert!(pane.next_unsent_guidance("turn").is_none());
-        assert_eq!(pane.composer.text(), "/plan inspect the failures");
+        assert!(pane.composer.is_empty());
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "plan guidance");
     }
 
     #[test]
@@ -18154,20 +18208,15 @@ mod tests {
                 entering: true,
                 permission_applied,
             });
-            restore_rejected_active_guidance(
-                &mut pane,
-                "turn",
-                "earlier",
-                "/plan literal text",
-                None,
-                &mut pending_plan,
-            );
+            restore_rejected_active_guidance(&mut pane, "turn", &mut pending_plan);
             assert!(pending_plan.is_none());
+            assert!(pane.recover_returned_root_guidance());
             assert_eq!(pane.composer.text(), "//plan literal text");
             let action = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(
                 matches!(action, BottomPaneAction::SubmitInput(ref text) if text == "//plan literal text")
             );
+            assert!(pane.recover_returned_root_guidance());
             assert_eq!(pane.composer.text(), command);
 
             let mut returned = BottomPane::new();
@@ -18205,6 +18254,8 @@ mod tests {
             &mut pane,
             true
         ));
+        assert!(pane.composer.is_empty());
+        assert!(pane.recover_returned_root_guidance());
         assert_eq!(pane.composer.text(), command);
         assert_eq!(pane.queued_next_turn_submission_count(), 0);
         assert!(pane.next_unsent_guidance("turn").is_none());
@@ -18804,14 +18855,8 @@ mod tests {
             Some(("first", "用 Python 写", 0))
         );
         assert!(pane.promote_user_intent_accepted("first"));
-        assert_eq!(
-            pane.next_unsent_guidance("turn").map(|intent| (
-                intent.intent_id.as_str(),
-                intent.text.as_str(),
-                intent.next_turn_position
-            )),
-            Some(("second", "再加测试", 1))
-        );
+        // The explicit next-turn entry was entered before the second message.
+        assert!(pane.next_unsent_guidance("turn").is_none());
         assert!(pane.next_unsent_guidance("other-turn").is_none());
         let unsent = pane.finish_turn_user_intents("turn");
         let mut queued = pane.take_queued_next_turn_submissions();
@@ -22821,7 +22866,7 @@ mod tests {
             Some("owner"),
         )
         .unwrap();
-        for terminal_rejection in [false, true] {
+        for (terminal_rejection, is_plan) in [(false, false), (true, false), (false, true)] {
             let mut state = crate::cli::session::session_state::SessionState::default();
             state.set_session_id("session-a");
             let original_epoch = state.session_attachment_epoch;
@@ -22833,8 +22878,23 @@ mod tests {
                 Arc::new(std::sync::Mutex::new(Some("session-a".into()))),
             )));
             assert!(pane.queue_next_turn_submission("/session".into()));
-            pane.accept_turn_user_intent("turn", "intent".into(), "private guidance".into())
+            let private = if is_plan {
+                "/plan private guidance"
+            } else {
+                "private guidance"
+            };
+            if is_plan {
+                pane.accept_turn_plan_intent(
+                    "turn",
+                    "intent".into(),
+                    private.into(),
+                    "prepare a plan".into(),
+                )
                 .unwrap();
+            } else {
+                pane.accept_turn_user_intent("turn", "intent".into(), private.into())
+                    .unwrap();
+            }
             let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
             if terminal_rejection {
                 control.expect_remote_user_intent_submission("intent");
@@ -22880,7 +22940,7 @@ mod tests {
                 state.session_attachment_epoch,
             );
             assert!(pane.recover_returned_root_guidance());
-            assert_eq!(pane.composer.text(), "private guidance");
+            assert_eq!(pane.composer.text(), private);
         }
     }
 

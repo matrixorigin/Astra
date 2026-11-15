@@ -458,7 +458,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 crate::cli::journal_digest::DigestFocus::All,
             )
             .unwrap();
-            assert_eq!(digest.aggregates.total_tool_calls, 0);
+            assert_eq!(digest.aggregates.reported_root_tool_calls, 0);
             continue;
         }
         if classified {
@@ -500,11 +500,11 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             )
             .unwrap();
             assert_eq!(
-                digest.aggregates.total_tool_calls,
+                digest.aggregates.reported_root_tool_calls,
                 u64::from(root_callbacks)
             );
             assert_eq!(
-                digest.aggregates.total_fresh_tool_calls,
+                digest.aggregates.reported_root_fresh_tool_calls,
                 u64::from(root_callbacks)
             );
             continue;

@@ -98,18 +98,19 @@ pub(crate) fn validate_digest_json(
         "total_tokens_in",
         "total_tokens_out",
         "total_duration_ms",
-        "total_tool_calls",
+        "reported_root_tool_calls",
+        "observed_root_tool_requests",
         "subrun_count",
         "subrun_total_tokens_in",
         "subrun_total_tokens_out",
         "subrun_total_duration_ms",
-        "subrun_total_tool_calls",
+        "observed_child_tool_requests",
         "inclusive_total_tokens_in",
         "inclusive_total_tokens_out",
-        "inclusive_total_tool_calls",
-        "total_fresh_tool_calls",
-        "total_noop_or_cached_tool_calls",
-        "tool_calls_failed",
+        "reported_root_fresh_tool_calls",
+        "reported_root_noop_or_cached_tool_calls",
+        "reported_root_tool_failures",
+        "reported_root_tool_outcomes_unknown",
         "safety_guard_blocks",
     ];
     for key in COUNTS {
@@ -123,6 +124,13 @@ pub(crate) fn validate_digest_json(
             ));
         }
     }
+    if aggregates
+        .get("root_tool_totals_complete")
+        .and_then(serde_json::Value::as_bool)
+        .is_none()
+    {
+        return Err("digest aggregates is missing boolean root_tool_totals_complete".into());
+    }
     for key in [
         "avg_tokens_in",
         "avg_tokens_out",
@@ -133,7 +141,12 @@ pub(crate) fn validate_digest_json(
         let raw = aggregates
             .get(key)
             .ok_or_else(|| format!("digest aggregates is missing {key}"))?;
-        if raw.is_null() && matches!(key, "avg_tokens_in" | "avg_tokens_out") {
+        if raw.is_null()
+            && matches!(
+                key,
+                "avg_tokens_in" | "avg_tokens_out" | "avg_tool_calls_per_round"
+            )
+        {
             continue;
         }
         let value = raw
@@ -325,12 +338,12 @@ mod tests {
                 "compact_count": 0, "stall_count": 0, "error_event_count": 0,
                 "session_start_count": 1, "session_end_count": 1,
                 "total_tokens_in": 10, "total_tokens_out": 5, "total_duration_ms": 20,
-                "total_tool_calls": 1, "subrun_count": 0,
+                "reported_root_tool_calls": 1, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0, "subrun_count": 0,
                 "subrun_total_tokens_in": 0, "subrun_total_tokens_out": 0,
-                "subrun_total_duration_ms": 0, "subrun_total_tool_calls": 0,
+                "subrun_total_duration_ms": 0, "observed_child_tool_requests": 0,
                 "inclusive_total_tokens_in": 10, "inclusive_total_tokens_out": 5,
-                "inclusive_total_tool_calls": 1, "total_fresh_tool_calls": 1,
-                "total_noop_or_cached_tool_calls": 0, "tool_calls_failed": 0,
+                "reported_root_fresh_tool_calls": 1,
+                "reported_root_noop_or_cached_tool_calls": 0, "reported_root_tool_failures": 0,
                 "safety_guard_blocks": 0, "avg_tokens_in": 10.0,
                 "avg_tokens_out": 5.0, "avg_duration_ms": 20.0,
                 "avg_llm_rounds": 1.0, "avg_tool_calls_per_round": 1.0

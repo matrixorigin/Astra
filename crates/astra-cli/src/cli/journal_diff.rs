@@ -35,6 +35,8 @@ pub struct JournalDiff {
     /// that no such gap was observed, not that absence is proven.
     pub a_observation_incomplete: bool,
     pub b_observation_incomplete: bool,
+    pub a_source_errors: Vec<String>,
+    pub b_source_errors: Vec<String>,
     /// Per-event-type counts for A (sorted by type name for stable diff).
     pub a_event_counts: BTreeMap<String, u32>,
     /// Per-event-type counts for B.
@@ -91,18 +93,21 @@ pub struct TokenDeltas {
 /// io / parse failures on either session; structural differences are
 /// always returned as Ok.
 pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, String> {
-    let (a_events, a_incomplete) = journal_digest::read_journal_for_analysis(a_session)
+    let (a_events, a_incomplete, a_errors) = journal_digest::read_journal_for_analysis(a_session)
         .map_err(|e| format!("{a_session}: {e}"))?;
-    let (b_events, b_incomplete) = journal_digest::read_journal_for_analysis(b_session)
+    let (b_events, b_incomplete, b_errors) = journal_digest::read_journal_for_analysis(b_session)
         .map_err(|e| format!("{b_session}: {e}"))?;
-    Ok(diff_events_with_coverage(
+    let mut diff = diff_events_with_coverage(
         a_session,
         b_session,
         &a_events,
         &b_events,
         a_incomplete,
         b_incomplete,
-    ))
+    );
+    diff.a_source_errors = a_errors;
+    diff.b_source_errors = b_errors;
+    Ok(diff)
 }
 
 pub(crate) fn diff_events_with_coverage(
@@ -189,6 +194,8 @@ pub(crate) fn diff_events(
         b_session: b_session.to_string(),
         a_observation_incomplete: !a_events.iter().any(is_terminal) || a_gap,
         b_observation_incomplete: !b_events.iter().any(is_terminal) || b_gap,
+        a_source_errors: Vec::new(),
+        b_source_errors: Vec::new(),
         a_event_counts: a_counts,
         b_event_counts: b_counts,
         only_in_a,
@@ -247,10 +254,7 @@ struct ToolActivity {
 }
 
 fn is_terminal(e: &JournalEvent) -> bool {
-    matches!(
-        e.event_type,
-        JournalEventType::Turn | JournalEventType::TurnError
-    )
+    journal_digest::is_root_terminal(e)
 }
 
 #[derive(Default)]
@@ -333,7 +337,7 @@ type RoundCallIndex<'a> = HashMap<CallKey<'a>, (usize, usize)>;
 
 /// Equality comes from the canonical invocation owner, not provider IDs or
 /// event annotations. Terminal summaries may contain calls from earlier runs.
-fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKey<'a>> {
+pub(super) fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKey<'a>> {
     let identity = call.invocation_identity.as_ref()?;
     if event.session_id.as_deref() != Some(identity.session_id.as_str())
         || call.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
@@ -344,7 +348,7 @@ fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKe
     Some(identity)
 }
 
-fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
+pub(super) fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
     a.name == b.name && a.was_executed() == b.was_executed()
 }
 
@@ -377,10 +381,24 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
     // Terminals own aggregate counts. Only explicit attempt/call identities
     // reconcile projections; unproven or contradictory execution evidence is
     // retained with incomplete coverage, never silently consumed by an aggregate.
+    let has_terminal = events.iter().any(is_terminal);
     let mut out = ToolActivity {
         sequence: Vec::new(),
         executed: 0,
-        complete: events.iter().any(is_terminal) && !observation_incomplete,
+        complete: has_terminal
+            && !observation_incomplete
+            && !events.iter().any(|event| {
+                matches!(
+                    event.event_type,
+                    JournalEventType::DelegationStarted
+                        | JournalEventType::DelegationSubRunStarted
+                        | JournalEventType::DelegationSubRunCompleted
+                ) || (journal_digest::is_child_producer(event)
+                    && matches!(
+                        event.event_type,
+                        JournalEventType::LlmRound | JournalEventType::ToolCallError
+                    ))
+            }),
     };
     let mut index = TerminalIndex::new(events);
     let mut owned: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -435,7 +453,12 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
             if call.was_executed() && index.has_unscoped_terminal {
                 out.complete = false;
             }
-            out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
+            if call.was_executed() && has_terminal {
+                // A terminal's unidentifiable records may already cover this call.
+                out.complete = false;
+            } else {
+                out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
+            }
             slots.insert((position, within, 0), call);
         }
     }
@@ -557,7 +580,6 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
                 // terminal aggregate, even when it reports zero executions.
                 if call.was_executed() {
                     out.complete = false;
-                    out.executed = out.executed.saturating_add(1);
                 }
             } else {
                 detailed += u64::from(call.was_executed());
@@ -574,6 +596,36 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         .filter(|call| call.was_executed())
         .map(|call| call.name.clone())
         .collect();
+    if !out.complete {
+        // Overlapping aggregates and observations cannot be added safely.
+        // Each terminal count, and the set of canonical invocation identities,
+        // independently establishes a lower bound.
+        let terminal_floor = events
+            .iter()
+            .filter(|event| is_terminal(event))
+            .filter_map(|event| event.tool_count)
+            .max()
+            .unwrap_or(0) as u64;
+        let mut identities = std::collections::HashSet::new();
+        let mut any_unidentified = false;
+        for event in events {
+            for call in event
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| call.was_executed())
+            {
+                if let Some(identity) = call_key(event, call) {
+                    identities.insert(identity);
+                } else {
+                    any_unidentified = true;
+                }
+            }
+        }
+        out.executed = terminal_floor
+            .max(identities.len() as u64)
+            .max(u64::from(any_unidentified));
+    }
     out
 }
 
@@ -629,6 +681,11 @@ pub fn render_text(diff: &JournalDiff) -> String {
     ));
     if diff.a_session == diff.b_session {
         s.push_str("  ⚠ Warning: A and B resolve to the same session — diff will be zero.\n");
+    }
+    for (label, errors) in [("A", &diff.a_source_errors), ("B", &diff.b_source_errors)] {
+        for error in errors {
+            s.push_str(&format!("  {label} source unavailable: {error}\n"));
+        }
     }
     s.push('\n');
 
@@ -851,7 +908,15 @@ mod tests {
                 let mut changed = raw.clone();
                 changed["tool_calls"][0]["invocation_identity"][field] = json!(value);
                 let d = diff_events("a", "b", &[evt(raw.clone()), evt(changed)], &[]);
-                assert_eq!(d.a_tool_calls_executed, 2, "{field}={value:?}");
+                assert_eq!(
+                    d.a_tool_calls_executed,
+                    if value == "different" && matches!(field, "user_id" | "turn_chain_id") {
+                        2
+                    } else {
+                        1
+                    },
+                    "{field}={value:?}"
+                );
                 assert_eq!(d.a_tool_sequence, ["bash", "bash"]);
                 assert!(!d.a_tool_sequence_complete, "the run has no terminal");
             }
@@ -862,7 +927,7 @@ mod tests {
             .unwrap()
             .remove("invocation_identity");
         let d = diff_events("a", "b", &[evt(missing.clone()), evt(missing)], &[]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
         assert!(!d.a_tool_sequence_complete);
     }
 
@@ -896,7 +961,11 @@ mod tests {
             (Shape::Orphan, false, "chain", "bash", true),
         ] {
             let label = format!("{shape:?}/{first_executed}/{second_chain}/{second_name}");
-            let expected_count = if first_executed { 2 } else { 1 };
+            let expected_count = if first_executed && second_chain != "chain" {
+                2
+            } else {
+                1
+            };
             let sid = uuid::Uuid::new_v4().to_string();
             let writer = JournalWriter::new(&sid).unwrap();
             let record = |chain: &str, name: &str, executed: bool| ToolCallRecord {
@@ -1036,11 +1105,11 @@ mod tests {
         // with full identity, or carry no executed terminal detail to overlap.
         for (id, identified, executed, aggregate, expected) in [
             (None, false, true, 0, (1, 2, false)),
-            (None, false, true, 1, (2, 2, false)),
-            (None, false, true, 2, (3, 2, false)),
-            (Some(" "), false, true, 2, (3, 2, false)),
-            (Some("call"), false, true, 2, (3, 2, false)),
-            (None, true, true, 2, (3, 2, false)),
+            (None, false, true, 1, (1, 2, false)),
+            (None, false, true, 2, (2, 2, false)),
+            (Some(" "), false, true, 2, (2, 2, false)),
+            (Some("call"), false, true, 2, (2, 2, false)),
+            (None, true, true, 2, (2, 2, false)),
             (Some("call"), true, true, 2, (2, 1, false)),
             (Some("other"), true, true, 2, (2, 2, true)),
             (None, false, false, 1, (1, 1, true)),
@@ -1079,7 +1148,7 @@ mod tests {
         }
         // Unknown detail does not blanket-poison the terminal's own list.
         // Only a new external identity faces the unresolved overlap barrier.
-        for (terminal_id, expected) in [("call", (2, 2, true)), ("other", (3, 3, false))] {
+        for (terminal_id, expected) in [("call", (2, 2, true)), ("other", (2, 3, false))] {
             let sid = uuid::Uuid::new_v4().to_string();
             let mut unknown = known(&sid, "unknown");
             unknown.invocation_identity = None;
@@ -1269,8 +1338,9 @@ mod tests {
                 ),
             ];
             let diff = diff_events("a", "b", &events, &[]);
-            assert_eq!(diff.a_tokens.prompt, terminal_input + 20);
-            assert_eq!(diff.a_tokens.completion, 12);
+            assert_eq!(diff.a_tokens.prompt, terminal_input);
+            assert_eq!(diff.a_tokens.completion, 10);
+            assert!(!diff.a_tokens.prompt_complete);
             let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
             assert_eq!(tree.self_prompt_tokens, diff.a_tokens.prompt);
             assert_eq!(tree.self_completion_tokens, diff.a_tokens.completion);
@@ -1533,7 +1603,7 @@ mod tests {
         ];
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
     }
 
     #[test]
@@ -1573,7 +1643,7 @@ mod tests {
         ];
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
     }
 
     #[test]
@@ -1593,7 +1663,7 @@ mod tests {
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
         assert_eq!(d.a_tool_calls_executed, 2);
-        assert!(d.a_tool_sequence_complete);
+        assert!(!d.a_tool_sequence_complete);
         // Same shape when the terminal carries its own per-call detail.
         let mut a = a;
         a[2] = identified_evt(
@@ -1620,7 +1690,7 @@ mod tests {
             }
             let diff = diff_events("a", "b", &[round, terminal.clone()], &[]);
             assert_eq!(diff.a_tool_sequence, [name, "read_file"]);
-            assert_eq!(diff.a_tool_calls_executed, 2);
+            assert_eq!(diff.a_tool_calls_executed, 1);
             assert!(!diff.a_tool_sequence_complete);
         }
     }
@@ -1738,7 +1808,7 @@ mod tests {
             );
         }
         let diff = super::compute_diff(&sid, &empty).unwrap();
-        assert_eq!(diff.a_tool_calls_executed, 2);
+        assert_eq!(diff.a_tool_calls_executed, 1);
         assert!(!diff.a_tool_sequence_complete);
         let expected = if detail != Some(false) {
             vec!["bash", "read_file"]
@@ -1747,12 +1817,12 @@ mod tests {
         };
         assert_eq!(diff.a_tool_sequence, expected);
         let encoded = serde_json::to_value(&diff).unwrap();
-        assert_eq!(encoded["a_tool_calls_executed"], 2);
+        assert_eq!(encoded["a_tool_calls_executed"], 1);
         assert_eq!(encoded["a_tool_sequence_complete"], false);
         assert_eq!(encoded["a_tool_sequence"], json!(expected));
         let text = render_text(&diff);
         assert!(
-            text.contains("confirmed executed calls: 2; detailed sequence"),
+            text.contains("confirmed executed calls: 1; detailed sequence"),
             "{text}"
         );
         assert!(!text.contains("tool sequence DIFFERS"), "{text}");
@@ -2004,7 +2074,7 @@ mod tests {
         let mut another = failed;
         another.tool_call_id = Some("another-failure".into());
         multiple.tool_calls.as_mut().unwrap().push(another);
-        for (error, retained) in [(missing, 2), (multiple, 2)] {
+        for (error, retained) in [(missing, 1), (multiple, 1)] {
             let diff = diff_events("a", "b", &[round.clone(), error], &[]);
             assert_eq!(diff.a_tool_calls_executed, retained);
             assert!(!diff.a_tool_sequence_complete);
@@ -2022,8 +2092,8 @@ mod tests {
             runless.tool_calls.as_ref().unwrap()[0].clone(),
         );
         for (events, count) in [
-            (vec![runless.clone(), error.clone(), error.clone()], 3),
-            (vec![error, runless], 2),
+            (vec![runless.clone(), error.clone(), error.clone()], 1),
+            (vec![error, runless], 1),
         ] {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_calls_executed, count);
@@ -2048,7 +2118,7 @@ mod tests {
                 }
                 let diff = diff_events("a", "b", &[error.clone(), error], &[]);
                 assert_eq!(diff.a_tool_sequence, ["bash", "bash"]);
-                assert_eq!(diff.a_tool_calls_executed, 2);
+                assert_eq!(diff.a_tool_calls_executed, 1);
                 assert!(!diff.a_tool_sequence_complete);
             }
         }
@@ -2097,7 +2167,7 @@ mod tests {
         anonymous.producer_scope = None;
         anonymous.tool_calls.as_mut().unwrap()[0].invocation_identity = None;
         let d = diff_events("a", "b", &[anonymous, child, other, root], &[]);
-        assert_eq!(d.a_tool_calls_executed, 3);
+        assert_eq!(d.a_tool_calls_executed, 2);
         assert!(
             !d.a_tool_sequence_complete,
             "conflicting identities cannot prove complete attribution"
@@ -2129,7 +2199,7 @@ mod tests {
         assert_eq!(d.a_tool_sequence, vec!["read_file", "grep", "bash"]);
         assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
         assert_eq!(d.a_tool_calls_executed, 3);
-        assert!(d.a_tool_sequence_complete);
+        assert!(!d.a_tool_sequence_complete);
         assert!(!render_text(&d).contains("tool sequence DIFFERS"));
         // Without call IDs, projections cannot be proved redundant.
         for e in &mut a {
@@ -2144,7 +2214,7 @@ mod tests {
             d.a_tool_sequence,
             ["read_file", "grep", "bash", "read_file", "bash"]
         );
-        assert_eq!(d.a_tool_calls_executed, 5);
+        assert_eq!(d.a_tool_calls_executed, 2);
         assert!(!d.a_tool_sequence_complete);
     }
 
@@ -2175,13 +2245,13 @@ mod tests {
     fn missing_or_conflicting_call_identity_never_erases_execution() {
         use astra_services::session_journal::ToolCallDisposition::{Executed, Rejected};
         for (run, id, terminal_name, disposition, count, complete) in [
-            (None, Some("call"), "read_file", Executed, 2, false),
-            (Some("root"), Some("call"), "read_file", Executed, 2, false),
+            (None, Some("call"), "read_file", Executed, 1, false),
+            (Some("root"), Some("call"), "read_file", Executed, 1, false),
             (Some("root"), Some("call"), "bash", Rejected, 1, false),
             (Some("root"), None, "bash", Rejected, 1, false),
             (Some("root"), Some("   "), "bash", Rejected, 1, false),
             (Some("root"), Some("call"), "bash", Executed, 1, true),
-            (Some("other"), Some("call"), "bash", Executed, 2, true),
+            (Some("other"), Some("call"), "bash", Executed, 2, false),
         ] {
             let mut record = serde_json::from_value(json!({
                 "tool_call_id":id,"name":"bash","ok":false,"ms":1
@@ -2315,20 +2385,27 @@ mod tests {
 
     #[test]
     fn token_delta_saturates_on_large_u64_instead_of_wrapping() {
-        // u64 values above i64::MAX must not wrap to negative on cast.
-        let big = (i64::MAX as u64) + 1000;
-        let a = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":big,"tokens_out":0}),
-        )];
+        // Individually valid samples can have an aggregate above i64::MAX.
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t1","session_id":"a","tokens_in":i64::MAX,"tokens_out":0}),
+            ),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","tokens_in":1000,"tokens_out":0})),
+        ];
         let b = vec![evt(
             json!({"type":"turn","ts":"t","session_id":"b","tokens_in":0,"tokens_out":0}),
         )];
         let d = diff_events("a", "b", &a, &b);
-        // Delta should be clamped, not wrapped to a positive number.
-        assert!(
-            d.token_deltas.prompt.is_some_and(|delta| delta <= 0),
-            "prompt delta must not wrap positive; got {:?}",
-            d.token_deltas.prompt
+        assert_eq!(d.token_deltas.prompt, Some(i64::MIN));
+
+        // A single invalid sample is quarantined, as it is during ingestion.
+        let invalid = vec![evt(json!({
+            "type":"turn","ts":"t","session_id":"a",
+            "tokens_in": (i64::MAX as u64) + 1000,"tokens_out":0
+        }))];
+        assert_eq!(
+            diff_events("a", "b", &invalid, &b).token_deltas.prompt,
+            None
         );
     }
 

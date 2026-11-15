@@ -848,7 +848,18 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         sent_rx.try_recv().is_err(),
         "a rejected message must not let later input overtake it"
     );
-    astra.write(&[0x03]); // Clear the nonempty draft without stopping the task.
+    // Rejected input remains scoped to this session until explicitly recovered.
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("first message recovered", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("↳ needs correction")
+    });
+    astra.write(&[0x03]);
+    astra.wait_for_absent("↳ needs correction", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("later message recovered", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("› later pending")
+    });
+    astra.write(&[0x03]); // Clear the recovered draft without stopping the task.
     astra.wait_for_absent("later pending", UI_TRANSITION_TIMEOUT);
     assert!(mock.cancellation_requests().is_empty());
     astra.paste_and_submit("corrected instruction");
@@ -987,6 +998,8 @@ async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
     let _journey = pty_journey_lock().lock().await;
     for uncertain in [false, true] {
         let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::unbounded_channel();
+        let permission_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let routes = axum::Router::new().route("/chat/runs/{run_id}/intents", post({
             let release = release.clone();
@@ -1002,13 +1015,32 @@ async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
                         if first_message {
                             release.notified().await;
                         }
+                        let event_index = match body["input"]["content"].as_str() {
+                            Some("first instruction") => 1,
+                            Some("earlier guidance") => 3,
+                            Some(text) if text.starts_with("Prepare a plan") => 5,
+                            Some("continue after plan") => 9,
+                            _ => 7,
+                        };
                         (StatusCode::OK, Json(serde_json::json!({"run_id":run_id,
                             "intent_id":body["intent_id"], "status":"accepted_remote", "duplicate":false,
-                            "event_index": if first_message {1} else {3}})))
+                            "event_index": event_index})))
                     }
                 }
             }
-        }));
+        })).route("/chat/runs/{run_id}/permission-mode", post(
+            move |Path(_run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let permission_tx = permission_tx.clone();
+                let permission_revision = permission_revision.clone();
+                async move {
+                    let revision = permission_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let mut observed = body.clone();
+                    observed["revision"] = revision.into();
+                    permission_tx.send(observed).unwrap();
+                    Json(serde_json::json!({"request_id":body["request_id"], "mode":body["mode"], "revision":revision}))
+                }
+            }
+        ));
         let mock =
             astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
                 astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
@@ -1053,12 +1085,13 @@ async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
         astra.wait_for("earlier guidance", UI_TRANSITION_TIMEOUT);
         assert!(sent_rx.try_recv().is_err());
         astra.paste_and_submit("/plan inspect first");
-        astra.wait_for(
-            "Command queued until the current task finishes",
-            UI_TRANSITION_TIMEOUT,
-        );
+        astra.wait_for("Plan queued behind earlier input", UI_TRANSITION_TIMEOUT);
         astra.paste_and_submit("later question");
         astra.wait_for("later question", UI_TRANSITION_TIMEOUT);
+        assert!(
+            permission_rx.try_recv().is_err(),
+            "plan mode cannot overtake earlier guidance"
+        );
         release.notify_one();
         mock.send_held_stream_event(serde_json::json!({
             "type":"user_intent_applied", "run_id":"mock-run-agent-root",
@@ -1083,14 +1116,104 @@ async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
             UI_TRANSITION_TIMEOUT,
             |screen| screen.contains("› earlier guidance"),
         );
+        let permission = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permission["mode"], "plan");
         assert!(
             sent_rx.try_recv().is_err(),
-            "later question overtook deferred /plan"
+            "plan guidance preceded permission application"
         );
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+            "request_id":permission["request_id"], "mode":"plan", "revision":1,
+            "round_index":2, "owner_generation":1
+        }));
+        let plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan["input"]["content"],
+            "Prepare a plan for this goal before making changes: inspect first"
+        );
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "later question overtook plan application"
+        );
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":plan["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":5, "content":plan["input"]["content"],
+        }));
+        let later = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later["input"]["content"], "later question");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":later["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":7, "content":"later question",
+        }));
+        astra.wait_for_screen("later guidance applied", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("› later question")
+        });
+        astra.paste_and_submit("/plan");
+        let exit_plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit_plan["mode"], "auto");
+        astra.paste_and_submit("continue after plan");
+        astra.wait_for("continue after plan", UI_TRANSITION_TIMEOUT);
+        assert!(sent_rx.try_recv().is_err(), "guidance overtook plan exit");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+            "request_id":exit_plan["request_id"], "mode":"auto", "revision":2,
+            "round_index":3, "owner_generation":1
+        }));
+        let after_exit = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_exit["input"]["content"], "continue after plan");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":after_exit["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":9, "content":"continue after plan",
+        }));
+        astra.wait_for_screen(
+            "plan exit guidance applied",
+            UI_TRANSITION_TIMEOUT,
+            |screen| screen.contains("› continue after plan"),
+        );
+        astra.paste_and_submit("/plan final task");
+        let pending_plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_plan["mode"], "plan");
+        astra.write(b"\x1b[200~explicit next turn\x1b[201~\x11");
+        astra.wait_for("explicit next turn", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("after queued turn");
+        astra.wait_for("after queued turn", UI_TRANSITION_TIMEOUT);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "guidance overtook an explicit next-turn entry"
+        );
+        mock.release_held_response();
+        astra.wait_for(
+            "The task ended before its planning request was delivered",
+            UI_TRANSITION_TIMEOUT,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             mock.received_requests().len(),
             1,
-            "original run must still be active"
+            "an undelivered plan must fence later follow-ups"
         );
         astra.signal(nix::sys::signal::Signal::SIGHUP);
         assert!(astra.wait_for_exit(Duration::from_secs(10)).success());

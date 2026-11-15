@@ -86,6 +86,8 @@ pub struct JournalDigest {
     /// Distinct run/round identities with contradictory facts; excluded from
     /// observed usage rather than guessed or double-counted.
     pub conflicting_round_count: usize,
+    /// Contradictory root terminals for the same attempt, excluded from totals.
+    pub conflicting_terminal_count: usize,
     /// Root rounds without a terminal carrying the same run identity.
     pub unattributed_root_round_count: usize,
     pub aggregates: Aggregates,
@@ -124,6 +126,9 @@ pub struct UsageCoverage {
 pub struct JournalSourceCoverage {
     pub path: String,
     pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+    pub malformed_records: usize,
     pub partial_flush_seen: bool,
     pub retained_event_losses: Vec<RetainedEventLoss>,
 }
@@ -155,7 +160,11 @@ pub struct Aggregates {
     pub total_provider_input_tokens: u64,
     pub total_tokens_out: u64,
     pub total_duration_ms: u64,
-    pub total_tool_calls: u64,
+    /// Sum of terminal reports; incomplete reports may overlap and are not a total.
+    pub reported_root_tool_calls: u64,
+    pub root_tool_totals_complete: bool,
+    /// Model-returned requests are not evidence that a tool executed.
+    pub observed_root_tool_requests: u64,
     /// Number of distinct child runs observed from producer-scoped LLM rounds.
     pub subrun_count: usize,
     /// Sum of child-run LLM token input. Duration is cumulative work, not wall time.
@@ -165,7 +174,7 @@ pub struct Aggregates {
     pub subrun_total_provider_input_tokens: u64,
     pub subrun_total_tokens_out: u64,
     pub subrun_total_duration_ms: u64,
-    pub subrun_total_tool_calls: u64,
+    pub observed_child_tool_requests: u64,
     /// Known root terminal usage plus observed child rounds. This is a mixed,
     /// potentially partial diagnostic total, never an authoritative bill.
     pub inclusive_total_tokens_in: u64,
@@ -173,18 +182,17 @@ pub struct Aggregates {
     pub inclusive_total_cache_creation_tokens: u64,
     pub inclusive_total_provider_input_tokens: u64,
     pub inclusive_total_tokens_out: u64,
-    pub inclusive_total_tool_calls: u64,
-    /// Tool records that produced fresh observations, excluding cache hits,
-    /// duplicate suppressions, synthetic placeholders, and failures.
-    pub total_fresh_tool_calls: u64,
+    /// Fresh, reused and failed semantic outcomes observed in retained records.
+    /// When coverage is incomplete, these are not totals and may overlap.
+    pub reported_root_fresh_tool_calls: u64,
     /// Tool records that did not execute fresh work because the runtime reused
     /// or pointed back to an already-known result.
-    pub total_noop_or_cached_tool_calls: u64,
-    pub tool_calls_failed: u64,
+    pub reported_root_noop_or_cached_tool_calls: u64,
+    pub reported_root_tool_failures: u64,
     /// Tool responses whose execution outcomes are unknown.
-    pub tool_calls_unknown: u64,
+    pub reported_root_tool_outcomes_unknown: u64,
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
-    /// Subset of `tool_calls_failed`. Non-zero means the agent hit safety walls.
+    /// Subset of `reported_root_tool_failures`. Non-zero means the agent hit safety walls.
     pub safety_guard_blocks: u64,
     pub avg_tokens_in: Option<f64>,
     pub avg_tokens_out: Option<f64>,
@@ -192,7 +200,7 @@ pub struct Aggregates {
     /// Average LLM rounds per turn (how many LLM→tool cycles).
     pub avg_llm_rounds: f64,
     /// Average tool calls per LLM round.
-    pub avg_tool_calls_per_round: f64,
+    pub avg_tool_calls_per_round: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -234,12 +242,10 @@ pub struct TurnRow {
     pub tools_used_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selected_skills: Vec<String>,
-    pub tool_calls_ok: u32,
-    pub tool_calls_fail: u32,
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub tool_calls_fresh: u32,
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub tool_calls_noop_or_cached: u32,
+    pub tool_calls_ok: Option<u32>,
+    pub tool_calls_fail: Option<u32>,
+    pub tool_calls_fresh: Option<u32>,
+    pub tool_calls_noop_or_cached: Option<u32>,
     /// Number of short-circuited skill re-entries in this turn (reentry_count ≥ 1).
     /// Surfaces "model called `skill(X)` again after already loading X" waste.
     #[serde(skip_serializing_if = "is_zero_u32")]
@@ -372,8 +378,8 @@ pub struct TurnErrRow {
     pub tokens_out: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    pub tool_calls_ok: u32,
-    pub tool_calls_fail: u32,
+    pub tool_calls_ok: Option<u32>,
+    pub tool_calls_fail: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_rounds: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -484,6 +490,72 @@ fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolC
     }
 }
 
+/// A scalar execution count contains no success, failure, or reuse outcomes.
+fn tool_outcomes_known(event: &session_journal::JournalEvent, stats: ToolCallStats) -> bool {
+    let Some(outcomes) = event
+        .tool_outcomes
+        .as_ref()
+        .filter(|outcomes| outcomes.is_consistent())
+    else {
+        return false;
+    };
+    stats.unknown == 0
+        && event
+            .tool_count
+            .is_none_or(|count| count == outcomes.executed)
+        && match event.tool_calls.as_ref() {
+            Some(calls) => {
+                calls.len() == outcomes.requested as usize
+                    && session_journal::ToolOutcomeSummary::from_records(calls) == *outcomes
+            }
+            None => outcomes.requested == 0,
+        }
+}
+
+/// A terminal aggregate cannot silently absorb an unrelated round/error
+/// observation unless the existing invocation identity proves they match.
+pub(super) fn root_tool_observations_reconciled(events: &[session_journal::JournalEvent]) -> bool {
+    use crate::cli::journal_diff::{call_key, compatible_call};
+    let mut terminal_calls = std::collections::HashMap::new();
+    for event in events.iter().filter(|event| is_root_terminal(event)) {
+        for call in event.tool_calls.iter().flatten() {
+            if let Some(key) = call_key(event, call)
+                && terminal_calls.insert(key, call).is_some()
+            {
+                // Two terminal summaries can refer to the same invocation.
+                // Their aggregates are then not proven disjoint.
+                return false;
+            }
+        }
+    }
+    for event in events.iter().filter(|event| {
+        !is_child_producer(event)
+            && matches!(
+                event.event_type,
+                JournalEventType::LlmRound | JournalEventType::ToolCallError
+            )
+    }) {
+        if event.event_type == JournalEventType::ToolCallError
+            && event.tool_calls.as_ref().is_none_or(Vec::is_empty)
+        {
+            return false;
+        }
+        for call in event.tool_calls.iter().flatten() {
+            let Some(terminal) = call_key(event, call).and_then(|key| terminal_calls.get(key))
+            else {
+                return false;
+            };
+            if !compatible_call(terminal, call)
+                || is_effective_failure(terminal) != is_effective_failure(call)
+                || terminal.outcome_is_unknown() != call.outcome_is_unknown()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Treat a tool call as a failure when either:
 /// - transport reports failure (`ok == false`), OR
 /// - transport succeeded but the result body encodes an error that the
@@ -494,7 +566,7 @@ fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolC
 /// result. Those calls show as `ok: true` in the journal (the executor
 /// "ran" the tool and returned its string), but from the LLM's
 /// perspective they are errors — and they're the class that
-/// previously hid from `tool_calls_failed` (session
+/// previously hid from `reported_root_tool_failures` (session
 /// 19ad8393 agent-spawn case).
 pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
     if c.outcome_is_unknown() {
@@ -872,17 +944,23 @@ pub(crate) fn root_terminal_usage(
     let mut seen = false;
     for event in events.iter().filter(|event| is_root_terminal(event)) {
         seen = true;
+        let Some(usage) =
+            astra_services::event_ingestion::canonical_token_usage_from_journal_event(event)
+        else {
+            complete = [false; 4];
+            continue;
+        };
         known.accumulate(&TokenAccounting::from_fields(
-            event.tokens_in.unwrap_or(0),
-            event.cache_read_tokens.unwrap_or(0),
-            event.cache_creation_tokens.unwrap_or(0),
-            event.tokens_out.unwrap_or(0),
+            usage.input_tokens().unwrap_or(0),
+            usage.cached_input_tokens().unwrap_or(0),
+            usage.cache_creation_tokens().unwrap_or(0),
+            usage.output_tokens().unwrap_or(0),
         ));
         for (complete, value) in complete.iter_mut().zip([
-            event.tokens_in,
-            event.tokens_out,
-            event.cache_read_tokens,
-            event.cache_creation_tokens,
+            usage.input_tokens(),
+            usage.output_tokens(),
+            usage.cached_input_tokens(),
+            usage.cache_creation_tokens(),
         ]) {
             *complete &= value.is_some();
         }
@@ -899,13 +977,28 @@ pub(crate) fn root_terminal_usage(
     }
 }
 
+fn terminal_usage_is_qualified(event: &session_journal::JournalEvent) -> bool {
+    astra_services::event_ingestion::canonical_token_usage_from_journal_event(event).is_some_and(
+        |usage| {
+            usage.input_tokens().is_some()
+                || usage.output_tokens().is_some()
+                || usage.cached_input_tokens().is_some()
+                || usage.cache_creation_tokens().is_some()
+        },
+    )
+}
+
 fn usage_source(event: &session_journal::JournalEvent) -> &'static str {
     if event.tokens_in.is_some()
         || event.tokens_out.is_some()
         || event.cache_read_tokens.is_some()
         || event.cache_creation_tokens.is_some()
     {
-        "terminal_qualified"
+        if terminal_usage_is_qualified(event) {
+            "terminal_qualified"
+        } else {
+            "unqualified_observation"
+        }
     } else {
         "unavailable"
     }
@@ -1154,13 +1247,52 @@ struct LinkedDigestJournals {
     primary_path: String,
     supplemental_paths: Vec<String>,
     conflicting_round_count: usize,
+    conflicting_terminal_count: usize,
     source_coverage: Vec<JournalSourceCoverage>,
+}
+
+/// One attempt owns one terminal. Replayed records are harmless; conflicting
+/// terminals cannot be attributed without guessing, so exclude both.
+fn normalize_root_terminals(events: &mut Vec<session_journal::JournalEvent>) -> usize {
+    let mut first = std::collections::HashMap::new();
+    let mut conflicts = std::collections::HashSet::new();
+    for event in events.iter().filter(|event| is_root_terminal(event)) {
+        if let (Some(turn), Some(run), Ok(payload)) = (
+            event.turn,
+            producer_run_id(event),
+            serde_json::to_string(event),
+        ) {
+            let key = (turn, run.to_owned());
+            if let Some(previous) = first.insert(key.clone(), payload.clone())
+                && previous != payload
+            {
+                conflicts.insert(key);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    events.retain(|event| {
+        if !is_root_terminal(event) {
+            return true;
+        }
+        if let (Some(turn), Some(run)) = (event.turn, producer_run_id(event))
+            && conflicts.contains(&(turn, run.to_owned()))
+        {
+            return false;
+        }
+        serde_json::to_string(event)
+            .map(|payload| seen.insert(payload))
+            .unwrap_or(true)
+    });
+    conflicts.len()
 }
 
 fn source_coverage(
     path: String,
     events: &[session_journal::JournalEvent],
     available: bool,
+    read_error: Option<String>,
+    malformed_records: usize,
 ) -> JournalSourceCoverage {
     let partial_flush_seen = events.iter().any(|event| {
         event
@@ -1188,6 +1320,8 @@ fn source_coverage(
     JournalSourceCoverage {
         path,
         available,
+        read_error,
+        malformed_records,
         partial_flush_seen,
         retained_event_losses,
     }
@@ -1200,6 +1334,7 @@ pub(crate) struct AttachedJournalSource {
     non_empty: usize,
     malformed: usize,
     available: bool,
+    pub read_error: Option<String>,
 }
 
 pub(crate) fn read_attached_journal_sources(
@@ -1215,14 +1350,19 @@ fn read_attached_journal_sources_with_owners(
     account: Option<&astra_services::OwnerScope>,
 ) -> Result<Vec<AttachedJournalSource>, String> {
     let mut sources = Vec::new();
-    for owner in std::iter::once(local).chain(account) {
+    for (index, owner) in std::iter::once(local).chain(account).enumerate() {
         let path = session_journal::journal_file_path_for_user(owner.id(), session_id)
             .map_err(|error| error.to_string())?;
-        let (events, non_empty, malformed, available) =
+        let (events, non_empty, malformed, available, read_error) =
             match session_journal::read_journal_source_for_owner(owner, session_id) {
-                Ok((events, lines, malformed)) => (events, lines, malformed, true),
+                Ok((events, lines, malformed)) => (events, lines, malformed, true, None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (Vec::new(), 0, 0, false)
+                    (Vec::new(), 0, 0, false, None)
+                }
+                // An unreadable supplemental source must not discard an
+                // authorized local journal. Corrupt content still fails closed.
+                Err(error) if index > 0 && error.kind() != std::io::ErrorKind::InvalidData => {
+                    (Vec::new(), 0, 0, false, Some(error.to_string()))
                 }
                 Err(error) => return Err(error.to_string()),
             };
@@ -1244,6 +1384,7 @@ fn read_attached_journal_sources_with_owners(
             non_empty,
             malformed,
             available,
+            read_error,
         });
     }
     Ok(sources)
@@ -1270,6 +1411,8 @@ fn read_linked_digest_journals(
         primary.path.to_string_lossy().into_owned(),
         &primary.events,
         primary.available,
+        primary.read_error,
+        primary.malformed,
     )];
     let mut events = primary.events;
     session_journal::stabilize_event_order(&mut events);
@@ -1288,11 +1431,25 @@ fn read_linked_digest_journals(
             source.path.to_string_lossy().into_owned(),
             &source.events,
             source.available,
+            source.read_error,
+            source.malformed,
         ));
         supplemental_events.extend(source.events);
     }
+    if coverage.iter().all(|source| !source.available) {
+        return Err(coverage
+            .iter()
+            .find_map(|source| {
+                source
+                    .read_error
+                    .as_deref()
+                    .map(|error| format!("{}: {error}", source.path))
+            })
+            .unwrap_or_else(|| format!("session journal not found: {}", primary.path.display())));
+    }
     let conflicting_round_count =
         merge_attached_events(&mut events, supplemental_events, include_supplemental);
+    let conflicting_terminal_count = normalize_root_terminals(&mut events);
     Ok(LinkedDigestJournals {
         events,
         non_empty,
@@ -1300,6 +1457,7 @@ fn read_linked_digest_journals(
         primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
         conflicting_round_count,
+        conflicting_terminal_count,
         source_coverage: coverage,
     })
 }
@@ -1307,7 +1465,7 @@ fn read_linked_digest_journals(
 /// Reuse the digest's authorized source join for other offline projections.
 pub(crate) fn read_journal_for_analysis(
     session_id: &str,
-) -> Result<(Vec<session_journal::JournalEvent>, bool), String> {
+) -> Result<(Vec<session_journal::JournalEvent>, bool, Vec<String>), String> {
     let (local, account) = crate::cli::cli_config::cli_utils::attached_journal_owners()?;
     read_journal_for_analysis_with_owners(session_id, &local, account.as_ref())
 }
@@ -1316,7 +1474,7 @@ fn read_journal_for_analysis_with_owners(
     session_id: &str,
     local: &astra_services::OwnerScope,
     account: Option<&astra_services::OwnerScope>,
-) -> Result<(Vec<session_journal::JournalEvent>, bool), String> {
+) -> Result<(Vec<session_journal::JournalEvent>, bool, Vec<String>), String> {
     let joined = read_linked_digest_journals(session_id, local, account, false, |kind| {
         contributes_runtime_digest_detail(kind)
             || matches!(
@@ -1328,12 +1486,23 @@ fn read_journal_for_analysis_with_owners(
     })?;
     let incomplete = joined.malformed > 0
         || joined.conflicting_round_count > 0
+        || joined.conflicting_terminal_count > 0
         || joined.source_coverage.iter().any(|source| {
             !source.available
                 || source.partial_flush_seen
                 || !source.retained_event_losses.is_empty()
         });
-    Ok((joined.events, incomplete))
+    let errors = joined
+        .source_coverage
+        .iter()
+        .filter_map(|source| {
+            source
+                .read_error
+                .as_ref()
+                .map(|error| format!("{}: {error}", source.path))
+        })
+        .collect();
+    Ok((joined.events, incomplete, errors))
 }
 
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
@@ -1355,6 +1524,7 @@ fn build_digest_with_owners(
         primary_path: journal_file,
         supplemental_paths: supplemental_journal_files,
         conflicting_round_count,
+        conflicting_terminal_count,
         source_coverage: journal_source_coverage,
     } = read_linked_digest_journals(
         session_id,
@@ -1373,6 +1543,7 @@ fn build_digest_with_owners(
 
     let source_incomplete = journal_lines_malformed > 0
         || conflicting_round_count > 0
+        || conflicting_terminal_count > 0
         || journal_source_coverage.iter().any(|source| {
             !source.available
                 || source.partial_flush_seen
@@ -1391,11 +1562,16 @@ fn build_digest_with_owners(
         completion: total_tokens_out,
     } = root_usage.known;
     let mut total_duration_ms: u64 = 0;
-    let mut total_tool_calls: u64 = 0;
-    let mut tool_calls_unknown: u64 = 0;
-    let mut total_fresh_tool_calls: u64 = 0;
-    let mut total_noop_or_cached_tool_calls: u64 = 0;
-    let mut tool_calls_failed: u64 = 0;
+    let mut reported_root_tool_calls: u64 = 0;
+    let mut root_tool_totals_complete = !source_incomplete
+        && !has_incomplete_observation(&events)
+        && !has_unmatched_root_rounds(&events);
+    let mut saw_root_terminal = false;
+    let mut observed_root_tool_requests = 0u64;
+    let mut reported_root_tool_outcomes_unknown: u64 = 0;
+    let mut reported_root_fresh_tool_calls: u64 = 0;
+    let mut reported_root_noop_or_cached_tool_calls: u64 = 0;
+    let mut reported_root_tool_failures: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut total_root_llm_rounds: u64 = 0;
     let mut root_attempts_with_llm_rounds: u64 = 0;
@@ -1414,7 +1590,7 @@ fn build_digest_with_owners(
     let mut subrun_total_cache_creation_tokens = 0u64;
     let mut subrun_total_tokens_out = 0u64;
     let mut subrun_total_duration_ms = 0u64;
-    let mut subrun_total_tool_calls = 0u64;
+    let mut observed_child_tool_requests = 0u64;
     let root_terminal_buckets_complete = root_usage.prompt_complete
         && root_usage.completion_complete
         && root_usage.cache_read_complete
@@ -1440,6 +1616,10 @@ fn build_digest_with_owners(
 
     let mut seq: u32 = 0;
     for ev in &events {
+        if is_root_terminal(ev) {
+            saw_root_terminal = true;
+            root_tool_totals_complete &= tool_outcomes_known(ev, authoritative_tool_call_stats(ev));
+        }
         match ev.event_type {
             JournalEventType::Turn if is_root_terminal(ev) => {
                 seq += 1;
@@ -1458,7 +1638,8 @@ fn build_digest_with_owners(
                     root_attempts_with_llm_rounds += 1;
                 }
                 let stats = authoritative_tool_call_stats(ev);
-                tool_calls_unknown += u64::from(stats.unknown);
+                reported_root_tool_outcomes_unknown += u64::from(stats.unknown);
+                let semantic_stats = tool_call_stats(ev.tool_calls.as_ref());
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if stats.total() > 0 {
@@ -1466,14 +1647,10 @@ fn build_digest_with_owners(
                 } else {
                     u64::from(ev.tool_count.unwrap_or(0))
                 };
-                total_tool_calls += effective_total;
-                total_fresh_tool_calls += if stats.total() > 0 {
-                    u64::from(stats.fresh)
-                } else {
-                    u64::from(ev.tool_count.unwrap_or(0))
-                };
-                total_noop_or_cached_tool_calls += u64::from(stats.noop_or_cached);
-                tool_calls_failed += u64::from(stats.fail);
+                reported_root_tool_calls += effective_total;
+                reported_root_fresh_tool_calls += u64::from(semantic_stats.fresh);
+                reported_root_noop_or_cached_tool_calls += u64::from(semantic_stats.noop_or_cached);
+                reported_root_tool_failures += u64::from(semantic_stats.fail);
                 // Count safety guard blocks regardless of focus level.
                 //
                 // Include `ok=true but result body encodes failure`
@@ -1563,20 +1740,11 @@ fn build_digest_with_owners(
                     } else {
                         Vec::new()
                     },
-                    // When tool_calls Vec is absent, treat tool_count as all-ok
-                    // and fresh because no per-call semantics are available.
-                    tool_calls_ok: if stats.total() > 0 {
-                        stats.ok
-                    } else {
-                        ev.tool_count.unwrap_or(0)
-                    },
-                    tool_calls_fail: stats.fail,
-                    tool_calls_fresh: if stats.total() > 0 {
-                        stats.fresh
-                    } else {
-                        ev.tool_count.unwrap_or(0)
-                    },
-                    tool_calls_noop_or_cached: stats.noop_or_cached,
+                    tool_calls_ok: tool_outcomes_known(ev, stats).then_some(stats.ok),
+                    tool_calls_fail: tool_outcomes_known(ev, stats).then_some(stats.fail),
+                    tool_calls_fresh: tool_outcomes_known(ev, stats).then_some(stats.fresh),
+                    tool_calls_noop_or_cached: tool_outcomes_known(ev, stats)
+                        .then_some(stats.noop_or_cached),
                     skill_reentry_calls: reentry_c,
                     skill_locked_out_calls: locked_out_c,
                     user_input_preview,
@@ -1620,20 +1788,17 @@ fn build_digest_with_owners(
                     root_attempts_with_llm_rounds += 1;
                 }
                 let stats = authoritative_tool_call_stats(ev);
-                tool_calls_unknown += u64::from(stats.unknown);
+                reported_root_tool_outcomes_unknown += u64::from(stats.unknown);
+                let semantic_stats = tool_call_stats(ev.tool_calls.as_ref());
                 let effective_total = if stats.total() > 0 {
                     u64::from(stats.total())
                 } else {
                     u64::from(ev.tool_count.unwrap_or(0))
                 };
-                total_tool_calls += effective_total;
-                total_fresh_tool_calls += if stats.total() > 0 {
-                    u64::from(stats.fresh)
-                } else {
-                    u64::from(ev.tool_count.unwrap_or(0))
-                };
-                total_noop_or_cached_tool_calls += u64::from(stats.noop_or_cached);
-                tool_calls_failed += u64::from(stats.fail);
+                reported_root_tool_calls += effective_total;
+                reported_root_fresh_tool_calls += u64::from(semantic_stats.fresh);
+                reported_root_noop_or_cached_tool_calls += u64::from(semantic_stats.noop_or_cached);
+                reported_root_tool_failures += u64::from(semantic_stats.fail);
                 if let Some(calls) = ev.tool_calls.as_ref() {
                     for call in calls.iter().filter(|call| is_effective_failure(call)) {
                         let error = effective_error_text(call);
@@ -1666,12 +1831,8 @@ fn build_digest_with_owners(
                     cache_creation_tokens,
                     tokens_out,
                     duration_ms: ev.duration_ms,
-                    tool_calls_ok: if stats.total() > 0 {
-                        stats.ok
-                    } else {
-                        ev.tool_count.unwrap_or(0)
-                    },
-                    tool_calls_fail: stats.fail,
+                    tool_calls_ok: tool_outcomes_known(ev, stats).then_some(stats.ok),
+                    tool_calls_fail: tool_outcomes_known(ev, stats).then_some(stats.fail),
                     llm_rounds: attempt_llm_rounds,
                     llm_round_details: if matches!(focus, DigestFocus::All) {
                         pending_rounds
@@ -1766,6 +1927,22 @@ fn build_digest_with_owners(
                     detail: json!({ "message": ev.error }),
                 });
             }
+            JournalEventType::ToolCallError => {
+                other_errors.push(SideEvent {
+                    ts: ev.ts.clone(),
+                    kind: "observed_tool_error".to_owned(),
+                    turn: ev.turn,
+                    agentic_step: ev.agentic_step,
+                    producer_scope: ev.producer_scope.clone(),
+                    source: None,
+                    detail: json!({
+                        "message": ev.error,
+                        "tools": ev.tools_used,
+                        "dispositions": ev.tool_calls.iter().flatten()
+                            .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
+                    }),
+                });
+            }
             JournalEventType::SessionStart => session_start_count += 1,
             JournalEventType::SessionEnd => session_end_count += 1,
             JournalEventType::ContextAssemblyRecorded => {}
@@ -1781,7 +1958,7 @@ fn build_digest_with_owners(
                     subrun_total_cache_creation_tokens += ev.cache_creation_tokens.unwrap_or(0);
                     subrun_total_tokens_out += ev.tokens_out.unwrap_or(0);
                     subrun_total_duration_ms += ev.duration_ms.unwrap_or(0);
-                    subrun_total_tool_calls += u64::from(ev.tool_calls_returned.unwrap_or(0));
+                    observed_child_tool_requests += u64::from(ev.tool_calls_returned.unwrap_or(0));
                     if matches!(focus, DigestFocus::All) {
                         let mut round = llm_round_row(ev);
                         round.local_turn = identity.local_turn;
@@ -1800,6 +1977,9 @@ fn build_digest_with_owners(
                     // Child evidence without its producer identity cannot be
                     // joined or counted as a complete child observation.
                     observed_child_round_buckets_complete = false;
+                } else {
+                    observed_root_tool_requests = observed_root_tool_requests
+                        .saturating_add(u64::from(ev.tool_calls_returned.unwrap_or(0)));
                 }
             }
             _ => {}
@@ -1807,6 +1987,10 @@ fn build_digest_with_owners(
     }
 
     let turn_count = turns_out.len();
+    root_tool_totals_complete = root_tool_totals_complete
+        && saw_root_terminal
+        && observed_root_tool_requests <= reported_root_tool_calls
+        && root_tool_observations_reconciled(&events);
     let unattributed_root_round_count = llm_rounds_by_turn.values().map(Vec::len).sum();
     let attempt_count = turn_count + turn_error_count;
     let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if attempt_count == 0 {
@@ -1858,6 +2042,7 @@ fn build_digest_with_owners(
         journal_lines_non_empty,
         journal_lines_malformed,
         conflicting_round_count,
+        conflicting_terminal_count,
         unattributed_root_round_count,
         aggregates: Aggregates {
             attempt_count,
@@ -1874,7 +2059,9 @@ fn build_digest_with_owners(
             total_provider_input_tokens,
             total_tokens_out,
             total_duration_ms,
-            total_tool_calls,
+            reported_root_tool_calls,
+            root_tool_totals_complete,
+            observed_root_tool_requests,
             subrun_count: subrun_ids.len(),
             subrun_total_tokens_in,
             subrun_total_cache_read_tokens,
@@ -1882,7 +2069,7 @@ fn build_digest_with_owners(
             subrun_total_provider_input_tokens,
             subrun_total_tokens_out,
             subrun_total_duration_ms,
-            subrun_total_tool_calls,
+            observed_child_tool_requests,
             inclusive_total_tokens_in: total_tokens_in + subrun_total_tokens_in,
             inclusive_total_cache_read_tokens: total_cache_read_tokens
                 .saturating_add(subrun_total_cache_read_tokens),
@@ -1891,11 +2078,10 @@ fn build_digest_with_owners(
             inclusive_total_provider_input_tokens: total_provider_input_tokens
                 .saturating_add(subrun_total_provider_input_tokens),
             inclusive_total_tokens_out: total_tokens_out + subrun_total_tokens_out,
-            inclusive_total_tool_calls: total_tool_calls + subrun_total_tool_calls,
-            total_fresh_tool_calls,
-            total_noop_or_cached_tool_calls,
-            tool_calls_failed,
-            tool_calls_unknown,
+            reported_root_fresh_tool_calls,
+            reported_root_noop_or_cached_tool_calls,
+            reported_root_tool_failures,
+            reported_root_tool_outcomes_unknown,
             safety_guard_blocks,
             avg_tokens_in,
             avg_tokens_out,
@@ -1905,13 +2091,8 @@ fn build_digest_with_owners(
             } else {
                 0.0
             },
-            avg_tool_calls_per_round: {
-                if total_root_llm_rounds > 0 {
-                    total_tool_calls as f64 / total_root_llm_rounds as f64
-                } else {
-                    0.0
-                }
-            },
+            avg_tool_calls_per_round: (root_tool_totals_complete && total_root_llm_rounds > 0)
+                .then(|| reported_root_tool_calls as f64 / total_root_llm_rounds as f64),
         },
         turns: turns_out,
         subruns: subruns_by_run.into_values().collect(),
@@ -1962,11 +2143,18 @@ pub fn print_text(d: &JournalDigest) {
     for source in &d.journal_source_coverage {
         if !source.available
             || source.partial_flush_seen
+            || source.malformed_records > 0
             || !source.retained_event_losses.is_empty()
         {
             stdout_println!("  journal observation is partial: {}", source.path);
             if !source.available {
                 stdout_println!("    source unavailable");
+                if let Some(error) = &source.read_error {
+                    stdout_println!("    read error: {error}");
+                }
+            }
+            if source.malformed_records > 0 {
+                stdout_println!("    malformed records: {}", source.malformed_records);
             }
             for loss in &source.retained_event_losses {
                 let run = loss
@@ -1999,6 +2187,12 @@ pub fn print_text(d: &JournalDigest) {
             d.conflicting_round_count.to_string().red()
         );
     }
+    if d.conflicting_terminal_count > 0 {
+        stdout_println!(
+            "  conflicting_terminals_excluded={} (attempt totals omitted)",
+            d.conflicting_terminal_count.to_string().red()
+        );
+    }
     if d.unattributed_root_round_count > 0 {
         stdout_println!(
             "  unattributed_root_rounds={} (no matching terminal run identity)",
@@ -2006,6 +2200,13 @@ pub fn print_text(d: &JournalDigest) {
         );
     }
     let a = &d.aggregates;
+    let tool_total = |value: u64| {
+        if a.root_tool_totals_complete {
+            value.to_string()
+        } else {
+            "?".to_owned()
+        }
+    };
     stdout_println!("\n  {}", "Aggregates".bold().magenta());
     stdout_println!(
         "  attempts={} turns={} turn_errors={} compacts={} stalls={} errors={}",
@@ -2021,11 +2222,24 @@ pub fn print_text(d: &JournalDigest) {
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
-        a.total_tool_calls,
-        a.total_fresh_tool_calls,
-        a.total_noop_or_cached_tool_calls,
-        a.tool_calls_failed,
-        a.tool_calls_unknown
+        tool_total(a.reported_root_tool_calls),
+        tool_total(a.reported_root_fresh_tool_calls),
+        tool_total(a.reported_root_noop_or_cached_tool_calls),
+        tool_total(a.reported_root_tool_failures),
+        tool_total(a.reported_root_tool_outcomes_unknown)
+    );
+    if !a.root_tool_totals_complete && a.reported_root_tool_calls > 0 {
+        stdout_println!(
+            "  terminal_tool_reports: calls={} observed_failures={} unknown={} (observations may overlap)",
+            a.reported_root_tool_calls,
+            a.reported_root_tool_failures,
+            a.reported_root_tool_outcomes_unknown
+        );
+    }
+    stdout_println!(
+        "  observed_model_tool_requests: root={} children={} (not execution counts)",
+        a.observed_root_tool_requests,
+        a.observed_child_tool_requests
     );
     stdout_println!(
         "  known_root_provider_input={} (fresh={} cache_read={} cache_write={})",
@@ -2038,6 +2252,7 @@ pub fn print_text(d: &JournalDigest) {
         || !d.usage_coverage.observed_child_round_buckets_complete
         || d.runtime_journal_coverage == "account_journal_unavailable"
         || d.conflicting_round_count > 0
+        || d.conflicting_terminal_count > 0
     {
         stdout_println!(
             "  usage coverage: partial; unavailable buckets are omitted from known totals"
@@ -2065,9 +2280,10 @@ pub fn print_text(d: &JournalDigest) {
     );
     if a.avg_llm_rounds > 0.0 {
         stdout_println!(
-            "  llm_rounds={:.1} tool_calls_per_round={:.1}",
+            "  llm_rounds={:.1} tool_calls_per_round={}",
             a.avg_llm_rounds,
             a.avg_tool_calls_per_round
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}"))
         );
     }
     if !d.turns.is_empty() {
@@ -2335,7 +2551,7 @@ mod tests {
         assert_eq!(d.aggregates.compact_count, 1);
         assert_eq!(d.turns[0].seq, 1);
         assert_eq!(d.turns[0].turn_id, Some(1));
-        assert_eq!(d.turns[1].tool_calls_ok, 1);
+        assert_eq!(d.turns[1].tool_calls_ok, None);
     }
 
     #[test]
@@ -2379,11 +2595,11 @@ mod tests {
         let digest = build_digest(sid, DigestFocus::Summary).unwrap();
         assert_eq!(digest.aggregates.attempt_count, 3);
         assert_eq!(digest.aggregates.turn_error_count, 1);
-        assert_eq!(digest.aggregates.total_tokens_in, 80);
-        assert_eq!(digest.aggregates.total_cache_read_tokens, 10);
-        assert_eq!(digest.aggregates.total_cache_creation_tokens, 3);
-        assert_eq!(digest.aggregates.total_provider_input_tokens, 93);
-        assert_eq!(digest.aggregates.total_tokens_out, 10);
+        assert_eq!(digest.aggregates.total_tokens_in, 20);
+        assert_eq!(digest.aggregates.total_cache_read_tokens, 4);
+        assert_eq!(digest.aggregates.total_cache_creation_tokens, 1);
+        assert_eq!(digest.aggregates.total_provider_input_tokens, 25);
+        assert_eq!(digest.aggregates.total_tokens_out, 3);
         assert_eq!(digest.aggregates.subrun_count, 1);
         assert_eq!(digest.aggregates.subrun_total_tokens_in, 5);
         assert!(!digest.usage_coverage.root_terminal_buckets_complete);
@@ -2411,7 +2627,7 @@ mod tests {
         assert_eq!(d.journal_lines_non_empty, 14);
         assert_eq!(d.journal_lines_malformed, 0);
         assert_eq!(d.aggregates.turn_count, 1);
-        assert_eq!(d.aggregates.total_tool_calls, 12);
+        assert_eq!(d.aggregates.reported_root_tool_calls, 12);
         assert_eq!(d.aggregates.avg_llm_rounds, 7.0);
         assert_eq!(d.turns.len(), 1);
 
@@ -2420,7 +2636,7 @@ mod tests {
             turn.user_input_preview,
             "review b273c589a73799070a71f4cfc6d55349b534d8d1"
         );
-        assert_eq!(turn.tool_calls_ok, 12);
+        assert_eq!(turn.tool_calls_ok, None);
         assert_eq!(turn.llm_rounds, Some(7));
         assert!(
             turn.tool_groups.iter().any(|group| {
@@ -2510,7 +2726,7 @@ mod tests {
         assert_eq!(digest.aggregates.subrun_total_tokens_in, 30);
         assert_eq!(digest.aggregates.subrun_total_tokens_out, 5);
         assert_eq!(digest.aggregates.subrun_total_duration_ms, 70);
-        assert_eq!(digest.aggregates.subrun_total_tool_calls, 3);
+        assert_eq!(digest.aggregates.observed_child_tool_requests, 3);
         assert_eq!(digest.aggregates.inclusive_total_tokens_in, 130);
         assert_eq!(digest.aggregates.inclusive_total_tokens_out, 15);
         assert_eq!(
@@ -2603,9 +2819,12 @@ mod tests {
                 "turn":1,"producer_scope":{"run_id":"run-a"},
                 "metadata":{"dropped_events_before":545,"partial":true}}),
             serde_json::json!({"type":"delegation_sub_run_started","ts":"t1","session_id":sid,
-                "metadata":{"run_id":"child","agent_type":"worker"}}),
-            serde_json::json!({"type":"delegation_sub_run_completed","ts":"t2","session_id":sid,
-                "tokens_in":12,"tokens_out":3,"tool_count":0,"metadata":{"run_id":"child"}}),
+                "metadata":{"delegation_id":"group","sub_run_id":"child","parent_run_id":"run-a","agent_id":"worker","depth":1}}),
+            serde_json::json!({"type":"llm_round","ts":"t2","session_id":sid,"round":0,
+                "producer_scope":{"run_id":"child","parent_run_id":"run-a","agent_id":"worker","local_turn":1},
+                "tokens_in":12,"tokens_out":3}),
+            serde_json::json!({"type":"delegation_sub_run_completed","ts":"t3","session_id":sid,
+                "metadata":{"delegation_id":"group","sub_run_id":"child","agent_id":"worker","status":"completed"}}),
         ];
         fs::write(
             &path,
@@ -2637,13 +2856,15 @@ mod tests {
         assert!(!digest.usage_coverage.root_terminal_buckets_complete);
         assert_eq!(digest.aggregates.avg_tokens_in, None);
         assert_eq!(digest.aggregates.total_tokens_in, 0);
-        let (events, incomplete) =
+        let (events, incomplete, errors) =
             super::read_journal_for_analysis_with_owners(sid, &local, Some(&account)).unwrap();
+        assert!(errors.is_empty());
         assert!(incomplete);
         let (tree, _, _) =
             crate::cli::journal_tree::fold_events_with_coverage(sid, &events, incomplete);
         assert_eq!(tree.children.len(), 1);
-        assert_eq!(tree.children[0].prompt_tokens, 12);
+        assert_eq!(tree.children[0].prompt_tokens, 0);
+        assert_eq!(tree.children[0].observed_round_input, Some(12));
         assert!(!tree.prompt_tokens_complete);
         let diff = crate::cli::journal_diff::diff_events_with_coverage(
             sid, sid, &events, &events, incomplete, incomplete,
@@ -3284,6 +3505,23 @@ mod tests {
             let partial = PartialTurnData {
                 tool_calls_count: 4,
                 tool_outcomes: outcomes.clone(),
+                tool_call_records: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "name":"read_file", "ok":true, "ms":1
+                    }))
+                    .unwrap(),
+                ],
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                qualified_usage: (index == 1).then(|| {
+                    astra_turn_types::CanonicalTokenUsage::new(
+                        Some(100),
+                        Some(0),
+                        Some(0),
+                        Some(10),
+                    )
+                    .unwrap()
+                }),
                 ..Default::default()
             };
             let mut event =
@@ -3296,6 +3534,16 @@ mod tests {
             );
             assert_eq!(event.tool_outcomes, outcomes);
             assert_eq!(event.metadata.as_ref().unwrap()["partial_tool_calls"], 4);
+            assert_eq!(event.tokens_in, (index == 1).then_some(100));
+            assert_eq!(
+                event
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get("token_usage_qualified")
+                    .is_some(),
+                index == 1
+            );
             write_test_journal(
                 journal_path_for_test(&sid),
                 format!("{}\n", serde_json::to_string(&event).unwrap()),
@@ -3303,17 +3551,21 @@ mod tests {
             .unwrap();
             let digest = build_digest(&sid, DigestFocus::All).unwrap();
             assert_eq!(
-                digest.aggregates.total_tool_calls,
-                if index == 0 { 0 } else { 4 }
+                digest.aggregates.total_tokens_in,
+                if index == 0 { 0 } else { 100 }
             );
             assert_eq!(
-                digest.aggregates.total_fresh_tool_calls,
-                if index == 0 { 0 } else { 1 }
+                digest.usage_coverage.root_terminal_buckets_complete,
+                index == 1
             );
+            assert_eq!(digest.turn_errors[0].tool_calls_ok, None);
+            assert_eq!(digest.turn_errors[0].tool_calls_fail, None);
             assert_eq!(
-                digest.aggregates.tool_calls_failed,
-                if index == 0 { 0 } else { 3 }
+                digest.aggregates.reported_root_tool_calls,
+                if index == 0 { 1 } else { 4 }
             );
+            assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 1);
+            assert_eq!(digest.aggregates.reported_root_tool_failures, 0);
         }
     }
 
@@ -3490,7 +3742,7 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(d.aggregates.tool_calls_failed, 2);
+        assert_eq!(d.aggregates.reported_root_tool_failures, 2);
         assert_eq!(d.aggregates.safety_guard_blocks, 1);
         assert_eq!(d.failed_tool_calls.len(), 2);
 
@@ -3577,7 +3829,7 @@ mod tests {
         // Regression guard for session 19ad8393: spawn_agent
         // returned ok=true but the result body was
         // `{"status":"failed","error":"..."}` + banner. The digest
-        // previously counted this as ok and tool_calls_failed
+        // previously counted this as ok and reported_root_tool_failures
         // stayed at 0 — making the failure invisible to
         // analyze_session.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3591,7 +3843,7 @@ mod tests {
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(
-            d.aggregates.tool_calls_failed, 1,
+            d.aggregates.reported_root_tool_failures, 1,
             "the ok=true spawn_agent with error body must count as a failure"
         );
         assert_eq!(d.failed_tool_calls.len(), 1);
@@ -3611,7 +3863,7 @@ mod tests {
         // Earlier versions with `result_preview: None` mis-reported
         // the tool as having returned an empty body and the LLM
         // hallucinated a `{}`-return bug. Pin both invariants:
-        // - cache hits are NOT counted in `tool_calls_failed`
+        // - cache hits are NOT counted in `reported_root_tool_failures`
         // - `result_body_signals_failure` returns false for the
         //   tagged preview shape
         assert!(
@@ -3629,19 +3881,19 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(d.aggregates.total_tool_calls, 2);
+        assert_eq!(d.aggregates.reported_root_tool_calls, 2);
         assert_eq!(
-            d.aggregates.total_fresh_tool_calls, 1,
+            d.aggregates.reported_root_fresh_tool_calls, 1,
             "only the real bash call should count as fresh evidence"
         );
         assert_eq!(
-            d.aggregates.total_noop_or_cached_tool_calls, 1,
+            d.aggregates.reported_root_noop_or_cached_tool_calls, 1,
             "cache hits should be visible as no-op/cache calls"
         );
-        assert_eq!(d.turns[0].tool_calls_fresh, 1);
-        assert_eq!(d.turns[0].tool_calls_noop_or_cached, 1);
+        assert_eq!(d.turns[0].tool_calls_fresh, None);
+        assert_eq!(d.turns[0].tool_calls_noop_or_cached, None);
         assert_eq!(
-            d.aggregates.tool_calls_failed, 0,
+            d.aggregates.reported_root_tool_failures, 0,
             "same-invocation replays must not count as failures"
         );
         assert!(
@@ -3663,7 +3915,7 @@ mod tests {
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(
-            d.aggregates.tool_calls_failed, 1,
+            d.aggregates.reported_root_tool_failures, 1,
             "deferred activation misses are protocol failures and must be visible"
         );
         assert!(
@@ -3690,7 +3942,7 @@ mod tests {
         // Summary focus omits per-call details
         assert!(d.failed_tool_calls.is_empty());
         // But aggregate counts still work
-        assert_eq!(d.aggregates.tool_calls_failed, 1);
+        assert_eq!(d.aggregates.reported_root_tool_failures, 1);
     }
 
     #[test]
@@ -3705,11 +3957,33 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::Summary).expect("digest");
-        assert_eq!(d.aggregates.total_tool_calls, 4);
-        assert_eq!(d.aggregates.total_fresh_tool_calls, 2);
-        assert_eq!(d.aggregates.tool_calls_failed, 2);
-        assert_eq!(d.turns[0].tool_calls_ok, 2);
-        assert_eq!(d.turns[0].tool_calls_fail, 2);
+        assert_eq!(d.aggregates.reported_root_tool_calls, 4);
+        assert_eq!(d.aggregates.reported_root_fresh_tool_calls, 0);
+        assert_eq!(d.aggregates.reported_root_tool_failures, 0);
+        assert_eq!(d.turns[0].tool_calls_ok, None);
+        assert_eq!(d.turns[0].tool_calls_fail, None);
+        assert!(!d.aggregates.root_tool_totals_complete);
+    }
+
+    #[test]
+    fn partial_tool_details_do_not_claim_complete_semantic_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-partial-semantic-outcomes";
+        write_test_journal(journal_path_for_test(sid),
+            r#"{"type":"turn","ts":"t","session_id":"S","turn":1,"tool_count":2,"tool_outcomes":{"requested":2,"executed":2,"succeeded":2,"failed":0,"started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},"tool_calls":[{"name":"bash","ok":true,"ms":1,"result_preview":"{\"status\":\"failed\"}"}]}"#).unwrap();
+        let digest = build_digest(sid, DigestFocus::All).unwrap();
+        assert_eq!(digest.turns[0].tool_calls_ok, None);
+        assert_eq!(digest.turns[0].tool_calls_fail, None);
+        assert!(!digest.aggregates.root_tool_totals_complete);
+        assert_eq!(digest.aggregates.reported_root_tool_failures, 1);
+        assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 0);
+        assert!(
+            digest
+                .failed_tool_calls
+                .iter()
+                .any(|call| call.tool == "bash")
+        );
     }
 
     #[test]
@@ -3720,9 +3994,84 @@ mod tests {
         write_test_journal(journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":1,"tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,"started_unknown":0,"unknown":1,"rejected":0,"reused":0,"suppressed":0,"deferred":0}}"#).unwrap();
         let digest = build_digest(sid, DigestFocus::Summary).unwrap();
-        assert_eq!(digest.aggregates.total_tool_calls, 2);
-        assert_eq!(digest.aggregates.tool_calls_failed, 0);
-        assert_eq!(digest.aggregates.tool_calls_unknown, 1);
+        assert_eq!(digest.aggregates.reported_root_tool_calls, 2);
+        assert_eq!(digest.aggregates.reported_root_tool_failures, 0);
+        assert_eq!(digest.aggregates.reported_root_tool_outcomes_unknown, 1);
+    }
+
+    #[test]
+    fn unmatched_tool_error_remains_visible_and_invalidates_terminal_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "unmatched-observed-tool-error";
+        let events = [
+            serde_json::json!({"type":"turn", "ts":"t1", "session_id":sid, "turn":1,
+                "producer_scope":{"run_id":"root-run"}, "tool_count":0,
+                "tool_outcomes":{"requested":0,"executed":0,"succeeded":0,"failed":0,
+                    "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}}),
+            serde_json::json!({"type":"tool_call_error", "ts":"t2", "session_id":sid, "turn":1,
+                "producer_scope":{"run_id":"other-run"}, "error":"permission denied",
+                "tools_used":["bash"], "tool_calls":[{"name":"bash","ok":false,"ms":1}]}),
+        ];
+        write_test_journal(
+            journal_path_for_test(sid),
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert!(!digest.aggregates.root_tool_totals_complete);
+        assert_eq!(digest.aggregates.reported_root_tool_calls, 0);
+        assert!(
+            digest
+                .other_errors
+                .iter()
+                .any(|error| error.kind == "observed_tool_error"
+                    && error.detail["message"] == "permission denied")
+        );
+    }
+
+    #[test]
+    fn returned_requests_do_not_make_a_conflicting_terminal_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "conflicting-tool-request-coverage";
+        let round = serde_json::json!({"type":"llm_round", "ts":"t1", "session_id":sid,
+            "turn":1, "round":0, "producer_scope":{"run_id":"root-run"}, "tool_calls_returned":1});
+        let terminal = serde_json::json!({"type":"turn", "ts":"t2", "session_id":sid,
+            "turn":1, "producer_scope":{"run_id":"root-run"}, "tool_count":0,
+            "tool_outcomes":{"requested":0,"executed":0,"succeeded":0,"failed":0,
+                "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}});
+        write_test_journal(journal_path_for_test(sid), format!("{round}\n{terminal}\n")).unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert_eq!(digest.aggregates.observed_root_tool_requests, 1);
+        assert!(!digest.aggregates.root_tool_totals_complete);
+        assert_eq!(digest.aggregates.avg_tool_calls_per_round, None);
+    }
+
+    #[test]
+    fn overlapping_terminal_reports_do_not_claim_distinct_tool_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "overlapping-terminal-tool-reports";
+        let terminal = serde_json::json!({"type":"turn", "ts":"t1", "session_id":sid,
+            "turn":1, "producer_scope":{"run_id":"root-run"}, "tool_count":1,
+            "tool_calls":[{"name":"bash","ok":true,"ms":1,"tool_call_id":"call",
+                "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"root-run",
+                    "turn_chain_id":"chain","invocation_id":"call"}}],
+            "tool_outcomes":{"requested":1,"executed":1,"succeeded":1,"failed":0,
+                "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}});
+        write_test_journal(
+            journal_path_for_test(sid),
+            format!("{terminal}\n{terminal}\n"),
+        )
+        .unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert_eq!(digest.aggregates.reported_root_tool_calls, 1);
+        assert!(digest.aggregates.root_tool_totals_complete);
+        assert_eq!(digest.aggregates.avg_tool_calls_per_round, None);
     }
 
     #[test]

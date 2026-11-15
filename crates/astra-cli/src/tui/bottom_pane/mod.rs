@@ -80,8 +80,6 @@ enum ModelCatalogState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NextTurnSubmission {
     Interactive(String),
-    /// A plan command deferred behind earlier current-run guidance.
-    DeferredPlan(String),
     Guidance(PendingUserIntent),
     Conversation {
         target: crate::tui::event_loop::SessionContinuationTarget,
@@ -92,7 +90,7 @@ pub(crate) enum NextTurnSubmission {
 impl NextTurnSubmission {
     pub(crate) fn text(&self) -> &str {
         match self {
-            Self::Interactive(text) | Self::DeferredPlan(text) => text,
+            Self::Interactive(text) => text,
             Self::Guidance(intent) => &intent.text,
             Self::Conversation { content, .. } => content,
         }
@@ -809,23 +807,45 @@ impl BottomPane {
         for intent in &self.pending_user_intents {
             if intent.turn_id.as_deref() != Some(turn_id)
                 || !matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                || intent.status == astra_turn_types::UserIntentStatus::Returned
             {
                 continue;
+            }
+            // An explicit next-turn submission entered earlier is a barrier.
+            if intent.next_turn_position > 0 {
+                return None;
             }
             match intent.custody {
                 PendingUserIntentCustody::Unconfirmed => return None,
                 PendingUserIntentCustody::Client => return Some(intent),
+                // Later messages cannot overtake a plan already accepted by
+                // the run but not yet applied.
+                PendingUserIntentCustody::Run if intent.wire_text.is_some() => return None,
                 PendingUserIntentCustody::Run => {}
             }
         }
         None
     }
 
-    pub(crate) fn has_unconfirmed_turn_guidance(&self, turn_id: &str) -> bool {
+    /// A plan may change permission only after all earlier guidance was applied.
+    pub(crate) fn next_startable_plan(&self, turn_id: &str) -> Option<&PendingUserIntent> {
+        let first = self.pending_user_intents.iter().find(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
+        })?;
+        (first.custody == PendingUserIntentCustody::Client
+            && first.wire_text.is_some()
+            && first.next_turn_position == 0)
+            .then_some(first)
+    }
+
+    pub(crate) fn has_turn_guidance_needing_attention(&self, turn_id: &str) -> bool {
         self.pending_user_intents.iter().any(|intent| {
             intent.turn_id.as_deref() == Some(turn_id)
                 && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-                && intent.custody == PendingUserIntentCustody::Unconfirmed
+                && (intent.custody == PendingUserIntentCustody::Unconfirmed
+                    || intent.status == astra_turn_types::UserIntentStatus::Returned)
         })
     }
 
@@ -1476,10 +1496,6 @@ impl BottomPane {
         self.take_client_recoverable_for_turn(Some(turn_id))
     }
 
-    pub(crate) fn take_unsent_turn_guidance(&mut self, turn_id: &str) -> Vec<PendingUserIntent> {
-        self.take_client_recoverable_for_turn(Some(turn_id))
-    }
-
     #[cfg(test)]
     pub fn take_client_recoverable_user_intents(&mut self) -> Vec<PendingUserIntent> {
         self.applied_user_intent_ids.clear();
@@ -1496,16 +1512,6 @@ impl BottomPane {
         self.queued_next_turn_submissions
             .push_back(NextTurnSubmission::Interactive(text));
         true
-    }
-
-    pub(crate) fn queue_deferred_plan(&mut self, text: String) {
-        self.queued_next_turn_submissions
-            .push_back(NextTurnSubmission::DeferredPlan(text));
-    }
-
-    pub(crate) fn has_deferred_plan(&self) -> bool {
-        self.visible_next_turn_submissions()
-            .any(|entry| matches!(entry, NextTurnSubmission::DeferredPlan(_)))
     }
 
     pub(crate) fn queue_session_continuation(

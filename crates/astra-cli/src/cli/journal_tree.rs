@@ -21,10 +21,8 @@
 //!
 //! ```text
 //! root [sess-abc] model=claude-sonnet-4-6 tokens=12k/450
-//! ├── delegate#1 started=T+2.1s ended=T+5.3s tokens=8k/200
-//! │   agent_type=coder task="refactor registry.rs"
-//! └── delegate#2 started=T+2.8s ended=T+4.9s tokens=2.5k/150
-//!     agent_type=reviewer task="review the refactor"
+//! ├── coder  tokens=?/? tool_calls=?
+//! └── reviewer  tokens=?/? tool_calls=?
 //! ```
 //!
 //! JSON mirrors `DelegationNode` verbatim so dashboards can deserialize
@@ -38,19 +36,16 @@ use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
 use crate::cli::journal_digest::display_known;
 use crate::cli::surface::delegation_event_surface::{
-    project_delegation_started, project_delegation_sub_run_completed,
-    project_delegation_sub_run_started,
+    project_delegation_sub_run_completed, project_delegation_sub_run_started,
 };
 
 /// One node in the rendered tree. Leaf = no `children`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationNode {
-    /// Stable identifier for this node. Root node uses the session id;
-    /// sub-run nodes use the sub-run's run_id if available, else a
-    /// synthetic "delegate-<seq>".
+    /// Stable identifier: the session id for root, sub-run id for a child.
     pub id: String,
     /// Human-readable label — "root" for the top-level session,
-    /// "delegate#N" or the agent_type name for children.
+    /// "delegate#N" or the agent id for children.
     pub label: String,
     /// ISO 8601 start timestamp. Absent when the journal didn't
     /// record a start (e.g. a bare `DelegationCompleted` without a
@@ -64,12 +59,18 @@ pub struct DelegationNode {
     /// Model id reported for this sub-run, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Agent type hint from the delegation config, e.g. "coder".
+    /// Agent identity recorded by the sub-run producer.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_type: Option<String>,
-    /// Task summary (truncated). Free-form from the delegation call.
+    pub agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<String>,
+    pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+    /// Raw model-round telemetry, separate from qualified terminal totals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_round_input: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_round_output: Option<u64>,
     /// Aggregated prompt tokens on the sub-run (includes children for root).
     pub prompt_tokens: u64,
     /// False means the value is only the known subtotal.
@@ -86,17 +87,21 @@ pub struct DelegationNode {
     /// Known executed tool invocations, including children for the root.
     pub tool_calls: u32,
     pub tool_calls_complete: bool,
-    /// Nested sub-runs.
+    /// Nested sub-runs with established parent relationships.
     pub children: Vec<DelegationNode>,
+    /// Sub-runs whose parent cannot be established from retained events.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unattached: Vec<DelegationNode>,
 }
 
 /// Load a session journal, fold its delegation events into a tree.
 /// Returns `(root, total_events, skipped_events)`. Skipped = events
 /// whose metadata couldn't be parsed to fit the tree shape — counted,
 /// not errored, so a rogue line doesn't break the whole command.
-pub fn build_tree(session_id: &str) -> Result<(DelegationNode, u32, u32), String> {
-    let (events, incomplete) = journal_digest::read_journal_for_analysis(session_id)?;
-    Ok(fold_events_with_coverage(session_id, &events, incomplete))
+pub fn build_tree(session_id: &str) -> Result<(DelegationNode, u32, u32, Vec<String>), String> {
+    let (events, incomplete, errors) = journal_digest::read_journal_for_analysis(session_id)?;
+    let (root, total, skipped) = fold_events_with_coverage(session_id, &events, incomplete);
+    Ok((root, total, skipped, errors))
 }
 
 pub(crate) fn fold_events_with_coverage(
@@ -117,7 +122,7 @@ fn mark_coverage_incomplete(node: &mut DelegationNode) {
     node.self_prompt_tokens_complete = false;
     node.self_completion_tokens_complete = false;
     node.tool_calls_complete = false;
-    for child in &mut node.children {
+    for child in node.children.iter_mut().chain(node.unattached.iter_mut()) {
         mark_coverage_incomplete(child);
     }
 }
@@ -129,24 +134,29 @@ pub(crate) fn fold_events_into_tree(
     session_id: &str,
     events: &[JournalEvent],
 ) -> (DelegationNode, u32, u32) {
+    use std::collections::HashMap;
+
     let observation_incomplete = journal_digest::has_incomplete_observation(events)
         || journal_digest::has_unmatched_root_rounds(events);
     let usage = journal_digest::root_terminal_usage(events, observation_incomplete);
     let mut root = DelegationNode {
-        id: session_id.to_string(),
-        label: "root".to_string(),
+        id: session_id.to_owned(),
+        label: "root".to_owned(),
         started_at: None,
         ended_at: None,
         model: None,
-        agent_type: None,
-        task: None,
+        agent_id: None,
+        parent_run_id: None,
+        retry_of: None,
+        observed_round_input: None,
+        observed_round_output: None,
         prompt_tokens: usage.known.prompt,
         prompt_tokens_complete: usage.prompt_complete,
         completion_tokens: usage.known.completion,
         completion_tokens_complete: usage.completion_complete,
-        self_prompt_tokens: 0,
+        self_prompt_tokens: usage.known.prompt,
         self_prompt_tokens_complete: usage.prompt_complete,
-        self_completion_tokens: 0,
+        self_completion_tokens: usage.known.completion,
         self_completion_tokens_complete: usage.completion_complete,
         tool_calls: 0,
         tool_calls_complete: events.iter().any(journal_digest::is_root_terminal)
@@ -154,67 +164,69 @@ pub(crate) fn fold_events_into_tree(
                 .iter()
                 .filter(|event| journal_digest::is_root_terminal(event))
                 .all(|event| event.tool_count.is_some())
-            && !observation_incomplete,
+            && !observation_incomplete
+            && journal_digest::root_tool_observations_reconciled(events),
         children: Vec::new(),
+        unattached: Vec::new(),
     };
-    let mut seq: u32 = 0;
+    // Store lifecycle identity alongside each node; completion by run id alone
+    // can incorrectly settle a different delegation or agent.
+    let mut nodes: Vec<(DelegationNode, Option<String>, u64)> = Vec::new();
+    let mut by_run_id = HashMap::new();
     let mut skipped: u32 = 0;
-    let mut by_run_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
     for ev in events {
         if journal_digest::is_root_terminal(ev) {
             root.tool_calls = root.tool_calls.saturating_add(ev.tool_count.unwrap_or(0));
         }
         match ev.event_type {
-            JournalEventType::Turn | JournalEventType::LlmRound => {
+            JournalEventType::Turn | JournalEventType::LlmRound
+                if !journal_digest::is_child_producer(ev) =>
+            {
                 if root.started_at.is_none() && !ev.ts.is_empty() {
                     root.started_at = Some(ev.ts.clone());
                 }
-                // Last seen ts becomes the end — approximate, but
-                // good enough for a tree overview.
                 root.ended_at = Some(ev.ts.clone());
-                if root.model.is_none()
-                    && let Some(m) = ev.model.as_deref()
-                {
-                    root.model = Some(m.to_string());
+                if root.model.is_none() {
+                    root.model.clone_from(&ev.model);
                 }
             }
-            JournalEventType::DelegationSubRunStarted | JournalEventType::DelegationStarted => {
-                seq = seq.saturating_add(1);
-                let (run_id, agent_type, task) = match ev.event_type {
-                    JournalEventType::DelegationStarted => {
-                        let projection = project_delegation_started(ev.metadata.as_ref());
-                        (
-                            projection
-                                .run_id
-                                .unwrap_or_else(|| format!("delegate-{seq}")),
-                            projection.agent_type,
-                            projection.task.map(|s| truncate_label(&s, 120)),
-                        )
-                    }
-                    JournalEventType::DelegationSubRunStarted => {
-                        let projection = project_delegation_sub_run_started(ev.metadata.as_ref());
-                        (
-                            projection
-                                .run_id
-                                .unwrap_or_else(|| format!("delegate-{seq}")),
-                            projection.agent_type,
-                            projection.task.map(|s| truncate_label(&s, 120)),
-                        )
-                    }
-                    _ => unreachable!(),
-                };
-                let label = agent_type
+            JournalEventType::DelegationSubRunStarted => {
+                let projection = project_delegation_sub_run_started(ev.metadata.as_ref());
+                let run_id = projection.sub_run_id;
+                if run_id.trim().is_empty() || by_run_id.contains_key(&run_id) {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                let agent_id = (projection.agent_id != "?").then_some(projection.agent_id);
+                let label = agent_id
                     .clone()
-                    .unwrap_or_else(|| format!("delegate#{seq}"));
+                    .unwrap_or_else(|| format!("delegate#{}", nodes.len() + 1));
+                let metadata = ev.metadata.as_ref();
+                let parent_run_id = metadata
+                    .and_then(|m| m.get("parent_run_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned);
+                let delegation_id = metadata
+                    .and_then(|m| m.get("delegation_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned);
+                let depth = metadata
+                    .and_then(|m| m.get("depth"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 let node = DelegationNode {
                     id: run_id.clone(),
                     label,
                     started_at: Some(ev.ts.clone()),
                     ended_at: None,
                     model: ev.model.clone(),
-                    agent_type,
-                    task,
+                    agent_id,
+                    parent_run_id,
+                    retry_of: projection.retry_of,
+                    observed_round_input: None,
+                    observed_round_output: None,
                     prompt_tokens: 0,
                     prompt_tokens_complete: false,
                     completion_tokens: 0,
@@ -226,94 +238,150 @@ pub(crate) fn fold_events_into_tree(
                     tool_calls: 0,
                     tool_calls_complete: false,
                     children: Vec::new(),
+                    unattached: Vec::new(),
                 };
-                match by_run_id.entry(run_id) {
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        skipped = skipped.saturating_add(1);
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        root.children.push(node);
-                        e.insert(root.children.len() - 1);
-                    }
-                }
+                by_run_id.insert(run_id, nodes.len());
+                nodes.push((node, delegation_id, depth));
             }
             JournalEventType::DelegationSubRunCompleted => {
-                let run_id = project_delegation_sub_run_completed(ev.metadata.as_ref()).run_id;
-                let Some(rid) = run_id else {
-                    // Completed event without a run_id — we can't
-                    // attach to any specific child. Count and move on.
+                let projection = project_delegation_sub_run_completed(ev.metadata.as_ref());
+                let Some(&idx) = by_run_id.get(&projection.sub_run_id) else {
                     skipped = skipped.saturating_add(1);
                     continue;
                 };
-                let Some(&idx) = by_run_id.get(&rid) else {
+                let (node, delegation, _) = &mut nodes[idx];
+                let completed_delegation = ev
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("delegation_id"))
+                    .and_then(serde_json::Value::as_str);
+                if node.ended_at.is_some()
+                    || node.agent_id.as_deref() != Some(projection.agent_id.as_str())
+                    || delegation.as_deref().is_none()
+                    || delegation.as_deref() != completed_delegation
+                {
                     skipped = skipped.saturating_add(1);
                     continue;
-                };
-                let child = &mut root.children[idx];
-                if child.ended_at.is_some() {
-                    skipped = skipped.saturating_add(1);
-                    continue;
                 }
-                child.ended_at = Some(ev.ts.clone());
-                child.prompt_tokens_complete = ev.tokens_in.is_some();
-                child.completion_tokens_complete = ev.tokens_out.is_some();
-                child.tool_calls_complete = ev.tool_count.is_some();
-                if let Some(p) = ev.tokens_in {
-                    child.prompt_tokens = child.prompt_tokens.saturating_add(p);
-                }
-                if let Some(c) = ev.tokens_out {
-                    child.completion_tokens = child.completion_tokens.saturating_add(c);
-                }
-                if let Some(t) = ev.tool_count {
-                    child.tool_calls = child.tool_calls.saturating_add(t);
-                }
+                node.ended_at = Some(ev.ts.clone());
             }
-            _ => { /* ignore: irrelevant for the tree view */ }
+            _ => {}
         }
     }
 
-    // Snapshot root's own tokens before roll-up.
-    root.self_prompt_tokens = root.prompt_tokens;
-    root.self_completion_tokens = root.completion_tokens;
-
-    // Roll-up aggregation into the root for a quick summary.
-    for child in &root.children {
-        root.prompt_tokens = root.prompt_tokens.saturating_add(child.prompt_tokens);
-        root.completion_tokens = root
-            .completion_tokens
-            .saturating_add(child.completion_tokens);
-        root.tool_calls = root.tool_calls.saturating_add(child.tool_calls);
-        root.prompt_tokens_complete &= child.prompt_tokens_complete;
-        root.completion_tokens_complete &= child.completion_tokens_complete;
-        root.tool_calls_complete &= child.tool_calls_complete;
-    }
-    // A child producer without a completed delegation contributes to neither
-    // the root's terminal totals nor any child aggregate in this view.
-    let unaccounted_child = events.iter().any(|event| {
-        journal_digest::is_child_producer(event)
-            && matches!(
-                event.event_type,
-                JournalEventType::LlmRound | JournalEventType::Turn | JournalEventType::TurnError
-            )
-            && journal_digest::producer_run_id(event)
-                .and_then(|run_id| by_run_id.get(run_id))
-                .is_none_or(|&index| root.children[index].ended_at.is_none())
+    // Child LLM rounds are observations, not terminal accounting. A delegated
+    // completion does not report usage, so no child total can be certified.
+    let mut has_child_observation = events.iter().any(|event| {
+        matches!(
+            event.event_type,
+            JournalEventType::DelegationStarted | JournalEventType::DelegationSubRunCompleted
+        )
     });
-    if skipped > 0 || unaccounted_child {
+    for event in events
+        .iter()
+        .filter(|event| journal_digest::is_child_producer(event))
+    {
+        if !matches!(
+            event.event_type,
+            JournalEventType::LlmRound
+                | JournalEventType::ToolCallError
+                | JournalEventType::Turn
+                | JournalEventType::TurnError
+        ) {
+            continue;
+        }
+        has_child_observation = true;
+        let Some(&idx) = journal_digest::producer_run_id(event).and_then(|id| by_run_id.get(id))
+        else {
+            continue;
+        };
+        let node = &mut nodes[idx].0;
+        if node.model.is_none() {
+            node.model.clone_from(&event.model);
+        }
+        if event.event_type == JournalEventType::LlmRound {
+            if let Some(value) = event.tokens_in {
+                let total = node.observed_round_input.get_or_insert(0);
+                *total = total.saturating_add(value);
+            }
+            if let Some(value) = event.tokens_out {
+                let total = node.observed_round_output.get_or_insert(0);
+                *total = total.saturating_add(value);
+            }
+        }
+    }
+
+    // Depth belongs to the producer contract. Enforce increasing depth and a
+    // bound when rendering a damaged journal so cycles cannot recurse forever.
+    const MAX_RENDER_DEPTH: u64 = 64;
+    let mut children = vec![Vec::new(); nodes.len()];
+    let mut root_indices = Vec::new();
+    let mut unattached = Vec::new();
+    for (idx, (node, _, depth)) in nodes.iter().enumerate() {
+        if *depth == 1
+            && node
+                .parent_run_id
+                .as_deref()
+                .is_some_and(|id| !by_run_id.contains_key(id))
+        {
+            root_indices.push(idx);
+        } else if *depth > 1
+            && *depth <= MAX_RENDER_DEPTH
+            && let Some(&parent) = node
+                .parent_run_id
+                .as_deref()
+                .and_then(|id| by_run_id.get(id))
+            && nodes[parent].2.checked_add(1) == Some(*depth)
+        {
+            children[parent].push(idx);
+        } else {
+            skipped = skipped.saturating_add(1);
+            unattached.push(idx);
+        }
+    }
+    fn take_tree(
+        idx: usize,
+        nodes: &mut [Option<DelegationNode>],
+        children: &[Vec<usize>],
+    ) -> DelegationNode {
+        let mut node = nodes[idx].take().expect("each sub-run has one parent");
+        node.children = children[idx]
+            .iter()
+            .map(|&child| take_tree(child, nodes, children))
+            .collect();
+        node
+    }
+    let mut nodes: Vec<_> = nodes.into_iter().map(|(node, _, _)| Some(node)).collect();
+    root.children = root_indices
+        .into_iter()
+        .map(|idx| take_tree(idx, &mut nodes, &children))
+        .collect();
+    root.unattached = unattached
+        .into_iter()
+        .map(|idx| take_tree(idx, &mut nodes, &children))
+        .collect();
+    if !root.children.is_empty()
+        || !root.unattached.is_empty()
+        || has_child_observation
+        || skipped > 0
+    {
         root.prompt_tokens_complete = false;
         root.completion_tokens_complete = false;
         root.tool_calls_complete = false;
     }
-
     (root, events.len() as u32, skipped)
 }
-
-use crate::cli::effects::truncate_label;
 
 /// Render the tree as ASCII art into a String.
 pub fn render_text(root: &DelegationNode) -> String {
     let mut out = String::new();
     render_node_text(root, "", true, &mut out, true);
+    if !root.unattached.is_empty() {
+        out.push_str("unattached sub-runs (parent not established):\n");
+        for (i, node) in root.unattached.iter().enumerate() {
+            render_node_text(node, "", i + 1 == root.unattached.len(), &mut out, false);
+        }
+    }
     out
 }
 
@@ -344,11 +412,22 @@ fn render_node_text(
         ));
         let extra_prefix = if is_last { "    " } else { "│   " };
         let child_prefix = format!("{prefix}{extra_prefix}");
-        if let Some(a) = node.agent_type.as_deref() {
-            out.push_str(&format!("{child_prefix}agent_type={a}\n"));
+        if let Some(a) = node.agent_id.as_deref() {
+            out.push_str(&format!("{child_prefix}agent_id={a}\n"));
         }
-        if let Some(t) = node.task.as_deref() {
-            out.push_str(&format!("{child_prefix}task=\"{t}\"\n"));
+        if let Some(parent) = node.parent_run_id.as_deref() {
+            out.push_str(&format!("{child_prefix}parent_run_id={parent}\n"));
+        }
+        if node.observed_round_input.is_some() || node.observed_round_output.is_some() {
+            let input = node
+                .observed_round_input
+                .map_or_else(|| "?".to_owned(), |value| value.to_string());
+            let output = node
+                .observed_round_output
+                .map_or_else(|| "?".to_owned(), |value| value.to_string());
+            out.push_str(&format!(
+                "{child_prefix}observed_round_tokens={input}/{output} (unqualified)\n"
+            ));
         }
         if let Some(s) = node.started_at.as_deref()
             && let Some(e) = node.ended_at.as_deref()
@@ -374,12 +453,15 @@ pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
         args.session_id.as_deref(),
         args.session.as_deref(),
     )?;
-    let (root, total, skipped) = build_tree(&session_id)?;
+    let (root, total, skipped, source_errors) = build_tree(&session_id)?;
     let format = args.format.trim().to_ascii_lowercase();
     match format.as_str() {
         "" | "text" | "txt" => {
             let rendered = render_text(&root);
             stdout_print!("{rendered}");
+            for error in &source_errors {
+                eprintln!("[journal tree] source unavailable: {error}");
+            }
             if skipped > 0 {
                 eprintln!(
                     "[journal tree] note: skipped {skipped}/{total} events (unattachable SubRunCompleted, etc.)"
@@ -389,10 +471,11 @@ pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
         }
         "json" => {
             let body = serde_json::json!({
-                "schema_version": "astra-journal-tree-v1",
+                "schema_version": "astra-journal-tree-v2",
                 "session_id": session_id,
                 "total_events": total,
                 "skipped_events": skipped,
+                "source_errors": source_errors,
                 "root": root,
             });
             stdout_println!(
@@ -426,38 +509,99 @@ mod tests {
         serde_json::from_value(raw).expect("valid turn event")
     }
 
-    fn sub_started(ts: &str, run_id: &str, agent_type: &str, task: &str) -> JournalEvent {
-        let raw = json!({
-            "type": "delegation_sub_run_started",
-            "ts": ts,
-            "session_id": "sess-1",
-            "model": "sonnet",
-            "metadata": {
-                "run_id": run_id,
-                "agent_type": agent_type,
-                "task": task,
-            }
-        });
-        serde_json::from_value(raw).expect("valid sub-run start")
+    fn sub_started(ts: &str, run_id: &str, agent_id: &str) -> JournalEvent {
+        let mut event = JournalEvent::delegation_sub_run_started(
+            Some("sess-1"),
+            "delegation",
+            run_id,
+            "root-run",
+            agent_id,
+            "running",
+            1,
+            None,
+        );
+        event.ts = ts.to_owned();
+        event
     }
 
-    fn sub_completed(
+    fn sub_completed(ts: &str, run_id: &str) -> JournalEvent {
+        let mut event = JournalEvent::delegation_sub_run_completed(
+            Some("sess-1"),
+            "delegation",
+            run_id,
+            match run_id {
+                "run-A" | "run-DUP" => "coder",
+                "run-B" => "reviewer",
+                _ => "worker",
+            },
+            "completed",
+            None,
+            None,
+        );
+        event.ts = ts.to_owned();
+        event
+    }
+
+    fn child_round(
         ts: &str,
         run_id: &str,
+        agent_id: &str,
         prompt: u64,
         completion: u64,
-        tools: u32,
     ) -> JournalEvent {
-        let raw = json!({
-            "type": "delegation_sub_run_completed",
-            "ts": ts,
-            "session_id": "sess-1",
-            "tokens_in": prompt,
-            "tokens_out": completion,
-            "tool_count": tools,
-            "metadata": { "run_id": run_id },
+        use astra_services::session_journal::{LlmRoundRecord, TurnEventBuffer};
+        let mut buffer = TurnEventBuffer::begin_producer_turn(Some("sess-1"), 7);
+        buffer.record_llm_round(LlmRoundRecord {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            run_id: Some(run_id.into()),
+            parent_run_id: Some("root-run".into()),
+            agent_id: Some(agent_id.into()),
+            ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
         });
-        serde_json::from_value(raw).expect("valid sub-run complete")
+        let mut event = buffer.drain().pop().unwrap();
+        event.ts = ts.to_owned();
+        event
+    }
+
+    #[test]
+    fn real_delegation_group_and_round_do_not_invent_child_or_qualified_usage() {
+        let mut root_turn = turn_event("t0", 100, 10, "sonnet");
+        root_turn.tool_count = Some(0);
+        let mut group = JournalEvent::delegation_started(
+            Some("sess-1"),
+            "delegation",
+            "root-run",
+            "parallel",
+            &["worker".into()],
+        );
+        group.ts = "t1".into();
+        let mut started = JournalEvent::delegation_sub_run_started(
+            Some("sess-1"),
+            "delegation",
+            "child-run",
+            "root-run",
+            "worker",
+            "running",
+            1,
+            None,
+        );
+        started.ts = "t2".into();
+        let round = child_round("t3", "child-run", "worker", 20, 2);
+        assert_eq!(round.turn, None);
+        assert_eq!(round.producer_scope.as_ref().unwrap().local_turn, Some(7));
+        let completed = sub_completed("t5", "child-run");
+        let events = vec![root_turn.clone(), group, started, round, completed];
+        let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(skipped, 0);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].observed_round_input, Some(20));
+        assert_eq!(root.children[0].observed_round_output, Some(2));
+        assert_eq!(root.children[0].prompt_tokens, 0);
+        assert!(!root.children[0].prompt_tokens_complete);
+        assert_eq!(root.prompt_tokens, 100);
+        assert!(!root.prompt_tokens_complete);
+        assert!(render_text(&root).contains("observed_round_tokens=20/2 (unqualified)"));
     }
 
     #[test]
@@ -488,27 +632,21 @@ mod tests {
         failed.tool_count = Some(9);
         failed.producer_scope =
             Some(serde_json::from_value(json!({"run_id":"root-run", "agent_id":"root"})).unwrap());
-        let mut child = failed.clone();
-        child.tool_count = Some(4);
-        child.producer_scope = Some(
-            serde_json::from_value(json!({
-                "run_id":"run-A", "parent_run_id":"root-run", "agent_id":"worker"
-            }))
-            .unwrap(),
-        );
+        let child = child_round("t3", "run-A", "coder", 20, 2);
         let events = vec![
             round,
             turn,
             failed,
-            sub_started("t3", "run-A", "coder", "task"),
+            sub_started("t3", "run-A", "coder"),
             child,
-            sub_completed("t4", "run-A", 50, 5, 4),
+            sub_completed("t4", "run-A"),
         ];
         let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
         assert_eq!(skipped, 0);
-        assert_eq!(root.tool_calls, 554);
-        assert_eq!(root.children[0].tool_calls, 4);
-        assert!(render_text(&root).contains("tool_calls=partial(554)\n"));
+        assert_eq!(root.tool_calls, 550);
+        assert_eq!(root.children[0].tool_calls, 0);
+        assert!(!root.children[0].tool_calls_complete);
+        assert!(render_text(&root).contains("tool_calls=partial(550)\n"));
     }
 
     #[test]
@@ -531,15 +669,16 @@ mod tests {
             "sess-1",
             &[
                 turn,
-                sub_started("t2", "run-A", "coder", "task"),
+                sub_started("t2", "run-A", "coder"),
                 child,
-                sub_completed("t3", "run-A", 20, 2, 1),
+                sub_completed("t3", "run-A"),
             ],
         );
-        assert!(root.prompt_tokens_complete);
-        assert!(root.completion_tokens_complete);
-        assert!(root.tool_calls_complete);
-        assert_eq!(root.prompt_tokens, 120);
+        assert!(!root.prompt_tokens_complete);
+        assert!(!root.completion_tokens_complete);
+        assert!(!root.tool_calls_complete);
+        assert_eq!(root.prompt_tokens, 100);
+        assert_eq!(root.children[0].observed_round_input, Some(100));
     }
 
     #[test]
@@ -561,8 +700,8 @@ mod tests {
         let events = vec![
             turn,
             second_turn,
-            sub_started("t2", "run-A", "coder", "task"),
-            sub_completed("t3", "run-A", 0, 0, 1),
+            sub_started("t2", "run-A", "coder"),
+            sub_completed("t3", "run-A"),
         ];
         let (root, _, _) = fold_events_into_tree("sess-1", &events);
         assert_eq!(root.tool_calls, u32::MAX);
@@ -572,34 +711,104 @@ mod tests {
     fn tree_attaches_sub_runs_by_run_id() {
         let events = vec![
             turn_event("2026-04-30T10:00:00Z", 1000, 100, "sonnet"),
-            sub_started("2026-04-30T10:00:01Z", "run-A", "coder", "refactor X"),
-            sub_started("2026-04-30T10:00:02Z", "run-B", "reviewer", "review X"),
-            sub_completed("2026-04-30T10:00:10Z", "run-A", 2000, 300, 4),
-            sub_completed("2026-04-30T10:00:12Z", "run-B", 500, 100, 1),
+            sub_started("2026-04-30T10:00:01Z", "run-A", "coder"),
+            sub_started("2026-04-30T10:00:02Z", "run-B", "reviewer"),
+            child_round("2026-04-30T10:00:09Z", "run-A", "coder", 2000, 300),
+            child_round("2026-04-30T10:00:11Z", "run-B", "reviewer", 500, 100),
+            sub_completed("2026-04-30T10:00:10Z", "run-A"),
+            sub_completed("2026-04-30T10:00:12Z", "run-B"),
         ];
         let (root, _total, skipped) = fold_events_into_tree("sess-1", &events);
         assert_eq!(skipped, 0);
         assert_eq!(root.children.len(), 2);
         let a = root.children.iter().find(|n| n.id == "run-A").unwrap();
         assert_eq!(a.label, "coder");
-        assert_eq!(a.prompt_tokens, 2000);
-        assert_eq!(a.completion_tokens, 300);
-        assert_eq!(a.tool_calls, 4);
-        assert_eq!(a.task.as_deref(), Some("refactor X"));
+        assert_eq!(a.observed_round_input, Some(2000));
+        assert_eq!(a.observed_round_output, Some(300));
+        assert!(!a.tool_calls_complete);
+        assert_eq!(a.agent_id.as_deref(), Some("coder"));
         assert_eq!(a.ended_at.as_deref(), Some("2026-04-30T10:00:10Z"));
         let b = root.children.iter().find(|n| n.id == "run-B").unwrap();
         assert_eq!(b.label, "reviewer");
-        // Root roll-up includes both children's tokens + root's own turn.
-        assert_eq!(root.prompt_tokens, 1000 + 2000 + 500);
-        assert_eq!(root.completion_tokens, 100 + 300 + 100);
-        assert_eq!(root.tool_calls, 4 + 1);
+        // Child rounds are observations, not qualified terminal usage.
+        assert_eq!(root.prompt_tokens, 1000);
+        assert_eq!(root.completion_tokens, 100);
+        assert!(!root.prompt_tokens_complete);
+    }
+
+    #[test]
+    fn nested_and_unattached_subruns_preserve_parent_and_completion_identity() {
+        let mut nested = JournalEvent::delegation_sub_run_started(
+            Some("sess-1"),
+            "nested",
+            "run-nested",
+            "run-A",
+            "worker",
+            "running",
+            2,
+            None,
+        );
+        nested.ts = "t3".into();
+        let wrong_completion = JournalEvent::delegation_sub_run_completed(
+            Some("sess-1"),
+            "wrong",
+            "run-nested",
+            "worker",
+            "completed",
+            None,
+            None,
+        );
+        let orphan = JournalEvent::delegation_sub_run_started(
+            Some("sess-1"),
+            "other",
+            "orphan",
+            "missing-parent",
+            "worker",
+            "running",
+            2,
+            None,
+        );
+        let events = vec![
+            sub_started("t1", "run-A", "coder"),
+            nested,
+            wrong_completion,
+            orphan,
+        ];
+        let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(skipped, 2);
+        assert_eq!(root.children[0].children[0].id, "run-nested");
+        assert_eq!(root.children[0].children[0].ended_at, None);
+        assert_eq!(root.unattached[0].id, "orphan");
+        assert!(render_text(&root).contains("unattached sub-runs"));
+    }
+
+    #[test]
+    fn completion_without_start_keeps_inclusive_coverage_unknown() {
+        let mut turn = turn_event("t1", 100, 10, "root");
+        turn.tool_count = Some(0);
+        let events = vec![turn, sub_completed("t2", "child-run")];
+        let (tree, _, _) = fold_events_into_tree("sess-1", &events);
+        assert!(!tree.prompt_tokens_complete);
+        assert!(!tree.tool_calls_complete);
+        let diff = crate::cli::journal_diff::diff_events("sess-1", "other", &events, &[]);
+        assert!(!diff.a_tool_sequence_complete);
+    }
+
+    #[test]
+    fn child_round_cannot_set_root_model_or_timestamps() {
+        let mut child = child_round("t0", "run-A", "coder", 20, 2);
+        child.model = Some("child-model".into());
+        let root_turn = turn_event("t1", 100, 10, "root-model");
+        let (root, _, _) = fold_events_into_tree("sess-1", &[child, root_turn]);
+        assert_eq!(root.started_at.as_deref(), Some("t1"));
+        assert_eq!(root.model.as_deref(), Some("root-model"));
     }
 
     #[test]
     fn tree_counts_skipped_for_unattachable_completions() {
         let events = vec![
             // Completed without a started — can't attach.
-            sub_completed("2026-04-30T10:00:10Z", "run-ghost", 500, 100, 1),
+            sub_completed("2026-04-30T10:00:10Z", "run-ghost"),
             // Completed with no run_id at all in metadata.
             {
                 let raw = json!({
@@ -621,33 +830,30 @@ mod tests {
     fn render_text_includes_ascii_connectors_and_child_labels() {
         let events = vec![
             turn_event("2026-04-30T10:00:00Z", 100, 10, "sonnet"),
-            sub_started("2026-04-30T10:00:01Z", "run-A", "coder", "refactor"),
-            sub_completed("2026-04-30T10:00:10Z", "run-A", 200, 30, 2),
+            sub_started("2026-04-30T10:00:01Z", "run-A", "coder"),
+            sub_completed("2026-04-30T10:00:10Z", "run-A"),
         ];
         let (root, _, _) = fold_events_into_tree("sess-1", &events);
         let txt = render_text(&root);
         assert!(txt.contains("root [sess-1]"));
         assert!(txt.contains("└── coder"));
-        assert!(txt.contains("agent_type=coder"));
-        assert!(txt.contains("task=\"refactor\""));
+        assert!(txt.contains("agent_id=coder"));
         assert!(txt.contains("started=2026-04-30T10:00:01Z ended=2026-04-30T10:00:10Z"));
     }
 
     #[test]
     fn tree_root_exposes_self_tokens_separate_from_total() {
-        // Root accumulates its own Turn tokens AND rolls up children.
-        // Consumers need to distinguish "root's own work" from "total
-        // including delegation". self_prompt_tokens / self_completion_tokens
-        // must reflect ONLY the root's Turn/LlmRound events.
+        // Child round telemetry cannot be added to terminal accounting.
         let events = vec![
             turn_event("t1", 1000, 100, "sonnet"),
-            sub_started("t2", "run-A", "coder", "task"),
-            sub_completed("t3", "run-A", 2000, 300, 4),
+            sub_started("t2", "run-A", "coder"),
+            child_round("t3", "run-A", "coder", 2000, 300),
+            sub_completed("t3", "run-A"),
         ];
         let (root, _, _) = fold_events_into_tree("sess-1", &events);
-        // Total = root own + children
-        assert_eq!(root.prompt_tokens, 3000, "total prompt = 1000 + 2000");
-        assert_eq!(root.completion_tokens, 400, "total completion = 100 + 300");
+        assert_eq!(root.prompt_tokens, 1000);
+        assert_eq!(root.completion_tokens, 100);
+        assert!(!root.prompt_tokens_complete);
         // Self = root own only
         assert_eq!(
             root.self_prompt_tokens, 1000,
@@ -666,9 +872,9 @@ mod tests {
         // Instead, increment skipped so the operator notices the
         // journal anomaly.
         let events = vec![
-            sub_started("t1", "run-DUP", "coder", "first task"),
-            sub_started("t2", "run-DUP", "reviewer", "second task"),
-            sub_completed("t3", "run-DUP", 100, 10, 1),
+            sub_started("t1", "run-DUP", "coder"),
+            sub_started("t2", "run-DUP", "reviewer"),
+            sub_completed("t3", "run-DUP"),
         ];
         let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
         assert!(
@@ -687,10 +893,10 @@ mod tests {
     #[test]
     fn render_text_emits_two_children_with_branch_and_last_connectors() {
         let events = vec![
-            sub_started("t1", "run-A", "coder", "task1"),
-            sub_started("t2", "run-B", "reviewer", "task2"),
-            sub_completed("t3", "run-A", 100, 10, 1),
-            sub_completed("t4", "run-B", 50, 5, 0),
+            sub_started("t1", "run-A", "coder"),
+            sub_started("t2", "run-B", "reviewer"),
+            sub_completed("t3", "run-A"),
+            sub_completed("t4", "run-B"),
         ];
         let (root, _, _) = fold_events_into_tree("sess-1", &events);
         let txt = render_text(&root);

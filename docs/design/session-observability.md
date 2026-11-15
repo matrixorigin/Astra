@@ -106,14 +106,15 @@ Progress should be derived from durable events:
 - stream cursor advanced.
 
 The explicit CLI `journal digest` reads the complete authorized profile and
-attached account journals. Terminal turn usage is the qualified accounting
-source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
+attached account journals. Terminal usage is decoded by the same accounting
+validation as event ingestion; contradictory witnesses cannot certify totals.
+Terminal turn usage is the qualified accounting source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;
-neither round replays nor child terminals add to those buckets. Tree still
-rolls separately attributed child completions into its inclusive root total.
-Tree's `tool_calls` likewise sums known root terminal execution counts and
-attributed child completions. An explicit terminal zero is authoritative;
-round mirrors and child terminals do not add to the root's own count. Missing
+neither round replays nor child completions add to those buckets. Delegation
+completion does not carry qualified usage or execution totals, so tree reports
+the root subtotal and marks inclusive child coverage incomplete. An explicit
+root terminal zero is authoritative for the root; it does not establish child
+usage or executions. Missing
 scalars contribute no known executions. Digest's outcome counts may also include
 rejected or reused requests, so they need not equal tree's execution count.
 Diff's `prompt` and `completion` are fresh input and output; its `total`
@@ -136,6 +137,16 @@ observed ring-buffer loss and interrupted flushes per authorized source before
 filtering supplemental events. A missing loss marker does not prove complete
 coverage. Interruption records include the run and producing layer when known;
 older unscoped records remain unattributed.
+Delegation-group events are not sub-runs. Child model-round token observations
+are reported separately from qualified terminal totals; neither they nor
+model-returned tool requests establish billing or tool execution. Digest tool
+totals carry their own coverage, and an unavailable supplemental journal is
+reported without discarding valid local evidence. Replayed terminal records are
+counted once; contradictory terminals for an attempt are excluded. A scalar
+execution count does not establish success, failure, or cache outcomes.
+Incomplete outcome totals report observed semantic records, not inferred
+success or failure from a partial transport summary. Tree
+output uses `astra-journal-tree-v2`, with unresolved parents shown separately.
 
 `journal diff` reports known executed tool calls from terminal `tool_count`,
 with unowned per-call execution evidence retained separately. Its ordered tool
@@ -151,16 +162,17 @@ identify invocations. Missing or malformed optional identity preserves the
 observation without proving replay. A reused turn number, a sole surviving
 call-ID witness or an identical unscoped payload does not establish ownership.
 Unscoped rounds and errors remain separate observations, as do contradictory
-execution facts. Incomplete totals combine terminal aggregates with retained
-unproven evidence and may overcount overlapping or replayed observations; they
-are not an exact physical invocation count. Unidentified executed terminal detail
+execution facts. Incomplete totals use the strongest independently supported
+lower bound from terminal reports or distinct invocation identities; overlapping
+observations are not added as if they were independent. Unidentified executed terminal detail
 cannot establish that an external observation is additional coverage; matching
 the aggregate numerically does not resolve that possible overlap.
 When canonical invocation identity establishes duplicate observations, round-internal call
 order takes precedence over a standalone error's persistence position.
 An executed canonical invocation shared by separately counted terminal buckets,
 or by an orphan observation and a terminal bucket, prevents completeness.
-Aggregate evidence totals and retained observations are not discarded.
+Terminal counts and retained observations remain available without adding
+potentially overlapping evidence as distinct executions.
 Invocation identity alone does not supply a missing canonical position. When
 relocation crosses terminal detail without a comparable position and reverses
 terminal-relative order, ordering is incomplete even if all identities are known.
