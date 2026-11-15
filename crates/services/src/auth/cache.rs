@@ -2,22 +2,25 @@
 //! replay admission and fresh reauthentication never enter this cache.
 
 use super::{AuthPrincipal, AuthPrincipalOrigin};
+use lru::LruCache;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 const TTL: Duration = Duration::from_secs(30);
-const MAX_ENTRIES: usize = 1_024;
-const MAX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENTRIES: usize = 16_384;
+const MAX_SESSION_INVALIDATIONS: usize = 1_024;
+const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
-// Reserve entry and session-fence buckets, including allocations retained
-// after invalidation. Churn can retain four buckets per live entry.
-const CONTAINER_BYTES: usize = MAX_ENTRIES
-    * 4
-    * (std::mem::size_of::<([u8; 32], Entry)>() + std::mem::size_of::<([u8; 32], u64)>() + 128);
+// Conservatively reserve for LRU nodes, hash buckets, session fences and
+// retained allocations after churn, plus the temporary invalidation keys.
+// This is an accounting budget, not a bound on allocator overhead or RSS.
+const CONTAINER_BYTES: usize = MAX_ENTRIES * 4 * (std::mem::size_of::<([u8; 32], Entry)>() + 128)
+    + MAX_SESSION_INVALIDATIONS * 4 * (std::mem::size_of::<([u8; 32], u64)>() + 16);
 
 struct Entry {
     principal: AuthPrincipal,
@@ -32,13 +35,24 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
 struct State {
     generation: u64,
     global_invalidation: u64,
     session_invalidations: HashMap<[u8; 32], u64>,
     bytes: usize,
-    entries: HashMap<[u8; 32], Entry>,
+    entries: LruCache<[u8; 32], Entry>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            global_invalidation: 0,
+            session_invalidations: HashMap::new(),
+            bytes: 0,
+            entries: LruCache::sparse(NonZeroUsize::new(MAX_ENTRIES).unwrap()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -62,17 +76,19 @@ impl AuthenticationCache {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fresh = state
-            .entries
-            .get(key)
-            .is_some_and(|entry| entry.is_fresh(Instant::now(), chrono::Utc::now().timestamp()));
-        if !fresh && let Some(expired) = state.entries.remove(key) {
-            state.bytes -= expired.bytes;
-        }
-        (
-            state.entries.get(key).map(|entry| entry.principal.clone()),
-            state.generation,
-        )
+        let principal = match state.entries.get(key) {
+            Some(entry) if entry.is_fresh(Instant::now(), chrono::Utc::now().timestamp()) => {
+                Some(entry.principal.clone())
+            }
+            Some(_) => {
+                if let Some(expired) = state.entries.pop(key) {
+                    state.bytes -= expired.bytes;
+                }
+                None
+            }
+            None => None,
+        };
+        (principal, state.generation)
     }
 
     /// Retention is independent of the caller's successful authentication
@@ -106,32 +122,24 @@ impl AuthenticationCache {
             return false;
         }
         let bytes = principal_bytes(principal);
-        if bytes > MAX_ENTRY_BYTES {
+        if bytes > MAX_ENTRY_BYTES || CONTAINER_BYTES.saturating_add(bytes) > MAX_BYTES {
             return false;
         }
-        if let Some(previous) = state.entries.remove(&key) {
+        if let Some(previous) = state.entries.pop(&key) {
             state.bytes -= previous.bytes;
         }
-        state
-            .entries
-            .retain(|_, entry| entry.is_fresh(now, now_unix));
-        state.bytes = state.entries.values().map(|entry| entry.bytes).sum();
         while state.entries.len() >= MAX_ENTRIES
-            || CONTAINER_BYTES + state.bytes + bytes > MAX_BYTES
+            || CONTAINER_BYTES
+                .saturating_add(state.bytes)
+                .saturating_add(bytes)
+                > MAX_BYTES
         {
-            let oldest = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(key, _)| *key)
-                .expect("bounded cache has an eviction candidate");
-            state.bytes -= state
-                .entries
-                .remove(&oldest)
-                .expect("selected cache entry")
-                .bytes;
+            let Some((_, evicted)) = state.entries.pop_lru() else {
+                return false;
+            };
+            state.bytes -= evicted.bytes;
         }
-        state.entries.insert(
+        state.entries.push(
             key,
             Entry {
                 principal: principal.clone(),
@@ -155,18 +163,27 @@ impl AuthenticationCache {
             // Bound the fence metadata. On overflow, fence all older fills
             // before discarding their session-specific invalidations.
             if !state.session_invalidations.contains_key(&key)
-                && state.session_invalidations.len() >= MAX_ENTRIES
+                && state.session_invalidations.len() >= MAX_SESSION_INVALIDATIONS
             {
                 state.global_invalidation = state.generation;
                 state.session_invalidations.clear();
             }
             let generation = state.generation;
             state.session_invalidations.insert(key, generation);
-            state.entries.retain(|_, entry| {
-                entry.principal.user.user_id != user_id
-                    || entry.principal.session_id.as_deref() != Some(session_id)
-            });
-            state.bytes = state.entries.values().map(|entry| entry.bytes).sum();
+            let keys: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.principal.user.user_id == user_id
+                        && entry.principal.session_id.as_deref() == Some(session_id)
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            for key in keys {
+                if let Some(entry) = state.entries.pop(&key) {
+                    state.bytes -= entry.bytes;
+                }
+            }
         } else {
             state.global_invalidation = state.generation;
             state.session_invalidations.clear();
@@ -215,20 +232,20 @@ impl Drop for InvalidateOnDrop {
 fn principal_bytes(principal: &AuthPrincipal) -> usize {
     let user = &principal.user;
     let mut bytes = std::mem::size_of::<Entry>()
-        + user.user_id.len()
-        + user.username.len()
-        + user.email.len()
-        + user.display_name.as_ref().map_or(0, String::len)
-        + principal.session_id.as_ref().map_or(0, String::len);
+        + user.user_id.capacity()
+        + user.username.capacity()
+        + user.email.capacity()
+        + user.display_name.as_ref().map_or(0, String::capacity)
+        + principal.session_id.as_ref().map_or(0, String::capacity);
     if let Some(grant) = &principal.execution_continuation {
-        bytes += grant.user_id.len() + grant.session_id.len();
+        bytes += grant.user_id.capacity() + grant.session_id.capacity();
     }
     if let AuthPrincipalOrigin::VerifiedProvider {
         provider_id,
         external_subject,
     } = &principal.origin
     {
-        bytes += provider_id.len() + external_subject.len();
+        bytes += provider_id.capacity() + external_subject.capacity();
     }
     bytes
 }
@@ -259,7 +276,17 @@ mod tests {
         assert!(cache.publish(key, generation, started, expires, &principal()));
         for _ in 0..3 {
             assert!(cache.lookup(&key).0.is_some());
-            assert_eq!(cache.0.lock().unwrap().entries[&key].checked_at, started);
+            assert_eq!(
+                cache
+                    .0
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .peek(&key)
+                    .unwrap()
+                    .checked_at,
+                started
+            );
         }
         assert!(
             cache
@@ -279,9 +306,67 @@ mod tests {
     }
 
     #[test]
+    fn ten_thousand_distinct_sessions_remain_warm() {
+        let cache = AuthenticationCache::default();
+        let now = Instant::now();
+        let expires = chrono::Utc::now().timestamp() + 60;
+        let mut value = principal();
+        for index in 0..10_000 {
+            value.user.user_id = format!("user-{index}");
+            value.session_id = Some(format!("session-{index}"));
+            let key = AuthenticationCache::key(&format!("token-{index}"));
+            assert!(cache.publish(key, 0, now, expires, &value));
+        }
+        for index in 0..10_000 {
+            let key = AuthenticationCache::key(&format!("token-{index}"));
+            assert_eq!(
+                cache.lookup(&key).0.unwrap().user.user_id,
+                format!("user-{index}"),
+                "a different user's authentication cannot displace the working set"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_the_least_recent_observation() {
+        let cache = AuthenticationCache::default();
+        let now = Instant::now();
+        let expires = chrono::Utc::now().timestamp() + 60;
+        let value = principal();
+        for index in 0..MAX_ENTRIES {
+            let key = AuthenticationCache::key(&format!("token-{index}"));
+            assert!(cache.publish(key, 0, now, expires, &value));
+        }
+        let first = AuthenticationCache::key("token-0");
+        let second = AuthenticationCache::key("token-1");
+        assert!(cache.lookup(&first).0.is_some());
+        assert!(cache.publish(
+            AuthenticationCache::key("overflow"),
+            0,
+            now,
+            expires,
+            &value
+        ));
+        assert!(cache.lookup(&first).0.is_some());
+        assert!(cache.lookup(&second).0.is_none());
+
+        // An LRU hit must never extend the original authentication deadline.
+        cache
+            .0
+            .lock()
+            .unwrap()
+            .entries
+            .peek_mut(&first)
+            .unwrap()
+            .checked_at = now - TTL;
+        assert!(cache.lookup(&first).0.is_none());
+    }
+
+    #[test]
     fn session_invalidation_preserves_other_sessions_and_fences_inflight_fills() {
         let cache = Arc::new(AuthenticationCache::default());
         let first_key = AuthenticationCache::key("first");
+        let first_extra_key = AuthenticationCache::key("first-extra-token");
         let second_key = AuthenticationCache::key("second");
         let other_key = AuthenticationCache::key("other");
         let other_fill = AuthenticationCache::key("other-cold-fill");
@@ -295,13 +380,31 @@ mod tests {
         let expires = chrono::Utc::now().timestamp() + 60;
         for (key, value) in [
             (first_key, &first),
+            (first_extra_key, &first),
             (second_key, &second),
             (other_key, &other),
         ] {
             assert!(cache.publish(key, 0, now, expires, value));
         }
+        let mut replacement = first.clone();
+        replacement.user.display_name = Some("replacement".repeat(128));
+        assert!(cache.publish(first_key, 0, now, expires, &replacement));
+        assert_eq!(cache.lookup(&first_key).0, Some(replacement));
+        {
+            let state = cache.0.lock().unwrap();
+            assert_eq!(
+                state.bytes,
+                state
+                    .entries
+                    .iter()
+                    .map(|(_, entry)| entry.bytes)
+                    .sum::<usize>()
+            );
+        }
+
         let mutation = cache.session_mutation("owner", "first-session");
         assert!(cache.lookup(&first_key).0.is_none());
+        assert!(cache.lookup(&first_extra_key).0.is_none());
         assert_eq!(cache.lookup(&second_key).0, Some(second.clone()));
         assert_eq!(cache.lookup(&other_key).0, Some(other.clone()));
         assert!(!cache.publish(first_key, 0, now, expires, &first));
@@ -324,11 +427,11 @@ mod tests {
         let cache = Arc::new(AuthenticationCache::default());
         let now = Instant::now();
         let expires = chrono::Utc::now().timestamp() + 60;
-        for index in 0..=MAX_ENTRIES {
+        for index in 0..=MAX_SESSION_INVALIDATIONS {
             drop(cache.session_mutation("owner", &format!("session-{index}")));
         }
         let state = cache.0.lock().unwrap();
-        assert!(state.session_invalidations.len() <= MAX_ENTRIES);
+        assert!(state.session_invalidations.len() <= MAX_SESSION_INVALIDATIONS);
         assert!(state.global_invalidation > 0);
         drop(state);
         let key = AuthenticationCache::key("unrelated");
@@ -346,7 +449,7 @@ mod tests {
             value.user.display_name = Some("x".repeat(content_bytes));
             // Exercise actual remove/insert churn under both the entry and byte
             // limits, rather than checking the accounting formula against itself.
-            for index in 0..8 * MAX_ENTRIES {
+            for index in 0..2 * MAX_ENTRIES {
                 assert!(cache.publish(
                     AuthenticationCache::key(&index.to_string()),
                     0,
@@ -366,23 +469,15 @@ mod tests {
                 state.bytes,
                 state
                     .entries
-                    .values()
-                    .map(|entry| entry.bytes)
+                    .iter()
+                    .map(|(_, entry)| entry.bytes)
                     .sum::<usize>()
             );
-            let retained_capacity = state.entries.capacity();
             drop(state);
             drop(cache.mutation());
             let state = cache.0.lock().unwrap();
             assert!(state.entries.is_empty());
             assert_eq!(state.bytes, 0);
-            // clear() removes tombstones but retains the bucket allocation.
-            assert!(state.entries.capacity() >= retained_capacity);
-            assert!(state.entries.capacity() <= 4 * MAX_ENTRIES * 7 / 8);
-            let buckets = (state.entries.capacity() * 8).div_ceil(7);
-            assert!(
-                buckets * (std::mem::size_of::<([u8; 32], Entry)>() + 1) + 16 <= CONTAINER_BYTES
-            );
         }
         let cache = AuthenticationCache::default();
         let mut large = principal();
