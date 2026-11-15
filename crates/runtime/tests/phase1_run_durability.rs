@@ -1192,19 +1192,33 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
             .gate
             .armed
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let backlog = (0..160)
+        // Reach both admission limits with live hinted observations while the
+        // joined responses are held. Root control must remain observable.
+        let same_owner = (0..=4096)
+            .map(|i| (other_user.clone(), format!("same-owner-child-{i}")))
+            .collect::<Vec<_>>();
+        let other_owners = (0..=8192)
             .map(|i| (format!("obs-backlog-{nonce}-{i}"), format!("child-{i}")))
-            .chain((0..160).map(|i| (other_user.clone(), format!("same-owner-child-{i}"))))
             .collect::<Vec<_>>();
         let mut pending = Vec::new();
-        for (owner, run) in &backlog {
-            let mut request = Box::pin(fault_engine.control_observation_with_parent_hint(
-                owner,
-                run,
-                "unused-parent",
-            ));
-            assert!(futures_util::poll!(request.as_mut()).is_pending());
-            pending.push(request);
+        for backlog in [&same_owner, &other_owners] {
+            let mut at_capacity = false;
+            for (owner, run) in backlog {
+                let mut request = Box::pin(fault_engine.control_observation_with_parent_hint(
+                    owner,
+                    run,
+                    "unused-parent",
+                ));
+                match futures_util::poll!(request.as_mut()) {
+                    std::task::Poll::Pending => pending.push(request),
+                    std::task::Poll::Ready(Err(error)) if error.contains("capacity") => {
+                        at_capacity = true;
+                        break;
+                    }
+                    other => panic!("unexpected control admission: {other:?}"),
+                }
+            }
+            assert!(at_capacity, "hinted admission must stay bounded");
         }
         let mut other_observation =
             Box::pin(fault_engine.control_observation(&other_user, &other_root));
@@ -1222,6 +1236,12 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
         assert_eq!(guidance.status, None);
         assert_eq!(guidance.last_guidance_event_idx, Some(guidance_index));
         assert_eq!(guidance.last_event_idx, Some(guidance_index));
+        for batch in &mut children {
+            assert!(
+                futures_util::poll!(batch.as_mut()).is_pending(),
+                "root observations must complete before joined queries time out"
+            );
+        }
         drop(pending);
         for batch in children {
             let failed = tokio::time::timeout(Duration::from_secs(5), batch)

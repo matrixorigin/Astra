@@ -10,7 +10,7 @@ use std::{
 
 use astra_services::runs::{
     RUN_CONTROL_READ_BATCH_SIZE, RUN_CONTROL_READ_MAX_KEY_BYTES, RUN_CONTROL_READ_MIN_PARENT_HINTS,
-    RunControlReadKey, RunControlReadKeyWithParent, RunControlReadResult,
+    RunControlReadKey, RunControlReadKeyWithParent, RunControlReadResult, RunControlReadWithParent,
     RunControlReadWithParentResult, RunStateStore,
 };
 use futures_util::{FutureExt, future::BoxFuture};
@@ -26,6 +26,7 @@ const MAX_JOINED_WORKERS: usize = MAX_WORKERS - 1;
 
 type Read = dyn Fn(
         Vec<RunControlReadKeyWithParent>,
+        bool,
     ) -> BoxFuture<'static, Result<Vec<RunControlReadWithParentResult>, String>>
     + Send
     + Sync;
@@ -217,9 +218,25 @@ impl State {
 impl ControlReads {
     pub(super) fn new(store: Arc<dyn RunStateStore>) -> Arc<Self> {
         Arc::new(Self {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, joined| {
                 let store = store.clone();
-                Box::pin(async move { store.load_run_control_batch_with_parents(&keys).await })
+                Box::pin(async move {
+                    if joined {
+                        store.load_run_control_batch_with_parents(&keys).await
+                    } else {
+                        // A custom store may prefetch even one hint. Plain
+                        // batches must never share that failure domain.
+                        let keys = keys.into_iter().map(|key| key.key).collect::<Vec<_>>();
+                        Ok(store
+                            .load_run_control_batch(&keys)
+                            .await?
+                            .into_iter()
+                            .map(|result| {
+                                result.map(|own| RunControlReadWithParent { own, parent: None })
+                            })
+                            .collect())
+                    }
+                })
             }),
             state: Mutex::new(State::default()),
         })
@@ -245,6 +262,13 @@ impl ControlReads {
             return Err("run control identity exceeds capacity".into());
         }
         let parent_hint = parent_hint.filter(|hint| hint.len() <= RUN_CONTROL_READ_MAX_KEY_BYTES);
+        // Keep one batch of admission capacity for unhinted observations,
+        // including when joined reads have already filled the hinted backlog.
+        let reserve = if parent_hint.is_some() {
+            RUN_CONTROL_READ_BATCH_SIZE
+        } else {
+            0
+        };
         let queued_at = Instant::now();
         let (reply, receiver) = oneshot::channel();
         let start_worker = {
@@ -252,11 +276,11 @@ impl ControlReads {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.outstanding >= MAX_READS
+            if state.outstanding >= MAX_READS - reserve
                 || state
                     .owners
                     .get(user_id)
-                    .is_some_and(|owner| owner.outstanding >= MAX_OWNER_READS)
+                    .is_some_and(|owner| owner.outstanding >= MAX_OWNER_READS - reserve)
             {
                 return Err("run control read queue is at capacity".into());
             }
@@ -350,7 +374,7 @@ impl ControlReads {
             let keys = batch.iter().map(|request| request.key.clone()).collect();
             let outcome = tokio::time::timeout(
                 QUERY_TIMEOUT,
-                AssertUnwindSafe(async { (self.read)(keys).await }).catch_unwind(),
+                AssertUnwindSafe(async { (self.read)(keys, joined).await }).catch_unwind(),
             )
             .await;
             let results = match outcome {
@@ -393,7 +417,6 @@ impl ControlReads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::runs::RunControlReadWithParent;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn empty_results(count: usize) -> Vec<RunControlReadWithParentResult> {
@@ -416,7 +439,7 @@ mod tests {
     ) -> Arc<ControlReads> {
         let read = Arc::new(read);
         Arc::new(ControlReads {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, _joined| {
                 let read = read.clone();
                 Box::pin(async move {
                     let original = keys.into_iter().map(|key| key.key).collect();
@@ -487,7 +510,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, _joined| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
                     Ok(keys
@@ -520,7 +543,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (start, gate, counter) = (entered.clone(), release.clone(), calls.clone());
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, _joined| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let joined = keys.iter().any(|key| key.parent_hint.is_some());
                 let (start, gate) = (start.clone(), gate.clone());
@@ -576,7 +599,7 @@ mod tests {
             let batches = Arc::new(Mutex::new(Vec::new()));
             let seen = batches.clone();
             let reader = Arc::new(ControlReads {
-                read: Arc::new(move |keys| {
+                read: Arc::new(move |keys, _joined| {
                     seen.lock().unwrap().push(
                         keys.iter()
                             .map(|key| (key.key.run_id.clone(), key.parent_hint.is_some()))
@@ -643,7 +666,7 @@ mod tests {
             peak.clone(),
         );
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, _joined| {
                 let (start, gate, ready, in_flight, max_seen) = (
                     start.clone(),
                     gate.clone(),
@@ -715,7 +738,7 @@ mod tests {
             plain_calls.clone(),
         );
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys| {
+            read: Arc::new(move |keys, _joined| {
                 let joined = keys.iter().filter(|key| key.parent_hint.is_some()).count()
                     >= RUN_CONTROL_READ_MIN_PARENT_HINTS;
                 let (started, gate, opened, joined_count, plain_count) = (
@@ -786,9 +809,10 @@ mod tests {
         }
 
         let mut backlog: Vec<BoxFuture<'static, ()>> = Vec::new();
-        for i in 0..320 {
+        let backlog_size = MAX_READS - RUN_CONTROL_READ_BATCH_SIZE - held.len();
+        for i in 0..backlog_size {
             let reader = reader.clone();
-            let owner = if i < 160 {
+            let owner = if i < backlog_size - 160 {
                 format!("owner-{i}")
             } else {
                 "target".into()
@@ -808,7 +832,7 @@ mod tests {
         );
 
         let mut roots: Vec<BoxFuture<'static, ()>> = Vec::new();
-        for i in 0..8 {
+        for i in 0..RUN_CONTROL_READ_BATCH_SIZE {
             let reader = reader.clone();
             let mut request: BoxFuture<'static, ()> = Box::pin(async move {
                 assert!(
@@ -830,6 +854,7 @@ mod tests {
                 );
             }
         }
+        assert!(reader.get("another-owner", "overflow").await.is_err());
         tokio::time::advance(COLLECTION_WINDOW).await;
         tokio::time::timeout(
             Duration::from_millis(100),
@@ -979,6 +1004,68 @@ mod tests {
         let state = reader.state.lock().unwrap();
         assert_eq!((state.outstanding, state.workers), (0, 0));
         assert!(state.owners.is_empty() && state.ready.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hinted_admission_reserves_bounded_unhinted_capacity_and_recovers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let reader = reads(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { panic!("closed observations must not reach SQL") })
+        });
+
+        let long_hint = "x".repeat(RUN_CONTROL_READ_MAX_KEY_BYTES + 1);
+        for (same_owner, limit) in [
+            (true, MAX_OWNER_READS - RUN_CONTROL_READ_BATCH_SIZE),
+            (false, MAX_READS - RUN_CONTROL_READ_BATCH_SIZE),
+        ] {
+            let mut hinted: Vec<BoxFuture<'static, RunControlReadWithParentResult>> = Vec::new();
+            for index in 0..limit {
+                let reader = reader.clone();
+                let owner = if same_owner {
+                    "owner".to_string()
+                } else {
+                    format!("owner-{index}")
+                };
+                let mut request: BoxFuture<'static, RunControlReadWithParentResult> =
+                    Box::pin(async move {
+                        reader
+                            .get_with_parent(&owner, "child", Some("parent"))
+                            .await
+                    });
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                hinted.push(request);
+            }
+            let root_owner = if same_owner { "owner" } else { "root-owner" };
+            assert!(
+                reader
+                    .get_with_parent(root_owner, "overflow", Some("parent"))
+                    .await
+                    .unwrap_err()
+                    .contains("capacity")
+            );
+            let mut unhinted = Vec::new();
+            for index in 0..RUN_CONTROL_READ_BATCH_SIZE {
+                // An oversized hint is filtered before the admission check.
+                let hint = (index == 0).then_some(long_hint.as_str());
+                let mut request = Box::pin(reader.get_with_parent(root_owner, "root", hint));
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                unhinted.push(request);
+            }
+            assert!(reader.get(root_owner, "overflow").await.is_err());
+            assert_eq!(
+                reader.state.lock().unwrap().outstanding,
+                limit + RUN_CONTROL_READ_BATCH_SIZE
+            );
+            drop(unhinted);
+            drop(hinted);
+            tokio::time::sleep(COLLECTION_WINDOW * 2).await;
+            let state = reader.state.lock().unwrap();
+            assert_eq!((state.outstanding, state.workers), (0, 0));
+            assert!(state.owners.is_empty() && state.ready.is_empty());
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

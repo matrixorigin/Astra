@@ -127,13 +127,17 @@ batches retain the indexed ancestor read. When such a batch also contains
 unhinted requests, the existing queue dispatches the two groups independently,
 so a joined-query error does not directly fail an unhinted observation. At most
 three of the four batch workers run joined reads; the remaining worker can
-select unhinted requests even behind hinted backlog. They still share the
-existing admission limits and database pool. Restored requests keep their
-original admission and deadline. The consumer validates durable lineage before
-using a prefetched result, and missing, stale or unsupported hints use the
-existing ancestor path. A failed joined query is
-reported and retried by the existing watcher, without issuing a second query
-for an uncertain outcome. Root-only batches retain their original SQL.
+select unhinted requests even behind hinted backlog. Hinted admissions stop
+one batch below the existing global and per-owner limits, leaving space for
+unhinted work under a hinted backlog. The global space is shared across owners;
+unhinted traffic can still reach the hard limits, and mixed load may reject a
+hinted observation before the hard limits. All observations share the database
+pool. Restored requests keep their original admission and deadline. The
+consumer validates durable lineage before using a prefetched result, and
+missing, stale or unsupported hints use the existing ancestor path. A failed
+joined query is reported and retried by the existing watcher, without issuing
+a second query for an uncertain outcome. Root-only batches retain their
+original SQL.
 
 Direct-child completion waits are a delivery concern, not a new lifecycle
 authority. Local children notify their parent in memory. Remotely owned

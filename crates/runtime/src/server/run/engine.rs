@@ -6946,6 +6946,7 @@ mod tests {
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
         reject_ancestor_reads: bool,
+        fail_eager_parent_prefetch: bool,
         load_user_intent_control_delta_failures: AtomicUsize,
         control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
@@ -6992,6 +6993,70 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn sparse_custom_prefetch_failure_does_not_mask_root_cancellation() {
+        let mut store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
+        store.fail_eager_parent_prefetch = true;
+        let store = Arc::new(store);
+        let engine = RunEngine::new(store.clone());
+        engine.start_run("parent", "user", "session").await.unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user",
+                "session",
+                Some("parent"),
+                Some("delegation"),
+                Some("agent"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine.start_run("root", "other", "session").await.unwrap();
+        assert!(
+            store
+                .inner
+                .request_run_cancellation("other", "root")
+                .await
+                .unwrap()
+        );
+
+        // A custom store may eagerly prefetch on a single hint. Its parent
+        // failure must not affect a coalesced, independently cancelled root.
+        let mut child = Box::pin(engine.check_control_observation_with_parent_hint(
+            "user",
+            "child",
+            Some("parent"),
+        ));
+        let mut root = Box::pin(engine.check_control_observation("other", "root"));
+        assert!(futures_util::poll!(child.as_mut()).is_pending());
+        assert!(futures_util::poll!(root.as_mut()).is_pending());
+        let (child, root) = tokio::join!(child, root);
+        assert_eq!(child.unwrap().status, None);
+        assert_eq!(root.unwrap().status, Some(RunControlStatus::Cancelled));
+
+        // Dense parent-prefetch selections still use the custom override.
+        let mut dense = (0..4)
+            .map(|_| {
+                Box::pin(engine.check_control_observation_with_parent_hint(
+                    "user",
+                    "child",
+                    Some("parent"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for request in &mut dense {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+        }
+        assert!(
+            futures_util::future::join_all(dense)
+                .await
+                .into_iter()
+                .all(|result| result.unwrap_err() == "eager parent failure")
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_store_rejects_both_agent_recovery_entrypoints() {
         let store =
@@ -7022,6 +7087,7 @@ mod tests {
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
                 reject_ancestor_reads: false,
+                fail_eager_parent_prefetch: false,
                 load_user_intent_control_delta_failures: AtomicUsize::new(0),
                 control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
@@ -7213,6 +7279,23 @@ mod tests {
                 }
             }
             Ok(controls)
+        }
+
+        async fn load_run_control_batch_with_parents(
+            &self,
+            keys: &[astra_services::runs::RunControlReadKeyWithParent],
+        ) -> Result<Vec<astra_services::runs::RunControlReadWithParentResult>, String> {
+            use astra_services::runs::RunControlReadWithParent;
+            if self.fail_eager_parent_prefetch && keys.iter().any(|key| key.parent_hint.is_some()) {
+                return Err("eager parent failure".into());
+            }
+            let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
+            Ok(self
+                .load_run_control_batch(&original)
+                .await?
+                .into_iter()
+                .map(|result| result.map(|own| RunControlReadWithParent { own, parent: None }))
+                .collect())
         }
 
         async fn load_latest_terminal_cancellation_origin(
