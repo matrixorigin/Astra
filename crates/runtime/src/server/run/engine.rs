@@ -3466,8 +3466,28 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
-        let read = self.control_reads.get(user_id, run_id).await;
-        let record = match read {
+        self.check_control_observation_with_parent_hint(user_id, run_id, None)
+            .await
+    }
+
+    async fn check_control_observation_with_parent_hint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        parent_hint: Option<&str>,
+    ) -> Result<RunControlObservation, String> {
+        let read =
+            match parent_hint {
+                Some(hint) => {
+                    self.control_reads
+                        .get_with_parent(user_id, run_id, Some(hint))
+                        .await
+                }
+                None => self.control_reads.get(user_id, run_id).await.map(|own| {
+                    astra_services::runs::RunControlReadWithParent { own, parent: None }
+                }),
+            };
+        let read = match read {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record
@@ -3478,9 +3498,10 @@ impl RunEngine {
                 return Err(error);
             }
         };
-        let Some(record) = record else {
+        let Some(record) = read.own else {
             return Ok(RunControlObservation::default());
         };
+        let prefetched_parent = read.parent;
         let mut observation = RunControlObservation {
             status: None,
             last_event_idx: Some(record.last_event_idx),
@@ -3553,7 +3574,14 @@ impl RunEngine {
             }
         };
 
-        let ancestors = self.store.load_run_controls(user_id, &ancestor_ids).await?;
+        let ancestors = match prefetched_parent {
+            Some(parent)
+                if ancestor_ids.len() == 1 && parent_hint == record.parent_run_id.as_deref() =>
+            {
+                parent?.into_iter().collect()
+            }
+            _ => self.store.load_run_controls(user_id, &ancestor_ids).await?,
+        };
         if ancestors.len() != ancestor_ids.len() {
             record_control_poll_error(self.metrics_registry.as_ref(), "status", "missing_ancestor");
             return Err(format!(
@@ -4621,6 +4649,16 @@ impl RunStatusProvider for RunEngine {
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
         self.check_control_observation(user_id, run_id).await
+    }
+
+    async fn control_observation_with_parent_hint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        parent_hint: &str,
+    ) -> Result<RunControlObservation, String> {
+        self.check_control_observation_with_parent_hint(user_id, run_id, Some(parent_hint))
+            .await
     }
 
     async fn cancellation_origin(
@@ -6907,6 +6945,7 @@ mod tests {
         fail_remaining: AtomicUsize,
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
+        reject_ancestor_reads: bool,
         load_user_intent_control_delta_failures: AtomicUsize,
         control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
@@ -6923,6 +6962,34 @@ mod tests {
         lease_releases: AtomicUsize,
         active_lease_releases: AtomicUsize,
         mode: BatchTransitionFailureMode,
+    }
+
+    #[tokio::test]
+    async fn hinted_control_keeps_custom_ancestor_policy() {
+        let mut store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
+        store.reject_ancestor_reads = true;
+        let engine = RunEngine::new(Arc::new(store));
+        engine.start_run("root", "user", "session").await.unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user",
+                "session",
+                Some("root"),
+                Some("delegation"),
+                Some("agent"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_observation_with_parent_hint("user", "child", Some("root"))
+                .await
+                .unwrap_err(),
+            "custom ancestor policy"
+        );
     }
 
     #[tokio::test]
@@ -6954,6 +7021,7 @@ mod tests {
                 fail_remaining: AtomicUsize::new(failures),
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
+                reject_ancestor_reads: false,
                 load_user_intent_control_delta_failures: AtomicUsize::new(0),
                 control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
@@ -7128,6 +7196,23 @@ mod tests {
                 return Err("load failed".into());
             }
             self.inner.load_run_control(user_id, run_id).await
+        }
+
+        async fn load_run_controls(
+            &self,
+            user_id: &str,
+            run_ids: &[String],
+        ) -> Result<Vec<astra_services::runs::DurableRunControlRecord>, String> {
+            if self.reject_ancestor_reads {
+                return Err("custom ancestor policy".into());
+            }
+            let mut controls = Vec::with_capacity(run_ids.len());
+            for run_id in run_ids {
+                if let Some(run) = self.load_run_control(user_id, run_id).await? {
+                    controls.push(run);
+                }
+            }
+            Ok(controls)
         }
 
         async fn load_latest_terminal_cancellation_origin(

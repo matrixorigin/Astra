@@ -29050,6 +29050,7 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .unwrap();
     // Let the task install its lifetime guard before simulating a task failure.
@@ -29082,6 +29083,7 @@ async fn fresh_control_watcher_observes_committed_guidance() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        Some("untrusted-parent".into()),
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -29120,6 +29122,7 @@ async fn active_run_control_watcher_retries_control_failure_without_losing_pause
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        None,
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -29159,6 +29162,7 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29190,6 +29194,17 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let ids = (0..1000)
         .map(|i| format!("{prefix}-{i}"))
         .collect::<Vec<_>>();
+    let run_ids = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            if index % 8 >= 4 {
+                format!("{id}-child")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_sessions (user_id,session_id,status) ",
     );
@@ -29211,6 +29226,27 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(7);
     });
     runs.build().execute(pool.get()).await.unwrap();
+    let children = ids
+        .iter()
+        .zip(&run_ids)
+        .filter(|(root, run)| root != run)
+        .collect::<Vec<_>>();
+    let mut child_runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status,run_generation,last_event_idx) ",
+    );
+    child_runs.push_values(&children, |mut row, (root, child)| {
+        row.push_bind(*root)
+            .push_bind(*root)
+            .push_bind(*child)
+            .push_bind(*root)
+            .push_bind(*root)
+            .push_bind(format!("/{root}/{child}"))
+            .push_bind(1)
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    child_runs.build().execute(pool.get()).await.unwrap();
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let control: Arc<dyn RunControlProvider> = Arc::new(engine);
     // Hot-checkout telemetry excludes newly established physical connections.
@@ -29223,7 +29259,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let before = astra_core::matrixone_pool_telemetry_snapshot();
     let started = Instant::now();
     let mut watchers = Vec::new();
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let cancel = Arc::new(CancellationToken::new());
         let pause = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
@@ -29232,7 +29268,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             Some(control.clone()),
             id.clone(),
             id.clone(),
-            id.clone(),
+            run_ids[index].clone(),
             Some(1),
             Arc::new(AtomicBool::new(false)),
             pause.clone(),
@@ -29240,6 +29276,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             lost.clone(),
             sender,
             tokio::sync::watch::channel(-1).0,
+            (index % 8 >= 4).then(|| id.clone()),
         )
         .unwrap();
         watchers.push((guard, cancel, pause, lost, receiver));
@@ -29260,28 +29297,46 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
     assert!(
         (8..=12).contains(&first_reads),
-        "1000 roots must batch, got {first_reads} checkouts"
+        "1000 roots and children must batch, got {first_reads} checkouts"
     );
     let initial_ms = started.elapsed().as_millis();
 
     // A separate pool represents a different control-plane process. The live
     // observers receive no local notification of these durable changes.
     let independent = SharedPool::new(pool.settings()).await.unwrap();
-    for group in 0..4 {
+    // Update each observed run's input watermark; control changes for a child
+    // are made only on its parent through the independent pool.
+    let mut watermark = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE agent_runs SET last_event_idx=9 WHERE run_id IN (",
+    );
+    {
+        let mut selected = watermark.separated(",");
+        for run in &run_ids {
+            selected.push_bind(run);
+        }
+    }
+    watermark
+        .push(")")
+        .build()
+        .execute(independent.get())
+        .await
+        .unwrap();
+    for group in 0..3 {
         let update = match group {
             0 => "cancellation_requested_at=NOW(6)",
             1 => "run_generation=2",
-            2 => "status='paused',waiting_for='user_pause'",
-            _ => "status='running'",
+            _ => "status='paused',waiting_for='user_pause'",
         };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+            "UPDATE agent_runs SET {update} WHERE run_id IN ("
         ));
         {
             let mut selected = query.separated(",");
             for (index, id) in ids.iter().enumerate() {
                 if index % 4 == group {
-                    selected.push_bind(id);
+                    // Ownership belongs to the observed run; inherited
+                    // cancellation and pause belong to its parent.
+                    selected.push_bind(if group == 1 { &run_ids[index] } else { id });
                 }
             }
         }
@@ -29320,7 +29375,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
         "changed sweep must also batch: {next_reads}"
     );
     println!(
-        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        "control_watchers owners=1000 direct_children=500 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
         changed.elapsed().as_millis()
     );
     drop(watchers);
@@ -29361,6 +29416,7 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29399,6 +29455,7 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 

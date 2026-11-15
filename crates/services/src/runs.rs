@@ -3642,7 +3642,34 @@ pub struct RunControlReadKey {
 }
 
 pub const RUN_CONTROL_READ_BATCH_SIZE: usize = 128;
+pub const RUN_CONTROL_READ_MAX_KEY_BYTES: usize = 512;
 pub type RunControlReadResult = Result<Option<DurableRunControlRecord>, String>;
+
+/// An optional parent is only a bounded lookup hint; durable lineage remains
+/// authoritative and must be validated before using a prefetched parent.
+#[derive(Clone, Debug)]
+pub struct RunControlReadKeyWithParent {
+    pub key: RunControlReadKey,
+    pub parent_hint: Option<String>,
+}
+
+impl RunControlReadKeyWithParent {
+    fn bounded_parent_hint(&self) -> Option<&str> {
+        self.parent_hint
+            .as_deref()
+            .filter(|hint| hint.len() <= RUN_CONTROL_READ_MAX_KEY_BYTES)
+    }
+}
+
+/// A parent of None means no parent was prefetched. Some(Ok(None)) means
+/// the hinted parent was checked and is absent.
+#[derive(Clone, Debug)]
+pub struct RunControlReadWithParent {
+    pub own: Option<DurableRunControlRecord>,
+    pub parent: Option<RunControlReadResult>,
+}
+
+pub type RunControlReadWithParentResult = Result<RunControlReadWithParent, String>;
 
 /// Exact authority required to terminalize a run whose executor is absent.
 ///
@@ -6746,6 +6773,21 @@ pub trait RunStateStore: Send + Sync {
             results.push(self.load_run_control(&key.user_id, &key.run_id).await);
         }
         Ok(results)
+    }
+
+    /// Optional parent prefetch for control observations. Custom stores keep
+    /// their existing batch and ancestor-read semantics by default.
+    async fn load_run_control_batch_with_parents(
+        &self,
+        keys: &[RunControlReadKeyWithParent],
+    ) -> Result<Vec<RunControlReadWithParentResult>, String> {
+        let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
+        Ok(self
+            .load_run_control_batch(&original)
+            .await?
+            .into_iter()
+            .map(|result| result.map(|own| RunControlReadWithParent { own, parent: None }))
+            .collect())
     }
 
     /// Process-local marker admission used by an invocation ledger that shares
@@ -11602,6 +11644,25 @@ const RUN_CONTROL_COLUMNS: &str =
      CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
      CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
           AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live";
+
+// The original projection remains byte-for-byte unchanged for batches without
+// parent hints. Joined batches qualify it and add the same narrow parent data.
+const RUN_CONTROL_JOINED_COLUMNS: &str =
+    "own.run_id AS run_id, own.session_id AS session_id, own.status AS status,
+     own.waiting_for AS waiting_for, own.parent_run_id AS parent_run_id,
+     own.ancestor_path AS ancestor_path, own.run_generation AS run_generation,
+     own.last_event_idx AS last_event_idx, own.last_guidance_event_idx AS last_guidance_event_idx,
+     CAST(own.cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
+     CAST(own.owner_pod_id IS NOT NULL AND own.owner_lease_expires_at IS NOT NULL
+          AND own.owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live,
+     parent.run_id AS hinted_run_id, parent.session_id AS hinted_session_id,
+     parent.status AS hinted_status, parent.waiting_for AS hinted_waiting_for,
+     parent.parent_run_id AS hinted_parent_run_id, parent.ancestor_path AS hinted_ancestor_path,
+     parent.run_generation AS hinted_run_generation, parent.last_event_idx AS hinted_last_event_idx,
+     parent.last_guidance_event_idx AS hinted_last_guidance_event_idx,
+     CAST(parent.cancellation_requested_at IS NOT NULL AS SIGNED) AS hinted_cancellation_requested,
+     CAST(parent.owner_pod_id IS NOT NULL AND parent.owner_lease_expires_at IS NOT NULL
+          AND parent.owner_lease_expires_at >= NOW(6) AS SIGNED) AS hinted_owner_lease_live";
 
 const EXECUTION_OWNER_CANCELLATION_RECEIPT_SELECT_SQL: &str =
     "SELECT events.payload_json, events.event_hash, events.event_idx,
@@ -19379,14 +19440,49 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         keys: &[RunControlReadKey],
     ) -> Result<Vec<RunControlReadResult>, String> {
+        let keys = keys
+            .iter()
+            .cloned()
+            .map(|key| RunControlReadKeyWithParent {
+                key,
+                parent_hint: None,
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .load_run_control_batch_with_parents(&keys)
+            .await?
+            .into_iter()
+            .map(|result| result.map(|result| result.own))
+            .collect())
+    }
+
+    async fn load_run_control_batch_with_parents(
+        &self,
+        keys: &[RunControlReadKeyWithParent],
+    ) -> Result<Vec<RunControlReadWithParentResult>, String> {
         if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
             return Err("run control read batch exceeds capacity".into());
         }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        // A parent join for only one or two children can cost more than the
+        // existing indexed reads. Keep sparse batches on the original path.
+        const MIN_PARENT_HINTS: usize = 4;
+        let has_parents = keys
+            .iter()
+            .filter(|key| key.bounded_parent_hint().is_some())
+            .take(MIN_PARENT_HINTS)
+            .count()
+            == MIN_PARENT_HINTS;
         let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
-        query.push(RUN_CONTROL_COLUMNS).push(" FROM (VALUES ");
+        query
+            .push(if has_parents {
+                RUN_CONTROL_JOINED_COLUMNS
+            } else {
+                RUN_CONTROL_COLUMNS
+            })
+            .push(" FROM (VALUES ");
         for (ordinal, key) in keys.iter().enumerate() {
             if ordinal != 0 {
                 query.push(",");
@@ -19395,25 +19491,45 @@ impl RunStateStore for DatabaseRunStateStore {
                 .push("ROW(")
                 .push(ordinal)
                 .push(",")
-                .push_bind(&key.user_id)
+                .push_bind(&key.key.user_id)
                 .push(",")
-                .push_bind(&key.run_id)
+                .push_bind(&key.key.run_id)
                 .push(")");
         }
-        query.push(
+        query.push(if has_parents {
+            ") requested(ordinal, requested_user_id, requested_run_id)
+             LEFT JOIN agent_runs own ON own.user_id = requested_user_id AND own.run_id = requested_run_id
+             AND own.run_id IN ("
+        } else {
             ") requested(ordinal, requested_user_id, requested_run_id)
              LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id
-             AND run_id IN (",
-        );
+             AND run_id IN ("
+        });
         // Give the database an independently pushable candidate filter. Join
         // equality alone can scan every historical run for each small batch.
         for (ordinal, key) in keys.iter().enumerate() {
             if ordinal != 0 {
                 query.push(",");
             }
-            query.push_bind(&key.run_id);
+            query.push_bind(&key.key.run_id);
         }
         query.push(")");
+        if has_parents {
+            query.push(
+                " LEFT JOIN agent_runs parent
+                  ON parent.user_id = requested_user_id
+                 AND parent.run_id = own.parent_run_id
+                 AND parent.run_id IN (",
+            );
+            let mut hints = query.separated(",");
+            for hint in keys
+                .iter()
+                .filter_map(RunControlReadKeyWithParent::bounded_parent_hint)
+            {
+                hints.push_bind(hint);
+            }
+            query.push(")");
+        }
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| db_error("acquire_run_control_batch", "batch", source).to_string())?;
@@ -19435,13 +19551,34 @@ impl RunStateStore for DatabaseRunStateStore {
             if slot.is_some() {
                 return Err("duplicate run control request ordinal".into());
             }
-            *slot = Some(
-                row.try_get::<Option<String>, _>("run_id")
-                    .map_err(|source| {
-                        db_error("decode_run_control_presence", "batch", source).to_string()
-                    })
-                    .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose()),
-            );
+            let own = row
+                .try_get::<Option<String>, _>("run_id")
+                .map_err(|source| {
+                    db_error("decode_run_control_presence", "batch", source).to_string()
+                })
+                .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose());
+            let parent = if has_parents && keys[ordinal].bounded_parent_hint().is_some() {
+                Some(
+                    row.try_get::<Option<String>, _>("hinted_run_id")
+                        .map_err(|source| {
+                            db_error("decode_run_control_parent_presence", "batch", source)
+                                .to_string()
+                        })
+                        .and_then(|id| {
+                            id.map(|id| {
+                                decode_run_control_row_with_columns(
+                                    &row,
+                                    &id,
+                                    HINTED_CONTROL_ROW_COLUMNS,
+                                )
+                            })
+                            .transpose()
+                        }),
+                )
+            } else {
+                None
+            };
+            *slot = Some(own.map(|own| RunControlReadWithParent { own, parent }));
         }
         let results = results
             .into_iter()
@@ -24553,17 +24690,69 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
     decode_run_record_from_row(&row)
 }
 
+#[derive(Clone, Copy)]
+struct RunControlRowColumns {
+    run_id: &'static str,
+    session_id: &'static str,
+    status: &'static str,
+    waiting_for: &'static str,
+    parent_run_id: &'static str,
+    ancestor_path: &'static str,
+    run_generation: &'static str,
+    last_event_idx: &'static str,
+    last_guidance_event_idx: &'static str,
+    cancellation_requested: &'static str,
+    owner_lease_live: &'static str,
+}
+
+const CONTROL_ROW_COLUMNS: RunControlRowColumns = RunControlRowColumns {
+    run_id: "run_id",
+    session_id: "session_id",
+    status: "status",
+    waiting_for: "waiting_for",
+    parent_run_id: "parent_run_id",
+    ancestor_path: "ancestor_path",
+    run_generation: "run_generation",
+    last_event_idx: "last_event_idx",
+    last_guidance_event_idx: "last_guidance_event_idx",
+    cancellation_requested: "cancellation_requested",
+    owner_lease_live: "owner_lease_live",
+};
+
+const HINTED_CONTROL_ROW_COLUMNS: RunControlRowColumns = RunControlRowColumns {
+    run_id: "hinted_run_id",
+    session_id: "hinted_session_id",
+    status: "hinted_status",
+    waiting_for: "hinted_waiting_for",
+    parent_run_id: "hinted_parent_run_id",
+    ancestor_path: "hinted_ancestor_path",
+    run_generation: "hinted_run_generation",
+    last_event_idx: "hinted_last_event_idx",
+    last_guidance_event_idx: "hinted_last_guidance_event_idx",
+    cancellation_requested: "hinted_cancellation_requested",
+    owner_lease_live: "hinted_owner_lease_live",
+};
+
 fn decode_run_control_row(
     row: &sqlx::mysql::MySqlRow,
     entity: &str,
 ) -> Result<DurableRunControlRecord, String> {
+    decode_run_control_row_with_columns(row, entity, CONTROL_ROW_COLUMNS)
+}
+
+fn decode_run_control_row_with_columns(
+    row: &sqlx::mysql::MySqlRow,
+    entity: &str,
+    columns: RunControlRowColumns,
+) -> Result<DurableRunControlRecord, String> {
     let last_event_idx: i64 = row
-        .try_get("last_event_idx")
+        .try_get(columns.last_event_idx)
         .map_err(|source| db_error("decode_run_control_event_index", entity, source).to_string())?;
     let last_guidance_event_idx: i64 =
-        row.try_get("last_guidance_event_idx").map_err(|source| {
-            db_error("decode_run_control_guidance_index", entity, source).to_string()
-        })?;
+        row.try_get(columns.last_guidance_event_idx)
+            .map_err(|source| {
+                db_error("decode_run_control_guidance_index", entity, source).to_string()
+            })?;
     if last_guidance_event_idx < -1
         || last_guidance_event_idx == 0
         || last_guidance_event_idx > last_event_idx
@@ -24572,34 +24761,37 @@ fn decode_run_control_row(
     }
     Ok(DurableRunControlRecord {
         run_id: row
-            .try_get("run_id")
+            .try_get(columns.run_id)
             .map_err(|source| db_error("decode_run_control_run_id", entity, source).to_string())?,
-        session_id: row.try_get("session_id").map_err(|source| {
+        session_id: row.try_get(columns.session_id).map_err(|source| {
             db_error("decode_run_control_session_id", entity, source).to_string()
         })?,
         status: row
-            .try_get("status")
+            .try_get(columns.status)
             .map_err(|source| db_error("decode_run_control_status", entity, source).to_string())?,
-        waiting_for: row.try_get("waiting_for").map_err(|source| {
+        waiting_for: row.try_get(columns.waiting_for).map_err(|source| {
             db_error("decode_run_control_waiting_for", entity, source).to_string()
         })?,
         parent_run_id: row
-            .try_get("parent_run_id")
+            .try_get(columns.parent_run_id)
             .map_err(|source| db_error("decode_run_control_parent", entity, source).to_string())?,
-        ancestor_path: row.try_get("ancestor_path").map_err(|source| {
+        ancestor_path: row.try_get(columns.ancestor_path).map_err(|source| {
             db_error("decode_run_control_ancestor_path", entity, source).to_string()
         })?,
-        cancellation_requested: row.try_get::<i64, _>("cancellation_requested").map_err(
-            |source| db_error("decode_run_control_cancellation", entity, source).to_string(),
-        )? != 0,
-        run_generation: u64::try_from(row.try_get::<i64, _>("run_generation").map_err(
+        cancellation_requested: row
+            .try_get::<i64, _>(columns.cancellation_requested)
+            .map_err(|source| {
+                db_error("decode_run_control_cancellation", entity, source).to_string()
+            })?
+            != 0,
+        run_generation: u64::try_from(row.try_get::<i64, _>(columns.run_generation).map_err(
             |source| db_error("decode_run_control_generation", entity, source).to_string(),
         )?)
         .map_err(|_| format!("negative run generation in control row for {entity}"))?,
         last_event_idx,
         last_guidance_event_idx,
         owner_lease_live: row
-            .try_get::<i64, _>("owner_lease_live")
+            .try_get::<i64, _>(columns.owner_lease_live)
             .map_err(|source| {
                 db_error("decode_run_control_owner_lease", entity, source).to_string()
             })?

@@ -987,3 +987,160 @@ async fn durable_reads_hide_corrupt_storage() {
     }
 }
 }
+
+async fn hinted_statuses(
+    engine: &RunEngine,
+    user: &str,
+    run: &str,
+    hint: &str,
+) -> Vec<Result<Option<astra_runtime::turn::run_control::RunControlStatus>, String>> {
+    use astra_runtime::turn::run_control::RunStatusProvider;
+    futures_util::future::join_all((0..4).map(|_| async {
+        engine
+            .control_observation_with_parent_hint(user, run, hint)
+            .await
+            .map(|observation| observation.status)
+    }))
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "isolated MatrixOne control semantics"]
+async fn control_observation_sees_fresh_cross_engine_parent_changes() {
+    use astra_runtime::turn::run_control::RunControlStatus;
+    use astra_services::runs::RunStatusCasRequest;
+
+    let observer_pool = setup_pool().await;
+    let writer_pool = astra_core::SharedPool::new(observer_pool.settings())
+        .await
+        .unwrap();
+    let observer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(observer_pool.clone())));
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(writer_pool.clone())));
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let user = format!("obs-qa-u-{nonce}");
+    let session = format!("obs-qa-s-{nonce}");
+    let root = format!("obs-qa-r-{nonce}");
+    let child = format!("obs-qa-c-{nonce}");
+    let grandchild = format!("obs-qa-g-{nonce}");
+    insert_session(&writer_pool, &user, &session).await;
+    let _root_owner = writer.start_run(&root, &user, &session).await.unwrap();
+    let _child_owner = writer
+        .start_run_ext(
+            &child,
+            &user,
+            &session,
+            Some(&root),
+            Some("qa-child"),
+            Some("qa-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+    let _grandchild_owner = writer
+        .start_run_ext(
+            &grandchild,
+            &user,
+            &session,
+            Some(&child),
+            Some("qa-grandchild"),
+            Some("qa-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    assert_eq!(
+        observer
+            .check_control_status("different-owner", &child)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !writer
+            .request_run_cancellation("different-owner", &root)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &user,
+                expected_session_id: &session,
+                run_id: &root,
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+        }
+    }
+    for result in hinted_statuses(&observer, &user, &child, "stale-parent").await {
+        assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+    }
+    for result in hinted_statuses(&observer, &user, &child, &"x".repeat(513)).await {
+        assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+    }
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &user,
+                expected_session_id: &session,
+                run_id: &root,
+                status: "running",
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["paused"],
+            })
+            .await
+            .unwrap()
+    );
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    assert!(writer.request_run_cancellation(&user, &root).await.unwrap());
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+        }
+    }
+    sqlx::query("DELETE FROM agent_runs WHERE user_id=? AND run_id=?")
+        .bind(&user)
+        .bind(&root)
+        .execute(writer_pool.get())
+        .await
+        .unwrap();
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert!(result.is_err(), "missing ancestor must fail closed");
+        }
+    }
+    for table in [
+        "agent_run_events",
+        "agent_run_openings",
+        "agent_runs",
+        "agent_session_lifecycle_fences",
+        "agent_sessions",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE user_id=?");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&user)
+            .execute(writer_pool.get())
+            .await
+            .unwrap();
+    }
+    writer_pool.close().await;
+}

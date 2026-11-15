@@ -9,7 +9,9 @@ use std::{
 };
 
 use astra_services::runs::{
-    RUN_CONTROL_READ_BATCH_SIZE, RunControlReadKey, RunControlReadResult, RunStateStore,
+    RUN_CONTROL_READ_BATCH_SIZE, RUN_CONTROL_READ_MAX_KEY_BYTES, RunControlReadKey,
+    RunControlReadKeyWithParent, RunControlReadResult, RunControlReadWithParentResult,
+    RunStateStore,
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::{sync::oneshot, time::Instant};
@@ -21,7 +23,9 @@ const MAX_READS: usize = 8192;
 const MAX_OWNER_READS: usize = 4096;
 const MAX_WORKERS: usize = 4;
 
-type Read = dyn Fn(Vec<RunControlReadKey>) -> BoxFuture<'static, Result<Vec<RunControlReadResult>, String>>
+type Read = dyn Fn(
+        Vec<RunControlReadKeyWithParent>,
+    ) -> BoxFuture<'static, Result<Vec<RunControlReadWithParentResult>, String>>
     + Send
     + Sync;
 
@@ -46,9 +50,9 @@ struct Owner {
 }
 
 struct Request {
-    key: RunControlReadKey,
+    key: RunControlReadKeyWithParent,
     collect_at: Instant,
-    reply: oneshot::Sender<RunControlReadResult>,
+    reply: oneshot::Sender<RunControlReadWithParentResult>,
 }
 
 impl State {
@@ -90,16 +94,29 @@ impl ControlReads {
         Arc::new(Self {
             read: Arc::new(move |keys| {
                 let store = store.clone();
-                Box::pin(async move { store.load_run_control_batch(&keys).await })
+                Box::pin(async move { store.load_run_control_batch_with_parents(&keys).await })
             }),
             state: Mutex::new(State::default()),
         })
     }
 
     pub(super) async fn get(self: &Arc<Self>, user_id: &str, run_id: &str) -> RunControlReadResult {
+        self.get_with_parent(user_id, run_id, None)
+            .await
+            .map(|result| result.own)
+    }
+
+    pub(super) async fn get_with_parent(
+        self: &Arc<Self>,
+        user_id: &str,
+        run_id: &str,
+        parent_hint: Option<&str>,
+    ) -> RunControlReadWithParentResult {
         // Bound retained key bytes as well as callers. These limits exceed
         // the canonical VARCHAR identity capacities, including UTF-8 bytes.
-        if user_id.len() > 512 || run_id.len() > 512 {
+        if user_id.len() > RUN_CONTROL_READ_MAX_KEY_BYTES
+            || run_id.len() > RUN_CONTROL_READ_MAX_KEY_BYTES
+        {
             return Err("run control identity exceeds capacity".into());
         }
         let queued_at = Instant::now();
@@ -121,9 +138,14 @@ impl ControlReads {
             let was_empty = owner.pending.is_empty();
             owner.outstanding += 1;
             owner.pending.push_back(Request {
-                key: RunControlReadKey {
-                    user_id: user_id.into(),
-                    run_id: run_id.into(),
+                key: RunControlReadKeyWithParent {
+                    key: RunControlReadKey {
+                        user_id: user_id.into(),
+                        run_id: run_id.into(),
+                    },
+                    parent_hint: parent_hint
+                        .filter(|hint| hint.len() <= RUN_CONTROL_READ_MAX_KEY_BYTES)
+                        .map(str::to_owned),
                 },
                 collect_at: queued_at + COLLECTION_WINDOW,
                 reply,
@@ -211,7 +233,7 @@ impl ControlReads {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for request in &batch {
-                    state.release(&request.key.user_id);
+                    state.release(&request.key.key.user_id);
                 }
             }
             match results {
@@ -233,6 +255,7 @@ impl ControlReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::runs::RunControlReadWithParent;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn reads(
@@ -243,8 +266,21 @@ mod tests {
         + Sync
         + 'static,
     ) -> Arc<ControlReads> {
+        let read = Arc::new(read);
         Arc::new(ControlReads {
-            read: Arc::new(read),
+            read: Arc::new(move |keys| {
+                let read = read.clone();
+                Box::pin(async move {
+                    let original = keys.into_iter().map(|key| key.key).collect();
+                    Ok(read(original)
+                        .await?
+                        .into_iter()
+                        .map(|result| {
+                            result.map(|own| RunControlReadWithParent { own, parent: None })
+                        })
+                        .collect())
+                })
+            }),
             state: Mutex::new(State::default()),
         })
     }
@@ -296,6 +332,37 @@ mod tests {
         let state = reader.state.lock().unwrap();
         assert_eq!((state.outstanding, state.workers), (0, 0));
         assert!(state.owners.is_empty() && state.ready.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parent_hints_are_scoped_to_each_request_and_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| {
+                            Ok(RunControlReadWithParent {
+                                own: None,
+                                parent: key.parent_hint.map(Err),
+                            })
+                        })
+                        .collect())
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let oversized = "x".repeat(RUN_CONTROL_READ_MAX_KEY_BYTES + 1);
+        let (first, second) = tokio::join!(
+            reader.get_with_parent("owner-a", "run-a", Some("parent-a")),
+            reader.get_with_parent("owner-b", "run-b", Some(&oversized)),
+        );
+        assert_eq!(first.unwrap().parent.unwrap().unwrap_err(), "parent-a");
+        assert!(second.unwrap().parent.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
