@@ -1163,6 +1163,10 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
         .get("root_tool_totals_complete")
         .and_then(|v| v.as_bool())
         .expect("validated coverage");
+    let counts_complete = a
+        .get("root_tool_counts_complete")
+        .and_then(|v| v.as_bool())
+        .expect("validated count coverage");
     let tool_total = |key: &str| {
         let value = get_u(key);
         if tools_complete {
@@ -1176,7 +1180,7 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             get_u("attempt_count"),
             get_u("turn_count"),
             get_u("turn_error_count"),
-            tool_total("reported_root_tool_calls"),
+            if counts_complete { get_u("reported_root_tool_calls").to_string() } else { "?".to_owned() },
             tool_total("reported_root_tool_failures"),
             get_u("error_event_count"),
             get_u("compact_count"),
@@ -1654,7 +1658,7 @@ mod tests {
                     "attempt_count": 3,
                     "turn_count": 3,
                     "turn_error_count": 0,
-                    "reported_root_tool_calls": 5, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "reported_root_tool_calls": 5, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
                     "reported_root_tool_failures": 1,
                     "error_event_count": 0,
                     "compact_count": 0,
@@ -1716,7 +1720,7 @@ mod tests {
                     "attempt_count": 2,
                     "turn_count": 1,
                     "turn_error_count": 1,
-                    "reported_root_tool_calls": 14, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "reported_root_tool_calls": 14, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
                     "reported_root_tool_failures": 2,
                     "error_event_count": 0,
                     "compact_count": 0,
@@ -1756,6 +1760,7 @@ mod tests {
             out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
         );
         let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["root_tool_counts_complete"] = false.into();
         digest["aggregates"]["root_tool_totals_complete"] = false.into();
         digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
         let partial = render(&r, Format::Text, false);

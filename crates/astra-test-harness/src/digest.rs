@@ -124,12 +124,14 @@ pub(crate) fn validate_digest_json(
             ));
         }
     }
-    if aggregates
-        .get("root_tool_totals_complete")
-        .and_then(serde_json::Value::as_bool)
-        .is_none()
-    {
-        return Err("digest aggregates is missing boolean root_tool_totals_complete".into());
+    for key in ["root_tool_counts_complete", "root_tool_totals_complete"] {
+        if aggregates
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        {
+            return Err(format!("digest aggregates is missing boolean {key}"));
+        }
     }
     for key in [
         "avg_tokens_in",
@@ -144,7 +146,7 @@ pub(crate) fn validate_digest_json(
         if raw.is_null()
             && matches!(
                 key,
-                "avg_tokens_in" | "avg_tokens_out" | "avg_tool_calls_per_round"
+                "avg_tokens_in" | "avg_tokens_out" | "avg_llm_rounds" | "avg_tool_calls_per_round"
             )
         {
             continue;
@@ -338,7 +340,7 @@ mod tests {
                 "compact_count": 0, "stall_count": 0, "error_event_count": 0,
                 "session_start_count": 1, "session_end_count": 1,
                 "total_tokens_in": 10, "total_tokens_out": 5, "total_duration_ms": 20,
-                "reported_root_tool_calls": 1, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0, "subrun_count": 0,
+                "reported_root_tool_calls": 1, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0, "subrun_count": 0,
                 "subrun_total_tokens_in": 0, "subrun_total_tokens_out": 0,
                 "subrun_total_duration_ms": 0, "observed_child_tool_requests": 0,
                 "inclusive_total_tokens_in": 10, "inclusive_total_tokens_out": 5,
@@ -357,6 +359,7 @@ mod tests {
         assert!(validate_digest_json(&digest, "session").is_ok());
         digest["aggregates"]["avg_tokens_in"] = serde_json::Value::Null;
         digest["aggregates"]["avg_tokens_out"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_llm_rounds"] = serde_json::Value::Null;
         assert!(validate_digest_json(&digest, "session").is_ok());
         digest["aggregates"]["avg_tokens_in"] = serde_json::json!(-1);
         assert!(validate_digest_json(&digest, "session").is_err());

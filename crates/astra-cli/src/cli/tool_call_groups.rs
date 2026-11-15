@@ -1,5 +1,6 @@
-use crate::cli::journal_digest::is_effective_failure;
+use crate::cli::journal_digest::semantic_outcome;
 use astra_services::session_journal::ToolCallRecord;
+use astra_turn_core::tool_result_semantics::ToolResultEvidence;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallGroup<'a> {
@@ -10,22 +11,16 @@ pub(crate) struct ToolCallGroup<'a> {
 }
 
 impl ToolCallGroup<'_> {
-    pub(crate) fn ok_count(&self) -> usize {
-        self.calls
-            .iter()
-            .filter(|c| !c.outcome_is_unknown() && !is_effective_failure(c))
-            .count()
-    }
-
-    pub(crate) fn fail_count(&self) -> usize {
-        self.calls
-            .iter()
-            .filter(|c| is_effective_failure(c))
-            .count()
-    }
-
-    pub(crate) fn unknown_count(&self) -> usize {
-        self.calls.iter().filter(|c| c.outcome_is_unknown()).count()
+    pub(crate) fn outcome_counts(&self) -> (usize, usize, usize) {
+        let (mut ok, mut fail, mut unknown) = (0, 0, 0);
+        for call in &self.calls {
+            match semantic_outcome(call) {
+                ToolResultEvidence::Succeeded => ok += 1,
+                ToolResultEvidence::Failed => fail += 1,
+                ToolResultEvidence::Unknown => unknown += 1,
+            }
+        }
+        (ok, fail, unknown)
     }
 }
 
@@ -105,20 +100,15 @@ mod tests {
     fn unknown_outcomes_are_not_counted_as_success_or_failure() {
         let mut success = make_call("read_file");
         success.batch_id = Some("batch".into());
+        success.result_full = Some(r#"{"ok":true}"#.into());
+        success.output_bytes = Some(success.result_full.as_ref().unwrap().len() as u32);
         let mut unknown = make_call("bash");
         unknown.batch_id = Some("batch".into());
         unknown.ok = false;
         unknown.disposition = Some(astra_services::session_journal::ToolCallDisposition::Unknown);
         let calls = [success, unknown];
         let groups = group_tool_calls(&calls);
-        assert_eq!(
-            (
-                groups[0].ok_count(),
-                groups[0].fail_count(),
-                groups[0].unknown_count()
-            ),
-            (1, 0, 1)
-        );
+        assert_eq!(groups[0].outcome_counts(), (1, 0, 1));
     }
 
     #[test]

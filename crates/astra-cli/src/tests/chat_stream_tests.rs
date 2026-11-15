@@ -449,9 +449,17 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .unwrap();
             let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
                 .unwrap();
-            let executed = if unexecuted_child { 1 } else { 2 };
-            assert_eq!(diff.a_tool_calls_executed, executed);
-            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
+            let observed_executions = if unexecuted_child { 1 } else { 2 };
+            // These callback observations have no canonical invocation identity.
+            // Preserve each in the sequence without asserting that they prove
+            // distinct executions beyond the confirmed lower bound.
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.invocation_identity.is_none())
+            );
+            assert_eq!(diff.a_tool_calls_executed, 1);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; observed_executions]);
             assert!(!diff.a_tool_sequence_complete);
             let digest = crate::cli::journal_digest::build_digest(
                 "partial-session",
@@ -503,10 +511,14 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 digest.aggregates.reported_root_tool_calls,
                 u64::from(root_callbacks)
             );
+            // A delivered plain-text body is retained, but does not prove a
+            // semantic success without an explicit result contract.
+            assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 0);
             assert_eq!(
-                digest.aggregates.reported_root_fresh_tool_calls,
+                digest.aggregates.reported_root_tool_outcomes_unknown,
                 u64::from(root_callbacks)
             );
+            assert!(!digest.aggregates.root_tool_totals_complete);
             continue;
         }
         let result = result.unwrap();

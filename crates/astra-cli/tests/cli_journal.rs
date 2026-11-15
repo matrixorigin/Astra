@@ -339,3 +339,169 @@ fn unqualified_failure_usage_never_becomes_a_complete_total() {
         );
     }
 }
+
+#[test]
+fn digest_reports_only_observed_semantics_and_complete_round_averages() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "679d8c97-5509-4b30-bca6-c1fe0c013614";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let parse = || {
+        let output = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "all"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let outcomes = json!({"requested":1,"executed":1,"succeeded":1,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
+    let long_failure = format!(
+        "{{\"description\":\"{}\",\"status\":\"failed\"}}",
+        "x".repeat(450)
+    );
+    let success = r#"{"ok":true}"#;
+    for (body, preview, complete, failures) in [
+        (
+            Some(long_failure.as_str()),
+            Some(&long_failure[..500.min(long_failure.len())]),
+            true,
+            1,
+        ),
+        (None, Some(&long_failure[..100]), false, 0),
+        (Some("<redacted: len=11 sha=abc>"), None, false, 0),
+        (Some(success), Some(success), true, 0),
+    ] {
+        let mut record = json!({"name":"bash","ok":true,"ms":1,"output_bytes":body.map_or(long_failure.len(), str::len)});
+        if let Some(body) = body {
+            record["result_full"] = json!(body);
+        }
+        if let Some(preview) = preview {
+            record["result_preview"] = json!(preview);
+        }
+        let event = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+            "tool_count":1,"tool_calls":[record],"tool_outcomes":outcomes,
+            "llm_rounds":1,"tokens_in":1,"tokens_out":1,"cache_read_tokens":0,"cache_creation_tokens":0});
+        std::fs::write(&path, format!("{event}\n")).unwrap();
+        let digest = parse();
+        assert_eq!(digest["aggregates"]["root_tool_totals_complete"], complete);
+        assert_eq!(
+            digest["aggregates"]["reported_root_tool_failures"],
+            failures
+        );
+        let group = &digest["turns"][0]["tool_groups"][0];
+        assert_eq!(group["fail_count"], failures);
+        assert_eq!(group["ok_count"], u32::from(complete && failures == 0));
+        assert_eq!(group["unknown_count"], u32::from(!complete));
+        assert_eq!(digest["aggregates"]["avg_tool_calls_per_round"], 1.0);
+    }
+    let event = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "tool_count":1,"tool_calls":[{"name":"bash","ok":true,"execution_ok":false,"ms":1,
+            "result_full":success,"output_bytes":success.len()}],"tool_outcomes":outcomes,"llm_rounds":1});
+    std::fs::write(&path, format!("{event}\n")).unwrap();
+    assert_eq!(parse()["aggregates"]["reported_root_tool_failures"], 1);
+
+    // A partial record list must not let a transport summary erase observed
+    // semantic uncertainty, on either successful or failed turns.
+    let partial = json!({"name":"bash","ok":true,"ms":1,"result_preview":"{\"status\":",
+        "output_bytes":100});
+    let mut partial_event = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "tool_count":2,"tool_calls":[partial],"tool_outcomes":{"requested":2,"executed":2,
+        "succeeded":2,"failed":0,"started_unknown":0,"unknown":0,"rejected":0,
+        "reused":0,"suppressed":0,"deferred":0},"llm_rounds":1});
+    for kind in ["turn", "turn_error"] {
+        partial_event["type"] = json!(kind);
+        std::fs::write(&path, format!("{partial_event}\n")).unwrap();
+        let digest = parse();
+        assert_eq!(digest["aggregates"]["root_tool_totals_complete"], false);
+        assert_eq!(
+            digest["aggregates"]["reported_root_tool_outcomes_unknown"],
+            1
+        );
+    }
+
+    let guard_failure = format!(
+        "{{\"description\":\"{}\",\"status\":\"failed\",\"error\":\"safety guard blocked command\"}}",
+        "x".repeat(500)
+    );
+    let event = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,"tool_count":1,
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"result_full":guard_failure,
+        "result_preview":&guard_failure[..100],"output_bytes":guard_failure.len()}],
+        "tool_outcomes":outcomes,"llm_rounds":1});
+    std::fs::write(&path, format!("{event}\n")).unwrap();
+    let digest = parse();
+    assert_eq!(digest["aggregates"]["safety_guard_blocks"], 1);
+    assert_eq!(
+        digest["failed_tool_calls"][0]["error_category"],
+        "safety_guard"
+    );
+    assert_eq!(
+        digest["failed_tool_calls"][0]["error_preview"],
+        "safety guard blocked command"
+    );
+
+    let record =
+        json!({"name":"bash","ok":true,"ms":1,"result_full":success,"output_bytes":success.len()});
+    let mut first = json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+        "tool_count":1,"tool_calls":[record],"tool_outcomes":outcomes});
+    let mut second = first.clone();
+    second["type"] = json!("turn");
+    second["turn"] = json!(2);
+    second["ts"] = json!("t2");
+    second["llm_rounds"] = json!(1);
+    std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+    let missing = parse();
+    assert!(missing["aggregates"]["avg_tool_calls_per_round"].is_null());
+    assert!(missing["aggregates"]["avg_llm_rounds"].is_null());
+    first["llm_rounds"] = json!(1);
+    std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+    let known = parse();
+    assert_eq!(known["aggregates"]["avg_tool_calls_per_round"], 1.0);
+    assert_eq!(known["aggregates"]["avg_llm_rounds"], 1.0);
+
+    first["llm_rounds"] = json!(0);
+    std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+    let inconsistent = parse();
+    assert!(inconsistent["aggregates"]["avg_tool_calls_per_round"].is_null());
+    assert!(inconsistent["aggregates"]["avg_llm_rounds"].is_null());
+
+    first["tool_count"] = json!(0);
+    first["tool_calls"] = json!([]);
+    first["tool_outcomes"] = json!({"requested":0,"executed":0,"succeeded":0,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
+    std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+    let zero = parse();
+    assert_eq!(zero["aggregates"]["avg_tool_calls_per_round"], 1.0);
+    assert_eq!(zero["aggregates"]["avg_llm_rounds"], 0.5);
+
+    // Matched round observations contradict a smaller terminal round count.
+    let mut terminal = first.clone();
+    terminal["metadata"] = json!({"run_id":"root-run"});
+    let round = |number| {
+        json!({"type":"llm_round","ts":format!("t{number}"),"session_id":sid,
+        "turn":1,"round":number,"producer_scope":{"run_id":"root-run"}})
+    };
+    for (reported, observed) in [(0, 1), (1, 2), (2, 2)] {
+        terminal["llm_rounds"] = json!(reported);
+        let mut events = (0..observed)
+            .map(|n| format!("{}\n", round(n)))
+            .collect::<String>();
+        events.push_str(&format!("{terminal}\n"));
+        std::fs::write(&path, events).unwrap();
+        let digest = parse();
+        if reported < observed {
+            assert!(digest["aggregates"]["avg_llm_rounds"].is_null());
+            assert!(digest["aggregates"]["avg_tool_calls_per_round"].is_null());
+        } else {
+            assert_eq!(digest["aggregates"]["avg_llm_rounds"], 2.0);
+            assert_eq!(digest["aggregates"]["avg_tool_calls_per_round"], 0.0);
+        }
+    }
+    terminal["llm_rounds"] = json!(1);
+    std::fs::write(&path, format!("{}\n{terminal}\n", round(2))).unwrap();
+    let sparse = parse();
+    assert!(sparse["aggregates"]["avg_llm_rounds"].is_null());
+    assert!(sparse["aggregates"]["avg_tool_calls_per_round"].is_null());
+}

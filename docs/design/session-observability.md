@@ -145,7 +145,11 @@ reported without discarding valid local evidence. Replayed terminal records are
 counted once; contradictory terminals for an attempt are excluded. A scalar
 execution count does not establish success, failure, or cache outcomes.
 Incomplete outcome totals report observed semantic records, not inferred
-success or failure from a partial transport summary. Tree
+success or failure from a partial transport summary. A successful transport
+does not establish semantic success when the retained body is missing,
+truncated, redacted, or lacks an explicit success contract. Tool calls per
+round and average rounds require complete counts for the same root attempts;
+an unavailable count remains unknown. Tree
 output uses `astra-journal-tree-v2`, with unresolved parents shown separately.
 
 `journal diff` reports known executed tool calls from terminal `tool_count`,

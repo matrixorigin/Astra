@@ -162,6 +162,7 @@ pub struct Aggregates {
     pub total_duration_ms: u64,
     /// Sum of terminal reports; incomplete reports may overlap and are not a total.
     pub reported_root_tool_calls: u64,
+    pub root_tool_counts_complete: bool,
     pub root_tool_totals_complete: bool,
     /// Model-returned requests are not evidence that a tool executed.
     pub observed_root_tool_requests: u64,
@@ -189,7 +190,8 @@ pub struct Aggregates {
     /// or pointed back to an already-known result.
     pub reported_root_noop_or_cached_tool_calls: u64,
     pub reported_root_tool_failures: u64,
-    /// Tool responses whose execution outcomes are unknown.
+    /// Observed tool responses whose effective outcomes are unknown (a lower
+    /// bound when not all records were retained).
     pub reported_root_tool_outcomes_unknown: u64,
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
     /// Subset of `reported_root_tool_failures`. Non-zero means the agent hit safety walls.
@@ -198,7 +200,7 @@ pub struct Aggregates {
     pub avg_tokens_out: Option<f64>,
     pub avg_duration_ms: f64,
     /// Average LLM rounds per turn (how many LLM→tool cycles).
-    pub avg_llm_rounds: f64,
+    pub avg_llm_rounds: Option<f64>,
     /// Average tool calls per LLM round.
     pub avg_tool_calls_per_round: Option<f64>,
 }
@@ -447,24 +449,31 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
     };
     let mut stats = ToolCallStats::default();
     for c in calls {
-        if c.outcome_is_unknown() {
-            stats.unknown += 1;
-        } else if is_effective_failure(c) {
-            stats.fail += 1;
-        } else {
-            stats.ok += 1;
-            if c.is_noop_or_cached_result() {
-                stats.noop_or_cached += 1;
-            } else {
-                stats.fresh += 1;
+        match semantic_outcome(c) {
+            astra_turn_core::tool_result_semantics::ToolResultEvidence::Failed => stats.fail += 1,
+            astra_turn_core::tool_result_semantics::ToolResultEvidence::Unknown => {
+                stats.unknown += 1;
+                if c.is_noop_or_cached_result() {
+                    stats.noop_or_cached += 1;
+                }
+            }
+            astra_turn_core::tool_result_semantics::ToolResultEvidence::Succeeded => {
+                stats.ok += 1;
+                if c.is_noop_or_cached_result() {
+                    stats.noop_or_cached += 1;
+                } else {
+                    stats.fresh += 1;
+                }
             }
         }
     }
     stats
 }
 
-fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolCallStats {
-    let record_stats = tool_call_stats(event.tool_calls.as_ref());
+fn authoritative_tool_call_stats(
+    event: &session_journal::JournalEvent,
+    record_stats: ToolCallStats,
+) -> ToolCallStats {
     let record_count = event.tool_calls.as_ref().map_or(0, Vec::len);
     let Some(outcomes) = event
         .tool_outcomes
@@ -512,6 +521,23 @@ fn tool_outcomes_known(event: &session_journal::JournalEvent, stats: ToolCallSta
         }
 }
 
+fn tool_count_known(event: &session_journal::JournalEvent) -> bool {
+    let Some(outcomes) = event
+        .tool_outcomes
+        .as_ref()
+        .filter(|value| value.is_consistent())
+    else {
+        return false;
+    };
+    let calls = event.tool_calls.as_deref().unwrap_or_default();
+    event
+        .tool_count
+        .is_none_or(|count| count == outcomes.executed)
+        && calls.len() <= outcomes.requested as usize
+        && (calls.len() != outcomes.requested as usize
+            || session_journal::ToolOutcomeSummary::from_records(calls) == *outcomes)
+}
+
 /// A terminal aggregate cannot silently absorb an unrelated round/error
 /// observation unless the existing invocation identity proves they match.
 pub(super) fn root_tool_observations_reconciled(events: &[session_journal::JournalEvent]) -> bool {
@@ -556,70 +582,49 @@ pub(super) fn root_tool_observations_reconciled(events: &[session_journal::Journ
     true
 }
 
-/// Treat a tool call as a failure when either:
-/// - transport reports failure (`ok == false`), OR
-/// - transport succeeded but the result body encodes an error that the
-///   model has to react to.
-///
-/// The second case covers tools that emit `{"status":"failed","error":"…"}`
-/// or append the `⚠ <tool> returned an error` banner at the top of the
-/// result. Those calls show as `ok: true` in the journal (the executor
-/// "ran" the tool and returned its string), but from the LLM's
-/// perspective they are errors — and they're the class that
-/// previously hid from `reported_root_tool_failures` (session
-/// 19ad8393 agent-spawn case).
-pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
-    if c.outcome_is_unknown() {
-        return false;
-    }
-    if !c.ok {
-        return true;
-    }
-    let Some(preview) = c.result_preview.as_deref() else {
-        return false;
+pub(super) fn semantic_outcome(
+    c: &session_journal::ToolCallRecord,
+) -> astra_turn_core::tool_result_semantics::ToolResultEvidence {
+    use astra_turn_core::tool_result_semantics::{
+        ToolResultEvidence::{Failed, Succeeded, Unknown},
+        tool_result_evidence,
     };
-    result_body_signals_failure(preview)
+    if c.outcome_is_unknown() {
+        return Unknown;
+    }
+    if !c.ok || c.execution_ok == Some(false) {
+        return Failed;
+    }
+    for body in [c.result_full.as_deref(), c.result_preview.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let evidence = tool_result_evidence(body);
+        if evidence == Failed {
+            return Failed;
+        }
+        if evidence == Succeeded
+            && c.result_artifact.is_none()
+            && c.output_bytes
+                .is_some_and(|bytes| bytes as usize == body.len())
+            && !body.contains("<astra-result-projection>")
+            && !body.contains("<redacted:")
+            && !body.contains("[REDACTED:")
+        {
+            return Succeeded;
+        }
+    }
+    Unknown
 }
 
-/// Detect the "tool returned ok but body is an error" pattern in a
-/// `result_preview` string.
-///
-/// Conservative: matches only strong signals (leading JSON error
-/// object, explicit "status":"failed", the warning banner emitted by
-/// edge-tool error handlers). Avoids matching incidental "error"
-/// words in bash/grep output.
-///
-/// **Window**: inspects only the first 400 chars of a JSON-shaped
-/// body.  Large success responses that happen to contain
-/// `"status":"failed"` deep in a nested field won't trigger a false
-/// positive, but the flip-side is that a malformed error response
-/// whose marker lives past the 400-char mark won't be caught
-/// either.  The previews are generated by the journal truncator
-/// (cap ~1 KiB) and the marker is always near the top of genuine
-/// error shapes, so the window is safe in practice.
-pub(crate) fn result_body_signals_failure(preview: &str) -> bool {
-    let trimmed = preview.trim_start();
-    // Warning banner that edge handlers prepend to error responses.
-    if trimmed.contains("⚠ ") && trimmed.contains("returned an error") {
-        return true;
-    }
-    // Leading JSON object with an explicit error/status=failed field.
-    if trimmed.starts_with('{') {
-        let head: String = trimmed.chars().take(400).collect();
-        if head.contains("\"status\":\"failed\"")
-            || head.contains("\"status\": \"failed\"")
-            || head.contains("\"status\":\"error\"")
-            || head.contains("\"status\": \"error\"")
-        {
-            return true;
-        }
-        // Leading `{"error":"..."` pattern — common for spawn_agent /
-        // get_result / send_message / memory server failures.
-        if head.starts_with("{\"error\"") || head.starts_with("{ \"error\"") {
-            return true;
-        }
-    }
-    false
+/// A transport failure or an explicit failure in the retained body.
+pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
+    semantic_outcome(c) == astra_turn_core::tool_result_semantics::ToolResultEvidence::Failed
+}
+
+fn result_body_signals_failure(body: &str) -> bool {
+    astra_turn_core::tool_result_semantics::tool_result_evidence(body)
+        == astra_turn_core::tool_result_semantics::ToolResultEvidence::Failed
 }
 
 /// Count skill re-entry short-circuits in a turn's tool-call record slice.
@@ -672,14 +677,29 @@ impl std::fmt::Display for ErrorCategory {
 }
 
 /// Derive the best-available error text for a failed tool call.
-/// Falls back to `result_preview` when the structured `error`
-/// field is empty — relevant for "ok=true but body is an error"
-/// failures that never populated `error`.
 fn effective_error_text(c: &session_journal::ToolCallRecord) -> String {
     if let Some(e) = c.error.as_deref()
         && !e.trim().is_empty()
     {
         return e.to_string();
+    }
+    let body = [c.result_full.as_deref(), c.result_preview.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|body| result_body_signals_failure(body));
+    if let Some(body) = body {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            let error = value.get("error");
+            if let Some(message) = error
+                .and_then(|error| error.as_str().or_else(|| error.get("message")?.as_str()))
+                .or_else(|| value.get("message")?.as_str())
+                .or_else(|| value.get("reason")?.as_str())
+                .filter(|message| !message.trim().is_empty())
+            {
+                return message.to_owned();
+            }
+        }
+        return body.to_owned();
     }
     c.result_preview.clone().unwrap_or_default()
 }
@@ -778,24 +798,27 @@ fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity>
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
     tool_call_groups::group_tool_calls(calls)
         .into_iter()
-        .map(|group| ToolGroupRow {
-            round: group.round,
-            batch_id: group.batch_id.map(|batch_id| batch_id.to_string()),
-            parallel: group.parallel,
-            call_count: group.calls.len(),
-            ok_count: group.ok_count(),
-            fail_count: group.fail_count(),
-            unknown_count: group.unknown_count(),
-            tools: group
-                .calls
-                .iter()
-                .map(|call| {
-                    crate::cli::stream::stream_render::format_tool_display_from_preview(
-                        &call.name,
-                        call.args_preview.as_deref(),
-                    )
-                })
-                .collect(),
+        .map(|group| {
+            let (ok_count, fail_count, unknown_count) = group.outcome_counts();
+            ToolGroupRow {
+                round: group.round,
+                batch_id: group.batch_id.map(|batch_id| batch_id.to_string()),
+                parallel: group.parallel,
+                call_count: group.calls.len(),
+                ok_count,
+                fail_count,
+                unknown_count,
+                tools: group
+                    .calls
+                    .iter()
+                    .map(|call| {
+                        crate::cli::stream::stream_render::format_tool_display_from_preview(
+                            &call.name,
+                            call.args_preview.as_deref(),
+                        )
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -1566,6 +1589,7 @@ fn build_digest_with_owners(
     let mut root_tool_totals_complete = !source_incomplete
         && !has_incomplete_observation(&events)
         && !has_unmatched_root_rounds(&events);
+    let mut root_tool_counts_complete = root_tool_totals_complete;
     let mut saw_root_terminal = false;
     let mut observed_root_tool_requests = 0u64;
     let mut reported_root_tool_outcomes_unknown: u64 = 0;
@@ -1574,7 +1598,7 @@ fn build_digest_with_owners(
     let mut reported_root_tool_failures: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut total_root_llm_rounds: u64 = 0;
-    let mut root_attempts_with_llm_rounds: u64 = 0;
+    let mut root_round_observations_consistent = true;
     let mut turn_error_count = 0usize;
     let mut compact_count = 0usize;
     let mut stall_count = 0usize;
@@ -1616,14 +1640,33 @@ fn build_digest_with_owners(
 
     let mut seq: u32 = 0;
     for ev in &events {
-        if is_root_terminal(ev) {
+        let pending_rounds = if is_root_terminal(ev) {
+            let rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
+            root_round_observations_consistent &= ev.llm_rounds.is_none_or(|count| {
+                rounds.len() <= count as usize
+                    && rounds
+                        .iter()
+                        .all(|round| round.round.is_none_or(|index| index < count))
+            });
+            Some(rounds)
+        } else {
+            None
+        };
+        let terminal_stats = if is_root_terminal(ev) {
             saw_root_terminal = true;
-            root_tool_totals_complete &= tool_outcomes_known(ev, authoritative_tool_call_stats(ev));
-        }
+            let semantic = tool_call_stats(ev.tool_calls.as_ref());
+            let stats = authoritative_tool_call_stats(ev, semantic);
+            let known = tool_outcomes_known(ev, stats);
+            root_tool_totals_complete &= known;
+            root_tool_counts_complete &= tool_count_known(ev);
+            Some((stats, semantic, known))
+        } else {
+            None
+        };
         match ev.event_type {
             JournalEventType::Turn if is_root_terminal(ev) => {
                 seq += 1;
-                let pending_rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
+                let pending_rounds = pending_rounds.expect("root terminal");
                 let observed_round_usage = observed_runtime_round_usage(ev, &pending_rounds);
                 let tokens_in = ev.tokens_in;
                 let cache_read_tokens = ev.cache_read_tokens;
@@ -1633,13 +1676,13 @@ fn build_digest_with_owners(
                 let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
                     (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
                 });
-                if let Some(rounds) = attempt_llm_rounds {
+                if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
-                    root_attempts_with_llm_rounds += 1;
                 }
-                let stats = authoritative_tool_call_stats(ev);
-                reported_root_tool_outcomes_unknown += u64::from(stats.unknown);
-                let semantic_stats = tool_call_stats(ev.tool_calls.as_ref());
+                let (stats, semantic_stats, outcomes_known) =
+                    terminal_stats.expect("root terminal");
+                reported_root_tool_outcomes_unknown +=
+                    u64::from(stats.unknown.max(semantic_stats.unknown));
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if stats.total() > 0 {
@@ -1655,8 +1698,7 @@ fn build_digest_with_owners(
                 //
                 // Include `ok=true but result body encodes failure`
                 // — those wouldn't have a populated `error` field,
-                // so we derive the error text from `result_preview`
-                // for classification.
+                // so we derive error text from retained result evidence.
                 if let Some(calls) = ev.tool_calls.as_ref() {
                     for call in calls.iter().filter(|c| is_effective_failure(c)) {
                         let err = effective_error_text(call);
@@ -1740,11 +1782,10 @@ fn build_digest_with_owners(
                     } else {
                         Vec::new()
                     },
-                    tool_calls_ok: tool_outcomes_known(ev, stats).then_some(stats.ok),
-                    tool_calls_fail: tool_outcomes_known(ev, stats).then_some(stats.fail),
-                    tool_calls_fresh: tool_outcomes_known(ev, stats).then_some(stats.fresh),
-                    tool_calls_noop_or_cached: tool_outcomes_known(ev, stats)
-                        .then_some(stats.noop_or_cached),
+                    tool_calls_ok: outcomes_known.then_some(stats.ok),
+                    tool_calls_fail: outcomes_known.then_some(stats.fail),
+                    tool_calls_fresh: outcomes_known.then_some(stats.fresh),
+                    tool_calls_noop_or_cached: outcomes_known.then_some(stats.noop_or_cached),
                     skill_reentry_calls: reentry_c,
                     skill_locked_out_calls: locked_out_c,
                     user_input_preview,
@@ -1773,7 +1814,7 @@ fn build_digest_with_owners(
             JournalEventType::TurnError if is_root_terminal(ev) => {
                 seq += 1;
                 turn_error_count += 1;
-                let pending_rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
+                let pending_rounds = pending_rounds.expect("root terminal");
                 let observed_round_usage = observed_runtime_round_usage(ev, &pending_rounds);
                 let tokens_in = ev.tokens_in;
                 let cache_read_tokens = ev.cache_read_tokens;
@@ -1783,13 +1824,13 @@ fn build_digest_with_owners(
                 let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
                     (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
                 });
-                if let Some(rounds) = attempt_llm_rounds {
+                if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
-                    root_attempts_with_llm_rounds += 1;
                 }
-                let stats = authoritative_tool_call_stats(ev);
-                reported_root_tool_outcomes_unknown += u64::from(stats.unknown);
-                let semantic_stats = tool_call_stats(ev.tool_calls.as_ref());
+                let (stats, semantic_stats, outcomes_known) =
+                    terminal_stats.expect("root terminal");
+                reported_root_tool_outcomes_unknown +=
+                    u64::from(stats.unknown.max(semantic_stats.unknown));
                 let effective_total = if stats.total() > 0 {
                     u64::from(stats.total())
                 } else {
@@ -1831,8 +1872,8 @@ fn build_digest_with_owners(
                     cache_creation_tokens,
                     tokens_out,
                     duration_ms: ev.duration_ms,
-                    tool_calls_ok: tool_outcomes_known(ev, stats).then_some(stats.ok),
-                    tool_calls_fail: tool_outcomes_known(ev, stats).then_some(stats.fail),
+                    tool_calls_ok: outcomes_known.then_some(stats.ok),
+                    tool_calls_fail: outcomes_known.then_some(stats.fail),
                     llm_rounds: attempt_llm_rounds,
                     llm_round_details: if matches!(focus, DigestFocus::All) {
                         pending_rounds
@@ -1987,12 +2028,31 @@ fn build_digest_with_owners(
     }
 
     let turn_count = turns_out.len();
-    root_tool_totals_complete = root_tool_totals_complete
-        && saw_root_terminal
+    let root_tool_coverage_consistent = saw_root_terminal
         && observed_root_tool_requests <= reported_root_tool_calls
         && root_tool_observations_reconciled(&events);
+    root_tool_totals_complete &= root_tool_coverage_consistent;
+    root_tool_counts_complete &= root_tool_coverage_consistent;
     let unattributed_root_round_count = llm_rounds_by_turn.values().map(Vec::len).sum();
     let attempt_count = turn_count + turn_error_count;
+    // Retained round rows are observations; only a terminal's round count
+    // establishes the denominator for every root attempt.
+    let root_round_counts_complete = !source_incomplete
+        && root_round_observations_consistent
+        && !has_unmatched_root_rounds(&events)
+        && events
+            .iter()
+            .filter(|event| is_root_terminal(event))
+            .all(|event| {
+                event.llm_rounds.is_some_and(|rounds| {
+                    rounds > 0
+                        || (event.tool_count.unwrap_or(0) == 0
+                            && event
+                                .tool_outcomes
+                                .as_ref()
+                                .is_none_or(|value| value.requested == 0))
+                })
+            });
     let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if attempt_count == 0 {
         (None, None, 0.0)
     } else {
@@ -2060,6 +2120,7 @@ fn build_digest_with_owners(
             total_tokens_out,
             total_duration_ms,
             reported_root_tool_calls,
+            root_tool_counts_complete,
             root_tool_totals_complete,
             observed_root_tool_requests,
             subrun_count: subrun_ids.len(),
@@ -2086,12 +2147,11 @@ fn build_digest_with_owners(
             avg_tokens_in,
             avg_tokens_out,
             avg_duration_ms,
-            avg_llm_rounds: if root_attempts_with_llm_rounds > 0 {
-                total_root_llm_rounds as f64 / root_attempts_with_llm_rounds as f64
-            } else {
-                0.0
-            },
-            avg_tool_calls_per_round: (root_tool_totals_complete && total_root_llm_rounds > 0)
+            avg_llm_rounds: (root_round_counts_complete && attempt_count > 0)
+                .then(|| total_root_llm_rounds as f64 / attempt_count as f64),
+            avg_tool_calls_per_round: (root_tool_counts_complete
+                && root_round_counts_complete
+                && total_root_llm_rounds > 0)
                 .then(|| reported_root_tool_calls as f64 / total_root_llm_rounds as f64),
         },
         turns: turns_out,
@@ -2222,7 +2282,11 @@ pub fn print_text(d: &JournalDigest) {
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
-        tool_total(a.reported_root_tool_calls),
+        if a.root_tool_counts_complete {
+            a.reported_root_tool_calls.to_string()
+        } else {
+            "?".to_owned()
+        },
         tool_total(a.reported_root_fresh_tool_calls),
         tool_total(a.reported_root_noop_or_cached_tool_calls),
         tool_total(a.reported_root_tool_failures),
@@ -2278,14 +2342,13 @@ pub fn print_text(d: &JournalDigest) {
             .map_or_else(|| "unknown".to_string(), |v| format!("{v:.1}")),
         a.avg_duration_ms
     );
-    if a.avg_llm_rounds > 0.0 {
-        stdout_println!(
-            "  llm_rounds={:.1} tool_calls_per_round={}",
-            a.avg_llm_rounds,
-            a.avg_tool_calls_per_round
-                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}"))
-        );
-    }
+    stdout_println!(
+        "  llm_rounds={} tool_calls_per_round={}",
+        a.avg_llm_rounds
+            .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}")),
+        a.avg_tool_calls_per_round
+            .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}"))
+    );
     if !d.turns.is_empty() {
         stdout_println!("\n  {}", "Turns".bold().magenta());
         stdout_println!(
@@ -2628,7 +2691,8 @@ mod tests {
         assert_eq!(d.journal_lines_malformed, 0);
         assert_eq!(d.aggregates.turn_count, 1);
         assert_eq!(d.aggregates.reported_root_tool_calls, 12);
-        assert_eq!(d.aggregates.avg_llm_rounds, 7.0);
+        // Retained rounds do not prove that no other round was omitted.
+        assert_eq!(d.aggregates.avg_llm_rounds, None);
         assert_eq!(d.turns.len(), 1);
 
         let turn = &d.turns[0];
@@ -3444,7 +3508,8 @@ mod tests {
             "/review turn must surface total_tool_ms"
         );
         assert_eq!(
-            d.aggregates.avg_llm_rounds, 3.0,
+            d.aggregates.avg_llm_rounds,
+            Some(3.0),
             "avg_llm_rounds must not be 0 when llm_rounds is present"
         );
     }
@@ -3564,7 +3629,8 @@ mod tests {
                 digest.aggregates.reported_root_tool_calls,
                 if index == 0 { 1 } else { 4 }
             );
-            assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 1);
+            assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 0);
+            assert!(!digest.aggregates.root_tool_totals_complete);
             assert_eq!(digest.aggregates.reported_root_tool_failures, 0);
         }
     }
@@ -3883,8 +3949,8 @@ mod tests {
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.aggregates.reported_root_tool_calls, 2);
         assert_eq!(
-            d.aggregates.reported_root_fresh_tool_calls, 1,
-            "only the real bash call should count as fresh evidence"
+            d.aggregates.reported_root_fresh_tool_calls, 0,
+            "plain output does not prove semantic success"
         );
         assert_eq!(
             d.aggregates.reported_root_noop_or_cached_tool_calls, 1,
@@ -4070,7 +4136,8 @@ mod tests {
         .unwrap();
         let digest = build_digest(sid, DigestFocus::Summary).unwrap();
         assert_eq!(digest.aggregates.reported_root_tool_calls, 1);
-        assert!(digest.aggregates.root_tool_totals_complete);
+        assert!(digest.aggregates.root_tool_counts_complete);
+        assert!(!digest.aggregates.root_tool_totals_complete);
         assert_eq!(digest.aggregates.avg_tool_calls_per_round, None);
     }
 
