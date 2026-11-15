@@ -7284,15 +7284,21 @@ mod tests {
         async fn load_run_control_batch_with_parents(
             &self,
             keys: &[astra_services::runs::RunControlReadKeyWithParent],
-        ) -> Result<Vec<astra_services::runs::RunControlReadWithParentResult>, String> {
-            use astra_services::runs::RunControlReadWithParent;
+        ) -> Result<
+            Vec<astra_services::runs::RunControlReadWithParentResult>,
+            astra_services::runs::RunControlBatchError,
+        > {
+            use astra_services::runs::{RunControlBatchError, RunControlReadWithParent};
             if self.fail_eager_parent_prefetch && keys.iter().any(|key| key.parent_hint.is_some()) {
-                return Err("eager parent failure".into());
+                return Err(RunControlBatchError::Unavailable(
+                    "eager parent failure".into(),
+                ));
             }
             let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
             Ok(self
                 .load_run_control_batch(&original)
-                .await?
+                .await
+                .map_err(RunControlBatchError::Invalid)?
                 .into_iter()
                 .map(|result| result.map(|own| RunControlReadWithParent { own, parent: None }))
                 .collect())

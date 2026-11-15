@@ -2183,6 +2183,128 @@ async fn control_batch_identity_positions_and_scan_plan(
     );
     assert_eq!(results[0], results[5]);
     assert!(results[1].as_ref().unwrap().is_none());
+    // Exercise the production recovery mapper at the full 128 logical / 256
+    // physical position limit with distinct owners and parent-child pairs.
+    use astra_services::runs::{RUN_CONTROL_READ_BATCH_SIZE, RunControlReadKeyWithParent};
+    let identities = (0..RUN_CONTROL_READ_BATCH_SIZE)
+        .map(|i| {
+            (
+                format!("fallback-owner-{nonce}-{i}"),
+                format!("fallback-root-{nonce}-{i}"),
+                format!("fallback-child-{nonce}-{i}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(identities.len() * 2);
+    for (owner, root, child) in &identities {
+        rows.push((
+            owner.clone(),
+            root.clone(),
+            root.clone(),
+            None,
+            root.clone(),
+            0_i32,
+        ));
+        rows.push((
+            owner.clone(),
+            child.clone(),
+            root.clone(),
+            Some(root.clone()),
+            format!("{root}/{child}"),
+            1_i32,
+        ));
+    }
+    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status) ",
+    );
+    insert.push_values(&rows, |mut row, (owner, run, root, parent, path, depth)| {
+        row.push_bind(owner)
+            .push_bind(owner)
+            .push_bind(run)
+            .push_bind(root)
+            .push_bind(parent)
+            .push_bind(path)
+            .push_bind(*depth)
+            .push_bind("running");
+    });
+    insert.build().execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE agent_runs SET last_guidance_event_idx=0 WHERE user_id=? AND run_id=?")
+        .bind(&identities[5].0)
+        .bind(&identities[5].1)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs SET run_generation=-1 WHERE user_id=? AND run_id=?")
+        .bind(&identities[6].0)
+        .bind(&identities[6].2)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let mut requests = identities
+        .iter()
+        .map(|(owner, root, child)| RunControlReadKeyWithParent {
+            key: RunControlReadKey {
+                user_id: owner.clone(),
+                run_id: child.clone(),
+            },
+            parent_hint: Some(root.clone()),
+        })
+        .collect::<Vec<_>>();
+    requests[1] = requests[0].clone();
+    requests[2].key.user_id = identities[127].0.clone();
+    requests[3].key.run_id = format!("missing-child-{nonce}");
+    requests[4].parent_hint = Some(format!("missing-parent-{nonce}"));
+    let capture = Queries::default();
+    let recovered = store
+        .load_run_control_batch_after_parent_failure(&requests)
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), RUN_CONTROL_READ_BATCH_SIZE);
+    for (i, result) in recovered.iter().enumerate() {
+        if i == 6 {
+            assert!(result.is_err(), "corrupt child must fail only its position");
+            continue;
+        }
+        let result = result.as_ref().unwrap();
+        if i == 2 || i == 3 {
+            assert!(
+                result.own.is_none(),
+                "wrong owner or missing child cannot expose a run"
+            );
+            continue;
+        }
+        let expected = if i == 1 {
+            &identities[0]
+        } else {
+            &identities[i]
+        };
+        assert_eq!(result.own.as_ref().unwrap().run_id, expected.2);
+        let parent = result.parent.as_ref().unwrap();
+        if i == 4 {
+            assert!(parent.as_ref().unwrap().is_none());
+        } else if i == 5 {
+            assert!(
+                parent.is_err(),
+                "corrupt parent must fail only its position"
+            );
+        } else {
+            assert_eq!(
+                parent.as_ref().unwrap().as_ref().unwrap().run_id,
+                expected.1
+            );
+        }
+    }
+    {
+        let statements = capture.0.lock().unwrap();
+        let reads = statements
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].matches('?').count(), 256 * 3);
+        assert!(!reads[0].contains("JOIN agent_runs parent"));
+    }
     independent.close().await;
 }
 
@@ -4409,6 +4531,50 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
     assert!(
         store
             .load_run_control_batch(&vec![keys[0].key.clone(); RUN_CONTROL_READ_BATCH_SIZE + 1])
+            .await
+            .is_err()
+    );
+
+    // Recovery uses one unjoined query with at most 256 physical positions.
+    // Keep the same per-position ownership and parent errors as the join.
+    let fallback = store
+        .load_run_control_batch_after_parent_failure(&keys)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (actual, expected) in fallback.iter().zip(&results) {
+        assert_eq!(actual.own, expected.own);
+        assert_eq!(actual.parent, expected.parent);
+    }
+    for size in [4, 64, 65] {
+        let repeated = vec![keys[0].clone(); size];
+        let capture = Queries::default();
+        let recovered = store
+            .load_run_control_batch_after_parent_failure(&repeated)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), size);
+        assert!(recovered.iter().all(|read| {
+            read.as_ref()
+                .is_ok_and(|read| read.own == results[0].own && read.parent == results[0].parent)
+        }));
+        let statements = capture.0.lock().unwrap();
+        let reads = statements
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1, "recovery must stay a single query");
+        assert!(!reads[0].contains("JOIN agent_runs parent"));
+    }
+    assert!(
+        store
+            .load_run_control_batch_after_parent_failure(&vec![
+                keys[0].clone();
+                RUN_CONTROL_READ_BATCH_SIZE + 1
+            ])
             .await
             .is_err()
     );

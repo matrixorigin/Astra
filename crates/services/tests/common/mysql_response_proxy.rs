@@ -18,11 +18,12 @@ pub enum Boundary {
     RowTerminator(&'static [u8]),
 }
 
-// Only the first matching exchange is gated. Requests reach the real database
+// By default only the first matching exchange is gated. Requests reach the real database
 // unchanged; its response is retained until the test cancels the caller. This
 // exercises cancellation after server execution, not a sleep before any SQL.
 pub struct ResponseGate {
     pub armed: AtomicBool,
+    pub continuous: AtomicBool,
     pub received: Notify,
     pub release: Notify,
 }
@@ -58,6 +59,7 @@ impl ResponseProxy {
         let proxy_port = listener.local_addr().unwrap().port();
         let gate = Arc::new(ResponseGate {
             armed: AtomicBool::new(true),
+            continuous: AtomicBool::new(false),
             received: Notify::new(),
             release: Notify::new(),
         });
@@ -97,7 +99,8 @@ impl ResponseProxy {
                                         Boundary::Commit => payload == b"\x03COMMIT",
                                         Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
-                                    if matches && request_gate.armed.swap(false, Ordering::SeqCst) {
+                                    if matches && (request_gate.continuous.load(Ordering::SeqCst)
+                                        || request_gate.armed.swap(false, Ordering::SeqCst)) {
                                         request_pending.store(true, Ordering::SeqCst);
                                     }
                                     server_write.write_all(&bytes).await?;
@@ -170,6 +173,9 @@ pub async fn proxy_pool_with_limit(
             .username(&settings.user)
             .password(&settings.password)
             .database(&settings.database)
+            // The proxy matches COM_STMT_PREPARE; cached statement IDs would
+            // otherwise bypass its SQL-specific fault injection.
+            .statement_cache_capacity(0)
             .ssl_mode(MySqlSslMode::Disabled),
     );
     initial.close().await.unwrap();

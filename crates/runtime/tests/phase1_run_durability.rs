@@ -1244,13 +1244,13 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
         }
         drop(pending);
         for batch in children {
-            let failed = tokio::time::timeout(Duration::from_secs(5), batch)
+            let observations = tokio::time::timeout(Duration::from_secs(5), batch)
                 .await
                 .unwrap();
             assert!(
-                failed
+                observations
                     .into_iter()
-                    .all(|result| result.unwrap_err().contains("batch query timed out"))
+                    .all(|result| { result.unwrap() == Some(RunControlStatus::Cancelled) })
             );
         }
         proxy
@@ -1262,7 +1262,65 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
             assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
         }
     }
+    // A stale hint or deeper child must still use the authoritative
+    // ancestor path after recovery, even while joined reads remain unhealthy.
+    for (run, hint) in [(&child, "stale-parent"), (&grandchild, child.as_str())] {
+        proxy
+            .gate
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut batch = Box::pin(hinted_statuses(&fault_engine, &user, run, hint));
+        assert!(futures_util::poll!(batch.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined response was not gated");
+        let observations = tokio::time::timeout(Duration::from_secs(5), batch)
+            .await
+            .expect("stale and deep controls must use the existing ancestor path");
+        assert!(
+            observations
+                .into_iter()
+                .all(|result| { result.unwrap() == Some(RunControlStatus::Cancelled) })
+        );
+        proxy
+            .gate
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+    }
     fault_pool.close().await;
+
+    // A joined attempt and its recovery must not extend a caller's deadline
+    // while an unrelated checkout exhausts the actual database pool.
+    let mut saturated_settings = observer_pool.settings().clone();
+    saturated_settings.db_pool_max_connections = 1;
+    saturated_settings.db_pool_min_connections = 0;
+    let saturated_pool = astra_core::SharedPool::new(&saturated_settings)
+        .await
+        .unwrap();
+    let held_connection = saturated_pool.get().acquire().await.unwrap();
+    let saturated_engine =
+        RunEngine::new(Arc::new(DatabaseRunStateStore::new(saturated_pool.clone())));
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(5),
+        hinted_statuses(&saturated_engine, &user, &child, &root),
+    )
+    .await
+    .expect("pool exhaustion must respect the original request budget");
+    assert!(
+        blocked
+            .into_iter()
+            .all(|result| result.unwrap_err().contains("timed out"))
+    );
+    drop(held_connection);
+    assert_eq!(
+        saturated_engine
+            .check_control_status(&user, &child)
+            .await
+            .unwrap(),
+        Some(RunControlStatus::Cancelled),
+    );
+    saturated_pool.close().await;
 
     sqlx::query("DELETE FROM agent_runs WHERE user_id=? AND run_id=?")
         .bind(&user)

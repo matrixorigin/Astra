@@ -3680,6 +3680,51 @@ pub struct RunControlReadWithParent {
 
 pub type RunControlReadWithParentResult = Result<RunControlReadWithParent, String>;
 
+/// Batch-level failures must distinguish an unavailable query from an invalid
+/// result: only the former can safely use an optional recovery read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunControlBatchError {
+    Unavailable(String),
+    Invalid(String),
+    Unsupported,
+}
+
+impl std::fmt::Display for RunControlBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) => f.write_str(error),
+            Self::Unsupported => {
+                f.write_str("run control parent fallback is unsupported by this store")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunControlBatchError {}
+
+// This classification is specific to the optional alternate read for a
+// read-only control query; it is not a general SQL retry policy.
+fn classify_control_batch_query_error(
+    operation: &'static str,
+    source: sqlx::Error,
+) -> RunControlBatchError {
+    let unavailable = matches!(
+        &source,
+        sqlx::Error::Database(_)
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+    );
+    let message = db_error(operation, "batch", source).to_string();
+    if unavailable {
+        RunControlBatchError::Unavailable(message)
+    } else {
+        RunControlBatchError::Invalid(message)
+    }
+}
+
 /// Exact authority required to terminalize a run whose executor is absent.
 ///
 /// The store must compare every field in the same critical section as the
@@ -6787,15 +6832,25 @@ pub trait RunStateStore: Send + Sync {
     async fn load_run_control_batch_with_parents(
         &self,
         keys: &[RunControlReadKeyWithParent],
-    ) -> Result<Vec<RunControlReadWithParentResult>, String> {
-        check_run_control_batch_size(keys.len())?;
+    ) -> Result<Vec<RunControlReadWithParentResult>, RunControlBatchError> {
+        check_run_control_batch_size(keys.len()).map_err(RunControlBatchError::Invalid)?;
         let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
         Ok(self
             .load_run_control_batch(&original)
-            .await?
+            .await
+            .map_err(RunControlBatchError::Invalid)?
             .into_iter()
             .map(|result| result.map(|own| RunControlReadWithParent { own, parent: None }))
             .collect())
+    }
+
+    /// Optional recovery after a joined control batch fails. The default
+    /// preserves custom stores' existing errors and ancestor-read policy.
+    async fn load_run_control_batch_after_parent_failure(
+        &self,
+        _keys: &[RunControlReadKeyWithParent],
+    ) -> Result<Vec<RunControlReadWithParentResult>, RunControlBatchError> {
+        Err(RunControlBatchError::Unsupported)
     }
 
     /// Process-local marker admission used by an invocation ledger that shares
@@ -16760,6 +16815,156 @@ impl DatabaseRunStateStore {
     }
 }
 
+impl DatabaseRunStateStore {
+    async fn query_run_control_batch(
+        &self,
+        keys: &[RunControlReadKeyWithParent],
+    ) -> Result<Vec<RunControlReadWithParentResult>, RunControlBatchError> {
+        // The public limit is 128 logical requests. Recovery may add one
+        // candidate parent for each request, all in a single bounded query.
+        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE * 2 {
+            return Err(RunControlBatchError::Invalid(
+                "run control physical batch exceeds capacity".into(),
+            ));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A parent join for only one or two children can cost more than the
+        // existing indexed reads. Keep sparse batches on the original path.
+        let has_parents = keys
+            .iter()
+            .filter(|key| key.bounded_parent_hint().is_some())
+            .take(RUN_CONTROL_READ_MIN_PARENT_HINTS)
+            .count()
+            == RUN_CONTROL_READ_MIN_PARENT_HINTS;
+        let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
+        query
+            .push(if has_parents {
+                RUN_CONTROL_JOINED_COLUMNS
+            } else {
+                RUN_CONTROL_COLUMNS
+            })
+            .push(" FROM (VALUES ");
+        for (ordinal, key) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query
+                .push("ROW(")
+                .push(ordinal)
+                .push(",")
+                .push_bind(&key.key.user_id)
+                .push(",")
+                .push_bind(&key.key.run_id)
+                .push(")");
+        }
+        query.push(if has_parents {
+            ") requested(ordinal, requested_user_id, requested_run_id)
+             LEFT JOIN agent_runs own ON own.user_id = requested_user_id AND own.run_id = requested_run_id
+             AND own.run_id IN ("
+        } else {
+            ") requested(ordinal, requested_user_id, requested_run_id)
+             LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id
+             AND run_id IN ("
+        });
+        // Give the database an independently pushable candidate filter. Join
+        // equality alone can scan every historical run for each small batch.
+        for (ordinal, key) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query.push_bind(&key.key.run_id);
+        }
+        query.push(")");
+        if has_parents {
+            query.push(
+                " LEFT JOIN agent_runs parent
+                  ON parent.user_id = requested_user_id
+                 AND parent.run_id = own.parent_run_id
+                 AND parent.run_id IN (",
+            );
+            let mut hints = query.separated(",");
+            for hint in keys
+                .iter()
+                .filter_map(RunControlReadKeyWithParent::bounded_parent_hint)
+            {
+                hints.push_bind(hint);
+            }
+            query.push(")");
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                classify_control_batch_query_error("acquire_run_control_batch", source)
+            })?;
+        let rows = query
+            .build()
+            .fetch_all(connection.connection_mut())
+            .await
+            .map_err(|source| {
+                classify_control_batch_query_error("load_run_control_batch", source)
+            })?;
+        let mut results = vec![None; keys.len()];
+        for row in rows {
+            let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
+                RunControlBatchError::Invalid(
+                    db_error("decode_run_control_ordinal", "batch", source).to_string(),
+                )
+            })?;
+            let ordinal = usize::try_from(ordinal).map_err(|_| {
+                RunControlBatchError::Invalid("negative run control request ordinal".into())
+            })?;
+            let slot = results.get_mut(ordinal).ok_or_else(|| {
+                RunControlBatchError::Invalid("run control request ordinal is out of bounds".into())
+            })?;
+            if slot.is_some() {
+                return Err(RunControlBatchError::Invalid(
+                    "duplicate run control request ordinal".into(),
+                ));
+            }
+            let own = row
+                .try_get::<Option<String>, _>("run_id")
+                .map_err(|source| {
+                    db_error("decode_run_control_presence", "batch", source).to_string()
+                })
+                .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose());
+            let parent = if has_parents && keys[ordinal].bounded_parent_hint().is_some() {
+                Some(
+                    row.try_get::<Option<String>, _>("hinted_run_id")
+                        .map_err(|source| {
+                            db_error("decode_run_control_parent_presence", "batch", source)
+                                .to_string()
+                        })
+                        .and_then(|id| {
+                            id.map(|id| {
+                                decode_run_control_row_with_columns(
+                                    &row,
+                                    &id,
+                                    HINTED_CONTROL_ROW_COLUMNS,
+                                )
+                            })
+                            .transpose()
+                        }),
+                )
+            } else {
+                None
+            };
+            *slot = Some(own.map(|own| RunControlReadWithParent { own, parent }));
+        }
+        let results = results
+            .into_iter()
+            .map(|result| {
+                result.ok_or_else(|| {
+                    RunControlBatchError::Invalid("missing run control request ordinal".into())
+                })
+            })
+            .collect::<Result<_, RunControlBatchError>>()?;
+        connection.release();
+        Ok(results)
+    }
+}
+
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
     async fn run_user_intent_status(
@@ -19459,7 +19664,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<Vec<_>>();
         Ok(self
             .load_run_control_batch_with_parents(&keys)
-            .await?
+            .await
+            .map_err(|error| error.to_string())?
             .into_iter()
             .map(|result| result.map(|result| result.own))
             .collect())
@@ -19468,129 +19674,56 @@ impl RunStateStore for DatabaseRunStateStore {
     async fn load_run_control_batch_with_parents(
         &self,
         keys: &[RunControlReadKeyWithParent],
-    ) -> Result<Vec<RunControlReadWithParentResult>, String> {
-        check_run_control_batch_size(keys.len())?;
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        // A parent join for only one or two children can cost more than the
-        // existing indexed reads. Keep sparse batches on the original path.
-        let has_parents = keys
-            .iter()
-            .filter(|key| key.bounded_parent_hint().is_some())
-            .take(RUN_CONTROL_READ_MIN_PARENT_HINTS)
-            .count()
-            == RUN_CONTROL_READ_MIN_PARENT_HINTS;
-        let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
-        query
-            .push(if has_parents {
-                RUN_CONTROL_JOINED_COLUMNS
-            } else {
-                RUN_CONTROL_COLUMNS
-            })
-            .push(" FROM (VALUES ");
-        for (ordinal, key) in keys.iter().enumerate() {
-            if ordinal != 0 {
-                query.push(",");
+    ) -> Result<Vec<RunControlReadWithParentResult>, RunControlBatchError> {
+        check_run_control_batch_size(keys.len()).map_err(RunControlBatchError::Invalid)?;
+        self.query_run_control_batch(keys).await
+    }
+
+    async fn load_run_control_batch_after_parent_failure(
+        &self,
+        keys: &[RunControlReadKeyWithParent],
+    ) -> Result<Vec<RunControlReadWithParentResult>, RunControlBatchError> {
+        check_run_control_batch_size(keys.len()).map_err(RunControlBatchError::Invalid)?;
+        let mut physical = Vec::with_capacity(keys.len() * 2);
+        for key in keys {
+            physical.push(RunControlReadKeyWithParent {
+                key: key.key.clone(),
+                parent_hint: None,
+            });
+            if let Some(parent) = key.bounded_parent_hint() {
+                physical.push(RunControlReadKeyWithParent {
+                    key: RunControlReadKey {
+                        user_id: key.key.user_id.clone(),
+                        run_id: parent.to_owned(),
+                    },
+                    parent_hint: None,
+                });
             }
-            query
-                .push("ROW(")
-                .push(ordinal)
-                .push(",")
-                .push_bind(&key.key.user_id)
-                .push(",")
-                .push_bind(&key.key.run_id)
-                .push(")");
         }
-        query.push(if has_parents {
-            ") requested(ordinal, requested_user_id, requested_run_id)
-             LEFT JOIN agent_runs own ON own.user_id = requested_user_id AND own.run_id = requested_run_id
-             AND own.run_id IN ("
-        } else {
-            ") requested(ordinal, requested_user_id, requested_run_id)
-             LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id
-             AND run_id IN ("
-        });
-        // Give the database an independently pushable candidate filter. Join
-        // equality alone can scan every historical run for each small batch.
-        for (ordinal, key) in keys.iter().enumerate() {
-            if ordinal != 0 {
-                query.push(",");
-            }
-            query.push_bind(&key.key.run_id);
-        }
-        query.push(")");
-        if has_parents {
-            query.push(
-                " LEFT JOIN agent_runs parent
-                  ON parent.user_id = requested_user_id
-                 AND parent.run_id = own.parent_run_id
-                 AND parent.run_id IN (",
-            );
-            let mut hints = query.separated(",");
-            for hint in keys
-                .iter()
-                .filter_map(RunControlReadKeyWithParent::bounded_parent_hint)
-            {
-                hints.push_bind(hint);
-            }
-            query.push(")");
-        }
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| db_error("acquire_run_control_batch", "batch", source).to_string())?;
-        let rows = query
-            .build()
-            .fetch_all(connection.connection_mut())
-            .await
-            .map_err(|source| db_error("load_run_control_batch", "batch", source).to_string())?;
-        let mut results = vec![None; keys.len()];
-        for row in rows {
-            let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
-                db_error("decode_run_control_ordinal", "batch", source).to_string()
-            })?;
-            let ordinal = usize::try_from(ordinal)
-                .map_err(|_| "negative run control request ordinal".to_string())?;
-            let slot = results
-                .get_mut(ordinal)
-                .ok_or_else(|| "run control request ordinal is out of bounds".to_string())?;
-            if slot.is_some() {
-                return Err("duplicate run control request ordinal".into());
-            }
-            let own = row
-                .try_get::<Option<String>, _>("run_id")
-                .map_err(|source| {
-                    db_error("decode_run_control_presence", "batch", source).to_string()
-                })
-                .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose());
-            let parent = if has_parents && keys[ordinal].bounded_parent_hint().is_some() {
+        let mut physical = self.query_run_control_batch(&physical).await?.into_iter();
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            let own = physical
+                .next()
+                .ok_or_else(|| {
+                    RunControlBatchError::Invalid("missing fallback child position".into())
+                })?
+                .map(|read| read.own);
+            let parent = if key.bounded_parent_hint().is_some() {
                 Some(
-                    row.try_get::<Option<String>, _>("hinted_run_id")
-                        .map_err(|source| {
-                            db_error("decode_run_control_parent_presence", "batch", source)
-                                .to_string()
-                        })
-                        .and_then(|id| {
-                            id.map(|id| {
-                                decode_run_control_row_with_columns(
-                                    &row,
-                                    &id,
-                                    HINTED_CONTROL_ROW_COLUMNS,
-                                )
-                            })
-                            .transpose()
-                        }),
+                    physical
+                        .next()
+                        .ok_or_else(|| {
+                            RunControlBatchError::Invalid("missing fallback parent position".into())
+                        })?
+                        .map(|read| read.own),
                 )
             } else {
                 None
             };
-            *slot = Some(own.map(|own| RunControlReadWithParent { own, parent }));
+            results.push(own.map(|own| RunControlReadWithParent { own, parent }));
         }
-        let results = results
-            .into_iter()
-            .map(|result| result.ok_or_else(|| "missing run control request ordinal".into()))
-            .collect::<Result<_, String>>()?;
-        connection.release();
+        debug_assert!(physical.next().is_none());
         Ok(results)
     }
 
@@ -27859,6 +27992,36 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_batch_classifies_protocol_and_transport_errors_without_losing_context() {
+        use super::{RunControlBatchError, classify_control_batch_query_error};
+        for source in [
+            sqlx::Error::Protocol("bad packet".into()),
+            sqlx::Error::Decode(Box::new(std::io::Error::other("bad row"))),
+            sqlx::Error::ColumnDecode {
+                index: "ordinal".into(),
+                source: Box::new(std::io::Error::other("bad value")),
+            },
+            sqlx::Error::ColumnNotFound("ordinal".into()),
+        ] {
+            let error = classify_control_batch_query_error("control_test", source);
+            assert!(matches!(error, RunControlBatchError::Invalid(_)));
+            assert!(error.to_string().contains("control_test"));
+        }
+        for source in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+        ] {
+            let error = classify_control_batch_query_error("control_test", source);
+            assert!(matches!(error, RunControlBatchError::Unavailable(_)));
+            assert!(error.to_string().contains("control_test"));
+        }
+    }
+
     #[test]
     fn client_warnings_project_only_marked_redacted_warnings() {
         let message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";

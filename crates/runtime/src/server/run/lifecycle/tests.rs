@@ -6,6 +6,10 @@ use astra_services::skills::{
 };
 use async_trait::async_trait;
 
+#[allow(dead_code)]
+#[path = "../../../../../services/tests/common/mysql_response_proxy.rs"]
+mod control_mysql_response_proxy;
+
 #[path = "native_stage_tests.rs"]
 mod native_stage_tests;
 
@@ -29220,7 +29224,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(id)
             .push_bind(id)
             .push_bind(id)
-            .push_bind(format!("/{id}"))
+            .push_bind(id)
             .push_bind("running")
             .push_bind(1)
             .push_bind(7);
@@ -29240,7 +29244,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(*child)
             .push_bind(*root)
             .push_bind(*root)
-            .push_bind(format!("/{root}/{child}"))
+            .push_bind(format!("{root}/{child}"))
             .push_bind(1)
             .push_bind("running")
             .push_bind(1)
@@ -29383,7 +29387,167 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     drop(watchers);
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    for table in ["agent_runs", "agent_sessions"] {
+    // Reuse four direct children for two real watcher waves. The joined SQL
+    // response is held after execution while the existing plain read remains
+    // healthy; none of these controls is delivered through a local token.
+    for index in 4..8 {
+        sqlx::query("UPDATE agent_runs SET status='running',waiting_for=NULL,cancellation_requested_at=NULL,run_generation=1,last_guidance_event_idx=-1 WHERE user_id=? AND run_id IN (?,?)")
+            .bind(&ids[index]).bind(&ids[index]).bind(&run_ids[index])
+            .execute(independent.get()).await.unwrap();
+    }
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(independent.clone())));
+    assert!(
+        writer
+            .request_run_cancellation(&ids[4], &run_ids[4])
+            .await
+            .unwrap()
+    );
+    writer
+        .append_event(
+            &ids[5],
+            &ids[5],
+            &run_ids[5],
+            json!({"event_type":"user_intent","id":format!("{prefix}-fault-guidance")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&ids[5], &run_ids[5])
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&ids[6], &ids[6])
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &ids[7],
+                expected_session_id: &ids[7],
+                run_id: &ids[7],
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+
+    use control_mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let proxy = ResponseProxy::start(
+        pool.settings().host.clone(),
+        pool.settings().port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(pool.settings(), proxy.port, 4).await;
+    let fault_control: Arc<dyn RunControlProvider> = Arc::new(RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(fault_pool.clone()),
+    )));
+    for wave in 0..2 {
+        proxy.gate.armed.store(false, Ordering::SeqCst);
+        proxy.gate.continuous.store(true, Ordering::SeqCst);
+        let mut fault_watchers = Vec::new();
+        // Four watchers per child keep all four distinct owners in one batch.
+        for ordinal in 0..16 {
+            let index = 4 + ordinal % 4;
+            let cancel = Arc::new(CancellationToken::new());
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let lease_lost = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let (guidance, receiver) = tokio::sync::watch::channel(-1);
+            let guard = start_active_run_control_watcher(
+                Some(fault_control.clone()),
+                ids[index].clone(),
+                ids[index].clone(),
+                run_ids[index].clone(),
+                Some(1),
+                cancel_flag.clone(),
+                pause.clone(),
+                cancel.clone(),
+                lease_lost.clone(),
+                tokio::sync::watch::channel(-1).0,
+                guidance,
+                Some(ids[index].clone()),
+            )
+            .unwrap();
+            fault_watchers.push((
+                index,
+                guard,
+                cancel_flag,
+                cancel,
+                pause,
+                lease_lost,
+                receiver,
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined watcher batch was not gated");
+        // A watcher that bypasses the held batch would otherwise make the
+        // regression pass without exercising recovery.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (_, _, cancel_flag, cancel, pause, lease_lost, guidance) in &fault_watchers {
+            assert!(!cancel_flag.load(Ordering::Acquire));
+            assert!(!cancel.is_cancelled());
+            assert!(!pause.load(Ordering::Acquire));
+            assert!(!lease_lost.load(Ordering::Acquire));
+            assert_eq!(*guidance.borrow(), -1);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(fault_watchers.iter_mut().map(
+                |(index, _, _, cancel, pause, _, guidance)| async move {
+                    match *index {
+                        4 | 6 => cancel.cancelled().await,
+                        5 => {
+                            while *guidance.borrow_and_update() < guidance_index {
+                                guidance.changed().await.unwrap();
+                            }
+                        }
+                        7 => {
+                            while !pause.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            )),
+        )
+        .await
+        .expect("watchers must recover child controls before the joined response is released");
+        for (index, _, cancel_flag, cancel, pause, lease_lost, _) in &fault_watchers {
+            assert!(
+                !lease_lost.load(Ordering::Acquire),
+                "valid identity must not lose its lease"
+            );
+            if *index == 4 || *index == 6 {
+                assert!(cancel_flag.load(Ordering::Acquire));
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(!cancel_flag.load(Ordering::Acquire));
+                assert!(!cancel.is_cancelled());
+                assert_eq!(pause.load(Ordering::Acquire), *index == 7);
+            }
+        }
+        println!(
+            "control_watchers joined_fault_wave={} recovered=16",
+            wave + 1
+        );
+        proxy.gate.continuous.store(false, Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        drop(fault_watchers);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(fault_control);
+    fault_pool.close().await;
+    for table in ["agent_run_events", "agent_runs", "agent_sessions"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id LIKE ?"
         )))

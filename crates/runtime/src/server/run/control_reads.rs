@@ -10,8 +10,8 @@ use std::{
 
 use astra_services::runs::{
     RUN_CONTROL_READ_BATCH_SIZE, RUN_CONTROL_READ_MAX_KEY_BYTES, RUN_CONTROL_READ_MIN_PARENT_HINTS,
-    RunControlReadKey, RunControlReadKeyWithParent, RunControlReadResult, RunControlReadWithParent,
-    RunControlReadWithParentResult, RunStateStore,
+    RunControlBatchError, RunControlReadKey, RunControlReadKeyWithParent, RunControlReadResult,
+    RunControlReadWithParent, RunControlReadWithParentResult, RunStateStore,
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::{sync::oneshot, time::Instant};
@@ -24,10 +24,17 @@ const MAX_OWNER_READS: usize = 4096;
 const MAX_WORKERS: usize = 4;
 const MAX_JOINED_WORKERS: usize = MAX_WORKERS - 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadMode {
+    Plain,
+    Joined,
+    Fallback,
+}
+
 type Read = dyn Fn(
         Vec<RunControlReadKeyWithParent>,
-        bool,
-    ) -> BoxFuture<'static, Result<Vec<RunControlReadWithParentResult>, String>>
+        ReadMode,
+    ) -> BoxFuture<'static, Result<Vec<RunControlReadWithParentResult>, RunControlBatchError>>
     + Send
     + Sync;
 
@@ -218,23 +225,30 @@ impl State {
 impl ControlReads {
     pub(super) fn new(store: Arc<dyn RunStateStore>) -> Arc<Self> {
         Arc::new(Self {
-            read: Arc::new(move |keys, joined| {
+            read: Arc::new(move |keys, mode| {
                 let store = store.clone();
                 Box::pin(async move {
-                    if joined {
-                        store.load_run_control_batch_with_parents(&keys).await
-                    } else {
-                        // A custom store may prefetch even one hint. Plain
-                        // batches must never share that failure domain.
-                        let keys = keys.into_iter().map(|key| key.key).collect::<Vec<_>>();
-                        Ok(store
-                            .load_run_control_batch(&keys)
-                            .await?
-                            .into_iter()
-                            .map(|result| {
-                                result.map(|own| RunControlReadWithParent { own, parent: None })
-                            })
-                            .collect())
+                    match mode {
+                        ReadMode::Joined => store.load_run_control_batch_with_parents(&keys).await,
+                        ReadMode::Fallback => {
+                            store
+                                .load_run_control_batch_after_parent_failure(&keys)
+                                .await
+                        }
+                        ReadMode::Plain => {
+                            // A custom store may prefetch even one hint. Plain
+                            // batches must never share that failure domain.
+                            let keys = keys.into_iter().map(|key| key.key).collect::<Vec<_>>();
+                            Ok(store
+                                .load_run_control_batch(&keys)
+                                .await
+                                .map_err(RunControlBatchError::Invalid)?
+                                .into_iter()
+                                .map(|result| {
+                                    result.map(|own| RunControlReadWithParent { own, parent: None })
+                                })
+                                .collect())
+                        }
                     }
                 })
             }),
@@ -372,20 +386,85 @@ impl ControlReads {
             // Freeze identities before SQL; later callers always get a fresh
             // observation, never one captured before their request.
             let keys = batch.iter().map(|request| request.key.clone()).collect();
+            let mode = if joined {
+                ReadMode::Joined
+            } else {
+                ReadMode::Plain
+            };
             let outcome = tokio::time::timeout(
                 QUERY_TIMEOUT,
-                AssertUnwindSafe(async { (self.read)(keys, joined).await }).catch_unwind(),
+                AssertUnwindSafe(async { (self.read)(keys, mode).await }).catch_unwind(),
             )
             .await;
-            let results = match outcome {
-                Ok(Ok(Ok(results))) if results.len() == batch.len() => Ok(results),
-                Ok(Ok(Ok(_))) => {
-                    Err("run control batch returned an invalid result count".to_string())
-                }
-                Ok(Ok(Err(error))) => Err(error),
-                Ok(Err(_)) => Err("run control batch panicked".to_string()),
-                Err(_) => Err("run control batch query timed out".to_string()),
+            let (mut results, recover) = match outcome {
+                Ok(Ok(Ok(results))) if results.len() == batch.len() => (Ok(results), false),
+                Ok(Ok(Ok(_))) => (
+                    Err("run control batch returned an invalid result count".to_string()),
+                    false,
+                ),
+                Ok(Ok(Err(RunControlBatchError::Unavailable(error)))) => (Err(error), joined),
+                Ok(Ok(Err(error))) => (Err(error.to_string()), false),
+                Ok(Err(_)) => (Err("run control batch panicked".to_string()), false),
+                Err(_) => (Err("run control batch query timed out".to_string()), joined),
             };
+            if recover {
+                let now = Instant::now();
+                let live = batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, request)| {
+                        let deadline = request.collect_at + (READ_TIMEOUT - COLLECTION_WINDOW);
+                        (!request.reply.is_closed() && deadline > now).then_some((index, deadline))
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(deadline) = live.iter().map(|(_, deadline)| *deadline).max() {
+                    let keys = live
+                        .iter()
+                        .map(|(index, _)| batch[*index].key.clone())
+                        .collect();
+                    // Retain this batch's admission and joined-worker slot.
+                    // Each caller keeps its original deadline, and no second
+                    // joined query is issued for the uncertain first read.
+                    let deadline = deadline.min(now + QUERY_TIMEOUT);
+                    let fallback = tokio::time::timeout_at(
+                        deadline,
+                        AssertUnwindSafe(async { (self.read)(keys, ReadMode::Fallback).await })
+                            .catch_unwind(),
+                    )
+                    .await;
+                    let original = results.as_ref().unwrap_err().clone();
+                    let fallback_error = match fallback {
+                        Ok(Ok(Ok(recovered))) if recovered.len() == live.len() => {
+                            tracing::warn!(
+                                outcome = "recovered",
+                                requests = live.len(),
+                                joined_error = %original,
+                                "joined run control batch required recovery"
+                            );
+                            let mut merged = vec![Err(original.clone()); batch.len()];
+                            for ((index, _), result) in live.into_iter().zip(recovered) {
+                                merged[index] = result;
+                            }
+                            results = Ok(merged);
+                            None
+                        }
+                        Ok(Ok(Err(RunControlBatchError::Unsupported))) => None,
+                        Ok(Ok(Err(error))) => Some(error.to_string()),
+                        Ok(Ok(Ok(_))) => Some("invalid fallback result count".to_string()),
+                        Ok(Err(_)) => Some("fallback panicked".to_string()),
+                        Err(_) => Some("fallback timed out".to_string()),
+                    };
+                    if let Some(error) = fallback_error {
+                        tracing::warn!(
+                            outcome = "failed",
+                            joined_error = %original,
+                            fallback_error = %error,
+                            "joined run control batch recovery failed"
+                        );
+                        results = Err(format!("{original}; fallback failed: {error}"));
+                    }
+                }
+            }
             {
                 let mut state = self
                     .state
@@ -398,15 +477,24 @@ impl ControlReads {
                     state.release(&request.key.key.user_id);
                 }
             }
+            let respond = |request: Request, result: RunControlReadWithParentResult| {
+                let deadline = request.collect_at + (READ_TIMEOUT - COLLECTION_WINDOW);
+                let result = if Instant::now() >= deadline {
+                    Err("run control read timed out".to_string())
+                } else {
+                    result
+                };
+                let _ = request.reply.send(result);
+            };
             match results {
                 Ok(results) => {
                     for (request, result) in batch.into_iter().zip(results) {
-                        let _ = request.reply.send(result);
+                        respond(request, result);
                     }
                 }
                 Err(error) => {
                     for request in batch {
-                        let _ = request.reply.send(Err(error.clone()));
+                        respond(request, Err(error.clone()));
                     }
                 }
             }
@@ -439,12 +527,13 @@ mod tests {
     ) -> Arc<ControlReads> {
         let read = Arc::new(read);
         Arc::new(ControlReads {
-            read: Arc::new(move |keys, _joined| {
+            read: Arc::new(move |keys, _mode| {
                 let read = read.clone();
                 Box::pin(async move {
                     let original = keys.into_iter().map(|key| key.key).collect();
                     Ok(read(original)
-                        .await?
+                        .await
+                        .map_err(RunControlBatchError::Invalid)?
                         .into_iter()
                         .map(|result| {
                             result.map(|own| RunControlReadWithParent { own, parent: None })
@@ -510,7 +599,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys, _joined| {
+            read: Arc::new(move |keys, _mode| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
                     Ok(keys
@@ -543,16 +632,18 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (start, gate, counter) = (entered.clone(), release.clone(), calls.clone());
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys, _joined| {
+            read: Arc::new(move |keys, mode| {
                 counter.fetch_add(1, Ordering::SeqCst);
-                let joined = keys.iter().any(|key| key.parent_hint.is_some());
+                let joined = mode == ReadMode::Joined;
                 let (start, gate) = (start.clone(), gate.clone());
                 Box::pin(async move {
                     if joined {
                         assert!(keys.iter().all(|key| key.parent_hint.is_some()));
                         start.notify_one();
                         gate.notified().await;
-                        Err("injected joined failure".into())
+                        Err(RunControlBatchError::Unavailable(
+                            "injected joined failure".into(),
+                        ))
                     } else {
                         Ok(empty_results(keys.len()))
                     }
@@ -587,10 +678,269 @@ mod tests {
             futures_util::future::join_all(children)
                 .await
                 .into_iter()
-                .all(|result| result.unwrap_err() == "injected joined failure")
+                .all(|result| result.unwrap().own.is_none())
         );
         assert_eq!(reader.state.lock().unwrap().outstanding, 0);
         assert!(reader.get("root-owner", "root").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_timeout_recovers_live_requests_with_original_deadlines() {
+        let joined_started = Arc::new(tokio::sync::Notify::new());
+        let fallback_started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (joined, fallback, gate, calls) = (
+            joined_started.clone(),
+            fallback_started.clone(),
+            release.clone(),
+            seen.clone(),
+        );
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys, mode| {
+                calls.lock().unwrap().push((
+                    mode,
+                    keys.iter()
+                        .map(|key| key.key.run_id.clone())
+                        .collect::<Vec<_>>(),
+                ));
+                let (joined, fallback, gate) = (joined.clone(), fallback.clone(), gate.clone());
+                Box::pin(async move {
+                    match mode {
+                        ReadMode::Joined => {
+                            joined.notify_one();
+                            std::future::pending().await
+                        }
+                        ReadMode::Fallback => {
+                            fallback.notify_one();
+                            gate.notified().await;
+                            Ok(empty_results(keys.len()))
+                        }
+                        ReadMode::Plain => panic!("unexpected plain batch"),
+                    }
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let mut early = Box::pin(reader.get_with_parent("owner-0", "early", Some("parent")));
+        assert!(futures_util::poll!(early.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let mut a = Box::pin(reader.get_with_parent("owner-1", "a", Some("parent")));
+        let mut b = Box::pin(reader.get_with_parent("owner-2", "b", Some("parent")));
+        let mut c = Box::pin(reader.get_with_parent("owner-3", "c", Some("parent")));
+        let mut dropped = Box::pin(reader.get_with_parent("owner-4", "dropped", Some("parent")));
+        for request in [&mut a, &mut b, &mut c, &mut dropped] {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(15)).await;
+        joined_started.notified().await;
+        drop(dropped);
+        tokio::time::advance(QUERY_TIMEOUT).await;
+        fallback_started.notified().await;
+        {
+            let calls = seen.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].0, ReadMode::Joined);
+            assert_eq!(calls[1].0, ReadMode::Fallback);
+            assert_eq!(calls[1].1.len(), 4);
+            assert!(!calls[1].1.iter().any(|run| run == "dropped"));
+        }
+        // The earliest caller still expires at its original deadline; the
+        // slightly later callers can use the same in-flight recovery result.
+        tokio::time::advance(Duration::from_millis(975)).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        release.notify_one();
+        // Let recovery publish before polling the expired caller. A ready
+        // oneshot must not turn its elapsed deadline into a late success.
+        tokio::time::timeout(Duration::from_millis(1), async {
+            while reader.state.lock().unwrap().outstanding != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (early, a, b, c) = tokio::join!(early, a, b, c);
+        assert!(early.unwrap_err().contains("timed out"));
+        assert!(a.unwrap().own.is_none());
+        assert!(b.unwrap().own.is_none());
+        assert!(c.unwrap().own.is_none());
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_waiting_for_a_pool_slot_stops_at_the_original_deadline() {
+        let joined_started = Arc::new(tokio::sync::Notify::new());
+        let fallback_started = Arc::new(tokio::sync::Notify::new());
+        let pool = Arc::new(tokio::sync::Semaphore::new(0));
+        let (joined, fallback, pool_slot) = (
+            joined_started.clone(),
+            fallback_started.clone(),
+            pool.clone(),
+        );
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |_keys, mode| {
+                let (joined, fallback, pool_slot) =
+                    (joined.clone(), fallback.clone(), pool_slot.clone());
+                Box::pin(async move {
+                    match mode {
+                        ReadMode::Joined => {
+                            joined.notify_one();
+                            std::future::pending().await
+                        }
+                        ReadMode::Fallback => {
+                            fallback.notify_one();
+                            let _permit = pool_slot.acquire().await.unwrap();
+                            unreachable!("the pool stays exhausted")
+                        }
+                        ReadMode::Plain => unreachable!(),
+                    }
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let mut requests = (0..4)
+            .map(|_| Box::pin(reader.get_with_parent("owner", "child", Some("parent"))))
+            .collect::<Vec<_>>();
+        for request in &mut requests {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+        }
+        tokio::time::advance(COLLECTION_WINDOW).await;
+        joined_started.notified().await;
+        tokio::time::advance(QUERY_TIMEOUT).await;
+        fallback_started.notified().await;
+        tokio::time::advance(READ_TIMEOUT - COLLECTION_WINDOW - QUERY_TIMEOUT).await;
+        let results = futures_util::future::join_all(requests).await;
+        assert!(
+            results
+                .into_iter()
+                .all(|result| result.unwrap_err().contains("timed out"))
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_fallback_preserves_both_errors_and_releases_capacity() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys, mode| {
+                seen.lock().unwrap().push(mode);
+                Box::pin(async move {
+                    match mode {
+                        ReadMode::Joined => Err(RunControlBatchError::Unavailable(
+                            "joined unavailable".into(),
+                        )),
+                        ReadMode::Fallback => Err(RunControlBatchError::Unavailable(
+                            "fallback unavailable".into(),
+                        )),
+                        ReadMode::Plain => Ok(empty_results(keys.len())),
+                    }
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let results = futures_util::future::join_all((0..4).map(|i| {
+            let reader = reader.clone();
+            async move {
+                reader
+                    .get_with_parent(&format!("owner-{i}"), "child", Some("parent"))
+                    .await
+            }
+        }))
+        .await;
+        assert!(results.into_iter().all(|result| result.unwrap_err()
+            == "joined unavailable; fallback failed: fallback unavailable"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![ReadMode::Joined, ReadMode::Fallback]
+        );
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+        assert!(reader.get("owner", "root").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_results_and_unsupported_recovery_preserve_original_errors() {
+        for invalid in [true, false] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let reader = Arc::new(ControlReads {
+                read: Arc::new(move |_keys, mode| {
+                    seen.lock().unwrap().push(mode);
+                    Box::pin(async move {
+                        match mode {
+                            ReadMode::Joined if invalid => {
+                                Err(RunControlBatchError::Invalid("bad ordinal".into()))
+                            }
+                            ReadMode::Joined => Err(RunControlBatchError::Unavailable(
+                                "joined unavailable".into(),
+                            )),
+                            ReadMode::Fallback => Err(RunControlBatchError::Unsupported),
+                            ReadMode::Plain => panic!("unexpected plain batch"),
+                        }
+                    })
+                }),
+                state: Mutex::new(State::default()),
+            });
+            let results = futures_util::future::join_all((0..4).map(|i| {
+                let reader = reader.clone();
+                async move {
+                    reader
+                        .get_with_parent(&format!("owner-{i}"), "child", Some("parent"))
+                        .await
+                }
+            }))
+            .await;
+            let expected = if invalid {
+                "bad ordinal"
+            } else {
+                "joined unavailable"
+            };
+            assert!(
+                results
+                    .into_iter()
+                    .all(|result| result.unwrap_err() == expected)
+            );
+            let expected_calls = if invalid {
+                vec![ReadMode::Joined]
+            } else {
+                vec![ReadMode::Joined, ReadMode::Fallback]
+            };
+            assert_eq!(*calls.lock().unwrap(), expected_calls);
+            assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_joined_batch_does_not_start_a_fallback() {
+        let joined_started = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (start, seen) = (joined_started.clone(), calls.clone());
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |_keys, mode| {
+                seen.lock().unwrap().push(mode);
+                let start = start.clone();
+                Box::pin(async move {
+                    assert_eq!(mode, ReadMode::Joined);
+                    start.notify_one();
+                    std::future::pending().await
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let mut requests = (0..4)
+            .map(|_| Box::pin(reader.get_with_parent("owner", "child", Some("parent"))))
+            .collect::<Vec<_>>();
+        for request in &mut requests {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+        }
+        tokio::time::advance(COLLECTION_WINDOW).await;
+        joined_started.notified().await;
+        drop(requests);
+        tokio::time::advance(QUERY_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*calls.lock().unwrap(), vec![ReadMode::Joined]);
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -599,7 +949,7 @@ mod tests {
             let batches = Arc::new(Mutex::new(Vec::new()));
             let seen = batches.clone();
             let reader = Arc::new(ControlReads {
-                read: Arc::new(move |keys, _joined| {
+                read: Arc::new(move |keys, _mode| {
                     seen.lock().unwrap().push(
                         keys.iter()
                             .map(|key| (key.key.run_id.clone(), key.parent_hint.is_some()))
@@ -666,7 +1016,7 @@ mod tests {
             peak.clone(),
         );
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys, _joined| {
+            read: Arc::new(move |keys, _mode| {
                 let (start, gate, ready, in_flight, max_seen) = (
                     start.clone(),
                     gate.clone(),
@@ -738,9 +1088,8 @@ mod tests {
             plain_calls.clone(),
         );
         let reader = Arc::new(ControlReads {
-            read: Arc::new(move |keys, _joined| {
-                let joined = keys.iter().filter(|key| key.parent_hint.is_some()).count()
-                    >= RUN_CONTROL_READ_MIN_PARENT_HINTS;
+            read: Arc::new(move |keys, mode| {
+                let joined = mode == ReadMode::Joined;
                 let (started, gate, opened, joined_count, plain_count) = (
                     started.clone(),
                     gate.clone(),
