@@ -22,6 +22,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_READS: usize = 8192;
 const MAX_OWNER_READS: usize = 4096;
 const MAX_WORKERS: usize = 4;
+const MAX_JOINED_WORKERS: usize = MAX_WORKERS - 1;
 
 type Read = dyn Fn(
         Vec<RunControlReadKeyWithParent>,
@@ -40,6 +41,7 @@ struct State {
     ready: VecDeque<String>,
     outstanding: usize,
     workers: usize,
+    joined_workers: usize,
 }
 
 #[derive(Default)]
@@ -68,22 +70,90 @@ impl State {
         }
     }
 
-    fn take_batch(&mut self) -> Vec<Request> {
+    fn collection_deadline(&self) -> Option<Instant> {
+        if self.joined_workers < MAX_JOINED_WORKERS {
+            let queued = self
+                .owners
+                .values()
+                .map(|owner| owner.pending.len())
+                .sum::<usize>();
+            if queued >= RUN_CONTROL_READ_BATCH_SIZE {
+                return None;
+            }
+            return self
+                .owners
+                .values()
+                .filter_map(|owner| owner.pending.front())
+                .map(|request| request.collect_at)
+                .min();
+        }
+
+        // Hinted work cannot use the reserved worker. Count only eligible
+        // requests so a large hinted backlog does not defeat root batching.
+        let mut queued = 0;
+        let mut earliest: Option<Instant> = None;
+        for request in self.owners.values().flat_map(|owner| owner.pending.iter()) {
+            if request.key.parent_hint.is_none() && !request.reply.is_closed() {
+                queued += 1;
+                if queued >= RUN_CONTROL_READ_BATCH_SIZE {
+                    return None;
+                }
+                earliest =
+                    Some(earliest.map_or(request.collect_at, |at| at.min(request.collect_at)));
+            }
+        }
+        earliest
+    }
+
+    fn has_unhinted(&self) -> bool {
+        self.owners.values().any(|owner| {
+            owner
+                .pending
+                .iter()
+                .any(|request| request.key.parent_hint.is_none() && !request.reply.is_closed())
+        })
+    }
+
+    fn take_batch(&mut self, unhinted_only: bool) -> (Vec<Request>, bool) {
         let mut batch = Vec::with_capacity(RUN_CONTROL_READ_BATCH_SIZE);
+        let mut skipped = VecDeque::new();
         while batch.len() < RUN_CONTROL_READ_BATCH_SIZE {
             let Some(user_id) = self.ready.pop_front() else {
                 break;
             };
             let owner = self.owners.get_mut(&user_id).expect("queued control owner");
-            let request = owner.pending.pop_front().expect("queued control request");
-            if !owner.pending.is_empty() {
-                self.ready.push_back(user_id.clone());
-            }
-            if request.reply.is_closed() {
-                self.release(&user_id);
+            let request = if unhinted_only {
+                // An unhinted request may be behind this owner's hinted work.
+                owner
+                    .pending
+                    .extract_if(|request| {
+                        request.key.parent_hint.is_none() || request.reply.is_closed()
+                    })
+                    .next()
             } else {
-                batch.push(request);
+                owner.pending.pop_front()
+            };
+            let pending = !owner.pending.is_empty();
+            if let Some(request) = request {
+                if pending {
+                    self.ready.push_back(user_id.clone());
+                }
+                if request.reply.is_closed() {
+                    self.release(&user_id);
+                } else {
+                    batch.push(request);
+                }
+            } else if unhinted_only && pending {
+                // Do not revisit hint-only owners until this batch is built.
+                skipped.push_back(user_id);
+            } else {
+                unreachable!("queued control request");
             }
+        }
+        if unhinted_only {
+            skipped.append(&mut self.ready);
+            self.ready = skipped;
+            return (batch, false);
         }
         let hinted = batch
             .iter()
@@ -95,7 +165,7 @@ impl State {
                 .iter()
                 .all(|request| request.key.parent_hint.is_some())
         {
-            return batch;
+            return (batch, hinted >= RUN_CONTROL_READ_MIN_PARENT_HINTS);
         }
 
         // Keep the original worker and queue bounds. A joined read must not
@@ -140,7 +210,7 @@ impl State {
                 .pending
                 .push_front(request);
         }
-        selected
+        (selected, take_hinted)
     }
 }
 
@@ -174,6 +244,7 @@ impl ControlReads {
         {
             return Err("run control identity exceeds capacity".into());
         }
+        let parent_hint = parent_hint.filter(|hint| hint.len() <= RUN_CONTROL_READ_MAX_KEY_BYTES);
         let queued_at = Instant::now();
         let (reply, receiver) = oneshot::channel();
         let start_worker = {
@@ -198,9 +269,7 @@ impl ControlReads {
                         user_id: user_id.into(),
                         run_id: run_id.into(),
                     },
-                    parent_hint: parent_hint
-                        .filter(|hint| hint.len() <= RUN_CONTROL_READ_MAX_KEY_BYTES)
-                        .map(str::to_owned),
+                    parent_hint: parent_hint.map(str::to_owned),
                 },
                 collect_at: queued_at + COLLECTION_WINDOW,
                 reply,
@@ -209,15 +278,15 @@ impl ControlReads {
                 state.ready.push_back(user_id.to_owned());
             }
             state.outstanding += 1;
-            let start = state.workers < MAX_WORKERS;
+            let start = state.workers < MAX_WORKERS
+                && (state.joined_workers < MAX_JOINED_WORKERS || parent_hint.is_none());
             if start {
                 state.workers += 1;
             }
             start
         };
         if start_worker {
-            let reads = self.clone();
-            tokio::spawn(async move { reads.run().await });
+            self.spawn_worker();
         }
         tokio::time::timeout_at(queued_at + READ_TIMEOUT, receiver)
             .await
@@ -225,46 +294,57 @@ impl ControlReads {
             .map_err(|_| "run control read worker closed".to_string())?
     }
 
+    fn spawn_worker(self: &Arc<Self>) {
+        let reads = self.clone();
+        tokio::spawn(async move { reads.run().await });
+    }
+
     async fn run(self: Arc<Self>) {
         loop {
-            let collect_at = {
-                let state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let queued = state
-                    .owners
-                    .values()
-                    .map(|owner| owner.pending.len())
-                    .sum::<usize>();
-                if queued >= RUN_CONTROL_READ_BATCH_SIZE {
-                    None
-                } else {
-                    state
-                        .owners
-                        .values()
-                        .filter_map(|owner| owner.pending.front())
-                        .map(|request| request.collect_at)
-                        .min()
-                }
-            };
-            if let Some(deadline) = collect_at {
-                // Collection is bounded from admission, not renewed every
-                // time a worker reaches an already-waiting partial batch.
-                tokio::time::sleep_until(deadline).await;
-            }
-            let batch = {
+            let selection = {
                 let mut state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let batch = state.take_batch();
-                if batch.is_empty() {
-                    state.workers -= 1;
-                    return;
+                // Check the current eligible class and its original collection
+                // deadline under the same lock used to select the batch.
+                if let Some(deadline) = state
+                    .collection_deadline()
+                    .filter(|at| *at > Instant::now())
+                {
+                    Err(deadline)
+                } else {
+                    let unhinted_only = state.joined_workers >= MAX_JOINED_WORKERS;
+                    let (batch, joined) = state.take_batch(unhinted_only);
+                    if batch.is_empty() {
+                        state.workers -= 1;
+                        return;
+                    }
+                    if joined {
+                        state.joined_workers += 1;
+                    }
+                    // A mixed selection can restore a previously queued root
+                    // as the third joined worker starts.
+                    let start = joined
+                        && state.joined_workers == MAX_JOINED_WORKERS
+                        && state.workers < MAX_WORKERS
+                        && state.has_unhinted();
+                    if start {
+                        state.workers += 1;
+                    }
+                    Ok((batch, joined, start))
                 }
-                batch
             };
+            let (batch, joined, start_reserved) = match selection {
+                Ok(selection) => selection,
+                Err(deadline) => {
+                    tokio::time::sleep_until(deadline).await;
+                    continue;
+                }
+            };
+            if start_reserved {
+                self.spawn_worker();
+            }
             // Freeze identities before SQL; later callers always get a fresh
             // observation, never one captured before their request.
             let keys = batch.iter().map(|request| request.key.clone()).collect();
@@ -287,6 +367,9 @@ impl ControlReads {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if joined {
+                    state.joined_workers -= 1;
+                }
                 for request in &batch {
                     state.release(&request.key.key.user_id);
                 }
@@ -615,6 +698,185 @@ mod tests {
         futures_util::future::join_all(pending).await;
         assert!(peak.load(Ordering::SeqCst) <= MAX_WORKERS);
         assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserved_worker_batches_roots_behind_hints_and_recovers() {
+        let joined_started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let open = Arc::new(AtomicBool::new(false));
+        let joined_calls = Arc::new(AtomicUsize::new(0));
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let (started, gate, opened, joined_count, plain_count) = (
+            joined_started.clone(),
+            release.clone(),
+            open.clone(),
+            joined_calls.clone(),
+            plain_calls.clone(),
+        );
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys| {
+                let joined = keys.iter().filter(|key| key.parent_hint.is_some()).count()
+                    >= RUN_CONTROL_READ_MIN_PARENT_HINTS;
+                let (started, gate, opened, joined_count, plain_count) = (
+                    started.clone(),
+                    gate.clone(),
+                    opened.clone(),
+                    joined_count.clone(),
+                    plain_count.clone(),
+                );
+                Box::pin(async move {
+                    if joined {
+                        joined_count.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        if !opened.load(Ordering::SeqCst) {
+                            gate.notified().await;
+                        }
+                    } else {
+                        plain_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(empty_results(keys.len()))
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+
+        let mut held: Vec<BoxFuture<'static, ()>> = Vec::new();
+        for wave in 0..MAX_JOINED_WORKERS {
+            for i in 0..RUN_CONTROL_READ_MIN_PARENT_HINTS {
+                let reader = reader.clone();
+                let mut request: BoxFuture<'static, ()> = Box::pin(async move {
+                    reader
+                        .get_with_parent("held", &format!("child-{wave}-{i}"), Some("parent"))
+                        .await
+                        .unwrap();
+                });
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                held.push(request);
+            }
+            if wave + 1 == MAX_JOINED_WORKERS {
+                // Both free workers can be waiting on the older hinted
+                // deadline when a root arrives just before the third join.
+                tokio::task::yield_now().await;
+                tokio::time::advance(COLLECTION_WINDOW - Duration::from_millis(5)).await;
+                let mut first = Box::pin(reader.get("transition", "root-1"));
+                assert!(futures_util::poll!(first.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(5)).await;
+                tokio::time::timeout(Duration::from_millis(100), joined_started.notified())
+                    .await
+                    .expect("third joined worker did not start");
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    plain_calls.load(Ordering::SeqCst),
+                    0,
+                    "a hinted deadline must not prematurely dispatch the restored root"
+                );
+                let mut second = Box::pin(reader.get("transition", "root-2"));
+                assert!(futures_util::poll!(second.as_mut()).is_pending());
+                tokio::time::advance(COLLECTION_WINDOW - Duration::from_millis(5)).await;
+                let (first, second) = tokio::join!(first, second);
+                assert!(first.unwrap().is_none() && second.unwrap().is_none());
+                assert_eq!(plain_calls.load(Ordering::SeqCst), 1);
+            } else {
+                tokio::time::advance(COLLECTION_WINDOW).await;
+                tokio::time::timeout(Duration::from_millis(100), joined_started.notified())
+                    .await
+                    .expect("joined worker did not start");
+            }
+        }
+
+        let mut backlog: Vec<BoxFuture<'static, ()>> = Vec::new();
+        for i in 0..320 {
+            let reader = reader.clone();
+            let owner = if i < 160 {
+                format!("owner-{i}")
+            } else {
+                "target".into()
+            };
+            let mut request: BoxFuture<'static, ()> = Box::pin(async move {
+                let _ = reader
+                    .get_with_parent(&owner, &format!("backlog-{i}"), Some("parent"))
+                    .await;
+            });
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            backlog.push(request);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            reader.state.lock().unwrap().joined_workers,
+            MAX_JOINED_WORKERS
+        );
+
+        let mut roots: Vec<BoxFuture<'static, ()>> = Vec::new();
+        for i in 0..8 {
+            let reader = reader.clone();
+            let mut request: BoxFuture<'static, ()> = Box::pin(async move {
+                assert!(
+                    reader
+                        .get("target", &format!("root-{i}"))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            roots.push(request);
+            if i == 0 {
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    plain_calls.load(Ordering::SeqCst),
+                    1,
+                    "hinted backlog must not bypass the root collection window"
+                );
+            }
+        }
+        tokio::time::advance(COLLECTION_WINDOW).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            futures_util::future::join_all(roots),
+        )
+        .await
+        .expect("roots behind hinted backlog must be observed");
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(joined_calls.load(Ordering::SeqCst), MAX_JOINED_WORKERS);
+
+        // The reserved worker may retire while joins are still held; a later
+        // root must start it again without waiting for a joined query.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if reader.state.lock().unwrap().workers == MAX_JOINED_WORKERS {
+                break;
+            }
+        }
+        assert_eq!(reader.state.lock().unwrap().workers, MAX_JOINED_WORKERS);
+        assert!(reader.get("target", "late-root").await.unwrap().is_none());
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 3);
+
+        drop(backlog);
+        open.store(true, Ordering::SeqCst);
+        release.notify_waiters();
+        futures_util::future::join_all(held).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                {
+                    let state = reader.state.lock().unwrap();
+                    if state.outstanding == 0 && state.workers == 0 {
+                        assert_eq!(state.joined_workers, 0);
+                        assert!(state.owners.is_empty() && state.ready.is_empty());
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed and completed work must release all capacity");
+        let calls = joined_calls.load(Ordering::SeqCst) + plain_calls.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            joined_calls.load(Ordering::SeqCst) + plain_calls.load(Ordering::SeqCst),
+            calls
+        );
     }
 
     #[tokio::test(start_paused = true)]

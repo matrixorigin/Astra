@@ -1120,8 +1120,8 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
             assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
         }
     }
-    // Withhold only the joined response. A different owner's unhinted
-    // cancellation must still be observable before that query times out.
+    // Withhold joined responses. An unhinted cancellation must remain
+    // observable even behind other owners and same-owner hinted requests.
     use astra_runtime::turn::run_control::RunStatusProvider;
     use mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
     let other_user = format!("obs-qa-other-u-{nonce}");
@@ -1138,6 +1138,29 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
             .await
             .unwrap()
     );
+    let guidance_session = format!("obs-qa-guidance-s-{nonce}");
+    let guidance_root = format!("obs-qa-guidance-r-{nonce}");
+    insert_session(&writer_pool, &other_user, &guidance_session).await;
+    writer
+        .start_run(&guidance_root, &other_user, &guidance_session)
+        .await
+        .unwrap();
+    writer
+        .append_event(
+            &other_user,
+            &guidance_session,
+            &guidance_root,
+            json!({"event_type": "user_intent", "id": format!("intent-{nonce}")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&other_user, &guidance_root)
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(guidance_index >= 0);
 
     let settings = observer_pool.settings();
     let proxy = ResponseProxy::start(
@@ -1146,32 +1169,78 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
         Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
     )
     .await;
-    let fault_pool = proxy_pool_with_limit(settings, proxy.port, 2).await;
+    let fault_pool = proxy_pool_with_limit(settings, proxy.port, 4).await;
     let fault_engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(fault_pool.clone())));
-    let mut children = Box::pin(hinted_statuses(&fault_engine, &user, &child, &root));
-    let mut other_observation =
-        Box::pin(fault_engine.control_observation(&other_user, &other_root));
-    assert!(futures_util::poll!(children.as_mut()).is_pending());
-    assert!(futures_util::poll!(other_observation.as_mut()).is_pending());
-    tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+    // Repeated timeouts must release connections for subsequent reads.
+    for _ in 0..2 {
+        let mut children = Vec::new();
+        // Hold three joined reads on distinct connections. Rearm before the
+        // backlog as well, so a fourth joined read would block the root.
+        for _ in 0..3 {
+            proxy
+                .gate
+                .armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut batch = Box::pin(hinted_statuses(&fault_engine, &user, &child, &root));
+            assert!(futures_util::poll!(batch.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+                .await
+                .expect("joined response was not gated");
+            children.push(batch);
+        }
+        proxy
+            .gate
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let backlog = (0..160)
+            .map(|i| (format!("obs-backlog-{nonce}-{i}"), format!("child-{i}")))
+            .chain((0..160).map(|i| (other_user.clone(), format!("same-owner-child-{i}"))))
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for (owner, run) in &backlog {
+            let mut request = Box::pin(fault_engine.control_observation_with_parent_hint(
+                owner,
+                run,
+                "unused-parent",
+            ));
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            pending.push(request);
+        }
+        let mut other_observation =
+            Box::pin(fault_engine.control_observation(&other_user, &other_root));
+        let mut guidance_observation =
+            Box::pin(fault_engine.control_observation(&other_user, &guidance_root));
+        assert!(futures_util::poll!(other_observation.as_mut()).is_pending());
+        assert!(futures_util::poll!(guidance_observation.as_mut()).is_pending());
+        let (observed, guidance) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(other_observation, guidance_observation)
+        })
         .await
-        .expect("joined response was not gated");
-    let observed = tokio::time::timeout(Duration::from_secs(2), other_observation)
-        .await
-        .expect("unhinted root must not wait for joined query")
-        .unwrap();
-    assert_eq!(observed.status, Some(RunControlStatus::Cancelled));
-    let failed = tokio::time::timeout(Duration::from_secs(5), children)
-        .await
-        .unwrap();
-    assert!(
-        failed
-            .into_iter()
-            .all(|result| result.unwrap_err().contains("batch query timed out"))
-    );
-    proxy.gate.release.notify_one();
-    for result in hinted_statuses(&fault_engine, &user, &child, &root).await {
-        assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+        .expect("unhinted roots must not wait for stalled joined workers");
+        assert_eq!(observed.unwrap().status, Some(RunControlStatus::Cancelled));
+        let guidance = guidance.unwrap();
+        assert_eq!(guidance.status, None);
+        assert_eq!(guidance.last_guidance_event_idx, Some(guidance_index));
+        assert_eq!(guidance.last_event_idx, Some(guidance_index));
+        drop(pending);
+        for batch in children {
+            let failed = tokio::time::timeout(Duration::from_secs(5), batch)
+                .await
+                .unwrap();
+            assert!(
+                failed
+                    .into_iter()
+                    .all(|result| result.unwrap_err().contains("batch query timed out"))
+            );
+        }
+        proxy
+            .gate
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        for result in hinted_statuses(&fault_engine, &user, &child, &root).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+        }
     }
     fault_pool.close().await;
 
