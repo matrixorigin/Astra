@@ -29295,8 +29295,10 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     .expect("first shared control sweep");
     let first_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    // Mixed hinted/unhinted reads use separate queries. Allow partial batches
+    // from the four workers while still excluding per-child polling.
     assert!(
-        (8..=12).contains(&first_reads),
+        (8..=24).contains(&first_reads),
         "1000 roots and children must batch, got {first_reads} checkouts"
     );
     let initial_ms = started.elapsed().as_millis();
@@ -29371,7 +29373,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let next_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
     assert!(
-        (8..=12).contains(&next_reads),
+        (8..=24).contains(&next_reads),
         "changed sweep must also batch: {next_reads}"
     );
     println!(

@@ -2,16 +2,16 @@
 //! between batches, and this queue never polls or grants execution authority.
 
 use std::{
-    collections::{HashMap, LinkedList, VecDeque},
+    collections::{HashMap, HashSet, LinkedList, VecDeque},
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use astra_services::runs::{
-    RUN_CONTROL_READ_BATCH_SIZE, RUN_CONTROL_READ_MAX_KEY_BYTES, RunControlReadKey,
-    RunControlReadKeyWithParent, RunControlReadResult, RunControlReadWithParentResult,
-    RunStateStore,
+    RUN_CONTROL_READ_BATCH_SIZE, RUN_CONTROL_READ_MAX_KEY_BYTES, RUN_CONTROL_READ_MIN_PARENT_HINTS,
+    RunControlReadKey, RunControlReadKeyWithParent, RunControlReadResult,
+    RunControlReadWithParentResult, RunStateStore,
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::{sync::oneshot, time::Instant};
@@ -85,7 +85,62 @@ impl State {
                 batch.push(request);
             }
         }
-        batch
+        let hinted = batch
+            .iter()
+            .filter(|request| request.key.parent_hint.is_some())
+            .take(RUN_CONTROL_READ_MIN_PARENT_HINTS)
+            .count();
+        if hinted < RUN_CONTROL_READ_MIN_PARENT_HINTS
+            || batch
+                .iter()
+                .all(|request| request.key.parent_hint.is_some())
+        {
+            return batch;
+        }
+
+        // Keep the original worker and queue bounds. A joined read must not
+        // make an unrelated unhinted observation share its failure domain.
+        // Restore the other class to each owner's existing queue, retaining
+        // its admission, deadline, and relative order.
+        let take_hinted = batch[0].key.parent_hint.is_some();
+        let (selected, deferred): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|request| request.key.parent_hint.is_some() == take_hinted);
+        let deferred = deferred
+            .into_iter()
+            .filter(|request| {
+                if request.reply.is_closed() {
+                    self.release(&request.key.key.user_id);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut deferred_owners = Vec::new();
+        let mut seen = HashSet::new();
+        for request in &deferred {
+            let user_id = request.key.key.user_id.as_str();
+            if seen.insert(user_id) {
+                deferred_owners.push(user_id);
+            }
+        }
+        // Give the restored class the next turn even under a sustained
+        // backlog, while keeping at most one ready entry for each owner.
+        self.ready
+            .retain(|user_id| !seen.contains(user_id.as_str()));
+        for user_id in deferred_owners.into_iter().rev() {
+            self.ready.push_front(user_id.to_owned());
+        }
+        drop(seen);
+        for request in deferred.into_iter().rev() {
+            self.owners
+                .get_mut(&request.key.key.user_id)
+                .expect("admitted control owner")
+                .pending
+                .push_front(request);
+        }
+        selected
     }
 }
 
@@ -258,6 +313,16 @@ mod tests {
     use astra_services::runs::RunControlReadWithParent;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    fn empty_results(count: usize) -> Vec<RunControlReadWithParentResult> {
+        vec![
+            Ok(RunControlReadWithParent {
+                own: None,
+                parent: None
+            });
+            count
+        ]
+    }
+
     fn reads(
         read: impl Fn(
             Vec<RunControlReadKey>,
@@ -363,6 +428,193 @@ mod tests {
         assert_eq!(first.unwrap().parent.unwrap().unwrap_err(), "parent-a");
         assert!(second.unwrap().parent.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_failure_does_not_delay_unhinted_observation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (start, gate, counter) = (entered.clone(), release.clone(), calls.clone());
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let joined = keys.iter().any(|key| key.parent_hint.is_some());
+                let (start, gate) = (start.clone(), gate.clone());
+                Box::pin(async move {
+                    if joined {
+                        assert!(keys.iter().all(|key| key.parent_hint.is_some()));
+                        start.notify_one();
+                        gate.notified().await;
+                        Err("injected joined failure".into())
+                    } else {
+                        Ok(empty_results(keys.len()))
+                    }
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let mut children = (0..4)
+            .map(|_| Box::pin(reader.get_with_parent("child-owner", "child", Some("parent"))))
+            .collect::<Vec<_>>();
+        for child in &mut children {
+            assert!(futures_util::poll!(child.as_mut()).is_pending());
+        }
+        let mut root = Box::pin(reader.get("root-owner", "root"));
+        assert!(futures_util::poll!(root.as_mut()).is_pending());
+
+        tokio::time::advance(COLLECTION_WINDOW).await;
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), root)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reader.state.lock().unwrap().outstanding, 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        release.notify_one();
+        assert!(
+            futures_util::future::join_all(children)
+                .await
+                .into_iter()
+                .all(|result| result.unwrap_err() == "injected joined failure")
+        );
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
+        assert!(reader.get("root-owner", "root").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_hints_remain_batched_and_mixed_groups_keep_owner_order() {
+        for hint_count in [3, 4] {
+            let batches = Arc::new(Mutex::new(Vec::new()));
+            let seen = batches.clone();
+            let reader = Arc::new(ControlReads {
+                read: Arc::new(move |keys| {
+                    seen.lock().unwrap().push(
+                        keys.iter()
+                            .map(|key| (key.key.run_id.clone(), key.parent_hint.is_some()))
+                            .collect::<Vec<_>>(),
+                    );
+                    Box::pin(async move { Ok(empty_results(keys.len())) })
+                }),
+                state: Mutex::new(State::default()),
+            });
+            let ids = (0..8).map(|i| format!("run-{i}")).collect::<Vec<_>>();
+            let mut pending = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let hint = (i % 2 == 0 && i / 2 < hint_count).then_some("parent");
+                    Box::pin(reader.get_with_parent("owner", id, hint))
+                })
+                .collect::<Vec<_>>();
+            for request in &mut pending {
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+            }
+            assert!(
+                futures_util::future::join_all(pending)
+                    .await
+                    .into_iter()
+                    .all(|result| result.unwrap().own.is_none())
+            );
+            let batches = batches.lock().unwrap();
+            if hint_count == 3 {
+                assert_eq!(batches.len(), 1, "sparse hints must not add a query");
+                assert_eq!(batches[0].len(), 8);
+            } else {
+                assert_eq!(batches.len(), 2);
+                assert_eq!(
+                    batches[0]
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["run-0", "run-2", "run-4", "run-6"]
+                );
+                assert_eq!(
+                    batches[1]
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["run-1", "run-3", "run-5", "run-7"]
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_hints_get_a_turn_under_other_owners_backlogs() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let open = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (start, gate, ready, in_flight, max_seen) = (
+            entered.clone(),
+            release.clone(),
+            open.clone(),
+            active.clone(),
+            peak.clone(),
+        );
+        let reader = Arc::new(ControlReads {
+            read: Arc::new(move |keys| {
+                let (start, gate, ready, in_flight, max_seen) = (
+                    start.clone(),
+                    gate.clone(),
+                    ready.clone(),
+                    in_flight.clone(),
+                    max_seen.clone(),
+                );
+                Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    if keys.iter().any(|key| key.parent_hint.is_some()) {
+                        start.notify_one();
+                    }
+                    if !ready.load(Ordering::SeqCst) {
+                        gate.notified().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(empty_results(keys.len()))
+                })
+            }),
+            state: Mutex::new(State::default()),
+        });
+        let mut pending: Vec<BoxFuture<'static, ()>> = Vec::new();
+        for i in 0..124 {
+            for _ in 0..4 {
+                let (reader, owner) = (reader.clone(), format!("root-{i}"));
+                let mut request: BoxFuture<'static, ()> = Box::pin(async move {
+                    reader.get(&owner, "root").await.unwrap();
+                });
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                pending.push(request);
+            }
+        }
+        for i in 0..4 {
+            let (reader, owner) = (reader.clone(), format!("child-{i}"));
+            let mut request: BoxFuture<'static, ()> = Box::pin(async move {
+                reader
+                    .get_with_parent(&owner, "child", Some("parent"))
+                    .await
+                    .unwrap();
+            });
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            pending.push(request);
+        }
+        tokio::time::advance(COLLECTION_WINDOW).await;
+        tokio::time::timeout(Duration::from_millis(100), entered.notified())
+            .await
+            .expect("deferred hints must not be starved by ready owners");
+        assert!(peak.load(Ordering::SeqCst) <= MAX_WORKERS);
+        open.store(true, Ordering::SeqCst);
+        release.notify_waiters();
+        futures_util::future::join_all(pending).await;
+        assert!(peak.load(Ordering::SeqCst) <= MAX_WORKERS);
+        assert_eq!(reader.state.lock().unwrap().outstanding, 0);
     }
 
     #[tokio::test(start_paused = true)]

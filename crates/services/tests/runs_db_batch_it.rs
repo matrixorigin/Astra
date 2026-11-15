@@ -1916,9 +1916,20 @@ async fn control_batch_reads_guidance_watermarks_without_event_queries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[ignore = "requires an explicitly designated isolated MatrixOne test database"]
 async fn control_batch_preserves_database_identity_positions_and_isolates_corruption() {
-    let (pool, store) = setup().await;
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let pool = isolated.pool.clone();
+    let store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
+    isolated
+        .run(control_batch_identity_positions_and_scan_plan(pool, store))
+        .await;
+}
+
+async fn control_batch_identity_positions_and_scan_plan(
+    pool: SharedPool,
+    store: Arc<DatabaseRunStateStore>,
+) {
     let nonce = uuid::Uuid::new_v4();
     let (user, other) = (format!("control-a-{nonce}"), format!("control-b-{nonce}"));
     let (run, bad) = (
@@ -1937,34 +1948,26 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
     sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status) VALUES (?,?,?,?,?,?,1,'running')")
         .bind(&user).bind(format!("session-{run}")).bind(&child).bind(&run).bind(&run)
         .bind(format!("/{run}/{child}")).execute(pool.get()).await.unwrap();
-    // MatrixOne inputRows counts storage rows before filtering, including
-    // unrelated rows sharing a candidate block. Bound scans by the population
-    // before injecting history, rather than by the number of requested keys.
+    // A fresh catalog keeps this fixture bounded and gives the scan assertion
+    // a known pre-history population, even after another test fails.
     let candidate_population: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
         .fetch_one(pool.get())
         .await
         .unwrap();
-    assert!(candidate_population >= 2);
-    // More history than the entire initial population ensures a missing
-    // candidate filter cannot pass the scan bound by reading that history.
-    let history_count = candidate_population + 256;
-    // Historical runs must not become work for unrelated active observations.
-    // Chunk the fixture so a populated database cannot exceed MySQL's bind limit.
-    for start in (0..history_count).step_by(1_000) {
-        let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
-        );
-        history.push_values(start..(start + 1_000).min(history_count), |mut row, i| {
-            let id = format!("control-history-{nonce}-{i}");
-            row.push_bind(&other)
-                .push_bind(format!("session-{bad}"))
-                .push_bind(id.clone())
-                .push_bind(id.clone())
-                .push_bind(format!("/{id}"))
-                .push_bind("completed");
-        });
-        history.build().execute(pool.get()).await.unwrap();
-    }
+    assert_eq!(candidate_population, 3);
+    let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
+    );
+    history.push_values(0..512, |mut row, i| {
+        let id = format!("control-history-{nonce}-{i}");
+        row.push_bind(&other)
+            .push_bind(format!("session-{bad}"))
+            .push_bind(id.clone())
+            .push_bind(id.clone())
+            .push_bind(format!("/{id}"))
+            .push_bind("completed");
+    });
+    history.build().execute(pool.get()).await.unwrap();
     let key = |user: &str, run: &str| RunControlReadKey {
         user_id: user.into(),
         run_id: run.into(),
@@ -2180,17 +2183,6 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
     );
     assert_eq!(results[0], results[5]);
     assert!(results[1].as_ref().unwrap().is_none());
-    for table in ["agent_runs", "agent_sessions"] {
-        for owner in [&user, &other] {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DELETE FROM {table} WHERE user_id=?"
-            )))
-            .bind(owner)
-            .execute(independent.get())
-            .await
-            .unwrap();
-        }
-    }
     independent.close().await;
 }
 
@@ -4411,6 +4403,12 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
                 keys[0].clone();
                 RUN_CONTROL_READ_BATCH_SIZE + 1
             ])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .load_run_control_batch(&vec![keys[0].key.clone(); RUN_CONTROL_READ_BATCH_SIZE + 1])
             .await
             .is_err()
     );

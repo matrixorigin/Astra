@@ -3643,6 +3643,15 @@ pub struct RunControlReadKey {
 
 pub const RUN_CONTROL_READ_BATCH_SIZE: usize = 128;
 pub const RUN_CONTROL_READ_MAX_KEY_BYTES: usize = 512;
+pub const RUN_CONTROL_READ_MIN_PARENT_HINTS: usize = 4;
+
+fn check_run_control_batch_size(size: usize) -> Result<(), String> {
+    if size > RUN_CONTROL_READ_BATCH_SIZE {
+        return Err("run control read batch exceeds capacity".into());
+    }
+    Ok(())
+}
+
 pub type RunControlReadResult = Result<Option<DurableRunControlRecord>, String>;
 
 /// An optional parent is only a bounded lookup hint; durable lineage remains
@@ -6765,9 +6774,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         keys: &[RunControlReadKey],
     ) -> Result<Vec<RunControlReadResult>, String> {
-        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
-            return Err("run control read batch exceeds capacity".into());
-        }
+        check_run_control_batch_size(keys.len())?;
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
             results.push(self.load_run_control(&key.user_id, &key.run_id).await);
@@ -6781,6 +6788,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         keys: &[RunControlReadKeyWithParent],
     ) -> Result<Vec<RunControlReadWithParentResult>, String> {
+        check_run_control_batch_size(keys.len())?;
         let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
         Ok(self
             .load_run_control_batch(&original)
@@ -19440,6 +19448,7 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         keys: &[RunControlReadKey],
     ) -> Result<Vec<RunControlReadResult>, String> {
+        check_run_control_batch_size(keys.len())?;
         let keys = keys
             .iter()
             .cloned()
@@ -19460,21 +19469,18 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         keys: &[RunControlReadKeyWithParent],
     ) -> Result<Vec<RunControlReadWithParentResult>, String> {
-        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
-            return Err("run control read batch exceeds capacity".into());
-        }
+        check_run_control_batch_size(keys.len())?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         // A parent join for only one or two children can cost more than the
         // existing indexed reads. Keep sparse batches on the original path.
-        const MIN_PARENT_HINTS: usize = 4;
         let has_parents = keys
             .iter()
             .filter(|key| key.bounded_parent_hint().is_some())
-            .take(MIN_PARENT_HINTS)
+            .take(RUN_CONTROL_READ_MIN_PARENT_HINTS)
             .count()
-            == MIN_PARENT_HINTS;
+            == RUN_CONTROL_READ_MIN_PARENT_HINTS;
         let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
         query
             .push(if has_parents {
@@ -48290,6 +48296,20 @@ mod tests {
             assert_eq!(control.last_event_idx, 3);
         }
         assert!(results[2].as_ref().unwrap().is_none());
+
+        let oversized = vec![
+            RunControlReadKeyWithParent {
+                key: key("u1"),
+                parent_hint: None,
+            };
+            RUN_CONTROL_READ_BATCH_SIZE + 1
+        ];
+        assert!(
+            store
+                .load_run_control_batch_with_parents(&oversized)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

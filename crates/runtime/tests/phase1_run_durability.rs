@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+#[path = "../../services/tests/common/mysql_response_proxy.rs"]
+mod mysql_response_proxy;
 mod test_support;
 
 use std::sync::Arc;
@@ -1117,6 +1120,61 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
             assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
         }
     }
+    // Withhold only the joined response. A different owner's unhinted
+    // cancellation must still be observable before that query times out.
+    use astra_runtime::turn::run_control::RunStatusProvider;
+    use mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let other_user = format!("obs-qa-other-u-{nonce}");
+    let other_session = format!("obs-qa-other-s-{nonce}");
+    let other_root = format!("obs-qa-other-r-{nonce}");
+    insert_session(&writer_pool, &other_user, &other_session).await;
+    writer
+        .start_run(&other_root, &other_user, &other_session)
+        .await
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&other_user, &other_root)
+            .await
+            .unwrap()
+    );
+
+    let settings = observer_pool.settings();
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(settings, proxy.port, 2).await;
+    let fault_engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(fault_pool.clone())));
+    let mut children = Box::pin(hinted_statuses(&fault_engine, &user, &child, &root));
+    let mut other_observation =
+        Box::pin(fault_engine.control_observation(&other_user, &other_root));
+    assert!(futures_util::poll!(children.as_mut()).is_pending());
+    assert!(futures_util::poll!(other_observation.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+        .await
+        .expect("joined response was not gated");
+    let observed = tokio::time::timeout(Duration::from_secs(2), other_observation)
+        .await
+        .expect("unhinted root must not wait for joined query")
+        .unwrap();
+    assert_eq!(observed.status, Some(RunControlStatus::Cancelled));
+    let failed = tokio::time::timeout(Duration::from_secs(5), children)
+        .await
+        .unwrap();
+    assert!(
+        failed
+            .into_iter()
+            .all(|result| result.unwrap_err().contains("batch query timed out"))
+    );
+    proxy.gate.release.notify_one();
+    for result in hinted_statuses(&fault_engine, &user, &child, &root).await {
+        assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+    }
+    fault_pool.close().await;
+
     sqlx::query("DELETE FROM agent_runs WHERE user_id=? AND run_id=?")
         .bind(&user)
         .bind(&root)
@@ -1136,11 +1194,13 @@ async fn control_observation_sees_fresh_cross_engine_parent_changes() {
         "agent_sessions",
     ] {
         let sql = format!("DELETE FROM {table} WHERE user_id=?");
-        sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(&user)
-            .execute(writer_pool.get())
-            .await
-            .unwrap();
+        for owner in [&user, &other_user] {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .bind(owner)
+                .execute(writer_pool.get())
+                .await
+                .unwrap();
+        }
     }
     writer_pool.close().await;
 }

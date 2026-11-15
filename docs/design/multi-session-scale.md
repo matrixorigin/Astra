@@ -123,8 +123,12 @@ three-second deadline and callers have a four-second overall read budget.
 A direct child's watcher may supply the parent already loaded during
 materialization as an untrusted lookup hint. A batch with at least four
 bounded hints reads matching parents in the same owner-scoped query; smaller
-batches retain the indexed ancestor read. The consumer validates the current
-durable lineage before using a prefetched result, and missing, stale or
+batches retain the indexed ancestor read. When such a batch also contains
+unhinted requests, the existing queue dispatches the two groups independently,
+so a joined-query error does not directly fail an unhinted observation. Both
+groups still share the four workers and their capacity. Restored requests keep
+their original admission and deadline. The consumer validates durable lineage before using
+a prefetched result, and missing, stale or
 unsupported hints use the existing ancestor path. A failed joined query is
 reported and retried by the existing watcher, without issuing a second query
 for an uncertain outcome. Root-only batches retain their original SQL.
