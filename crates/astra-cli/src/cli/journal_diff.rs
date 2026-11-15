@@ -52,9 +52,8 @@ pub struct JournalDiff {
     /// level diff: "A called [Read, Grep, Read]; B called [Read, Read]".
     pub a_tool_sequence: Vec<String>,
     pub b_tool_sequence: Vec<String>,
-    /// Executed tool calls per run. Taken from each turn's authoritative
-    /// `tool_count` aggregate, so it stays correct when per-call detail
-    /// (`tool_calls`) was not recorded (e.g. server-owned CLI turns).
+    /// Executed tool calls per run, using terminal counts or consistent outcome
+    /// summaries even when per-call detail was not recorded.
     pub a_tool_calls_executed: u64,
     pub b_tool_calls_executed: u64,
     /// False when the run executed more calls than its per-call detail
@@ -463,18 +462,7 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         }
     }
     for (idx, event) in events.iter().enumerate().filter(|(_, e)| is_terminal(e)) {
-        if event.tool_count.is_none() {
-            out.complete = false;
-        }
-        if event
-            .tool_outcomes
-            .as_ref()
-            .is_some_and(|outcomes| outcomes.unknown > 0)
-            || event.tool_calls.iter().flatten().any(|call| {
-                call.effective_disposition()
-                    == astra_services::session_journal::ToolCallDisposition::Unknown
-            })
-        {
+        if !super::journal_digest::terminal_execution_complete(event) {
             out.complete = false;
         }
         let rounds = owned.remove(&idx).unwrap_or_default();
@@ -585,7 +573,7 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
                 detailed += u64::from(call.was_executed());
             }
         }
-        let executed = event.tool_count.map(u64::from).unwrap_or(detailed);
+        let executed = super::journal_digest::terminal_execution_count(event).unwrap_or(detailed);
         if detailed != executed {
             out.complete = false;
         }
@@ -603,9 +591,9 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         let terminal_floor = events
             .iter()
             .filter(|event| is_terminal(event))
-            .filter_map(|event| event.tool_count)
+            .filter_map(super::journal_digest::terminal_execution_count)
             .max()
-            .unwrap_or(0) as u64;
+            .unwrap_or(0);
         let mut identities = std::collections::HashSet::new();
         let mut any_unidentified = false;
         for event in events {
@@ -1976,6 +1964,11 @@ mod tests {
                     let mut calls = vec![read, failed];
                     calls.truncate(with_detail);
                     event = event.with_tool_calls(calls);
+                    if with_detail < 2 {
+                        // The constructor summarized only the retained records;
+                        // it cannot represent the complete remote outcome summary.
+                        event.tool_outcomes = None;
+                    }
                 }
                 // Partial terminal data keeps its independent executed aggregate.
                 event.tool_count = Some(2);

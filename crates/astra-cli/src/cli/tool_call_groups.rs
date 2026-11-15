@@ -1,6 +1,15 @@
-use crate::cli::journal_digest::semantic_outcome;
-use astra_services::session_journal::ToolCallRecord;
-use astra_turn_core::tool_result_semantics::ToolResultEvidence;
+use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+/// Producer-owned status is independent of the contents of the result body.
+pub(super) fn observed_outcome(call: &ToolCallRecord) -> Option<bool> {
+    (!call.outcome_is_unknown()).then_some(
+        !matches!(
+            call.effective_disposition(),
+            ToolCallDisposition::Rejected | ToolCallDisposition::Deferred
+        ) && call.ok
+            && call.execution_ok != Some(false),
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallGroup<'a> {
@@ -14,10 +23,10 @@ impl ToolCallGroup<'_> {
     pub(crate) fn outcome_counts(&self) -> (usize, usize, usize) {
         let (mut ok, mut fail, mut unknown) = (0, 0, 0);
         for call in &self.calls {
-            match semantic_outcome(call) {
-                ToolResultEvidence::Succeeded => ok += 1,
-                ToolResultEvidence::Failed => fail += 1,
-                ToolResultEvidence::Unknown => unknown += 1,
+            match observed_outcome(call) {
+                Some(true) => ok += 1,
+                Some(false) => fail += 1,
+                None => unknown += 1,
             }
         }
         (ok, fail, unknown)
@@ -100,7 +109,7 @@ mod tests {
     fn unknown_outcomes_are_not_counted_as_success_or_failure() {
         let mut success = make_call("read_file");
         success.batch_id = Some("batch".into());
-        success.result_full = Some(r#"{"ok":true}"#.into());
+        success.result_full = Some(r#"{"ok":false}"#.into());
         success.output_bytes = Some(success.result_full.as_ref().unwrap().len() as u32);
         let mut unknown = make_call("bash");
         unknown.batch_id = Some("batch".into());

@@ -144,16 +144,17 @@ totals carry their own coverage, and an unavailable supplemental journal is
 reported without discarding valid local evidence. Replayed terminal records are
 counted once; contradictory terminals for an attempt are excluded. A scalar
 execution count does not establish success, failure, or cache outcomes.
-Incomplete outcome totals report observed semantic records, not inferred
-success or failure from a partial transport summary. A successful transport
-does not establish semantic success when the retained body is missing,
-truncated, redacted, or lacks an explicit success contract. Tool calls per
-round and average rounds require complete counts for the same root attempts;
-an unavailable count remains unknown. Tree
+Incomplete outcome totals report retained producer facts, not inferred
+success or failure from tool output. Truncation, redaction or missing output
+does not erase a typed outcome; explicit execution uncertainty remains unknown.
+Executed calls exclude rejected, deferred, reused and suppressed requests.
+Tool calls per round and average rounds require complete counts for the same
+root attempts; an unavailable count remains unknown. Tree
 output uses `astra-journal-tree-v2`, with unresolved parents shown separately.
 
-`journal diff` reports known executed tool calls from terminal `tool_count`,
-with unowned per-call execution evidence retained separately. Its ordered tool
+`journal diff` reports known executed tool calls from terminal `tool_count` or
+a consistent outcome summary, with unowned per-call execution evidence retained
+separately. Its ordered tool
 sequence includes executed records only; rejected, reused, suppressed and
 deferred records are not executions. Aggregate-only turns and unresolved
 executed observations without sufficient identity make the sequence incomplete.

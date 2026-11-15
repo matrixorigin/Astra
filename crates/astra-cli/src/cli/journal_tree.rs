@@ -163,7 +163,7 @@ pub(crate) fn fold_events_into_tree(
             && events
                 .iter()
                 .filter(|event| journal_digest::is_root_terminal(event))
-                .all(|event| event.tool_count.is_some())
+                .all(journal_digest::terminal_execution_complete)
             && !observation_incomplete
             && journal_digest::root_tool_observations_reconciled(events),
         children: Vec::new(),
@@ -173,10 +173,13 @@ pub(crate) fn fold_events_into_tree(
     // can incorrectly settle a different delegation or agent.
     let mut nodes: Vec<(DelegationNode, Option<String>, u64)> = Vec::new();
     let mut by_run_id = HashMap::new();
+    let mut ambiguous_run_ids = std::collections::HashSet::new();
     let mut skipped: u32 = 0;
     for ev in events {
         if journal_digest::is_root_terminal(ev) {
-            root.tool_calls = root.tool_calls.saturating_add(ev.tool_count.unwrap_or(0));
+            root.tool_calls = root.tool_calls.saturating_add(
+                journal_digest::reported_executions(ev).min(u64::from(u32::MAX)) as u32,
+            );
         }
         match ev.event_type {
             JournalEventType::Turn | JournalEventType::LlmRound
@@ -193,7 +196,12 @@ pub(crate) fn fold_events_into_tree(
             JournalEventType::DelegationSubRunStarted => {
                 let projection = project_delegation_sub_run_started(ev.metadata.as_ref());
                 let run_id = projection.sub_run_id;
-                if run_id.trim().is_empty() || by_run_id.contains_key(&run_id) {
+                if run_id.trim().is_empty() {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                if by_run_id.contains_key(&run_id) {
+                    ambiguous_run_ids.insert(run_id);
                     skipped = skipped.saturating_add(1);
                     continue;
                 }
@@ -314,22 +322,53 @@ pub(crate) fn fold_events_into_tree(
     // Depth belongs to the producer contract. Enforce increasing depth and a
     // bound when rendering a damaged journal so cycles cannot recurse forever.
     const MAX_RENDER_DEPTH: u64 = 64;
+    let root_runs: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|event| {
+            journal_digest::is_root_terminal(event)
+                || (matches!(
+                    event.event_type,
+                    JournalEventType::LlmRound | JournalEventType::SessionStart
+                ) && !journal_digest::is_child_producer(event))
+        })
+        .filter_map(|event| {
+            let scoped = event
+                .producer_scope
+                .as_ref()
+                .map(|scope| scope.run_id.as_str());
+            let recorded = event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("run_id"))
+                .and_then(serde_json::Value::as_str);
+            if scoped
+                .zip(recorded)
+                .is_some_and(|(left, right)| left != right)
+            {
+                return None;
+            }
+            journal_digest::producer_run_id(event)
+        })
+        .collect();
     let mut children = vec![Vec::new(); nodes.len()];
     let mut root_indices = Vec::new();
     let mut unattached = Vec::new();
     for (idx, (node, _, depth)) in nodes.iter().enumerate() {
-        if *depth == 1
+        if !ambiguous_run_ids.contains(&node.id)
+            && *depth == 1
             && node
                 .parent_run_id
                 .as_deref()
-                .is_some_and(|id| !by_run_id.contains_key(id))
+                .is_some_and(|id| root_runs.contains(id) && !by_run_id.contains_key(id))
         {
             root_indices.push(idx);
-        } else if *depth > 1
+        } else if !ambiguous_run_ids.contains(&node.id)
+            && *depth > 1
             && *depth <= MAX_RENDER_DEPTH
             && let Some(&parent) = node
                 .parent_run_id
                 .as_deref()
+                .filter(|id| !ambiguous_run_ids.contains(*id))
                 .and_then(|id| by_run_id.get(id))
             && nodes[parent].2.checked_add(1) == Some(*depth)
         {
@@ -501,6 +540,7 @@ mod tests {
             "type": "turn",
             "ts": ts,
             "session_id": "sess-1",
+            "producer_scope": {"run_id":"root-run"},
             "turn": 1,
             "model": model,
             "tokens_in": prompt,
@@ -665,6 +705,7 @@ mod tests {
         assert!(!root.tool_calls_complete);
 
         child.metadata = Some(json!({"purpose": "sub_agent", "run_id": "run-A"}));
+        child.producer_scope.as_mut().unwrap().run_id = "run-A".into();
         let (root, _, _) = fold_events_into_tree(
             "sess-1",
             &[
@@ -769,6 +810,7 @@ mod tests {
             None,
         );
         let events = vec![
+            turn_event("t0", 0, 0, "root"),
             sub_started("t1", "run-A", "coder"),
             nested,
             wrong_completion,
@@ -780,6 +822,45 @@ mod tests {
         assert_eq!(root.children[0].children[0].ended_at, None);
         assert_eq!(root.unattached[0].id, "orphan");
         assert!(render_text(&root).contains("unattached sub-runs"));
+    }
+
+    #[test]
+    fn only_known_root_runs_can_parent_top_level_children() {
+        let mut other_root = turn_event("t0", 0, 0, "root");
+        other_root.producer_scope.as_mut().unwrap().run_id = "other-root".into();
+        let mut unattached = sub_started("t3", "orphan", "worker");
+        unattached.metadata.as_mut().unwrap()["parent_run_id"] = json!("missing-root");
+        let mut other_child = sub_started("t2", "other-child", "worker");
+        other_child.metadata.as_mut().unwrap()["parent_run_id"] = json!("other-root");
+        // Events can arrive out of order; both explicit root identities remain usable.
+        let events = vec![
+            unattached,
+            other_child,
+            sub_started("t1", "run-A", "coder"),
+            other_root,
+            turn_event("t0", 0, 0, "root"),
+        ];
+        let (root, _, _) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(
+            root.children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["other-child", "run-A"]
+        );
+        assert_eq!(root.unattached[0].id, "orphan");
+
+        // Conflicting root identities cannot establish either parent.
+        let mut conflict = turn_event("t0", 0, 0, "root");
+        conflict.metadata = Some(json!({"run_id":"other-root"}));
+        let (root, _, _) =
+            fold_events_into_tree("sess-1", &[conflict, sub_started("t1", "run-A", "coder")]);
+        assert!(root.children.is_empty());
+        assert_eq!(root.unattached[0].id, "run-A");
+
+        let (root, _, _) = fold_events_into_tree("sess-1", &[sub_started("t1", "run-A", "coder")]);
+        assert!(root.children.is_empty());
+        assert_eq!(root.unattached[0].id, "run-A");
     }
 
     #[test]
@@ -866,28 +947,36 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_run_id_in_started_events_counts_as_skipped() {
-        // Two DelegationSubRunStarted with the same run_id: the second
-        // must NOT silently overwrite the first's index in by_run_id.
-        // Instead, increment skipped so the operator notices the
-        // journal anomaly.
+    fn duplicate_run_ids_do_not_establish_a_parent() {
+        let mut nested = JournalEvent::delegation_sub_run_started(
+            Some("sess-1"),
+            "nested",
+            "nested-run",
+            "run-DUP",
+            "worker",
+            "running",
+            2,
+            None,
+        );
+        nested.ts = "t4".into();
         let events = vec![
+            turn_event("t0", 0, 0, "root"),
             sub_started("t1", "run-DUP", "coder"),
             sub_started("t2", "run-DUP", "reviewer"),
             sub_completed("t3", "run-DUP"),
+            nested,
         ];
         let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
-        assert!(
-            skipped >= 1,
-            "duplicate run_id must be counted as skipped, got skipped={skipped}"
-        );
-        // Only the first child with that run_id should exist.
+        assert!(skipped >= 1);
+        assert!(root.children.is_empty());
         assert_eq!(
-            root.children.len(),
-            1,
-            "duplicate run_id must not create a second child"
+            root.unattached
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-DUP", "nested-run"]
         );
-        assert_eq!(root.children[0].label, "coder");
+        assert!(root.unattached[0].children.is_empty());
     }
 
     #[test]

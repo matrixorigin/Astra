@@ -511,13 +511,12 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 digest.aggregates.reported_root_tool_calls,
                 u64::from(root_callbacks)
             );
-            // A delivered plain-text body is retained, but does not prove a
-            // semantic success without an explicit result contract.
-            assert_eq!(digest.aggregates.reported_root_fresh_tool_calls, 0);
+            // The producer records callback outcomes independently of their bodies.
             assert_eq!(
-                digest.aggregates.reported_root_tool_outcomes_unknown,
+                digest.aggregates.reported_root_fresh_tool_calls,
                 u64::from(root_callbacks)
             );
+            assert_eq!(digest.aggregates.reported_root_tool_outcomes_unknown, 0);
             assert!(!digest.aggregates.root_tool_totals_complete);
             continue;
         }
