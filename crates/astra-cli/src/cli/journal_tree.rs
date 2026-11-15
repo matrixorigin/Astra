@@ -112,6 +112,8 @@ pub(crate) fn fold_events_with_coverage(
     let (mut root, total, skipped) = fold_events_into_tree(session_id, events);
     if incomplete {
         mark_coverage_incomplete(&mut root);
+        root.tool_calls = super::journal_diff::confirmed_execution_floor(events.iter())
+            .min(u64::from(u32::MAX)) as u32;
     }
     (root, total, skipped)
 }
@@ -205,7 +207,9 @@ pub(crate) fn fold_events_into_tree(
                     skipped = skipped.saturating_add(1);
                     continue;
                 }
-                let agent_id = (projection.agent_id != "?").then_some(projection.agent_id);
+                let agent_id = (projection.agent_id != "?"
+                    && !projection.agent_id.trim().is_empty())
+                .then_some(projection.agent_id);
                 let label = agent_id
                     .clone()
                     .unwrap_or_else(|| format!("delegate#{}", nodes.len() + 1));
@@ -251,30 +255,37 @@ pub(crate) fn fold_events_into_tree(
                 by_run_id.insert(run_id, nodes.len());
                 nodes.push((node, delegation_id, depth));
             }
-            JournalEventType::DelegationSubRunCompleted => {
-                let projection = project_delegation_sub_run_completed(ev.metadata.as_ref());
-                let Some(&idx) = by_run_id.get(&projection.sub_run_id) else {
-                    skipped = skipped.saturating_add(1);
-                    continue;
-                };
-                let (node, delegation, _) = &mut nodes[idx];
-                let completed_delegation = ev
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("delegation_id"))
-                    .and_then(serde_json::Value::as_str);
-                if node.ended_at.is_some()
-                    || node.agent_id.as_deref() != Some(projection.agent_id.as_str())
-                    || delegation.as_deref().is_none()
-                    || delegation.as_deref() != completed_delegation
-                {
-                    skipped = skipped.saturating_add(1);
-                    continue;
-                }
-                node.ended_at = Some(ev.ts.clone());
-            }
             _ => {}
         }
+    }
+
+    // Resolve completions after indexing all starts so a later conflicting
+    // start cannot make an earlier completion belong to the wrong node.
+    for ev in events
+        .iter()
+        .filter(|ev| ev.event_type == JournalEventType::DelegationSubRunCompleted)
+    {
+        let projection = project_delegation_sub_run_completed(ev.metadata.as_ref());
+        let Some(&idx) = by_run_id.get(&projection.sub_run_id) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let (node, delegation, _) = &mut nodes[idx];
+        let completed_delegation = ev
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("delegation_id"))
+            .and_then(serde_json::Value::as_str);
+        if ambiguous_run_ids.contains(&projection.sub_run_id)
+            || node.ended_at.is_some()
+            || node.agent_id.as_deref() != Some(projection.agent_id.as_str())
+            || delegation.as_deref().is_none()
+            || delegation.as_deref() != completed_delegation
+        {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        node.ended_at = Some(ev.ts.clone());
     }
 
     // Child LLM rounds are observations, not terminal accounting. A delegated
@@ -299,11 +310,35 @@ pub(crate) fn fold_events_into_tree(
             continue;
         }
         has_child_observation = true;
-        let Some(&idx) = journal_digest::producer_run_id(event).and_then(|id| by_run_id.get(id))
-        else {
+        let Some(run_id) = journal_digest::producer_run_id(event) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let Some(&idx) = by_run_id.get(run_id) else {
+            skipped = skipped.saturating_add(1);
             continue;
         };
         let node = &mut nodes[idx].0;
+        let scope = event.producer_scope.as_ref();
+        if ambiguous_run_ids.contains(run_id)
+            || scope.is_some_and(|scope| {
+                scope
+                    .parent_run_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .zip(node.parent_run_id.as_deref())
+                    .is_some_and(|(observed, started)| observed != started)
+                    || scope
+                        .agent_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .zip(node.agent_id.as_deref())
+                        .is_some_and(|(observed, started)| observed != started)
+            })
+        {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         if node.model.is_none() {
             node.model.clone_from(&event.model);
         }
@@ -407,6 +442,10 @@ pub(crate) fn fold_events_into_tree(
         root.prompt_tokens_complete = false;
         root.completion_tokens_complete = false;
         root.tool_calls_complete = false;
+    }
+    if !root.tool_calls_complete {
+        root.tool_calls = super::journal_diff::confirmed_execution_floor(events.iter())
+            .min(u64::from(u32::MAX)) as u32;
     }
     (root, events.len() as u32, skipped)
 }
@@ -662,16 +701,18 @@ mod tests {
     }
 
     #[test]
-    fn tree_counts_root_terminals_without_round_or_child_duplicates() {
+    fn tree_uses_a_lower_bound_for_partially_observed_execution() {
         let mut turn = turn_event("t1", 100, 10, "sonnet");
         turn.tool_count = Some(541);
         let mut round = turn.clone();
         round.event_type = astra_services::session_journal::JournalEventType::LlmRound;
         let mut failed = turn_event("t2", 20, 2, "sonnet");
         failed.event_type = astra_services::session_journal::JournalEventType::TurnError;
+        failed.turn = Some(2);
         failed.tool_count = Some(9);
-        failed.producer_scope =
-            Some(serde_json::from_value(json!({"run_id":"root-run", "agent_id":"root"})).unwrap());
+        failed.producer_scope = Some(
+            serde_json::from_value(json!({"run_id":"other-root", "agent_id":"root"})).unwrap(),
+        );
         let child = child_round("t3", "run-A", "coder", 20, 2);
         let events = vec![
             round,
@@ -683,10 +724,11 @@ mod tests {
         ];
         let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
         assert_eq!(skipped, 0);
-        assert_eq!(root.tool_calls, 550);
+        // Without invocation identities, the two terminal reports might overlap.
+        assert_eq!(root.tool_calls, 541);
         assert_eq!(root.children[0].tool_calls, 0);
         assert!(!root.children[0].tool_calls_complete);
-        assert!(render_text(&root).contains("tool_calls=partial(550)\n"));
+        assert!(render_text(&root).contains("tool_calls=partial(541)\n"));
     }
 
     #[test]
@@ -723,13 +765,46 @@ mod tests {
     }
 
     #[test]
-    fn tree_preserves_explicit_zero_even_with_tool_detail() {
+    fn tree_does_not_certify_a_zero_that_contradicts_executed_detail() {
         let mut turn = turn_event("t1", 0, 0, "sonnet");
         turn.tool_count = Some(0);
         turn.tool_calls =
             Some(serde_json::from_value(json!([{"name":"read_file", "ok":true, "ms":1}])).unwrap());
         let (root, _, _) = fold_events_into_tree("sess-1", &[turn]);
+        assert_eq!(root.tool_calls, 1);
+        assert!(!root.tool_calls_complete);
+
+        let mut rejected = turn_event("t1", 0, 0, "sonnet");
+        rejected.tool_count = Some(0);
+        rejected.tool_calls = Some(
+            serde_json::from_value(json!([{"name":"read_file", "ok":false, "ms":0,
+                "disposition":"rejected"}]))
+            .unwrap(),
+        );
+        let (root, _, _) = fold_events_into_tree("sess-1", &[rejected]);
         assert_eq!(root.tool_calls, 0);
+        assert!(root.tool_calls_complete);
+    }
+
+    #[test]
+    fn incomplete_tree_keeps_identified_child_execution_evidence() {
+        let mut turn = turn_event("t1", 0, 0, "root");
+        turn.tool_count = Some(0);
+        let mut child = child_round("t3", "run-A", "coder", 10, 1);
+        child.tool_calls = Some(
+            serde_json::from_value(json!([{"name":"bash","ok":true,"ms":1,
+                "tool_call_id":"call","invocation_identity":{"user_id":"owner",
+                "session_id":"sess-1","run_id":"run-A","turn_chain_id":"chain",
+                "invocation_id":"call"}}]))
+            .unwrap(),
+        );
+        let events = [turn, sub_started("t2", "run-A", "coder"), child];
+        let (root, _, _) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(root.tool_calls, 1);
+        assert!(!root.tool_calls_complete);
+        let diff = crate::cli::journal_diff::diff_events("sess-1", "other", &events, &[]);
+        assert_eq!(diff.a_tool_calls_executed, 1);
+        assert!(!diff.a_tool_sequence_complete);
     }
 
     #[test]

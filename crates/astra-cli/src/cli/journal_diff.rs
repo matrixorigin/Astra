@@ -125,6 +125,7 @@ pub(crate) fn diff_events_with_coverage(
             diff.a_tokens.completion_complete = false;
             diff.a_tokens.total_complete = false;
             diff.a_tool_sequence_complete = false;
+            diff.a_tool_calls_executed = confirmed_execution_floor(a_events.iter());
         }
         if b_incomplete {
             diff.b_observation_incomplete = true;
@@ -132,6 +133,7 @@ pub(crate) fn diff_events_with_coverage(
             diff.b_tokens.completion_complete = false;
             diff.b_tokens.total_complete = false;
             diff.b_tool_sequence_complete = false;
+            diff.b_tool_calls_executed = confirmed_execution_floor(b_events.iter());
         }
         diff.token_deltas = TokenDeltas::default();
     }
@@ -349,6 +351,36 @@ pub(super) fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Op
 
 pub(super) fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
     a.name == b.name && a.was_executed() == b.was_executed()
+}
+
+/// Independently supported execution evidence can overlap. Only canonical
+/// identities establish distinct calls, and a contradictory terminal cannot
+/// establish a count merely by reporting one.
+pub(super) fn confirmed_execution_floor<'a>(events: impl Iterator<Item = &'a JournalEvent>) -> u64 {
+    let mut terminal_floor = 0;
+    let mut identities = std::collections::HashSet::new();
+    let mut any_unidentified = false;
+    for event in events {
+        if is_terminal(event) && journal_digest::terminal_execution_consistent(event) {
+            terminal_floor = terminal_floor
+                .max(journal_digest::terminal_execution_count(event).unwrap_or_default());
+        }
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| call.was_executed())
+        {
+            if let Some(identity) = call_key(event, call) {
+                identities.insert(identity);
+            } else {
+                any_unidentified = true;
+            }
+        }
+    }
+    terminal_floor
+        .max(identities.len() as u64)
+        .max(u64::from(any_unidentified))
 }
 
 /// A matching round owns call order, independently of error persistence order.
@@ -585,34 +617,7 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         .map(|call| call.name.clone())
         .collect();
     if !out.complete {
-        // Overlapping aggregates and observations cannot be added safely.
-        // Each terminal count, and the set of canonical invocation identities,
-        // independently establishes a lower bound.
-        let terminal_floor = events
-            .iter()
-            .filter(|event| is_terminal(event))
-            .filter_map(super::journal_digest::terminal_execution_count)
-            .max()
-            .unwrap_or(0);
-        let mut identities = std::collections::HashSet::new();
-        let mut any_unidentified = false;
-        for event in events {
-            for call in event
-                .tool_calls
-                .iter()
-                .flatten()
-                .filter(|call| call.was_executed())
-            {
-                if let Some(identity) = call_key(event, call) {
-                    identities.insert(identity);
-                } else {
-                    any_unidentified = true;
-                }
-            }
-        }
-        out.executed = terminal_floor
-            .max(identities.len() as u64)
-            .max(u64::from(any_unidentified));
+        out.executed = confirmed_execution_floor(events.iter());
     }
     out
 }

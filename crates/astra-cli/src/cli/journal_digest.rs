@@ -556,11 +556,9 @@ pub(super) fn terminal_execution_consistent(event: &session_journal::JournalEven
     };
     let calls = event.tool_calls.as_deref().unwrap_or_default();
     let mut observed = buckets(&session_journal::ToolOutcomeSummary::from_records(calls));
-    if fits(observed) {
-        return true;
-    }
     // Replayed records with the same canonical identity are one observation.
-    // Resolve duplicates only on the contradictory path and never clone bodies.
+    // Check for conflicting outcomes even when the raw record counts fit the
+    // reported buckets. Never clone potentially large result bodies.
     let mut seen = std::collections::HashMap::new();
     for call in calls {
         let Some(key) = call_key(event, call) else {
@@ -618,14 +616,8 @@ pub(super) fn terminal_execution_complete(event: &session_journal::JournalEvent)
 }
 
 pub(super) fn reported_executions(event: &session_journal::JournalEvent) -> u64 {
-    terminal_execution_count(event).unwrap_or_else(|| {
-        event
-            .tool_calls
-            .iter()
-            .flatten()
-            .filter(|call| call.was_executed())
-            .count() as u64
-    })
+    terminal_execution_count(event)
+        .unwrap_or_else(|| super::journal_diff::confirmed_execution_floor(std::iter::once(event)))
 }
 
 /// A terminal aggregate cannot silently absorb an unrelated round/error
@@ -824,8 +816,14 @@ fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity>
         .filter(|scope| !scope.run_id.trim().is_empty())?;
     is_child_producer(ev).then(|| SubrunIdentity {
         run_id: scope.run_id.clone(),
-        parent_run_id: scope.parent_run_id.clone(),
-        agent_id: scope.agent_id.clone(),
+        parent_run_id: scope
+            .parent_run_id
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        agent_id: scope
+            .agent_id
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
         local_turn: scope.local_turn,
     })
 }
@@ -1637,7 +1635,7 @@ fn build_digest_with_owners(
     let mut session_start_count = 0usize;
     let mut session_end_count = 0usize;
     let mut failed_tool_calls: Vec<FailedToolCall> = Vec::new();
-    let mut subruns_by_run: std::collections::BTreeMap<String, SubrunRow> =
+    let mut subruns_by_scope: std::collections::BTreeMap<_, SubrunRow> =
         std::collections::BTreeMap::new();
     let mut subrun_ids = std::collections::BTreeSet::new();
     let mut subrun_total_tokens_in = 0u64;
@@ -2029,8 +2027,12 @@ fn build_digest_with_owners(
                     if matches!(focus, DigestFocus::All) {
                         let mut round = llm_round_row(ev);
                         round.local_turn = identity.local_turn;
-                        subruns_by_run
-                            .entry(identity.run_id.clone())
+                        subruns_by_scope
+                            .entry((
+                                identity.run_id.clone(),
+                                identity.parent_run_id.clone(),
+                                identity.agent_id.clone(),
+                            ))
                             .or_insert_with(|| SubrunRow {
                                 run_id: identity.run_id,
                                 parent_run_id: identity.parent_run_id,
@@ -2181,7 +2183,7 @@ fn build_digest_with_owners(
                 .then(|| reported_root_tool_calls as f64 / total_root_llm_rounds as f64),
         },
         turns: turns_out,
-        subruns: subruns_by_run.into_values().collect(),
+        subruns: subruns_by_scope.into_values().collect(),
         compaction_events,
         stalls,
         interruptions,

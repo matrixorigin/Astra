@@ -273,6 +273,33 @@ fn replayed_and_conflicting_terminals_never_inflate_analysis() {
             assert!(digest["turns"][0]["tool_calls_fresh"].is_null());
         }
     }
+
+    // Conflicting terminal reports for one attempt are removed before any
+    // projection. An independently retained round can still witness a call.
+    let call = json!({"name":"bash","ok":true,"ms":1,"tool_call_id":"a",
+        "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"root-run",
+            "turn_chain_id":"chain","invocation_id":"a"}});
+    let summary = |count| {
+        json!({"requested":count,"executed":count,"succeeded":count,
+        "failed":0,"started_unknown":0,"unknown":0,"rejected":0,"reused":0,
+        "suppressed":0,"deferred":0})
+    };
+    let first = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"tool_count":1,"tool_outcomes":summary(1),
+        "tool_calls":[call]});
+    let mut conflicting = first.clone();
+    conflicting["ts"] = json!("t2");
+    conflicting["tool_count"] = json!(2);
+    conflicting["tool_outcomes"] = summary(2);
+    let round = json!({"type":"llm_round","ts":"t0","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"root-run"},"tool_calls":[call]});
+    std::fs::write(&path, format!("{round}\n{first}\n{conflicting}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
 }
 
 #[cfg(unix)]
@@ -594,7 +621,7 @@ fn execution_counts_agree_across_commands_with_nonexecuted_requests() {
 
     // Partial detail is still evidence: it must not be contradicted by a
     // smaller summary or scalar, even when other requested calls are missing.
-    let identity = |id| {
+    let identity = |id: &str| {
         json!({"user_id":"owner","session_id":sid,"run_id":"root-run",
         "turn_chain_id":"chain","invocation_id":id})
     };
@@ -625,4 +652,169 @@ fn execution_counts_agree_across_commands_with_nonexecuted_requests() {
             assert_eq!(diff["a_tool_sequence_complete"], false);
         }
     }
+
+    // A partial terminal can retain repeated observations of one invocation;
+    // unidentified records are not proof of additional executions either.
+    let call = |id: &str| {
+        json!({"name":"bash","ok":true,"ms":1,"tool_call_id":id,
+            "invocation_identity":identity(id)})
+    };
+    for (calls, expected) in [
+        (json!([call("a"), call("a")]), 1),
+        (json!([call("a"), call("b")]), 2),
+        (json!([call("a"), {"name":"bash","ok":true,"ms":1}]), 1),
+    ] {
+        for kind in ["turn", "turn_error"] {
+            let event = json!({"type":kind,"ts":"t","session_id":sid,"turn":1,
+                "producer_scope":{"run_id":"root-run"},"tool_calls":calls});
+            std::fs::write(&path, format!("{event}\n")).unwrap();
+            let digest = parse(&["digest", sid, "--format", "json"]);
+            let tree = parse(&["tree", sid, "--format", "json"]);
+            let diff = parse(&["diff", sid, sid, "--format", "json"]);
+            assert_eq!(digest["aggregates"]["reported_root_tool_calls"], expected);
+            assert_eq!(tree["root"]["tool_calls"], expected);
+            assert_eq!(tree["root"]["tool_calls_complete"], false);
+            assert_eq!(diff["a_tool_calls_executed"], expected);
+            assert_eq!(diff["a_tool_sequence_complete"], false);
+        }
+    }
+
+    // A replay cannot simultaneously establish contradictory outcomes for
+    // one invocation, even when the raw record counts fit the summary.
+    let mut failed_call = call("a");
+    failed_call["ok"] = json!(false);
+    let event = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"tool_count":2,
+        "tool_outcomes":{"requested":2,"executed":2,"succeeded":1,"failed":1,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[call("a"),failed_call]});
+    std::fs::write(&path, format!("{event}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // Contradictory raw reports are not confirmed execution counts.
+    let event = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"tool_count":1000,
+        "tool_outcomes":{"requested":1,"executed":1,"succeeded":1,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[call("a")]});
+    std::fs::write(&path, format!("{event}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+    let output = run_journal(root.path(), &["diff", sid, sid]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("confirmed executed calls: 1;"));
+
+    // When a journal source is incomplete, reports from different attempts
+    // need not be disjoint even if each retained terminal is consistent.
+    let terminal = |turn, count| {
+        json!({"type":"turn","ts":format!("t{turn}"),"session_id":sid,
+        "turn":turn,"producer_scope":{"run_id":format!("run-{turn}")},"tool_count":count,
+        "tool_outcomes":{"requested":count,"executed":count,"succeeded":count,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}})
+    };
+    std::fs::write(
+        &path,
+        format!("{}\n{}\nnot json\n", terminal(1, 2), terminal(2, 3)),
+    )
+    .unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 3);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 3);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+}
+
+#[test]
+fn tree_does_not_attribute_rounds_to_conflicting_or_ambiguous_subruns() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "3fc9c724-2b34-499a-b525-f73b0f668eff";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let terminal = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root"},"tool_count":0});
+    let started = json!({"type":"delegation_sub_run_started","ts":"t2","session_id":sid,
+        "metadata":{"delegation_id":"d","sub_run_id":"child","parent_run_id":"root",
+            "agent_id":"agent-a","depth":1}});
+    let mut round = json!({"type":"llm_round","ts":"t3","session_id":sid,"round":0,
+        "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"agent-a",
+            "local_turn":1},"tokens_in":99,"tokens_out":10});
+    let tree = |events: &[Value]| {
+        std::fs::write(
+            &path,
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let output = run_journal(root.path(), &["tree", sid, "--format", "json"]);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let base = [terminal.clone(), started.clone(), round.clone()];
+    assert_eq!(
+        tree(&base)["root"]["children"][0]["observed_round_input"],
+        99
+    );
+    round["producer_scope"]
+        .as_object_mut()
+        .unwrap()
+        .remove("parent_run_id");
+    assert_eq!(
+        tree(&[terminal.clone(), started.clone(), round.clone()])["root"]["children"][0]["observed_round_input"],
+        99
+    );
+    round["producer_scope"]["parent_run_id"] = json!("");
+    assert_eq!(
+        tree(&[terminal.clone(), started.clone(), round.clone()])["root"]["children"][0]["observed_round_input"],
+        99
+    );
+    round["producer_scope"]
+        .as_object_mut()
+        .unwrap()
+        .remove("parent_run_id");
+    for (field, wrong) in [("parent_run_id", "other-parent"), ("agent_id", "agent-b")] {
+        let mut conflict = round.clone();
+        conflict["producer_scope"][field] = json!(wrong);
+        let result = tree(&[terminal.clone(), started.clone(), conflict]);
+        assert!(result["root"]["children"][0]["observed_round_input"].is_null());
+        assert!(result["skipped_events"].as_u64().unwrap() > 0);
+    }
+    let mut other = round.clone();
+    other["round"] = json!(1);
+    other["producer_scope"]["local_turn"] = json!(2);
+    other["producer_scope"]["agent_id"] = json!("agent-b");
+    other["producer_scope"]["parent_run_id"] = json!("other-parent");
+    std::fs::write(&path, format!("{terminal}\n{started}\n{round}\n{other}\n")).unwrap();
+    let output = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "all"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let digest: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = digest["subruns"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row["agent_id"] == "agent-a"));
+    assert!(rows.iter().any(|row| row["agent_id"] == "agent-b"));
+    let mut duplicate = started.clone();
+    duplicate["ts"] = json!("t4");
+    duplicate["metadata"]["agent_id"] = json!("agent-b");
+    let completed = json!({"type":"delegation_sub_run_completed","ts":"t3.5","session_id":sid,
+        "metadata":{"delegation_id":"d","sub_run_id":"child","agent_id":"agent-a",
+            "status":"completed"}});
+    let result = tree(&[terminal, started, round, completed, duplicate]);
+    assert!(result["root"]["unattached"][0]["observed_round_input"].is_null());
+    assert!(result["root"]["unattached"][0]["ended_at"].is_null());
 }

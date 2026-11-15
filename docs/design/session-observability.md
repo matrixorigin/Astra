@@ -144,6 +144,8 @@ totals carry their own coverage, and an unavailable supplemental journal is
 reported without discarding valid local evidence. Replayed terminal records are
 counted once; contradictory terminals for an attempt are excluded. A scalar
 execution count does not establish success, failure, or cache outcomes.
+Raw terminal reports can overlap or contradict their outcome summaries; they
+are shown as reports, not as confirmed execution totals.
 Incomplete outcome totals report retained producer facts, not inferred
 success or failure from tool output. Truncation, redaction or missing output
 does not erase a typed outcome; explicit execution uncertainty remains unknown.
@@ -151,6 +153,10 @@ Executed calls exclude rejected, deferred, reused and suppressed requests.
 Tool calls per round and average rounds require complete counts for the same
 root attempts; an unavailable count remains unknown. Tree
 output uses `astra-journal-tree-v2`, with unresolved parents shown separately.
+Child round observations are attributed only when their asserted parent and
+agent agree with an unambiguous started run; missing optional scope does not
+by itself contradict a match. Digest groups child rounds by their recorded
+scope so conflicting producers are not silently combined.
 
 `journal diff` reports known executed tool calls from terminal `tool_count` or
 a consistent outcome summary, with unowned per-call execution evidence retained
@@ -168,8 +174,9 @@ observation without proving replay. A reused turn number, a sole surviving
 call-ID witness or an identical unscoped payload does not establish ownership.
 Unscoped rounds and errors remain separate observations, as do contradictory
 execution facts. Incomplete totals use the strongest independently supported
-lower bound from terminal reports or distinct invocation identities; overlapping
-observations are not added as if they were independent. Unidentified executed terminal detail
+lower bound from noncontradictory terminal reports or distinct invocation
+identities; overlapping observations are not added as if they were independent.
+Unidentified executed terminal detail
 cannot establish that an external observation is additional coverage; matching
 the aggregate numerically does not resolve that possible overlap.
 When canonical invocation identity establishes duplicate observations, round-internal call
