@@ -1414,3 +1414,19 @@ test.each(["run_waiting", "run_paused", "run_resumed", "run_cancelled"])(
   expect(result.current.isStreaming).toBe(true);
   expect(result.current.error).toBeNull();
 });
+
+test.each([408, 401])("the public chat hook distinguishes HTTP%s observation loss from rejection", async status => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Turn response unavailable", { status }));
+  const client = new AstraClient({ baseUrl: "https://example.test" });
+  const { result, unmount } = renderHook(() => useAstraChat({ client, offeringId: "fixture" }));
+  try {
+    act(() => result.current.sendMessage("continue"));
+    await waitFor(() => expect(result.current.isStreaming).toBe(false));
+    expect(result.current.runStatus).toBe(status === 408 ? null : "failed");
+    expect(result.current.runId).toBeNull();
+    expect(result.current.error).toContain("Turn response unavailable");
+    expect(result.current.messages.at(-1)?.streaming).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][1]?.method).toBe("POST");
+  } finally { unmount(); fetch.mockRestore(); }
+});

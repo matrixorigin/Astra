@@ -1,6 +1,7 @@
 import { parseChatSseFrame, isReplayConnectionError } from "@/lib/api/chat-sse-frame";
 import { NextRequest, NextResponse } from "next/server";
 import {
+  AstraApiError,
   ASTRA_AGENT_INTERACTION_API_MAJOR,
   ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER,
   PATH_CHAT_STREAM,
@@ -37,8 +38,10 @@ import {
   RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
+  runtimeErrorDetail,
 } from "@/lib/runtime-client";
 import type {
+  ChatArtifactRef,
   SendMessageRequest,
 } from "@/lib/api/types";
 import {
@@ -482,13 +485,23 @@ function proxyRunStream(params: {
           }
 
           if (!replayOnly && state.lastStatus === "complete") {
-            const runtimeClient = await currentRuntime();
-            const artifacts = (
-              await fetchSessionArtifacts(runtimeClient, currentSessionId())
-            ).filter((artifact) => !knownArtifactIds.has(artifact.id));
-            if (clientCancelled) {
-              return;
+            if (clientCancelled || !mutate(() => {})) return;
+            let loadedArtifacts: ChatArtifactRef[] = [];
+            try {
+              const runtimeClient = await currentRuntime();
+              if (clientCancelled || !mutate(() => {})) return;
+              loadedArtifacts = await fetchSessionArtifacts(runtimeClient, currentSessionId());
+            } catch (error) {
+              if (clientCancelled || !mutate(() => {})) return;
+              const context = error instanceof RuntimeClientError || error instanceof AstraApiError
+                ? [error.status && `HTTP ${error.status}`, error.code,
+                  error instanceof AstraApiError && error.category].filter(Boolean).join(", ")
+                : "";
+              enqueueFrame({ type: "warning",
+                message: `Additional attachments could not be loaded${context ? ` (${context})` : ""}: ${runtimeErrorDetail(error).slice(0, 1024)}` });
             }
+            if (clientCancelled || !mutate(() => {})) return;
+            const artifacts = loadedArtifacts.filter((artifact) => !knownArtifactIds.has(artifact.id));
             if (artifacts.length > 0) {
               updateStreamingAssistantMessage(
                 ownerUserId,

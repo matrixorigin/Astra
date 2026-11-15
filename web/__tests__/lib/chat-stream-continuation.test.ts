@@ -8,6 +8,7 @@ vi.mock("@/lib/runtime-client", async () => ({
   ...(await import("@/lib/runtime-client/errors")), requireRuntimeClient: vi.fn(),
 }));
 
+import { AstraApiError } from "@astra/sdk";
 import { GET, POST } from "@/app/api/chats/[chatId]/stream/route";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { requireRuntimeClient } from "@/lib/runtime-client";
@@ -16,6 +17,7 @@ import { getStore, getChat, claimChatStreamProjection, withChatStreamProjection,
 import { WebRuntimeClient, getRuntimeClient as getStoreRuntimeClient, requireRuntimeClient as requireStoreRuntimeClient } from "@/lib/runtime-client/server";
 import { streamExistingChatRun, streamChatMessage } from "@/lib/api/chats";
 import { isNotFoundError } from "@/lib/api/errors";
+import { RuntimeClientError } from "@/lib/runtime-client/errors";
 
 function chat(owner = "owner", id = "chat") {
   const record = { id, title: "Chat", projectId: null, createdAt: "2026-10-21T00:00:00Z",
@@ -887,6 +889,120 @@ it("stops the upstream at DONE, delivers supplemental artifacts, and releases th
     { sessionId: "session", runId: "root" });
   expect(lease.projection.state.lastStatus).toBe("complete");
   releaseChatStreamProjection(lease);
+});
+
+it.each(["completed", "paused"])("keeps the confirmed %s response when supplemental artifacts fail", async status => {
+  const first = backend([bootstrap, { type: "text_done", full_text: "Owner-selected answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, status, waiting_for: "user_resume" },
+    { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+  const client = runtime(first);
+  const error = status === "completed"
+    ? new AstraApiError(503, '{"code":"artifact_unavailable","category":"availability"}',
+      "/sessions/session/artifacts", "artifact_unavailable", "availability")
+    : new RuntimeClientError({ operation: "list artifacts", path: "/sessions/session/artifacts",
+      status: 503, code: "artifact_unavailable", detail: "Artifact service unavailable." });
+  vi.mocked(client.sdk.listSessionArtifacts).mockResolvedValueOnce({ artifacts: [] } as never).mockRejectedValueOnce(error);
+  const response = await startPost();
+  const wire = response.clone().text();
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+  const onDone = vi.fn(), onPaused = vi.fn(), onWarning = vi.fn();
+  await expect(streamChatMessage("chat", payload, { onDone, onPaused, onWarning })).resolves.toBe("Owner-selected answer");
+  expect(status === "paused" ? onPaused : onDone).toHaveBeenCalledExactlyOnceWith("Owner-selected answer");
+  expect(status === "paused" ? onDone : onPaused).not.toHaveBeenCalled();
+  expect(onWarning).toHaveBeenCalledTimes(1);
+  expect(onWarning.mock.calls[0][0]).toContain("HTTP 503");
+  expect(onWarning.mock.calls[0][0]).toContain("artifact_unavailable");
+  expect(onWarning.mock.calls[0][0]).toContain(status === "completed" ? "availability" : "Artifact service unavailable.");
+  expect(selectedMessage()).toMatchObject({ content: "Owner-selected answer", status: "complete" });
+  if (status === "paused") expect(getChat("owner", "chat")?.activeRun).toMatchObject({
+    runId: "root", assistantMessageId: assistantId, status: "paused", waitingFor: "user_resume" });
+  else expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+  expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(2);
+  expect(client.fetchResponse).toHaveBeenCalledTimes(1);
+  const text = await wire;
+  expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+  expect(text).not.toContain('"type":"error"');
+  expect(first.cancel).toHaveBeenCalledTimes(1);
+  expect(first.releaseLock).toHaveBeenCalledTimes(1);
+});
+
+it.each(["cancel", "replace", "resume"].flatMap(mode =>
+  ["success", "failure"].map(outcome => ({ mode, outcome }))))(
+  "ignores late artifact $outcome after $mode", async ({ mode, outcome }) => {
+    const first = backend([bootstrap, { type: "text_done", full_text: "Old answer" },
+      { type: "run_finished", run_id: "root", owner_generation: 4, status: mode === "resume" ? "paused" : "completed" },
+      { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+    const client = runtime(first);
+    type ArtifactPage = Awaited<ReturnType<typeof client.sdk.listSessionArtifacts>>;
+    let resolve!: (page: ArtifactPage) => void, reject!: (error: Error) => void;
+    const pending = new Promise<ArtifactPage>((ok, failure) => { resolve = ok; reject = failure; });
+    vi.mocked(client.sdk.listSessionArtifacts).mockResolvedValueOnce({ artifacts: [] } as never).mockReturnValueOnce(pending);
+    const response = await startPost();
+    const oldAssistantId = assistantId;
+    const reader = response.body!.getReader();
+    let output = "";
+    const observed = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        output += new TextDecoder().decode(value);
+      }
+    })();
+    await vi.waitFor(() => expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(2));
+    let successor: ReturnType<typeof claimChatStreamProjection> | undefined;
+    let successorReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let successorBackend: ReturnType<typeof backend> | undefined;
+    if (mode === "cancel") {
+      await reader.cancel();
+    } else if (mode === "resume") {
+      vi.spyOn(client.sdk, "resumeRun").mockResolvedValue({ status: "running" });
+      await resumeActiveRun("owner", "chat");
+      successor = claimChatStreamProjection("owner", "chat", oldAssistantId, new AbortController(),
+        { sessionId: "session", runId: "root" });
+    } else {
+      successorBackend = backend([{ ...bootstrap, run_id: "new-root" }, { type: "text_delta", content: "New answer" }], true);
+      runtime(successorBackend);
+      successorReader = (await startPost()).body!.getReader();
+      await successorReader.read();
+      await vi.waitFor(() => expect(selectedMessage().content).toBe("New answer"));
+    }
+    const expected = structuredClone(getChat("owner", "chat"));
+    const writer = getStore("owner").chats[0].streamProjection?.writer;
+    if (outcome === "failure") reject(new Error("Late artifact failure"));
+    else resolve({ artifacts: [{ artifact_id: "late-file", artifact_kind: "file", source: "publish_artifact",
+      metadata: { normalize_version: "artifact_file_v1" }, content: { title: "Late file", filename: "late.txt" } }] } as never);
+    await observed;
+    await vi.waitFor(() => expect(first.releaseLock).toHaveBeenCalledTimes(1));
+    expect(getChat("owner", "chat")).toEqual(expected);
+    expect(output).not.toContain('"type":"warning"');
+    expect(output).not.toContain('"type":"artifacts"');
+    if (mode !== "cancel") expect(getStore("owner").chats[0].streamProjection?.writer).toBe(writer);
+    if (successor) releaseChatStreamProjection(successor);
+    await successorReader?.cancel();
+    if (successorBackend) await vi.waitFor(() => expect(successorBackend!.releaseLock).toHaveBeenCalledTimes(1));
+});
+
+it("does not start an artifact refresh after another writer takes over during reader cleanup", async () => {
+  const first = backend([bootstrap, { type: "text_done", full_text: "Old answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, status: "completed" },
+    { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+  let release!: () => void;
+  first.cancel.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+  const client = runtime(first);
+  const body = (await startPost()).text();
+  await vi.waitFor(() => expect(first.cancel).toHaveBeenCalledTimes(1));
+  runtime(backend([{ ...bootstrap, run_id: "new-root" }, { type: "text_delta", content: "New answer" }], true));
+  const reader = (await startPost()).body!.getReader();
+  await reader.read();
+  await vi.waitFor(() => expect(selectedMessage().content).toBe("New answer"));
+  const writer = getStore("owner").chats[0].streamProjection?.writer;
+  release();
+  await body;
+  expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(1);
+  expect(getStore("owner").chats[0].streamProjection?.writer).toBe(writer);
+  expect(selectedMessage()).toMatchObject({ content: "New answer", status: "streaming" });
+  expect(first.releaseLock).toHaveBeenCalledTimes(1);
+  await reader.cancel();
 });
 
 it("the browser closes an open body at DONE and ignores following frames", async () => {

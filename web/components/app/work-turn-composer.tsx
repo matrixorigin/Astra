@@ -34,7 +34,12 @@ import {
 } from "@/app/(workspace)/works/[workId]/actions";
 
 type LocalMessage = { id: string; role: "user" | "assistant"; text: string };
-type PendingTurn = { requestId: string; message: string; ownerReceipt?: Extract<StreamEvent, { type: "run_finished" }> };
+type PendingTurn = {
+  requestId: string;
+  message: string;
+  mayHaveRun: boolean;
+  ownerReceipt?: Extract<StreamEvent, { type: "run_finished" }>;
+};
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 type PromptQuestion = {
   id?: string;
@@ -221,7 +226,7 @@ export function WorkTurnComposer({
     router.refresh();
   }
 
-  function handleEvent(raw: StreamEvent) {
+  function handleEvent(raw: StreamEvent, recovering: boolean) {
     let event: WorkTurnStreamEvent;
     try {
       event = decodeWorkTurnStreamEventV1(raw);
@@ -352,17 +357,23 @@ export function WorkTurnComposer({
           break;
         }
         if (event.code === "writer_conflict") {
+          if (!recovering && !rootRunId.current && event.http_status === 409 && pending.current) {
+            pending.current.mayHaveRun = false;
+          }
           controlBlocked.current = true;
           setControlConflict(true);
-        } else if (!rootRunId.current && event.http_status !== undefined
+        } else if (!recovering && !rootRunId.current && event.http_status !== undefined
           && event.http_status >= 400 && event.http_status < 500 && event.http_status !== 408) {
           // Only a definite pre-admission rejection releases this request.
           pending.current = null;
         }
         setState("disconnected");
         setCanReconnect(event.code !== "writer_conflict" && (pending.current !== null || event.retryable === true));
+        const message = recovering && event.http_status !== undefined
+          ? `The original turn remains unconfirmed; recovery reported: ${event.message}`
+          : event.message;
         setError((previous) => previous && event.code === "stream_observation_interrupted"
-          ? previous + "\n" + event.message : event.message);
+          ? previous + "\n" + message : message);
         if (event.code !== "writer_conflict" && event.action_hints?.includes("refresh_work")) router.refresh();
         break;
       }
@@ -379,6 +390,8 @@ export function WorkTurnComposer({
   }
 
   function connect(turn: PendingTurn) {
+    const recovering = turn.mayHaveRun;
+    turn.mayHaveRun = true;
     stream.current?.close();
     setState("connecting");
     setError(null);
@@ -393,7 +406,7 @@ export function WorkTurnComposer({
       }),
       maxRetries: 0,
       decodeHttpError,
-      onEvent: handleEvent,
+      onEvent: event => handleEvent(event, recovering),
       onStateChange: (connection) => {
         if (
           mounted.current &&
@@ -417,7 +430,7 @@ export function WorkTurnComposer({
     const requestId = `web-work-turn:${crypto.randomUUID()}`;
     const assistantId = `assistant:${requestId}`;
     assistantMessageId.current = assistantId;
-    pending.current = { requestId, message };
+    pending.current = { requestId, message, mayHaveRun: false };
     setMessages((current) => [
       ...current,
       { id: `user:${requestId}`, role: "user", text: message },
@@ -562,6 +575,14 @@ export function WorkTurnComposer({
 
   function viewLive() {
     const turn = pending.current;
+    if (turn?.mayHaveRun) {
+      stream.current?.close();
+      setState("disconnected");
+      setCanReconnect(false);
+      setError("The original turn remains unconfirmed. Keep viewing or continue here to recover the same request.");
+      router.refresh();
+      return;
+    }
     if (turn) {
       setDraft(turn.message);
       setMessages((current) =>

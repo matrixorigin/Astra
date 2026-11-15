@@ -196,6 +196,7 @@ export class SSEClient {
     this.heartbeatController = heartbeatController;
     const fetchSignal = combineSignals(linkedSignal, heartbeatController.signal);
     let retry = false;
+    let response: Response | undefined;
 
     try {
       let headers = headersInitToRecord({
@@ -209,23 +210,29 @@ export class SSEClient {
         headers = headersInitToRecord(headers, { 'Content-Type': 'application/json' });
       }
 
-      const response = await (this.options.transport ?? fetch)(this.options.url, {
+      response = await (this.options.transport ?? fetch)(this.options.url, {
         method: this.options.method ?? 'GET',
         headers,
         body: this.options.body,
         signal: fetchSignal.signal,
       });
 
+      if (this.closed || linkedSignal.aborted) return;
       if (!response.ok) {
         if (this.options.decodeHttpError) {
           const event = await this.options.decodeHttpError(response);
+          if (this.closed || linkedSignal.aborted) return;
           this.options.onStateChange?.('error');
+          if (this.closed || linkedSignal.aborted) return;
           this.options.onEvent(event);
           return;
         }
         const detail = await readHttpErrorMessage(response);
-        if (response.status >= 400 && response.status < 500) {
+        if (this.closed || linkedSignal.aborted) return;
+        if (response.status >= 400 && response.status < 500 && response.status !== 408
+          && (this.options.method === 'POST' || response.status !== 429)) {
           this.options.onStateChange?.('error');
+          if (this.closed || linkedSignal.aborted) return;
           this.options.onEvent({
             type: 'error', message: detail, http_status: response.status, retryable: false,
           });
@@ -251,8 +258,10 @@ export class SSEClient {
       if (this.closed || linkedSignal.aborted || this.sawStreamCompletion) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       this.options.onStateChange?.('error');
+      if (this.closed || linkedSignal.aborted) return;
       this.options.onEvent({
         type: 'error',
+        ...(response && !response.ok ? { http_status: response.status } : {}),
         message: heartbeatController.signal.aborted
           ? `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`
           : `Connection error: ${message}`,

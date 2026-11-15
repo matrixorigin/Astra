@@ -514,6 +514,8 @@ struct WorkContinueSurface {
 }
 
 struct WorkContinueRequest<'a> {
+    // An attempt-local rejection cannot settle an earlier uncertain request.
+    recovering: bool,
     requested_work_id: &'a str,
     requested_branch_id: Option<&'a str>,
     message: &'a str,
@@ -909,17 +911,23 @@ async fn execute_work_continue(
             Ok(event) => event,
             Err(error) => {
                 let interrupted = match error {
-                    astra_thin_client::ThinClientError::Api { status, .. }
-                        if status.is_server_error() =>
-                    {
-                        WorkContinueOutcome::Unknown(format!(
-                            "The Work response was inconclusive (HTTP {status}); check the Work status before retrying"
-                        ))
-                    }
-                    astra_thin_client::ThinClientError::Api { status, .. } => {
-                        WorkContinueOutcome::Rejected(format!(
-                            "Work turn was not accepted (HTTP {status})"
-                        ))
+                    astra_thin_client::ThinClientError::Api { status, body } => {
+                        let detail = crate::cli::cli_config::cli_utils::read_api_error(
+                            status.as_u16(),
+                            &body,
+                        );
+                        if !request.recovering
+                            && status.is_client_error()
+                            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        {
+                            WorkContinueOutcome::Rejected(format!(
+                                "Work turn was not accepted: {detail}"
+                            ))
+                        } else {
+                            WorkContinueOutcome::Unknown(format!(
+                                "The Work response was inconclusive: {detail}; check the Work status before retrying"
+                            ))
+                        }
                     }
                     error => WorkContinueOutcome::Unknown(format!(
                         "Work response was interrupted before completion: {error}"
@@ -1631,6 +1639,7 @@ fn dispatch_work_continue(
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let slash_dispatch::SlashBackgroundRead::WorkContinue {
+        recovering,
         api,
         profile,
         work_id,
@@ -1653,6 +1662,7 @@ fn dispatch_work_continue(
                     &api,
                     &token,
                     WorkContinueRequest {
+                        recovering,
                         requested_work_id: &work_id,
                         requested_branch_id: branch_id.as_deref(),
                         message: &message,
@@ -2470,7 +2480,7 @@ fn apply_slash_background_read_effect(
                 }
                 if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
-                        "The accepted request is {request_id}; retry only with `/work retry {request_id}` after checking the Work status.",
+                        "The request ID is {request_id}; inspect the Work status and, if needed, retry with `/work retry {request_id}`.",
                         request_id = surface.request_id
                     )));
                 }
@@ -15734,6 +15744,7 @@ mod tests {
             &api,
             "token",
             WorkContinueRequest {
+                recovering: false,
                 requested_work_id: "work-1",
                 requested_branch_id: None,
                 message: "continue",
@@ -15812,6 +15823,7 @@ mod tests {
             &api,
             "token",
             WorkContinueRequest {
+                recovering: false,
                 requested_work_id: "work-1",
                 requested_branch_id: None,
                 message: "continue",
@@ -15829,27 +15841,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_continue_keeps_server_error_unknown_for_exact_retry() {
-        for (response, expected_run, expected_text) in [
-            (ResponseTemplate::new(503).set_body_string("upstream unavailable"), None, ""),
+    async fn work_continue_keeps_unconfirmed_requests_for_exact_retry() {
+        for (response, expected_run, expected_text, rejected) in [
+            (ResponseTemplate::new(503).set_body_string("upstream unavailable"), None, "", false),
+            (ResponseTemplate::new(408).set_body_json(serde_json::json!({
+                "message":"gateway timed out after forwarding", "code":"gateway_timeout",
+                "category":"availability", "action_hints":["review_effects"]
+            })), None, "", false),
+            (ResponseTemplate::new(302).set_body_string("unexpected redirect"), None, "", false),
+            (ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "code":"work_conflict", "category":"conflict", "action_hints":["refresh_work"]
+            })), None, "", true),
             (ResponseTemplate::new(200).set_body_string(concat!(
                 "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
                 "data: {\"type\":\"text_delta\",\"content\":\"retained partial result\"}\n\n",
                 "data: {\"type\":\"run_error\",\"run_id\":\"root\",\"error_kind\":\"database_error\",\"message\":\"storage unavailable\"}\n\n",
                 "data: {\"type\":\"error\",\"run_id\":\"root\",\"code\":\"stream_observation_interrupted\",\"error_kind\":\"stream_transport\",\"retryable\":false,\"message\":\"Run outcome unconfirmed\"}\n\n",
                 "data: [DONE]\n\n"
-            )), Some("root"), "retained partial result"),
+            )), Some("root"), "retained partial result", false),
             (ResponseTemplate::new(200).set_body_string(concat!(
                 "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
                 "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"failed\",\"error\":\"unstamped fallback\"}\n\n",
                 "data: [DONE]\n\n"
-            )), Some("root"), ""),
+            )), Some("root"), "", false),
             (ResponseTemplate::new(200).set_body_string(concat!(
                 "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
                 "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
                 "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":4}\n\n",
                 "data: [DONE]\n\n"
-            )), Some("root"), "projection not confirmed"),
+            )), Some("root"), "projection not confirmed", false),
             (ResponseTemplate::new(200).set_body_string(concat!(
                 "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
                 "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
@@ -15857,7 +15877,7 @@ mod tests {
                 "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"paused\",\"owner_generation\":4}\n\n",
                 "data: {\"type\":\"error\",\"run_id\":\"root\",\"error_kind\":\"contract_violation\",\"message\":\"Final response projection missing\",\"retryable\":false}\n\n",
                 "data: [DONE]\n\n"
-            )), Some("root"), "projection not confirmed"),
+            )), Some("root"), "projection not confirmed", false),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -15883,12 +15903,19 @@ mod tests {
                 .mount(&server)
                 .await;
 
+            Mock::given(method("DELETE"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments/attachment-1"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
             let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
             let surface = execute_work_continue(
                 &api,
                 "token",
                 WorkContinueRequest {
+                        recovering: false,
                     requested_work_id: "work-1",
                     requested_branch_id: None,
                     message: "continue",
@@ -15900,19 +15927,81 @@ mod tests {
             )
             .await
             .expect("a missing owner outcome keeps the admitted request recoverable");
-            assert!(
-                matches!(surface.outcome, WorkContinueOutcome::Unknown(_))
-            );
+            if rejected {
+                assert!(matches!(&surface.outcome, WorkContinueOutcome::Rejected(_)));
+            } else {
+                assert!(matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)));
+            }
+            assert!(surface.cleanup_error.is_none());
             assert_eq!(surface.branch_id, "branch-1");
             let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), 3, "only overview, attachment and one admitted turn; no cleanup or replay: {requests:?}");
-            assert!(!requests.iter().any(|request| request.method == "DELETE" || request.url.path().ends_with("control-operations")));
+            assert_eq!(requests.len(), 3 + usize::from(rejected), "one turn POST; only definite rejection can detach: {requests:?}");
+            assert_eq!(requests.iter().filter(|request| request.method == "DELETE").count(), usize::from(rejected));
+            assert!(!requests.iter().any(|request| request.url.path().ends_with("control-operations")));
+            let turn = requests.iter().find(|request| request.url.path().ends_with("/turns")).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&turn.body).unwrap();
+            assert_eq!(body, serde_json::json!({
+                "request_id":"request-3", "attachment_id":"attachment-1", "message":"continue"
+            }));
+            if let WorkContinueOutcome::Unknown(cause) = &surface.outcome
+                && cause.contains("gateway timed out") {
+                assert!(cause.contains("gateway_timeout") && cause.contains("availability")
+                    && cause.contains("review_effects"), "{cause}");
+            }
             assert_eq!(surface.run_id.as_deref(), expected_run);
             assert_eq!(surface.response, expected_text);
             if expected_text == "retained partial result" {
                 let WorkContinueOutcome::Unknown(cause) = &surface.outcome else { panic!("unknown outcome") };
                 assert!(cause.contains("storage unavailable"));
                 assert!(cause.contains("Run outcome unconfirmed"));
+            }
+            let mut pending = BTreeMap::from([("request-3".into(), slash_dispatch::PendingWorkContinue {
+                work_id: "work-1".into(), branch_id: None, message: "continue".into(),
+                request_id: "request-3".into(), attachment_request_id: "attach-request-3".into(),
+            })]);
+            let mut in_flight = 1;
+            SlashBackgroundReadCompletion {
+                generation: 1, effect: SlashBackgroundReadEffect::WorkContinue(Ok(surface)),
+            }.accept(1, &mut in_flight, &mut pending, &mut BTreeSet::new());
+            assert_eq!(in_flight, 0);
+            assert_eq!(pending.contains_key("request-3"), !rejected);
+            if !rejected {
+                assert_eq!(pending["request-3"].branch_id.as_deref(), Some("branch-1"));
+            }
+            if expected_run.is_none() && !rejected {
+                let retained = &pending["request-3"];
+                Mock::given(method("POST"))
+                    .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                    .respond_with(ResponseTemplate::new(403).set_body_string("recovery denied"))
+                    .with_priority(1)
+                    .mount(&server).await;
+                let retried = execute_work_continue(&api, "token", WorkContinueRequest {
+                        recovering: true,
+                    requested_work_id: &retained.work_id, requested_branch_id: retained.branch_id.as_deref(),
+                    message: &retained.message, client_id: "tui-client", request_id: &retained.request_id,
+                    attachment_request_id: &retained.attachment_request_id,
+                }, &progress_tx).await.unwrap();
+                assert!(matches!(retried.outcome, WorkContinueOutcome::Unknown(_)));
+                in_flight = 1;
+                assert!(SlashBackgroundReadCompletion {
+                    generation: 1, effect: SlashBackgroundReadEffect::WorkContinue(Ok(retried)),
+                }.accept(1, &mut in_flight, &mut pending, &mut BTreeSet::new()).is_some());
+                assert!(pending.contains_key("request-3"), "the original attempt remains uncertain");
+                let replay = server.received_requests().await.unwrap();
+                assert_eq!(replay.len(), 6, "second POST only after explicit same-ID retry");
+                assert!(!replay.iter().any(|request| request.method == "DELETE" ||
+                    request.url.path().ends_with("control-operations")));
+                for (path, expected) in [
+                    ("/turns", serde_json::json!({"request_id":"request-3",
+                        "attachment_id":"attachment-1", "message":"continue"})),
+                    ("/attachments", serde_json::json!({"request_id":"attach-request-3",
+                        "client_id":"tui-client", "surface":"tui"})),
+                ] {
+                    let bodies = replay.iter().filter(|request| request.url.path().ends_with(path))
+                        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(bodies, vec![expected.clone(), expected]);
+                }
             }
         }
     }
@@ -16000,6 +16089,7 @@ mod tests {
                 &api,
                 "token",
                 WorkContinueRequest {
+                    recovering: true,
                     requested_work_id: "work-1",
                     requested_branch_id: None,
                     message: "continue",

@@ -46,7 +46,9 @@ streams close with the existing SSE [DONE] marker. The transport observes that
 framing marker and releases the HTTP reader at that boundary; it does not
 classify root or child execution outcomes. A read error discards any incomplete
 frame; it cannot manufacture a completion from trailing bytes. Web sends its
-supplemental artifacts before its one downstream completion marker. Accounting prefixes expanded from a
+supplemental artifacts before its one downstream completion marker. A failed
+post-turn artifact refresh emits a warning; it cannot replace the confirmed
+outcome or remove a paused run's resume binding. Accounting prefixes expanded from a
 durable terminal have no cursor; only the final owner receipt advances it.
 Interruption and a waiting event with execution_live false remain provisional,
 so a connection loss before the final projection keeps that root attachable.
@@ -59,6 +61,9 @@ switches on event.type may require migration. Use isWorkTurnEventType for each
 handled known payload; unmodeled fields remain unknown.
 Unknown facts do not authorize actions or settle requests. An inconclusive HTTP
 or protocol failure retains the pending request ID for explicit same-turn recovery.
+A rejected recovery attempt cannot establish the original request's outcome.
+POST timeouts remain unconfirmed without automatic replay; transient GET408/429
+responses use the existing cancellable retry budget.
 
 One-shot CLI JSON reports `cache.hit` as true for an observed cache read,
 false for a supported zero with complete coverage, and null when unknown.

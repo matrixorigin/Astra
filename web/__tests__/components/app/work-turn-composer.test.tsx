@@ -1027,7 +1027,10 @@ test.each(["live", "replay"])("the real Work stream consumes canonical producer 
   }
 });
 
-test.each([503, 408])("an admitted Work can retry again after a reconnect returns HTTP %s", async status => {
+test.each([
+  { status: 503, admitted: true }, { status: 408, admitted: true },
+  { status: 403, admitted: false }, { status: 409, admitted: false },
+])("an uncertain Work survives recovery HTTP$status (admitted=$admitted)", async ({ status, admitted }) => {
   streamHarness.real = true;
   let sent = false;
   const first = new ReadableStream<Uint8Array>({
@@ -1044,7 +1047,7 @@ test.each([503, 408])("an admitted Work can retry again after a reconnect return
   const recovered = workProjection.events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")
     + 'data: [DONE]\n\n';
   const fetch = vi.spyOn(globalThis, "fetch")
-    .mockResolvedValueOnce(new Response(first))
+    .mockResolvedValueOnce(admitted ? new Response(first) : new Response("Gateway timeout", { status: 408 }))
     .mockResolvedValueOnce(new Response("gateway unavailable", { status }))
     .mockResolvedValueOnce(new Response(recovered));
   const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
@@ -1052,8 +1055,9 @@ test.each([503, 408])("an admitted Work can retry again after a reconnect return
     fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
     fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("could not be confirmed"));
-    expect(screen.getByText("Retained partial answer")).toBeInTheDocument();
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    if (admitted) expect(screen.getByText("Retained partial answer")).toBeInTheDocument();
+    else await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("original turn remains unconfirmed"));
     expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
     fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
@@ -1066,4 +1070,63 @@ test.each([503, 408])("an admitted Work can retry again after a reconnect return
     rendered.unmount();
     fetch.mockRestore();
   }
+});
+
+test("a first-attempt HTTP403 releases the definitively rejected guidance", async () => {
+  streamHarness.real = true;
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Not permitted", { status: 403 }));
+  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  try {
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally { rendered.unmount(); fetch.mockRestore(); }
+});
+
+test.each(["takeover denial", "keep viewing"])("writer-conflict navigation preserves the uncertain request (%s)", async action => {
+  streamHarness.real = true;
+  forceTakeover.mockResolvedValue({ ok: true, operation: {
+    schema_version: 2, operation_id: "operation-recover", work_id: "work-1", branch_id: "branch-1",
+    attachment_id: "attachment-1", kind: "force_takeover", state: "succeeded", outcome: "taken_over",
+    branch_revision: 3, control_basis: { writer_epoch: 5, canonical_root_hash: null },
+    created_at: "2026-08-01T00:00:00Z", completed_at: "2026-08-01T00:00:01Z",
+  } });
+  const recovered = workProjection.events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")
+    + 'data: [DONE]\n\n';
+  const fetch = vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(new Response("Gateway timeout", { status: 408 }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ code: "writer_conflict", category: "conflict",
+      retryable: false, action_hints: ["refresh_work"] }), { status: 409 }));
+  if (action === "takeover denial") fetch.mockResolvedValueOnce(new Response("Recovery denied", { status: 403 }));
+  fetch.mockResolvedValueOnce(new Response(recovered));
+  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1"
+    branchRevision={3} controlBasis={{ writer_epoch: 4, canonical_root_hash: null }} />);
+  try {
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Preserve this guidance" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await screen.findByRole("button", { name: "Continue here" });
+    if (action === "keep viewing") {
+      fireEvent.click(screen.getByRole("button", { name: "Keep viewing" }));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      expect(screen.getByRole("alert")).toHaveTextContent("original turn remains unconfirmed");
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Continue here" }));
+    fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "test reauthentication proof" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    if (action === "takeover denial") {
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    }
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(screen.getByText("Durably saved Work answer")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(action === "takeover denial" ? 4 : 3);
+    const bodies = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+    expect(bodies.every(body => body.request_id === bodies[0].request_id
+      && body.attachment_id === "attachment-1" && body.message === "Preserve this guidance")).toBe(true);
+  } finally { rendered.unmount(); fetch.mockRestore(); }
 });
