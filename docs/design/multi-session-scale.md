@@ -104,9 +104,12 @@ execution. A new scheduler, sticky-session requirement, or process-local
 parallel state machine must not be introduced to make a scale test pass.
 
 Fresh run-control observations share an on-demand read queue in `RunEngine`.
-Concurrent requests across owners use at most 128 positional lookups per SQL,
-four concurrent queries, and a maximum 25 ms collection window measured from
-admission. Full batches and partial batches whose oldest request has already
+Concurrent requests across owners use at most 128 logical requests per batch,
+four concurrent queue-owned reads, and a maximum 25 ms collection window
+measured from admission. Normal SQL has at most 128 positional lookups; failure
+recovery can use up to 256 physical positions for those same 128 requests.
+A dropped statement can continue server-side, and existing ancestor reads are
+outside the queue's concurrency bound. Full batches and partial batches whose oldest request has already
 waited that window dispatch without another collection delay.
 The queue admits at most 8,192 outstanding reads and 4,096 per owner, including
 in-flight queries, with bounded identity bytes and owner-rotating dispatch.
@@ -120,6 +123,28 @@ Overload and storage failures are explicit; this queue is not execution
 authorization. Lease renewal and provider/action fences retain their owners.
 The collection window is not a total-latency guarantee: query attempts have a
 three-second deadline and callers have a four-second overall read budget.
+A direct child's watcher may supply the parent already loaded during
+materialization as an untrusted lookup hint. A batch with at least four
+bounded hints reads matching parents in the same owner-scoped query; smaller
+batches retain the indexed ancestor read. When such a batch also contains
+unhinted requests, the existing queue dispatches the two groups independently,
+so a joined-query error does not directly fail an unhinted observation. At most
+three of the four batch workers run joined reads; the remaining worker can
+select unhinted requests even behind hinted backlog. Hinted admissions stop
+one batch below the existing global and per-owner limits, leaving space for
+unhinted work under a hinted backlog. The global space is shared across owners;
+unhinted traffic can still reach the hard limits, and mixed load may reject a
+hinted observation before the hard limits. All observations share the database
+pool. Restored requests keep their original admission and deadline. The
+consumer validates durable lineage before using a prefetched result, and
+missing, stale or unsupported hints use the existing ancestor path. If a
+joined database read fails or times out, still-live requests can use one
+unjoined recovery query for their own and candidate parent records. It retains
+the original request deadlines and worker reservation; the database may still
+be finishing the abandoned joined query. A stale or deeper lineage can require
+the existing per-child ancestor read. Custom stores retain their old failure
+behavior unless they explicitly support this recovery. Root-only and healthy
+joined batches retain their original SQL.
 
 Direct-child completion waits are a delivery concern, not a new lifecycle
 authority. Local children notify their parent in memory. Remotely owned

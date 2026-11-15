@@ -5558,6 +5558,7 @@ fn start_active_run_control_watcher(
     execution_lease_lost: Arc<AtomicBool>,
     input_wake: tokio::sync::watch::Sender<i64>,
     guidance_wake: tokio::sync::watch::Sender<i64>,
+    parent_hint: Option<String>,
 ) -> Option<ActiveRunControlWatcher> {
     let run_control = run_control?;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -5581,7 +5582,14 @@ fn start_active_run_control_watcher(
                     }
                     let control_status = tokio::time::timeout(
                         ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT,
-                        run_control.control_observation(&user_id, &run_id),
+                        async {
+                            match parent_hint.as_deref() {
+                                Some(hint) => run_control
+                                    .control_observation_with_parent_hint(&user_id, &run_id, hint)
+                                    .await,
+                                None => run_control.control_observation(&user_id, &run_id).await,
+                            }
+                        },
                     )
                     .await;
                     match control_status {
@@ -14338,6 +14346,7 @@ impl AgenticRunLifecycleService {
                     bg_execution_lease_lost.clone(),
                     input_wake,
                     guidance_wake,
+                    None,
                 );
                 state.durable_control_watcher = control_watcher
                     .as_ref()
@@ -25346,6 +25355,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             local_execution_lease_lost.clone(),
             input_wake,
             guidance_wake,
+            durable_run.as_ref().and_then(|run| {
+                (run.depth == 1
+                    && run.parent_run_id.as_deref() == Some(config.parent_run_id.as_str())
+                    && run.root_run_id.as_deref() == Some(config.parent_run_id.as_str()))
+                    .then(|| config.parent_run_id.clone())
+            }),
         );
 
         loop_state.durable_control_watcher = durable_control_watcher.as_ref().map(|watcher| watcher.alive.clone());
