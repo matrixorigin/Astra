@@ -29050,6 +29050,7 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .unwrap();
     // Let the task install its lifetime guard before simulating a task failure.
@@ -29082,6 +29083,7 @@ async fn fresh_control_watcher_observes_committed_guidance() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        Some("untrusted-parent".into()),
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -29120,6 +29122,7 @@ async fn active_run_control_watcher_retries_control_failure_without_losing_pause
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        None,
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -29159,6 +29162,7 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29190,6 +29194,17 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let ids = (0..1000)
         .map(|i| format!("{prefix}-{i}"))
         .collect::<Vec<_>>();
+    let run_ids = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            if index % 8 >= 4 {
+                format!("{id}-child")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_sessions (user_id,session_id,status) ",
     );
@@ -29205,12 +29220,33 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(id)
             .push_bind(id)
             .push_bind(id)
-            .push_bind(format!("/{id}"))
+            .push_bind(id)
             .push_bind("running")
             .push_bind(1)
             .push_bind(7);
     });
     runs.build().execute(pool.get()).await.unwrap();
+    let children = ids
+        .iter()
+        .zip(&run_ids)
+        .filter(|(root, run)| root != run)
+        .collect::<Vec<_>>();
+    let mut child_runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status,run_generation,last_event_idx) ",
+    );
+    child_runs.push_values(&children, |mut row, (root, child)| {
+        row.push_bind(*root)
+            .push_bind(*root)
+            .push_bind(*child)
+            .push_bind(*root)
+            .push_bind(*root)
+            .push_bind(format!("{root}/{child}"))
+            .push_bind(1)
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    child_runs.build().execute(pool.get()).await.unwrap();
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let control: Arc<dyn RunControlProvider> = Arc::new(engine);
     // Hot-checkout telemetry excludes newly established physical connections.
@@ -29223,7 +29259,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let before = astra_core::matrixone_pool_telemetry_snapshot();
     let started = Instant::now();
     let mut watchers = Vec::new();
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let cancel = Arc::new(CancellationToken::new());
         let pause = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
@@ -29232,7 +29268,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             Some(control.clone()),
             id.clone(),
             id.clone(),
-            id.clone(),
+            run_ids[index].clone(),
             Some(1),
             Arc::new(AtomicBool::new(false)),
             pause.clone(),
@@ -29240,6 +29276,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             lost.clone(),
             sender,
             tokio::sync::watch::channel(-1).0,
+            (index % 8 >= 4).then(|| id.clone()),
         )
         .unwrap();
         watchers.push((guard, cancel, pause, lost, receiver));
@@ -29258,30 +29295,50 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     .expect("first shared control sweep");
     let first_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    // Mixed hinted/unhinted reads use separate queries. Allow partial batches
+    // from the four workers while still excluding per-child polling.
     assert!(
-        (8..=12).contains(&first_reads),
-        "1000 roots must batch, got {first_reads} checkouts"
+        (8..=24).contains(&first_reads),
+        "1000 roots and children must batch, got {first_reads} checkouts"
     );
     let initial_ms = started.elapsed().as_millis();
 
     // A separate pool represents a different control-plane process. The live
     // observers receive no local notification of these durable changes.
     let independent = SharedPool::new(pool.settings()).await.unwrap();
-    for group in 0..4 {
+    // Update each observed run's input watermark; control changes for a child
+    // are made only on its parent through the independent pool.
+    let mut watermark = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE agent_runs SET last_event_idx=9 WHERE run_id IN (",
+    );
+    {
+        let mut selected = watermark.separated(",");
+        for run in &run_ids {
+            selected.push_bind(run);
+        }
+    }
+    watermark
+        .push(")")
+        .build()
+        .execute(independent.get())
+        .await
+        .unwrap();
+    for group in 0..3 {
         let update = match group {
             0 => "cancellation_requested_at=NOW(6)",
             1 => "run_generation=2",
-            2 => "status='paused',waiting_for='user_pause'",
-            _ => "status='running'",
+            _ => "status='paused',waiting_for='user_pause'",
         };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+            "UPDATE agent_runs SET {update} WHERE run_id IN ("
         ));
         {
             let mut selected = query.separated(",");
             for (index, id) in ids.iter().enumerate() {
                 if index % 4 == group {
-                    selected.push_bind(id);
+                    // Ownership belongs to the observed run; inherited
+                    // cancellation and pause belong to its parent.
+                    selected.push_bind(if group == 1 { &run_ids[index] } else { id });
                 }
             }
         }
@@ -29316,17 +29373,177 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let next_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
     assert!(
-        (8..=12).contains(&next_reads),
+        (8..=24).contains(&next_reads),
         "changed sweep must also batch: {next_reads}"
     );
     println!(
-        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        "control_watchers owners=1000 direct_children=500 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
         changed.elapsed().as_millis()
     );
     drop(watchers);
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    for table in ["agent_runs", "agent_sessions"] {
+    // Reuse four direct children for two real watcher waves. The joined SQL
+    // response is held after execution while the existing plain read remains
+    // healthy; none of these controls is delivered through a local token.
+    for index in 4..8 {
+        sqlx::query("UPDATE agent_runs SET status='running',waiting_for=NULL,cancellation_requested_at=NULL,run_generation=1,last_guidance_event_idx=-1 WHERE user_id=? AND run_id IN (?,?)")
+            .bind(&ids[index]).bind(&ids[index]).bind(&run_ids[index])
+            .execute(independent.get()).await.unwrap();
+    }
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(independent.clone())));
+    assert!(
+        writer
+            .request_run_cancellation(&ids[4], &run_ids[4])
+            .await
+            .unwrap()
+    );
+    writer
+        .append_event(
+            &ids[5],
+            &ids[5],
+            &run_ids[5],
+            json!({"event_type":"user_intent","id":format!("{prefix}-fault-guidance")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&ids[5], &run_ids[5])
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&ids[6], &ids[6])
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &ids[7],
+                expected_session_id: &ids[7],
+                run_id: &ids[7],
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+
+    use crate::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let proxy = ResponseProxy::start(
+        pool.settings().host.clone(),
+        pool.settings().port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(pool.settings(), proxy.port, 4).await;
+    let fault_control: Arc<dyn RunControlProvider> = Arc::new(RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(fault_pool.clone()),
+    )));
+    for wave in 0..2 {
+        proxy.gate.armed.store(false, Ordering::SeqCst);
+        proxy.gate.continuous.store(true, Ordering::SeqCst);
+        let mut fault_watchers = Vec::new();
+        // Four watchers per child keep all four distinct owners in one batch.
+        for ordinal in 0..16 {
+            let index = 4 + ordinal % 4;
+            let cancel = Arc::new(CancellationToken::new());
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let lease_lost = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let (guidance, receiver) = tokio::sync::watch::channel(-1);
+            let guard = start_active_run_control_watcher(
+                Some(fault_control.clone()),
+                ids[index].clone(),
+                ids[index].clone(),
+                run_ids[index].clone(),
+                Some(1),
+                cancel_flag.clone(),
+                pause.clone(),
+                cancel.clone(),
+                lease_lost.clone(),
+                tokio::sync::watch::channel(-1).0,
+                guidance,
+                Some(ids[index].clone()),
+            )
+            .unwrap();
+            fault_watchers.push((
+                index,
+                guard,
+                cancel_flag,
+                cancel,
+                pause,
+                lease_lost,
+                receiver,
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined watcher batch was not gated");
+        // A watcher that bypasses the held batch would otherwise make the
+        // regression pass without exercising recovery.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (_, _, cancel_flag, cancel, pause, lease_lost, guidance) in &fault_watchers {
+            assert!(!cancel_flag.load(Ordering::Acquire));
+            assert!(!cancel.is_cancelled());
+            assert!(!pause.load(Ordering::Acquire));
+            assert!(!lease_lost.load(Ordering::Acquire));
+            assert_eq!(*guidance.borrow(), -1);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(fault_watchers.iter_mut().map(
+                |(index, _, _, cancel, pause, _, guidance)| async move {
+                    match *index {
+                        4 | 6 => cancel.cancelled().await,
+                        5 => {
+                            while *guidance.borrow_and_update() < guidance_index {
+                                guidance.changed().await.unwrap();
+                            }
+                        }
+                        7 => {
+                            while !pause.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            )),
+        )
+        .await
+        .expect("watchers must recover child controls before the joined response is released");
+        for (index, _, cancel_flag, cancel, pause, lease_lost, _) in &fault_watchers {
+            assert!(
+                !lease_lost.load(Ordering::Acquire),
+                "valid identity must not lose its lease"
+            );
+            if *index == 4 || *index == 6 {
+                assert!(cancel_flag.load(Ordering::Acquire));
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(!cancel_flag.load(Ordering::Acquire));
+                assert!(!cancel.is_cancelled());
+                assert_eq!(pause.load(Ordering::Acquire), *index == 7);
+            }
+        }
+        println!(
+            "control_watchers joined_fault_wave={} recovered=16",
+            wave + 1
+        );
+        proxy.gate.continuous.store(false, Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        drop(fault_watchers);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(fault_control);
+    fault_pool.close().await;
+    for table in ["agent_run_events", "agent_runs", "agent_sessions"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id LIKE ?"
         )))
@@ -29361,6 +29578,7 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29399,6 +29617,7 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
