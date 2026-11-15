@@ -430,6 +430,8 @@ export function WorkTurnComposer({
     const requestId = `web-work-turn:${crypto.randomUUID()}`;
     const assistantId = `assistant:${requestId}`;
     assistantMessageId.current = assistantId;
+    // A new request must not inherit an earlier interaction's root.
+    rootRunId.current = null;
     pending.current = { requestId, message, mayHaveRun: false };
     setMessages((current) => [
       ...current,

@@ -939,42 +939,6 @@ test("does not invent execution location when stopping a takeover is unconfirmed
   expect(screen.queryByRole("alert")).not.toHaveTextContent(/active on the other device/i);
 });
 
-test("keeps viewing without losing guidance or leaving optimistic messages behind", () => {
-  render(
-    <WorkTurnComposer
-      workId="work-1"
-      branchId="branch-1"
-      attachmentId="attachment-1"
-      branchRevision={3}
-      controlBasis={{ writer_epoch: 4, canonical_root_hash: "a".repeat(64) }}
-    />,
-  );
-  const composer = screen.getByRole("textbox", { name: "Guide this Work" });
-  fireEvent.change(composer, { target: { value: "Keep this guidance safe" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
-  const first = streamHarness.instances[0]!;
-
-  act(() => {
-    first.options.onEvent({
-      type: "error",
-      code: "writer_conflict",
-      message: "This Work is active elsewhere. You can keep viewing it here.",
-      retryable: false,
-      http_status: 409,
-      action_hints: ["refresh_work"],
-    });
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Keep viewing" }));
-
-  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toHaveValue(
-    "Keep this guidance safe",
-  );
-  expect(screen.queryByText("You")).not.toBeInTheDocument();
-  expect(screen.queryByText("Astra")).not.toBeInTheDocument();
-  expect(first.close).toHaveBeenCalledTimes(1);
-  expect(forceTakeover).not.toHaveBeenCalled();
-  expect(refresh).toHaveBeenCalledTimes(1);
-});
 
 test("a definite pre-admission HTTP rejection releases the rejected request", async () => {
   render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
@@ -1072,18 +1036,62 @@ test.each([
   }
 });
 
-test("a first-attempt HTTP403 releases the definitively rejected guidance", async () => {
+test.each([
+  { status: 403, history: "none" },
+  { status: 403, history: "refreshed" },
+  { status: 403, history: "answered" },
+  { status: 409, history: "none" },
+  { status: 409, history: "refreshed" },
+  { status: 409, history: "answered" },
+])("first HTTP$status releases guidance after $history interaction history", async ({ status, history }) => {
   streamHarness.real = true;
-  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Not permitted", { status: 403 }));
-  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+    JSON.stringify({ code: status === 409 ? "writer_conflict" : "invalid_request", retryable: false }),
+    { status },
+  ));
+  const props = {
+    workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1",
+    branchRevision: 3, controlBasis: { writer_epoch: 4, canonical_root_hash: "a".repeat(64) },
+  };
+  const page: NonNullable<Parameters<typeof WorkTurnComposer>[0]["initialInteractions"]> = {
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1",
+    interactions: history === "none" ? [] : [{
+      schema_version: 1, work_id: "work-1", branch_id: "branch-1",
+      run_id: "run-1", request_id: "approval-1", kind: "approval",
+      tool: "bash", approval_kind: "standard", display_label: "Earlier approval",
+    }],
+  };
+  const rendered = render(<WorkTurnComposer {...props} initialInteractions={page} />);
   try {
-    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
+    if (history === "refreshed") {
+      // Another surface answers the old interaction; this same composer survives refresh.
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      rendered.rerender(<WorkTurnComposer {...props} initialInteractions={{ ...page, interactions: [] }} />);
+    } else if (history === "answered") {
+      // A local answer makes guidance available before new server props arrive.
+      fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+      await waitFor(() => expect(respondInteraction).toHaveBeenCalledOnce());
+    }
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Keep this guidance safe" } });
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    if (status === 409) {
+      fireEvent.click(await screen.findByRole("button", { name: "Keep viewing" }));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toHaveValue("Keep this guidance safe");
+      expect(screen.queryByText("You", { exact: true })).not.toBeInTheDocument();
+      expect(screen.queryByText("Astra", { exact: true })).not.toBeInTheDocument();
+      expect(forceTakeover).not.toHaveBeenCalled();
+    }
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
     expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(1);
-  } finally { rendered.unmount(); fetch.mockRestore(); }
+    expect(fetch).toHaveBeenCalledOnce();
+  } finally {
+    rendered.unmount();
+    fetch.mockRestore();
+  }
 });
+
 
 test.each(["takeover denial", "keep viewing"])("writer-conflict navigation preserves the uncertain request (%s)", async action => {
   streamHarness.real = true;
