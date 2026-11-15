@@ -6,10 +6,6 @@ use astra_services::skills::{
 };
 use async_trait::async_trait;
 
-#[allow(dead_code)]
-#[path = "../../../../../services/tests/common/mysql_response_proxy.rs"]
-mod control_mysql_response_proxy;
-
 #[path = "native_stage_tests.rs"]
 mod native_stage_tests;
 
@@ -29438,7 +29434,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .unwrap()
     );
 
-    use control_mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    use crate::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
     let proxy = ResponseProxy::start(
         pool.settings().host.clone(),
         pool.settings().port,
