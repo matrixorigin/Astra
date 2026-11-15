@@ -5,6 +5,9 @@ export type StreamEventType =
   | "session_info"
   | "work_turn_started"
   | "work_task_graph_changed"
+  | "context_usage"
+  | "agent_communication"
+  | "work_task_board_update"
   | "context_meta"
   | "run_started"
   | "run_paused"
@@ -147,6 +150,7 @@ export type RunWaitingEvent = {
   type: "run_waiting";
   run_id?: string;
   reason?: string;
+  execution_live?: boolean;
   waiting_for?: string | null;
   timestamp?: number;
 } & ExecutionBindingFields;
@@ -337,8 +341,61 @@ export type UsageEvent = {
   cache_read_input_tokens?: number;
 };
 
+/** Final physical request accounting, separate from a run-total usage event. */
+export type ContextUsageEvent = {
+  type: "context_usage";
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+};
+
+export type AgentCommunicationEvent = {
+  type: "agent_communication";
+  schema_version: "astra.agent_communication.v1";
+  observed_by: { run_id: string; agent_id: string };
+  direction: "sent" | "received";
+  message_id: string;
+  from: { run_id: string; agent_id: string };
+  to: { kind: "direct"; address: { run_id: string; agent_id: string } }
+    | { kind: "broadcast"; delegation_id: string } | { kind: "parent" };
+  payload_kind: "text" | "progress" | "request" | "response" | "signal";
+  summary?: string;
+  response_accepted?: boolean;
+  related_message_id?: string;
+  timestamp_ms: number;
+  correlation_id?: string;
+};
+
+export type WorkTaskBoardTaskV1 = {
+  item_id: string;
+  item_revision: number;
+  objective: string;
+  expected_result: string;
+  declaration_state: "active" | "superseded" | "cancelled";
+  execution_status: "not_started" | "running" | "waiting" | "paused" | "completed" | "delegated" | "failed" | "cancelled";
+  delivery_status: "unreported" | "delivered" | "blocked" | "failed";
+  delivery_summary: string | null;
+  blocker_kind: "capability_unavailable" | "dependency_blocked" | "policy_blocked" | "external_unavailable" | null;
+  unavailable_capabilities: string[];
+};
+
+export type WorkTaskBoardUpdateEvent = {
+  type: "work_task_board_update";
+  tool_call_id?: string;
+  session_id?: string;
+  task_board_update: {
+    schema_version: 1;
+    work_id: string;
+    branch_id: string;
+    tasks: WorkTaskBoardTaskV1[];
+  } & ({ kind: "snapshot"; goal: string; graph_revision: number; criteria_member_count: number }
+    | { kind: "upsert"; graph_revision: number | null });
+};
+
 export type TurnCompleteEvent = {
   type: "turn_complete";
+  continuation_owner?: "server" | "client";
   /** Some runtime paths include final visible assistant text on turn completion. */
   assistant_text?: string;
   followup_suggestion?: string;
@@ -346,7 +403,9 @@ export type TurnCompleteEvent = {
 
 export type StreamErrorEvent = {
   type: "error";
+  run_id?: string;
   code?: string;
+  error_kind?: string;
   error_code?: string;
   message: string;
   retryable?: boolean;
@@ -989,6 +1048,9 @@ export type StreamEvent = (
   | ToolCallStartEvent
   | ToolCallEndEvent
   | UsageEvent
+  | ContextUsageEvent
+  | AgentCommunicationEvent
+  | WorkTaskBoardUpdateEvent
   | TurnCompleteEvent
   | StreamErrorEvent
   | WarningEvent
@@ -1028,12 +1090,26 @@ export type StreamEvent = (
   | ToolExecutionCompletedEvent
 ) & { index?: number };
 
-/** Events emitted by the Work-first continuation stream. Structural session
- * identity is deliberately unrepresentable on this public surface. */
+/** Known producer schemas available for typed Work consumers. */
+export type KnownWorkTurnStreamEvent =
+  Exclude<StreamEvent, SessionInfoEvent> & { session_id?: never };
+
+/** Runtime observations are extensible; only Work control envelopes are closed.
+ * The decoder rejects structural session identities in both known and new facts. */
 export type WorkTurnStreamEvent =
-  | WorkTurnStartedEventV1
-  | WorkTaskGraphChangedEventV1
-  | (StreamEvent & { session_id?: never });
+  | KnownWorkTurnStreamEvent
+  | { type: string; session_id?: never; [field: string]: unknown };
+
+type WorkEventFor<K extends string, E = KnownWorkTurnStreamEvent> =
+  E extends { type: infer T } ? K extends T ? E & { type: K } : never : never;
+
+/** Discriminator narrowing under the canonical producer schema, not payload validation. */
+export function isWorkTurnEventType<K extends KnownWorkTurnStreamEvent["type"]>(
+  event: WorkTurnStreamEvent,
+  type: K,
+): event is WorkTurnStreamEvent & WorkEventFor<K> {
+  return event.type === type;
+}
 
 export type ConnectionState =
   "disconnected" | "connecting" | "connected" | "error";
@@ -1211,7 +1287,7 @@ export type SSEClientOptions = {
   retryDelayMs?: number;
   /** Abort the stream when no SSE event arrives within this window. Defaults to disabled. */
   heartbeatTimeoutMs?: number;
-  /** Require a protocol terminal before EOF is treated as a completed stream. */
+  /** Require the SSE [DONE] observation marker before accepting EOF. */
   requireTerminalEvent?: boolean;
   signal?: AbortSignal;
   /** HTTP method. Defaults to 'GET'. Use 'POST' for streaming chat endpoints. */

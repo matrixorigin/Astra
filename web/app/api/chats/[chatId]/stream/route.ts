@@ -1,6 +1,7 @@
 import { parseChatSseFrame, isReplayConnectionError } from "@/lib/api/chat-sse-frame";
 import { NextRequest, NextResponse } from "next/server";
 import {
+  AstraApiError,
   ASTRA_AGENT_INTERACTION_API_MAJOR,
   ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER,
   PATH_CHAT_STREAM,
@@ -37,8 +38,10 @@ import {
   RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
+  runtimeErrorDetail,
 } from "@/lib/runtime-client";
 import type {
+  ChatArtifactRef,
   SendMessageRequest,
 } from "@/lib/api/types";
 import {
@@ -53,10 +56,6 @@ const encoder = new TextEncoder();
 
 function sseFrame(event: unknown) {
   return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
-}
-
-function eventFromSseFrame(frame: string, strict = false): import("@astra/sdk").StreamEvent | null {
-  return parseChatSseFrame(frame, strict) as import("@astra/sdk").StreamEvent | null;
 }
 
 async function readSendMessageRequest(
@@ -235,6 +234,7 @@ function proxyRunStream(params: {
           return;
         }
         try {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch {
           clientCancelled = true;
@@ -256,11 +256,11 @@ function proxyRunStream(params: {
         };
         if (projectionLease) {
           const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
-            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus } = state;
+            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus, waitingFor } = state;
           if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
             session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
               reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
-              lastFailureMessage, errorCode, terminalStatus } })) return;
+              lastFailureMessage, errorCode, terminalStatus, waitingFor } })) return;
         }
         let resolvedBackendResponse: Response;
         try {
@@ -401,7 +401,9 @@ function proxyRunStream(params: {
         };
 
         const forwardFrame = (frame: string) => {
-          const event = eventFromSseFrame(frame, replayOnly);
+          const parsed = parseChatSseFrame(frame, replayOnly);
+          if (parsed === "[DONE]") return "[DONE]";
+          const event = parsed as import("@astra/sdk").StreamEvent | null;
           if ((event as { type?: string } | null)?.type === "chat_stream_init") {
             mutate(() => { throw new Error("Runtime supplied a reserved Web initialization frame."); });
           }
@@ -421,7 +423,7 @@ function proxyRunStream(params: {
 
         let upstreamDone = false;
         try {
-          for (;;) {
+          readLoop: for (;;) {
             let chunk: ReadableStreamReadResult<Uint8Array>;
             try {
               chunk = await reader.read();
@@ -429,6 +431,7 @@ function proxyRunStream(params: {
               if (clientCancelled) return;
               // Transport loss cannot override an observed failure or resumable/terminal state.
               if (!replayOnly && (state.lastStatus === "failed" || state.runLifecycle !== "running")) {
+                buffer = "";
                 break;
               }
               if (replayOnly) throw error;
@@ -448,7 +451,14 @@ function proxyRunStream(params: {
             const frames = buffer.split(/\r?\n\r?\n/);
             buffer = frames.pop() ?? "";
             for (const frame of frames) {
-              if (!forwardFrame(frame)) return;
+              const result = forwardFrame(frame);
+              if (result === "[DONE]") {
+                buffer = "";
+                await Promise.resolve(reader.cancel()).catch(() => undefined);
+                upstreamDone = true;
+                break readLoop;
+              }
+              if (!result) return;
             }
           }
 
@@ -475,13 +485,23 @@ function proxyRunStream(params: {
           }
 
           if (!replayOnly && state.lastStatus === "complete") {
-            const runtimeClient = await currentRuntime();
-            const artifacts = (
-              await fetchSessionArtifacts(runtimeClient, currentSessionId())
-            ).filter((artifact) => !knownArtifactIds.has(artifact.id));
-            if (clientCancelled) {
-              return;
+            if (clientCancelled || !mutate(() => {})) return;
+            let loadedArtifacts: ChatArtifactRef[] = [];
+            try {
+              const runtimeClient = await currentRuntime();
+              if (clientCancelled || !mutate(() => {})) return;
+              loadedArtifacts = await fetchSessionArtifacts(runtimeClient, currentSessionId());
+            } catch (error) {
+              if (clientCancelled || !mutate(() => {})) return;
+              const context = error instanceof RuntimeClientError || error instanceof AstraApiError
+                ? [error.status && `HTTP ${error.status}`, error.code,
+                  error instanceof AstraApiError && error.category].filter(Boolean).join(", ")
+                : "";
+              enqueueFrame({ type: "warning",
+                message: `Additional attachments could not be loaded${context ? ` (${context})` : ""}: ${runtimeErrorDetail(error).slice(0, 1024)}` });
             }
+            if (clientCancelled || !mutate(() => {})) return;
+            const artifacts = loadedArtifacts.filter((artifact) => !knownArtifactIds.has(artifact.id));
             if (artifacts.length > 0) {
               updateStreamingAssistantMessage(
                 ownerUserId,

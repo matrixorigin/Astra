@@ -23,6 +23,54 @@ It does not own raw trace schema, which belongs to [observation-plane.md](observ
 A session should be explainable from durable projections and structured facts.
 ```
 
+## Stream closure and execution outcome
+
+Only the run owner publishes a settled run outcome. A root-scoped
+`run_error` is diagnostic evidence while the lifecycle owner settles the
+run; it must not release a Work controller or overwrite a later owner outcome.
+If the event channel closes, or the owner's terminal publication grace expires,
+the SSE adapter emits an existing error frame with code
+`stream_observation_interrupted`, kind `stream_transport` and
+`retryable: false`, followed by exactly one `[DONE]`. This closes observation;
+it does not manufacture a failed/cancelled run, confirm side effects, or authorize
+re-execution. Clients retain the admitted run/request identity and earlier
+classified cause. Explicit descendant diagnostics cannot settle the root stream.
+Observation loss closes queued tool admission while already-started work remains
+under its existing owner and deadline. Actual owner/user cancellation still applies.
+A live completed or paused owner terminal still requires its authoritative
+`turn_complete` projection.
+
+A durable indexed owner receipt replays the already-journaled answer without
+inventing a live completion frame. Both finite replay/error responses and live
+streams close with the existing SSE [DONE] marker. The transport observes that
+framing marker and releases the HTTP reader at that boundary; it does not
+classify root or child execution outcomes. A read error discards any incomplete
+frame; it cannot manufacture a completion from trailing bytes. Web sends its
+supplemental artifacts before its one downstream completion marker. A failed
+post-turn artifact refresh emits a warning; it cannot replace the confirmed
+outcome or remove a paused run's resume binding. Accounting prefixes expanded from a
+durable terminal have no cursor; only the final owner receipt advances it.
+Interruption and a waiting event with execution_live false remain provisional,
+so a connection loss before the final projection keeps that root attachable.
+
+Work continuation decoders validate Work control envelopes and reject structural
+session identity. The canonical server projector owns the runtime publication
+catalog; public runtime observations pass through without a duplicate client
+catalog. SDK Work callbacks have an open event union: existing unguarded
+switches on event.type may require migration. Use isWorkTurnEventType for each
+handled known payload; unmodeled fields remain unknown.
+Unknown facts do not authorize actions or settle requests. An inconclusive HTTP
+or protocol failure retains the pending request ID for explicit same-turn recovery.
+A rejected recovery attempt cannot establish the original request's outcome.
+POST timeouts remain unconfirmed without automatic replay; transient GET408/429
+responses use the existing cancellable retry budget.
+
+One-shot CLI JSON reports `cache.hit` as true for an observed cache read,
+false for a supported zero with complete coverage, and null when unknown.
+Numeric fields remain known observed subtotals; qualified usage and its coverage
+identify missing buckets or calls. This changes reporting, not provider prompts,
+cache keys, or cacheable prefixes.
+
 ## Status model
 
 A session status projection should include:

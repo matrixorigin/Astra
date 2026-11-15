@@ -50,6 +50,7 @@ describe('scenarios / multi-agent delegation', () => {
       'data: {"type":"agent_completed","agent_id":"tester","status":"completed","result_summary":"tests passed","total_tool_calls":2}\n\n',
       'data: {"type":"agent_completed","agent_id":"researcher","status":"completed","result_summary":"context mapped","total_tool_calls":5}\n\n',
       'data: {"type":"turn_complete"}\n\n',
+      'data: [DONE]\n\n',
     ];
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,

@@ -162,6 +162,7 @@ pub(crate) enum SlashBackgroundRead {
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
     },
     WorkContinue {
+        recovering: bool,
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         work_id: String,
@@ -574,6 +575,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 );
                 ctx.show_response("Continuing Work…".to_string());
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: false,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id,
@@ -593,6 +595,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 };
                 ctx.show_response(format!("Retrying Work request {request_id}…"));
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: true,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id: pending.work_id,

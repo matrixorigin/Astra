@@ -1088,6 +1088,7 @@ async fn post_work_turn(
     let events = raw
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|json| *json != "[DONE]")
         .map(|json| serde_json::from_str(json).expect("SSE data JSON"))
         .collect();
     (status, events, raw)

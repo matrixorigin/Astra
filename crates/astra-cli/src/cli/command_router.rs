@@ -4220,6 +4220,14 @@ fn final_json_output_with_context(
             .expect("fixed tool result-class aggregate must serialize")
     };
     let disposition = completion_disposition(sr, exit_code);
+    let cache_hit = match sr
+        .qualified_usage
+        .and_then(astra_turn_types::CanonicalTokenUsage::cached_input_tokens)
+    {
+        Some(read) if read > 0 || sr.token_usage_coverage.status() == "complete" => Some(read > 0),
+        _ if sr.cache_read_tokens > 0 => Some(true),
+        _ => None,
+    };
     let mut output = serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
@@ -4242,7 +4250,7 @@ fn final_json_output_with_context(
         "prompt_tokens": total_prompt_tokens,
         "fresh_prompt_tokens": sr.prompt_tokens,
         "cache": {
-            "hit": sr.cache_read_tokens > 0,
+            "hit": cache_hit,
             "read_tokens": sr.cache_read_tokens,
             "creation_tokens": sr.cache_creation_tokens,
         },
@@ -5521,8 +5529,37 @@ mod exit_code_tests {
             json["qualified_usage"],
             serde_json::json!({"input_tokens":17,"output_tokens":3})
         );
+        assert!(
+            json["cache"]["hit"].is_null(),
+            "unknown cache reads are not a measured miss: {json}"
+        );
         assert!(json["llm_rounds"].is_null());
         assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn cache_hit_reports_observed_hits_complete_zero_and_unknown_reads() {
+        for (read, missing, expected) in [
+            (None, 0, serde_json::Value::Null),
+            (Some(0), 0, serde_json::json!(false)),
+            (Some(0), 1, serde_json::Value::Null),
+            (Some(7), 1, serde_json::json!(true)),
+        ] {
+            let mut failure = accepted_failed_run();
+            failure.partial.qualified_usage = Some(
+                astra_turn_types::CanonicalTokenUsage::new(Some(17), read, None, Some(3)).unwrap(),
+            );
+            failure.partial.cache_read_tokens = read.unwrap_or(0);
+            failure.partial.token_usage_coverage =
+                astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                    attempts: 1 + missing,
+                    provider_reported: 1,
+                    unavailable: missing,
+                };
+            let output = super::hard_failure_json_output(failure);
+            assert_eq!(output["cache"]["hit"], expected, "{output}");
+            assert_eq!(output["cache"]["read_tokens"], read.unwrap_or(0));
+        }
     }
 
     #[test]

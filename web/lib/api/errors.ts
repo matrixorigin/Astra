@@ -12,9 +12,9 @@ export class WebApiError extends Error {
   }
 }
 
-export function streamObservationInterrupted() {
+export function streamObservationInterrupted(diagnostic?: string) {
   return new WebApiError(502,
-    "The run stream was interrupted. Reconnect to continue observing this run.",
+    [diagnostic, "The run stream was interrupted. Reconnect to continue observing this run."].filter(Boolean).join("\n"),
     "stream_observation_interrupted");
 }
 

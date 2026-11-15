@@ -938,10 +938,20 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
             }
             let error_code = json
                 .get("error_code")
+                .or_else(|| json.get("code"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
             if let Some(code) = error_code {
                 context_lines.push(format!("  error_code: {}", api_error_preview(code, 128)));
+            }
+            for field in ["category", "action_hints"] {
+                if let Some(value) = json.get(field) {
+                    let detail = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    context_lines.push(format!("  {field}: {}", api_error_preview(&detail, 256)));
+                }
             }
             if let Some(hint) = status_hint_for(status, error_code) {
                 context_lines.push(format!("  Hint: {hint}"));
@@ -1730,6 +1740,31 @@ mod tests {
         let hint_pos = err.find("Hint:").unwrap();
         assert!(rid_pos < hint_pos, "request_id must appear before Hint");
         assert!(code_pos < hint_pos, "error_code must appear before Hint");
+    }
+
+    #[test]
+    fn read_api_error_keeps_work_diagnostics_with_or_without_a_message() {
+        for message in [None, Some("Work response unavailable")] {
+            let mut body = serde_json::json!({
+                "code":"work_unavailable", "category":"availability", "action_hints":["review_effects"]
+            });
+            if let Some(message) = message {
+                body["message"] = serde_json::json!(message);
+            }
+            let error = read_api_error(408, &body.to_string());
+            for fact in ["408", "work_unavailable", "availability", "review_effects"] {
+                assert!(error.contains(fact), "{error}");
+            }
+        }
+        let error = read_api_error(
+            408,
+            &serde_json::json!({
+                "message":"bounded diagnostic", "code":"work_unavailable",
+                "category":"x".repeat(4096), "action_hints":["y".repeat(4096)]
+            })
+            .to_string(),
+        );
+        assert!(error.len() < 2048, "metadata must remain bounded");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { isOwnedRunFinishedEvent, isRunTerminalStatus, requiresRunCompletionProjection, isRunFinalizationHint } from "./sse-client";
 import { useState, useRef, useCallback, useEffect, useReducer } from "react";
 import type {
   StreamEvent,
@@ -223,11 +224,12 @@ type ChatAction =
   | { type: "SET_RUN_ID"; runId: string | null }
   | {
       type: "SET_RUN_STATUS";
-      status: string | null;
+      status: string | null | ((previous: string | null) => string | null);
       waitingFor?: string | null;
     }
-  | { type: "SET_ERROR"; error: string | null }
+  | { type: "SET_ERROR"; error: string | null | ((previous: string | null) => string | null) }
   | { type: "SET_STREAMING"; isStreaming: boolean }
+  | { type: "FINISH_RESPONSE" }
   | { type: "SET_CONNECTION_STATE"; state: ConnectionState | "idle" }
   | {
       type: "SET_MESSAGES";
@@ -275,6 +277,12 @@ const initialChatState: ChatState = {
   connectionState: "idle",
 };
 
+function finishLastAssistant(messages: ChatMessage[]): ChatMessage[] {
+  const last = messages[messages.length - 1];
+  return last?.role === "assistant" && last.streaming
+    ? [...messages.slice(0, -1), { ...last, streaming: false }] : messages;
+}
+
 function chatReducer(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     case "SET_SESSION_ID":
@@ -284,14 +292,28 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "SET_RUN_STATUS":
       return {
         ...state,
-        runStatus: action.status,
+        runStatus: typeof action.status === "function" ? action.status(state.runStatus) : action.status,
         waitingFor: action.waitingFor ?? null,
       };
     case "SET_ERROR":
-      return { ...state, error: action.error };
+      return { ...state, error: typeof action.error === "function" ? action.error(state.error) : action.error };
     case "SET_STREAMING":
       return { ...state, isStreaming: action.isStreaming };
+    case "FINISH_RESPONSE":
+      return isRunTerminalStatus(state.runStatus)
+        ? { ...state, isStreaming: false, connectionState: "idle", messages: finishLastAssistant(state.messages) }
+        : state;
     case "SET_CONNECTION_STATE":
+      if (action.state === "disconnected" && state.isStreaming) {
+        return {
+          ...state, connectionState: action.state, isStreaming: false,
+          runStatus: isRunTerminalStatus(state.runStatus) ? state.runStatus : null,
+          error: state.error ?? (isRunTerminalStatus(state.runStatus)
+            ? "The stream ended before its final response projection was confirmed."
+            : "The stream ended before its owner outcome was confirmed."),
+          messages: finishLastAssistant(state.messages),
+        };
+      }
       return { ...state, connectionState: action.state };
     case "SET_MESSAGES":
       return {
@@ -428,6 +450,12 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       return;
     }
 
+    // Descendant observations share this transport but cannot mutate the
+    // bound root's lifecycle, identity, error or execution boundary.
+    const producer = runIdFromEvent(event);
+    if (rootRunIdRef.current && producer && producer !== rootRunIdRef.current
+      && (event.type.startsWith("run_") || event.type === "error")) return;
+
     if (event.type === "run_blocked") {
       applyRunExecutionBoundary();
       const reason = extractBlockedReason(event) ?? "blocked";
@@ -449,7 +477,6 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         break;
 
       case "run_started":
-        if (rootRunIdRef.current && event.run_id && event.run_id !== rootRunIdRef.current) break;
         rootRunIdRef.current ??= event.run_id;
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
@@ -494,7 +521,12 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         });
         break;
 
+      case "run_interrupted":
+        applyRunExecutionBoundary();
+        break;
+
       case "run_waiting": {
+        if (isRunFinalizationHint(event)) break;
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         const projection = projectRunWaitingState(event);
@@ -521,48 +553,10 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       case "run_error":
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-        dispatch({
-          type: "SET_RUN_STATUS",
-          status: "failed",
-          waitingFor: null,
-        });
+        // A diagnostic can precede the owner's final outcome. Keep observing.
         dispatch({
           type: "SET_ERROR",
-          error: event.message ?? event.error ?? "Astra run failed.",
-        });
-        dispatch({ type: "SET_STREAMING", isStreaming: false });
-        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-        dispatch({
-          type: "SET_MESSAGES",
-          messages: (prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.role === "assistant" && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, streaming: false }];
-            }
-            return prev;
-          },
-        });
-        break;
-
-      case "run_interrupted":
-        applyRunExecutionBoundary();
-        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-        dispatch({
-          type: "SET_RUN_STATUS",
-          status: "paused",
-          waitingFor: event.waiting_for ?? "user_resume",
-        });
-        dispatch({ type: "SET_STREAMING", isStreaming: false });
-        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-        dispatch({
-          type: "SET_MESSAGES",
-          messages: (prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.role === "assistant" && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, streaming: false }];
-            }
-            return prev;
-          },
+          error: event.message ?? event.error ?? "Astra run reported an error.",
         });
         break;
 
@@ -826,16 +820,23 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         });
         break;
 
-      case "error":
-        dispatch({ type: "SET_ERROR", error: event.message });
-        // A retryable transport error keeps the stream alive while
-        // `SSEClient` reconnects. A non-retryable protocol/server error is a
-        // terminal failure; close the provisional assistant message so the
-        // UI cannot remain in a permanently streaming state after EOF.
-        if (event.retryable === true) break;
+      case "error": {
+        const unconfirmed = event.code === "stream_observation_interrupted";
+        const admitted = !!rootRunIdRef.current;
+        dispatch({
+          type: "SET_ERROR",
+          error: unconfirmed && event.retryable !== true
+            ? (previous) => previous ? previous + "\n" + event.message : event.message
+            : event.message,
+        });
+        // Closing observation does not settle an admitted run. A rejection
+        // before admission still closes the failed request normally.
+        if (event.retryable === true || admitted && !unconfirmed && event.error_kind !== "contract_violation") break;
         dispatch({ type: "SET_STREAMING", isStreaming: false });
         dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-        dispatch({ type: "SET_RUN_STATUS", status: "failed", waitingFor: null });
+        dispatch({ type: "SET_RUN_STATUS", status: admitted || unconfirmed
+          ? (previous) => isRunTerminalStatus(previous) ? previous : null
+          : "failed", waitingFor: null });
         dispatch({
           type: "SET_MESSAGES",
           messages: (prev) => {
@@ -847,6 +848,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           },
         });
         break;
+      }
 
       case "turn_complete":
         if (event.assistant_text !== undefined) {
@@ -867,23 +869,42 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
             },
           });
         }
-        dispatch({ type: "SET_STREAMING", isStreaming: false });
-        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-        dispatch({
-          type: "SET_MESSAGES",
-          messages: (prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.role === "assistant" && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, streaming: false }];
-            }
-            return prev;
-          },
-        });
+        if (event.continuation_owner === "server") {
+          for (const [callId, tool] of toolCallMapRef.current) {
+            if (tool.status === "running") toolCallMapRef.current.delete(callId);
+          }
+          dispatch({ type: "SET_TOOL_CALLS", toolCalls: Array.from(toolCallMapRef.current.values()) });
+          dispatch({ type: "FINISH_RESPONSE" });
+        }
         break;
 
       case "run_finished":
       case "run_cancelled":
-        if (rootRunIdRef.current && event.run_id && event.run_id !== rootRunIdRef.current) break;
+        if (event.type === "run_finished" && !isOwnedRunFinishedEvent(event)) break;
+        applyRunExecutionBoundary();
+        if (event.type === "run_finished") {
+          if (event.error) dispatch({ type: "SET_ERROR", error: event.error });
+          else if (event.status === "completed") dispatch({ type: "SET_ERROR", error: null });
+        }
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status:
+            event.type === "run_cancelled"
+              ? "cancelled"
+              : (event.status ?? null),
+          waitingFor: event.type === "run_finished" && event.status === "paused"
+            ? event.waiting_for ?? "user_resume" : null,
+        });
+        if (event.type === "run_finished") dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            return last?.role === "assistant" ? [...prev.slice(0, -1),
+              { ...last, contextNotSaved: cancelledContextObservation(event) }] : prev;
+          },
+        });
+        if (event.type === "run_finished" && requiresRunCompletionProjection(event)) break;
         // Run completion never substitutes for a tool's own result. Live-only
         // cards can be absent from cold replay; discard unresolved presentation.
         for (const [callId, tool] of toolCallMapRef.current) {
@@ -893,30 +914,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           type: "SET_TOOL_CALLS",
           toolCalls: Array.from(toolCallMapRef.current.values()),
         });
-        applyRunExecutionBoundary();
-        dispatch({ type: "SET_STREAMING", isStreaming: false });
-        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-        dispatch({
-          type: "SET_RUN_STATUS",
-          status:
-            event.type === "run_cancelled"
-              ? "cancelled"
-              : (event.status ?? "completed"),
-          waitingFor: null,
-        });
-        dispatch({
-          type: "SET_MESSAGES",
-          messages: (prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.role === "assistant" && (last.streaming || event.type === "run_finished")) {
-              return [...prev.slice(0, -1), { ...last, streaming: false,
-                ...(event.type === "run_finished" ? { contextNotSaved: cancelledContextObservation(event) } : {}),
-              }];
-            }
-            return prev;
-          },
-        });
+        dispatch({ type: "FINISH_RESPONSE" });
         break;
 
       case "agent_delegated":
@@ -1007,8 +1005,11 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         },
         {
           onEvent: (event) => processEvent(event, generation),
-          onStateChange: (state) =>
-            dispatch({ type: "SET_CONNECTION_STATE", state }),
+          onStateChange: (state) => {
+            if (generation === streamGenerationRef.current) {
+              dispatch({ type: "SET_CONNECTION_STATE", state });
+            }
+          },
           signal: controllerRef.current.signal,
         },
       );

@@ -43,9 +43,9 @@ describe("applyStreamEvent", () => {
     const state = makeState();
     state.runId = "root";
     state.assistantText = "partial answer";
-    applyStreamEvent({ type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: true }, ctx, state);
+    applyStreamEvent({ owner_generation: 4, type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: true }, ctx, state);
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
-    const terminal = { type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation } as const;
+    const terminal = { owner_generation: 4, type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation } as const;
     applyStreamEvent(terminal, ctx, state);
     applyStreamEvent(terminal, ctx, state);
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith("user-a", "chat-1", "assistant-1", { contextNotSaved: observation ?? null });
@@ -145,12 +145,12 @@ describe("applyStreamEvent", () => {
     const state = makeState();
 
     applyStreamEvent(
-      { type: "run_finished", run_id: "run-1", status: "completed" },
+      { owner_generation: 4, index: 0, type: "run_finished", run_id: "run-1", status: "completed" },
       ctx,
       state,
     );
     applyStreamEvent(
-      { type: "turn_complete", assistant_text: "final text" },
+      { type: "turn_complete", continuation_owner: "server", assistant_text: "final text" },
       ctx,
       state,
     );
@@ -225,7 +225,7 @@ describe("applyStreamEvent", () => {
       state,
     );
     applyStreamEvent(
-      {
+      { owner_generation: 4,
         type: "run_finished",
         run_id: "run-1",
         status: "failed",
@@ -260,7 +260,7 @@ describe("applyStreamEvent", () => {
       error: "Completion could not be saved.", error_code: "canonical_persistence_failed" }, ctx, state);
     expect(state.assistantText).toBe("Useful partial answer\n\nCompletion could not be saved.");
     for (const error of ["Completion could not be saved.", undefined]) {
-      applyStreamEvent({ type: "run_finished", run_id: "run-1", status: "failed", error }, ctx, state);
+      applyStreamEvent({ owner_generation: 4, type: "run_finished", run_id: "run-1", status: "failed", error }, ctx, state);
     }
     expect(state.assistantRawText).toBe("Useful partial answer");
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "chat-1", "assistant-1",
@@ -289,18 +289,18 @@ describe("applyStreamEvent", () => {
       expect(mockSetChatActiveRun).not.toHaveBeenCalled();
     }
     applyStreamEvent({ type: "run_resumed", run_id: "root" }, ctx, state);
-    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
-    expect(state.runLifecycle).toBe("finished");
+    expect(mockSetChatActiveRun).toHaveBeenCalledWith("user-a", "chat-1", expect.objectContaining({ runId: "root", status: "running" }));
+    expect(state.runLifecycle).toBe("running");
   });
 
-  it("retains distinct failure reasons even after an earlier generic error", () => {
+  it("selects the owned failure reason after a provisional diagnostic", () => {
     const state = makeState();
     applyStreamEvent({ type: "text_delta", content: "Answer mentions save failure" }, ctx, state);
     applyStreamEvent({ type: "error", message: "generic transport issue" }, ctx, state);
     applyStreamEvent({ type: "run_error", run_id: "root", error: "save failure" }, ctx, state);
-    applyStreamEvent({ type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
-    applyStreamEvent({ type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
-    expect(state.assistantText).toBe("Answer mentions save failure\n\nsave failure\n\ndifferent failure");
+    applyStreamEvent({ owner_generation: 4, type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
+    applyStreamEvent({ owner_generation: 4, type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
+    expect(state.assistantText).toBe("Answer mentions save failure\n\ndifferent failure");
   });
 
   it("rejects a conflicting root bootstrap without rebinding or accepting later text", () => {
@@ -315,36 +315,21 @@ describe("applyStreamEvent", () => {
     expect(state.assistantText).toBe(failure);
   });
 
-  it("projects run_error as run failure instead of a protocol disconnect", () => {
+  it("keeps a root diagnostic available without settling or dropping its active identity", () => {
     const state = makeState();
-
-    applyStreamEvent(
-      {
-        type: "run_error",
-        run_id: "run-1",
-        message: "loop crashed",
-        error_kind: "runtime",
-      },
-      ctx,
-      state,
-    );
-
-    expect(mockSetChatActiveRun).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      undefined,
-    );
-    expect(state.lastStatus).toBe("failed");
-    expect(state.runLifecycle).toBe("finished");
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content: "loop crashed",
-        status: "failed",
-      }),
-    );
+    applyStreamEvent({ type: "session_info", session_id: "session-1", run_id: "run-1" }, ctx, state);
+    applyStreamEvent({ type: "text_delta", content: "Useful partial answer" }, ctx, state);
+    vi.clearAllMocks();
+    applyStreamEvent({ type: "run_error", run_id: "run-1", message: "storage unavailable", error_kind: "database_error" }, ctx, state);
+    applyStreamEvent({ type: "error", run_id: "run-1", code: "stream_observation_interrupted", message: "Run outcome unconfirmed", retryable: false }, ctx, state);
+    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+    expect(state.lastStatus).toBe("streaming");
+    expect(state.runLifecycle).toBe("running");
+    expect(state.runId).toBe("run-1");
+    expect(state.assistantText).toBe("Useful partial answer");
+    expect(state.lastFailureMessage).toContain("storage unavailable");
+    expect(state.errorCode).toBe("stream_observation_interrupted");
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
   });
 
   it("projects blocked run events with explicit messages as visible feedback", () => {
@@ -625,7 +610,7 @@ describe("applyStreamEvent", () => {
       state,
     );
     applyStreamEvent(
-      {
+      { owner_generation: 4,
         type: "run_finished",
         run_id: "run-1",
         status: "paused",
@@ -635,6 +620,8 @@ describe("applyStreamEvent", () => {
       ctx,
       state,
     );
+
+    applyStreamEvent({ type: "turn_complete", continuation_owner: "server" }, ctx, state);
 
     expect(state.lastStatus).toBe("complete");
     expect(state.runLifecycle).toBe("paused");
@@ -679,7 +666,7 @@ describe("applyStreamEvent", () => {
       state,
     );
     applyStreamEvent(
-      {
+      { owner_generation: 4,
         type: "run_finished",
         run_id: "run-task",
         status: "paused",
@@ -689,6 +676,8 @@ describe("applyStreamEvent", () => {
       ctx,
       state,
     );
+
+    applyStreamEvent({ type: "turn_complete", continuation_owner: "server" }, ctx, state);
 
     expect(state.runLifecycle).toBe("paused");
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(

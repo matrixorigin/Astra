@@ -990,6 +990,16 @@ fn apply_one_event(
     {
         let _ = accum.root_identity.bind_legacy_hint(existing);
     }
+    if etype == "error"
+        && accum.root_identity.run_id().is_some_and(|root| {
+            event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != root)
+        })
+    {
+        return;
+    }
     if matches!(etype, "session_info" | "run_started") {
         match accum.root_identity.observe_event(event) {
             Ok(()) => accum.run_id = accum.root_identity.run_id().map(str::to_string),
@@ -1873,6 +1883,40 @@ fn apply_one_event(
             *pending_cleared = true;
         }
         "error" => {
+            if event.get("code").and_then(Value::as_str) == Some("stream_observation_interrupted") {
+                // Connection closure revokes queued admission, not the run's
+                // outcome or the surviving owner's execution custody.
+                edge_pending.clear();
+                *pending_cleared = true;
+                if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+                    || accum.observed_root_terminal().is_some()
+                {
+                    return;
+                }
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The run outcome was not confirmed");
+                accum.error_message = Some(match accum.error_message.take() {
+                    Some(cause) => format!("{cause}\n{message}"),
+                    None => message.to_owned(),
+                });
+                accum.error_kind = Some(
+                    accum
+                        .error_kind
+                        .filter(|kind| {
+                            !matches!(
+                                kind,
+                                astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::Unknown
+                            )
+                        })
+                        .unwrap_or(astra_core::ErrorKind::StreamTransport),
+                );
+                accum.explain_analyze_degraded = true;
+                accum.pending_attempt_error = false;
+                accum.attempt_error_supersession_eligible = false;
+                return;
+            }
             // Indexed errors are durable historical events. An error without
             // a replay index is a transport/connection failure and may have
             // cut off later Explain Analyze facts.
@@ -2086,6 +2130,7 @@ fn apply_one_event(
                             return;
                         }
                         if accum.has_final_error()
+                            && terminal.owner_generation.is_none()
                             && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
                             && (terminal.status != DurableRunTerminalStatus::Failed
                                 || terminal
@@ -2096,6 +2141,56 @@ fn apply_one_event(
                             accum.error_message =
                                 Some("Root failure contradicted by terminal outcome".into());
                             return;
+                        }
+                        if terminal.owner_generation.is_some()
+                            && accum.error_message.is_some()
+                            && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
+                        {
+                            match terminal.status {
+                                DurableRunTerminalStatus::Failed
+                                | DurableRunTerminalStatus::Cancelled => {
+                                    accum.error_kind =
+                                        if terminal.status == DurableRunTerminalStatus::Cancelled {
+                                            Some(astra_core::ErrorKind::Cancelled)
+                                        } else {
+                                            terminal.error_kind
+                                        };
+                                    let owner_message =
+                                        terminal.error.clone().unwrap_or_else(|| {
+                                            if terminal.status
+                                                == DurableRunTerminalStatus::Cancelled
+                                            {
+                                                format!(
+                                                    "Server run {} was cancelled",
+                                                    terminal.run_id
+                                                )
+                                            } else {
+                                                format!("Server run {} failed", terminal.run_id)
+                                            }
+                                        });
+                                    let prior = accum
+                                        .error_message
+                                        .take()
+                                        .filter(|prior| prior != &owner_message);
+                                    accum.error_message = Some(match prior {
+                                        Some(prior) => format!("{owner_message}\n{prior}"),
+                                        None => owner_message,
+                                    });
+                                    accum.error_code = event
+                                        .get("error_code")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    accum.error_metadata = event.get("metadata").cloned();
+                                    accum.pending_attempt_error = false;
+                                }
+                                DurableRunTerminalStatus::Completed
+                                | DurableRunTerminalStatus::Paused => {
+                                    // The receipt selects execution status; the existing
+                                    // completion projection resolves its final response.
+                                    accum.pending_attempt_error = accum.error_message.is_some();
+                                }
+                                DurableRunTerminalStatus::Delegated => {}
+                            }
                         }
                         if let Some(interruption) = terminal.interruption.as_ref() {
                             accum.server_interruption = Some(interruption.to_json());
@@ -3235,39 +3330,60 @@ mod tests {
     }
 
     #[test]
-    fn root_failure_cannot_be_superseded_by_attempt_error_or_success() {
+    fn owner_completion_supersedes_diagnostic_after_coherent_projection() {
         let mut accum = ChatTurnSseAccum::default();
-        let mut pending = vec![];
         for event in [
-            serde_json::json!({"type":"run_started","run_id":"root"}),
-            serde_json::json!({"type":"run_error","run_id":"root","error":"stream failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_started","run_id":"r"}),
+            serde_json::json!({"type":"run_error","run_id":"r","error":"storage unavailable","error_kind":"database_error"}),
             serde_json::json!({"type":"error","message":"later attempt","error_kind":"rate_limit"}),
         ] {
             dispatch_chat_turn_sse_event_block(
                 &format!("data: {event}\n\n"),
                 &mut accum,
-                &mut pending,
+                &mut vec![],
             );
         }
+        assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::DatabaseError));
+        dispatch_bound_server_terminal(&mut accum, tool_receipt_fragment("r", 4, 1, 1, true), 4);
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.server_loop_terminal);
         assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::StreamTransport)
+            accum.observed_root_terminal().unwrap().status,
+            DurableRunTerminalStatus::Completed
         );
-        assert_eq!(accum.error_message.as_deref(), Some("stream failed"));
-        dispatch_chat_turn_sse_event_block(
-            &sse(
-                "run_finished",
-                ",\"run_id\":\"root\",\"owner_generation\":4,\"status\":\"completed\"",
-            ),
-            &mut accum,
-            &mut pending,
-        );
-        assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::ContractViolation)
-        );
-        assert!(!accum.has_authoritative_failed_terminal());
-        assert!(accum.run_terminal.is_none());
+    }
+
+    #[test]
+    fn owner_failure_or_cancellation_selects_outcome_after_root_diagnostic() {
+        for (status, expected) in [
+            ("failed", astra_core::ErrorKind::ServerError),
+            ("cancelled", astra_core::ErrorKind::Cancelled),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            for event in [
+                serde_json::json!({"type":"session_info","session_id":"s","run_id":"root"}),
+                serde_json::json!({"type":"run_error","run_id":"root","error":"storage unavailable","error_kind":"database_error"}),
+                serde_json::json!({"type":"run_finished","run_id":"root","owner_generation":4,"status":status,"error":"owner selected this outcome","error_code":"owner_selected","error_kind":if status == "failed" {"server_error"} else {"cancelled"}}),
+            ] {
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut vec![],
+                );
+            }
+            assert_eq!(accum.error_kind, Some(expected));
+            let message = accum.error_message.as_deref().unwrap();
+            assert!(message.starts_with("owner selected this outcome"));
+            assert!(message.contains("storage unavailable"));
+            assert_eq!(
+                accum.observed_root_terminal().unwrap().status,
+                if status == "failed" {
+                    DurableRunTerminalStatus::Failed
+                } else {
+                    DurableRunTerminalStatus::Cancelled
+                }
+            );
+        }
     }
 
     #[test]
@@ -3791,7 +3907,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_terminal_does_not_supersede_attempt_error() {
+    fn owned_failure_retains_its_diagnostic_without_becoming_success() {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending = vec![];
         for block in [
@@ -3816,7 +3932,7 @@ mod tests {
             dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut pending);
         }
 
-        assert!(accum.pending_attempt_error);
+        assert!(accum.has_authoritative_failed_terminal());
         assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::ServerError));
         assert!(accum.error_message.is_some());
     }
@@ -5412,6 +5528,22 @@ mod tests {
             &mut vec![],
         );
         assert!(a.run_id.is_none());
+    }
+
+    #[test]
+    fn child_error_respects_the_already_bound_run_hint() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"run_id\":\"child\",\"session_id\":\"foreign\",\"message\":\"child failed\",\"error_kind\":\"database_error\"}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(accum.run_id.as_deref(), Some("root"));
+        assert_eq!(accum.error_kind, None);
+        assert_eq!(accum.session_id, None);
     }
 
     #[test]
