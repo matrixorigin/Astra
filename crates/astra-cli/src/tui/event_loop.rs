@@ -487,7 +487,6 @@ enum WorkContinueOutcome {
     Waiting(String),
     Paused,
     Cancelled,
-    Interrupted(String),
     Unknown(String),
     Rejected(String),
 }
@@ -669,9 +668,10 @@ fn stream_event_run_id(event: &astra_thin_client::StreamEvent) -> Option<&str> {
         | StreamEvent::RunCancelled { run_id }
         | StreamEvent::RunInterrupted { run_id, .. }
         | StreamEvent::RunFinished { run_id, .. } => run_id.as_deref(),
-        // `run_error` historically exposed only its raw payload. Preserve
-        // root scoping when newer servers include the producer run id there.
-        StreamEvent::RunError { raw, .. } => raw.get("run_id").and_then(|value| value.as_str()),
+        // `run_error` carries the producer identity in its raw wire payload.
+        StreamEvent::RunError { raw, .. } | StreamEvent::Error { raw, .. } => {
+            raw.get("run_id").and_then(|value| value.as_str())
+        }
         // Work streams announce their admitted root before the first physical
         // `run_started`. The thin client keeps this forward-compatible event
         // in `Other`; use it only for the explicit Work envelope so a child
@@ -692,59 +692,50 @@ fn work_stream_terminal_outcome(
         StreamEvent::RunFinished { .. }
         | StreamEvent::RunPaused { .. }
         | StreamEvent::RunWaiting { .. }
-        | StreamEvent::RunResumed { .. }
         | StreamEvent::RunCancelled { .. }
-        | StreamEvent::RunInterrupted { .. }
-        | StreamEvent::RunStarted { .. } => match root_run_id {
+        | StreamEvent::RunInterrupted { .. } => match root_run_id {
             Some(root) => {
                 stream_event_run_id(event).is_some_and(|event_run_id| event_run_id == root)
             }
-            // A durable replay may omit run_started but still carry the
-            // authoritative run_finished. Treat its first identified
-            // lifecycle event as the root fallback; an identified root is
-            // still required for all later lifecycle events.
-            None => stream_event_run_id(event).is_some(),
+            None => false,
         },
-        // A run_error without a producer id is a stream-level error. If the
-        // server does attach one, only the physical root may settle the Work.
-        StreamEvent::RunError { .. } => root_run_id
-            .map(|root| stream_event_run_id(event).is_none_or(|event_run_id| event_run_id == root))
-            .unwrap_or(true),
-        // These are stream-level terminal/error facts. A known root still
-        // needs its durable lifecycle event before a successful turn is
-        // considered complete; this prevents a child turn_complete from
-        // releasing the controller early.
+        // Diagnostics do not settle an admitted Work. A definitive rejection
+        // before its root is known still closes the request normally.
         StreamEvent::Error {
-            retryable: false, ..
-        } => true,
-        StreamEvent::TurnComplete { .. } | StreamEvent::Done { .. } => root_run_id.is_none(),
+            retryable: false,
+            code,
+            ..
+        } => {
+            (root_run_id.is_none() || code.as_deref() == Some("stream_observation_interrupted"))
+                && root_run_id
+                    .is_none_or(|root| stream_event_run_id(event).is_none_or(|id| id == root))
+        }
+        StreamEvent::TurnComplete { .. } | StreamEvent::Done { .. } => false,
         _ => false,
     };
     if !root_lifecycle {
         return None;
     }
     match event {
-        StreamEvent::RunError {
-            message,
-            error_kind,
-            ..
-        } => Some(WorkContinueOutcome::Failed(if message.trim().is_empty() {
-            error_kind
-                .as_deref()
-                .unwrap_or("Work run failed")
-                .to_string()
-        } else {
-            message.clone()
-        })),
         StreamEvent::Error {
             message,
             code,
             retryable: false,
             ..
-        } => Some(WorkContinueOutcome::Failed(match code {
-            Some(code) if !code.trim().is_empty() => format!("{message} ({code})"),
-            _ => message.clone(),
-        })),
+        } => Some(
+            if code.as_deref() == Some("stream_observation_interrupted") {
+                WorkContinueOutcome::Unknown(message.clone())
+            } else {
+                WorkContinueOutcome::Failed(match code {
+                    Some(code) if !code.trim().is_empty() => format!("{message} ({code})"),
+                    _ => message.clone(),
+                })
+            },
+        ),
+        StreamEvent::RunFinished {
+            owner_generation: None,
+            ..
+        } => None,
         StreamEvent::RunFinished {
             status: Some(status),
             error,
@@ -756,12 +747,9 @@ fn work_stream_terminal_outcome(
                     .clone()
                     .unwrap_or_else(|| "Work reported completion with an error".to_string()),
             ),
-            "waiting" => WorkContinueOutcome::Waiting(
-                error
-                    .clone()
-                    .unwrap_or_else(|| "Work is waiting for input".to_string()),
-            ),
+            "delegated" => WorkContinueOutcome::Waiting("Execution was delegated".to_owned()),
             "paused" => WorkContinueOutcome::Paused,
+            "cancelled" => WorkContinueOutcome::Cancelled,
             status => WorkContinueOutcome::Failed(
                 error
                     .clone()
@@ -772,20 +760,17 @@ fn work_stream_terminal_outcome(
             "Work run ended without a terminal status".to_string(),
         )),
         StreamEvent::RunCancelled { .. } => Some(WorkContinueOutcome::Cancelled),
-        StreamEvent::RunInterrupted { message, .. } => Some(WorkContinueOutcome::Interrupted(
-            message
-                .clone()
-                .unwrap_or_else(|| "Work run was interrupted before completion".to_string()),
-        )),
+        // The producer emits interruption before its paused receipt/projection.
+        StreamEvent::RunInterrupted { .. } => None,
         StreamEvent::RunPaused { .. } => Some(WorkContinueOutcome::Paused),
+        StreamEvent::RunWaiting {
+            execution_live: Some(false),
+            ..
+        } => None,
         StreamEvent::RunWaiting { reason, .. } => Some(WorkContinueOutcome::Waiting(
             reason
                 .clone()
                 .unwrap_or_else(|| "Work is waiting for input".to_string()),
-        )),
-        StreamEvent::TurnComplete { .. } => Some(WorkContinueOutcome::Completed),
-        StreamEvent::Done { .. } => Some(WorkContinueOutcome::Unknown(
-            "Work stream ended without a run status".to_string(),
         )),
         _ => None,
     }
@@ -908,11 +893,22 @@ async fn execute_work_continue(
     let mut next_text_progress = 256usize;
     let mut text_progress_sent = false;
     let mut stream = api.work_branch_turn_stream(&token, &work_id, &branch_id, &stream_request);
-    while let Some(event) = futures_util::StreamExt::next(&mut stream).await {
+    loop {
+        let Some(event) = futures_util::StreamExt::next(&mut stream).await else {
+            if matches!(
+                outcome,
+                Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+            ) {
+                outcome = Some(WorkContinueOutcome::Unknown(
+                    "The run ended, but its final response projection was not confirmed. Inspect the existing Work before retrying.".into()
+                ));
+            }
+            break;
+        };
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                outcome = Some(match error {
+                let interrupted = match error {
                     astra_thin_client::ThinClientError::Api { status, .. }
                         if status.is_server_error() =>
                     {
@@ -928,36 +924,29 @@ async fn execute_work_continue(
                     error => WorkContinueOutcome::Unknown(format!(
                         "Work response was interrupted before completion: {error}"
                     )),
+                };
+                outcome = Some(match (outcome, interrupted) {
+                    (
+                        Some(WorkContinueOutcome::Unknown(cause)),
+                        WorkContinueOutcome::Unknown(observation),
+                    ) => WorkContinueOutcome::Unknown(format!("{cause}\n{observation}")),
+                    (_, outcome) => outcome,
                 });
                 break;
             }
         };
-        if run_id.is_none() {
-            let is_root_lifecycle = matches!(
-                &event,
-                astra_thin_client::StreamEvent::RunStarted { .. }
-                    | astra_thin_client::StreamEvent::RunFinished { .. }
-                    | astra_thin_client::StreamEvent::RunWaiting { .. }
-                    | astra_thin_client::StreamEvent::RunPaused { .. }
-                    | astra_thin_client::StreamEvent::RunCancelled { .. }
-                    | astra_thin_client::StreamEvent::RunInterrupted { .. }
-            ) || matches!(
-                &event,
-                astra_thin_client::StreamEvent::Other { event_type, .. }
-                    if event_type == "work_turn_started"
-            );
-            if is_root_lifecycle {
-                let id = stream_event_run_id(&event);
-                if let Some(id) = id {
-                    // The first physical run_started is the Work turn root.
-                    // A replay without run_started uses the first identified
-                    // root lifecycle event as a conservative fallback.
-                    // Descendant lifecycle events share this stream and must
-                    // not replace the root identity or settle its controller.
-                    run_id = Some(id.to_owned());
-                }
-            }
+        if run_id.is_none()
+            && let astra_thin_client::StreamEvent::Other { event_type, raw } = &event
+            && event_type == "work_turn_started"
+        {
+            run_id = raw
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
         }
+        let matches_root = run_id
+            .as_deref()
+            .is_none_or(|root| stream_event_run_id(&event).is_none_or(|id| id == root));
         match &event {
             astra_thin_client::StreamEvent::TextDelta { content, .. } => {
                 if !text_done_seen {
@@ -995,16 +984,81 @@ async fn execute_work_continue(
             }
             astra_thin_client::StreamEvent::TurnComplete {
                 assistant_text: Some(content),
+                raw,
                 ..
-            } if text.is_empty() => text = content.clone(),
+            } if matches_root
+                && raw
+                    .get("continuation_owner")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("server")
+                && matches!(
+                    outcome,
+                    Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+                ) =>
+            {
+                text = content.clone();
+                text_done_seen = true;
+            }
             _ => {}
         }
         if let Some(progress) = work_stream_progress(&event, &work_id, request.request_id) {
             publish_work_continue_progress(progress_tx, progress);
         }
-        if let Some(terminal) = work_stream_terminal_outcome(&event, run_id.as_deref()) {
-            outcome = Some(terminal);
+        if matches_root
+            && let astra_thin_client::StreamEvent::Error { message, raw, .. } = &event
+            && raw.get("error_kind").and_then(serde_json::Value::as_str)
+                == Some("contract_violation")
+            && matches!(
+                outcome,
+                Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+            )
+        {
+            outcome = Some(WorkContinueOutcome::Unknown(message.clone()));
             break;
+        }
+        if matches_root {
+            match &event {
+                astra_thin_client::StreamEvent::RunError { message, .. }
+                | astra_thin_client::StreamEvent::Error { message, .. }
+                    if outcome.is_none() =>
+                {
+                    outcome = Some(WorkContinueOutcome::Unknown(message.clone()));
+                }
+                astra_thin_client::StreamEvent::TurnComplete { raw, .. }
+                    if raw
+                        .get("continuation_owner")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("server")
+                        && matches!(
+                            outcome,
+                            Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+                        ) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(terminal) = work_stream_terminal_outcome(&event, run_id.as_deref()) {
+            let awaiting_projection = matches!(
+                &event,
+                astra_thin_client::StreamEvent::RunFinished { index: None, .. }
+            ) && matches!(
+                terminal,
+                WorkContinueOutcome::Completed | WorkContinueOutcome::Paused
+            );
+            outcome = Some(match (outcome, terminal) {
+                (
+                    Some(WorkContinueOutcome::Unknown(cause)),
+                    WorkContinueOutcome::Unknown(observation),
+                ) if cause != observation => {
+                    WorkContinueOutcome::Unknown(format!("{cause}\n{observation}"))
+                }
+                (_, terminal) => terminal,
+            });
+            if !awaiting_projection {
+                break;
+            }
         }
     }
 
@@ -2388,9 +2442,6 @@ fn apply_slash_background_read_effect(
                     }
                     WorkContinueOutcome::Cancelled => {
                         format!("Work cancelled · {work_label} · no new turn was committed")
-                    }
-                    WorkContinueOutcome::Interrupted(reason) => {
-                        format!("Work interrupted · {work_label} · {reason}")
                     }
                     WorkContinueOutcome::Unknown(reason) => format!(
                         "Work response incomplete · {work_label} · {reason} · status is unknown; open `/work` before retrying"
@@ -15325,12 +15376,31 @@ mod tests {
     }
 
     #[test]
+    fn work_error_observations_do_not_settle_an_admitted_turn() {
+        for event in [
+            serde_json::json!({"type":"run_error", "run_id":"root", "error":"storage unavailable", "error_kind":"database_error"}),
+            serde_json::json!({"type":"error", "run_id":"root", "message":"outcome unconfirmed", "code":"stream_observation_interrupted", "error_kind":"stream_transport", "retryable":false}),
+        ] {
+            let event = astra_thin_client::classify_stream_event(event).unwrap();
+            assert!(
+                matches!(
+                    work_stream_terminal_outcome(&event, Some("root")),
+                    None | Some(WorkContinueOutcome::Unknown(_))
+                ),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
     fn work_stream_outcomes_never_treat_missing_or_retryable_status_as_success() {
         use astra_thin_client::StreamEvent;
 
         assert!(matches!(
             work_stream_terminal_outcome(&StreamEvent::RunFinished {
                 run_id: Some("run-1".into()),
+                owner_generation: Some(4),
+                index: None,
                 status: None,
                 error: None,
             }, Some("run-1")),
@@ -15353,6 +15423,7 @@ mod tests {
             work_stream_terminal_outcome(&StreamEvent::RunWaiting {
                 run_id: Some("run-1".into()),
                 reason: Some("approval".into()),
+                execution_live: Some(true),
             }, Some("run-1")),
             Some(WorkContinueOutcome::Waiting(reason)) if reason == "approval"
         ));
@@ -15360,6 +15431,8 @@ mod tests {
             work_stream_terminal_outcome(
                 &StreamEvent::RunFinished {
                     run_id: Some("child-1".into()),
+                    owner_generation: Some(4),
+                    index: None,
                     status: Some("completed".into()),
                     error: None,
                 },
@@ -15710,8 +15783,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/turns"))
             .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root-2\"}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root-2\",\"error_kind\":\"context_window\",\"message\":\"recovering provider attempt\",\"retryable\":false}\n\n",
                 "data: {\"type\":\"text_delta\",\"content\":\"done\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"root-2\",\"status\":\"completed\"}\n\n"
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root-2\",\"owner_generation\":4,\"status\":\"completed\"}\n\n",
+                "data: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\",\"assistant_text\":\"canonical done\"}\n\n"
             )))
             .mount(&server)
             .await;
@@ -15747,134 +15823,210 @@ mod tests {
         )
         .await
         .expect("terminal Work outcome remains structured");
-        assert_eq!(surface.response, "done");
+        assert_eq!(surface.response, "canonical done");
         assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
         assert!(surface.cleanup_error.is_some());
     }
 
     #[tokio::test]
     async fn work_continue_keeps_server_error_unknown_for_exact_retry() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/works/work-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "overview": {
-                    "work_id": "work-1",
-                    "delivery_branch": {"branch_id": "branch-1"}
-                }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "attachment_id": "attachment-1"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/turns"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
-            .mount(&server)
-            .await;
+        for (response, expected_run, expected_text) in [
+            (ResponseTemplate::new(503).set_body_string("upstream unavailable"), None, ""),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"retained partial result\"}\n\n",
+                "data: {\"type\":\"run_error\",\"run_id\":\"root\",\"error_kind\":\"database_error\",\"message\":\"storage unavailable\"}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root\",\"code\":\"stream_observation_interrupted\",\"error_kind\":\"stream_transport\",\"retryable\":false,\"message\":\"Run outcome unconfirmed\"}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "retained partial result"),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"failed\",\"error\":\"unstamped fallback\"}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), ""),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":4}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "projection not confirmed"),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
+                "data: {\"type\":\"run_waiting\",\"run_id\":\"root\",\"waiting_for\":\"user_resume\",\"execution_live\":false}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"paused\",\"owner_generation\":4}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root\",\"error_kind\":\"contract_violation\",\"message\":\"Final response projection missing\",\"retryable\":false}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "projection not confirmed"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/works/work-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "overview": {
+                        "work_id": "work-1",
+                        "delivery_branch": {"branch_id": "branch-1"}
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "attachment_id": "attachment-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
 
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-        let surface = execute_work_continue(
-            &api,
-            "token",
-            WorkContinueRequest {
-                requested_work_id: "work-1",
-                requested_branch_id: None,
-                message: "continue",
-                client_id: "tui-client",
-                request_id: "request-3",
-                attachment_request_id: "attach-request-3",
-            },
-            &progress_tx,
-        )
-        .await
-        .expect("a 5xx response is an accepted-or-rejected unknown");
-        assert!(
-            matches!(surface.outcome, WorkContinueOutcome::Unknown(reason) if reason.contains("503"))
-        );
-        assert_eq!(surface.branch_id, "branch-1");
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+            let surface = execute_work_continue(
+                &api,
+                "token",
+                WorkContinueRequest {
+                    requested_work_id: "work-1",
+                    requested_branch_id: None,
+                    message: "continue",
+                    client_id: "tui-client",
+                    request_id: "request-3",
+                    attachment_request_id: "attach-request-3",
+                },
+                &progress_tx,
+            )
+            .await
+            .expect("a missing owner outcome keeps the admitted request recoverable");
+            assert!(
+                matches!(surface.outcome, WorkContinueOutcome::Unknown(_))
+            );
+            assert_eq!(surface.branch_id, "branch-1");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 3, "only overview, attachment and one admitted turn; no cleanup or replay: {requests:?}");
+            assert!(!requests.iter().any(|request| request.method == "DELETE" || request.url.path().ends_with("control-operations")));
+            assert_eq!(surface.run_id.as_deref(), expected_run);
+            assert_eq!(surface.response, expected_text);
+            if expected_text == "retained partial result" {
+                let WorkContinueOutcome::Unknown(cause) = &surface.outcome else { panic!("unknown outcome") };
+                assert!(cause.contains("storage unavailable"));
+                assert!(cause.contains("Run outcome unconfirmed"));
+            }
+        }
     }
 
     #[tokio::test]
     async fn work_continue_scopes_root_lifecycle_and_replays_text_done() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/works/work-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "overview": {
-                    "work_id": "work-1",
-                    "delivery_branch": {"branch_id": "branch-1"}
-                }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "attachment_id": "attachment-1",
-                "branch_revision": 2,
-                "control_basis": {
-                    "writer_epoch": 3,
-                    "canonical_root_hash": null
-                }
-            })))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/turns"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
-                "data: {\"type\":\"run_started\",\"run_id\":\"root-1\"}\n\n",
-                "data: {\"type\":\"run_started\",\"run_id\":\"child-1\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"child-1\",\"status\":\"completed\"}\n\n",
-                "data: {\"type\":\"text_delta\",\"content\":\"partial\"}\n\n",
-                "data: {\"type\":\"text_done\",\"full_text\":\"authoritative answer\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"root-1\",\"status\":\"completed\"}\n\n"
-            )))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(
-                "/v1/works/work-1/branches/branch-1/control-operations",
-            ))
-            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(
-                "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
-            ))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
+        for (status, replay) in [
+            ("completed", false),
+            ("paused", false),
+            ("completed", true),
+            ("delegated", false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/works/work-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "overview": {
+                        "work_id": "work-1",
+                        "delivery_branch": {"branch_id": "branch-1"}
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "attachment_id": "attachment-1",
+                    "branch_revision": 2,
+                    "control_basis": {
+                        "writer_epoch": 3,
+                        "canonical_root_hash": null
+                    }
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let mut events = vec![
+                serde_json::json!({"type":"work_turn_started","run_id":"root-1"}),
+                serde_json::json!({"type":"run_started","run_id":"root-1"}),
+                serde_json::json!({"type":"run_started","run_id":"child-1"}),
+                serde_json::json!({"type":"run_finished","run_id":"child-1","owner_generation":4,"status":"completed"}),
+                serde_json::json!({"type":"text_delta","content":"partial"}),
+                serde_json::json!({"type":"text_done","full_text":"authoritative answer"}),
+            ];
+            if status == "paused" {
+                events.push(serde_json::json!({"type":"run_waiting","run_id":"root-1","waiting_for":"user_resume","execution_live":false}));
+                events.push(serde_json::json!({"type":"run_interrupted","run_id":"root-1","kind":"budget_exhausted","message":"turn budget reached"}));
+            }
+            let mut receipt = serde_json::json!({"type":"run_finished","run_id":"root-1","owner_generation":4,"status":status});
+            if replay {
+                receipt["index"] = serde_json::json!(8);
+            }
+            events.push(receipt);
+            if !replay && status != "delegated" {
+                events.push(serde_json::json!({"type":"turn_complete","continuation_owner":"server","assistant_text":"projected authoritative answer"}));
+            }
+            let mut body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            body.push_str("data: [DONE]\n\n");
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(
+                    "/v1/works/work-1/branches/branch-1/control-operations",
+                ))
+                .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(
+                    "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
 
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-        let surface = execute_work_continue(
-            &api,
-            "token",
-            WorkContinueRequest {
-                requested_work_id: "work-1",
-                requested_branch_id: None,
-                message: "continue",
-                client_id: "tui-client",
-                request_id: "request-root",
-                attachment_request_id: "attach-request-root",
-            },
-            &progress_tx,
-        )
-        .await
-        .expect("root terminal should produce a Work surface");
-        assert_eq!(surface.run_id.as_deref(), Some("root-1"));
-        assert_eq!(surface.response, "authoritative answer");
-        assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
-        assert!(surface.cleanup_error.is_some());
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+            let surface = execute_work_continue(
+                &api,
+                "token",
+                WorkContinueRequest {
+                    requested_work_id: "work-1",
+                    requested_branch_id: None,
+                    message: "continue",
+                    client_id: "tui-client",
+                    request_id: "request-root",
+                    attachment_request_id: "attach-request-root",
+                },
+                &progress_tx,
+            )
+            .await
+            .expect("root terminal should produce a Work surface");
+            assert_eq!(surface.run_id.as_deref(), Some("root-1"));
+            assert_eq!(
+                surface.response,
+                if replay || status == "delegated" {
+                    "authoritative answer"
+                } else {
+                    "projected authoritative answer"
+                }
+            );
+            assert!(match status {
+                "paused" => matches!(surface.outcome, WorkContinueOutcome::Paused),
+                "delegated" => matches!(surface.outcome, WorkContinueOutcome::Waiting(_)),
+                _ => matches!(surface.outcome, WorkContinueOutcome::Completed),
+            });
+            assert!(surface.cleanup_error.is_some());
+        }
     }
 
     #[test]

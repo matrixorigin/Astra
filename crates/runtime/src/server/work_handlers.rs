@@ -10297,4 +10297,23 @@ mod tests {
             Err("attestation_workspace_dirty")
         );
     }
+    #[test]
+    fn work_runtime_projection_matches_the_public_sdk_and_web_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/sdk/src/__tests__/__fixtures__/sse/work-turn-projection.json"
+        )))
+        .expect("shared Work wire fixture");
+        let actual = project_work_turn_events(
+            "run-1",
+            fixture["runtime_events"].as_array().unwrap().clone(),
+            &mut None,
+        );
+        assert_eq!(serde_json::json!(actual), fixture["events"]);
+        assert!(
+            actual
+                .iter()
+                .all(|event| !contains_structural_field(event, "session_id"))
+        );
+    }
 }

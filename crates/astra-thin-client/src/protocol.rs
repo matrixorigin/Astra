@@ -674,6 +674,7 @@ pub enum StreamEvent {
     RunWaiting {
         run_id: Option<String>,
         reason: Option<String>,
+        execution_live: Option<bool>,
     },
     RunResumed {
         run_id: Option<String>,
@@ -717,6 +718,8 @@ pub enum StreamEvent {
     },
     RunFinished {
         run_id: Option<String>,
+        owner_generation: Option<u64>,
+        index: Option<u64>,
         status: Option<String>,
         error: Option<String>,
     },
@@ -932,6 +935,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "run_waiting" => StreamEvent::RunWaiting {
             run_id: optional_str(&obj, "run_id"),
             reason: optional_str(&obj, "reason"),
+            execution_live: obj.get("execution_live").and_then(Value::as_bool),
         },
         "run_resumed" => StreamEvent::RunResumed {
             run_id: optional_str(&obj, "run_id"),
@@ -998,6 +1002,8 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         },
         "run_finished" => StreamEvent::RunFinished {
             run_id: optional_str(&obj, "run_id"),
+            owner_generation: obj.get("owner_generation").and_then(Value::as_u64),
+            index: obj.get("index").and_then(Value::as_u64),
             status: optional_str(&obj, "status"),
             error: optional_str(&obj, "error"),
         },
@@ -1843,20 +1849,37 @@ mod tests {
             "type": "run_finished",
             "run_id": "run-1",
             "status": "failed",
+            "owner_generation": 4,
+            "index": 7,
             "error": "boom"
         });
         match classify_stream_event(finished).unwrap() {
             StreamEvent::RunFinished {
                 run_id,
+                owner_generation,
+                index,
                 status,
                 error,
             } => {
+                assert_eq!(index, Some(7));
+                assert_eq!(owner_generation, Some(4));
                 assert_eq!(run_id.as_deref(), Some("run-1"));
                 assert_eq!(status.as_deref(), Some("failed"));
                 assert_eq!(error.as_deref(), Some("boom"));
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        assert!(matches!(
+            classify_stream_event(serde_json::json!({
+                "type":"run_finished", "run_id":"run-1", "status":"failed", "index":7
+            }))
+            .unwrap(),
+            StreamEvent::RunFinished {
+                owner_generation: None,
+                ..
+            }
+        ));
 
         let run_error = serde_json::json!({
             "type": "run_error",
@@ -1878,10 +1901,16 @@ mod tests {
         let waiting = serde_json::json!({
             "type": "run_waiting",
             "run_id": "run-1",
-            "reason": "waiting: executor_offline"
+            "reason": "waiting: executor_offline",
+            "execution_live": false
         });
         match classify_stream_event(waiting).unwrap() {
-            StreamEvent::RunWaiting { run_id, reason } => {
+            StreamEvent::RunWaiting {
+                run_id,
+                reason,
+                execution_live,
+            } => {
+                assert_eq!(execution_live, Some(false));
                 assert_eq!(run_id.as_deref(), Some("run-1"));
                 assert_eq!(reason.as_deref(), Some("waiting: executor_offline"));
             }

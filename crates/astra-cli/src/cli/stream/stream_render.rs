@@ -1346,10 +1346,14 @@ fn apply_edge_callback_failure_result(
                 }),
             )
         });
-        let preserve_existing_kind = accum.error_kind.is_some_and(|kind| {
-            kind != astra_core::ErrorKind::Cancelled
-                && (kind != astra_core::ErrorKind::Unknown
-                    || failure.kind == astra_core::ErrorKind::Unknown)
+        let preserve_existing_kind = accum.error_kind.is_some_and(|kind| match kind {
+            astra_core::ErrorKind::Cancelled => false,
+            astra_core::ErrorKind::Unknown => failure.kind == astra_core::ErrorKind::Unknown,
+            astra_core::ErrorKind::StreamTransport => matches!(
+                failure.kind,
+                astra_core::ErrorKind::Unknown | astra_core::ErrorKind::StreamTransport
+            ),
+            _ => true,
         }) || selected_terminal.is_some();
         if preserve_existing_kind {
             if accum
@@ -1376,11 +1380,7 @@ fn apply_edge_callback_failure_result(
                 accum.error_message = Some(failure.message);
             }
         } else {
-            let prior = accum
-                .error_kind
-                .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
-                .then(|| accum.error_message.take())
-                .flatten();
+            let prior = accum.error_message.take();
             accum.error_message = Some(match prior {
                 Some(prior) => format!("{}\n{prior}", failure.message),
                 None => failure.message,
@@ -9342,9 +9342,12 @@ mod tests {
 
     #[test]
     fn callback_database_failure_precedes_unclassified_transport_loss() {
-        for kind in [Some("unknown"), None] {
+        for kind in [Some("unknown"), Some("stream_transport"), None] {
             let mut accum = ChatTurnSseAccum::default();
-            let event = serde_json::json!({"type":"error", "message":"stream closed before run_finished", "error_kind":kind});
+            let mut event = serde_json::json!({"type":"error", "message":"stream closed before run_finished", "error_kind":kind});
+            if kind == Some("stream_transport") {
+                event["code"] = serde_json::json!("stream_observation_interrupted");
+            }
             astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
                 &format!("data: {event}\n\n"),
                 &mut accum,
@@ -9352,7 +9355,7 @@ mod tests {
             );
             assert_eq!(
                 accum.error_kind,
-                kind.map(|_| astra_core::ErrorKind::Unknown)
+                kind.and_then(astra_core::ErrorKind::parse_tag)
             );
             apply_edge_callback_failure_result(
                 &mut accum,

@@ -23309,6 +23309,12 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         )
         .await
         .expect("seed durable replay run");
+    svc.run_engine.append_events_batch("user-1", session_id, run_id, &[
+        json!({"event_type":"text_done","data":{"full_text":"Durably saved answer"}}),
+        json!({"event_type":"run_finished","data":{"run_id":run_id,"status":"completed","owner_generation":0,
+            "prompt_tokens":7,"completion_tokens":3,
+            "last_request_usage":{"prompt_tokens":7,"cache_read_tokens":0,"cache_creation_tokens":0,"completion_tokens":3}}}),
+    ]).await.expect("journal the completed answer and owner receipt");
     assert!(
         svc.run_engine
             .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
@@ -23351,6 +23357,46 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         llm.requests.load(Ordering::SeqCst),
         0,
         "an exact replay must not execute a child or make a model request"
+    );
+
+    let projected = crate::server::run::handlers::transform_stream_run_events_for_client(
+        run_id,
+        replay.events.clone(),
+    );
+    let receipt = projected
+        .iter()
+        .find(|event| event["type"] == "run_finished")
+        .expect("durable receipt");
+    for kind in ["usage", "context_usage"] {
+        let prefix = projected
+            .iter()
+            .find(|event| event["type"] == kind)
+            .expect("accounting prefix");
+        assert!(
+            prefix.get("index").is_none(),
+            "only the final receipt commits this durable event"
+        );
+    }
+    assert_eq!(receipt["owner_generation"], 0);
+    assert!(receipt["index"].as_u64().is_some());
+    assert!(
+        projected
+            .iter()
+            .any(|event| event["type"] == "text_done"
+                && event["full_text"] == "Durably saved answer")
+    );
+    assert!(
+        !projected
+            .iter()
+            .any(|event| event["type"] == "turn_complete")
+    );
+    let response = crate::server::http_helpers::sse_json_response(projected);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        body.ends_with(b"data: [DONE]\n\n"),
+        "replay closes observation without fabricating a completion projection"
     );
 
     let after = svc

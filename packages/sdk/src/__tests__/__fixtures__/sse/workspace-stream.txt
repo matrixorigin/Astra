@@ -8,3 +8,5 @@ data: {"type":"usage","prompt_tokens":1,"completion_tokens":2,"cache_creation_to
 
 data: {"type":"turn_complete"}
 
+data: [DONE]
+

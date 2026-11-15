@@ -2,6 +2,10 @@
 
 import {
   SSEClient,
+  isOwnedRunFinishedEvent,
+  requiresRunCompletionProjection,
+  isRunFinalizationHint,
+  isWorkTurnEventType,
   decodeWorkTurnStreamEventV1,
   type StreamEvent,
   type WorkApiErrorV1,
@@ -30,7 +34,7 @@ import {
 } from "@/app/(workspace)/works/[workId]/actions";
 
 type LocalMessage = { id: string; role: "user" | "assistant"; text: string };
-type PendingTurn = { requestId: string; message: string };
+type PendingTurn = { requestId: string; message: string; ownerReceipt?: Extract<StreamEvent, { type: "run_finished" }> };
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 type PromptQuestion = {
   id?: string;
@@ -92,7 +96,9 @@ async function decodeHttpError(response: Response): Promise<StreamEvent> {
     type: "error",
     code: typeof body.code === "string" ? body.code : "work_turn_unavailable",
     message:
-      response.status === 401
+      response.status >= 500 || response.status === 408
+        ? "The Work response could not be confirmed. Reconnect to the same durable turn."
+        : response.status === 401
         ? "Your sign-in expired."
         : body.code === "writer_conflict"
           ? "This Work is active elsewhere. You can keep viewing it here."
@@ -156,9 +162,6 @@ export function WorkTurnComposer({
   const rootRunId = useRef<string | null>(
     initialInteractions?.interactions[0]?.run_id ?? null,
   );
-  const activeRunId = useRef<string | null>(
-    initialInteractions?.interactions[0]?.run_id ?? null,
-  );
   const stream = useRef<SSEClient | null>(null);
   const assistantMessageId = useRef<string | null>(null);
   const refreshedGraphRevision = useRef(0);
@@ -190,7 +193,6 @@ export function WorkTurnComposer({
       pendingInteractionRef.current = interaction;
       setPendingInteraction(interaction);
       rootRunId.current = interaction?.run_id ?? rootRunId.current;
-      activeRunId.current = interaction?.run_id ?? activeRunId.current;
       if (changed) setPromptAnswers({});
     }
   }, [initialInteractions]);
@@ -207,54 +209,66 @@ export function WorkTurnComposer({
     );
   }
 
+  function finishTurn(message: string | null) {
+    pending.current = null;
+    pendingInteractionRef.current = null;
+    setPendingInteraction(null);
+    setPromptAnswers({});
+    setState(message ? "disconnected" : "idle");
+    setCanReconnect(false);
+    setError(message);
+    rootRunId.current = null;
+    router.refresh();
+  }
+
   function handleEvent(raw: StreamEvent) {
     let event: WorkTurnStreamEvent;
     try {
       event = decodeWorkTurnStreamEventV1(raw);
     } catch {
-      pending.current = null;
+      // Invalid observation cannot release custody of a possibly admitted
+      // request. Stop this reader; an explicit reconnect keeps the same ID.
       stream.current?.close();
       setState("disconnected");
-      setCanReconnect(false);
+      setCanReconnect(pending.current !== null && !controlBlocked.current);
       setError("The runtime returned an invalid Work event. No further events were applied.");
       return;
     }
 
-    switch (event.type) {
-      case "warning":
+    switch (true) {
+      case isWorkTurnEventType(event, "warning"):
         addToast(event.message, "warning");
         break;
-      case "work_turn_started":
+      case isWorkTurnEventType(event, "work_turn_started"):
         rootRunId.current = event.run_id;
-        activeRunId.current = event.run_id;
         setState("working");
         setError(null);
         break;
-      case "run_started":
+      case isWorkTurnEventType(event, "run_started"):
         if (event.run_id) {
           if (rootRunId.current && event.run_id !== rootRunId.current) break;
           rootRunId.current ??= event.run_id;
-          activeRunId.current = event.run_id;
         }
         setState("working");
         setError(null);
         break;
-      case "text_delta":
+      case isWorkTurnEventType(event, "text_delta"):
         updateAssistant(event.content);
         break;
-      case "text_done":
+      case isWorkTurnEventType(event, "text_done"):
         updateAssistant(event.full_text, true);
         break;
-      case "run_waiting":
-      case "run_blocked":
+      case isWorkTurnEventType(event, "run_waiting"):
+      case isWorkTurnEventType(event, "run_blocked"):
+        if (isRunFinalizationHint(event)) break;
         if (eventRunId(event) && rootRunId.current && eventRunId(event) !== rootRunId.current) {
           break;
         }
         setState("waiting");
         break;
-      case "approval_required":
-      case "user_prompt_required": {
-        const runId = event.run_id ?? rootRunId.current ?? activeRunId.current;
+      case isWorkTurnEventType(event, "approval_required"):
+      case isWorkTurnEventType(event, "user_prompt_required"): {
+        const runId = event.run_id ?? rootRunId.current;
         if (!runId) {
           setError("The Work is waiting for input, but its durable run identity was missing. Refresh to retry.");
           setState("disconnected");
@@ -290,7 +304,6 @@ export function WorkTurnComposer({
               kind: "user_prompt",
               prompt: event.prompt,
         };
-        activeRunId.current = runId;
         rootRunId.current ??= runId;
         const changed = !sameInteractionIdentity(pendingInteractionRef.current, interaction);
         pendingInteractionRef.current = interaction;
@@ -300,7 +313,7 @@ export function WorkTurnComposer({
         setError(null);
         break;
       }
-      case "work_task_graph_changed":
+      case isWorkTurnEventType(event, "work_task_graph_changed"):
         if (event.graph_revision > refreshedGraphRevision.current) {
           refreshedGraphRevision.current = event.graph_revision;
           // React's server refresh preserves the active composer while
@@ -308,52 +321,57 @@ export function WorkTurnComposer({
           router.refresh();
         }
         break;
-      case "turn_complete":
+      case isWorkTurnEventType(event, "turn_complete"):
         if (eventRunId(event) && rootRunId.current && eventRunId(event) !== rootRunId.current) {
           break;
         }
         if (event.assistant_text) updateAssistant(event.assistant_text, true);
-        pending.current = null;
-        pendingInteractionRef.current = null;
-        setPendingInteraction(null);
-        setPromptAnswers({});
-        setState("idle");
-        setCanReconnect(false);
-        setError(null);
-        rootRunId.current = null;
-        activeRunId.current = null;
-        router.refresh();
+        if (!pending.current?.ownerReceipt || event.continuation_owner !== "server") break;
+        finishTurn(null);
         break;
-      case "error":
+      case isWorkTurnEventType(event, "run_finished"):
+        if (!isOwnedRunFinishedEvent(event) ||
+          rootRunId.current && event.run_id !== rootRunId.current) break;
+        if (event.status === "failed" || event.status === "cancelled") {
+          finishTurn(event.error || (event.status === "cancelled" ? "The Work run was cancelled." : "The Work run failed."));
+        } else if (!requiresRunCompletionProjection(event)) {
+          finishTurn(null);
+        }
+        // The existing pending request carries its producer-owned receipt
+        // until the final response projection arrives.
+        if (pending.current && (event.status === "completed" || event.status === "paused")) {
+          pending.current.ownerReceipt = event;
+        }
+        break;
+      case isWorkTurnEventType(event, "error"): {
+        const producer = eventRunId(event);
+        if (producer && rootRunId.current && producer !== rootRunId.current) break;
+        if (rootRunId.current && event.http_status === undefined
+          && event.code !== "stream_observation_interrupted" && event.code !== "writer_conflict") {
+          setError(event.message);
+          break;
+        }
         if (event.code === "writer_conflict") {
           controlBlocked.current = true;
           setControlConflict(true);
-        } else if (event.retryable !== true) {
+        } else if (!rootRunId.current && event.http_status !== undefined
+          && event.http_status >= 400 && event.http_status < 500 && event.http_status !== 408) {
+          // Only a definite pre-admission rejection releases this request.
           pending.current = null;
         }
         setState("disconnected");
-        setCanReconnect(event.code !== "writer_conflict" && event.retryable === true);
-        setError(event.message);
-        if (
-          event.code !== "writer_conflict" &&
-          event.action_hints?.includes("refresh_work")
-        ) {
-          router.refresh();
-        }
+        setCanReconnect(event.code !== "writer_conflict" && (pending.current !== null || event.retryable === true));
+        setError((previous) => previous && event.code === "stream_observation_interrupted"
+          ? previous + "\n" + event.message : event.message);
+        if (event.code !== "writer_conflict" && event.action_hints?.includes("refresh_work")) router.refresh();
         break;
-      case "run_error":
+      }
+      case isWorkTurnEventType(event, "run_error"):
         if (eventRunId(event) && rootRunId.current && eventRunId(event) !== rootRunId.current) {
-          setState("waiting");
-          setError("A nested Work step failed; the root Work state is still available.");
+          setError("A nested Work step reported an error; the root Work is still available.");
           break;
         }
-        pending.current = null;
-        pendingInteractionRef.current = null;
-        setPendingInteraction(null);
-        setPromptAnswers({});
-        setState("disconnected");
-        setCanReconnect(false);
-        setError("The Work run failed. Its durable state is preserved.");
+        setError(event.message ?? event.error ?? "The Work reported an error.");
         break;
       default:
         break;
@@ -385,7 +403,7 @@ export function WorkTurnComposer({
         ) {
           setState("disconnected");
           setCanReconnect(true);
-          setError("The stream disconnected. Reconnect to the same durable turn.");
+          setError((previous) => previous || "The stream disconnected. Reconnect to the same durable turn.");
         }
       },
     });

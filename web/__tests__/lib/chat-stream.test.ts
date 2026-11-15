@@ -74,9 +74,12 @@ describe('streamChatMessage cancellation semantics', () => {
 
   it.each([
     { name: 'empty', events: [] },
+    { name: 'completed without response projection', events: [{ type: 'run_finished', run_id: 'root', owner_generation: 4, status: 'completed' }] },
+    { name: 'paused without response projection', events: [{ type: 'run_finished', run_id: 'root', owner_generation: 4, status: 'paused' }] },
+    { name: 'root diagnostic', events: [{ type: 'run_error', run_id: 'root', error_kind: 'database_error', message: 'Storage unavailable' }, { type: 'error', code: 'stream_observation_interrupted', message: 'Outcome unconfirmed', retryable: false }] },
     { name: 'text only', events: [{ type: 'text_done', full_text: 'Partial' }] },
     { name: 'turn text', events: [{ type: 'turn_complete', assistant_text: 'Partial' }] },
-    { name: 'child completion', events: [{ type: 'run_finished', run_id: 'child', status: 'completed' }] },
+    { name: 'child completion', events: [{ owner_generation: 4, type: 'run_finished', run_id: 'child', status: 'completed' }] },
   ])('rejects $name EOF without a root receipt', async ({ events }) => {
     const frames = [{ type: 'session_info', run_id: 'root' }, ...events]
       .map(event => `data: ${JSON.stringify(event)}\n\n`);
@@ -92,6 +95,7 @@ describe('streamChatMessage cancellation semantics', () => {
 
   it.each([
     { run_id: 'root' }, { run_id: 'root', status: 'unknown' }, { status: 'completed' },
+    { run_id: 'root', status: 'completed' },
   ])('rejects a malformed terminal receipt (%j)', async receipt => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
       'data: {"type":"session_info","run_id":"root"}\n\n',
@@ -107,9 +111,10 @@ describe('streamChatMessage cancellation semantics', () => {
     const events = [
       { type: 'session_info', session_id: 'session', run_id: 'root' },
       { type: 'run_started', run_id: 'child' },
-      { type: 'run_finished', run_id: 'child', status: 'cancelled', index: 7 },
+      { owner_generation: 4, type: 'run_finished', run_id: 'child', status: 'cancelled', index: 7 },
       { type: 'text_delta', content: 'Root answer' },
-      { type: 'run_finished', run_id: 'root', status: 'completed' },
+      { owner_generation: 4, type: 'run_finished', run_id: 'root', status: 'completed' },
+      { type: "turn_complete", continuation_owner: "server" },
     ];
     const frames = events.map(event => `data: ${JSON.stringify(event)}\n\n`);
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(coalesced ? [frames.join('')] : frames) });
@@ -128,7 +133,7 @@ describe('streamChatMessage cancellation semantics', () => {
       'data: {"type":"session_info","run_id":"root"}\n\n',
       'data: {"type":"text_delta","content":"Partial answer"}\n\n',
       'data: {"type":"run_error","run_id":"root","error":"Save failed","error_code":"canonical_persistence_failed"}\n\n',
-      'data: {"type":"run_finished","run_id":"root","status":"failed","error":"Save failed"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"failed\",\"error\":\"Save failed\",\"owner_generation\":4}\n\n",
       'data: [DONE]\n\n',
     ];
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(frames) });
@@ -173,7 +178,7 @@ describe('streamChatMessage cancellation semantics', () => {
     const events = [
       { type: 'session_info', run_id: 'root' },
       ...(prior ? [{ type: 'run_error', run_id: 'root', error: 'Save failed', error_code: 'canonical_persistence_failed' }] : []),
-      { type: 'run_finished', run_id: 'root', status: 'failed', error: reason },
+      { owner_generation: 4, type: 'run_finished', run_id: 'root', status: 'failed', error: reason },
     ];
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true,
       body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)) });
@@ -192,7 +197,7 @@ describe('streamChatMessage cancellation semantics', () => {
       `data: ${JSON.stringify({ type: 'warning', code: 'hook_configuration', message, index: 7 })}\n\n`,
       'data: {"type":"stream_gap","run_id":"run-1","repair":"refresh_run_snapshot"}\n\n',
       'data: {"type":"text_delta","content":"answer"}\n\n',
-      'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     ]) });
     await expect(streamChatMessage('chat', defaultPayload, { onWarning, onRunFinished, onStreamGap })).resolves.toBe('answer');
     expect(onWarning).toHaveBeenCalledExactlyOnceWith(message);
@@ -207,8 +212,8 @@ describe('streamChatMessage cancellation semantics', () => {
     const events = [
       { type: 'session_info', run_id: 'root' },
       { type: 'text_delta', content: 'partial answer' },
-      { type: 'run_finished', run_id: 'child', status: 'cancelled', context_not_saved: true },
-      { type: 'run_finished', run_id: 'root', status: 'cancelled', context_not_saved: observation },
+      { owner_generation: 4, type: 'run_finished', run_id: 'child', status: 'cancelled', context_not_saved: true },
+      { owner_generation: 4, type: 'run_finished', run_id: 'root', status: 'cancelled', context_not_saved: observation },
     ];
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)) });
     await streamChatMessage('chat', defaultPayload, { onWarning, onRunFinished, onCancelled });
@@ -235,7 +240,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ': heartbeat\n\n',
       'data: {"type":"text_delta","content":"old text"}\n\n',
       ...(status === "failed" ? ['data: {"type":"error","message":"historical provider failure","index":12}\n\n'] : []),
-      `data: ${JSON.stringify({ type: "run_finished", run_id: "r", status })}\n\n`,
+      `data: ${JSON.stringify({ owner_generation: 4, type: "run_finished", run_id: "r", status })}\n\n`,
       'data: [DONE]\n\n',
     ]) });
     await expect(streamExistingChatRun("chat", "r", { onRunUpdated, onText }, { replayOnly: true })).resolves.toBe("");
@@ -253,7 +258,7 @@ describe('streamChatMessage cancellation semantics', () => {
 
   it("rejects a truncated replay frame even after valid events", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
-      'data: {"type":"run_finished","run_id":"r","status":"completed"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"r\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       'data: {"type":"explain_analyze","node_id":',
     ]) });
     await expect(streamExistingChatRun("chat", "r", {}, { replayOnly: true }))
@@ -270,7 +275,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"run_started","run_id":"run-plan"}\n\n',
         'data: {"type":"approval_required","request_id":"review-1","tool":"exit_plan_mode","session_id":"session-plan","run_id":"run-plan","approval_kind":"standard","display_label":"Review plan","detail":"1. Verify\\n2. Ship"}\n\n',
         'data: {"type":"run_resumed","run_id":"run-plan","interaction_outcome":"approved"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-plan","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-plan\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -308,7 +313,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"agent_live_gap","run_id":"child-run-1","agent_id":"reviewer","dropped_event_count":4,"repair":"refresh_run_snapshot"}\n\n',
         'data: {"type":"run_started","run_id":"run-123","index":7}\n\n',
         'data: {"type":"stream_gap","run_id":"run-123","dropped_event_count":9,"repair":"refresh_run_snapshot"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -343,7 +348,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"explain_analyze","schema_version":1,"label":"invalid"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
     await streamChatMessage('chat-123', defaultPayload, { onExplainAnalyzeEvent, onExplainAnalyzeInvalid });
@@ -383,7 +388,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         `data: ${JSON.stringify(event)}\n\n`,
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -457,7 +462,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         `data: ${JSON.stringify(event)}\n\n`,
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -475,7 +480,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"cancelled"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"cancelled\",\"owner_generation\":4}\n\n",
       ]),
     });
 
@@ -493,7 +498,7 @@ describe('streamChatMessage cancellation semantics', () => {
       type: 'run_started',
       run_id: 'run-123',
     });
-    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({ owner_generation: 4,
       type: 'run_finished',
       run_id: 'run-123',
       status: 'cancelled',
@@ -552,7 +557,7 @@ describe('streamChatMessage cancellation semantics', () => {
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
         'data: {"type":"run_interrupted","run_id":"run-123","kind":"budget_exhausted","resumable":true,"message":"Budget exhausted. You can continue."}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"paused","interrupted":true,"resumable":true}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"paused\",\"interrupted\":true,\"resumable\":true,\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -579,7 +584,7 @@ describe('streamChatMessage cancellation semantics', () => {
       expect.objectContaining({ type: 'run_interrupted', run_id: 'run-123' }),
     );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
+      expect.objectContaining({ owner_generation: 4,
         type: 'run_finished',
         run_id: 'run-123',
         status: 'paused',
@@ -717,7 +722,7 @@ describe('streamChatMessage cancellation semantics', () => {
   it('passes AbortSignal to fetch and releases the reader lock', async () => {
     const body = sseBody([
       'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     ]);
     const signal = new AbortController().signal;
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -755,7 +760,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"reasoning_done"}\n\n',
         'data: {"type":"artifacts","artifacts":[{"id":"artifact-1","kind":"text","title":"Notes"}]}\n\n',
         'data: {"type":"text_done","full_text":"<thinking>hidden</thinking>visible"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-session","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-session\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -819,7 +824,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"tool_transport_started","call_id":"call-1","tool":"bash","transport":"server_local"}\n\n',
         'data: {"type":"tool_transport_completed","call_id":"call-1","tool":"bash","transport":"server_local","duration_ms":12}\n\n',
         'data: {"type":"tool_call_end","call_id":"call-1","tool":"bash","success":true,"result":"ok"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -830,7 +835,7 @@ describe('streamChatMessage cancellation semantics', () => {
     ).resolves.toBe('');
 
     expect(onWorkSurfaceEvent).toHaveBeenLastCalledWith(
-      expect.objectContaining({ type: 'run_finished', run_id: 'run-123', status: 'completed' }),
+      expect.objectContaining({ owner_generation: 4, type: 'run_finished', run_id: 'run-123', status: 'completed' }),
     );
     expect(onWorkSurfaceEvent).toHaveBeenNthCalledWith(
       1,
@@ -857,7 +862,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"tool_call_end","call_id":"call-1","artifacts":[{"artifact_id":"artifact-1","name":"report.pdf","type":"file","data":{"filename":"report.pdf","download_url":"/api/files/file-1"}}]}\n\n',
-        'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -887,7 +892,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123","session_id":"session-123","workspace":{"kind":"edge_workspace","display_name":"MacBook Pro","cwd":"/workspace/astra","authority":"read_write","fallback_policy":"disabled"},"executor":{"kind":"edge_agent","executor_id":"edge-macbook-1","display_name":"MacBook Pro","transport":"edge_ws","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -926,7 +931,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"session_info","run_id":"root"}\n\n',
         'data: {"type":"text_delta","content":"draft"}\n\n',
         'data: {"type":"turn_complete","assistant_text":"final answer"}\n\n',
-        'data: {"type":"run_finished","run_id":"root","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -964,7 +969,7 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       body: sseBody([
-        'data: {"type":"run_finished","run_id":"run-123","status":"failed","error":"tool crashed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"failed\",\"error\":\"tool crashed\",\"owner_generation\":4}\n\n",
       ]),
     });
 
@@ -985,7 +990,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_error","run_id":"run-456","message":"loop crashed","error_kind":"runtime"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-456","status":"failed","error":"loop crashed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-456\",\"status\":\"failed\",\"error\":\"loop crashed\",\"owner_generation\":4}\n\n",
       ]),
     });
 
@@ -1056,7 +1061,7 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
-        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run/123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -1074,7 +1079,7 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
-        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run/123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 
@@ -1122,7 +1127,7 @@ describe('streamChatMessage cancellation semantics', () => {
       body: sseBody([
         'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
         'data: {"type":"text_done","full_text":"continued"}\n\n',
-        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-123\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
 

@@ -30,7 +30,10 @@ export async function readHttpErrorMessage(response: Response): Promise<string> 
  */
 export function parseSseDataEvents(raw: string): StreamEvent[] {
   const events: StreamEvent[] = [];
+  let complete = false;
   const parser = new SseDataParser((data) => {
+    if (complete) return;
+    if (data === "[DONE]") { complete = true; return; }
     const event = parseSseEvent(data);
     if (event === undefined) return;
     // Buffered callers advance their source cursor by the returned event count.
@@ -120,17 +123,31 @@ class SseDataParser {
   }
 }
 
-function isTerminalEvent(event: StreamEvent): boolean {
-  return (
-    event.type === 'turn_complete' ||
-    event.type === 'run_finished' ||
-    event.type === 'run_cancelled' ||
-    event.type === 'run_error' ||
-    event.type === 'run_interrupted' ||
-    event.type === 'run_paused' ||
-    event.type === 'run_waiting' ||
-    (event.type === 'error' && event.retryable !== true)
-  );
+/** A diagnostic or unstamped fallback cannot select the durable run outcome. */
+export function isRunTerminalStatus(value: unknown): value is string {
+  return typeof value === "string" && ["completed", "failed", "cancelled", "paused", "delegated"].includes(value);
+}
+
+export function isOwnedRunFinishedEvent<T>(value: T): value is T & {
+  type: "run_finished"; run_id: string; owner_generation: number; status: string;
+} {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  return event.type === "run_finished" && typeof event.run_id === "string" && !!event.run_id.trim()
+    && typeof event.owner_generation === "number" && Number.isSafeInteger(event.owner_generation)
+    && event.owner_generation >= 0 && isRunTerminalStatus(event.status);
+}
+
+/** These observations precede final publication; they do not finish the response. */
+export function isRunFinalizationHint(event: { type?: unknown; execution_live?: unknown }): boolean {
+  return event.type === "run_interrupted"
+    || event.type === "run_waiting" && event.execution_live === false;
+}
+
+/** Durable owner receipts replay their journaled answer without a live turn_complete. */
+export function requiresRunCompletionProjection(event: { status?: unknown; index?: unknown }): boolean {
+  return (event.status === "completed" || event.status === "paused")
+    && !(typeof event.index === "number" && Number.isSafeInteger(event.index) && event.index >= 0);
 }
 
 /**
@@ -147,7 +164,7 @@ export class SSEClient {
   private retryCount = 0;
   private closed = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-  private sawTerminalEvent = false;
+  private sawStreamCompletion = false;
 
   constructor(options: SSEClientOptions) {
     this.options = {
@@ -165,7 +182,7 @@ export class SSEClient {
 
   private async connectAttempt(): Promise<void> {
     if (this.closed || this.options.signal?.aborted) return;
-    this.sawTerminalEvent = false;
+    this.sawStreamCompletion = false;
     this.options.onStateChange?.('connecting');
     if (this.closed || this.options.signal?.aborted) return;
 
@@ -207,6 +224,13 @@ export class SSEClient {
           return;
         }
         const detail = await readHttpErrorMessage(response);
+        if (response.status >= 400 && response.status < 500) {
+          this.options.onStateChange?.('error');
+          this.options.onEvent({
+            type: 'error', message: detail, http_status: response.status, retryable: false,
+          });
+          return;
+        }
         throw new Error(detail);
       }
       if (!response.body) {
@@ -216,7 +240,7 @@ export class SSEClient {
       this.options.onStateChange?.('connected');
       await this.readStream(response.body, linkedSignal, heartbeatController);
       if (linkedSignal.aborted) return;
-      if (heartbeatController.signal.aborted && !this.sawTerminalEvent) {
+      if (heartbeatController.signal.aborted && !this.sawStreamCompletion) {
         throw new Error('Heartbeat timeout');
       }
 
@@ -224,7 +248,7 @@ export class SSEClient {
         this.options.onStateChange?.('disconnected');
       }
     } catch (err) {
-      if (this.closed || linkedSignal.aborted || this.sawTerminalEvent) return;
+      if (this.closed || linkedSignal.aborted || this.sawStreamCompletion) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       this.options.onStateChange?.('error');
       this.options.onEvent({
@@ -232,7 +256,9 @@ export class SSEClient {
         message: heartbeatController.signal.aborted
           ? `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`
           : `Connection error: ${message}`,
-        retryable: this.retryCount < this.options.maxRetries,
+        code: 'stream_observation_interrupted',
+        error_kind: 'stream_transport',
+        retryable: this.options.method !== 'POST' && this.retryCount < this.options.maxRetries,
       } as StreamEvent);
       retry = await this.maybeRetry(linkedSignal);
     } finally {
@@ -260,41 +286,53 @@ export class SSEClient {
     const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
     const parser = new SseDataParser(
       (data) => { if (!signal.aborted) this.processSSEData(data); },
-      this.options.onRawLine,
+      (line) => {
+        if (!this.closed && !this.sawStreamCompletion && !this.options.signal?.aborted) {
+          this.options.onRawLine?.(line);
+        }
+      },
     );
     let streamFailed = false;
     let streamError: unknown;
 
     try {
       this.resetHeartbeatTimer();
-      while (!this.closed && !signal.aborted) {
+      while (!this.closed && !signal.aborted && !this.sawStreamCompletion) {
         const { done, value } = await reader.read();
         if (done) break;
 
         parser.push(decoder.decode(value, { stream: true }));
       }
     } catch (error) {
-      // Once the server has published a protocol terminal, a trailing socket
-      // reset is transport noise rather than a second failure of the turn.
-      // Preserve the successful terminal projection and only surface stream
-      // errors that happen before it.
-      if (!this.sawTerminalEvent) {
+      // Once the server has closed observation with [DONE], a trailing socket
+      // reset cannot replace the already selected observation closure.
+      // Execution outcomes remain with the event consumer.
+      if (!this.sawStreamCompletion) {
         streamFailed = true;
         streamError = error;
       }
     } finally {
-      parser.push(decoder.decode());
-      parser.finish();
+      // Only clean EOF may complete an unterminated tail. A reset or abort
+      // cannot promote partial bytes to a completion marker or owner projection.
+      if (!streamFailed && !signal.aborted && !this.closed) {
+        parser.push(decoder.decode());
+        parser.finish();
+      }
       // close() already cleared the cancelled attempt's timer. A replacement
       // connection may now own the shared timer.
       if (this.heartbeatController === heartbeatController) this.clearHeartbeatTimer();
+      if (this.sawStreamCompletion) {
+        // DONE owns observation closure; release an otherwise open response body.
+        // A trailing reset/cancel error cannot replace the selected closure.
+        await reader.cancel().catch(() => {});
+      }
       reader.releaseLock();
     }
     if (signal.aborted) return;
-    if (streamFailed && !this.sawTerminalEvent) throw streamError;
-    if (this.options.requireTerminalEvent && !this.sawTerminalEvent) {
+    if (streamFailed && !this.sawStreamCompletion) throw streamError;
+    if (this.options.requireTerminalEvent && !this.sawStreamCompletion) {
       throw new Error(
-        'SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)',
+        'SSE stream ended before its completion marker [DONE]',
       );
     }
   }
@@ -302,12 +340,16 @@ export class SSEClient {
   private processSSEData(data: string): void {
     // Cancellation can occur in a callback while the parser still holds more
     // events from the same network chunk, including its final buffered event.
-    if (this.closed || this.options.signal?.aborted) return;
+    if (this.closed || this.sawStreamCompletion || this.options.signal?.aborted) return;
+    // Framing owns observation completion; run/child outcome belongs to the consumer.
+    if (data === "[DONE]") {
+      this.sawStreamCompletion = true;
+      return;
+    }
     const event = parseSseEvent(data);
     if (event === undefined) return;
     try {
       this.resetHeartbeatTimer();
-      this.sawTerminalEvent ||= isTerminalEvent(event);
       this.options.onEvent(event);
     } catch {
       // Preserve the existing tolerance for invalid events or callback errors.
@@ -318,10 +360,10 @@ export class SSEClient {
     this.clearHeartbeatTimer();
     if (!this.options.heartbeatTimeoutMs || this.options.heartbeatTimeoutMs <= 0) return;
     this.heartbeatTimer = setTimeout(() => {
-      // A terminal lifecycle event is authoritative. A provider/proxy that
-      // keeps the HTTP body open after it has published that event must not
-      // turn an otherwise completed turn into a retryable heartbeat error.
-      if (this.closed || this.sawTerminalEvent) return;
+      // A completed SSE observation is authoritative. A provider/proxy that
+      // keeps the HTTP body open after that marker must not invent another
+      // observation error.
+      if (this.closed || this.sawStreamCompletion) return;
       this.heartbeatController?.abort();
     }, this.options.heartbeatTimeoutMs);
   }
@@ -335,7 +377,7 @@ export class SSEClient {
 
   private async maybeRetry(signal: AbortSignal): Promise<boolean> {
     this.retryCount++;
-    if (this.closed || signal.aborted || this.retryCount > this.options.maxRetries) return false;
+    if (this.closed || signal.aborted || this.options.method === 'POST' || this.retryCount > this.options.maxRetries) return false;
 
     const delay = this.options.retryDelayMs * Math.pow(1.5, this.retryCount - 1);
     await new Promise<void>((resolve) => {

@@ -55,10 +55,6 @@ function sseFrame(event: unknown) {
   return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function eventFromSseFrame(frame: string, strict = false): import("@astra/sdk").StreamEvent | null {
-  return parseChatSseFrame(frame, strict) as import("@astra/sdk").StreamEvent | null;
-}
-
 async function readSendMessageRequest(
   request: NextRequest,
   chat: ReturnType<typeof getChat>,
@@ -235,6 +231,7 @@ function proxyRunStream(params: {
           return;
         }
         try {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch {
           clientCancelled = true;
@@ -256,11 +253,11 @@ function proxyRunStream(params: {
         };
         if (projectionLease) {
           const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
-            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus } = state;
+            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus, waitingFor } = state;
           if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
             session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
               reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
-              lastFailureMessage, errorCode, terminalStatus } })) return;
+              lastFailureMessage, errorCode, terminalStatus, waitingFor } })) return;
         }
         let resolvedBackendResponse: Response;
         try {
@@ -401,7 +398,9 @@ function proxyRunStream(params: {
         };
 
         const forwardFrame = (frame: string) => {
-          const event = eventFromSseFrame(frame, replayOnly);
+          const parsed = parseChatSseFrame(frame, replayOnly);
+          if (parsed === "[DONE]") return "[DONE]";
+          const event = parsed as import("@astra/sdk").StreamEvent | null;
           if ((event as { type?: string } | null)?.type === "chat_stream_init") {
             mutate(() => { throw new Error("Runtime supplied a reserved Web initialization frame."); });
           }
@@ -421,7 +420,7 @@ function proxyRunStream(params: {
 
         let upstreamDone = false;
         try {
-          for (;;) {
+          readLoop: for (;;) {
             let chunk: ReadableStreamReadResult<Uint8Array>;
             try {
               chunk = await reader.read();
@@ -429,6 +428,7 @@ function proxyRunStream(params: {
               if (clientCancelled) return;
               // Transport loss cannot override an observed failure or resumable/terminal state.
               if (!replayOnly && (state.lastStatus === "failed" || state.runLifecycle !== "running")) {
+                buffer = "";
                 break;
               }
               if (replayOnly) throw error;
@@ -448,7 +448,14 @@ function proxyRunStream(params: {
             const frames = buffer.split(/\r?\n\r?\n/);
             buffer = frames.pop() ?? "";
             for (const frame of frames) {
-              if (!forwardFrame(frame)) return;
+              const result = forwardFrame(frame);
+              if (result === "[DONE]") {
+                buffer = "";
+                await Promise.resolve(reader.cancel()).catch(() => undefined);
+                upstreamDone = true;
+                break readLoop;
+              }
+              if (!result) return;
             }
           }
 
