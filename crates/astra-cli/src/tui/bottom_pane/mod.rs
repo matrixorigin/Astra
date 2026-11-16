@@ -184,7 +184,19 @@ pub(crate) struct RootIntentScope {
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     attachment_epoch: u64,
     session_binding: Arc<std::sync::Mutex<Option<String>>>,
+    remote_run: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    recheck_in_flight: std::sync::atomic::AtomicBool,
     started_unbound: bool,
+}
+
+pub(crate) struct RootIntentRecheck(Arc<RootIntentScope>);
+
+impl Drop for RootIntentRecheck {
+    fn drop(&mut self) {
+        self.0
+            .recheck_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RootIntentScope {
@@ -199,8 +211,53 @@ impl RootIntentScope {
             owner,
             attachment_epoch,
             session_binding,
+            remote_run: None,
+            recheck_in_flight: std::sync::atomic::AtomicBool::new(false),
             started_unbound,
         }
+    }
+
+    /// Retain the existing first-wins Run binding for later receipt lookup.
+    pub(crate) fn with_remote_run(
+        mut self,
+        remote_run: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Self {
+        self.remote_run = Some(remote_run);
+        self
+    }
+
+    pub(crate) fn recovery_context(
+        &self,
+    ) -> Option<(
+        crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        String,
+        String,
+    )> {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        if !owner.is_current() || !self.owner.same_presentation_owner(&owner) {
+            return None;
+        }
+        let session = astra_core::sync_poison::recover_mutex_lock(&self.session_binding).clone()?;
+        let remote_run = self.remote_run.as_ref()?;
+        // While the originating turn is active, its ordered stream owns
+        // settlement and its FIFO wakeup. Recheck only after that owner exits.
+        if remote_run.has_changed().is_ok() {
+            return None;
+        }
+        let run = remote_run.borrow().clone()?;
+        (!run.trim().is_empty()).then_some((owner, session, run))
+    }
+
+    pub(crate) fn begin_recheck(self: &Arc<Self>) -> Option<RootIntentRecheck> {
+        self.recheck_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| RootIntentRecheck(self.clone()))
     }
 
     fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
@@ -262,15 +319,23 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    pub(crate) fn root_scope(&self) -> Option<Arc<RootIntentScope>> {
+        self.root_scope.clone()
+    }
+
     pub(crate) fn wire_text(&self) -> &str {
         self.wire_text.as_deref().unwrap_or(&self.text)
     }
 
     pub(crate) fn composer_text(&self) -> std::borrow::Cow<'_, str> {
+        self.composer_text_for(&self.text)
+    }
+
+    pub(crate) fn composer_text_for<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         if self.wire_text.is_some() {
-            std::borrow::Cow::Borrowed(&self.text)
+            std::borrow::Cow::Borrowed(text)
         } else {
-            super::slash_dispatch::conversation_for_composer(&self.text)
+            super::slash_dispatch::conversation_for_composer(text)
         }
     }
 
@@ -509,6 +574,20 @@ impl BottomPane {
         let view = self.view_stack.remove(index);
         self.view_stack.push(view);
         true
+    }
+
+    pub(crate) fn take_open_root_recovery_draft(&mut self, intent_id: &str) -> Option<String> {
+        let (index, draft) =
+            self.view_stack
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, view)| {
+                    view.root_recovery_draft(intent_id)
+                        .map(|draft| (index, draft))
+                })?;
+        self.view_stack.remove(index);
+        Some(draft)
     }
 
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
@@ -927,6 +1006,26 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn mark_root_guidance_received(&mut self, intent_id: &str) {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+        }) else {
+            return;
+        };
+        intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        for view in &mut self.view_stack {
+            view.mark_root_guidance_received(intent_id);
+        }
+    }
+
+    pub(crate) fn root_guidance_check_failed(&mut self, intent_id: &str) {
+        for view in &mut self.view_stack {
+            view.root_guidance_check_failed(intent_id);
+        }
+    }
+
     /// Transfer an active-run intent from local custody to the durable run.
     ///
     /// The local entry is created before the HTTP submission starts so a
@@ -1257,11 +1356,16 @@ impl BottomPane {
     }
 
     pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
+        self.recover_returned_root_guidance_by_id(None)
+    }
+
+    pub(crate) fn recover_returned_root_guidance_by_id(&mut self, intent_id: Option<&str>) -> bool {
         let Some(id) = self
             .visible_pending_intents()
             .find(|intent| {
                 matches!(intent.target, PendingUserIntentTarget::ActiveRun)
                     && intent.status == astra_turn_types::UserIntentStatus::Returned
+                    && intent_id.is_none_or(|id| intent.intent_id == id)
             })
             .map(|intent| intent.intent_id.clone())
         else {

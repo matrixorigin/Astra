@@ -5,6 +5,7 @@ use astra_services::{
 };
 use serde_json::{Value, json};
 use std::{
+    io::{Read, Seek, SeekFrom},
     path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -12,6 +13,10 @@ use std::{
 
 fn run_journal(root: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_astra"));
+    // Capture to files so a detailed journal cannot fill a pipe while the
+    // parent waits to enforce the timeout.
+    let mut stdout = tempfile::tempfile().unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("ASTRA_") || key.starts_with("MOI_"))
     {
@@ -29,20 +34,30 @@ fn run_journal(root: &Path, args: &[&str]) -> Output {
         .env("ASTRA_API_URL", "http://127.0.0.1:9")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout.try_clone().unwrap()))
+        .stderr(Stdio::from(stderr.try_clone().unwrap()))
         .spawn()
         .unwrap();
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() > Duration::from_secs(10) {
             child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
-            panic!("journal command timed out: {args:?}: {output:?}");
+            child.wait().unwrap();
+            panic!("journal command timed out: {args:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    child.wait_with_output().unwrap()
+    let status = child.wait().unwrap();
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.seek(SeekFrom::Start(0)).unwrap();
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    stdout.read_to_end(&mut output.stdout).unwrap();
+    stderr.read_to_end(&mut output.stderr).unwrap();
+    output
 }
 
 #[test]
@@ -1949,4 +1964,142 @@ fn partial_rejected_failures_remain_visible_in_digest_summary() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn consistent_mixed_terminal_keeps_its_execution_lower_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "50f21eee-5b76-4c77-9991-8d0691e08961";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mixed = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run-1"},"tool_count":1,
+        "tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed",
+            "tool_call_id":"call-1","invocation_identity":{"user_id":"owner","session_id":sid,
+                "run_id":"run-1","turn_chain_id":"chain","invocation_id":"call-1"}}]});
+    let later = json!({"type":"turn","ts":"t2","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"run-2"},"tool_count":3,
+        "tool_outcomes":{"requested":3,"executed":3,"succeeded":3,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed",
+            "tool_call_id":"call-2","invocation_identity":{"user_id":"owner","session_id":sid,
+                "run_id":"run-2","turn_chain_id":"chain","invocation_id":"call-2"}}]});
+    let child_call = json!({"name":"bash","ok":true,"ms":1,"disposition":"executed",
+        "tool_call_id":"child-call","invocation_identity":{"user_id":"owner","session_id":sid,
+            "run_id":"child-run","turn_chain_id":"child-chain","invocation_id":"child-call"}});
+    let child = json!({"type":"sync_marker","ts":"t0","session_id":sid,
+        "producer_scope":{"run_id":"child-run"},"metadata":{"source":"child_agent"},
+        "tool_calls":[child_call]});
+    let mut overlap = mixed.clone();
+    overlap["tool_calls"] = json!([child["tool_calls"][0]]);
+    let mut child_rejection = child.clone();
+    child_rejection["tool_calls"][0]["disposition"] = json!("rejected");
+    child_rejection["tool_calls"][0]["ok"] = json!(false);
+    child_rejection["tool_calls"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("invocation_identity");
+    let mut zero = mixed.clone();
+    zero["tool_count"] = json!(0);
+    zero["tool_outcomes"]["requested"] = json!(1);
+    zero["tool_outcomes"]["executed"] = json!(0);
+    zero["tool_outcomes"]["succeeded"] = json!(0);
+    zero["tool_calls"] = json!([]);
+    let mut other_session = child.clone();
+    other_session["session_id"] = json!("different-session");
+    other_session["tool_calls"][0]["invocation_identity"]["session_id"] =
+        json!("different-session");
+    for (journal, lower_bound) in [
+        (format!("{mixed}\n"), 1),
+        (format!("{mixed}\n{later}\n"), 3),
+        (format!("{mixed}\n{child}\n"), 2),
+        (format!("{mixed}\n{child}\n{child}\n"), 2),
+        (format!("{mixed}\n{child}\n{child_rejection}\n"), 1),
+        (format!("{zero}\n{child}\n{child_rejection}\n"), 0),
+        (format!("{overlap}\n{child}\n"), 1),
+    ] {
+        std::fs::write(&path, journal).unwrap();
+        for args in [
+            vec!["tree", sid, "--format", "json"],
+            vec!["diff", sid, sid, "--format", "json"],
+        ] {
+            let output = run_journal(root.path(), &args);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let count = if args[0] == "tree" {
+                &value["root"]["tool_calls"]
+            } else {
+                &value["a_tool_calls_executed"]
+            };
+            assert_eq!(count, lower_bound, "{args:?}: {value}");
+        }
+    }
+    std::fs::write(&path, format!("{mixed}\n{other_session}\n")).unwrap();
+    for args in [
+        vec!["tree", sid, "--format", "json"],
+        vec!["diff", sid, sid, "--format", "json"],
+    ] {
+        let output = run_journal(root.path(), &args);
+        assert!(
+            !output.status.success(),
+            "cross-session journal must fail closed: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn conflicting_terminal_summary_omits_per_call_payloads() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "1a75a089-2e4b-4ecd-a685-570e9b76f634";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let calls: Vec<Value> = (0..128)
+        .map(|n| {
+            json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":format!("call-{n}"),
+        "error":"SECRET_MARKER tool result that belongs in full detail"})
+        })
+        .collect();
+    let first = json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"error":"first terminal","tool_calls":calls});
+    let mut second = first.clone();
+    second["error"] = json!("second terminal");
+    let round = json!({"type":"llm_round","ts":"t0","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"run"},"tool_calls":first["tool_calls"]});
+    let errors = first["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            json!({"type":"tool_call_error","ts":"t0","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"error":call["error"],"tool_calls":[call]})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{round}\n{errors}{first}\n{second}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(value["conflicting_terminal_count"], 1);
+    assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+    assert!(
+        summary.stdout.len() < 16_000,
+        "summary was {} bytes",
+        summary.stdout.len()
+    );
+    let full = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "all"],
+    );
+    assert!(full.status.success(), "{full:?}");
+    assert!(String::from_utf8_lossy(&full.stdout).contains("SECRET_MARKER"));
 }

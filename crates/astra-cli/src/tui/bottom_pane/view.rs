@@ -274,6 +274,15 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    /// Preserve edits made while an unknown main-message receipt is checked.
+    fn root_recovery_draft(&self, _intent_id: &str) -> Option<String> {
+        None
+    }
+
+    fn mark_root_guidance_received(&mut self, _intent_id: &str) {}
+
+    fn root_guidance_check_failed(&mut self, _intent_id: &str) {}
+
     fn refresh_agent_guide_recipient(
         &mut self,
         _target: &crate::tui::event_loop::AgentGuideTarget,

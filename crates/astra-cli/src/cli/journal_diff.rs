@@ -456,14 +456,23 @@ impl<'a> RejectionIds<'a> {
 /// Independently supported execution evidence can overlap. A definitive
 /// rejection and an execution for the same canonical invocation conflict;
 /// unknown and deferred observations may be refined by later execution.
+#[derive(Default)]
+struct InvocationEvidence {
+    executed: bool,
+    rejected: bool,
+    root_execution: bool,
+    non_child_observation: bool,
+    child_execution: bool,
+}
+
 pub(super) fn confirmed_execution_evidence(
     events: &[JournalEvent],
     conflicting_terminals: &[JournalEvent],
 ) -> (u64, bool) {
     use astra_services::session_journal::ToolCallDisposition;
 
-    let mut identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
-    let mut invalid_identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
+    let mut identities: HashMap<CallKey<'_>, InvocationEvidence> = HashMap::new();
+    let mut invalid_identities: HashMap<CallKey<'_>, InvocationEvidence> = HashMap::new();
     let mut rejected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
     let mut child_rejected_ids: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
     let mut child_unidentified_rejections = std::collections::HashSet::new();
@@ -477,13 +486,22 @@ pub(super) fn confirmed_execution_evidence(
     for event in events.iter().chain(conflicting_terminals) {
         for call in event.tool_calls.iter().flatten() {
             let disposition = call.effective_disposition();
+            let valid = call_key(event, call);
+            let child_callback = is_child_callback(event);
+            if let Some(identity) = valid
+                && !child_callback
+            {
+                identities
+                    .entry(identity)
+                    .or_default()
+                    .non_child_observation = true;
+            }
             if !matches!(
                 disposition,
                 ToolCallDisposition::Executed | ToolCallDisposition::Rejected
             ) {
                 continue;
             }
-            let valid = call_key(event, call);
             if disposition == ToolCallDisposition::Rejected {
                 any_rejected = true;
                 let id = call
@@ -492,7 +510,6 @@ pub(super) fn confirmed_execution_evidence(
                     .map(str::trim)
                     .filter(|id| !id.is_empty());
                 all_rejection_ids.insert(Some(call.name.as_str()), id, false);
-                let child_callback = is_child_callback(event);
                 if child_callback && call.invocation_identity.is_none() {
                     // This producer writes request IDs from one scoped callback
                     // batch even when account identity is unavailable.
@@ -557,14 +574,16 @@ pub(super) fn confirmed_execution_evidence(
                 continue;
             };
             let facts = facts.entry(identity).or_default();
-            facts.0 |= disposition == ToolCallDisposition::Executed;
-            facts.1 |= disposition == ToolCallDisposition::Rejected;
+            facts.executed |= disposition == ToolCallDisposition::Executed;
+            facts.rejected |= disposition == ToolCallDisposition::Rejected;
+            facts.root_execution |= disposition == ToolCallDisposition::Executed && !child_callback;
+            facts.child_execution |= disposition == ToolCallDisposition::Executed && child_callback;
         }
     }
 
     // A terminal ledger can report rejected requests without retaining
     // their identities. An execution may be one of those requests.
-    if any_unidentified || identities.values().any(|(executed, _)| *executed) {
+    if any_unidentified || identities.values().any(|facts| facts.executed) {
         for event in events
             .iter()
             .chain(conflicting_terminals)
@@ -611,14 +630,28 @@ pub(super) fn confirmed_execution_evidence(
         .chain(invalid_identities.keys())
         .copied()
         .filter(|identity| {
-            let (executed, rejected) = identities.get(*identity).copied().unwrap_or_default();
-            let (invalid_executed, invalid_rejected) = invalid_identities
-                .get(*identity)
-                .copied()
-                .unwrap_or_default();
-            (executed || invalid_executed) && (rejected || invalid_rejected)
+            let valid = identities.get(*identity);
+            let invalid = invalid_identities.get(*identity);
+            (valid.is_some_and(|facts| facts.executed)
+                || invalid.is_some_and(|facts| facts.executed))
+                && (valid.is_some_and(|facts| facts.rejected)
+                    || invalid.is_some_and(|facts| facts.rejected))
         })
         .collect();
+    for (identity, facts) in &identities {
+        let scope = (identity.session_id.as_str(), identity.run_id.as_str());
+        if facts.child_execution
+            && (child_unidentified_rejections.contains(&scope)
+                || child_rejected_ids
+                    .get(&scope)
+                    .is_some_and(|ids| ids.contains(identity.invocation_id.as_str())))
+        {
+            disputed.insert(identity);
+        }
+    }
+    // Missing rejection details can overlap a call observation, but cannot
+    // contradict the execution bucket in their own consistent ledger.
+    let mut summary_ambiguity = false;
     let mut affected_terminals = std::collections::HashSet::new();
     let mut anonymous_conflict_attempts = std::collections::HashSet::new();
     let mut unscoped_anonymous_conflict = false;
@@ -643,19 +676,21 @@ pub(super) fn confirmed_execution_evidence(
             // Child callback tool calls are explicitly outside the root
             // terminal's aggregate, but explicit rejection records can still
             // contradict them by identity.
-            let overlaps = (summary_rejection && !is_child_callback(event))
-                || if is_terminal(event) && key.is_none() {
-                    // An anonymous terminal execution can also be a projection
-                    // of an earlier run's rejected request.
-                    all_rejection_ids.overlaps(&call.name, id, true)
-                } else {
-                    unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
-                        || attempt
-                            .and_then(|((session, turn), run)| {
-                                rejected_attempts.get(&(session, turn, run))
-                            })
-                            .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
-                };
+            if summary_rejection && !is_child_callback(event) {
+                summary_ambiguity = true;
+            }
+            let overlaps = if is_terminal(event) && key.is_none() {
+                // An anonymous terminal execution can also be a projection
+                // of an earlier run's rejected request.
+                all_rejection_ids.overlaps(&call.name, id, true)
+            } else {
+                unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
+                    || attempt
+                        .and_then(|((session, turn), run)| {
+                            rejected_attempts.get(&(session, turn, run))
+                        })
+                        .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
+            };
             if overlaps {
                 if let Some(identity) = key {
                     disputed.insert(identity);
@@ -674,7 +709,7 @@ pub(super) fn confirmed_execution_evidence(
         || !affected_terminals.is_empty()
         || !anonymous_conflict_attempts.is_empty()
         || unscoped_anonymous_conflict;
-    let incomplete = has_conflict || !invalid_identities.is_empty();
+    let incomplete = has_conflict || summary_ambiguity || !invalid_identities.is_empty();
     let mut affected_attempts = anonymous_conflict_attempts;
     let mut affected_runs = std::collections::HashSet::new();
     let mut affected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
@@ -798,6 +833,25 @@ pub(super) fn confirmed_execution_evidence(
             }
         }
     }
+    // Root terminal counts exclude child callback execution. Add only child
+    // identities that cannot overlap any non-child observation or rejection.
+    let mut children_by_session = HashMap::<&str, u64>::new();
+    if !unscoped_rejection {
+        for (identity, facts) in &identities {
+            let scope = (identity.session_id.as_str(), identity.run_id.as_str());
+            if facts.child_execution
+                && !facts.non_child_observation
+                && !disputed.contains(identity)
+                && !invalid_identities.contains_key(identity)
+                && !child_unidentified_rejections.contains(&scope)
+                && child_rejected_ids
+                    .get(&scope)
+                    .is_none_or(|ids| !ids.contains(identity.invocation_id.as_str()))
+            {
+                *children_by_session.entry(scope.0).or_default() += 1;
+            }
+        }
+    }
     let terminal_floor = events
         .iter()
         .enumerate()
@@ -831,12 +885,27 @@ pub(super) fn confirmed_execution_evidence(
                     .is_some_and(|scope| affected_runs.contains(&scope))
                 && journal_digest::terminal_execution_consistent(event)
         })
-        .filter_map(|(_, event)| journal_digest::terminal_execution_count(event))
+        .filter_map(|(_, event)| {
+            let count = journal_digest::terminal_execution_count(event)?;
+            let children = event
+                .session_id
+                .as_deref()
+                .filter(|session| !session.trim().is_empty())
+                .filter(|_| event.turn.is_some() && run_id_of(event).is_some())
+                .and_then(|session| children_by_session.get(session))
+                .copied()
+                .unwrap_or(0);
+            Some(count.saturating_add(children))
+        })
         .max()
         .unwrap_or_default();
     let identified = identities
         .iter()
-        .filter(|(identity, (executed, _))| *executed && !disputed.contains(*identity))
+        .filter(|(identity, facts)| {
+            facts.executed
+                && !disputed.contains(*identity)
+                && !(summary_rejection && facts.root_execution)
+        })
         .count() as u64;
     (
         terminal_floor
@@ -1271,6 +1340,22 @@ mod tests {
         call.invocation_identity = call.tool_call_id.as_ref().and_then(|id| {
             astra_turn_types::ToolInvocationIdentity::new("owner", session, run, "chain", id).ok()
         });
+    }
+
+    #[test]
+    fn child_floor_never_combines_different_sessions() {
+        let terminal = identified_evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"root"},"tool_count":1,
+            "tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,
+                "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0},
+            "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed","tool_call_id":"root-call"}]}));
+        let child = identified_evt(json!({"type":"sync_marker","ts":"t","session_id":"b",
+            "producer_scope":{"run_id":"child"},"metadata":{"source":"child_agent"},
+            "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed","tool_call_id":"child-call"}]}));
+        assert_eq!(
+            super::confirmed_execution_evidence(&[terminal, child], &[]).0,
+            1
+        );
     }
 
     #[test]

@@ -2097,17 +2097,20 @@ fn build_digest_with_owners(
                 {
                     safety_guard_blocks += 1;
                 }
-                let error_preview = preview(Some(&error), 200);
-                let first_detail = key.is_none_or(|key| {
-                    seen_root_failure_details.insert((
-                        key,
-                        call.name.as_str(),
-                        error_preview.clone(),
-                        call.args_preview.as_deref(),
-                    ))
-                });
-                if let Some(failure_seq) = failure_seq {
-                    if matches!(focus, DigestFocus::All) && first_detail {
+                if matches!(focus, DigestFocus::All) {
+                    let error_preview = preview(Some(&error), 200);
+                    let first_detail = key.is_none_or(|key| {
+                        seen_root_failure_details.insert((
+                            key,
+                            call.name.as_str(),
+                            error_preview.clone(),
+                            call.args_preview.as_deref(),
+                        ))
+                    });
+                    if let Some(failure_seq) = failure_seq {
+                        if !first_detail {
+                            continue;
+                        }
                         failed_tool_calls.push(FailedToolCall {
                             seq: failure_seq,
                             turn_id: ev.turn,
@@ -2116,21 +2119,20 @@ fn build_digest_with_owners(
                             error_preview,
                             args_preview: call.args_preview.clone(),
                         });
+                    } else if !candidate && first_detail {
+                        // An owned failure remains diagnostic even when conflicting
+                        // terminals do not establish a turn row or its sequence.
+                        other_errors.push(SideEvent {
+                            ts: ev.ts.clone(),
+                            kind: "conflicting_attempt_tool_failure".into(),
+                            turn: ev.turn,
+                            agentic_step: ev.agentic_step,
+                            producer_scope: ev.producer_scope.clone(),
+                            source: None,
+                            detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
+                                "error": error_preview, "args_preview": call.args_preview}),
+                        });
                     }
-                } else if !candidate && first_detail {
-                    // An owned failure remains diagnostic even when conflicting
-                    // terminals do not establish a turn row or its sequence.
-                    other_errors.push(SideEvent {
-                        ts: ev.ts.clone(),
-                        kind: "conflicting_attempt_tool_failure".into(),
-                        turn: ev.turn,
-                        agentic_step: ev.agentic_step,
-                        producer_scope: ev.producer_scope.clone(),
-                        source: None,
-                        detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
-                            "error": error_preview,
-                            "args_preview": matches!(focus, DigestFocus::All).then_some(call.args_preview.as_ref()).flatten()}),
-                    });
                 }
             }
         }
@@ -2419,20 +2421,27 @@ fn build_digest_with_owners(
                 });
             }
             JournalEventType::ToolCallError => {
-                other_errors.push(SideEvent {
-                    ts: ev.ts.clone(),
-                    kind: "observed_tool_error".to_owned(),
-                    turn: ev.turn,
-                    agentic_step: ev.agentic_step,
-                    producer_scope: ev.producer_scope.clone(),
-                    source: None,
-                    detail: json!({
-                        "message": ev.error,
-                        "tools": ev.tools_used,
-                        "dispositions": ev.tool_calls.iter().flatten()
-                            .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
-                    }),
-                });
+                let conflicting_attempt = ev
+                    .turn
+                    .zip(producer_run_id(ev))
+                    .and_then(|attempt| root_attempts.get(&attempt))
+                    .is_some_and(Option::is_none);
+                if !conflicting_attempt || matches!(focus, DigestFocus::All) {
+                    other_errors.push(SideEvent {
+                        ts: ev.ts.clone(),
+                        kind: "observed_tool_error".to_owned(),
+                        turn: ev.turn,
+                        agentic_step: ev.agentic_step,
+                        producer_scope: ev.producer_scope.clone(),
+                        source: None,
+                        detail: json!({
+                            "message": ev.error,
+                            "tools": ev.tools_used,
+                            "dispositions": ev.tool_calls.iter().flatten()
+                                .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
+                        }),
+                    });
+                }
             }
             JournalEventType::SessionStart => session_start_count += 1,
             JournalEventType::SessionEnd => session_end_count += 1,
@@ -2509,7 +2518,10 @@ fn build_digest_with_owners(
 
     // Candidate terminals do not contribute aggregate totals. Keep their
     // diagnostic call facts and errors even when they cannot be attributed.
-    for event in &conflicting_terminals {
+    for event in conflicting_terminals
+        .iter()
+        .filter(|_| matches!(focus, DigestFocus::All))
+    {
         let calls: Vec<_> = event
             .tool_calls
             .iter()
@@ -2519,15 +2531,12 @@ fn build_digest_with_owners(
                     let error = effective_error_text(call);
                     preview(Some(&error), 200)
                 });
-                let args = matches!(focus, DigestFocus::All)
-                    .then_some(call.args_preview.as_ref())
-                    .flatten();
                 json!({
                     "tool": call.name,
                     "tool_call_id": call.tool_call_id,
                     "invocation_identity": call.invocation_identity,
                     "disposition": call.effective_disposition(),
-                    "args_preview": args,
+                    "args_preview": call.args_preview,
                     "error": error,
                 })
             })

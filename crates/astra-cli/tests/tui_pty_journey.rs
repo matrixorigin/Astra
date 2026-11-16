@@ -1738,6 +1738,101 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
+    use axum::{
+        Json,
+        extract::Path,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    let _journey = pty_journey_lock().lock().await;
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+    let routes = axum::Router::new()
+        .route(
+            "/chat/runs/{run_id}/intents",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(body).unwrap();
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})))
+                }
+            }),
+        )
+        .route(
+            "/chat/runs/{run_id}/intents/{intent_id}",
+            get(move |Path((run, intent)): Path<(String, String)>| {
+                let checked = checked.clone();
+                async move {
+                    checked.send((run, intent)).unwrap();
+                    Json("returned")
+                }
+            }),
+        );
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+        true,
+        routes,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn_with_config(
+        home.path(),
+        &mock.base_url,
+        "mock-model",
+        "gateway-token",
+        &[],
+    );
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Start the current task.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(Instant::now() < deadline, "turn did not reach the server");
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    mock.release_held_binding();
+    astra.paste_and_submit("What happened?");
+    let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let retry = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["intent_id"], retry["intent_id"]);
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.wait_for("total ·", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1bu");
+    let (run, intent) = tokio::time::timeout(UI_TRANSITION_TIMEOUT, checks.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run, "mock-run-agent-root");
+    assert_eq!(intent, first["intent_id"].as_str().unwrap());
+    astra.wait_for_screen(
+        "returned message in composer",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains('›') && line.contains("What happened?"))
+        },
+    );
+    assert!(
+        received.try_recv().is_err(),
+        "receipt lookup must not resend guidance"
+    );
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes() {
     use axum::{Json, extract::Path, routing::post};
     let _journey = pty_journey_lock().lock().await;

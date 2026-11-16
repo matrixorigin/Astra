@@ -29,6 +29,7 @@ enum InputPurpose {
     },
     RootUnconfirmed {
         intent_id: String,
+        received: bool,
     },
     Continue(crate::tui::event_loop::SessionContinuationTarget),
     Shell {
@@ -147,12 +148,15 @@ impl TaskInputView {
         view
     }
 
-    pub(crate) fn unconfirmed_root(intent_id: String, text: &str) -> Self {
+    pub(crate) fn unconfirmed_root(intent_id: String, text: &str, received: bool) -> Self {
         let mut input = TextArea::new();
         input.set_text(text);
         Self {
             recovery_navigation_id: Some(intent_id.clone()),
-            purpose: InputPurpose::RootUnconfirmed { intent_id },
+            purpose: InputPurpose::RootUnconfirmed {
+                intent_id,
+                received,
+            },
             input,
             error: None,
             acknowledged_unknown: Vec::new(),
@@ -210,9 +214,11 @@ impl TaskInputView {
                 }
             )
         {
-            self.error = Some(
-                "Delivery is unknown and may still be used. Copy or discard explicitly.".into(),
-            );
+            self.error = Some(if matches!(self.purpose, InputPurpose::RootUnconfirmed { received: true, .. }) {
+                "The message was received, but whether it was used is unknown. Copy or discard explicitly."
+            } else {
+                "Delivery is unknown and may still be used. Copy or discard explicitly."
+            }.into());
             return;
         }
         let content = if matches!(self.purpose, InputPurpose::Shell { .. }) {
@@ -265,6 +271,30 @@ impl TaskInputView {
 }
 
 impl BottomPaneView for TaskInputView {
+    fn root_recovery_draft(&self, intent_id: &str) -> Option<String> {
+        matches!(&self.purpose, InputPurpose::RootUnconfirmed { intent_id: id, .. } if id == intent_id)
+            .then(|| self.input.text().to_owned())
+    }
+
+    fn mark_root_guidance_received(&mut self, intent_id: &str) {
+        if let InputPurpose::RootUnconfirmed {
+            intent_id: id,
+            received,
+        } = &mut self.purpose
+            && id == intent_id
+        {
+            *received = true;
+            self.error = None;
+        }
+    }
+
+    fn root_guidance_check_failed(&mut self, intent_id: &str) {
+        if matches!(&self.purpose, InputPurpose::RootUnconfirmed { intent_id: id, .. } if id == intent_id)
+        {
+            self.error = Some("Check failed. Alt+N next/check; no message resent.".into());
+        }
+    }
+
     fn refresh_agent_guide_recipient(
         &mut self,
         target: &crate::tui::event_loop::AgentGuideTarget,
@@ -286,7 +316,7 @@ impl BottomPaneView for TaskInputView {
     fn is_recoverable_guidance(&self, intent: &super::PendingUserIntent) -> bool {
         match (&self.purpose, &intent.target) {
             (
-                InputPurpose::RootUnconfirmed { intent_id },
+                InputPurpose::RootUnconfirmed { intent_id, .. },
                 super::PendingUserIntentTarget::ActiveRun,
             ) => intent_id == &intent.intent_id,
             (
@@ -355,9 +385,16 @@ impl BottomPaneView for TaskInputView {
                     (" Unsent message ", target.agent_name(), " · not used ", "")
                 }
             }
-            InputPurpose::RootUnconfirmed { .. } => {
-                (" Message ", "main conversation", " · delivery unknown ", "")
-            }
+            InputPurpose::RootUnconfirmed { received, .. } => (
+                " Message ",
+                "main conversation",
+                if *received {
+                    " · received; outcome unknown "
+                } else {
+                    " · delivery unknown "
+                },
+                "",
+            ),
             InputPurpose::Continue(_) => (
                 " Next message ",
                 "main conversation",
@@ -476,7 +513,7 @@ impl BottomPaneView for TaskInputView {
                 return;
             }
         }
-        if let InputPurpose::RootUnconfirmed { intent_id } = &self.purpose
+        if let InputPurpose::RootUnconfirmed { intent_id, .. } = &self.purpose
             && key.modifiers == crossterm::event::KeyModifiers::ALT
         {
             let action = match key.code {
@@ -760,7 +797,7 @@ mod tests {
             action: BottomPaneViewAction::DismissReturnedAgentGuide { intent_id, .. }, ..
         }) if intent_id == "unknown")
         );
-        let mut root = TaskInputView::unconfirmed_root("root".into(), "first message");
+        let mut root = TaskInputView::unconfirmed_root("root".into(), "first message", false);
         root.handle_key(key(KeyCode::Enter));
         assert!(root.take_action_request().is_none());
         root.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
