@@ -5805,9 +5805,11 @@ fn drain_agent_workbench_outcomes(
     chat_widget: &mut chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
-) {
+) -> bool {
     bottom_pane.retire_detached_agent_observations(active_session_id, attachment_epoch);
+    let mut processed = false;
     while let Ok(outcome) = outcome_rx.try_recv() {
+        processed = true;
         if matches!(&outcome,
             AgentWorkbenchOutcome::GuideAccepted { target, .. }
                 | AgentWorkbenchOutcome::GuideApplied { target, .. }
@@ -6079,7 +6081,10 @@ fn drain_agent_workbench_outcomes(
                     continue;
                 }
                 let Ok(status) = status else {
-                    bottom_pane.root_guidance_check_failed(&intent_id);
+                    bottom_pane.root_guidance_check_notice(
+                        &intent_id,
+                        Some("Check failed. Alt+N next/check; no message resent."),
+                    );
                     frame_requester.schedule_frame();
                     continue;
                 };
@@ -6102,34 +6107,33 @@ fn drain_agent_workbench_outcomes(
                         astra_turn_types::UserIntentStatus::Returned,
                         &intent.text,
                     )
-                } else if let Some(applied) = bottom_pane.apply_user_intent(
-                    &intent_id,
-                    intent.delivery,
-                    astra_turn_types::UserIntentStatus::Applied,
-                    intent.wire_text(),
-                ) {
-                    chat_widget.commit_applied_user_intent(
-                        applied.intent_id,
-                        applied.delivery,
-                        applied.status,
-                        applied.text,
-                    );
-                    true
                 } else {
-                    false
+                    bottom_pane
+                        .apply_user_intent(
+                            &intent_id,
+                            intent.delivery,
+                            astra_turn_types::UserIntentStatus::Applied,
+                            intent.wire_text(),
+                        )
+                        .is_some()
                 };
                 if !resolved {
                     continue;
                 }
                 settle_open_root_recovery(bottom_pane, &intent, returned);
-                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-                    if returned {
-                        "Your message was not used; it is available for editing."
-                    } else {
-                        "Your message was used by the previous task."
-                    }
-                    .to_string(),
-                ));
+                let message = if returned {
+                    format!(
+                        "Earlier message was not used and is available for editing:\n{}",
+                        intent.text
+                    )
+                } else {
+                    format!(
+                        "Earlier message applied to its original task:\n{}",
+                        intent.text
+                    )
+                };
+                chat_widget
+                    .commit_concurrent_system(history_cell::system::SystemCell::info(message));
             }
             AgentWorkbenchOutcome::TranscriptUpdate(update) => {
                 if !bottom_pane.refresh_agent_transcript(update) {
@@ -6145,6 +6149,7 @@ fn drain_agent_workbench_outcomes(
         refresh_open_agent_monitor(chat_widget, bottom_pane);
         frame_requester.schedule_frame();
     }
+    processed
 }
 
 fn reconcile_server_agent_observer(
@@ -6335,40 +6340,51 @@ fn open_recoverable_guidance(
                     ),
                 ));
             }
-            if let Some((scope, owner, session_id, run_id)) = lookup
-                && let Some(guard) = scope.begin_recheck()
-            {
-                let api = backends.api.clone().without_bearer_provider();
-                let auth = AgentActionAuth::capture(&owner, None);
-                let attachment_epoch = backends.session_attachment_epoch;
-                let intent_id = intent.intent_id;
-                let outcome_tx = backends.agent_workbench_tx.clone();
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    let status = authorized_intent_status(
-                        &api,
-                        &owner,
-                        auth,
-                        (&run_id, &session_id, &intent_id),
-                        None,
-                        None,
-                    )
-                    .await
-                    .map_err(|_| ());
-                    if !owner.is_current() {
-                        return;
-                    }
-                    let _ = outcome_tx
-                        .send(AgentWorkbenchOutcome::RootGuideStatus {
-                            scope,
-                            owner,
-                            session_id,
-                            attachment_epoch,
-                            intent_id,
-                            status,
-                        })
-                        .await;
-                });
+            if let Some((scope, owner, session_id, run_id)) = lookup {
+                if let Some(guard) = scope.begin_recheck() {
+                    bottom_pane.root_guidance_check_notice(&intent.intent_id, None);
+                    let api = backends.api.clone().without_bearer_provider();
+                    let auth = AgentActionAuth::capture(&owner, None);
+                    let attachment_epoch = backends.session_attachment_epoch;
+                    let intent_id = intent.intent_id;
+                    let outcome_tx = backends.agent_workbench_tx.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let status = authorized_intent_status(
+                            &api,
+                            &owner,
+                            auth,
+                            (&run_id, &session_id, &intent_id),
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|_| ());
+                        if !owner.is_current() {
+                            return;
+                        }
+                        let _ = outcome_tx
+                            .send(AgentWorkbenchOutcome::RootGuideStatus {
+                                scope,
+                                owner,
+                                session_id,
+                                attachment_epoch,
+                                intent_id,
+                                status,
+                            })
+                            .await;
+                    });
+                } else {
+                    bottom_pane.root_guidance_check_notice(
+                        &intent.intent_id,
+                        Some("Check not started; a check was already in progress. Alt+N next/check again."),
+                    );
+                }
+            } else {
+                bottom_pane.root_guidance_check_notice(
+                    &intent.intent_id,
+                    Some("Status check was unavailable; no message was resent."),
+                );
             }
         }
         bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
@@ -12607,7 +12623,7 @@ pub(crate) async fn run_tui_session(
                                                 _ = itick.tick() => {
                                                     let background_commands_mutated = false;
                                                     let workbench_session_id = chat_widget.session_id().to_string();
-                                                    drain_agent_workbench_outcomes(
+                                                    let workbench_processed = drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
                                                         (!workbench_session_id.is_empty()).then_some(workbench_session_id.as_str()),
                                                         live_session_attachment_epoch,
@@ -12830,7 +12846,8 @@ pub(crate) async fn run_tui_session(
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    if control_notice {
+                                                    if control_notice || (workbench_processed
+                                                        && should_flush_ambient_commits(pending_deferred_slash_flush)) {
                                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     }
                                                     let frame = active_viewport(
@@ -24371,13 +24388,177 @@ mod tests {
                     "draft edited"
                 }
             );
-            if plan {
-                assert!(rendered_transcript_overlay(&widget, 80).contains("prepare a plan"));
+            if disposition == "applied" {
+                let transcript = rendered_transcript_overlay(&widget, 80);
+                assert!(transcript.contains("Earlier message applied"));
+                assert!(transcript.contains(if plan { "/plan inspect" } else { "draft" }));
+                assert!(!transcript.contains("prepare a plan"));
+                assert!(widget.last_user_text().is_none());
             }
             let requests = server.received_requests().await.unwrap();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].method.as_str(), "GET");
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_identifies_its_message_after_switching_drafts() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-receipt-label-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-label-owner"),
+        )
+        .unwrap();
+
+        for (status, label) in [
+            (astra_turn_types::UserIntentStatus::Applied, "applied"),
+            (astra_turn_types::UserIntentStatus::Returned, "not used"),
+        ] {
+            let scope = root_recovery_scope(Some("original-run"));
+            let original = format!("first message {} retained end", "x".repeat(200));
+            let mut pane = root_recovery_pane(scope.clone(), &original, false);
+            pane.accept_turn_user_intent("turn", "other".into(), "second message".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed("other"));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    "other".into(),
+                    "second message",
+                    false,
+                ),
+            ));
+            pane.handle_paste(" edited");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(AgentWorkbenchOutcome::RootGuideStatus {
+                scope,
+                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                session_id: "session".into(),
+                attachment_epoch: 3,
+                intent_id: "guide".into(),
+                status: Ok(status),
+            })
+            .await
+            .unwrap();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let transcript = rendered_transcript_overlay(&widget, 100);
+            assert!(transcript.contains(label), "{transcript}");
+            assert!(transcript.contains("first message"), "{transcript}");
+            assert!(!transcript.contains("second message"), "{transcript}");
+            assert!(widget.history().iter().any(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+                    .is_some_and(|notice| notice.message().contains(&original))
+            }));
+            assert!(widget.last_user_text().is_none());
+            assert!(pane.unconfirmed_root_guidance(Some("other")).is_some());
+            assert!(render_bottom_pane_text(&pane, 100, 20).contains("second message edited"));
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_reports_busy_and_can_check_next_message_later() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-receipt-busy-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-busy-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/original-run/intents/guide"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json("applied"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/original-run/intents/other"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("returned"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (backends, mut rx) = root_recovery_backends(&server.uri());
+        let scope = root_recovery_scope(Some("original-run"));
+        let mut pane = root_recovery_pane(scope.clone(), "first", false);
+        pane.accept_turn_user_intent("turn", "other".into(), "second".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("other"));
+        let first = pane
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        let second = pane
+            .unconfirmed_root_guidance(Some("other"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(first, &backends, &mut pane);
+        open_recoverable_guidance(second.clone(), &backends, &mut pane);
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("check was already in progress"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            while scope.begin_recheck().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        open_recoverable_guidance(second, &backends, &mut pane);
+        assert!(!render_bottom_pane_text(&pane, 100, 20).contains("check was already in progress"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.unconfirmed_root_guidance(Some("other")).is_none());
+
+        let mut unavailable = root_recovery_pane(root_recovery_scope(None), "draft", false);
+        let draft = unavailable
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(draft, &backends, &mut unavailable);
+        assert!(
+            render_bottom_pane_text(&unavailable, 100, 20).contains("Status check was unavailable")
+        );
     }
 
     #[serial_test::serial]

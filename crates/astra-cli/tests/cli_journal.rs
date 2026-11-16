@@ -2090,6 +2090,14 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     assert!(summary.status.success(), "{summary:?}");
     let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
     assert_eq!(value["conflicting_terminal_count"], 1);
+    let causes = value["other_errors"].as_array().unwrap();
+    for expected in ["first terminal", "second terminal"] {
+        assert!(
+            causes
+                .iter()
+                .any(|cause| cause["detail"]["message"] == expected)
+        );
+    }
     assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
     assert!(
         summary.stdout.len() < 16_000,
@@ -2102,4 +2110,52 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     );
     assert!(full.status.success(), "{full:?}");
     assert!(String::from_utf8_lossy(&full.stdout).contains("SECRET_MARKER"));
+
+    // Error-only conflicting terminals retain useful reasons under a fixed
+    // output bound, even when many contain long Unicode/control text.
+    let terminals = (0..8)
+        .map(|n| {
+            let message = match n {
+                0 => "first terminal".to_owned(),
+                1 => "second terminal".to_owned(),
+                _ => format!("terminal-{n} \u{1}{}", "界".repeat(1_000)),
+            };
+            json!({"type":"turn_error", "ts":format!("t{n}"), "session_id":sid,
+                "turn":1, "producer_scope":{"run_id":"run"}, "error":message})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, terminals).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    assert!(summary.stdout.len() < 16_000);
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    for expected in ["first terminal", "second terminal"] {
+        assert!(
+            causes
+                .iter()
+                .any(|cause| cause["detail"]["message"] == expected)
+        );
+    }
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|cause| cause["kind"] == "conflicting_terminal")
+            .count(),
+        4
+    );
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "conflicting_terminal_errors_omitted" && cause["detail"]["omitted"] == 4
+    }));
+    for cause in causes
+        .iter()
+        .filter(|cause| cause["kind"] == "conflicting_terminal")
+    {
+        assert!(cause["detail"]["message"].as_str().unwrap().chars().count() <= 160);
+        assert!(cause["detail"].get("tool_calls").is_none());
+    }
 }

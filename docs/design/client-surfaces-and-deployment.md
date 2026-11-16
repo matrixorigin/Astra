@@ -96,10 +96,11 @@ unresolved accepted messages receive one exact receipt lookup; a failed or
 still-pending lookup remains unconfirmed and is not resent.
 After the originating turn ends, opening an unknown main-conversation message
 can check its intent once when the original Run and session are known. A
-returned message becomes an editable draft; an applied message is shown as used
-by the previous task. An accepted receipt confirms delivery but not use. A
-failed lookup preserves the last confirmed status, and checking never resends
-the message. The lookup adds no recurring or ordinary-turn query.
+returned message becomes an editable draft; an applied receipt shows the
+original text as a status for its originating task, not a new user message. An
+accepted receipt confirms delivery but not use. A failed lookup preserves the
+last confirmed status, and checking never resends the message. The lookup adds
+no recurring or ordinary-turn query.
 The agent navigator's message action targets the selected agent. A previous
 message still being sent keeps a later draft editable; if its delivery is
 unknown, the user may explicitly send the later message despite possible

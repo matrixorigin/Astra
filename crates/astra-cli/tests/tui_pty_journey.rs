@@ -1737,15 +1737,13 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
+async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) {
     use axum::{
         Json,
         extract::Path,
         http::StatusCode,
         routing::{get, post},
     };
-    let _journey = pty_journey_lock().lock().await;
     let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
     let routes = axum::Router::new()
@@ -1765,7 +1763,7 @@ async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
                 let checked = checked.clone();
                 async move {
                     checked.send((run, intent)).unwrap();
-                    Json("returned")
+                    Json(disposition)
                 }
             }),
         );
@@ -1795,7 +1793,12 @@ async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
         tokio::task::yield_now().await;
     }
     mock.release_held_binding();
-    astra.paste_and_submit("What happened?");
+    let message = if disposition == "applied" {
+        format!("What happened? {} retained end", "details-".repeat(24))
+    } else {
+        "What happened?".into()
+    };
+    astra.paste_and_submit(&message);
     let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
         .await
         .unwrap()
@@ -1808,6 +1811,20 @@ async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
     astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
     mock.release_held_response();
     astra.wait_for("total ·", UI_TRANSITION_TIMEOUT);
+    if next_turn {
+        astra.paste_and_submit("Start the next task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "next task did not reach the server"
+            );
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.wait_for("Start the next task.", UI_TRANSITION_TIMEOUT);
+    }
     astra.write(b"\x1bu");
     let (run, intent) = tokio::time::timeout(UI_TRANSITION_TIMEOUT, checks.recv())
         .await
@@ -1815,21 +1832,64 @@ async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
         .unwrap();
     assert_eq!(run, "mock-run-agent-root");
     assert_eq!(intent, first["intent_id"].as_str().unwrap());
-    astra.wait_for_screen(
-        "returned message in composer",
-        UI_TRANSITION_TIMEOUT,
-        |screen| {
-            screen
+    if disposition == "returned" {
+        astra.wait_for_screen(
+            "returned message in composer",
+            UI_TRANSITION_TIMEOUT,
+            |screen| {
+                screen
+                    .lines()
+                    .any(|line| line.contains('›') && line.contains("What happened?"))
+            },
+        );
+    } else {
+        // For a quiet next turn this must appear before its stream is released.
+        astra.wait_for_screen("full earlier message", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Earlier message applied to its original task:")
+                && screen.contains("retained end")
+        });
+        let screen = astra.current_screen();
+        assert!(screen.contains("What happened?"), "{screen}");
+        assert!(
+            !screen
                 .lines()
-                .any(|line| line.contains('›') && line.contains("What happened?"))
-        },
-    );
+                .any(|line| line.contains('›') && line.contains("What happened?")),
+            "an old message must not become a new user turn: {screen}"
+        );
+        if next_turn {
+            mock.release_held_response();
+            astra.wait_for_screen("next turn completed", UI_TRANSITION_TIMEOUT, |screen| {
+                screen.matches("total ·").count() >= 2
+            });
+            astra.write(b"\x12");
+            astra.wait_for_screen("last user input", UI_TRANSITION_TIMEOUT, |screen| {
+                screen
+                    .lines()
+                    .rev()
+                    .find(|line| line.trim_start().starts_with('›'))
+                    .is_some_and(|line| line.contains("Start the next task."))
+            });
+        }
+    }
     assert!(
         received.try_recv().is_err(),
         "receipt lookup must not resend guidance"
     );
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("returned", false).await;
+    check_unknown_root_message("applied", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_root_receipt_is_visible_during_a_quiet_next_turn() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("applied", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

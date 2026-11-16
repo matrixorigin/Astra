@@ -288,10 +288,10 @@ impl BottomPaneView for TaskInputView {
         }
     }
 
-    fn root_guidance_check_failed(&mut self, intent_id: &str) {
+    fn root_guidance_check_notice(&mut self, intent_id: &str, message: Option<&str>) {
         if matches!(&self.purpose, InputPurpose::RootUnconfirmed { intent_id: id, .. } if id == intent_id)
         {
-            self.error = Some("Check failed. Alt+N next/check; no message resent.".into());
+            self.error = message.map(str::to_owned);
         }
     }
 

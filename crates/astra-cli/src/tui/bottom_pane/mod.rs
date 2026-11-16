@@ -1020,9 +1020,9 @@ impl BottomPane {
         }
     }
 
-    pub(crate) fn root_guidance_check_failed(&mut self, intent_id: &str) {
+    pub(crate) fn root_guidance_check_notice(&mut self, intent_id: &str, message: Option<&str>) {
         for view in &mut self.view_stack {
-            view.root_guidance_check_failed(intent_id);
+            view.root_guidance_check_notice(intent_id, message);
         }
     }
 

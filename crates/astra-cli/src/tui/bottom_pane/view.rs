@@ -281,7 +281,7 @@ pub(crate) trait BottomPaneView: Send {
 
     fn mark_root_guidance_received(&mut self, _intent_id: &str) {}
 
-    fn root_guidance_check_failed(&mut self, _intent_id: &str) {}
+    fn root_guidance_check_notice(&mut self, _intent_id: &str, _message: Option<&str>) {}
 
     fn refresh_agent_guide_recipient(
         &mut self,

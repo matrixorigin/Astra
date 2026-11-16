@@ -2516,8 +2516,51 @@ fn build_digest_with_owners(
         }
     }
 
-    // Candidate terminals do not contribute aggregate totals. Keep their
-    // diagnostic call facts and errors even when they cannot be attributed.
+    // Candidate terminals do not contribute aggregate totals. Summary keeps
+    // bounded terminal-level causes without copying per-call payloads.
+    if matches!(focus, DigestFocus::Summary) {
+        const MAX_CONFLICT_ERRORS: usize = 4;
+        let mut shown = 0;
+        let mut omitted = 0;
+        for event in &conflicting_terminals {
+            let Some(error) = event
+                .error
+                .as_ref()
+                .filter(|error| !error.trim().is_empty())
+            else {
+                continue;
+            };
+            if shown == MAX_CONFLICT_ERRORS {
+                omitted += 1;
+                continue;
+            }
+            other_errors.push(SideEvent {
+                ts: preview(Some(&event.ts), 32),
+                kind: "conflicting_terminal".into(),
+                turn: event.turn,
+                agentic_step: None,
+                producer_scope: None,
+                source: None,
+                detail: json!({
+                    "coverage": "conflicting terminal observation; not an aggregate total",
+                    "message": preview(Some(error), 160),
+                }),
+            });
+            shown += 1;
+        }
+        if omitted > 0 {
+            other_errors.push(SideEvent {
+                ts: String::new(),
+                kind: "conflicting_terminal_errors_omitted".into(),
+                turn: None,
+                agentic_step: None,
+                producer_scope: None,
+                source: None,
+                detail: json!({"omitted": omitted}),
+            });
+        }
+    }
+    // Full focus retains per-call facts even when they cannot be attributed.
     for event in conflicting_terminals
         .iter()
         .filter(|_| matches!(focus, DigestFocus::All))
