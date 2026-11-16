@@ -169,6 +169,9 @@ pub(crate) struct PendingUserIntent {
     /// Model-facing text when a local command needs a different wire form.
     /// The original text remains available for explicit user recovery.
     pub(crate) wire_text: Option<String>,
+    /// Unsent edits to a message whose delivery is still uncertain. They
+    /// inherit the original message's owner/session scope.
+    pub(crate) recovery_draft: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
     /// Physical turn that owns an active-run submission. Child messages keep
     /// their own captured target and do not use this field.
@@ -260,7 +263,7 @@ impl RootIntentScope {
             .map(|_| RootIntentRecheck(self.clone()))
     }
 
-    fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+    pub(crate) fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
         if !self.owner.can_view_local_draft() {
             return false;
         }
@@ -268,6 +271,10 @@ impl RootIntentScope {
             Some(bound) => session_id == Some(bound),
             None => session_id.is_none() && epoch == self.attachment_epoch,
         }
+    }
+
+    pub(crate) fn owner_can_view(&self) -> bool {
+        self.owner.can_view_local_draft()
     }
 
     fn returned_unbound_visible_in(&self, session_id: Option<&str>) -> bool {
@@ -328,15 +335,16 @@ impl PendingUserIntent {
     }
 
     pub(crate) fn composer_text(&self) -> std::borrow::Cow<'_, str> {
-        self.composer_text_for(&self.text)
-    }
-
-    pub(crate) fn composer_text_for<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        let text = self.recovery_text();
         if self.wire_text.is_some() {
             std::borrow::Cow::Borrowed(text)
         } else {
             super::slash_dispatch::conversation_for_composer(text)
         }
+    }
+
+    pub(crate) fn recovery_text(&self) -> &str {
+        self.recovery_draft.as_deref().unwrap_or(&self.text)
     }
 
     pub(crate) fn delivery_is_unconfirmed(&self) -> bool {
@@ -455,7 +463,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             TaskStatus::WaitingModel => {
                 "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
-            TaskStatus::Cancelling => "Stopping · unused messages return to your input".to_string(),
+            TaskStatus::Cancelling => "Stopping · checking message delivery".to_string(),
             TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
             TaskStatus::Idle => "Checking whether your message was used".to_string(),
             TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
@@ -466,7 +474,11 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             "Message added to the conversation".to_string()
         }
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Returned) => {
-            "Message returned to your input".to_string()
+            if intent.recovery_draft.is_some() {
+                "Unsent edit · Alt+U to restore".to_string()
+            } else {
+                "Unsent message · Alt+U to restore".to_string()
+            }
         }
     }
 }
@@ -507,7 +519,27 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        let drafts: Vec<_> = self
+            .view_stack
+            .iter_mut()
+            .filter_map(|view| {
+                (!view.visible_in_attachment(session_id, epoch))
+                    .then(|| view.root_recovery_draft_on_close())
+                    .flatten()
+            })
+            .collect();
+        for (id, draft) in drafts {
+            self.save_root_recovery_draft(&id, draft);
+        }
+        self.view_stack
+            .retain(|view| view.visible_in_attachment(session_id, epoch));
         self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    pub(crate) fn root_scope_visible(&self, scope: &RootIntentScope) -> bool {
+        self.session_attachment
+            .as_ref()
+            .is_some_and(|(session_id, epoch)| scope.visible_in(session_id.as_deref(), *epoch))
     }
 
     pub(crate) fn set_root_intent_scope(&mut self, scope: Arc<RootIntentScope>) {
@@ -579,7 +611,7 @@ impl BottomPane {
     pub(crate) fn take_open_root_recovery_draft(&mut self, intent_id: &str) -> Option<String> {
         let (index, draft) =
             self.view_stack
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .rev()
                 .find_map(|(index, view)| {
@@ -588,6 +620,28 @@ impl BottomPane {
                 })?;
         self.view_stack.remove(index);
         Some(draft)
+    }
+
+    pub(crate) fn save_root_recovery_draft(&mut self, intent_id: &str, draft: String) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+        }) {
+            intent.recovery_draft = (draft != intent.text).then_some(draft);
+        }
+    }
+
+    pub(crate) fn keep_returned_root_edit(&mut self, original: &PendingUserIntent, draft: String) {
+        if draft == original.text || draft.trim().is_empty() {
+            return;
+        }
+        let mut unsent = original.clone();
+        // The original identity is already applied. The edit is a new,
+        // local-only draft and must never be reconciled as that old intent.
+        unsent.intent_id = uuid::Uuid::new_v4().to_string();
+        unsent.recovery_draft = Some(draft);
+        unsent.turn_id = None;
+        self.retain_returned_root_guidance(unsent);
     }
 
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
@@ -845,7 +899,11 @@ impl BottomPane {
                 .pending_user_intents
                 .iter()
                 .filter(counts_toward_limit)
-                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
+                .map(|intent| {
+                    intent.text.len()
+                        + intent.wire_text.as_ref().map_or(0, String::len)
+                        + intent.recovery_draft.as_ref().map_or(0, String::len)
+                })
                 .sum::<usize>()
                 .saturating_add(text.len())
                 .saturating_add(wire_text.as_ref().map_or(0, String::len))
@@ -867,6 +925,7 @@ impl BottomPane {
             status,
             text,
             wire_text,
+            recovery_draft: None,
             target,
             turn_id,
             next_turn_position: self.queued_next_turn_submissions.len(),
@@ -1272,6 +1331,7 @@ impl BottomPane {
             status,
             text: runtime_content.to_string(),
             wire_text: None,
+            recovery_draft: None,
             target,
             turn_id: None,
             next_turn_position: 0,
@@ -1322,11 +1382,18 @@ impl BottomPane {
         }) else {
             return false;
         };
+        if let Some(draft) = self.take_open_root_recovery_draft(intent_id) {
+            self.save_root_recovery_draft(intent_id, draft);
+        }
         if returned {
             self.pending_user_intents[index].status = astra_turn_types::UserIntentStatus::Returned;
             self.pending_user_intents[index].custody = PendingUserIntentCustody::Run;
         } else {
-            self.pending_user_intents.remove(index);
+            if let Some(original) = self.pending_user_intents.remove(index)
+                && let Some(draft) = original.recovery_draft.clone()
+            {
+                self.keep_returned_root_edit(&original, draft);
+            }
             self.applied_user_intent_ids.insert(intent_id.to_owned());
         }
         true
@@ -1356,26 +1423,11 @@ impl BottomPane {
     }
 
     pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
-        self.recover_returned_root_guidance_by_id(None)
-    }
-
-    pub(crate) fn recover_returned_root_guidance_by_id(&mut self, intent_id: Option<&str>) -> bool {
-        let Some(id) = self
-            .visible_pending_intents()
-            .find(|intent| {
-                matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-                    && intent.status == astra_turn_types::UserIntentStatus::Returned
-                    && intent_id.is_none_or(|id| intent.intent_id == id)
-            })
-            .map(|intent| intent.intent_id.clone())
-        else {
-            return false;
-        };
-        let Some(index) = self
-            .pending_user_intents
-            .iter()
-            .position(|intent| intent.intent_id == id)
-        else {
+        let Some(index) = self.pending_user_intents.iter().position(|intent| {
+            self.intent_is_visible(intent)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.status == astra_turn_types::UserIntentStatus::Returned
+        }) else {
             return false;
         };
         let Some(intent) = self.pending_user_intents.remove(index) else {
@@ -2276,7 +2328,14 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.pop()?;
+        self.pop_active_view_with_draft(true)
+    }
+
+    fn pop_active_view_with_draft(&mut self, keep_draft: bool) -> Option<Box<dyn BottomPaneView>> {
+        let mut view = self.view_stack.pop()?;
+        if keep_draft && let Some((id, draft)) = view.root_recovery_draft_on_close() {
+            self.save_root_recovery_draft(&id, draft);
+        }
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2741,6 +2800,11 @@ impl BottomPane {
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
+            return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
+                after_cell_id: None,
+            });
+        }
         if key.code == KeyCode::Char('u') && key.modifiers == KeyModifiers::ALT {
             if self.visible_pending_intents().any(|intent| {
                 intent.status == astra_turn_types::UserIntentStatus::Returned
@@ -2948,7 +3012,11 @@ impl BottomPane {
         view.handle_key(key);
         if let Some(request) = view.take_action_request() {
             if request.disposition == ViewActionDisposition::Close {
-                self.pop_active_view();
+                let keep_draft = !matches!(
+                    request.action,
+                    BottomPaneViewAction::DismissUnconfirmedRootGuidance { .. }
+                );
+                self.pop_active_view_with_draft(keep_draft);
             }
             return Some(BottomPaneAction::ViewAction(request.action));
         }
@@ -3428,7 +3496,7 @@ impl BottomPane {
             0
         };
         let title = if self.interrupt_pending {
-            "Stopping · unapplied guidance returns to composer".to_string()
+            "Stopping · checking message delivery".to_string()
         } else {
             pending_user_intent_title(head, &self.task_status)
         };
@@ -3472,12 +3540,22 @@ impl BottomPane {
                     astra_turn_types::UserIntentStatus::AcceptedLocal => "waiting",
                     astra_turn_types::UserIntentStatus::AcceptedRemote => "received",
                     astra_turn_types::UserIntentStatus::Applied => "applied",
+                    astra_turn_types::UserIntentStatus::Returned
+                        if pending.recovery_draft.is_some() =>
+                    {
+                        "unsent edit"
+                    }
                     astra_turn_types::UserIntentStatus::Returned => "returned",
                 }
             };
             let prefix = format!("{}  {status} · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let preview = deferred_followup_preview(&pending.text, budget);
+            let text = if pending.status == astra_turn_types::UserIntentStatus::Returned {
+                pending.recovery_text()
+            } else {
+                &pending.text
+            };
+            let preview = deferred_followup_preview(text, budget);
             let line = format!("{prefix}{preview}");
             let style = if idx == 0 { head_style } else { tail_style };
             Widget::render(

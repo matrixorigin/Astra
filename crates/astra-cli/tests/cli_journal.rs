@@ -2063,7 +2063,7 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
         .map(|n| {
             json!({"name":"bash","ok":false,"ms":1,
         "disposition":"executed","tool_call_id":format!("call-{n}"),
-        "error":"SECRET_MARKER tool result that belongs in full detail"})
+        "error":"permission denied", "args_preview":"SECRET_MARKER tool arguments"})
         })
         .collect();
     let first = json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
@@ -2098,6 +2098,12 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
                 .any(|cause| cause["detail"]["message"] == expected)
         );
     }
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "observed_tool_error" && cause["detail"]["message"] == "permission denied"
+    }));
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "tool_error_observations_omitted" && cause["detail"]["omitted"] == 127
+    }));
     assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
     assert!(
         summary.stdout.len() < 16_000,
@@ -2158,4 +2164,155 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
         assert!(cause["detail"]["message"].as_str().unwrap().chars().count() <= 160);
         assert!(cause["detail"].get("tool_calls").is_none());
     }
+
+    // Conflicting terminals need not contain an error: the tool observation
+    // may be the only retained reason, including when its top-level error is
+    // absent but the call itself has one.
+    let call = json!({"name":"bash","ok":false,"ms":1,"disposition":"executed",
+        "tool_call_id":"call-1","error":"permission denied opening report",
+        "args_preview":"SECRET_MARKER arguments",
+        "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"run",
+            "turn_chain_id":"chain","invocation_id":"call-1"}});
+    let terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tokens_in":100,"tool_calls":[call]});
+    let mut conflicting = terminal.clone();
+    conflicting["ts"] = json!("t3");
+    conflicting["tokens_in"] = json!(200);
+    for top_level in [true, false] {
+        let mut error = json!({"type":"tool_call_error","ts":"t1","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tool_calls":[call]});
+        if top_level {
+            error["error"] = json!("permission denied opening report");
+        }
+        std::fs::write(&path, format!("{error}\n{terminal}\n{conflicting}\n")).unwrap();
+        let summary = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(summary.status.success(), "{summary:?}");
+        let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+        assert_eq!(value["conflicting_terminal_count"], 1);
+        assert!(
+            value["other_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| {
+                    cause["kind"] == "observed_tool_error"
+                        && cause["detail"]["run_id_preview"] == "run"
+                        && cause["detail"]["message"] == "permission denied opening report"
+                })
+        );
+        assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+    }
+
+    // Ordinary attempts use the same bound; otherwise a long journal still
+    // turns a summary into an unbounded per-call report.
+    let errors = (0..8)
+        .map(|n| {
+            json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"error":format!("failure {n}")})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{errors}{terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|e| e["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 4)
+    );
+    assert!(causes.iter().any(|e| e["detail"]["message"] == "failure 7"));
+    assert!(!causes.iter().any(|e| e["detail"]["message"] == "failure 0"));
+
+    // A repeated recent error must refresh its position and timestamp instead
+    // of being evicted as though its only observation were the old one.
+    let repeated = ["a", "b", "c", "d", "a", "e"]
+        .into_iter()
+        .enumerate()
+        .map(|(n, error)| {
+            json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+                "producer_scope":{"run_id":"run"},"error":error})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{repeated}{terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["detail"]["message"] == "a" && e["ts"] == "t4")
+    );
+    assert!(!causes.iter().any(|e| e["detail"]["message"] == "b"));
+
+    // Distinct reasons sharing a truncated prefix must not be treated as the
+    // same observation. Missing reasons remain explicitly unavailable.
+    let long = "界".repeat(200);
+    let errors = [
+        Some(format!("{long}a")),
+        Some(format!("{long}b")),
+        Some(format!("{long}a")),
+        Some(format!(" {} ", "x".repeat(160))),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(n, error)| {
+        json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "metadata":{"run_id":"run"},"error":error})
+    })
+    .map(|event| format!("{event}\n"))
+    .collect::<String>();
+    std::fs::write(&path, format!("{errors}{terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    let observed: Vec<_> = causes
+        .iter()
+        .filter(|e| e["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 4);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["detail"]["message_truncated"] == true)
+            .count(),
+        2
+    );
+    assert!(observed.iter().any(|e| e["detail"]["message"].is_null()));
+    assert!(observed.iter().any(|e| {
+        e["detail"]["message"] == "x".repeat(160) && e["detail"]["message_truncated"] == false
+    }));
+    assert!(
+        observed
+            .iter()
+            .all(|e| e["detail"]["run_id_preview"] == "run")
+    );
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 1)
+    );
 }

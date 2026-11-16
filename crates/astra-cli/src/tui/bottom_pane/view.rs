@@ -167,6 +167,12 @@ pub(crate) enum BottomPaneViewAction {
     },
     RecoverReturnedRootGuidance,
     OpenUnconfirmedRootGuidance,
+    OpenAppliedRootGuidance {
+        after_cell_id: Option<u64>,
+    },
+    CopyAppliedRootGuidance {
+        cell_id: u64,
+    },
     CopyUnconfirmedRootGuidance {
         intent_id: String,
         text: String,
@@ -270,12 +276,20 @@ pub(crate) trait BottomPaneView: Send {
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
 
+    fn visible_in_attachment(&self, _session_id: Option<&str>, _epoch: u64) -> bool {
+        true
+    }
+
     fn is_recoverable_guidance(&self, _intent: &super::PendingUserIntent) -> bool {
         false
     }
 
     /// Preserve edits made while an unknown main-message receipt is checked.
-    fn root_recovery_draft(&self, _intent_id: &str) -> Option<String> {
+    fn root_recovery_draft(&mut self, _intent_id: &str) -> Option<String> {
+        None
+    }
+
+    fn root_recovery_draft_on_close(&mut self) -> Option<(String, String)> {
         None
     }
 

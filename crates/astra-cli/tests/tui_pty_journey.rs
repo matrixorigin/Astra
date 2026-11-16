@@ -1794,7 +1794,11 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
     }
     mock.release_held_binding();
     let message = if disposition == "applied" {
-        format!("What happened? {} retained end", "details-".repeat(24))
+        if next_turn {
+            format!("What happened?\n{}retained end", "line\n".repeat(2_000))
+        } else {
+            format!("What happened? {} retained end", "details-".repeat(24))
+        }
     } else {
         "What happened?".into()
     };
@@ -1833,6 +1837,8 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
     assert_eq!(run, "mock-run-agent-root");
     assert_eq!(intent, first["intent_id"].as_str().unwrap());
     if disposition == "returned" {
+        astra.wait_for("Earlier message was not used", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1bu");
         astra.wait_for_screen(
             "returned message in composer",
             UI_TRANSITION_TIMEOUT,
@@ -1844,10 +1850,10 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
         );
     } else {
         // For a quiet next turn this must appear before its stream is released.
-        astra.wait_for_screen("full earlier message", UI_TRANSITION_TIMEOUT, |screen| {
-            screen.contains("Earlier message applied to its original task:")
-                && screen.contains("retained end")
-        });
+        astra.wait_for(
+            "Earlier message applied to its original task:",
+            UI_TRANSITION_TIMEOUT,
+        );
         let screen = astra.current_screen();
         assert!(screen.contains("What happened?"), "{screen}");
         assert!(
@@ -1870,6 +1876,14 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
                     .is_some_and(|line| line.contains("Start the next task."))
             });
         }
+        astra.write(b"\x1br");
+        astra.wait_for_screen("earlier message start", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Earlier message") && screen.contains("What happened?")
+        });
+        astra.write(b"\x1b[F");
+        astra.wait_for_screen("earlier message end", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Earlier message") && screen.contains("retained end")
+        });
     }
     assert!(
         received.try_recv().is_err(),

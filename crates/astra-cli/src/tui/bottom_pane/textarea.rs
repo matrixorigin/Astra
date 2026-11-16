@@ -68,17 +68,26 @@ impl TextArea {
     }
 
     pub fn take_text(&mut self) -> String {
-        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
-            self.insert_str(&pending);
-        }
+        self.flush_pending_paste();
         let text = std::mem::take(&mut self.text);
         self.set_text("");
         text
     }
 
+    pub(super) fn flush_pending_paste(&mut self) {
+        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
+            self.insert_str(&pending);
+        }
+    }
+
     /// Current cursor byte offset within `text()`.
     pub fn cursor_byte(&self) -> usize {
         self.cursor_pos
+    }
+
+    pub(super) fn move_to_document_boundary(&mut self, end: bool) {
+        self.cursor_pos = if end { self.text.len() } else { 0 };
+        self.preferred_col = None;
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {

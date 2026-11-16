@@ -1906,6 +1906,12 @@ fn build_digest_with_owners(
     let mut interruptions = Vec::new();
     let mut turn_errors = Vec::new();
     let mut other_errors = conflicting_round_requests;
+    // Summary keeps a bounded set of tool error observations across both
+    // ordinary and conflicting attempts. Full focus keeps the raw events.
+    const MAX_SUMMARY_TOOL_ERRORS: usize = 4;
+    let mut summary_tool_errors: Vec<SideEvent> = Vec::new();
+    let mut summary_tool_error_keys: Vec<(Option<u32>, Option<&str>, Option<&str>)> = Vec::new();
+    let mut omitted_tool_error_observations = 0usize;
 
     let source_incomplete = journal_lines_malformed > 0
         || conflicting_round_count > 0
@@ -2421,12 +2427,7 @@ fn build_digest_with_owners(
                 });
             }
             JournalEventType::ToolCallError => {
-                let conflicting_attempt = ev
-                    .turn
-                    .zip(producer_run_id(ev))
-                    .and_then(|attempt| root_attempts.get(&attempt))
-                    .is_some_and(Option::is_none);
-                if !conflicting_attempt || matches!(focus, DigestFocus::All) {
+                if matches!(focus, DigestFocus::All) {
                     other_errors.push(SideEvent {
                         ts: ev.ts.clone(),
                         kind: "observed_tool_error".to_owned(),
@@ -2439,6 +2440,50 @@ fn build_digest_with_owners(
                             "tools": ev.tools_used,
                             "dispositions": ev.tool_calls.iter().flatten()
                                 .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
+                        }),
+                    });
+                } else {
+                    let error = ev
+                        .error
+                        .as_ref()
+                        .filter(|error| !error.trim().is_empty())
+                        .or_else(|| {
+                            ev.tool_calls
+                                .iter()
+                                .flatten()
+                                .filter(|call| is_effective_failure(call))
+                                .find_map(|call| {
+                                    call.error.as_ref().filter(|error| !error.trim().is_empty())
+                                })
+                        });
+                    let run = producer_run_id(ev);
+                    let key = (ev.turn, run, error.map(String::as_str));
+                    if let Some(index) = run.and_then(|_| {
+                        summary_tool_error_keys
+                            .iter()
+                            .position(|saved| *saved == key)
+                    }) {
+                        summary_tool_errors.remove(index);
+                        summary_tool_error_keys.remove(index);
+                        omitted_tool_error_observations += 1;
+                    } else if summary_tool_errors.len() == MAX_SUMMARY_TOOL_ERRORS {
+                        summary_tool_errors.remove(0);
+                        summary_tool_error_keys.remove(0);
+                        omitted_tool_error_observations += 1;
+                    }
+                    summary_tool_error_keys.push(key);
+                    summary_tool_errors.push(SideEvent {
+                        ts: preview(Some(&ev.ts), 32),
+                        kind: "observed_tool_error".to_owned(),
+                        turn: ev.turn,
+                        agentic_step: ev.agentic_step,
+                        producer_scope: None,
+                        source: None,
+                        detail: json!({
+                            "message": error.map(|error| preview(Some(error), 160)),
+                            "message_truncated": error.is_some_and(|error| error.trim().chars().nth(160).is_some()),
+                            "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
+                            "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
                         }),
                     });
                 }
@@ -2515,6 +2560,19 @@ fn build_digest_with_owners(
             _ => {}
         }
     }
+
+    if omitted_tool_error_observations > 0 {
+        summary_tool_errors.push(SideEvent {
+            ts: String::new(),
+            kind: "tool_error_observations_omitted".to_owned(),
+            turn: None,
+            agentic_step: None,
+            producer_scope: None,
+            source: None,
+            detail: json!({"omitted": omitted_tool_error_observations}),
+        });
+    }
+    other_errors.extend(summary_tool_errors);
 
     // Candidate terminals do not contribute aggregate totals. Summary keeps
     // bounded terminal-level causes without copying per-call payloads.

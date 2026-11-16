@@ -3083,6 +3083,13 @@ impl ChatWidget {
         self.commit_cell(Box::new(cell));
     }
 
+    pub(crate) fn commit_recovered_guidance(
+        &mut self,
+        cell: super::history_cell::recovered_guidance::RecoveredGuidanceCell,
+    ) {
+        self.commit_cell(Box::new(cell));
+    }
+
     /// Claim a parent-directed communication receipt before projecting it
     /// into the parent transcript. The same logical message may arrive first
     /// from a local child stream and later from a durable observer; both

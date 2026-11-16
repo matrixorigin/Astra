@@ -4876,14 +4876,14 @@ fn settle_open_root_recovery(
     intent: &bottom_pane::PendingUserIntent,
     returned: bool,
 ) {
-    if let Some(draft) = bottom_pane.take_open_root_recovery_draft(&intent.intent_id) {
-        if returned && !draft.trim().is_empty() {
-            bottom_pane.recover_returned_root_guidance_by_id(Some(&intent.intent_id));
-            if draft != intent.text {
-                bottom_pane.replace_composer_text(&intent.composer_text_for(&draft));
-            }
-        } else if !returned && draft != intent.text && !draft.trim().is_empty() {
-            bottom_pane.start_composer_draft(&intent.composer_text_for(&draft));
+    let draft = bottom_pane
+        .take_open_root_recovery_draft(&intent.intent_id)
+        .or_else(|| intent.recovery_draft.clone());
+    if let Some(draft) = draft {
+        if returned {
+            bottom_pane.save_root_recovery_draft(&intent.intent_id, draft);
+        } else {
+            bottom_pane.keep_returned_root_edit(intent, draft);
         }
     }
 }
@@ -6121,19 +6121,21 @@ fn drain_agent_workbench_outcomes(
                     continue;
                 }
                 settle_open_root_recovery(bottom_pane, &intent, returned);
-                let message = if returned {
-                    format!(
-                        "Earlier message was not used and is available for editing:\n{}",
-                        intent.text
-                    )
+                if returned {
+                    let preview = history_cell::recovered_guidance::guidance_preview(&intent.text);
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                        format!(
+                            "Earlier message was not used: {preview} · Alt+U restores unsent messages"
+                        ),
+                    ));
                 } else {
-                    format!(
-                        "Earlier message applied to its original task:\n{}",
-                        intent.text
-                    )
-                };
-                chat_widget
-                    .commit_concurrent_system(history_cell::system::SystemCell::info(message));
+                    chat_widget.commit_recovered_guidance(
+                        history_cell::recovered_guidance::RecoveredGuidanceCell::new(
+                            scope,
+                            intent.text,
+                        ),
+                    );
+                }
             }
             AgentWorkbenchOutcome::TranscriptUpdate(update) => {
                 if !bottom_pane.refresh_agent_transcript(update) {
@@ -6335,8 +6337,9 @@ fn open_recoverable_guidance(
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
                         intent.intent_id.clone(),
-                        &intent.text,
+                        intent.recovery_text(),
                         intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote,
+                        intent.root_scope(),
                     ),
                 ));
             }
@@ -8293,6 +8296,68 @@ async fn dispatch_bottom_pane_view_action(
         BottomPaneViewAction::OpenUnconfirmedRootGuidance => {
             if let Some(intent) = bottom_pane.unconfirmed_root_guidance(None).cloned() {
                 open_recoverable_guidance(intent, &backends, bottom_pane);
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::OpenAppliedRootGuidance { after_cell_id } => {
+            let receipts: Vec<_> = chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    let receipt = cell
+                        .as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>(
+                    )?;
+                    bottom_pane
+                        .root_scope_visible(&receipt.scope)
+                        .then_some((chat_widget.history_cell_id(index), receipt))
+                })
+                .collect();
+            if !receipts.is_empty() {
+                let next = after_cell_id
+                    .and_then(|id| receipts.iter().position(|(cell_id, _)| *cell_id == id))
+                    .map_or(receipts.len() - 1, |index| (index + 1) % receipts.len());
+                let (cell_id, receipt) = receipts[next];
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::applied_root(
+                        cell_id,
+                        receipt.scope.clone(),
+                        &receipt.text,
+                    ),
+                ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyAppliedRootGuidance { cell_id } => {
+            if let Some(receipt) = chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .find_map(|(index, cell)| {
+                    if chat_widget.history_cell_id(index) != cell_id {
+                        return None;
+                    }
+                    cell.as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>()
+                })
+                .filter(|receipt| bottom_pane.root_scope_visible(&receipt.scope))
+            {
+                let text = receipt.text.clone();
+                let scope = receipt.scope.clone();
+                let outcome_tx = backends.agent_workbench_tx.clone();
+                tokio::spawn(async move {
+                    if !scope.owner_can_view() {
+                        return;
+                    }
+                    let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
+                    let _ = outcome_tx
+                        .send(AgentWorkbenchOutcome::Clipboard {
+                            success_message: "Message copied".into(),
+                            result,
+                        })
+                        .await;
+                });
             }
             frame_requester.schedule_frame();
         }
@@ -17662,9 +17727,50 @@ mod tests {
         assert!(!owner_a.is_current());
         assert!(owner_a.can_view_local_draft());
         assert!(scope.recovery_context().is_some());
+        for (id, returned) in [("detached-applied", false), ("detached-returned", true)] {
+            pane.accept_turn_user_intent("turn", id.into(), "private".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed(id));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    id.into(),
+                    "private",
+                    false,
+                    Some(scope.clone()),
+                ),
+            ));
+            pane.handle_paste(" edited");
+            assert!(pane.settle_detached_root_intent(id, returned));
+            assert!(pane.composer.is_empty());
+        }
         pane.set_session_attachment(Some("session"), 2);
+        for _ in 0..2 {
+            assert!(pane.recover_returned_root_guidance());
+            assert_eq!(pane.composer.text(), "private edited");
+            pane.replace_composer_text("");
+        }
         assert!(pane.unconfirmed_root_guidance(Some("root")).is_some());
         assert!(!pane.root_intent_is_visible("root"));
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                "root".into(),
+                "root private",
+                false,
+                Some(scope.clone()),
+            ),
+        ));
+        pane.handle_paste(" edited");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(pane.composer.is_empty());
+        assert_eq!(
+            pane.unconfirmed_root_guidance(Some("root"))
+                .unwrap()
+                .recovery_text(),
+            "root private edited"
+        );
         assert!(old_child.can_view_draft(Some("session"), 2));
         assert!(!old_child.is_attached(Some("session"), 2));
         let new_child = AgentGuideTarget::capture(
@@ -17689,6 +17795,7 @@ mod tests {
         )
         .unwrap();
         assert!(pane.unconfirmed_root_guidance(Some("root")).is_none());
+        assert!(pane.composer.is_empty());
         assert!(scope.recovery_context().is_none());
         assert!(!old_child.can_view_draft(Some("session"), 2));
     }
@@ -24272,6 +24379,195 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[test]
+    fn closing_unknown_root_recovery_keeps_only_explicit_edits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-close-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-close-owner"),
+        )
+        .unwrap();
+
+        for (key, should_keep) in [
+            (KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            (
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                true,
+            ),
+            (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT), false),
+        ] {
+            let scope = root_recovery_scope(Some("run"));
+            let mut pane = root_recovery_pane(scope.clone(), "original", false);
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    "guide".into(),
+                    "original",
+                    false,
+                    Some(scope),
+                ),
+            ));
+            pane.handle_paste(" edited");
+            let _ = pane.handle_key(key);
+            assert!(pane.composer.is_empty());
+            assert_eq!(
+                pane.unconfirmed_root_guidance(Some("guide"))
+                    .unwrap()
+                    .recovery_text(),
+                if should_keep {
+                    "original edited"
+                } else {
+                    "original"
+                }
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn root_recovery_edits_stay_scoped_through_detached_settlement() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-scope-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-scope-owner"),
+        )
+        .unwrap();
+        for close_first in [false, true] {
+            for returned in [false, true] {
+                let scope = root_recovery_scope(Some("run"));
+                let mut pane = root_recovery_pane(scope.clone(), "original", false);
+                pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        "guide".into(),
+                        "original",
+                        false,
+                        Some(scope),
+                    ),
+                ));
+                pane.handle_paste(" edited");
+                if close_first {
+                    pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                pane.set_session_attachment(Some("other"), 4);
+                assert!(pane.composer.is_empty());
+                assert!(!pane.has_active_view());
+                assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+                assert!(pane.settle_detached_root_intent("guide", returned));
+                if !returned {
+                    assert!(!pane.settle_detached_root_intent("guide", false));
+                }
+                assert!(!pane.recover_returned_root_guidance());
+                pane.set_session_attachment(Some("session"), 5);
+                assert!(pane.recover_returned_root_guidance());
+                assert_eq!(pane.composer.text(), "original edited");
+                assert!(!pane.recover_returned_root_guidance());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn root_recovery_keeps_cleared_draft_and_counts_edits_toward_budget() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-budget-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-budget-owner"),
+        )
+        .unwrap();
+        let scope = root_recovery_scope(Some("run"));
+        let mut pane = root_recovery_pane(scope.clone(), "original", false);
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                "guide".into(),
+                "original",
+                false,
+                Some(scope.clone()),
+            ),
+        ));
+        pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            pane.unconfirmed_root_guidance(Some("guide"))
+                .unwrap()
+                .recovery_draft
+                .as_deref(),
+            Some("")
+        );
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                "guide".into(),
+                "",
+                false,
+                Some(scope),
+            ),
+        ));
+        pane.handle_paste(&"x".repeat(1024 * 1024));
+        pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            pane.unconfirmed_root_guidance(Some("guide"))
+                .unwrap()
+                .recovery_text()
+                .len(),
+            1024 * 1024
+        );
+        assert_eq!(
+            pane.accept_turn_user_intent("turn", "later".into(), "next".into()),
+            Err(bottom_pane::UserIntentRejectReason::QueueFull)
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn applied_root_receipt_is_read_only_and_fenced_to_owner_and_session() {
+        use crate::tui::bottom_pane::view::BottomPaneView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-receipt-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-owner"),
+        )
+        .unwrap();
+        let scope = root_recovery_scope(Some("run"));
+        let mut view =
+            bottom_pane::task_input_view::TaskInputView::applied_root(7, scope, "first\nlast");
+        assert!(view.visible_in_attachment(Some("session"), 3));
+        assert!(!view.visible_in_attachment(Some("other"), 3));
+        view.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(view.handle_paste("unwanted"));
+        view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(matches!(
+            view.take_action_request(),
+            Some(bottom_pane::view::ViewActionRequest {
+                action: BottomPaneViewAction::CopyAppliedRootGuidance { cell_id: 7 },
+                ..
+            })
+        ));
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
+                after_cell_id: None
+            })
+        ));
+        pane.push_view(Box::new(view));
+        let visible = render_bottom_pane_text(&pane, 80, 15);
+        assert!(
+            visible.contains("first") && visible.contains("last"),
+            "{visible}"
+        );
+        assert!(!visible.contains("unwanted"), "{visible}");
+        pane.set_session_attachment(Some("other"), 4);
+        assert!(!pane.has_active_view());
+    }
+
+    #[serial_test::serial]
     #[tokio::test]
     async fn resolved_root_recovery_preserves_literal_and_command_drafts() {
         let _credentials = crate::tests::isolate_credentials();
@@ -24318,6 +24614,8 @@ mod tests {
                 };
                 let mut widget = chat_widget::ChatWidget::new("session");
                 apply_tui_control_event(&event, &mut pane, &mut widget, 3);
+                assert!(pane.composer.is_empty());
+                assert!(pane.recover_returned_root_guidance());
                 assert_eq!(pane.composer.text(), expected);
             }
         }
@@ -24380,6 +24678,8 @@ mod tests {
                 &FrameRequester::test_dummy(),
             );
             assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+            assert!(pane.composer.is_empty());
+            assert!(pane.recover_returned_root_guidance());
             assert_eq!(
                 pane.composer.text(),
                 if plan {
@@ -24428,6 +24728,7 @@ mod tests {
                     "other".into(),
                     "second message",
                     false,
+                    Some(scope.clone()),
                 ),
             ));
             pane.handle_paste(" edited");
@@ -24455,11 +24756,16 @@ mod tests {
             assert!(transcript.contains(label), "{transcript}");
             assert!(transcript.contains("first message"), "{transcript}");
             assert!(!transcript.contains("second message"), "{transcript}");
-            assert!(widget.history().iter().any(|cell| {
-                cell.as_any_ref()
-                    .downcast_ref::<history_cell::system::SystemCell>()
-                    .is_some_and(|notice| notice.message().contains(&original))
-            }));
+            if status == astra_turn_types::UserIntentStatus::Applied {
+                assert!(widget.history().iter().any(|cell| {
+                    cell.as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>()
+                        .is_some_and(|receipt| receipt.text == original)
+                }));
+            } else {
+                assert!(pane.recover_returned_root_guidance());
+                assert_eq!(pane.composer.text(), original);
+            }
             assert!(widget.last_user_text().is_none());
             assert!(pane.unconfirmed_root_guidance(Some("other")).is_some());
             assert!(render_bottom_pane_text(&pane, 100, 20).contains("second message edited"));
@@ -24780,6 +25086,8 @@ mod tests {
             &FrameRequester::test_dummy(),
         );
         assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+        assert!(pane.composer.is_empty());
+        assert!(pane.recover_returned_root_guidance());
         assert_eq!(pane.composer.text(), "draft edited");
         backends
             .agent_workbench_tx

@@ -96,8 +96,11 @@ unresolved accepted messages receive one exact receipt lookup; a failed or
 still-pending lookup remains unconfirmed and is not resent.
 After the originating turn ends, opening an unknown main-conversation message
 can check its intent once when the original Run and session are known. A
-returned message becomes an editable draft; an applied receipt shows the
-original text as a status for its originating task, not a new user message. An
+returned message remains an account- and session-scoped draft until Alt+U
+restores it for editing; an applied receipt shows a short
+preview for its originating task, not a new user message. Alt+R opens the full
+local message for reading and copying while this session remains attached;
+the local receipt does not survive replacing the current session view. An
 accepted receipt confirms delivery but not use. A failed lookup preserves the
 last confirmed status, and checking never resends the message. The lookup adds
 no recurring or ordinary-turn query.
