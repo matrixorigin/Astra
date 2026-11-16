@@ -32,15 +32,34 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
     printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' |
         cc -x c - -o "${fixture_root}/target/debug/astra-edge"
+    "${fixture_root}/target/debug/astra-edge" 30 &
 else
-    cp /bin/sleep "${fixture_root}/target/debug/astra-edge"
+    # On multicall coreutils, a renamed copy of sleep dispatches by argv[0]
+    # and exits because "astra-edge" is not an applet. Python is already
+    # required by the repository validator and can run through a symlink while
+    # retaining the exact argv[0] that the ownership check inspects.
+    python_executable="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+    ln -s "$python_executable" "${fixture_root}/target/debug/astra-edge"
+    "${fixture_root}/target/debug/astra-edge" -I -S -c 'import time; time.sleep(30)' &
 fi
-"${fixture_root}/target/debug/astra-edge" 30 &
 owned_pid=$!
 /bin/sleep 30 &
 unrelated_pid=$!
 
-edge_process_is_owned "$fixture_root" "$owned_pid"
+# The child can still be between fork and exec on a busy runner.
+owned_ready=false
+for _ in {1..100}; do
+    if edge_process_is_owned "$fixture_root" "$owned_pid" 2>/dev/null; then
+        owned_ready=true
+        break
+    fi
+    kill -0 "$owned_pid" 2>/dev/null || break
+    /bin/sleep 0.02
+done
+if [ "$owned_ready" != true ]; then
+    echo "owned edge-process fixture did not start" >&2
+    exit 1
+fi
 if edge_process_is_owned "$fixture_root" "$unrelated_pid"; then
     echo "ownership check accepted an unrelated process" >&2
     exit 1
