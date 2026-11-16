@@ -18778,6 +18778,79 @@ mod tests {
     }
 
     #[test]
+    fn resumed_summaries_preserve_system_and_human_context_on_each_provider_wire() {
+        use crate::turn::prompt_cache::PromptCacheConfig;
+        use crate::turn::wire_assembly::{
+            PostCompactAttachments, assemble_llm_messages_with_cache_capability_output,
+        };
+        use astra_turn_core::cloud::history_summary::history_summary_message;
+        let human = json!({"role":"user","content":"Continue the authorized inspection."});
+        let summary_text = "Verified evidence: 路径与回执 preserved. artifact://00000000-0000-4000-8000-000000000000";
+        let summary = history_summary_message(summary_text.into());
+        let history = vec![summary.clone(), human.clone()];
+        for provider in ["openai", "anthropic", "bedrock"] {
+            let assemble = |history| {
+                let assembled = assemble_llm_messages_with_cache_capability_output(
+                    vec![json!({"role":"system","content":"Stable instruction contract."})],
+                    vec![],
+                    vec![],
+                    history,
+                    &PostCompactAttachments::default(),
+                    "summary-wire-session",
+                    provider,
+                    "model",
+                    &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    None,
+                    &PromptCacheConfig::latch(provider),
+                )
+                .unwrap();
+                let messages =
+                    consolidate_system_messages_for_provider(&assembled.messages, provider, None);
+                match provider {
+                    "anthropic" => build_anthropic_system_and_messages(&messages),
+                    "bedrock" => build_bedrock_messages(&messages, false),
+                    _ => {
+                        let (system, body): (Vec<_>, Vec<_>) = messages
+                            .into_iter()
+                            .partition(|message| message["role"] == "system");
+                        (system, body)
+                    }
+                }
+            };
+            let (before_system, _) = assemble(vec![human.clone()]);
+            let (system, messages) = assemble(history.clone());
+            assert_eq!(
+                system, before_system,
+                "{provider}: summary cannot perturb stable system"
+            );
+            assert_eq!(
+                messages[0]["role"], "user",
+                "{provider}: strict providers require a user first"
+            );
+            assert_eq!(messages[1]["role"], "assistant");
+            assert!(messages[1]["content"].to_string().contains(summary_text));
+            assert_eq!(messages.last().unwrap()["role"], "user");
+            assert!(
+                messages.last().unwrap()["content"]
+                    .to_string()
+                    .contains("Continue the authorized inspection.")
+            );
+        }
+        assert_eq!(
+            history,
+            [summary, human],
+            "wire-only context cannot alter canonical history"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| astra_turn_types::is_human_user_message(message))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn build_anthropic_system_and_messages_merges_consecutive_user_messages() {
         let messages = vec![
             json!({"role": "user", "content": "run tools"}),

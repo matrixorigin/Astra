@@ -1,14 +1,12 @@
+import { isOwnedRunFinishedEvent, isRunTerminalStatus } from "@astra/sdk";
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
 import { extractBlockedReason } from "@/lib/run-status-messages";
 import { WebApiError } from "@/lib/api/errors";
 
 type StreamEventLike = Record<string, unknown> & { type?: string };
 
-const RUN_FINISHED_STATUSES = ["completed", "failed", "cancelled", "paused", "interrupted", "delegated"];
-
 export function rootRunFinishedStatus(event: StreamEventLike, runId: string | undefined): string {
-  if (!runId || event.run_id !== runId || typeof event.status !== "string" ||
-    !RUN_FINISHED_STATUSES.includes(event.status)) {
+  if (!runId || !isOwnedRunFinishedEvent(event) || event.run_id !== runId) {
     throw new WebApiError(502, "Invalid root run completion.", "contract_violation");
   }
   return event.status;
@@ -23,6 +21,7 @@ export function resumeStreamProjection(state: StreamEventState) {
   state.runLifecycle = "running";
   state.lastStatus = "streaming";
   state.terminalStatus = undefined;
+  state.waitingFor = undefined;
 }
 
 export function isRunLifecycleEvent(type: string): boolean {
@@ -35,7 +34,7 @@ export function isForeignRunLifecycleEvent(
   rootRunId: string | null | undefined,
 ): boolean {
   return !!rootRunId && typeof event.type === "string" &&
-    isRunLifecycleEvent(event.type) && typeof event.run_id === "string" &&
+    (isRunLifecycleEvent(event.type) || event.type === "error") && typeof event.run_id === "string" &&
     !!event.run_id.trim() && event.run_id !== rootRunId;
 }
 
@@ -87,7 +86,7 @@ export type ChatStreamInitialization = {
   session_id: string;
   state: Pick<StreamEventState, "assistantRawText" | "assistantText" | "reasoningText" |
     "reasoningFromThinkingTags" | "lastStatus" | "runLifecycle" | "runId" |
-    "nextEventIndex" | "lastFailureMessage" | "errorCode" | "terminalStatus">;
+    "nextEventIndex" | "lastFailureMessage" | "errorCode" | "terminalStatus" | "waitingFor">;
 };
 
 export function isChatStreamInitialization(event: Record<string, unknown>): event is ChatStreamInitialization {
@@ -97,12 +96,11 @@ export function isChatStreamInitialization(event: Record<string, unknown>): even
     !s || typeof s !== "object" || Array.isArray(s)) return false;
   const state = s as Record<string, unknown>;
   return ["assistantRawText", "assistantText", "reasoningText"].every(key => typeof state[key] === "string") &&
-    ["runId", "lastFailureMessage", "errorCode"].every(key => state[key] === undefined || typeof state[key] === "string") &&
+    ["runId", "lastFailureMessage", "errorCode", "waitingFor"].every(key => state[key] === undefined || typeof state[key] === "string") &&
     (state.reasoningFromThinkingTags === undefined || typeof state.reasoningFromThinkingTags === "boolean") &&
     typeof state.lastStatus === "string" && ["streaming", "complete", "failed"].includes(state.lastStatus) &&
     typeof state.runLifecycle === "string" && ["running", "paused", "waiting", "blocked", "finished"].includes(state.runLifecycle) &&
-    (state.terminalStatus === undefined || typeof state.terminalStatus === "string" &&
-      RUN_FINISHED_STATUSES.includes(state.terminalStatus)) &&
+    (state.terminalStatus === undefined || isRunTerminalStatus(state.terminalStatus)) &&
     (state.nextEventIndex === undefined || typeof state.nextEventIndex === "number" &&
       Number.isSafeInteger(state.nextEventIndex) && state.nextEventIndex >= 0);
 }

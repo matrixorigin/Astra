@@ -1,3 +1,4 @@
+export { isWorkTurnEventType } from "./types";
 // @astra/sdk — Core exports (framework-agnostic)
 export type {
   // Stream events
@@ -9,6 +10,7 @@ export type {
   WorkTurnStartedEventV1,
   WorkTaskGraphChangedEventV1,
   WorkTurnStreamEvent,
+  KnownWorkTurnStreamEvent,
   ContextMetaEvent,
   RunStartedEvent,
   RunPausedEvent,
@@ -31,6 +33,10 @@ export type {
   ToolCallStartEvent,
   ToolCallEndEvent,
   UsageEvent,
+  ContextUsageEvent,
+  AgentCommunicationEvent,
+  WorkTaskBoardUpdateEvent,
+  WorkTaskBoardTaskV1,
   TurnCompleteEvent,
   StreamErrorEvent,
   WarningEvent,
@@ -513,6 +519,7 @@ export {
 } from "./paths";
 export {
   SSEClient,
+  isOwnedRunFinishedEvent, isRunTerminalStatus, requiresRunCompletionProjection, isRunFinalizationHint,
   parseSseDataEvents,
   readHttpErrorMessage,
 } from "./sse-client";

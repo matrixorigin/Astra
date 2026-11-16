@@ -4073,6 +4073,7 @@ mod tests {
                 ref run_id,
                 ref status,
                 ref error,
+                ..
             } if run_id.as_deref() == Some("r-y")
                 && status.as_deref() == Some("completed")
                 && error.is_none()
@@ -4844,6 +4845,7 @@ mod tests {
                 ref run_id,
                 ref status,
                 ref error,
+                ..
             } if run_id.as_deref() == Some("run-1")
                 && status.as_deref() == Some("completed")
                 && error.is_none()

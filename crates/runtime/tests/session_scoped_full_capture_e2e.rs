@@ -644,13 +644,16 @@ async fn assert_failed_terminal_replay_after_usage(explain: bool) {
     assert_eq!(next_ws_json(&mut first).await["type"], "session_info");
     let usage = next_ws_json(&mut first).await;
     assert_eq!(usage["type"], "usage");
-    assert_eq!(usage["index"], 11);
+    assert!(
+        usage.get("index").is_none(),
+        "auxiliary usage must not acknowledge the unseen terminal record"
+    );
     first.close(None).await.expect("disconnect after usage");
 
     let mut recovered = connect_authenticated_ws(addr, "test-capture-token").await;
     recovered
         .send(Message::Text(
-            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 11})
+            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 10})
                 .to_string()
                 .into(),
         ))

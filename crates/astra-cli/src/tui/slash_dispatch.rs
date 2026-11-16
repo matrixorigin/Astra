@@ -162,6 +162,7 @@ pub(crate) enum SlashBackgroundRead {
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
     },
     WorkContinue {
+        recovering: bool,
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         work_id: String,
@@ -574,6 +575,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 );
                 ctx.show_response("Continuing Work…".to_string());
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: false,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id,
@@ -593,6 +595,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 };
                 ctx.show_response(format!("Retrying Work request {request_id}…"));
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: true,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id: pending.work_id,
@@ -647,30 +650,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "Usage: /agent [list] — select an agent in the workbench to inspect, guide, pause, resume, or stop it."
                     .to_string(),
             );
-            SlashResult::Handled
-        }
-
-        "/plan" => {
-            let trimmed = args.trim();
-            if !trimmed.is_empty() {
-                ctx.show_error(
-                    "Usage: /plan — then describe the plan in the composer.".to_string(),
-                );
-                return SlashResult::Handled;
-            }
-
-            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(ctx.state);
-            if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            if ctx.state.cloud_plan_mirror.is_some() {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            crate::cli::slash::slash_plan::enter_local_plan_mode(ctx.state);
             SlashResult::Handled
         }
 

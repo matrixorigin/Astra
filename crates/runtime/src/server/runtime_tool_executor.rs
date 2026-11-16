@@ -5255,6 +5255,7 @@ impl RuntimeToolExecutor {
                         args,
                         astra_tools::tool_engine::ToolInvocationMetadata {
                             admission_deadline: request.policy.admission_deadline,
+                            observation_deadline: None,
                             run_id: non_empty_identity(&request.run_id),
                             turn_chain_id: non_empty_identity(&request.turn_chain_id),
                             tool_call_id: non_empty_identity(&request.tool_call_id),

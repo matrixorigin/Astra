@@ -593,17 +593,19 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
                         let index = (n as u64) * 2 + 1;
                         let rejected = text == "needs correction";
                         if !rejected {
-                            received
-                                .lock()
-                                .unwrap()
-                                .push((intent_id.clone(), text.clone(), index));
+                            let mut received = received.lock().unwrap();
+                            if !received.iter().any(|(id, _, _)| id == &intent_id) {
+                                received.push((intent_id.clone(), text.clone(), index));
+                            }
                         }
                         let bearer = headers.get("authorization").unwrap().to_str().unwrap().to_owned();
-                        sent_tx.send((run_id.clone(), text, bearer)).unwrap();
+                        sent_tx.send((run_id.clone(), text.clone(), bearer)).unwrap();
                         if n == 0 {
                             release_first.notified().await;
                         }
-                        if rejected {
+                        if matches!(text.as_str(), "ambiguous instruction" | "discarded uncertain") {
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"detail":"ack unavailable"})))
+                        } else if rejected {
                             release_rejection.notified().await;
                             (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail": "Please correct this message"})))
                         } else {
@@ -739,6 +741,92 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         "live disposition must not wait for the terminal lookup"
     );
     assert_eq!(mock.received_requests().len(), 1, "the turn remains open");
+
+    // The server admitted this input but both POST acknowledgements were
+    // lost. A later stream disposition must unblock the same-turn FIFO.
+    astra.paste_and_submit("ambiguous instruction");
+    for _ in 0..2 {
+        let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.1, "ambiguous instruction");
+    }
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("later live question");
+    astra.wait_for("later live question", UI_TRANSITION_TIMEOUT);
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "an unknown prior message must retain FIFO order"
+    );
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "ambiguous instruction")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    let later = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.1, "later live question");
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "later live question")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "the original turn is still running"
+    );
+
+    astra.paste_and_submit("discarded uncertain");
+    for _ in 0..2 {
+        let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.1, "discarded uncertain");
+    }
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("after discard");
+    astra.wait_for("after discard", UI_TRANSITION_TIMEOUT);
+    assert!(sent_rx.try_recv().is_err());
+    astra.write(b"\x1bu"); // Open the existing recovery view.
+    astra.wait_for("delivery unknown", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1bd"); // Discard the local copy explicitly.
+    astra.wait_for("may still apply it", UI_TRANSITION_TIMEOUT);
+    let after_discard = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_discard.1, "after discard");
+    let (intent_id, content, event_index) = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, text, _)| text == "after discard")
+        .unwrap()
+        .clone();
+    mock.send_held_stream_event(serde_json::json!({
+        "type": "user_intent_applied", "run_id": "mock-run-agent-root",
+        "intent_id": intent_id, "delivery": "guide_current_run",
+        "status": "applied", "event_index": event_index, "content": content,
+    }));
     astra.paste_and_submit("needs correction");
     let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -760,7 +848,18 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         sent_rx.try_recv().is_err(),
         "a rejected message must not let later input overtake it"
     );
-    astra.write(&[0x03]); // Clear the nonempty draft without stopping the task.
+    // Rejected input remains scoped to this session until explicitly recovered.
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("first message recovered", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("↳ needs correction")
+    });
+    astra.write(&[0x03]);
+    astra.wait_for_absent("↳ needs correction", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("later message recovered", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("› later pending")
+    });
+    astra.write(&[0x03]); // Clear the recovered draft without stopping the task.
     astra.wait_for_absent("later pending", UI_TRANSITION_TIMEOUT);
     assert!(mock.cancellation_requests().is_empty());
     astra.paste_and_submit("corrected instruction");
@@ -830,6 +929,9 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         [
             "first instruction",
             "second instruction",
+            "ambiguous instruction",
+            "later live question",
+            "after discard",
             "corrected instruction"
         ]
     );
@@ -887,6 +989,445 @@ fn seed_account(home: &std::path::Path) {
             );
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_plan_guidance_can_be_recovered_without_exiting_plan_mode() {
+    use axum::{Json, extract::Path, http::StatusCode, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    let _journey = pty_journey_lock().lock().await;
+    for scenario in ["active", "changed-mode", "closed", "permission-failure"] {
+        let closed = scenario == "closed";
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::unbounded_channel();
+        let submissions = Arc::new(AtomicU64::new(0));
+        let revision = Arc::new(AtomicU64::new(0));
+        let routes = axum::Router::new()
+        .route("/chat/runs/{run_id}/intents", post(move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+            let sent_tx = sent_tx.clone();
+            let submissions = submissions.clone();
+            async move {
+                sent_tx.send(body.clone()).unwrap();
+                    if submissions.fetch_add(1, Ordering::SeqCst) == 0 && scenario != "permission-failure" {
+                    if closed {
+                        (StatusCode::CONFLICT, Json(serde_json::json!({"error_code":"run_intent_run_terminal"})))
+                    } else {
+                        (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail":"not admitted"})))
+                    }
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({"run_id":run_id,
+                        "intent_id":body["intent_id"], "status":"accepted_remote", "duplicate":false,
+                        "event_index": 2})))
+                }
+            }
+        }))
+        .route("/chat/runs/{run_id}/permission-mode", post(move |Path(_run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+            let permission_tx = permission_tx.clone();
+            let revision = revision.clone();
+            async move {
+                let revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut observed = body.clone();
+                observed["revision"] = revision.into();
+                permission_tx.send(observed).unwrap();
+                if scenario == "permission-failure" && revision == 1 {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail":"could not confirm"})))
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({"request_id":body["request_id"], "mode":body["mode"], "revision":revision})))
+                }
+            }
+        }));
+        let mock =
+            astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+                astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+                true,
+                routes,
+            )
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        seed_trusted_workspace(home.path());
+        seed_account(home.path());
+        let mut astra = PtyAstra::spawn_with_config(
+            home.path(),
+            &mock.base_url,
+            "mock-model",
+            "gateway-token",
+            &[],
+        );
+        astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("Start a task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().is_empty() {
+            assert!(Instant::now() < deadline);
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.paste_and_submit("/plan");
+        let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["mode"], "plan");
+        if scenario == "permission-failure" {
+            astra.wait_for("could not confirm", UI_TRANSITION_TIMEOUT);
+            astra.paste_and_submit("continue the current task");
+            let sent = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sent["input"]["content"], "continue the current task");
+            mock.send_held_stream_event(serde_json::json!({
+                "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                "request_id":first["request_id"], "mode":"plan", "revision":1,
+                "round_index":1, "owner_generation":1
+            }));
+            astra.wait_for_screen(
+                "late permission application",
+                UI_TRANSITION_TIMEOUT,
+                |screen| {
+                    screen
+                        .lines()
+                        .any(|line| line.contains("Read-only") && !line.contains("requested"))
+                },
+            );
+            assert!(
+                sent_rx.try_recv().is_err(),
+                "failed plan must not be replayed automatically"
+            );
+            astra.signal(nix::sys::signal::Signal::SIGHUP);
+            assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+            continue;
+        }
+        mock.send_held_stream_event(serde_json::json!({
+        "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+        "request_id":first["request_id"], "mode":"plan", "revision":1,
+        "round_index":1, "owner_generation":1
+    }));
+        let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rejected["input"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+        astra.wait_for("Alt+U", UI_TRANSITION_TIMEOUT);
+        if scenario == "changed-mode" {
+            astra.paste_and_submit("/allow auto");
+            let changed = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(changed["mode"], "auto");
+            mock.send_held_stream_event(serde_json::json!({
+                "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                "request_id":changed["request_id"], "mode":"auto", "revision":changed["revision"],
+                "round_index":2, "owner_generation":1
+            }));
+        }
+        if closed {
+            mock.release_held_response();
+            astra.wait_for("total ·", UI_TRANSITION_TIMEOUT);
+        }
+        astra.write(b"\x1bu");
+        astra.wait_for_screen("recovered plan draft", UI_TRANSITION_TIMEOUT, |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains('›') && line.contains("plan"))
+        });
+        astra.write(b"\r");
+        if closed {
+            let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+            while mock.received_requests().len() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "recovered plan did not start a new turn\n{}",
+                    astra.screen_diagnostic()
+                );
+                astra.receive(Duration::from_millis(25));
+                tokio::task::yield_now().await;
+            }
+            let requests = mock.received_requests();
+            let retry = &requests[1];
+            assert_eq!(retry["message"], rejected["input"]["content"]);
+            assert!(
+                retry["context"]["edge_tools"]
+                    .as_array()
+                    .is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["function"]["name"] == "exit_plan_mode")
+                    }),
+                "the new turn did not expose the Plan-mode tool surface: {retry}"
+            );
+            astra.wait_for("Read-only", UI_TRANSITION_TIMEOUT);
+            assert!(permission_rx.try_recv().is_err());
+            astra.signal(nix::sys::signal::Signal::SIGHUP);
+            assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+            continue;
+        }
+        let retried = tokio::time::timeout(UI_TRANSITION_TIMEOUT, async {
+        tokio::select! {
+            permission = permission_rx.recv() => {
+                let permission = permission.unwrap();
+                assert_eq!(permission["mode"], "plan", "retry must never exit Plan mode");
+                mock.send_held_stream_event(serde_json::json!({
+                    "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+                    "request_id":permission["request_id"], "mode":"plan", "revision":permission["revision"],
+                    "round_index":2, "owner_generation":1
+                }));
+                sent_rx.recv().await.unwrap()
+            }
+            sent = sent_rx.recv() => sent.unwrap(),
+        }
+    }).await.unwrap();
+        assert!(
+            retried["input"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+        assert_eq!(retried["input"]["content"], rejected["input"]["content"]);
+        assert!(permission_rx.try_recv().is_err());
+        astra.signal(nix::sys::signal::Signal::SIGHUP);
+        assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_plan_keeps_later_guidance_behind_earlier_messages() {
+    use axum::{Json, extract::Path, http::StatusCode, routing::post};
+    use std::sync::Arc;
+    let _journey = pty_journey_lock().lock().await;
+    for uncertain in [false, true] {
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::unbounded_channel();
+        let permission_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let routes = axum::Router::new().route("/chat/runs/{run_id}/intents", post({
+            let release = release.clone();
+            move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let release = release.clone();
+                let sent_tx = sent_tx.clone();
+                async move {
+                    sent_tx.send(body.clone()).unwrap();
+                    let first_message = body["input"]["content"] == "first instruction";
+                    if uncertain && first_message {
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})))
+                    } else {
+                        if first_message {
+                            release.notified().await;
+                        }
+                        let event_index = match body["input"]["content"].as_str() {
+                            Some("first instruction") => 1,
+                            Some("earlier guidance") => 3,
+                            Some(text) if text.starts_with("Prepare a plan") => 5,
+                            Some("continue after plan") => 9,
+                            _ => 7,
+                        };
+                        (StatusCode::OK, Json(serde_json::json!({"run_id":run_id,
+                            "intent_id":body["intent_id"], "status":"accepted_remote", "duplicate":false,
+                            "event_index": event_index})))
+                    }
+                }
+            }
+        })).route("/chat/runs/{run_id}/permission-mode", post(
+            move |Path(_run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let permission_tx = permission_tx.clone();
+                let permission_revision = permission_revision.clone();
+                async move {
+                    let revision = permission_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let mut observed = body.clone();
+                    observed["revision"] = revision.into();
+                    permission_tx.send(observed).unwrap();
+                    Json(serde_json::json!({"request_id":body["request_id"], "mode":body["mode"], "revision":revision}))
+                }
+            }
+        ));
+        let mock =
+            astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+                astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+                true,
+                routes,
+            )
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        seed_trusted_workspace(home.path());
+        seed_account(home.path());
+        let mut astra = PtyAstra::spawn_with_config(
+            home.path(),
+            &mock.base_url,
+            "mock-model",
+            "gateway-token",
+            &[],
+        );
+        astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("Start a task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().is_empty() {
+            assert!(Instant::now() < deadline);
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.paste_and_submit("first instruction");
+        let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if uncertain {
+            let retry = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry, first);
+            astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+        }
+        astra.paste_and_submit("earlier guidance");
+        astra.wait_for("earlier guidance", UI_TRANSITION_TIMEOUT);
+        assert!(sent_rx.try_recv().is_err());
+        astra.paste_and_submit("/plan inspect first");
+        astra.wait_for("Plan queued behind earlier input", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("later question");
+        astra.wait_for("later question", UI_TRANSITION_TIMEOUT);
+        assert!(
+            permission_rx.try_recv().is_err(),
+            "plan mode cannot overtake earlier guidance"
+        );
+        release.notify_one();
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":first["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":1, "content":"first instruction",
+        }));
+        astra.wait_for_screen("first message applied", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("› first instruction") && !screen.contains("delivery is unknown")
+        });
+        let earlier = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(earlier["input"]["content"], "earlier guidance");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":earlier["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":3, "content":"earlier guidance",
+        }));
+        astra.wait_for_screen(
+            "earlier guidance applied",
+            UI_TRANSITION_TIMEOUT,
+            |screen| screen.contains("› earlier guidance"),
+        );
+        let permission = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permission["mode"], "plan");
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "plan guidance preceded permission application"
+        );
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+            "request_id":permission["request_id"], "mode":"plan", "revision":1,
+            "round_index":2, "owner_generation":1
+        }));
+        let plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan["input"]["content"],
+            "Prepare a plan for this goal before making changes: inspect first"
+        );
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "later question overtook plan application"
+        );
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":plan["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":5, "content":plan["input"]["content"],
+        }));
+        let later = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later["input"]["content"], "later question");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":later["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":7, "content":"later question",
+        }));
+        astra.wait_for_screen("later guidance applied", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("› later question")
+        });
+        astra.paste_and_submit("/allow auto");
+        let exit_plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit_plan["mode"], "auto");
+        astra.paste_and_submit("continue after plan");
+        astra.wait_for("continue after plan", UI_TRANSITION_TIMEOUT);
+        assert!(sent_rx.try_recv().is_err(), "guidance overtook plan exit");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"permission_mode_applied", "session_id":"mock-session", "run_id":"mock-run-agent-root",
+            "request_id":exit_plan["request_id"], "mode":"auto", "revision":2,
+            "round_index":3, "owner_generation":1
+        }));
+        let after_exit = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_exit["input"]["content"], "continue after plan");
+        mock.send_held_stream_event(serde_json::json!({
+            "type":"user_intent_applied", "run_id":"mock-run-agent-root",
+            "intent_id":after_exit["intent_id"], "delivery":"guide_current_run", "status":"applied",
+            "event_index":9, "content":"continue after plan",
+        }));
+        astra.wait_for_screen(
+            "plan exit guidance applied",
+            UI_TRANSITION_TIMEOUT,
+            |screen| screen.contains("› continue after plan"),
+        );
+        astra.paste_and_submit("/plan final task");
+        let pending_plan = tokio::time::timeout(UI_TRANSITION_TIMEOUT, permission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_plan["mode"], "plan");
+        astra.write(b"\x1b[200~explicit next turn\x1b[201~\x11");
+        astra.wait_for("explicit next turn", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("after queued turn");
+        astra.wait_for("after queued turn", UI_TRANSITION_TIMEOUT);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "guidance overtook an explicit next-turn entry"
+        );
+        mock.release_held_response();
+        astra.wait_for(
+            "The task ended before its planning request was delivered",
+            UI_TRANSITION_TIMEOUT,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            mock.received_requests().len(),
+            1,
+            "an undelivered plan must fence later follow-ups"
+        );
+        astra.signal(nix::sys::signal::Signal::SIGHUP);
+        assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1186,7 +1727,12 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     );
     mock.release_held_response();
     astra.wait_for("planning request was delivered", UI_TRANSITION_TIMEOUT);
-    assert!(astra.current_screen().contains("/plan inspect the failure"));
+    astra.write(b"\x1bu");
+    astra.wait_for_screen("undelivered plan draft", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.contains('›') && line.contains("/plan inspect the failure"))
+    });
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
@@ -2935,4 +3481,79 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
     assert_eq!(mock.received_requests().len(), 1);
     assert!(mock.tool_results().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::Slow,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    for (index, command) in [
+        "/plan",
+        "first objective",
+        "/plan second objective",
+        "/plan",
+        "/plan first objective",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 2 {
+            astra.paste_and_submit("/allow auto");
+            astra.wait_for("Mode → Auto", UI_TRANSITION_TIMEOUT);
+        }
+        astra.paste_and_submit(command);
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().len() <= index {
+            assert!(
+                Instant::now() < deadline,
+                "plan request {index} did not reach admission\n{}",
+                astra.screen_diagnostic()
+            );
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        if index == 2 {
+            let screen = astra.screen_diagnostic();
+            assert!(
+                !screen.contains("Plan mode active - goal: first objective"),
+                "re-entering Plan must not announce the previous goal: {screen}"
+            );
+        }
+        let requests = mock.received_requests();
+        let request = &requests[index];
+        let message = request["message"].as_str().expect("admitted message");
+        match index {
+            0 | 3 => assert!(message.contains("current task"), "{request}"),
+            1 | 4 => assert!(message.contains("first objective"), "{request}"),
+            2 => assert!(message.contains("second objective"), "{request}"),
+            _ => unreachable!(),
+        }
+        let context = request["runtime_system_prompt"]
+            .as_str()
+            .expect("runtime context");
+        assert!(context.contains("client plan snapshot"), "{context}");
+        assert!(context.contains("may predate"), "{context}");
+        assert!(
+            !context.contains("plan authoring: [plan-resume]"),
+            "{context}"
+        );
+        if index == 0 {
+            assert!(!context.contains("Pause implementation"), "{context}");
+        } else {
+            assert!(context.contains("first objective"), "{context}");
+        }
+        astra.wait_for(&format!("turn {}", index + 1), UI_TRANSITION_TIMEOUT);
+    }
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }

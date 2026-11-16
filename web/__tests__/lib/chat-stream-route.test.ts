@@ -452,7 +452,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-stop"}\n\n',
-      'data: {"type":"run_finished","run_id":"run-stop","status":"cancelled"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"run-stop\",\"status\":\"cancelled\",\"owner_generation\":4}\n\n",
     ]);
     setAdmittedRuntime({
       sdk: {
@@ -652,7 +652,7 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
       'data: {"type":"text_done","full_text":"done"}\n\n',
-      'data: {"type":"run_finished","run_id":"run-soft","status":"completed"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"run-soft\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     ]);
     setAdmittedRuntime({
       sdk: {
@@ -871,7 +871,7 @@ describe("chat stream route proxy cancellation", () => {
           elapsed_ms: 30, start_elapsed_ms: 0, duration_ms: 30, outcome: "completed" })}\n\n`,
         'data: {"type":"text_delta","content":"stale text","index":9}\n\n',
         'data: {"type":"error","message":"historical provider failure","index":12}\n\n',
-        'data: {"type":"run_finished","run_id":"run-1","status":"failed"}\n\n',
+        "data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"status\":\"failed\",\"owner_generation\":4}\n\n",
       ],
     },
     {
@@ -950,7 +950,7 @@ describe("chat stream route proxy cancellation", () => {
       const responseText = await response.text();
       if (malformed) {
         expect(responseText).toContain("Incomplete or malformed replay event");
-      } else expect(responseText).toBe(frames.join(""));
+      } else expect(responseText).toBe(frames.join("") + "data: [DONE]\n\n");
 
       expect(runtime.fetchResponse).toHaveBeenCalledWith(
         `/chat/runs/run-1/stream?last_index=${fromOrigin ? 0 : 8}&replay_only=true`,
@@ -2012,9 +2012,9 @@ describe("chat existing run stream route", () => {
       { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
       { type: "text_delta", content: "Useful partial answer" },
       { type: "reasoning_delta", content: "Partial reasoning" },
-      { type: "run_finished", run_id: "child", status: "cancelled" },
+      { owner_generation: 4, type: "run_finished", run_id: "child", status: "cancelled" },
       { type: "run_error", run_id: "root", error: "Save failed", error_code: "canonical_persistence_failed" },
-      { type: "run_finished", run_id: "root", status: "failed", error: "Save failed" },
+      { owner_generation: 4, type: "run_finished", run_id: "root", status: "failed", error: "Save failed" },
     ].filter(event => !resumed || !["text_delta", "reasoning_delta"].includes(event.type))
       .map(event => `data: ${JSON.stringify(event)}\n\n`);
     frames.push("data: [DONE]\n\n");
@@ -2071,7 +2071,7 @@ describe("chat existing run stream route", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
       'data: {"type":"text_delta","content":"reply"}\n\n',
-      'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+      "data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     ]);
     const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     setAdmittedRuntime({

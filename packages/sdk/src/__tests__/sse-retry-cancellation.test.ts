@@ -10,7 +10,7 @@ test.each(['close', 'external-abort'])('%s stops delivery of already buffered ev
   const transport = vi.fn().mockResolvedValue(new Response(
     'data: {"type":"text_delta","content":"first"}\n\n' +
     'data: {"type":"text_delta","content":"stale"}\n\n' +
-    'data: {"type":"run_finished"}',
+    "data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n",
   ));
   const client = new SSEClient({
     url: 'https://example.test/stream', signal: controller.signal, transport,
@@ -75,7 +75,7 @@ test('retry delay still retries normally and releases external abort listeners',
   const add = vi.spyOn(controller.signal, 'addEventListener');
   const remove = vi.spyOn(controller.signal, 'removeEventListener');
   const fetch = vi.fn().mockRejectedValueOnce(new Error('Connection failed'))
-    .mockImplementation(() => Promise.resolve(new Response('data: {"type":"run_finished"}\n\n')));
+    .mockImplementation(() => Promise.resolve(new Response("data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n")));
   vi.stubGlobal('fetch', fetch);
   const received = vi.fn();
   const client = new SSEClient({
@@ -88,7 +88,7 @@ test('retry delay still retries normally and releases external abort listeners',
   await vi.advanceTimersByTimeAsync(1);
   await pending;
   expect(fetch).toHaveBeenCalledTimes(2);
-  expect(received).toHaveBeenLastCalledWith({ type: 'run_finished' });
+  expect(received).toHaveBeenLastCalledWith({ run_id: "run-fixture", owner_generation: 4, status: "completed", type: 'run_finished' });
   expect(remove.mock.calls.map(([event, listener]) => [event, listener]))
     .toEqual(add.mock.calls.map(([event, listener]) => [event, listener]));
   client.close();
@@ -131,11 +131,11 @@ test.each([false, true])('close/reopen keeps old buffered events cancelled (imme
     .mockResolvedValueOnce(new Response(
       'data: {"type":"text_delta","content":"first"}\n\n' +
       'data: {"type":"text_delta","content":"stale"}\n\n' +
-      'data: {"type":"run_finished","run_id":"old"}',
+      "data: {\"type\":\"run_finished\",\"owner_generation\":4,\"status\":\"completed\",\"run_id\":\"old\"}\n\ndata: [DONE]\n\n",
     ))
     .mockResolvedValueOnce(new Response(
       'data: {"type":"text_delta","content":"fresh"}\n\n' +
-      'data: {"type":"run_finished","run_id":"new"}',
+      "data: {\"type\":\"run_finished\",\"owner_generation\":4,\"status\":\"completed\",\"run_id\":\"new\"}\n\ndata: [DONE]\n\n",
     ));
   let reopened: Promise<void> | undefined;
   const client = new SSEClient({
@@ -156,7 +156,7 @@ test.each([false, true])('close/reopen keeps old buffered events cancelled (imme
   expect(received).toEqual([
     { type: 'text_delta', content: 'first' },
     { type: 'text_delta', content: 'fresh' },
-    { type: 'run_finished', run_id: 'new' },
+    { owner_generation: 4, status: "completed", type: 'run_finished', run_id: 'new' },
   ]);
   expect(transport).toHaveBeenCalledTimes(2);
   expect(states).toEqual(['connecting', 'connected', 'disconnected',

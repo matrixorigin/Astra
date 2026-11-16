@@ -462,6 +462,7 @@ mod tests {
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::default(),
             provider_strategy: ProviderCacheStrategy::default(),
+            cache_protocol: Default::default(),
             project_context: "test project".into(),
             edge_profile: EdgeProfile::default(),
             self_model: None,

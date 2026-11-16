@@ -159,6 +159,14 @@ impl ActivePermissionControl {
         self.latest.is_some()
     }
 
+    /// A failed request can still apply later, but it must not stall ordinary
+    /// input after its unconfirmed status has been shown to the user.
+    pub(super) fn is_waiting(&self) -> bool {
+        self.latest.as_ref().is_some_and(|intent| {
+            self.reported_error.as_deref() != Some(intent.request_id.as_str())
+        })
+    }
+
     /// A stale response must never erase a newer requested mode.
     pub(super) fn reconcile(
         &mut self,
@@ -242,6 +250,43 @@ mod tests {
         );
         assert_eq!(control.reconcile(&mirror), Some(Ok(PermissionMode::Prompt)));
         assert!(control.reconcile(&mirror).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_selection_unblocks_input_but_late_application_is_still_observed() {
+        let api = ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let mut manager = PermissionManager::new(false);
+        let mirror = manager.mode_mirror_handle();
+        let mut control = ActivePermissionControl::new(
+            api,
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            watch::channel(None).1,
+            watch::channel(None).1,
+            manager.permission_control_signal(),
+        );
+        let id = control.request(PermissionMode::Plan);
+        let (_tx, result) = watch::channel(Some(SubmissionResult {
+            request_id: id.clone(),
+            outcome: Err("not confirmed".into()),
+        }));
+        control.result = result;
+        assert!(control.is_waiting());
+        assert_eq!(
+            control.reconcile(&mirror),
+            Some(Err("not confirmed".into()))
+        );
+        assert!(!control.is_waiting());
+        assert!(control.has_pending());
+        manager.apply_acknowledged_mode(
+            "run",
+            &astra_turn_types::RunPermissionModeSelection {
+                request_id: id,
+                mode: PermissionMode::Plan,
+                revision: 1,
+            },
+        );
+        assert_eq!(control.reconcile(&mirror), Some(Ok(PermissionMode::Plan)));
+        assert!(!control.has_pending());
     }
 
     #[tokio::test]

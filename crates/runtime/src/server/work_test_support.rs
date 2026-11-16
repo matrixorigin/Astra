@@ -52,3 +52,39 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         .await
         .expect("commit Work fixture cleanup");
 }
+
+use astra_services::work::{InternalSessionId, WorkOwnerId};
+
+pub(crate) async fn admit_running_test_session(
+    pool: &SharedPool,
+    owner: &WorkOwnerId,
+    session: &InternalSessionId,
+    run_id: &str,
+    title: &str,
+) {
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, ?, 'active', 0)",
+    )
+    .bind(session.as_str())
+    .bind(owner.as_str())
+    .bind(title)
+    .execute(pool.get())
+    .await
+    .expect("canonical session admission fence");
+    sqlx::query(
+        "INSERT INTO agent_runs
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+          owner_pod_id, owner_lease_expires_at, run_generation)
+         VALUES (?, ?, ?, ?, ?, 'running',
+                 'work-lifecycle-test-owner', TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
+    )
+    .bind(run_id)
+    .bind(owner.as_str())
+    .bind(session.as_str())
+    .bind(run_id)
+    .bind(run_id)
+    .execute(pool.get())
+    .await
+    .expect("active run authority");
+}

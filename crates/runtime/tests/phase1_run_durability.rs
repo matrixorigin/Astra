@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+#[path = "../../services/tests/common/mysql_response_proxy.rs"]
+mod mysql_response_proxy;
 mod test_support;
 
 use std::sync::Arc;
@@ -986,4 +989,365 @@ async fn durable_reads_hide_corrupt_storage() {
             .delete_session(session, user).await.unwrap();
     }
 }
+}
+
+async fn hinted_statuses(
+    engine: &RunEngine,
+    user: &str,
+    run: &str,
+    hint: &str,
+) -> Vec<Result<Option<astra_runtime::turn::run_control::RunControlStatus>, String>> {
+    use astra_runtime::turn::run_control::RunStatusProvider;
+    futures_util::future::join_all((0..4).map(|_| async {
+        engine
+            .control_observation_with_parent_hint(user, run, hint)
+            .await
+            .map(|observation| observation.status)
+    }))
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "isolated MatrixOne control semantics"]
+async fn control_observation_sees_fresh_cross_engine_parent_changes() {
+    use astra_runtime::turn::run_control::RunControlStatus;
+    use astra_services::runs::RunStatusCasRequest;
+
+    let observer_pool = setup_pool().await;
+    let writer_pool = astra_core::SharedPool::new(observer_pool.settings())
+        .await
+        .unwrap();
+    let observer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(observer_pool.clone())));
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(writer_pool.clone())));
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let user = format!("obs-qa-u-{nonce}");
+    let session = format!("obs-qa-s-{nonce}");
+    let root = format!("obs-qa-r-{nonce}");
+    let child = format!("obs-qa-c-{nonce}");
+    let grandchild = format!("obs-qa-g-{nonce}");
+    insert_session(&writer_pool, &user, &session).await;
+    let _root_owner = writer.start_run(&root, &user, &session).await.unwrap();
+    let _child_owner = writer
+        .start_run_ext(
+            &child,
+            &user,
+            &session,
+            Some(&root),
+            Some("qa-child"),
+            Some("qa-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+    let _grandchild_owner = writer
+        .start_run_ext(
+            &grandchild,
+            &user,
+            &session,
+            Some(&child),
+            Some("qa-grandchild"),
+            Some("qa-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    assert_eq!(
+        observer
+            .check_control_status("different-owner", &child)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !writer
+            .request_run_cancellation("different-owner", &root)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &user,
+                expected_session_id: &session,
+                run_id: &root,
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+        }
+    }
+    for result in hinted_statuses(&observer, &user, &child, "stale-parent").await {
+        assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+    }
+    for result in hinted_statuses(&observer, &user, &child, &"x".repeat(513)).await {
+        assert_eq!(result.unwrap(), Some(RunControlStatus::Paused));
+    }
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &user,
+                expected_session_id: &session,
+                run_id: &root,
+                status: "running",
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["paused"],
+            })
+            .await
+            .unwrap()
+    );
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    assert!(writer.request_run_cancellation(&user, &root).await.unwrap());
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+        }
+    }
+    // Withhold joined responses. An unhinted cancellation must remain
+    // observable even behind other owners and same-owner hinted requests.
+    use astra_runtime::turn::run_control::RunStatusProvider;
+    use mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let other_user = format!("obs-qa-other-u-{nonce}");
+    let other_session = format!("obs-qa-other-s-{nonce}");
+    let other_root = format!("obs-qa-other-r-{nonce}");
+    insert_session(&writer_pool, &other_user, &other_session).await;
+    writer
+        .start_run(&other_root, &other_user, &other_session)
+        .await
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&other_user, &other_root)
+            .await
+            .unwrap()
+    );
+    let guidance_session = format!("obs-qa-guidance-s-{nonce}");
+    let guidance_root = format!("obs-qa-guidance-r-{nonce}");
+    insert_session(&writer_pool, &other_user, &guidance_session).await;
+    writer
+        .start_run(&guidance_root, &other_user, &guidance_session)
+        .await
+        .unwrap();
+    writer
+        .append_event(
+            &other_user,
+            &guidance_session,
+            &guidance_root,
+            json!({"event_type": "user_intent", "id": format!("intent-{nonce}")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&other_user, &guidance_root)
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(guidance_index >= 0);
+
+    let settings = observer_pool.settings();
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(settings, proxy.port, 4).await;
+    let fault_engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(fault_pool.clone())));
+    // Repeated timeouts must release connections for subsequent reads.
+    for _ in 0..2 {
+        let mut children = Vec::new();
+        // Hold three joined reads on distinct connections. Rearm before the
+        // backlog as well, so a fourth joined read would block the root.
+        for _ in 0..3 {
+            proxy
+                .gate
+                .armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut batch = Box::pin(hinted_statuses(&fault_engine, &user, &child, &root));
+            assert!(futures_util::poll!(batch.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+                .await
+                .expect("joined response was not gated");
+            children.push(batch);
+        }
+        proxy
+            .gate
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Reach both admission limits with live hinted observations while the
+        // joined responses are held. Root control must remain observable.
+        let same_owner = (0..=4096)
+            .map(|i| (other_user.clone(), format!("same-owner-child-{i}")))
+            .collect::<Vec<_>>();
+        let other_owners = (0..=8192)
+            .map(|i| (format!("obs-backlog-{nonce}-{i}"), format!("child-{i}")))
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for backlog in [&same_owner, &other_owners] {
+            let mut at_capacity = false;
+            for (owner, run) in backlog {
+                let mut request = Box::pin(fault_engine.control_observation_with_parent_hint(
+                    owner,
+                    run,
+                    "unused-parent",
+                ));
+                match futures_util::poll!(request.as_mut()) {
+                    std::task::Poll::Pending => pending.push(request),
+                    std::task::Poll::Ready(Err(error)) if error.contains("capacity") => {
+                        at_capacity = true;
+                        break;
+                    }
+                    other => panic!("unexpected control admission: {other:?}"),
+                }
+            }
+            assert!(at_capacity, "hinted admission must stay bounded");
+        }
+        let mut other_observation =
+            Box::pin(fault_engine.control_observation(&other_user, &other_root));
+        let mut guidance_observation =
+            Box::pin(fault_engine.control_observation(&other_user, &guidance_root));
+        assert!(futures_util::poll!(other_observation.as_mut()).is_pending());
+        assert!(futures_util::poll!(guidance_observation.as_mut()).is_pending());
+        let (observed, guidance) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(other_observation, guidance_observation)
+        })
+        .await
+        .expect("unhinted roots must not wait for stalled joined workers");
+        assert_eq!(observed.unwrap().status, Some(RunControlStatus::Cancelled));
+        let guidance = guidance.unwrap();
+        assert_eq!(guidance.status, None);
+        assert_eq!(guidance.last_guidance_event_idx, Some(guidance_index));
+        assert_eq!(guidance.last_event_idx, Some(guidance_index));
+        for batch in &mut children {
+            assert!(
+                futures_util::poll!(batch.as_mut()).is_pending(),
+                "root observations must complete before joined queries time out"
+            );
+        }
+        drop(pending);
+        for batch in children {
+            let observations = tokio::time::timeout(Duration::from_secs(5), batch)
+                .await
+                .unwrap();
+            assert!(
+                observations
+                    .into_iter()
+                    .all(|result| { result.unwrap() == Some(RunControlStatus::Cancelled) })
+            );
+        }
+        proxy
+            .gate
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        for result in hinted_statuses(&fault_engine, &user, &child, &root).await {
+            assert_eq!(result.unwrap(), Some(RunControlStatus::Cancelled));
+        }
+    }
+    // A stale hint or deeper child must still use the authoritative
+    // ancestor path after recovery, even while joined reads remain unhealthy.
+    for (run, hint) in [(&child, "stale-parent"), (&grandchild, child.as_str())] {
+        proxy
+            .gate
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut batch = Box::pin(hinted_statuses(&fault_engine, &user, run, hint));
+        assert!(futures_util::poll!(batch.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined response was not gated");
+        let observations = tokio::time::timeout(Duration::from_secs(5), batch)
+            .await
+            .expect("stale and deep controls must use the existing ancestor path");
+        assert!(
+            observations
+                .into_iter()
+                .all(|result| { result.unwrap() == Some(RunControlStatus::Cancelled) })
+        );
+        proxy
+            .gate
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+    }
+    fault_pool.close().await;
+
+    // A joined attempt and its recovery must not extend a caller's deadline
+    // while an unrelated checkout exhausts the actual database pool.
+    let mut saturated_settings = observer_pool.settings().clone();
+    saturated_settings.db_pool_max_connections = 1;
+    saturated_settings.db_pool_min_connections = 0;
+    let saturated_pool = astra_core::SharedPool::new(&saturated_settings)
+        .await
+        .unwrap();
+    let held_connection = saturated_pool.get().acquire().await.unwrap();
+    let saturated_engine =
+        RunEngine::new(Arc::new(DatabaseRunStateStore::new(saturated_pool.clone())));
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(5),
+        hinted_statuses(&saturated_engine, &user, &child, &root),
+    )
+    .await
+    .expect("pool exhaustion must respect the original request budget");
+    assert!(
+        blocked
+            .into_iter()
+            .all(|result| result.unwrap_err().contains("timed out"))
+    );
+    drop(held_connection);
+    assert_eq!(
+        saturated_engine
+            .check_control_status(&user, &child)
+            .await
+            .unwrap(),
+        Some(RunControlStatus::Cancelled),
+    );
+    saturated_pool.close().await;
+
+    sqlx::query("DELETE FROM agent_runs WHERE user_id=? AND run_id=?")
+        .bind(&user)
+        .bind(&root)
+        .execute(writer_pool.get())
+        .await
+        .unwrap();
+    for (run, hint) in [(&child, &root), (&grandchild, &child)] {
+        for result in hinted_statuses(&observer, &user, run, hint).await {
+            assert!(result.is_err(), "missing ancestor must fail closed");
+        }
+    }
+    for table in [
+        "agent_run_events",
+        "agent_run_openings",
+        "agent_runs",
+        "agent_session_lifecycle_fences",
+        "agent_sessions",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE user_id=?");
+        for owner in [&user, &other_user] {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .bind(owner)
+                .execute(writer_pool.get())
+                .await
+                .unwrap();
+        }
+    }
+    writer_pool.close().await;
 }

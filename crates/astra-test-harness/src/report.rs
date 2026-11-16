@@ -1159,34 +1159,90 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             .and_then(|v| v.as_f64())
             .expect("validated average")
     };
+    let tools_complete = a
+        .get("root_tool_totals_complete")
+        .and_then(|v| v.as_bool())
+        .expect("validated coverage");
+    let counts_complete = a
+        .get("root_tool_counts_complete")
+        .and_then(|v| v.as_bool())
+        .expect("validated count coverage");
+    let tool_total = |key: &str| {
+        let value = get_u(key);
+        if tools_complete {
+            value.to_string()
+        } else {
+            "?".to_owned()
+        }
+    };
     out.push_str(&format!(
             "      attempts={} turns={} turn_errors={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
             get_u("attempt_count"),
             get_u("turn_count"),
             get_u("turn_error_count"),
-            get_u("total_tool_calls"),
-            get_u("tool_calls_failed"),
+            if counts_complete { get_u("reported_root_tool_calls").to_string() } else { "?".to_owned() },
+            tool_total("observed_root_tool_failures"),
             get_u("error_event_count"),
             get_u("compact_count"),
             get_u("stall_count"),
     ));
+    if let Some(conflicts) = json
+        .get("conflicting_terminal_count")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|count| *count > 0)
+    {
+        out.push_str(&format!(
+            "      conflicting_terminals={conflicts} (excluded from attempt totals)\n"
+        ));
+    }
+    if !tools_complete
+        && (get_u("reported_root_tool_calls") > 0 || get_u("observed_root_tool_failures") > 0)
+    {
+        out.push_str(&format!(
+            "      tool_reports: terminal_calls={} ledger_failed_executions={} observed_failures={} (observations may overlap)\n",
+            get_u("reported_root_tool_calls"),
+            get_u("reported_root_ledger_failed_executions"),
+            get_u("observed_root_tool_failures")
+        ));
+    }
     out.push_str(&format!(
-        "      root_tokens_in={} root_tokens_out={} root_duration_ms={}\n",
+        "      known_root_tokens_in={} known_root_tokens_out={} root_duration_ms={}\n",
         get_u("total_tokens_in"),
         get_u("total_tokens_out"),
         get_u("total_duration_ms"),
     ));
+    let request_coverage = if !counts_complete
+        || json
+            .get("conflicting_round_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    {
+        " (partial; see coverage)"
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "      subruns={} inclusive_tokens_in={} inclusive_tokens_out={} inclusive_tool_calls={}\n",
+        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} observed_child_tool_requests={}{}\n",
         get_u("subrun_count"),
         get_u("inclusive_total_tokens_in"),
         get_u("inclusive_total_tokens_out"),
-        get_u("inclusive_total_tool_calls"),
+        get_u("observed_child_tool_requests"),
+        request_coverage,
     ));
     out.push_str(&format!(
-        "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
-        get_f("avg_tokens_in"),
-        get_f("avg_tokens_out"),
+        "      observed_root_tool_requests={} (not an execution count){}\n",
+        get_u("observed_root_tool_requests"),
+        request_coverage
+    ));
+    out.push_str(&format!(
+        "      avg_tokens_in={} avg_tokens_out={} avg_duration_ms={:.1}\n",
+        a.get("avg_tokens_in")
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "unknown".to_owned(), |v| format!("{v:.1}")),
+        a.get("avg_tokens_out")
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "unknown".to_owned(), |v| format!("{v:.1}")),
         get_f("avg_duration_ms"),
     ));
     // Point the reviewer at the full digest — if and only if the
@@ -1619,7 +1675,7 @@ mod tests {
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "sess",
                 "journal_file": "/tmp/sess.jsonl",
                 "journal_lines_non_empty": 3,
@@ -1628,8 +1684,8 @@ mod tests {
                     "attempt_count": 3,
                     "turn_count": 3,
                     "turn_error_count": 0,
-                    "total_tool_calls": 5,
-                    "tool_calls_failed": 1,
+                    "reported_root_tool_calls": 5, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "observed_root_tool_failures": 1, "reported_root_ledger_failed_executions": 1,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1639,16 +1695,15 @@ mod tests {
                     "subrun_count": 0,
                     "inclusive_total_tokens_in": 12000,
                     "inclusive_total_tokens_out": 450,
-                    "inclusive_total_tool_calls": 5,
-                    "total_fresh_tool_calls": 5,
-                    "total_noop_or_cached_tool_calls": 0,
+                    "reported_root_fresh_tool_calls": 5,
+                    "reported_root_noop_or_cached_tool_calls": 0,
                     "safety_guard_blocks": 0,
                     "session_start_count": 1,
                     "session_end_count": 1,
                     "subrun_total_tokens_in": 0,
                     "subrun_total_tokens_out": 0,
                     "subrun_total_duration_ms": 0,
-                    "subrun_total_tool_calls": 0,
+                    "observed_child_tool_requests": 0,
                     "avg_tokens_in": 4000.0,
                     "avg_tokens_out": 150.0,
                     "avg_duration_ms": 2733.33,
@@ -1665,17 +1720,24 @@ mod tests {
         assert!(out.contains("inclusive_tokens_in=12000"));
         assert!(out.contains("avg_tokens_in=4000.0"));
         assert!(out.contains("astra journal digest sess"));
+
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["avg_tokens_in"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_tokens_out"] = serde_json::Value::Null;
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("avg_tokens_in=unknown avg_tokens_out=unknown"));
+        assert!(!out.contains("digest_error"));
     }
 
     #[test]
-    fn text_report_renders_v2_digest_aggregate_names_without_false_zeroes() {
+    fn text_report_renders_v3_digest_aggregate_names_without_false_zeroes() {
         use crate::digest::DigestArtifact;
         let mut r = mk_report_passed();
         r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess-v2".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "sess-v2",
                 "journal_file": "/tmp/sess-v2.jsonl",
                 "journal_lines_non_empty": 2,
@@ -1684,8 +1746,8 @@ mod tests {
                     "attempt_count": 2,
                     "turn_count": 1,
                     "turn_error_count": 1,
-                    "total_tool_calls": 14,
-                    "tool_calls_failed": 2,
+                    "reported_root_tool_calls": 14, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0,
+                    "observed_root_tool_failures": 2, "reported_root_ledger_failed_executions": 2,
                     "error_event_count": 0,
                     "compact_count": 0,
                     "stall_count": 0,
@@ -1695,16 +1757,15 @@ mod tests {
                     "subrun_count": 3,
                     "inclusive_total_tokens_in": 189908,
                     "inclusive_total_tokens_out": 29610,
-                    "inclusive_total_tool_calls": 96,
-                    "total_fresh_tool_calls": 12,
-                    "total_noop_or_cached_tool_calls": 2,
+                    "reported_root_fresh_tool_calls": 12,
+                    "reported_root_noop_or_cached_tool_calls": 2,
                     "safety_guard_blocks": 0,
                     "session_start_count": 1,
                     "session_end_count": 1,
                     "subrun_total_tokens_in": 129761,
                     "subrun_total_tokens_out": 22498,
                     "subrun_total_duration_ms": 0,
-                    "subrun_total_tool_calls": 82,
+                    "observed_child_tool_requests": 82,
                     "avg_tokens_in": 30073.5,
                     "avg_tokens_out": 3556.0,
                     "avg_duration_ms": 58160.0,
@@ -1717,10 +1778,75 @@ mod tests {
         let out = render(&r, Format::Text, false);
         assert!(out.contains("attempts=2 turns=1 turn_errors=1"));
         assert!(out.contains("tool_calls=14 tool_failures=2"));
-        assert!(out.contains("root_tokens_in=60147 root_tokens_out=7112 root_duration_ms=116320"));
-        assert!(out.contains("subruns=3 inclusive_tokens_in=189908"));
+        assert!(out.contains(
+            "known_root_tokens_in=60147 known_root_tokens_out=7112 root_duration_ms=116320"
+        ));
+        assert!(out.contains("subruns=3 known_inclusive_tokens_in=189908"));
         assert!(
             out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
+        );
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["root_tool_counts_complete"] = false.into();
+        digest["aggregates"]["root_tool_totals_complete"] = false.into();
+        digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
+        let partial = render(&r, Format::Text, false);
+        assert!(partial.contains("tool_calls=? tool_failures=?"));
+        assert!(
+            partial.contains(
+                "observed_root_tool_requests=0 (not an execution count) (partial; see coverage)"
+            ),
+            "{partial}"
+        );
+        assert!(partial.contains("tool_reports: terminal_calls=14 ledger_failed_executions=2 observed_failures=2 (observations may overlap)"));
+        assert!(!partial.contains("tool_calls=14"));
+
+        // A retained rejection is still useful when no operation executed.
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["reported_root_tool_calls"] = 0.into();
+        digest["aggregates"]["root_tool_counts_complete"] = true.into();
+        digest["aggregates"]["reported_root_ledger_failed_executions"] = 0.into();
+        digest["aggregates"]["observed_root_tool_failures"] = 1.into();
+        digest["aggregates"]["avg_tool_calls_per_round"] = 0.0.into();
+        let rejected = render(&r, Format::Text, false);
+        assert!(
+            rejected.contains("tool_calls=0 tool_failures=?"),
+            "{rejected}"
+        );
+        assert!(rejected.contains("observed_failures=1"), "{rejected}");
+
+        // A deferred failure remains visible after a later execution.
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["reported_root_tool_calls"] = 1.into();
+        let deferred = render(&r, Format::Text, false);
+        assert!(
+            deferred.contains("tool_calls=1 tool_failures=?"),
+            "{deferred}"
+        );
+        assert!(deferred.contains("observed_failures=1"), "{deferred}");
+
+        r.runs[0].digest.as_mut().unwrap().json["aggregates"]["reported_root_tool_calls"] =
+            0.into();
+        r.runs[0].digest.as_mut().unwrap().json["aggregates"]["observed_root_tool_failures"] =
+            0.into();
+        let no_failure = render(&r, Format::Text, false);
+        assert!(!no_failure.contains("tool_reports:"), "{no_failure}");
+        r.runs[0].digest.as_mut().unwrap().json["conflicting_terminal_count"] = 1.into();
+        let conflict = render(&r, Format::Text, false);
+        assert!(
+            conflict.contains("conflicting_terminals=1 (excluded from attempt totals)"),
+            "{conflict}"
+        );
+        r.runs[0].digest.as_mut().unwrap().json["conflicting_round_count"] = 1.into();
+        let conflict = render(&r, Format::Text, false);
+        assert!(
+            conflict.contains(
+                "observed_root_tool_requests=0 (not an execution count) (partial; see coverage)"
+            ),
+            "{conflict}"
+        );
+        assert!(
+            conflict.contains("observed_child_tool_requests=82 (partial; see coverage)"),
+            "{conflict}"
         );
     }
 
@@ -1732,7 +1858,7 @@ mod tests {
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "requested".into(),
             json: serde_json::json!({
-                "schema_version": "astra-journal-digest-v2",
+                "schema_version": "astra-journal-digest-v3",
                 "session_id": "foreign",
                 "journal_file": "/tmp/foreign.jsonl",
                 "journal_lines_non_empty": 1,

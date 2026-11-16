@@ -2541,8 +2541,7 @@ mod tests {
                 "output_tokens": 3,
                 "total_tokens": 10,
                 "usage_scope": "run_total",
-                "tool_call_count": 2,
-                "index": 5
+                "tool_call_count": 2
             })
         );
         assert_eq!(
@@ -2607,8 +2606,7 @@ mod tests {
                     "output_tokens": 3,
                     "total_tokens": 10,
                     "usage_scope": "run_total",
-                    "tool_call_count": 2,
-                    "index": 3
+                    "tool_call_count": 2
                 }),
                 serde_json::json!({
                     "type": "run_finished",

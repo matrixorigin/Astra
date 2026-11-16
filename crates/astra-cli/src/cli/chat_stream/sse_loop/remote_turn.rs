@@ -523,12 +523,16 @@ pub(super) async fn consume_remote_turn(
                 tracing::warn!(session_id=session,%error,"failed to flush interrupted remote turn journal");
             }
             if let Some(interruption) = state.interruption.as_ref() {
-                let event = JournalEvent::interruption_recorded(
+                let mut event = JournalEvent::interruption_recorded(
                     Some(session),
                     state.session_turn.max(1),
                     interruption.to_json(),
                 )
-                .with_agentic_step(Some(1));
+                .with_agentic_step(Some(1))
+                .with_producer_scope(state.current_run_id.as_deref());
+                if let Some(metadata) = event.metadata.as_mut() {
+                    metadata["source"] = serde_json::json!("remote_stream");
+                }
                 if let Ok(writer) =
                     journal_writer_for_owner(state.owner_user_id.as_deref(), session)
                     && let Err(error) = writer.append(&event)

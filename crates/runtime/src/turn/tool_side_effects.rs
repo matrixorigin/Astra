@@ -9,12 +9,7 @@ use serde_json::Value;
 /// with `CloudGatedToolKind::Write`. Keep this supplemental list limited to
 /// tools cross-checked against edge schemas or internal rollback hooks that can
 /// change local files/git state but are not cloud-gated.
-const NON_CLOUD_MUTATION_TOOLS: &[&str] = &[
-    "apply_patch",
-    // Conservative: even a no-op checkout can refresh file contents.
-    "rollback_git_worktrees",
-    "worktree",
-];
+const NON_CLOUD_MUTATION_TOOLS: &[&str] = &["apply_patch", "worktree"];
 
 /// Tools that can directly change files or VCS state in the bound workspace.
 ///
@@ -34,7 +29,6 @@ const DIRECT_WORKSPACE_MUTATION_TOOLS: &[&str] = &[
     "delete_file",
     "notebook_edit",
     "rollback_file_edits",
-    "rollback_git_worktrees",
     "worktree",
     "rename_symbol",
 ];
@@ -282,7 +276,7 @@ mod tests {
                     .map(str::to_string)
             })
             .collect();
-        let internal_hooks = ["apply_patch", "rollback_git_worktrees"];
+        let internal_hooks = ["apply_patch"];
 
         for &name in NON_CLOUD_MUTATION_TOOLS {
             assert!(

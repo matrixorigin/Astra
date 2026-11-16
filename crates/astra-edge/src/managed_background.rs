@@ -8,6 +8,7 @@ use fs2::FileExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
+#[cfg(test)]
 use std::future::Future;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
@@ -117,6 +118,7 @@ fn should_detach_with(
         && matches!(user_runner_identity_with(args, workspace_env), Ok(Some(_)))
 }
 
+#[cfg(test)]
 pub async fn until_cancelled<T>(
     shutdown: &CancellationToken,
     work: impl Future<Output = T>,

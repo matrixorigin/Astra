@@ -1,10 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{
-    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel,
-    tool_output_limit, truncate_output,
-};
+use super::{SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, tool_output_limit, truncate_output};
 use astra_runtime::tool_sandbox::validate_path;
 use astra_tools::fs_ops::{
     PreparedWriteFile, normalize_read_file_line_range, read_to_string_lossy, unified_diff_raw,
@@ -473,80 +470,6 @@ impl ToolExecutor {
                      • read_file(path=\"{path_str}\", start_line=N, end_line=M) — specific range\n\
                      • grep(pattern=\"keyword\", path=\"{path_str}\") — find specific symbols",
                 ));
-            }
-        }
-
-        // Aggregate output gate: when cumulative tool output this turn is
-        // already high and a full-file read would be too large, auto-downgrade
-        // to outline mode instead of blocking. Ranged reads are always allowed
-        // (they're already targeted). Degrades gracefully instead of blocking.
-        if !has_range && !has_outline {
-            let agg = self
-                .aggregate_output_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if agg > AGGREGATE_SOFT_LIMIT {
-                if let Ok(meta) = fs::metadata(&path) {
-                    let size = meta.len() as usize;
-                    let remaining = AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
-                    if size > remaining {
-                        // Auto-downgrade: return outline instead of full content
-                        let content_for_outline =
-                            if let Some(cached) = self.get_cached_content(&path) {
-                                cached
-                            } else {
-                                read_to_string_lossy(&path)
-                                    .map_err(|e| FsLeafError::io(&e, format!("Error: {e}")))?
-                            };
-                        let total_lines = content_for_outline.lines().count();
-                        let (safe_content_for_outline, _) =
-                            astra_text_utils::credential_redaction::redact_credentials_in_text(
-                                &content_for_outline,
-                            );
-                        if let Some(outline) = astra_tools::fs_ops::render_outline(
-                            &path,
-                            &content_for_outline,
-                            total_lines,
-                        ) {
-                            self.record_read_cached(&path, true, content_for_outline.clone());
-                            return Ok(format!(
-                                "[Auto-downgraded to outline — aggregate output budget is high \
-                                 ({agg} bytes used). Use start_line/end_line to read specific sections.]\n{outline}"
-                            ));
-                        }
-
-                        // No outline available — return truncated content with hint
-                        let marker = format!(
-                            "\n[Auto-truncated — aggregate output budget is high \
-                             ({agg} bytes used, file has {total_lines} lines). \
-                             Use start_line/end_line to read specific sections.]"
-                        );
-                        let budget = self
-                            .read_file_body_output_limit()
-                            .saturating_sub(marker.chars().count());
-                        let lines: Vec<&str> = safe_content_for_outline.split('\n').collect();
-                        let delivery = add_line_numbers_budgeted(&lines, 1, budget);
-                        let end = delivery.complete_lines.min(total_lines);
-                        let delivered_range = (end > 0
-                            && safe_content_for_outline.lines().count() == total_lines)
-                            .then_some(super::file_state::DeliveredLineRange {
-                                start: 1,
-                                end: end as u64,
-                            });
-                        self.record_read_with_delivery_range_cached(
-                            &path,
-                            true,
-                            content_for_outline,
-                            delivered_range,
-                        );
-                        let mut delivered = delivery.output;
-                        push_suffix_if_fits(
-                            &mut delivered,
-                            &marker,
-                            self.read_file_model_output_limit(),
-                        );
-                        return Ok(delivered);
-                    }
-                }
             }
         }
 

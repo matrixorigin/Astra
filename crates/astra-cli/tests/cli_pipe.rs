@@ -560,7 +560,7 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                     } else {
                         json!({"type":"run_error", "run_id":"failure-root", "error":message, "error_code":kind, "error_kind":kind})
                     });
-                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": kind, "error": message}));
+                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_code": kind, "error_kind": kind, "error": message}));
                 }
                 let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
                 ([

@@ -17,6 +17,9 @@ mod skill_ledger_tests;
 
 #[path = "provider_rejection_tests.rs"]
 mod provider_rejection_tests;
+
+#[path = "work_input_recovery_tests.rs"]
+mod work_input_recovery_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1839,16 +1842,67 @@ async fn session_continuation_restores_primary_attempt_after_run_recovery() {
     exercise_primary_attempt_continuation(ContinuationFixture::Recovered).await;
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn explicit_new_turn_continues_unassigned_durable_work_without_cached_binding() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Unassigned).await;
+}
+
+#[derive(Clone, Copy)]
 enum ContinuationFixture {
+    Unassigned,
     Direct,
     NewTurn,
     Compacted,
     Recovered,
+    BudgetRecovered,
+    ContextWindowRecovered,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn reactive_budget_recovery_keeps_cache_prefix_without_artifact_sql() {
+    exercise_primary_attempt_continuation(ContinuationFixture::BudgetRecovered).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn provider_overflow_recovers_unique_history_through_authorized_artifact() {
+    exercise_primary_attempt_continuation(ContinuationFixture::ContextWindowRecovered).await;
+}
+
+fn native_work_provider_response(
+    request: &Value,
+    prompt_tokens: u64,
+    message: Value,
+) -> axum::response::Response {
+    use axum::{Json, response::IntoResponse};
+    let reason = if message.get("tool_calls").is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    if request["stream"].as_bool() == Some(true) {
+        let mut delta = message.clone();
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = json!(index);
+            }
+        }
+        let chunk = json!({"choices":[{"index":0,"delta":delta}]});
+        let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}});
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    } else {
+        Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}})).into_response()
+    }
 }
 
 async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     let through_new_turn = !matches!(fixture, ContinuationFixture::Direct);
-    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
     use astra_services::work::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         InternalSessionId, NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt,
@@ -1968,6 +2022,23 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         .await
         .expect("accept continuation plan");
 
+    if matches!(fixture, ContinuationFixture::Unassigned) {
+        exercise_primary_continuation_entry(
+            &pool,
+            &owner,
+            &session,
+            &work,
+            &branch,
+            "",
+            "",
+            ContinuationFixture::Unassigned,
+        )
+        .await;
+        cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
+        crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
+        return;
+    }
+
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let old_authority = engine
         .start_run(&old_run, &owner, &session)
@@ -2037,14 +2108,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     }
     if through_new_turn {
         exercise_primary_continuation_entry(
-            &pool,
-            &owner,
-            &session,
-            &work,
-            &branch,
-            &attempt,
-            &old_run,
-            compact_history,
+            &pool, &owner, &session, &work, &branch, &attempt, &old_run, fixture,
         )
         .await;
         cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
@@ -2165,8 +2229,16 @@ async fn exercise_primary_continuation_entry(
     branch: &str,
     attempt: &str,
     old_run: &str,
-    compact_history: bool,
+    fixture: ContinuationFixture,
 ) {
+    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
+    let budget_recovery = matches!(fixture, ContinuationFixture::BudgetRecovered);
+    let overflow_recovery = matches!(fixture, ContinuationFixture::ContextWindowRecovered);
+    let context_window = if budget_recovery || overflow_recovery {
+        120_000u32
+    } else {
+        128_000
+    };
     use axum::{Router, extract::State, response::IntoResponse, routing::post};
     #[derive(Clone)]
     struct Probe {
@@ -2178,6 +2250,9 @@ async fn exercise_primary_continuation_entry(
         tool_feedback: Arc<TokioMutex<Vec<Value>>>,
         first_request: Arc<TokioMutex<Option<Value>>>,
         summary_requests: Arc<AtomicUsize>,
+        primary_requests: Arc<TokioMutex<Vec<Value>>>,
+        budget_recovery: bool,
+        overflow_recovery: bool,
     }
     async fn respond(
         State(probe): State<Probe>,
@@ -2188,6 +2263,23 @@ async fn exercise_primary_continuation_entry(
             message["content"].as_str()
                 == Some(astra_turn_core::cloud::summary::INLINE_COMPACT_INSTRUCTION)
         });
+        let ordinal = if is_summary {
+            0
+        } else {
+            let mut primary = probe.primary_requests.lock().await;
+            primary.push(request.clone());
+            primary.len()
+        };
+        if probe.overflow_recovery && ordinal == 1 {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input exceeds the provider context window"}
+            }))).into_response();
+        }
+        let prompt_tokens = if probe.budget_recovery && ordinal == 1 {
+            100_000
+        } else {
+            3
+        };
         let message = if is_summary {
             assert!(
                 probe.first_request.lock().await.is_none(),
@@ -2239,9 +2331,31 @@ async fn exercise_primary_continuation_entry(
                     .cloned()
                     .collect();
             }
-            let row: (String, String, Option<String>) = sqlx::query_as(
-            "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
-        ).bind(&probe.owner).bind(&probe.attempt).fetch_one(probe.pool.get()).await.expect("observe attempt at provider boundary");
+            let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)",
+            ).bind(&probe.owner).bind(&probe.attempt).bind(&probe.attempt)
+                .fetch_optional(probe.pool.get()).await.expect("observe attempt at provider boundary");
+            let Some(row) = row else {
+                assert!(
+                    probe.attempt.is_empty(),
+                    "a restored attempt must already exist"
+                );
+                let calls = request["tools"].as_array().expect("provider tools");
+                assert!(
+                    calls
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "run_next_work_item"),
+                    "explicit continuation remains discoverable"
+                );
+                return native_work_provider_response(
+                    &request,
+                    prompt_tokens,
+                    json!({"role":"assistant","content":null,"tool_calls":[{
+                        "id":"continue-unassigned-work","type":"function",
+                        "function":{"name":"run_next_work_item","arguments":"{}"}
+                    }]}),
+                );
+            };
             probe.observations.lock().await.push(row.clone());
             let can_settle = request["tools"].as_array().is_some_and(|tools| {
                 tools
@@ -2299,34 +2413,14 @@ async fn exercise_primary_continuation_entry(
                 json!({"role":"assistant","content":"Review delivered."})
             }
         };
-        let reason = if message.get("tool_calls").is_some() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        if request["stream"].as_bool() == Some(true) {
-            let mut delta = message.clone();
-            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                for (index, call) in calls.iter_mut().enumerate() {
-                    call["index"] = json!(index);
-                }
-            }
-            let chunk = json!({"choices":[{"index":0,"delta":delta}]});
-            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}});
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
-            )
-                .into_response()
-        } else {
-            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})).into_response()
-        }
+        native_work_provider_response(&request, prompt_tokens, message)
     }
     let observations = Arc::new(TokioMutex::new(Vec::new()));
     let settlements = Arc::new(AtomicUsize::new(0));
     let tool_feedback = Arc::new(TokioMutex::new(Vec::new()));
     let first_request = Arc::new(TokioMutex::new(None));
     let summary_requests = Arc::new(AtomicUsize::new(0));
+    let primary_requests = Arc::new(TokioMutex::new(Vec::new()));
     let probe = Probe {
         pool: pool.clone(),
         owner: owner.into(),
@@ -2336,6 +2430,9 @@ async fn exercise_primary_continuation_entry(
         tool_feedback: tool_feedback.clone(),
         first_request: first_request.clone(),
         summary_requests: summary_requests.clone(),
+        primary_requests: primary_requests.clone(),
+        budget_recovery,
+        overflow_recovery,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2356,9 +2453,9 @@ async fn exercise_primary_continuation_entry(
     };
     let offering_id = format!("continuation-offering-{}", Uuid::new_v4());
     let model_name = format!("continuation-model-{}", Uuid::new_v4());
-    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&offering_id).bind(&model_name)
-        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url)
+        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url).bind(context_window)
         .bind(r#"["text"]"#).bind(r#"["text"]"#).bind("[]").bind("{}").bind("[]").bind("{}")
         .execute(pool.get()).await.expect("seed unique test Offering");
     let service =
@@ -2367,26 +2464,33 @@ async fn exercise_primary_continuation_entry(
                 .with_pool(pool.clone()),
         ));
     let mut created = Vec::new();
-    if compact_history {
+    if compact_history || budget_recovery || overflow_recovery {
         let mut history = vec![
             json!({"role":"user","content":"Read the current continuation live runtime overview."}),
         ];
-        for index in 0..160 {
+        for index in 0..if compact_history { 160 } else { 20 } {
             let call_id = format!("prior-observation-{index}");
             history.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
-            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if budget_recovery { "evidence ".repeat(970) } else if overflow_recovery { format!("CONFIRMED_OBSERVATION_{index}: {}", "unique evidence ".repeat(250)) } else if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
         }
         history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
-        let prompt_limit =
-            crate::prompts::budget_for_model_with_metadata(Some(&model_name), Some(128_000), None)
-                .effective_input_limit();
+        let prompt_limit = crate::prompts::budget_for_model_with_metadata(
+            Some(&model_name),
+            Some(context_window),
+            None,
+        )
+        .effective_input_limit();
         let turn_limit = astra_core::runtime_limits::RuntimeLimits::default()
-            .effective_max_turn_input_tokens_with_context_window(Some(&model_name), Some(128_000));
+            .effective_max_turn_input_tokens_with_context_window(
+                Some(&model_name),
+                Some(context_window),
+            );
         let estimated = crate::prompts::estimate_tokens(&history, 0, 0);
-        assert!(
-            estimated as f64 / turn_limit as f64
-                >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit),
-            "fixture must require pre-turn compaction: {estimated}/{turn_limit}"
+        let requires_compact = estimated as f64 / turn_limit as f64
+            >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit);
+        assert_eq!(
+            requires_compact, compact_history,
+            "fixture pressure: {estimated}/{turn_limit}"
         );
         assert!(
             estimated < prompt_limit,
@@ -2452,16 +2556,31 @@ async fn exercise_primary_continuation_entry(
             offering_id: offering_id.clone(),
         });
         request.session_id = Some(session.into());
-        request.work_binding = Some(astra_services::runs::WorkRuntimeBindingRequest {
-            work_id: work.into(),
-            branch_id: branch.into(),
-            item: None,
-        });
+        if attempt.is_empty() {
+            // Select the existing native Server provider, without supplying a
+            // Work binding or preloading the new executor's Work cache.
+            let binding = astra_services::SessionExecutionBindingV1::server_work_default(format!(
+                "session:{session}:branch:{}",
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            ));
+            request.workspace_binding = Some(binding.workspace);
+            request.executor_binding = Some(binding.executor);
+            request.execution_binding_generation = Some(binding.generation);
+        }
+        request.work_binding =
+            (!attempt.is_empty()).then(|| astra_services::runs::WorkRuntimeBindingRequest {
+                work_id: work.into(),
+                branch_id: branch.into(),
+                item: None,
+            });
         let run = service
             .create_run(owner.into(), request)
             .await
             .expect("new turn entry");
-        let settled = tokio::time::timeout(Duration::from_secs(15), async {
+        // This is a multi-round correctness/watchdog bound, not a latency
+        // assertion. Instrumented builds also drain the real invocation and
+        // canonical-writer owners before inspecting the durable result.
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
             // Terminal status precedes conversation commit and writer release.
             // Await this fixture's existing task accounting without repeatedly
             // loading event history from the pool used by turn settlement.
@@ -2610,8 +2729,120 @@ async fn exercise_primary_continuation_entry(
                 "real compaction must be followed by multiple provider calls"
             );
         }
-        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
-            .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
+        if turn == 0 && (budget_recovery || overflow_recovery) {
+            let primary = primary_requests.lock().await;
+            assert!(
+                primary.len() >= 2,
+                "recovery rebuilds a real provider request"
+            );
+            assert_eq!(
+                summary_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no auxiliary inference"
+            );
+            assert_eq!(
+                primary[0]["tools"], primary[1]["tools"],
+                "stable tool/cache prefix"
+            );
+            assert_eq!(
+                primary[0]["messages"][0], primary[1]["messages"][0],
+                "stable system/cache prefix"
+            );
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT artifact_id, content_json FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_kind=?",
+            ).bind(owner).bind(session).bind(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_KIND)
+                .fetch_all(pool.get()).await.unwrap();
+            assert_eq!(
+                rows.len(),
+                usize::from(overflow_recovery),
+                "only true provider overflow needs an artifact"
+            );
+            if overflow_recovery {
+                let snapshot: astra_turn_types::ContextHistoryArtifactV1 =
+                    serde_json::from_str(&rows[0].1).unwrap();
+                snapshot.validate(session).unwrap();
+                for index in 0..20 {
+                    assert!(
+                        snapshot
+                            .transcript_json
+                            .contains(&format!("CONFIRMED_OBSERVATION_{index}:"))
+                    );
+                }
+                let handle = format!(
+                    "{}{}",
+                    astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+                    rows[0].0
+                );
+                assert!(primary[1]["messages"].to_string().contains(&handle));
+                let reader =
+                    astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
+                        .with_pool(pool.clone());
+                let args = json!({"artifact":handle,"max_bytes":65_536});
+                let output = crate::server::context_history_artifact::resolve_request(
+                    Some(&reader),
+                    owner,
+                    session,
+                    &args,
+                )
+                .await
+                .unwrap();
+                assert!(output.contains("CONFIRMED_OBSERVATION_0:"));
+                assert!(
+                    crate::server::context_history_artifact::resolve_request(
+                        Some(&reader),
+                        "foreign-owner",
+                        session,
+                        &args
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(
+                    crate::server::context_history_artifact::resolve_request(
+                        Some(&reader),
+                        owner,
+                        "foreign-session",
+                        &args
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            let journal =
+                astra_pipeline::step_checkpoint::FileBackedEventStore::load_recent_events_bounded(
+                    owner,
+                    session,
+                    4 * 1024 * 1024,
+                    1000,
+                )
+                .unwrap();
+            assert!(
+                journal.events.iter().any(|event| event.event_type
+                    == astra_pipeline::step_protocol::StepEventType::CompactionFired
+                    && event
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload["tokens_saved"]
+                            .as_u64()
+                            .is_some_and(|tokens| tokens > 0))),
+                "actual recovery saved context"
+            );
+            if budget_recovery {
+                let durable = service
+                    .run_engine
+                    .load_run(owner, &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    durable.total_prompt_tokens,
+                    100_000 + 3 * (primary.len() as u64 - 1),
+                    "each physical primary request remains in raw accounting"
+                );
+            }
+        }
+        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)")
+            .bind(owner).bind(attempt).bind(attempt).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
             terminal.0,
             if turn == 0 { &run.run_id } else { &created[0] }.as_str()
@@ -2627,6 +2858,65 @@ async fn exercise_primary_continuation_entry(
         .await
         .unwrap();
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        if attempt.is_empty() {
+            let admission_scope: (Option<String>,Option<String>,Option<String>) = sqlx::query_as(
+                "SELECT work_id, work_branch_id, work_item_attempt_id FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                admission_scope,
+                (None, None, None),
+                "dynamic task assignment does not rewrite the run's admission scope"
+            );
+            if turn == 0 {
+                let graph = astra_services::work::DatabaseWorkRepository::new(pool.clone())
+                    .load_task_execution_snapshot_for_session(
+                        &astra_services::work::WorkOwnerId::parse(owner).unwrap(),
+                        &astra_services::work::InternalSessionId::parse(session).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let expected = graph
+                    .items()
+                    .iter()
+                    .find(|item| {
+                        item.kind == astra_services::work::WorkItemKind::Task
+                            && item.objective.as_str()
+                                == "Read the current continuation live runtime overview."
+                    })
+                    .expect("the existing declared task");
+                let durable:(String,String,String,i64,String)=sqlx::query_as(
+                    "SELECT work_id, branch_id, work_item_id, work_item_revision, attempt_id FROM work_item_attempts WHERE owner_id=? AND executor_run_id=?")
+                    .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+                assert_eq!(durable.0, work);
+                assert_eq!(durable.1, branch);
+                assert_eq!(durable.2, expected.item_id.as_str());
+                assert_eq!(durable.3, expected.revision.get());
+                assert!(
+                    !durable.4.is_empty(),
+                    "the declared task owns its durable attempt"
+                );
+            }
+        }
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM works WHERE owner_id = ?")
+            .bind(owner)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            works, 1,
+            "continuation must not synthesize a replacement Work"
+        );
+        let genesis_operations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_establishment_operations WHERE owner_id = ?",
+        )
+        .bind(owner)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            genesis_operations, 0,
+            "continuation must not leave speculative genesis operations"
+        );
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
         created.push(run.run_id);
@@ -18664,7 +18954,11 @@ async fn native_edge_execution_reports_capability_schema_errors() {
                 .await
                 .unwrap();
             let text = std::str::from_utf8(&body).unwrap();
-            let data = text.strip_prefix("data: ").unwrap().trim();
+            assert!(text.ends_with("data: [DONE]\n\n"));
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("capability rejection SSE data frame");
             let event =
                 astra_thin_client::classify_stream_event(serde_json::from_str(data).unwrap())
                     .unwrap();
@@ -23019,6 +23313,12 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         )
         .await
         .expect("seed durable replay run");
+    svc.run_engine.append_events_batch("user-1", session_id, run_id, &[
+        json!({"event_type":"text_done","data":{"full_text":"Durably saved answer"}}),
+        json!({"event_type":"run_finished","data":{"run_id":run_id,"status":"completed","owner_generation":0,
+            "prompt_tokens":7,"completion_tokens":3,
+            "last_request_usage":{"prompt_tokens":7,"cache_read_tokens":0,"cache_creation_tokens":0,"completion_tokens":3}}}),
+    ]).await.expect("journal the completed answer and owner receipt");
     assert!(
         svc.run_engine
             .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
@@ -23061,6 +23361,46 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         llm.requests.load(Ordering::SeqCst),
         0,
         "an exact replay must not execute a child or make a model request"
+    );
+
+    let projected = crate::server::run::handlers::transform_stream_run_events_for_client(
+        run_id,
+        replay.events.clone(),
+    );
+    let receipt = projected
+        .iter()
+        .find(|event| event["type"] == "run_finished")
+        .expect("durable receipt");
+    for kind in ["usage", "context_usage"] {
+        let prefix = projected
+            .iter()
+            .find(|event| event["type"] == kind)
+            .expect("accounting prefix");
+        assert!(
+            prefix.get("index").is_none(),
+            "only the final receipt commits this durable event"
+        );
+    }
+    assert_eq!(receipt["owner_generation"], 0);
+    assert!(receipt["index"].as_u64().is_some());
+    assert!(
+        projected
+            .iter()
+            .any(|event| event["type"] == "text_done"
+                && event["full_text"] == "Durably saved answer")
+    );
+    assert!(
+        !projected
+            .iter()
+            .any(|event| event["type"] == "turn_complete")
+    );
+    let response = crate::server::http_helpers::sse_json_response(projected);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        body.ends_with(b"data: [DONE]\n\n"),
+        "replay closes observation without fabricating a completion projection"
     );
 
     let after = svc
@@ -28710,6 +29050,7 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .unwrap();
     // Let the task install its lifetime guard before simulating a task failure.
@@ -28742,6 +29083,7 @@ async fn fresh_control_watcher_observes_committed_guidance() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        Some("untrusted-parent".into()),
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -28780,6 +29122,7 @@ async fn active_run_control_watcher_retries_control_failure_without_losing_pause
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        None,
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -28819,6 +29162,7 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -28850,6 +29194,17 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let ids = (0..1000)
         .map(|i| format!("{prefix}-{i}"))
         .collect::<Vec<_>>();
+    let run_ids = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            if index % 8 >= 4 {
+                format!("{id}-child")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_sessions (user_id,session_id,status) ",
     );
@@ -28865,12 +29220,33 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(id)
             .push_bind(id)
             .push_bind(id)
-            .push_bind(format!("/{id}"))
+            .push_bind(id)
             .push_bind("running")
             .push_bind(1)
             .push_bind(7);
     });
     runs.build().execute(pool.get()).await.unwrap();
+    let children = ids
+        .iter()
+        .zip(&run_ids)
+        .filter(|(root, run)| root != run)
+        .collect::<Vec<_>>();
+    let mut child_runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status,run_generation,last_event_idx) ",
+    );
+    child_runs.push_values(&children, |mut row, (root, child)| {
+        row.push_bind(*root)
+            .push_bind(*root)
+            .push_bind(*child)
+            .push_bind(*root)
+            .push_bind(*root)
+            .push_bind(format!("{root}/{child}"))
+            .push_bind(1)
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    child_runs.build().execute(pool.get()).await.unwrap();
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let control: Arc<dyn RunControlProvider> = Arc::new(engine);
     // Hot-checkout telemetry excludes newly established physical connections.
@@ -28883,7 +29259,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let before = astra_core::matrixone_pool_telemetry_snapshot();
     let started = Instant::now();
     let mut watchers = Vec::new();
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let cancel = Arc::new(CancellationToken::new());
         let pause = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
@@ -28892,7 +29268,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             Some(control.clone()),
             id.clone(),
             id.clone(),
-            id.clone(),
+            run_ids[index].clone(),
             Some(1),
             Arc::new(AtomicBool::new(false)),
             pause.clone(),
@@ -28900,6 +29276,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             lost.clone(),
             sender,
             tokio::sync::watch::channel(-1).0,
+            (index % 8 >= 4).then(|| id.clone()),
         )
         .unwrap();
         watchers.push((guard, cancel, pause, lost, receiver));
@@ -28918,30 +29295,50 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     .expect("first shared control sweep");
     let first_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    // Mixed hinted/unhinted reads use separate queries. Allow partial batches
+    // from the four workers while still excluding per-child polling.
     assert!(
-        (8..=12).contains(&first_reads),
-        "1000 roots must batch, got {first_reads} checkouts"
+        (8..=24).contains(&first_reads),
+        "1000 roots and children must batch, got {first_reads} checkouts"
     );
     let initial_ms = started.elapsed().as_millis();
 
     // A separate pool represents a different control-plane process. The live
     // observers receive no local notification of these durable changes.
     let independent = SharedPool::new(pool.settings()).await.unwrap();
-    for group in 0..4 {
+    // Update each observed run's input watermark; control changes for a child
+    // are made only on its parent through the independent pool.
+    let mut watermark = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE agent_runs SET last_event_idx=9 WHERE run_id IN (",
+    );
+    {
+        let mut selected = watermark.separated(",");
+        for run in &run_ids {
+            selected.push_bind(run);
+        }
+    }
+    watermark
+        .push(")")
+        .build()
+        .execute(independent.get())
+        .await
+        .unwrap();
+    for group in 0..3 {
         let update = match group {
             0 => "cancellation_requested_at=NOW(6)",
             1 => "run_generation=2",
-            2 => "status='paused',waiting_for='user_pause'",
-            _ => "status='running'",
+            _ => "status='paused',waiting_for='user_pause'",
         };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+            "UPDATE agent_runs SET {update} WHERE run_id IN ("
         ));
         {
             let mut selected = query.separated(",");
             for (index, id) in ids.iter().enumerate() {
                 if index % 4 == group {
-                    selected.push_bind(id);
+                    // Ownership belongs to the observed run; inherited
+                    // cancellation and pause belong to its parent.
+                    selected.push_bind(if group == 1 { &run_ids[index] } else { id });
                 }
             }
         }
@@ -28976,17 +29373,177 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let next_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
     assert!(
-        (8..=12).contains(&next_reads),
+        (8..=24).contains(&next_reads),
         "changed sweep must also batch: {next_reads}"
     );
     println!(
-        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        "control_watchers owners=1000 direct_children=500 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
         changed.elapsed().as_millis()
     );
     drop(watchers);
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    for table in ["agent_runs", "agent_sessions"] {
+    // Reuse four direct children for two real watcher waves. The joined SQL
+    // response is held after execution while the existing plain read remains
+    // healthy; none of these controls is delivered through a local token.
+    for index in 4..8 {
+        sqlx::query("UPDATE agent_runs SET status='running',waiting_for=NULL,cancellation_requested_at=NULL,run_generation=1,last_guidance_event_idx=-1 WHERE user_id=? AND run_id IN (?,?)")
+            .bind(&ids[index]).bind(&ids[index]).bind(&run_ids[index])
+            .execute(independent.get()).await.unwrap();
+    }
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(independent.clone())));
+    assert!(
+        writer
+            .request_run_cancellation(&ids[4], &run_ids[4])
+            .await
+            .unwrap()
+    );
+    writer
+        .append_event(
+            &ids[5],
+            &ids[5],
+            &run_ids[5],
+            json!({"event_type":"user_intent","id":format!("{prefix}-fault-guidance")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&ids[5], &run_ids[5])
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&ids[6], &ids[6])
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &ids[7],
+                expected_session_id: &ids[7],
+                run_id: &ids[7],
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+
+    use crate::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let proxy = ResponseProxy::start(
+        pool.settings().host.clone(),
+        pool.settings().port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(pool.settings(), proxy.port, 4).await;
+    let fault_control: Arc<dyn RunControlProvider> = Arc::new(RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(fault_pool.clone()),
+    )));
+    for wave in 0..2 {
+        proxy.gate.armed.store(false, Ordering::SeqCst);
+        proxy.gate.continuous.store(true, Ordering::SeqCst);
+        let mut fault_watchers = Vec::new();
+        // Four watchers per child keep all four distinct owners in one batch.
+        for ordinal in 0..16 {
+            let index = 4 + ordinal % 4;
+            let cancel = Arc::new(CancellationToken::new());
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let lease_lost = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let (guidance, receiver) = tokio::sync::watch::channel(-1);
+            let guard = start_active_run_control_watcher(
+                Some(fault_control.clone()),
+                ids[index].clone(),
+                ids[index].clone(),
+                run_ids[index].clone(),
+                Some(1),
+                cancel_flag.clone(),
+                pause.clone(),
+                cancel.clone(),
+                lease_lost.clone(),
+                tokio::sync::watch::channel(-1).0,
+                guidance,
+                Some(ids[index].clone()),
+            )
+            .unwrap();
+            fault_watchers.push((
+                index,
+                guard,
+                cancel_flag,
+                cancel,
+                pause,
+                lease_lost,
+                receiver,
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined watcher batch was not gated");
+        // A watcher that bypasses the held batch would otherwise make the
+        // regression pass without exercising recovery.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (_, _, cancel_flag, cancel, pause, lease_lost, guidance) in &fault_watchers {
+            assert!(!cancel_flag.load(Ordering::Acquire));
+            assert!(!cancel.is_cancelled());
+            assert!(!pause.load(Ordering::Acquire));
+            assert!(!lease_lost.load(Ordering::Acquire));
+            assert_eq!(*guidance.borrow(), -1);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(fault_watchers.iter_mut().map(
+                |(index, _, _, cancel, pause, _, guidance)| async move {
+                    match *index {
+                        4 | 6 => cancel.cancelled().await,
+                        5 => {
+                            while *guidance.borrow_and_update() < guidance_index {
+                                guidance.changed().await.unwrap();
+                            }
+                        }
+                        7 => {
+                            while !pause.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            )),
+        )
+        .await
+        .expect("watchers must recover child controls before the joined response is released");
+        for (index, _, cancel_flag, cancel, pause, lease_lost, _) in &fault_watchers {
+            assert!(
+                !lease_lost.load(Ordering::Acquire),
+                "valid identity must not lose its lease"
+            );
+            if *index == 4 || *index == 6 {
+                assert!(cancel_flag.load(Ordering::Acquire));
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(!cancel_flag.load(Ordering::Acquire));
+                assert!(!cancel.is_cancelled());
+                assert_eq!(pause.load(Ordering::Acquire), *index == 7);
+            }
+        }
+        println!(
+            "control_watchers joined_fault_wave={} recovered=16",
+            wave + 1
+        );
+        proxy.gate.continuous.store(false, Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        drop(fault_watchers);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(fault_control);
+    fault_pool.close().await;
+    for table in ["agent_run_events", "agent_runs", "agent_sessions"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id LIKE ?"
         )))
@@ -29021,6 +29578,7 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29059,6 +29617,7 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 

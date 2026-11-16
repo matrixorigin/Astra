@@ -1,4 +1,6 @@
+import workProjection from "../../../../packages/sdk/src/__tests__/__fixtures__/sse/work-turn-projection.json";
 const streamHarness = vi.hoisted(() => ({
+  real: false,
   instances: [] as Array<{
     options: Record<string, any>;
     close: ReturnType<typeof vi.fn>;
@@ -20,7 +22,9 @@ vi.mock("@astra/sdk", async (importOriginal) => {
       this.options.onStateChange?.("connecting");
     }
   }
-  return { ...original, SSEClient: TestSSEClient };
+  return { ...original, SSEClient: function(options: any) {
+    return streamHarness.real ? new original.SSEClient(options) : new TestSSEClient(options);
+  } };
 });
 
 const refresh = vi.fn();
@@ -61,6 +65,7 @@ beforeEach(() => {
     },
   });
   streamHarness.instances.length = 0;
+  streamHarness.real = false;
   Object.defineProperty(globalThis.crypto, "randomUUID", {
     configurable: true,
     value: vi.fn(() => "00000000-0000-4000-8000-000000000011"),
@@ -90,7 +95,10 @@ test("shows hook configuration warnings and continues the same Work turn", async
   expect(screen.getByRole("alert")).toHaveTextContent(message);
   expect(client.close).not.toHaveBeenCalled();
   expect(screen.getByText("answer")).toBeInTheDocument();
-  act(() => client.options.onEvent({ type: "turn_complete", run_id: "run-1", assistant_text: "answer" }));
+  act(() => {
+    client.options.onEvent({ type: "run_finished", run_id: "run-1", owner_generation: 4, status: "completed" });
+    client.options.onEvent({ type: "turn_complete", run_id: "run-1", continuation_owner: "server", assistant_text: "answer" });
+  });
   expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled();
   expect(refresh).toHaveBeenCalledOnce();
 });
@@ -160,7 +168,9 @@ test("submits one typed Work turn and applies only decoded visible text", async 
     instance.options.onEvent({ type: "ping" });
     instance.options.onEvent({ type: "reasoning_delta", content: "private reasoning" });
     instance.options.onEvent({ type: "text_delta", content: "I started the work." });
-    instance.options.onEvent({ type: "turn_complete" });
+    instance.options.onEvent({ type: "run_finished", run_id: "run-1", owner_generation: 4, status: "completed" });
+    expect(refresh).not.toHaveBeenCalled();
+    instance.options.onEvent({ type: "turn_complete", continuation_owner: "server" });
   });
 
   expect(screen.getByText("I started the work.")).toBeInTheDocument();
@@ -584,7 +594,7 @@ test("keeps the root interaction card when a child run fails", () => {
     });
   });
   expect(screen.getByRole("button", { name: "Submit answer" })).toBeInTheDocument();
-  expect(screen.getByRole("alert")).toHaveTextContent(/nested Work step failed/i);
+  expect(screen.getByRole("alert")).toHaveTextContent(/nested Work step reported an error/i);
 });
 
 test("refreshes the Work projection once per committed Task Graph revision", () => {
@@ -623,7 +633,7 @@ test("refreshes the Work projection once per committed Task Graph revision", () 
   expect(refresh).toHaveBeenCalledTimes(1);
 });
 
-test("reconnects a dropped stream with the same durable request identity", async () => {
+test.each(["missing receipt", "completed receipt", "diagnostic", "5xx", "408", "protocol failure"])("reconnects a dropped stream with the same durable request identity (prior=%s)", async (prior) => {
   render(
     <StrictMode>
       <WorkTurnComposer
@@ -639,13 +649,41 @@ test("reconnects a dropped stream with the same durable request identity", async
   fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
   const first = streamHarness.instances[0]!;
 
-  act(() => first.options.onStateChange("disconnected"));
+  act(() => {
+    if (prior !== "5xx" && prior !== "408") first.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root" });
+    first.options.onEvent({ type: "text_delta", content: "Useful partial answer" });
+    if (prior === "5xx" || prior === "408") {
+      // Use the same HTTP decoder the public SSE client invokes.
+      void first.options.decodeHttpError(new Response("gateway unavailable", { status: prior === "5xx" ? 503 : 408 }))
+        .then((event: unknown) => first.options.onEvent(event));
+    }
+    if (prior === "protocol failure") first.options.onEvent({ type: "run_started", run_id: "root", session_id: "private" });
+    if (prior === "diagnostic") {
+      first.options.onEvent({ type: "run_error", run_id: "root", message: "Storage unavailable", error_kind: "database_error" });
+      first.options.onEvent({ type: "error", run_id: "root", code: "stream_observation_interrupted", message: "Run outcome unconfirmed", retryable: false });
+    }
+    if (prior === "completed receipt") first.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "completed" });
+    first.options.onStateChange("disconnected");
+  });
+  expect(screen.getByText("Useful partial answer")).toBeInTheDocument();
+  if (prior === "5xx" || prior === "408") await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent("could not be confirmed"));
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+  if (prior === "diagnostic") expect(screen.getByRole("alert")).toHaveTextContent("Storage unavailable");
   fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
 
   expect(streamHarness.instances).toHaveLength(2);
   expect(JSON.parse(streamHarness.instances[1]!.options.body).request_id).toBe(
     JSON.parse(first.options.body).request_id,
   );
+  act(() => {
+    const retry = streamHarness.instances[1]!;
+    retry.options.onEvent({ type: "text_done", full_text: "Durably saved answer" });
+    retry.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, index: 12, status: "completed" });
+  });
+  expect(screen.getByText("Durably saved answer")).toBeInTheDocument();
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled();
+  expect(refresh).toHaveBeenCalledOnce();
 });
 
 test("fails closed when a Work stream exposes internal session identity", () => {
@@ -672,10 +710,12 @@ test("fails closed when a Work stream exposes internal session identity", () => 
 
   expect(screen.getByRole("alert")).toHaveTextContent(/invalid Work event/i);
   expect(instance.close).toHaveBeenCalledTimes(1);
-  expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(JSON.parse(streamHarness.instances[1]!.options.body).request_id).toBe(JSON.parse(instance.options.body).request_id);
 });
 
-test("does not offer reconnect after a typed terminal run error", () => {
+test("does not offer reconnect after an owned failed receipt", () => {
   render(
     <WorkTurnComposer
       workId="work-1"
@@ -690,7 +730,7 @@ test("does not offer reconnect after a typed terminal run error", () => {
   const instance = streamHarness.instances[0]!;
 
   act(() => {
-    instance.options.onEvent({ type: "run_error", code: "provider_failed" });
+    instance.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "failed", error: "The run failed." });
     instance.options.onStateChange("disconnected");
   });
 
@@ -899,39 +939,202 @@ test("does not invent execution location when stopping a takeover is unconfirmed
   expect(screen.queryByRole("alert")).not.toHaveTextContent(/active on the other device/i);
 });
 
-test("keeps viewing without losing guidance or leaving optimistic messages behind", () => {
-  render(
-    <WorkTurnComposer
-      workId="work-1"
-      branchId="branch-1"
-      attachmentId="attachment-1"
-      branchRevision={3}
-      controlBasis={{ writer_epoch: 4, canonical_root_hash: "a".repeat(64) }}
-    />,
-  );
-  const composer = screen.getByRole("textbox", { name: "Guide this Work" });
-  fireEvent.change(composer, { target: { value: "Keep this guidance safe" } });
+
+test("a definite pre-admission HTTP rejection releases the rejected request", async () => {
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
   fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
   const first = streamHarness.instances[0]!;
-
+  const rejection = await first.options.decodeHttpError(new Response('{"code":"invalid_request"}', { status: 400 }));
   act(() => {
-    first.options.onEvent({
-      type: "error",
-      code: "writer_conflict",
-      message: "This Work is active elsewhere. You can keep viewing it here.",
-      retryable: false,
-      http_status: 409,
-      action_hints: ["refresh_work"],
-    });
+    first.options.onEvent(rejection);
+    first.options.onStateChange("disconnected");
   });
-  fireEvent.click(screen.getByRole("button", { name: "Keep viewing" }));
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled();
+  expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+});
 
-  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toHaveValue(
-    "Keep this guidance safe",
-  );
-  expect(screen.queryByText("You")).not.toBeInTheDocument();
-  expect(screen.queryByText("Astra")).not.toBeInTheDocument();
-  expect(first.close).toHaveBeenCalledTimes(1);
-  expect(forceTakeover).not.toHaveBeenCalled();
-  expect(refresh).toHaveBeenCalledTimes(1);
+test.each(["live", "replay"])("the real Work stream consumes canonical producer facts through %s completion", async mode => {
+  streamHarness.real = true;
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { source = controller; } });
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body));
+  const emit = (...events: unknown[]) => source.enqueue(new TextEncoder().encode(
+    events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")));
+  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  try {
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    emit({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "run-1" },
+      ...workProjection.events.slice(0, -1),
+      { type: "future_observation", status: "completed", graph_revision: 999 });
+    await screen.findByText("Durably saved Work answer");
+    expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(refresh).not.toHaveBeenCalled();
+    const receipt: Record<string, unknown> = { ...workProjection.events.at(-1)! };
+    if (mode === "live") delete receipt.index;
+    emit(receipt);
+    if (mode === "live") {
+      // The producer's live receipt must not release the request before projection.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      emit({ type: "turn_complete", continuation_owner: "server", assistant_text: "Final Work answer" });
+    }
+    source.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    rendered.unmount();
+    fetch.mockRestore();
+  }
+});
+
+test.each([
+  { status: 503, admitted: true }, { status: 408, admitted: true },
+  { status: 403, admitted: false }, { status: 409, admitted: false },
+])("an uncertain Work survives recovery HTTP$status (admitted=$admitted)", async ({ status, admitted }) => {
+  streamHarness.real = true;
+  let sent = false;
+  const first = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) controller.error(new Error("socket reset"));
+      else {
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"work_turn_started","schema_version":1,"work_id":"work-1","branch_id":"branch-1","run_id":"run-1"}\n\n'
+          + 'data: {"type":"text_delta","content":"Retained partial answer"}\n\n'));
+      }
+    },
+  });
+  const recovered = workProjection.events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")
+    + 'data: [DONE]\n\n';
+  const fetch = vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(admitted ? new Response(first) : new Response("Gateway timeout", { status: 408 }))
+    .mockResolvedValueOnce(new Response("gateway unavailable", { status }))
+    .mockResolvedValueOnce(new Response(recovered));
+  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  try {
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    if (admitted) expect(screen.getByText("Retained partial answer")).toBeInTheDocument();
+    else await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("original turn remains unconfirmed"));
+    expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+    fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(screen.getByText("Durably saved Work answer")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const ids = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).request_id);
+    expect(new Set(ids).size).toBe(1);
+    expect(refresh).toHaveBeenCalledOnce();
+  } finally {
+    rendered.unmount();
+    fetch.mockRestore();
+  }
+});
+
+test.each([
+  { status: 403, history: "none" },
+  { status: 403, history: "refreshed" },
+  { status: 403, history: "answered" },
+  { status: 409, history: "none" },
+  { status: 409, history: "refreshed" },
+  { status: 409, history: "answered" },
+])("first HTTP$status releases guidance after $history interaction history", async ({ status, history }) => {
+  streamHarness.real = true;
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+    JSON.stringify({ code: status === 409 ? "writer_conflict" : "invalid_request", retryable: false }),
+    { status },
+  ));
+  const props = {
+    workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1",
+    branchRevision: 3, controlBasis: { writer_epoch: 4, canonical_root_hash: "a".repeat(64) },
+  };
+  const page: NonNullable<Parameters<typeof WorkTurnComposer>[0]["initialInteractions"]> = {
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1",
+    interactions: history === "none" ? [] : [{
+      schema_version: 1, work_id: "work-1", branch_id: "branch-1",
+      run_id: "run-1", request_id: "approval-1", kind: "approval",
+      tool: "bash", approval_kind: "standard", display_label: "Earlier approval",
+    }],
+  };
+  const rendered = render(<WorkTurnComposer {...props} initialInteractions={page} />);
+  try {
+    if (history === "refreshed") {
+      // Another surface answers the old interaction; this same composer survives refresh.
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      rendered.rerender(<WorkTurnComposer {...props} initialInteractions={{ ...page, interactions: [] }} />);
+    } else if (history === "answered") {
+      // A local answer makes guidance available before new server props arrive.
+      fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+      await waitFor(() => expect(respondInteraction).toHaveBeenCalledOnce());
+    }
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Keep this guidance safe" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    if (status === 409) {
+      fireEvent.click(await screen.findByRole("button", { name: "Keep viewing" }));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toHaveValue("Keep this guidance safe");
+      expect(screen.queryByText("You", { exact: true })).not.toBeInTheDocument();
+      expect(screen.queryByText("Astra", { exact: true })).not.toBeInTheDocument();
+      expect(forceTakeover).not.toHaveBeenCalled();
+    }
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledOnce();
+  } finally {
+    rendered.unmount();
+    fetch.mockRestore();
+  }
+});
+
+
+test.each(["takeover denial", "keep viewing"])("writer-conflict navigation preserves the uncertain request (%s)", async action => {
+  streamHarness.real = true;
+  forceTakeover.mockResolvedValue({ ok: true, operation: {
+    schema_version: 2, operation_id: "operation-recover", work_id: "work-1", branch_id: "branch-1",
+    attachment_id: "attachment-1", kind: "force_takeover", state: "succeeded", outcome: "taken_over",
+    branch_revision: 3, control_basis: { writer_epoch: 5, canonical_root_hash: null },
+    created_at: "2026-08-01T00:00:00Z", completed_at: "2026-08-01T00:00:01Z",
+  } });
+  const recovered = workProjection.events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")
+    + 'data: [DONE]\n\n';
+  const fetch = vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(new Response("Gateway timeout", { status: 408 }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ code: "writer_conflict", category: "conflict",
+      retryable: false, action_hints: ["refresh_work"] }), { status: 409 }));
+  if (action === "takeover denial") fetch.mockResolvedValueOnce(new Response("Recovery denied", { status: 403 }));
+  fetch.mockResolvedValueOnce(new Response(recovered));
+  const rendered = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1"
+    branchRevision={3} controlBasis={{ writer_epoch: 4, canonical_root_hash: null }} />);
+  try {
+    fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Preserve this guidance" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await screen.findByRole("button", { name: "Continue here" });
+    if (action === "keep viewing") {
+      fireEvent.click(screen.getByRole("button", { name: "Keep viewing" }));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      expect(screen.getByRole("alert")).toHaveTextContent("original turn remains unconfirmed");
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Continue here" }));
+    fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "test reauthentication proof" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    if (action === "takeover denial") {
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+      expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
+      fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    }
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled());
+    expect(screen.getByText("Durably saved Work answer")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(action === "takeover denial" ? 4 : 3);
+    const bodies = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+    expect(bodies.every(body => body.request_id === bodies[0].request_id
+      && body.attachment_id === "attachment-1" && body.message === "Preserve this guidance")).toBe(true);
+  } finally { rendered.unmount(); fetch.mockRestore(); }
 });

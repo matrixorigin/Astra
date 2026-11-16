@@ -410,6 +410,32 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             let unexecuted_child = expired_child || admission_rejected;
             assert_eq!(records[1].ok, !unexecuted_child);
             assert_eq!(records[1].was_executed(), !unexecuted_child);
+            // The actual callback producer, rather than a hand-built child
+            // event, must make inclusive accounting incomplete even when the
+            // root's own terminal reports no tool calls.
+            let mut root = session_journal::JournalEvent::turn(
+                Some("partial-session"),
+                1,
+                None,
+                "task",
+                "done",
+                0,
+                12,
+                3,
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            root.cache_read_tokens = Some(0);
+            root.cache_creation_tokens = Some(0);
+            root.tool_outcomes = Some(Default::default());
+            let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree(
+                "partial-session",
+                &[root, observation.clone()],
+            );
+            assert!(tree.self_prompt_tokens_complete);
+            assert!(!tree.prompt_tokens_complete);
+            assert!(!tree.tool_calls_complete);
+            assert_eq!(tree.tool_calls, 1);
             assert!(
                 records[1]
                     .result_full
@@ -449,16 +475,24 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .unwrap();
             let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
                 .unwrap();
-            let executed = if unexecuted_child { 1 } else { 2 };
-            assert_eq!(diff.a_tool_calls_executed, executed);
-            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
+            let observed_executions = if unexecuted_child { 1 } else { 2 };
+            // These callback observations have no canonical invocation identity.
+            // Preserve each in the sequence without asserting that they prove
+            // distinct executions beyond the confirmed lower bound.
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.invocation_identity.is_none())
+            );
+            assert_eq!(diff.a_tool_calls_executed, 1);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; observed_executions]);
             assert!(!diff.a_tool_sequence_complete);
             let digest = crate::cli::journal_digest::build_digest(
                 "partial-session",
                 crate::cli::journal_digest::DigestFocus::All,
             )
             .unwrap();
-            assert_eq!(digest.aggregates.total_tool_calls, 0);
+            assert_eq!(digest.aggregates.reported_root_tool_calls, 0);
             continue;
         }
         if classified {
@@ -500,13 +534,16 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             )
             .unwrap();
             assert_eq!(
-                digest.aggregates.total_tool_calls,
+                digest.aggregates.reported_root_tool_calls,
                 u64::from(root_callbacks)
             );
+            // The producer records callback outcomes independently of their bodies.
             assert_eq!(
-                digest.aggregates.total_fresh_tool_calls,
+                digest.aggregates.reported_root_fresh_tool_calls,
                 u64::from(root_callbacks)
             );
+            assert_eq!(digest.aggregates.reported_root_tool_outcomes_unknown, 0);
+            assert!(!digest.aggregates.root_tool_totals_complete);
             continue;
         }
         let result = result.unwrap();
@@ -1256,7 +1293,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1439,7 +1476,7 @@ async fn stream_chat_sse_simple_text_response() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1564,7 +1601,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1714,7 +1751,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -1819,7 +1856,7 @@ async fn stream_chat_sse_api_error_propagated() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1937,7 +1974,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -2129,7 +2166,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2270,7 +2307,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2436,7 +2473,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,

@@ -909,7 +909,7 @@ impl BackgroundTaskRegistry {
                     };
                 }
                 if outcome.output.len() > 2048 || live_output.as_ref().is_some_and(|view| view.bytes() > 2048) {
-                    summary.push_str("\nUse task_output to inspect the retained output, if available.");
+                    summary.push_str("\nIf retained output is available, use task_output; if deferred, select it with tool_search before invoke_tool.");
                 }
                 let completion = Arc::new(TaskCompletion {
                     finished_at_ms: unix_epoch_millis(),

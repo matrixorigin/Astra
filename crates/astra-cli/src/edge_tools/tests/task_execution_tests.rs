@@ -2711,6 +2711,138 @@ async fn task_execution_stop_is_a_request_until_the_owner_observes_terminal() {
 }
 
 #[tokio::test]
+async fn task_observation_cancellation_does_not_claim_parent_or_task_stopped() {
+    let (_root, executor) = fixture();
+    let id = launch(&executor, "cat", true, 5.0).await;
+    stdin_ready(&executor, &id).await;
+    let parent = tokio_util::sync::CancellationToken::new();
+    let observer = parent.child_token();
+    let wait = {
+        let (executor, id, observer) = (executor.clone(), id.clone(), observer.clone());
+        tokio::spawn(async move {
+            executor
+                .execute_with_invocation_metadata_cancelable(
+                    "task_output",
+                    &json!({"task_id":id,"block":true,"timeout_ms":300_000}),
+                    ToolInvocationMetadata::default(),
+                    Some(&observer),
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !executor.foreground_wait_control.is_active() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    observer.cancel();
+    let outcome = wait.await.unwrap();
+    assert!(outcome.is_error);
+    let fields = outcome.tool_result_fields.unwrap();
+    assert_eq!(fields["error_kind"], "cancelled");
+    assert_eq!(fields["execution_started"], true);
+    assert_eq!(fields["stage"], "observation");
+    assert_eq!(fields["side_effects_maybe"], false);
+    assert!(!parent.is_cancelled());
+    assert!(!outcome.output.contains("stop_or_resume_parent_turn"));
+    assert!(!outcome.output.contains("not executed"));
+    let status = call(
+        &executor,
+        "task_output",
+        json!({"task_id":id,"block":false}),
+    )
+    .await;
+    assert!(!status.is_error, "{status:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&status.output).unwrap()["status"],
+        "running"
+    );
+    call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"close_stdin":true}),
+    )
+    .await;
+    assert!(!terminal(&executor, &id).await.is_error);
+}
+
+#[tokio::test]
+async fn task_observation_keeps_admitted_cap_and_absolute_cutoff() {
+    let (_root, executor) = fixture();
+    let id = launch(&executor, "cat", true, 5.0).await;
+    stdin_ready(&executor, &id).await;
+    for (cutoff, cap, wake) in [
+        (50u64, 300_000u64, false),
+        (5_000, 25, false),
+        (50, 300_000, true),
+        (5_000, 25, true),
+    ] {
+        let started = std::time::Instant::now();
+        let outcome = executor
+            .execute_with_invocation_metadata_cancelable(
+                "task_output",
+                &json!({"task_id":id,"block":true,"timeout_ms":300_000,"wake_on_output":wake}),
+                ToolInvocationMetadata {
+                    observation_deadline: Some(started + Duration::from_millis(cutoff)),
+                    command_timeout_cap_ms: Some(cap),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(1), "{outcome:?}");
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        if outcome.is_error {
+            assert_eq!(fields["error_kind"], "tool_timeout");
+            assert_eq!(fields["stage"], "observation");
+            assert_eq!(fields["execution_started"], true);
+            assert_eq!(fields["side_effects_maybe"], false);
+        } else {
+            assert_eq!(fields["wait_result"], "timeout");
+            assert!(outcome.output.contains("Observation deadline reached"));
+            assert!(!outcome.output.contains("300000"));
+        }
+    }
+    let cutoff = std::time::Instant::now() + Duration::from_millis(10);
+    let invocation = ToolInvocationMetadata {
+        observation_deadline: Some(cutoff),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let rejected = executor
+        .execute_with_invocation_metadata_cancelable(
+            "task_output",
+            &json!({"task_id":id,"block":true,"timeout_ms":300_000}),
+            invocation,
+            None,
+        )
+        .await;
+    assert!(rejected.is_error);
+    let fields = rejected.tool_result_fields.unwrap();
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(fields["error_kind"], "tool_timeout");
+    let running = call(
+        &executor,
+        "task_output",
+        json!({"task_id":id,"block":false}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&running.output).unwrap()["status"],
+        "running"
+    );
+    call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"close_stdin":true}),
+    )
+    .await;
+    assert!(!terminal(&executor, &id).await.is_error);
+}
+
+#[tokio::test]
 async fn task_execution_parent_guidance_releases_wait_without_timeout_or_input() {
     let (_root, executor) = fixture();
     let id = launch(&executor, "cat", true, 5.0).await;

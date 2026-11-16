@@ -75,7 +75,6 @@ async fn callback_through_pipeline(
     let mut executor = crate::edge_tools::ToolExecutor::new(workspace.path());
     executor.install_mcp_bundle(Arc::clone(&manager), schemas);
     let executor = Arc::new(executor);
-    let mut tool_cache = EdgeToolCache::new(8);
     let mut host = CliSseStreamHost::from_edge_ctx(
         EdgeSseContext {
             api: &api,
@@ -91,7 +90,6 @@ async fn callback_through_pipeline(
             ask_user_request_tx: None,
             skill_resolver: None,
             compensate_non_file_on_failure: false,
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         },
