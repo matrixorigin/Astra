@@ -3392,6 +3392,9 @@ impl TurnEventBuffer {
     pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
         for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !meta.is_object() {
+                *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+            }
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
@@ -3417,6 +3420,9 @@ fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64
     let meta = events[0]
         .metadata
         .get_or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+    }
     if let Some(obj) = meta.as_object_mut() {
         obj.insert(
             TURN_EVENT_DROPPED_META_KEY.into(),
@@ -4352,12 +4358,6 @@ pub fn read_journal_source_for_owner(
 fn read_journal_source_from_path(
     path: &Path,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("session journal not found: {}", path.display()),
-        ));
-    }
     let content = std::fs::read_to_string(path)?;
     let parsed = parse_journal_text_in_append_order(&content);
     record_journal_read(
@@ -5843,6 +5843,18 @@ impl JournalEvent {
         self
     }
 
+    /// Failure counters are authoritative only when their producer recorded
+    /// qualified usage, not when it retained partial stream observations.
+    pub fn has_unqualified_failure_usage(&self) -> bool {
+        self.event_type == JournalEventType::TurnError
+            && self
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("token_usage_qualified"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+    }
+
     /// Replace observed subtotals with qualified accounting evidence.
     /// An empty sample needs a presence witness; known lanes are not mirrored.
     pub fn with_qualified_usage(
@@ -5859,6 +5871,14 @@ impl JournalEvent {
             .and_then(serde_json::Value::as_object_mut)
         {
             metadata.remove("qualified_usage");
+            metadata.remove("token_usage_qualified");
+        }
+        if usage.is_some() && self.event_type == JournalEventType::TurnError {
+            let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !metadata.is_object() {
+                *metadata = serde_json::json!({ "previous_metadata": metadata.clone() });
+            }
+            metadata["token_usage_qualified"] = serde_json::json!(true);
         }
         if usage.is_some()
             && self.tokens_in.is_none()
@@ -8939,6 +8959,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_turn_usage_provenance_survives_ingestion() {
+        use astra_turn_types::CanonicalTokenUsage;
+        for usage in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(17), Some(2), Some(0), Some(3)).unwrap()),
+        ] {
+            let event = JournalEvent::turn_error(Some("s"), 1, None, "in", "error", 1)
+                .with_qualified_usage(usage);
+            assert_eq!(event.has_unqualified_failure_usage(), usage.is_none());
+            let ingestion =
+                crate::event_ingestion::IngestionEvent::from_journal_event(&event, "user").unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
+        let mut old = JournalEvent::turn_error(Some("s"), 1, None, "in", "error", 1);
+        old.tokens_in = Some(99);
+        assert!(old.has_unqualified_failure_usage());
+        assert_eq!(
+            crate::event_ingestion::IngestionEvent::from_journal_event(&old, "user")
+                .unwrap()
+                .token_usage,
+            None
+        );
+    }
+
+    #[test]
     fn turn_event_with_tool_calls_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -11951,6 +11997,31 @@ mod turn_event_buffer_tests {
             Some(5)
         );
         assert_eq!(buf.dropped_events(), 0);
+    }
+
+    #[test]
+    fn interrupted_flush_preserves_non_object_metadata_and_retention_loss() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 1);
+        for _ in 0..=TURN_EVENT_BUFFER_CAP {
+            let mut event = JournalEvent::base_public(JournalEventType::LlmRound, Some("s"));
+            event.metadata = Some(serde_json::json!("original"));
+            buf.record(event);
+        }
+        let events = buf.prepare_flush(true);
+        assert_eq!(events.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
+        assert_eq!(events[0].metadata.as_ref().unwrap()["partial"], true);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()[TURN_EVENT_DROPPED_META_KEY],
+            1
+        );
+        assert_eq!(
+            buf.prepare_flush(true)[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
     }
 
     #[test]

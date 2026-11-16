@@ -511,7 +511,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/plan",
-        "Enter or exit plan mode; then describe the plan",
+        "Enter plan mode and request a plan",
         CommandGroup::Work,
     )
     .with_tui_route(TuiCommandRoute::Native)

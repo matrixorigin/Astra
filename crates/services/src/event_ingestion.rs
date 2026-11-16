@@ -1651,7 +1651,8 @@ fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
 
 use astra_turn_types::CanonicalTokenUsage;
 
-pub(crate) fn canonical_token_usage_from_journal_event(
+/// Decode the journal's canonical usage, quarantining contradictory evidence.
+pub fn canonical_token_usage_from_journal_event(
     event: &crate::session_journal::JournalEvent,
 ) -> Option<CanonicalTokenUsage> {
     let no_counts = [
@@ -1673,6 +1674,9 @@ pub(crate) fn canonical_token_usage_from_journal_event(
         // This field is only an unknown-sample witness, never another numeric
         // source. Invalid or contradictory witnesses quarantine all lanes.
         return CanonicalTokenUsage::new(None, None, None, None).ok();
+    }
+    if event.has_unqualified_failure_usage() {
+        return None;
     }
     if no_counts {
         return None;

@@ -571,12 +571,21 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
 
-            let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
+            let mut evt = astra_services::session_journal::JournalEvent::interruption_recorded(
                 Some(sid.as_str()),
                 session_turn_number(state),
                 interruption.to_json(),
             )
-            .with_agentic_step(Some(current_agentic_step(state)));
+            .with_agentic_step(Some(current_agentic_step(state)))
+            .with_producer_scope(state.current_run_id.as_deref());
+            if state.inference_purpose == astra_turn_types::InferencePurpose::SubAgent
+                && let Some(scope) = evt.producer_scope.as_mut()
+            {
+                scope.agent_id = Some(state.self_agent_id.clone());
+            }
+            if let Some(metadata) = evt.metadata.as_mut() {
+                metadata["source"] = serde_json::json!("agentic_loop");
+            }
             if let Ok(writer) = journal_writer_for_owner(state.owner_user_id.as_deref(), sid) {
                 if let Err(error) = writer.append(&evt) {
                     tracing::warn!(
@@ -1773,6 +1782,7 @@ mod tests {
         let mut state = make_state();
         let sid = "11111111-2222-3333-4444-555555555555";
         state.current_session_id = Some(sid.to_string());
+        state.current_run_id = Some("run-test".into());
         state.policy_model_name = Some("gpt-5".to_string());
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
@@ -1811,6 +1821,15 @@ mod tests {
         assert!(
             session_start_index < interruption_index,
             "session start must be recorded before interruption even when trace spans precede it"
+        );
+        let interruption = &events[interruption_index];
+        assert_eq!(
+            interruption.producer_scope.as_ref().unwrap().run_id,
+            "run-test"
+        );
+        assert_eq!(
+            interruption.metadata.as_ref().unwrap()["source"],
+            "agentic_loop"
         );
     }
 

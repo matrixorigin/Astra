@@ -3648,7 +3648,12 @@ impl CliSseEdgeHost<'_> {
                 continue;
             }
             let mut record =
-                astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result);
+                astra_turn_core::headless_tool_journal::journal_record_scoped_edge_tool_result(
+                    result,
+                    self.owner_auth_snapshot
+                        .as_ref()
+                        .and_then(|owner| owner.server_account_id.as_deref()),
+                );
             if journal_content_redact_enabled() {
                 record.args_full = None;
                 record.result_full = None;
@@ -3669,6 +3674,7 @@ impl CliSseEdgeHost<'_> {
             // adding child calls to the foreground terminal's aggregate.
             let mut event = JournalEvent::sync_marker(Some(session_id), None, None, Some(note))
                 .with_producer_scope(Some(run_id));
+            event.metadata = Some(serde_json::json!({"source": "child_agent"}));
             event.tool_calls = Some(records);
             let writer = match self.owner_auth_snapshot.as_ref() {
                 Some(owner) => JournalWriter::for_owner(&owner.owner_scope, session_id),

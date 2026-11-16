@@ -1141,7 +1141,7 @@ fn run_next_work_item_schema() -> Value {
         "type": "function",
         "function": {
             "name": "run_next_work_item",
-            "description": "Select and bind one next foreground canonical Work task only when no assignment was returned by start_work or settle_work_item. The server, not the model, selects the dependency-ready task and derives its immutable attempt and settlement authority. When start_work returns initial_task or settlement returns next_task, execute that assignment directly instead of calling this tool. The returned expected_result is the attempt's completion boundary: gather sufficient direct evidence, settle immediately once it is satisfied, and do not broaden into adjacent investigation. Create a child agent only for a real isolation or parallelism boundary, never merely because a Work task exists.",
+            "description": "Select and bind one next foreground canonical Work task only when no assignment was returned by start_work or settle_work_item. Call this coordinator transition alone and wait for its result before calling other tools. The server, not the model, selects the dependency-ready task and derives its immutable attempt and settlement authority. When start_work returns initial_task or settlement returns next_task, execute that assignment directly instead of calling this tool. The returned expected_result is the attempt's completion boundary: gather sufficient direct evidence, settle immediately once it is satisfied, and do not broaden into adjacent investigation. Create a child agent only for a real isolation or parallelism boundary, never merely because a Work task exists.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1167,10 +1167,12 @@ fn settle_work_item_schema() -> Value {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
                     "blocker_kind": {
                         "type": "string",
+                        "description": "Required for blocked; omit for delivered or failed.",
                         "enum": ["capability_unavailable", "dependency_blocked", "policy_blocked", "external_unavailable"]
                     },
                     "unavailable_capabilities": {
                         "type": "array",
+                        "description": "Required and nonempty only when blocker_kind is capability_unavailable; otherwise omit.",
                         "maxItems": 16,
                         "items": {"type": "string", "minLength": 1, "maxLength": 128}
                     }

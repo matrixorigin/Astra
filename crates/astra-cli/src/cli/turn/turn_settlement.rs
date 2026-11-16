@@ -14,6 +14,8 @@ use crate::cli::stream::streaming_types::StreamResult;
 pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) ctx: &'a TurnContext<'b>,
     pub(crate) line: &'a str,
+    /// Original user input when the model receives generated guidance.
+    pub(crate) restore_line: Option<&'a str>,
     pub(crate) effective_line: &'a str,
     pub(crate) user_intent: &'a str,
     pub(crate) input_runtime_required_texts: &'a [String],
@@ -87,7 +89,12 @@ pub(crate) async fn settle_failed_turn(
     failure: &mut crate::TurnFailure,
 ) {
     if failure.partial.admission_rejected {
-        report_admission_rejection(state, dispatch.line, failure, dispatch.ui);
+        report_admission_rejection(
+            state,
+            dispatch.restore_line.unwrap_or(dispatch.line),
+            failure,
+            dispatch.ui,
+        );
         clear_recovery_scoped_turn_restrictions(state);
         return;
     }
@@ -134,6 +141,7 @@ mod tests {
         let mut dispatch = TurnDispatch {
             ctx: &ctx,
             line: "continue",
+            restore_line: None,
             effective_line: "continue",
             user_intent: "continue",
             input_runtime_required_texts: &[],
@@ -178,6 +186,7 @@ mod tests {
         let mut dispatch = TurnDispatch {
             ctx: &ctx,
             line: "continue",
+            restore_line: None,
             effective_line: "continue",
             user_intent: "continue",
             input_runtime_required_texts: &[],
@@ -218,7 +227,12 @@ mod tests {
     #[tokio::test]
     async fn settle_failed_turn_restores_draft_without_advancing_cursor_for_session_admission_rejections()
      {
-        for rejected_code in ["session_execution_slot_occupied", "session_unavailable"] {
+        for (rejected_code, restore) in [
+            ("session_execution_slot_occupied", None),
+            ("session_execution_slot_occupied", Some("/plan inspect")),
+            ("session_unavailable", None),
+            ("session_unavailable", Some("/plan inspect")),
+        ] {
             let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
             let ctx = TurnContext {
                 api: &api,
@@ -232,6 +246,7 @@ mod tests {
             let mut dispatch = TurnDispatch {
                 ctx: &ctx,
                 line: "hello again",
+                restore_line: restore,
                 effective_line: "hello again",
                 user_intent: "hello again",
                 input_runtime_required_texts: &[],
@@ -272,7 +287,7 @@ mod tests {
                 state.turn, 0,
                 "a start-rejection must not advance the local turn cursor"
             );
-            assert_eq!(ui.restored_inputs, vec!["hello again"]);
+            assert_eq!(ui.restored_inputs, vec![restore.unwrap_or("hello again")]);
             assert!(
                 state.journal.is_none(),
                 "a start-rejection must not bootstrap a journal or record a TurnError"

@@ -22,15 +22,21 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType, ToolCallRecord};
+use astra_services::session_journal::{JournalEvent, JournalEventType, ToolCallRecord};
 
 use crate::cli::cli_config::cli_args;
-use crate::cli::journal_digest::{self, producer_run_id as run_id_of};
+use crate::cli::journal_digest::{self, display_known, producer_run_id as run_id_of};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalDiff {
     pub a_session: String,
     pub b_session: String,
+    /// Known loss, malformed records or unmatched activity; false means only
+    /// that no such gap was observed, not that absence is proven.
+    pub a_observation_incomplete: bool,
+    pub b_observation_incomplete: bool,
+    pub a_source_errors: Vec<String>,
+    pub b_source_errors: Vec<String>,
     /// Per-event-type counts for A (sorted by type name for stable diff).
     pub a_event_counts: BTreeMap<String, u32>,
     /// Per-event-type counts for B.
@@ -46,9 +52,8 @@ pub struct JournalDiff {
     /// level diff: "A called [Read, Grep, Read]; B called [Read, Read]".
     pub a_tool_sequence: Vec<String>,
     pub b_tool_sequence: Vec<String>,
-    /// Executed tool calls per run. Taken from each turn's authoritative
-    /// `tool_count` aggregate, so it stays correct when per-call detail
-    /// (`tool_calls`) was not recorded (e.g. server-owned CLI turns).
+    /// Executed tool calls per run, using terminal counts or consistent outcome
+    /// summaries even when per-call detail was not recorded.
     pub a_tool_calls_executed: u64,
     pub b_tool_calls_executed: u64,
     /// False when the run executed more calls than its per-call detail
@@ -61,34 +66,94 @@ pub struct JournalDiff {
     pub b_tokens: TokenTotals,
     /// b - a, signed. Negative = B used fewer tokens (usually good).
     pub token_deltas: TokenDeltas,
-    /// Whether each run produced a non-empty final assistant output.
-    pub a_has_final_text: bool,
-    pub b_has_final_text: bool,
+    /// Whether non-empty final text is present in the retained observation.
+    pub a_final_text_observed: bool,
+    pub b_final_text_observed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TokenTotals {
     pub prompt: u64,
+    pub prompt_complete: bool,
     pub completion: u64,
+    pub completion_complete: bool,
     pub total: u64,
+    pub total_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TokenDeltas {
-    pub prompt: i64,
-    pub completion: i64,
-    pub total: i64,
+    pub prompt: Option<i64>,
+    pub completion: Option<i64>,
+    pub total: Option<i64>,
 }
 
 /// Load two journals + compute the diff. Returns `Err` only for fatal
 /// io / parse failures on either session; structural differences are
 /// always returned as Ok.
 pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, String> {
-    let a_events =
-        session_journal::read_journal(a_session).map_err(|e| format!("{a_session}: {e}"))?;
-    let b_events =
-        session_journal::read_journal(b_session).map_err(|e| format!("{b_session}: {e}"))?;
-    Ok(diff_events(a_session, b_session, &a_events, &b_events))
+    let (a_events, a_conflicting, a_incomplete, a_errors) =
+        journal_digest::read_journal_for_analysis(a_session)
+            .map_err(|e| format!("{a_session}: {e}"))?;
+    let (b_events, b_conflicting, b_incomplete, b_errors) =
+        journal_digest::read_journal_for_analysis(b_session)
+            .map_err(|e| format!("{b_session}: {e}"))?;
+    let mut diff = diff_events_with_coverage(
+        a_session,
+        b_session,
+        &a_events,
+        &b_events,
+        a_incomplete,
+        b_incomplete,
+    );
+    if !a_conflicting.is_empty() {
+        diff.a_tool_calls_executed = confirmed_execution_evidence(&a_events, &a_conflicting).0;
+        add_conflicting_call_observations(&a_events, &a_conflicting, &mut diff.a_tool_sequence);
+        add_conflicting_terminal_counts(&mut diff.a_event_counts, &a_conflicting);
+    }
+    if !b_conflicting.is_empty() {
+        diff.b_tool_calls_executed = confirmed_execution_evidence(&b_events, &b_conflicting).0;
+        add_conflicting_call_observations(&b_events, &b_conflicting, &mut diff.b_tool_sequence);
+        add_conflicting_terminal_counts(&mut diff.b_event_counts, &b_conflicting);
+    }
+    if !a_conflicting.is_empty() || !b_conflicting.is_empty() {
+        (diff.only_in_a, diff.only_in_b, diff.count_deltas) =
+            event_count_differences(&diff.a_event_counts, &diff.b_event_counts);
+    }
+    diff.a_source_errors = a_errors;
+    diff.b_source_errors = b_errors;
+    Ok(diff)
+}
+
+pub(crate) fn diff_events_with_coverage(
+    a_session: &str,
+    b_session: &str,
+    a_events: &[JournalEvent],
+    b_events: &[JournalEvent],
+    a_incomplete: bool,
+    b_incomplete: bool,
+) -> JournalDiff {
+    let mut diff = diff_events(a_session, b_session, a_events, b_events);
+    if a_incomplete || b_incomplete {
+        if a_incomplete {
+            diff.a_observation_incomplete = true;
+            diff.a_tokens.prompt_complete = false;
+            diff.a_tokens.completion_complete = false;
+            diff.a_tokens.total_complete = false;
+            diff.a_tool_sequence_complete = false;
+            diff.a_tool_calls_executed = confirmed_execution_floor(a_events);
+        }
+        if b_incomplete {
+            diff.b_observation_incomplete = true;
+            diff.b_tokens.prompt_complete = false;
+            diff.b_tokens.completion_complete = false;
+            diff.b_tokens.total_complete = false;
+            diff.b_tool_sequence_complete = false;
+            diff.b_tool_calls_executed = confirmed_execution_floor(b_events);
+        }
+        diff.token_deltas = TokenDeltas::default();
+    }
+    diff
 }
 
 /// Pure fold: no filesystem IO. Exposed as pub(crate) for tests.
@@ -100,43 +165,33 @@ pub(crate) fn diff_events(
 ) -> JournalDiff {
     let a_counts = event_counts(a_events);
     let b_counts = event_counts(b_events);
-    let only_in_a: Vec<String> = a_counts
-        .keys()
-        .filter(|k| !b_counts.contains_key(*k))
-        .cloned()
-        .collect();
-    let only_in_b: Vec<String> = b_counts
-        .keys()
-        .filter(|k| !a_counts.contains_key(*k))
-        .cloned()
-        .collect();
-    let mut count_deltas = BTreeMap::new();
-    let mut all_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    all_keys.extend(a_counts.keys().map(String::as_str));
-    all_keys.extend(b_counts.keys().map(String::as_str));
-    for k in all_keys {
-        let a = a_counts.get(k).copied().unwrap_or(0) as i64;
-        let b = b_counts.get(k).copied().unwrap_or(0) as i64;
-        let d = b - a;
-        if d != 0 {
-            count_deltas.insert(k.to_string(), d);
-        }
-    }
+    let (only_in_a, only_in_b, count_deltas) = event_count_differences(&a_counts, &b_counts);
 
-    let a_tokens = token_totals(a_events);
-    let b_tokens = token_totals(b_events);
+    let a_gap = journal_digest::has_incomplete_observation(a_events)
+        || journal_digest::has_unmatched_root_rounds(a_events);
+    let b_gap = journal_digest::has_incomplete_observation(b_events)
+        || journal_digest::has_unmatched_root_rounds(b_events);
+    let a_tokens = token_totals(a_events, a_gap);
+    let b_tokens = token_totals(b_events, b_gap);
     let token_deltas = TokenDeltas {
-        prompt: saturating_delta(a_tokens.prompt, b_tokens.prompt),
-        completion: saturating_delta(a_tokens.completion, b_tokens.completion),
-        total: saturating_delta(a_tokens.total, b_tokens.total),
+        prompt: (a_tokens.prompt_complete && b_tokens.prompt_complete)
+            .then(|| saturating_delta(a_tokens.prompt, b_tokens.prompt)),
+        completion: (a_tokens.completion_complete && b_tokens.completion_complete)
+            .then(|| saturating_delta(a_tokens.completion, b_tokens.completion)),
+        total: (a_tokens.total_complete && b_tokens.total_complete)
+            .then(|| saturating_delta(a_tokens.total, b_tokens.total)),
     };
 
-    let a_tools = tool_activity(a_events);
-    let b_tools = tool_activity(b_events);
+    let a_tools = tool_activity(a_events, a_gap);
+    let b_tools = tool_activity(b_events, b_gap);
 
     JournalDiff {
         a_session: a_session.to_string(),
         b_session: b_session.to_string(),
+        a_observation_incomplete: !a_events.iter().any(is_terminal) || a_gap,
+        b_observation_incomplete: !b_events.iter().any(is_terminal) || b_gap,
+        a_source_errors: Vec::new(),
+        b_source_errors: Vec::new(),
         a_event_counts: a_counts,
         b_event_counts: b_counts,
         only_in_a,
@@ -151,8 +206,8 @@ pub(crate) fn diff_events(
         a_tokens,
         b_tokens,
         token_deltas,
-        a_has_final_text: has_final_text(a_events),
-        b_has_final_text: has_final_text(b_events),
+        a_final_text_observed: has_final_text(a_events),
+        b_final_text_observed: has_final_text(b_events),
     }
 }
 
@@ -173,12 +228,90 @@ fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
     out
 }
 
-fn token_totals(events: &[JournalEvent]) -> TokenTotals {
-    let usage = journal_digest::root_terminal_usage(events);
+// Conflicting terminals cannot establish sequence completeness. Preserve
+// identifiable executed observations that are absent from the normal view.
+fn add_conflicting_call_observations(
+    events: &[JournalEvent],
+    conflicting: &[JournalEvent],
+    sequence: &mut Vec<String>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for (candidate, event) in events
+        .iter()
+        .map(|event| (false, event))
+        .chain(conflicting.iter().map(|event| (true, event)))
+    {
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| call.was_executed())
+        {
+            if let Some(key) = call_key(event, call)
+                && seen.insert(key)
+                && candidate
+            {
+                sequence.push(call.name.clone());
+            }
+        }
+    }
+}
+
+fn add_conflicting_terminal_counts(counts: &mut BTreeMap<String, u32>, events: &[JournalEvent]) {
+    let mut seen = std::collections::HashSet::new();
+    for event in events {
+        let kind = event_type_str(&event.event_type);
+        let unique = event
+            .turn
+            .zip(run_id_of(event))
+            .is_none_or(|(turn, run)| seen.insert((turn, run, kind.clone())));
+        if unique {
+            let count = counts.entry(kind).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+fn event_count_differences(
+    a: &BTreeMap<String, u32>,
+    b: &BTreeMap<String, u32>,
+) -> (Vec<String>, Vec<String>, BTreeMap<String, i64>) {
+    let only_in_a = a
+        .keys()
+        .filter(|kind| !b.contains_key(*kind))
+        .cloned()
+        .collect();
+    let only_in_b = b
+        .keys()
+        .filter(|kind| !a.contains_key(*kind))
+        .cloned()
+        .collect();
+    let mut all = std::collections::BTreeSet::new();
+    all.extend(a.keys());
+    all.extend(b.keys());
+    let mut deltas = BTreeMap::new();
+    for kind in all {
+        let delta = i64::from(b.get(kind).copied().unwrap_or(0))
+            - i64::from(a.get(kind).copied().unwrap_or(0));
+        if delta != 0 {
+            deltas.insert(kind.clone(), delta);
+        }
+    }
+    (only_in_a, only_in_b, deltas)
+}
+
+fn token_totals(events: &[JournalEvent], observation_incomplete: bool) -> TokenTotals {
+    let usage = journal_digest::root_terminal_usage(events, observation_incomplete);
     TokenTotals {
-        prompt: usage.prompt,
-        completion: usage.completion,
-        total: usage.prompt.saturating_add(usage.completion),
+        prompt: usage.known.prompt,
+        prompt_complete: usage.prompt_complete,
+        completion: usage.known.completion,
+        completion_complete: usage.completion_complete,
+        total: usage.known.total(),
+        total_complete: usage.prompt_complete
+            && usage.completion_complete
+            && usage.cache_read_complete
+            && usage.cache_creation_complete,
     }
 }
 
@@ -189,10 +322,7 @@ struct ToolActivity {
 }
 
 fn is_terminal(e: &JournalEvent) -> bool {
-    matches!(
-        e.event_type,
-        JournalEventType::Turn | JournalEventType::TurnError
-    )
+    journal_digest::is_root_terminal(e)
 }
 
 #[derive(Default)]
@@ -260,14 +390,18 @@ impl<'a> TerminalIndex<'a> {
 }
 
 /// Per-call observations, including callback results with uncertain delivery.
+fn is_child_callback(event: &JournalEvent) -> bool {
+    event.event_type == JournalEventType::SyncMarker
+        && event.metadata.as_ref().is_some_and(|metadata| {
+            metadata.get("source").and_then(serde_json::Value::as_str) == Some("child_agent")
+        })
+}
+
 fn observed_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
-    matches!(
-        e.event_type,
-        JournalEventType::LlmRound | JournalEventType::ToolCallError | JournalEventType::SyncMarker
-    )
-    .then_some(e.tool_calls.as_ref())
-    .flatten()
-    .filter(|calls| !calls.is_empty())
+    (!is_terminal(e))
+        .then_some(e.tool_calls.as_ref())
+        .flatten()
+        .filter(|calls| !calls.is_empty())
 }
 
 type CallKey<'a> = &'a astra_turn_types::ToolInvocationIdentity;
@@ -275,9 +409,10 @@ type RoundCallIndex<'a> = HashMap<CallKey<'a>, (usize, usize)>;
 
 /// Equality comes from the canonical invocation owner, not provider IDs or
 /// event annotations. Terminal summaries may contain calls from earlier runs.
-fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKey<'a>> {
+pub(super) fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKey<'a>> {
     let identity = call.invocation_identity.as_ref()?;
     if event.session_id.as_deref() != Some(identity.session_id.as_str())
+        || journal_digest::producer_scope_conflicts(event)
         || call.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
         || (!is_terminal(event) && run_id_of(event).is_some_and(|run| run != identity.run_id))
     {
@@ -286,8 +421,433 @@ fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKe
     Some(identity)
 }
 
-fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
+pub(super) fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
     a.name == b.name && a.was_executed() == b.was_executed()
+}
+
+#[derive(Default)]
+struct RejectionIds<'a> {
+    all: HashMap<Option<&'a str>, std::collections::HashSet<Option<&'a str>>>,
+    anonymous: HashMap<Option<&'a str>, std::collections::HashSet<Option<&'a str>>>,
+}
+
+impl<'a> RejectionIds<'a> {
+    fn insert(&mut self, name: Option<&'a str>, id: Option<&'a str>, anonymous: bool) {
+        self.all.entry(name).or_default().insert(id);
+        if anonymous {
+            self.anonymous.entry(name).or_default().insert(id);
+        }
+    }
+
+    fn overlaps(&self, name: &str, id: Option<&str>, anonymous_execution: bool) -> bool {
+        let by_name = if anonymous_execution {
+            &self.all
+        } else {
+            &self.anonymous
+        };
+        [Some(name), None].into_iter().any(|name| {
+            by_name.get(&name).is_some_and(|ids| {
+                !ids.is_empty() && (id.is_none() || ids.contains(&None) || ids.contains(&id))
+            })
+        })
+    }
+}
+
+/// Independently supported execution evidence can overlap. A definitive
+/// rejection and an execution for the same canonical invocation conflict;
+/// unknown and deferred observations may be refined by later execution.
+pub(super) fn confirmed_execution_evidence(
+    events: &[JournalEvent],
+    conflicting_terminals: &[JournalEvent],
+) -> (u64, bool) {
+    use astra_services::session_journal::ToolCallDisposition;
+
+    let mut identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
+    let mut invalid_identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
+    let mut rejected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut child_rejected_ids: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut child_unidentified_rejections = std::collections::HashSet::new();
+    let mut rejected_attempts: HashMap<_, RejectionIds<'_>> = HashMap::new();
+    let mut unscoped_rejection_ids = RejectionIds::default();
+    let mut all_rejection_ids = RejectionIds::default();
+    let mut unscoped_rejection = false;
+    let mut summary_rejection = false;
+    let mut any_rejected = false;
+    let mut any_unidentified = false;
+    for event in events.iter().chain(conflicting_terminals) {
+        for call in event.tool_calls.iter().flatten() {
+            let disposition = call.effective_disposition();
+            if !matches!(
+                disposition,
+                ToolCallDisposition::Executed | ToolCallDisposition::Rejected
+            ) {
+                continue;
+            }
+            let valid = call_key(event, call);
+            if disposition == ToolCallDisposition::Rejected {
+                any_rejected = true;
+                let id = call
+                    .tool_call_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                all_rejection_ids.insert(Some(call.name.as_str()), id, false);
+                let child_callback = is_child_callback(event);
+                if child_callback && call.invocation_identity.is_none() {
+                    // This producer writes request IDs from one scoped callback
+                    // batch even when account identity is unavailable.
+                    if let Some(scope) = event.session_id.as_deref().zip(run_id_of(event)) {
+                        if let Some(id) = call
+                            .tool_call_id
+                            .as_deref()
+                            .filter(|id| !id.trim().is_empty())
+                        {
+                            child_rejected_ids.entry(scope).or_default().insert(id);
+                        } else {
+                            child_unidentified_rejections.insert(scope);
+                        }
+                    } else {
+                        unscoped_rejection = true;
+                    }
+                } else {
+                    let attempt = event
+                        .session_id
+                        .as_deref()
+                        .zip(event.turn)
+                        .zip(run_id_of(event));
+                    // Terminal details may include an invocation from an
+                    // earlier run, so their rejection is not attempt-scoped.
+                    let ids = if !is_terminal(event)
+                        && let Some(((session, turn), run)) = attempt
+                    {
+                        rejected_attempts.entry((session, turn, run)).or_default()
+                    } else {
+                        &mut unscoped_rejection_ids
+                    };
+                    ids.insert(Some(call.name.as_str()), id, valid.is_none());
+                    if let Some(identity) = call.invocation_identity.as_ref() {
+                        rejected_scopes
+                            .entry((identity.session_id.as_str(), identity.run_id.as_str()))
+                            .or_default()
+                            .insert(call.name.as_str());
+                    }
+                    if valid.is_none() {
+                        // A root terminal can include earlier runs, so its own
+                        // run does not scope an anonymous or invalid rejection.
+                        if !is_terminal(event)
+                            && let Some(scope) = event.session_id.as_deref().zip(run_id_of(event))
+                        {
+                            rejected_scopes
+                                .entry(scope)
+                                .or_default()
+                                .insert(call.name.as_str());
+                        } else {
+                            unscoped_rejection = true;
+                        }
+                    }
+                }
+            }
+            let (identity, facts) = if let Some(identity) = valid {
+                (identity, &mut identities)
+            } else if let Some(identity) = call.invocation_identity.as_ref() {
+                any_unidentified |= disposition == ToolCallDisposition::Executed;
+                (identity, &mut invalid_identities)
+            } else {
+                any_unidentified |= disposition == ToolCallDisposition::Executed;
+                continue;
+            };
+            let facts = facts.entry(identity).or_default();
+            facts.0 |= disposition == ToolCallDisposition::Executed;
+            facts.1 |= disposition == ToolCallDisposition::Rejected;
+        }
+    }
+
+    // A terminal ledger can report rejected requests without retaining
+    // their identities. An execution may be one of those requests.
+    if any_unidentified || identities.values().any(|(executed, _)| *executed) {
+        for event in events
+            .iter()
+            .chain(conflicting_terminals)
+            .filter(|event| is_terminal(event))
+        {
+            let Some(summary) = event
+                .tool_outcomes
+                .as_ref()
+                .filter(|summary| summary.is_consistent() && summary.rejected > 0)
+            else {
+                continue;
+            };
+            any_rejected = true;
+            let known: std::collections::HashSet<_> = event
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| call.effective_disposition() == ToolCallDisposition::Rejected)
+                .filter_map(|call| {
+                    call.tool_call_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                })
+                .collect();
+            let has_anonymous = event.tool_calls.iter().flatten().any(|call| {
+                call.effective_disposition() == ToolCallDisposition::Rejected
+                    && call
+                        .tool_call_id
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
+            });
+            // At least one anonymous rejection is known even without an ID;
+            // several such rows may still be replays of the same request.
+            let known_min = known.len().max(usize::from(has_anonymous));
+            if known_min < summary.rejected as usize {
+                summary_rejection = true;
+            }
+        }
+    }
+
+    let mut disputed: std::collections::HashSet<_> = identities
+        .keys()
+        .chain(invalid_identities.keys())
+        .copied()
+        .filter(|identity| {
+            let (executed, rejected) = identities.get(*identity).copied().unwrap_or_default();
+            let (invalid_executed, invalid_rejected) = invalid_identities
+                .get(*identity)
+                .copied()
+                .unwrap_or_default();
+            (executed || invalid_executed) && (rejected || invalid_rejected)
+        })
+        .collect();
+    let mut affected_terminals = std::collections::HashSet::new();
+    let mut anonymous_conflict_attempts = std::collections::HashSet::new();
+    let mut unscoped_anonymous_conflict = false;
+    for (position, event) in events.iter().chain(conflicting_terminals).enumerate() {
+        let attempt = event
+            .session_id
+            .as_deref()
+            .zip(event.turn)
+            .zip(run_id_of(event));
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| call.was_executed())
+        {
+            let key = call_key(event, call);
+            let id = call
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            // Child callback tool calls are explicitly outside the root
+            // terminal's aggregate, but explicit rejection records can still
+            // contradict them by identity.
+            let overlaps = (summary_rejection && !is_child_callback(event))
+                || if is_terminal(event) && key.is_none() {
+                    // An anonymous terminal execution can also be a projection
+                    // of an earlier run's rejected request.
+                    all_rejection_ids.overlaps(&call.name, id, true)
+                } else {
+                    unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
+                        || attempt
+                            .and_then(|((session, turn), run)| {
+                                rejected_attempts.get(&(session, turn, run))
+                            })
+                            .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
+                };
+            if overlaps {
+                if let Some(identity) = key {
+                    disputed.insert(identity);
+                } else if is_terminal(event) {
+                    affected_terminals.insert(position);
+                } else if let (Some(turn), Some(run)) = (event.turn, run_id_of(event)) {
+                    anonymous_conflict_attempts.insert((turn, run));
+                } else {
+                    unscoped_anonymous_conflict = true;
+                }
+            }
+        }
+    }
+    let has_conflict = !conflicting_terminals.is_empty()
+        || !disputed.is_empty()
+        || !affected_terminals.is_empty()
+        || !anonymous_conflict_attempts.is_empty()
+        || unscoped_anonymous_conflict;
+    let incomplete = has_conflict || !invalid_identities.is_empty();
+    let mut affected_attempts = anonymous_conflict_attempts;
+    let mut affected_runs = std::collections::HashSet::new();
+    let mut affected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut unscoped_invalid = unscoped_anonymous_conflict;
+    if has_conflict {
+        for (position, event) in events.iter().chain(conflicting_terminals).enumerate() {
+            for call in event.tool_calls.iter().flatten() {
+                let Some(identity) = call.invocation_identity.as_ref() else {
+                    continue;
+                };
+                if !disputed.contains(identity) {
+                    continue;
+                }
+                let invalid = call_key(event, call).is_none();
+                affected_scopes
+                    .entry((identity.session_id.as_str(), identity.run_id.as_str()))
+                    .or_default()
+                    .insert(call.name.as_str());
+                if let Some(scope) = event.session_id.as_deref().zip(run_id_of(event)) {
+                    affected_scopes
+                        .entry(scope)
+                        .or_default()
+                        .insert(call.name.as_str());
+                } else if invalid {
+                    unscoped_invalid = true;
+                }
+                if invalid {
+                    // The invalid annotation can refer to any attempt in its
+                    // claimed run, as well as the producer's actual attempt.
+                    affected_runs.insert((identity.session_id.as_str(), identity.run_id.as_str()));
+                }
+                if is_terminal(event) {
+                    affected_terminals.insert(position);
+                } else if let (Some(turn), Some(run)) = (event.turn, run_id_of(event)) {
+                    affected_attempts.insert((turn, run));
+                } else {
+                    affected_runs.insert((identity.session_id.as_str(), identity.run_id.as_str()));
+                }
+            }
+        }
+    }
+
+    // An anonymous execution can overlap a rejection. Without a validated
+    // aggregate, only a disjoint producer scope establishes independence.
+    let anonymous_execution = any_unidentified
+        && (!(has_conflict || any_rejected)
+            || (!unscoped_invalid
+                && !unscoped_rejection
+                && events.iter().chain(conflicting_terminals).any(|event| {
+                    let scoped_child_callback = is_child_callback(event);
+                    if summary_rejection && !scoped_child_callback {
+                        return false;
+                    }
+                    if !matches!(
+                        event.event_type,
+                        JournalEventType::LlmRound | JournalEventType::ToolCallError
+                    ) && !scoped_child_callback
+                    {
+                        return false;
+                    }
+                    let Some((session, scope)) = event
+                        .session_id
+                        .as_deref()
+                        .filter(|session| !session.trim().is_empty())
+                        .zip(event.producer_scope.as_ref())
+                    else {
+                        return false;
+                    };
+                    !scope.run_id.trim().is_empty()
+                        && !child_unidentified_rejections
+                            .contains(&(session, scope.run_id.as_str()))
+                        && event.tool_calls.iter().flatten().any(|call| {
+                            let scope_key = (session, scope.run_id.as_str());
+                            let overlaps_named = affected_scopes
+                                .get(&scope_key)
+                                .is_some_and(|names| names.contains(call.name.as_str()))
+                                || rejected_scopes
+                                    .get(&scope_key)
+                                    .is_some_and(|names| names.contains(call.name.as_str()));
+                            let distinct_child_request = child_rejected_ids
+                                .get(&(session, scope.run_id.as_str()))
+                                .is_none_or(|rejected| {
+                                    scoped_child_callback
+                                        && call.invocation_identity.is_none()
+                                        && call.tool_call_id.as_deref().is_some_and(|id| {
+                                            !id.trim().is_empty() && !rejected.contains(id)
+                                        })
+                                });
+                            call.was_executed()
+                                && !overlaps_named
+                                && distinct_child_request
+                                && match call.invocation_identity.as_ref() {
+                                    None => true,
+                                    Some(identity) => {
+                                        call_key(event, call).is_none()
+                                            && !disputed.contains(identity)
+                                    }
+                                }
+                        })
+                })));
+    // A retained terminal summary may include calls projected by a
+    // conflicting terminal. Do not promote that aggregate unless its
+    // detailed identities establish disjointness from those candidates.
+    let mut conflict_keys = std::collections::HashSet::new();
+    // A rejected summary without complete detail can overlap a later report.
+    let conflicting_summary_rejection = conflicting_terminals.iter().any(|event| {
+        event
+            .tool_outcomes
+            .as_ref()
+            .is_some_and(|summary| summary.is_consistent() && summary.rejected > 0)
+    });
+    let mut conflict_has_anonymous = conflicting_summary_rejection;
+    let mut conflict_has_calls = conflicting_summary_rejection;
+    for event in conflicting_terminals {
+        for call in event.tool_calls.iter().flatten() {
+            conflict_has_calls = true;
+            if let Some(key) = call_key(event, call) {
+                conflict_keys.insert(key);
+            } else {
+                conflict_has_anonymous = true;
+            }
+        }
+    }
+    let terminal_floor = events
+        .iter()
+        .enumerate()
+        .filter(|(position, event)| {
+            is_terminal(event)
+                && (!conflict_has_calls
+                    || (!conflict_has_anonymous
+                        && event.tool_calls.as_ref().is_some_and(|calls| {
+                            let mut executed = std::collections::HashSet::new();
+                            calls.iter().all(|call| {
+                                call_key(event, call).is_some_and(|key| {
+                                    if call.was_executed() {
+                                        executed.insert(key);
+                                    }
+                                    !conflict_keys.contains(key)
+                                })
+                            }) && journal_digest::terminal_execution_count(event)
+                                == Some(executed.len() as u64)
+                        })))
+                && !unscoped_invalid
+                && !affected_terminals.contains(position)
+                && !(has_conflict && (event.turn.is_none() || run_id_of(event).is_none()))
+                && !event
+                    .turn
+                    .zip(run_id_of(event))
+                    .is_some_and(|attempt| affected_attempts.contains(&attempt))
+                && !event
+                    .session_id
+                    .as_deref()
+                    .zip(run_id_of(event))
+                    .is_some_and(|scope| affected_runs.contains(&scope))
+                && journal_digest::terminal_execution_consistent(event)
+        })
+        .filter_map(|(_, event)| journal_digest::terminal_execution_count(event))
+        .max()
+        .unwrap_or_default();
+    let identified = identities
+        .iter()
+        .filter(|(identity, (executed, _))| *executed && !disputed.contains(*identity))
+        .count() as u64;
+    (
+        terminal_floor
+            .max(identified)
+            .max(u64::from(anonymous_execution)),
+        incomplete,
+    )
+}
+
+pub(super) fn confirmed_execution_floor(events: &[JournalEvent]) -> u64 {
+    confirmed_execution_evidence(events, &[]).0
 }
 
 /// A matching round owns call order, independently of error persistence order.
@@ -315,14 +875,17 @@ fn normalized_error<'a>(
     Some(((round, offset), representative))
 }
 
-fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
+fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolActivity {
     // Terminals own aggregate counts. Only explicit attempt/call identities
     // reconcile projections; unproven or contradictory execution evidence is
     // retained with incomplete coverage, never silently consumed by an aggregate.
+    let has_terminal = events.iter().any(is_terminal);
     let mut out = ToolActivity {
         sequence: Vec::new(),
         executed: 0,
-        complete: true,
+        complete: has_terminal
+            && !observation_incomplete
+            && !journal_digest::has_child_observation(events),
     };
     let mut index = TerminalIndex::new(events);
     let mut owned: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -377,20 +940,17 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             if call.was_executed() && index.has_unscoped_terminal {
                 out.complete = false;
             }
-            out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
+            if call.was_executed() && has_terminal {
+                // A terminal's unidentifiable records may already cover this call.
+                out.complete = false;
+            } else {
+                out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
+            }
             slots.insert((position, within, 0), call);
         }
     }
     for (idx, event) in events.iter().enumerate().filter(|(_, e)| is_terminal(e)) {
-        if event
-            .tool_outcomes
-            .as_ref()
-            .is_some_and(|outcomes| outcomes.unknown > 0)
-            || event.tool_calls.iter().flatten().any(|call| {
-                call.effective_disposition()
-                    == astra_services::session_journal::ToolCallDisposition::Unknown
-            })
-        {
+        if !super::journal_digest::terminal_execution_complete(event) {
             out.complete = false;
         }
         let rounds = owned.remove(&idx).unwrap_or_default();
@@ -496,13 +1056,12 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
                 // terminal aggregate, even when it reports zero executions.
                 if call.was_executed() {
                     out.complete = false;
-                    out.executed = out.executed.saturating_add(1);
                 }
             } else {
                 detailed += u64::from(call.was_executed());
             }
         }
-        let executed = event.tool_count.map(u64::from).unwrap_or(detailed);
+        let executed = super::journal_digest::terminal_execution_count(event).unwrap_or(detailed);
         if detailed != executed {
             out.complete = false;
         }
@@ -513,6 +1072,11 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         .filter(|call| call.was_executed())
         .map(|call| call.name.clone())
         .collect();
+    let (floor, conflicts) = confirmed_execution_evidence(events, &[]);
+    out.complete &= !conflicts;
+    if !out.complete {
+        out.executed = floor;
+    }
     out
 }
 
@@ -535,7 +1099,7 @@ fn has_final_text(events: &[JournalEvent]) -> bool {
         .find(|e| {
             matches!(
                 e.event_type,
-                JournalEventType::Turn | JournalEventType::LlmRound
+                JournalEventType::Turn | JournalEventType::TurnError | JournalEventType::LlmRound
             )
         })
         .and_then(|e| e.assistant_output.as_deref())
@@ -560,6 +1124,7 @@ fn event_type_str(t: &JournalEventType) -> String {
 }
 
 pub fn render_text(diff: &JournalDiff) -> String {
+    let delta = |value: Option<i64>| value.map_or_else(|| "?".to_string(), |v| v.to_string());
     let mut s = String::new();
     s.push_str(&format!(
         "=== journal diff ===\n  A: {}\n  B: {}\n",
@@ -568,33 +1133,44 @@ pub fn render_text(diff: &JournalDiff) -> String {
     if diff.a_session == diff.b_session {
         s.push_str("  ⚠ Warning: A and B resolve to the same session — diff will be zero.\n");
     }
+    for (label, errors) in [("A", &diff.a_source_errors), ("B", &diff.b_source_errors)] {
+        for error in errors {
+            s.push_str(&format!("  {label} source unavailable: {error}\n"));
+        }
+    }
     s.push('\n');
 
     s.push_str("token totals  (A → B,  Δ = B - A)\n");
     s.push_str(&format!(
         "  prompt:     {} → {}  (Δ {})\n",
-        diff.a_tokens.prompt, diff.b_tokens.prompt, diff.token_deltas.prompt
+        display_known(diff.a_tokens.prompt, diff.a_tokens.prompt_complete),
+        display_known(diff.b_tokens.prompt, diff.b_tokens.prompt_complete),
+        delta(diff.token_deltas.prompt)
     ));
     s.push_str(&format!(
         "  completion: {} → {}  (Δ {})\n",
-        diff.a_tokens.completion, diff.b_tokens.completion, diff.token_deltas.completion
+        display_known(diff.a_tokens.completion, diff.a_tokens.completion_complete),
+        display_known(diff.b_tokens.completion, diff.b_tokens.completion_complete),
+        delta(diff.token_deltas.completion)
     ));
     s.push_str(&format!(
         "  total:      {} → {}  (Δ {})\n\n",
-        diff.a_tokens.total, diff.b_tokens.total, diff.token_deltas.total
+        display_known(diff.a_tokens.total, diff.a_tokens.total_complete),
+        display_known(diff.b_tokens.total, diff.b_tokens.total_complete),
+        delta(diff.token_deltas.total)
     ));
 
-    s.push_str("final text: ");
-    match (diff.a_has_final_text, diff.b_has_final_text) {
-        (true, true) => s.push_str("both runs produced output\n\n"),
-        (false, false) => s.push_str("NEITHER run produced output\n\n"),
-        (true, false) => s.push_str("A produced output; B did NOT\n\n"),
-        (false, true) => s.push_str("B produced output; A did NOT\n\n"),
-    }
+    s.push_str(&format!(
+        "final text observed: A={} B={}\n\n",
+        diff.a_final_text_observed, diff.b_final_text_observed
+    ));
 
-    s.push_str("event-type counts (Δ non-zero only):\n");
+    s.push_str("observed event-type counts (Δ non-zero only):\n");
+    if diff.a_observation_incomplete || diff.b_observation_incomplete {
+        s.push_str("  observation is incomplete; missing events are unknown\n");
+    }
     if diff.count_deltas.is_empty() {
-        s.push_str("  (no differences)\n");
+        s.push_str("  (no observed differences)\n");
     } else {
         for (k, d) in &diff.count_deltas {
             let a = diff.a_event_counts.get(k).copied().unwrap_or(0);
@@ -603,10 +1179,10 @@ pub fn render_text(diff: &JournalDiff) -> String {
         }
     }
     if !diff.only_in_a.is_empty() {
-        s.push_str(&format!("  only in A: {:?}\n", diff.only_in_a));
+        s.push_str(&format!("  only observed in A: {:?}\n", diff.only_in_a));
     }
     if !diff.only_in_b.is_empty() {
-        s.push_str(&format!("  only in B: {:?}\n", diff.only_in_b));
+        s.push_str(&format!("  only observed in B: {:?}\n", diff.only_in_b));
     }
 
     s.push('\n');
@@ -628,7 +1204,7 @@ pub fn render_text(diff: &JournalDiff) -> String {
         }
     } else if diff.a_tool_calls_executed != diff.b_tool_calls_executed {
         s.push_str(&format!(
-            "  → confirmed executed counts differ ({} → {}); full counts may be higher; sequences not comparable\n",
+            "  → known recorded counts differ ({} → {}); full counts may be higher; sequences not comparable\n",
             diff.a_tool_calls_executed, diff.b_tool_calls_executed
         ));
     } else {
@@ -713,7 +1289,10 @@ mod tests {
             let d = diff_events("a", "b", &[error("original", 0), error(chain, 1)], &[]);
             assert_eq!(d.a_tool_calls_executed, expected);
             assert_eq!(d.a_tool_sequence.len() as u64, expected);
-            assert!(d.a_tool_sequence_complete);
+            assert!(
+                !d.a_tool_sequence_complete,
+                "standalone observations have no terminal"
+            );
         }
     }
 
@@ -780,13 +1359,17 @@ mod tests {
                 let mut changed = raw.clone();
                 changed["tool_calls"][0]["invocation_identity"][field] = json!(value);
                 let d = diff_events("a", "b", &[evt(raw.clone()), evt(changed)], &[]);
-                assert_eq!(d.a_tool_calls_executed, 2, "{field}={value:?}");
-                assert_eq!(d.a_tool_sequence, ["bash", "bash"]);
-                let conflict = ["session_id", "run_id", "invocation_id"].contains(&field);
                 assert_eq!(
-                    d.a_tool_sequence_complete,
-                    value == "different" && !conflict
+                    d.a_tool_calls_executed,
+                    if value == "different" && matches!(field, "user_id" | "turn_chain_id") {
+                        2
+                    } else {
+                        1
+                    },
+                    "{field}={value:?}"
                 );
+                assert_eq!(d.a_tool_sequence, ["bash", "bash"]);
+                assert!(!d.a_tool_sequence_complete, "the run has no terminal");
             }
         }
         let mut missing = raw;
@@ -795,7 +1378,7 @@ mod tests {
             .unwrap()
             .remove("invocation_identity");
         let d = diff_events("a", "b", &[evt(missing.clone()), evt(missing)], &[]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
         assert!(!d.a_tool_sequence_complete);
     }
 
@@ -829,7 +1412,14 @@ mod tests {
             (Shape::Orphan, false, "chain", "bash", true),
         ] {
             let label = format!("{shape:?}/{first_executed}/{second_chain}/{second_name}");
-            let expected_count = if first_executed { 2 } else { 1 };
+            let conflict = !first_executed && second_chain == "chain";
+            let expected_count = if conflict {
+                0
+            } else if first_executed && second_chain != "chain" {
+                2
+            } else {
+                1
+            };
             let sid = uuid::Uuid::new_v4().to_string();
             let writer = JournalWriter::new(&sid).unwrap();
             let record = |chain: &str, name: &str, executed: bool| ToolCallRecord {
@@ -886,6 +1476,7 @@ mod tests {
                 }
             }
             let diff = super::compute_diff(&sid, &empty).unwrap();
+            let complete = complete && !matches!(shape, Shape::Orphan) && !conflict;
             assert_eq!(diff.a_tool_calls_executed, expected_count, "{label}");
             assert_eq!(diff.a_tool_sequence_complete, complete, "{label}");
             let names = if first_executed {
@@ -954,7 +1545,13 @@ mod tests {
                 writer.append(event).unwrap();
             }
             let d = super::compute_diff(sid, &empty).unwrap();
-            assert_eq!(d.a_tool_calls_executed, expected.0);
+            assert_eq!(
+                d.a_tool_calls_executed,
+                expected.0,
+                "error={} terminal={}",
+                serde_json::to_string(&error).unwrap(),
+                serde_json::to_string(&terminal).unwrap()
+            );
             assert_eq!(d.a_tool_sequence, vec!["bash"; expected.1]);
             assert_eq!(d.a_tool_sequence_complete, expected.2);
             let encoded = serde_json::to_value(&d).unwrap();
@@ -968,14 +1565,15 @@ mod tests {
         // with full identity, or carry no executed terminal detail to overlap.
         for (id, identified, executed, aggregate, expected) in [
             (None, false, true, 0, (1, 2, false)),
-            (None, false, true, 1, (2, 2, false)),
-            (None, false, true, 2, (3, 2, false)),
-            (Some(" "), false, true, 2, (3, 2, false)),
-            (Some("call"), false, true, 2, (3, 2, false)),
-            (None, true, true, 2, (3, 2, false)),
+            (None, false, true, 1, (1, 2, false)),
+            (None, false, true, 2, (2, 2, false)),
+            (Some(" "), false, true, 2, (2, 2, false)),
+            (Some("call"), false, true, 2, (2, 2, false)),
+            (None, true, true, 2, (2, 2, false)),
             (Some("call"), true, true, 2, (2, 1, false)),
             (Some("other"), true, true, 2, (2, 2, true)),
-            (None, false, false, 1, (1, 1, true)),
+            // An anonymous rejection can refer to the observed execution.
+            (None, false, false, 1, (0, 1, false)),
         ] {
             let sid = uuid::Uuid::new_v4().to_string();
             let observed = known(&sid, "call");
@@ -1011,7 +1609,7 @@ mod tests {
         }
         // Unknown detail does not blanket-poison the terminal's own list.
         // Only a new external identity faces the unresolved overlap barrier.
-        for (terminal_id, expected) in [("call", (2, 2, true)), ("other", (3, 3, false))] {
+        for (terminal_id, expected) in [("call", (2, 2, true)), ("other", (2, 3, false))] {
             let sid = uuid::Uuid::new_v4().to_string();
             let mut unknown = known(&sid, "unknown");
             unknown.invocation_identity = None;
@@ -1165,13 +1763,13 @@ mod tests {
         )];
         let b = a.clone();
         let d = diff_events("a", "b", &a, &b);
-        assert_eq!(d.token_deltas.prompt, 0);
-        assert_eq!(d.token_deltas.completion, 0);
+        assert_eq!(d.token_deltas.prompt, Some(0));
+        assert_eq!(d.token_deltas.completion, Some(0));
         assert!(d.count_deltas.is_empty());
         assert!(d.only_in_a.is_empty());
         assert!(d.only_in_b.is_empty());
-        assert!(d.a_has_final_text);
-        assert!(d.b_has_final_text);
+        assert!(d.a_final_text_observed);
+        assert!(d.b_final_text_observed);
     }
 
     #[test]
@@ -1201,8 +1799,9 @@ mod tests {
                 ),
             ];
             let diff = diff_events("a", "b", &events, &[]);
-            assert_eq!(diff.a_tokens.prompt, terminal_input + 20);
-            assert_eq!(diff.a_tokens.completion, 12);
+            assert_eq!(diff.a_tokens.prompt, terminal_input);
+            assert_eq!(diff.a_tokens.completion, 10);
+            assert!(!diff.a_tokens.prompt_complete);
             let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
             assert_eq!(tree.self_prompt_tokens, diff.a_tokens.prompt);
             assert_eq!(tree.self_completion_tokens, diff.a_tokens.completion);
@@ -1227,15 +1826,88 @@ mod tests {
     #[test]
     fn token_deltas_are_signed_b_minus_a() {
         let a = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50}),
+            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50,"cache_read_tokens":0,"cache_creation_tokens":0}),
         )];
         let b = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80}),
+            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80,"cache_read_tokens":0,"cache_creation_tokens":0}),
         )];
         let d = diff_events("a", "b", &a, &b);
-        assert_eq!(d.token_deltas.prompt, -200); // B used fewer prompt tokens
-        assert_eq!(d.token_deltas.completion, 30);
-        assert_eq!(d.token_deltas.total, -170);
+        assert_eq!(d.token_deltas.prompt, Some(-200)); // B used fewer prompt tokens
+        assert_eq!(d.token_deltas.completion, Some(30));
+        assert_eq!(d.token_deltas.total, Some(-170));
+    }
+
+    #[test]
+    fn total_includes_cache_and_requires_each_bucket() {
+        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":900,"cache_creation_tokens":0}))];
+        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":1000,"cache_creation_tokens":0}))];
+        let diff = diff_events("a", "b", &a, &b);
+        assert_eq!(diff.a_tokens.total, 1020);
+        assert!(diff.a_tokens.total_complete);
+        assert_eq!(diff.token_deltas.total, Some(100));
+
+        let missing_cache = vec![evt(json!({"type":"turn","ts":"t","session_id":"b",
+            "tokens_in":100,"tokens_out":20,"cache_read_tokens":1000}))];
+        let diff = diff_events("a", "b", &a, &missing_cache);
+        assert!(!diff.b_tokens.total_complete);
+        assert_eq!(diff.token_deltas.total, None);
+    }
+
+    #[test]
+    fn unattributed_running_round_and_dropped_events_keep_counts_partial() {
+        let events = vec![
+            evt(json!({"type":"turn","ts":"t1","session_id":"a","turn":1,
+                "tokens_in":100,"tokens_out":20,"cache_read_tokens":0,"cache_creation_tokens":0,
+                "tool_count":0,"metadata":{"run_id":"finished"}})),
+            evt(
+                json!({"type":"llm_round","ts":"t2","session_id":"a","turn":2,
+                "producer_scope":{"run_id":"running"},"tokens_in":50,"tokens_out":3}),
+            ),
+        ];
+        let diff = diff_events("a", "b", &events, &events);
+        assert!(!diff.a_tokens.prompt_complete);
+        assert_eq!(diff.token_deltas.total, None);
+        assert!(!diff.a_tool_sequence_complete);
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
+        assert!(!tree.prompt_tokens_complete);
+        assert!(!tree.tool_calls_complete);
+
+        let dropped = vec![evt(json!({"type":"turn","ts":"t","session_id":"a",
+            "metadata":{"dropped_events_before":545}}))];
+        let diff = diff_events("a", "b", &dropped, &dropped);
+        assert!(!diff.a_tool_sequence_complete);
+        assert!(render_text(&diff).contains("unavailable/incomplete"));
+    }
+
+    #[test]
+    fn missing_usage_is_partial_not_zero_in_tree_and_diff() {
+        let partial = vec![
+            evt(json!({"type":"turn","ts":"t1","session_id":"a","tokens_out":34162})),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","tokens_in":7,"tokens_out":0})),
+        ];
+        let complete = vec![evt(json!({
+            "type":"turn","ts":"t3","session_id":"b","tokens_in":0,"tokens_out":34162
+        }))];
+        let diff = diff_events("a", "b", &partial, &complete);
+        assert_eq!(diff.a_tokens.prompt, 7);
+        assert!(!diff.a_tokens.prompt_complete);
+        assert_eq!(diff.token_deltas.prompt, None);
+        assert_eq!(diff.token_deltas.completion, Some(0));
+        assert_eq!(diff.token_deltas.total, None);
+        assert!(render_text(&diff).contains("partial(7) → 0  (Δ ?)"));
+        let json = serde_json::to_value(&diff).unwrap();
+        assert_eq!(json["a_tokens"]["prompt_complete"], false);
+        assert!(json["token_deltas"]["prompt"].is_null());
+
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &partial);
+        assert!(crate::cli::journal_tree::render_text(&tree).contains("tokens=partial(7)/34162"));
+        assert!(!tree.prompt_tokens_complete);
+        assert!(tree.completion_tokens_complete);
+        let (zero, _, _) = crate::cli::journal_tree::fold_events_into_tree("b", &complete);
+        assert!(zero.prompt_tokens_complete);
+        assert!(crate::cli::journal_tree::render_text(&zero).contains("tokens=0/34162"));
     }
 
     #[test]
@@ -1392,7 +2064,7 @@ mod tests {
         ];
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
     }
 
     #[test]
@@ -1432,7 +2104,7 @@ mod tests {
         ];
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
-        assert_eq!(d.a_tool_calls_executed, 2);
+        assert_eq!(d.a_tool_calls_executed, 1);
     }
 
     #[test]
@@ -1452,7 +2124,7 @@ mod tests {
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
         assert_eq!(d.a_tool_calls_executed, 2);
-        assert!(d.a_tool_sequence_complete);
+        assert!(!d.a_tool_sequence_complete);
         // Same shape when the terminal carries its own per-call detail.
         let mut a = a;
         a[2] = identified_evt(
@@ -1479,7 +2151,7 @@ mod tests {
             }
             let diff = diff_events("a", "b", &[round, terminal.clone()], &[]);
             assert_eq!(diff.a_tool_sequence, [name, "read_file"]);
-            assert_eq!(diff.a_tool_calls_executed, 2);
+            assert_eq!(diff.a_tool_calls_executed, 1);
             assert!(!diff.a_tool_sequence_complete);
         }
     }
@@ -1597,7 +2269,7 @@ mod tests {
             );
         }
         let diff = super::compute_diff(&sid, &empty).unwrap();
-        assert_eq!(diff.a_tool_calls_executed, 2);
+        assert_eq!(diff.a_tool_calls_executed, 1);
         assert!(!diff.a_tool_sequence_complete);
         let expected = if detail != Some(false) {
             vec!["bash", "read_file"]
@@ -1606,12 +2278,12 @@ mod tests {
         };
         assert_eq!(diff.a_tool_sequence, expected);
         let encoded = serde_json::to_value(&diff).unwrap();
-        assert_eq!(encoded["a_tool_calls_executed"], 2);
+        assert_eq!(encoded["a_tool_calls_executed"], 1);
         assert_eq!(encoded["a_tool_sequence_complete"], false);
         assert_eq!(encoded["a_tool_sequence"], json!(expected));
         let text = render_text(&diff);
         assert!(
-            text.contains("confirmed executed calls: 2; detailed sequence"),
+            text.contains("confirmed executed calls: 1; detailed sequence"),
             "{text}"
         );
         assert!(!text.contains("tool sequence DIFFERS"), "{text}");
@@ -1690,13 +2362,16 @@ mod tests {
             "tool_count":0,"metadata":{"run_id":"later-run"}}));
         for events in [vec![error.clone()], vec![error, terminal]] {
             let diff = diff_events("a", "b", &events, &[]);
+            let complete = events.iter().any(super::is_terminal);
             assert_eq!(diff.a_tool_calls_executed, 0);
             assert!(diff.a_tool_sequence.is_empty());
-            assert!(diff.a_tool_sequence_complete);
+            assert_eq!(diff.a_tool_sequence_complete, complete);
             let encoded = serde_json::to_value(&diff).unwrap();
             assert_eq!(encoded["a_tool_sequence"], json!([]));
-            assert_eq!(encoded["a_tool_sequence_complete"], true);
-            assert!(render_text(&diff).contains("tool sequence A (0 calls): []"));
+            assert_eq!(encoded["a_tool_sequence_complete"], complete);
+            if complete {
+                assert!(render_text(&diff).contains("tool sequence A (0 calls): []"));
+            }
         }
     }
 
@@ -1762,6 +2437,11 @@ mod tests {
                     let mut calls = vec![read, failed];
                     calls.truncate(with_detail);
                     event = event.with_tool_calls(calls);
+                    if with_detail < 2 {
+                        // The constructor summarized only the retained records;
+                        // it cannot represent the complete remote outcome summary.
+                        event.tool_outcomes = None;
+                    }
                 }
                 // Partial terminal data keeps its independent executed aggregate.
                 event.tool_count = Some(2);
@@ -1798,11 +2478,11 @@ mod tests {
                     );
                     assert_eq!(diff.a_tool_sequence, diff.b_tool_sequence);
                     assert_eq!(diff.a_tool_calls_executed, 2);
-                    assert!(diff.a_tool_sequence_complete);
+                    assert_eq!(diff.a_tool_sequence_complete, terminal.is_some());
                     let json = serde_json::to_value(&diff).unwrap();
                     assert_eq!(json["a_tool_sequence"], json!(["read_file", "bash"]));
                     assert_eq!(json["a_tool_calls_executed"], 2);
-                    assert_eq!(json["a_tool_sequence_complete"], true);
+                    assert_eq!(json["a_tool_sequence_complete"], terminal.is_some());
                     assert!(!render_text(&diff).contains("tool sequence DIFFERS"));
                 }
             }
@@ -1845,7 +2525,10 @@ mod tests {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_sequence, ["bash"]);
             assert_eq!(diff.a_tool_calls_executed, 1);
-            assert!(diff.a_tool_sequence_complete);
+            assert_eq!(
+                diff.a_tool_sequence_complete,
+                events.iter().any(super::is_terminal)
+            );
         }
         // Missing IDs and multi-call errors cannot inherit a round's identity.
         let failed = round.tool_calls.as_ref().unwrap()[0].clone();
@@ -1857,7 +2540,7 @@ mod tests {
         let mut another = failed;
         another.tool_call_id = Some("another-failure".into());
         multiple.tool_calls.as_mut().unwrap().push(another);
-        for (error, retained) in [(missing, 2), (multiple, 2)] {
+        for (error, retained) in [(missing, 1), (multiple, 1)] {
             let diff = diff_events("a", "b", &[round.clone(), error], &[]);
             assert_eq!(diff.a_tool_calls_executed, retained);
             assert!(!diff.a_tool_sequence_complete);
@@ -1875,8 +2558,8 @@ mod tests {
             runless.tool_calls.as_ref().unwrap()[0].clone(),
         );
         for (events, count) in [
-            (vec![runless.clone(), error.clone(), error.clone()], 3),
-            (vec![error, runless], 2),
+            (vec![runless.clone(), error.clone(), error.clone()], 1),
+            (vec![error, runless], 1),
         ] {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_calls_executed, count);
@@ -1901,7 +2584,7 @@ mod tests {
                 }
                 let diff = diff_events("a", "b", &[error.clone(), error], &[]);
                 assert_eq!(diff.a_tool_sequence, ["bash", "bash"]);
-                assert_eq!(diff.a_tool_calls_executed, 2);
+                assert_eq!(diff.a_tool_calls_executed, 1);
                 assert!(!diff.a_tool_sequence_complete);
             }
         }
@@ -1950,7 +2633,7 @@ mod tests {
         anonymous.producer_scope = None;
         anonymous.tool_calls.as_mut().unwrap()[0].invocation_identity = None;
         let d = diff_events("a", "b", &[anonymous, child, other, root], &[]);
-        assert_eq!(d.a_tool_calls_executed, 3);
+        assert_eq!(d.a_tool_calls_executed, 2);
         assert!(
             !d.a_tool_sequence_complete,
             "conflicting identities cannot prove complete attribution"
@@ -1982,7 +2665,7 @@ mod tests {
         assert_eq!(d.a_tool_sequence, vec!["read_file", "grep", "bash"]);
         assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
         assert_eq!(d.a_tool_calls_executed, 3);
-        assert!(d.a_tool_sequence_complete);
+        assert!(!d.a_tool_sequence_complete);
         assert!(!render_text(&d).contains("tool sequence DIFFERS"));
         // Without call IDs, projections cannot be proved redundant.
         for e in &mut a {
@@ -1997,7 +2680,7 @@ mod tests {
             d.a_tool_sequence,
             ["read_file", "grep", "bash", "read_file", "bash"]
         );
-        assert_eq!(d.a_tool_calls_executed, 5);
+        assert_eq!(d.a_tool_calls_executed, 2);
         assert!(!d.a_tool_sequence_complete);
     }
 
@@ -2020,21 +2703,22 @@ mod tests {
             let d = diff_events("a", "b", &a, &[]);
             assert_eq!(d.a_tool_sequence, vec!["bash"]);
             assert_eq!(d.a_tool_calls_executed, 1);
-            assert!(d.a_tool_sequence_complete);
+            assert_eq!(d.a_tool_sequence_complete, a.iter().any(super::is_terminal));
         }
     }
 
     #[test]
-    fn missing_or_conflicting_call_identity_never_erases_execution() {
+    fn missing_identity_preserves_unconflicted_execution() {
         use astra_services::session_journal::ToolCallDisposition::{Executed, Rejected};
         for (run, id, terminal_name, disposition, count, complete) in [
-            (None, Some("call"), "read_file", Executed, 2, false),
-            (Some("root"), Some("call"), "read_file", Executed, 2, false),
-            (Some("root"), Some("call"), "bash", Rejected, 1, false),
-            (Some("root"), None, "bash", Rejected, 1, false),
-            (Some("root"), Some("   "), "bash", Rejected, 1, false),
+            (None, Some("call"), "read_file", Executed, 1, false),
+            (Some("root"), Some("call"), "read_file", Executed, 1, false),
+            (Some("root"), Some("call"), "bash", Rejected, 0, false),
+            // An anonymous execution may be the rejected invocation.
+            (Some("root"), None, "bash", Rejected, 0, false),
+            (Some("root"), Some("   "), "bash", Rejected, 0, false),
             (Some("root"), Some("call"), "bash", Executed, 1, true),
-            (Some("other"), Some("call"), "bash", Executed, 2, true),
+            (Some("other"), Some("call"), "bash", Executed, 2, false),
         ] {
             let mut record = serde_json::from_value(json!({
                 "tool_call_id":id,"name":"bash","ok":false,"ms":1
@@ -2134,7 +2818,7 @@ mod tests {
         let txt = render_text(&d);
         assert!(txt.contains("tool sequence B (0 calls): []"), "{txt}");
         assert!(
-            txt.contains("confirmed executed counts differ (3 → 0)"),
+            txt.contains("known recorded counts differ (3 → 0)"),
             "{txt}"
         );
     }
@@ -2147,8 +2831,8 @@ mod tests {
         // B has a turn but no assistant output — crash / empty run.
         let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b"}))];
         let d = diff_events("a", "b", &a, &b);
-        assert!(d.a_has_final_text);
-        assert!(!d.b_has_final_text);
+        assert!(d.a_final_text_observed);
+        assert!(!d.b_final_text_observed);
     }
 
     #[test]
@@ -2163,25 +2847,32 @@ mod tests {
         let txt = render_text(&d);
         assert!(txt.contains("100 → 120"));
         assert!(txt.contains("(Δ 20)"));
-        assert!(txt.contains("both runs produced output"));
+        assert!(txt.contains("final text observed: A=true B=true"));
     }
 
     #[test]
     fn token_delta_saturates_on_large_u64_instead_of_wrapping() {
-        // u64 values above i64::MAX must not wrap to negative on cast.
-        let big = (i64::MAX as u64) + 1000;
-        let a = vec![evt(
-            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":big,"tokens_out":0}),
-        )];
+        // Individually valid samples can have an aggregate above i64::MAX.
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t1","session_id":"a","tokens_in":i64::MAX,"tokens_out":0}),
+            ),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","tokens_in":1000,"tokens_out":0})),
+        ];
         let b = vec![evt(
             json!({"type":"turn","ts":"t","session_id":"b","tokens_in":0,"tokens_out":0}),
         )];
         let d = diff_events("a", "b", &a, &b);
-        // Delta should be clamped, not wrapped to a positive number.
-        assert!(
-            d.token_deltas.prompt <= 0,
-            "prompt delta must not wrap positive; got {}",
-            d.token_deltas.prompt
+        assert_eq!(d.token_deltas.prompt, Some(i64::MIN));
+
+        // A single invalid sample is quarantined, as it is during ingestion.
+        let invalid = vec![evt(json!({
+            "type":"turn","ts":"t","session_id":"a",
+            "tokens_in": (i64::MAX as u64) + 1000,"tokens_out":0
+        }))];
+        assert_eq!(
+            diff_events("a", "b", &invalid, &b).token_deltas.prompt,
+            None
         );
     }
 
@@ -2191,7 +2882,7 @@ mod tests {
         let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b"}))];
         let d = diff_events("a", "b", &a, &b);
         let txt = render_text(&d);
-        assert!(txt.contains("(no differences)"));
+        assert!(txt.contains("(no observed differences)"));
     }
 
     #[test]
@@ -2208,7 +2899,7 @@ mod tests {
         let b: Vec<JournalEvent> = vec![];
         let d = diff_events("a", "b", &a, &b);
         assert!(
-            !d.a_has_final_text,
+            !d.a_final_text_observed,
             "has_final_text must check the LAST event with potential output, \
              not any event. A run whose last turn has no output crashed."
         );

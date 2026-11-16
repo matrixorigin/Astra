@@ -396,6 +396,11 @@ fn interactive_outcome(
 pub(crate) enum ChatInput {
     Interactive(String),
     Conversation(String),
+    /// Generated wire guidance retains the user's command for recovery.
+    PlanGuidance {
+        wire: String,
+        original: String,
+    },
 }
 
 async fn capture_turn_auth_owner(
@@ -445,13 +450,15 @@ pub(crate) async fn handle_chat_input_with_ui(
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) -> Result<InteractiveTurnOutcome, String> {
-    let (line, interactive) = match input {
-        ChatInput::Interactive(line) => (line, true),
-        ChatInput::Conversation(line) => (line, false),
+    let (line, interactive, original_plan) = match input {
+        ChatInput::Interactive(line) => (line, true, None),
+        ChatInput::Conversation(line) => (line, false, None),
+        ChatInput::PlanGuidance { wire, original } => (wire, false, Some(original)),
     };
+    let restore_line = original_plan.as_deref().unwrap_or(&line);
     if !ctx.permits_admission(state) {
         ui.show_warning("The account or conversation changed. This instruction was not sent.");
-        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        let _ = ui.restore_input(restore_line, state.session_id.as_deref());
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
     if let Some(decision) = interactive
@@ -493,7 +500,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         Some(token) => token,
         None => {
             ui.show_warning(missing_access.user_warning());
-            let _ = ui.restore_input(&line, state.session_id.as_deref());
+            let _ = ui.restore_input(restore_line, state.session_id.as_deref());
             return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
@@ -511,7 +518,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         Ok(owner) => owner,
         Err(message) => {
             ui.show_warning(message);
-            let _ = ui.restore_input(&line, state.session_id.as_deref());
+            let _ = ui.restore_input(restore_line, state.session_id.as_deref());
             return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
@@ -519,12 +526,12 @@ pub(crate) async fn handle_chat_input_with_ui(
         match ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await {
             Ok(session_id) => session_id,
             Err(error) => {
-                let _ = ui.restore_input(&line, state.session_id.as_deref());
+                let _ = ui.restore_input(restore_line, state.session_id.as_deref());
                 return Err(error);
             }
         };
     if !ctx.permits_admission(state) {
-        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        let _ = ui.restore_input(restore_line, state.session_id.as_deref());
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
 
@@ -538,7 +545,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     )
     .await
     {
-        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        let _ = ui.restore_input(restore_line, state.session_id.as_deref());
         return Err(error);
     }
 
@@ -549,7 +556,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         match acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = ui.restore_input(&line, state.session_id.as_deref());
+                let _ = ui.restore_input(restore_line, state.session_id.as_deref());
                 return Err(error);
             }
         };
@@ -571,7 +578,9 @@ pub(crate) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
-    if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state) {
+    if original_plan.is_none()
+        && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+    {
         crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(state, &line);
     }
 
@@ -587,7 +596,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     if auth_owner.as_ref().is_some_and(|owner| !owner.is_current()) || !ctx.permits_admission(state)
     {
         ui.show_warning("The account or conversation changed. This instruction was not sent.");
-        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        let _ = ui.restore_input(restore_line, state.session_id.as_deref());
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
     let consumed_bg_notifications = state.pending_bg_notifications.clone();
@@ -624,6 +633,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &line,
+        restore_line: original_plan.as_deref(),
         effective_line: &finalized_input.user_message,
         user_intent: &finalized_input.user_intent,
         input_runtime_required_texts: &finalized_input.runtime_required_texts,
@@ -800,6 +810,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &logical_user_line,
+        restore_line: None,
         effective_line: &runtime_envelope,
         user_intent: &user_intent,
         input_runtime_required_texts: &runtime_required_texts,
@@ -1100,6 +1111,7 @@ mod tests {
         let mut dispatch = TurnDispatch {
             ctx: &context,
             line: "continue",
+            restore_line: None,
             effective_line: "continue",
             user_intent: "continue",
             input_runtime_required_texts: &required,
@@ -1394,6 +1406,37 @@ mod tests {
             assert!(state.session_id.is_none());
             assert_eq!(state.turn, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn plan_guidance_restores_the_command_when_access_is_missing() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        crate::cli::slash::slash_plan::ensure_local_plan_mode(&mut state, "");
+        let mut ui = crate::tests::TestUi::default();
+        let outcome = handle_chat_input_with_ui(
+            ChatInput::PlanGuidance {
+                wire: "Pause implementation and prepare a plan".into(),
+                original: "/plan".into(),
+            },
+            None,
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            TurnContext {
+                api: &api,
+                profile: None,
+                post_commit_tx: None,
+                admission: None,
+                explain_analyze_terminal_degraded: None,
+            },
+            &mut ui,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        assert_eq!(ui.restored_inputs, ["/plan"]);
+        assert_eq!(state.cloud_plan_mirror.as_ref().unwrap().goal, "");
+        assert!(state.plan_mode_active());
     }
 
     #[tokio::test]

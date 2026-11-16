@@ -123,7 +123,8 @@ reports that its execution boundary applied them.
 During an active turn, `/allow` and `/allow read_only` use that same permission
 control. `/plan` requests read-only planning at the next observed boundary and
 submits the planning instruction only after the exact permission application is
-acknowledged. If the task ends or the request is superseded first, the original
+acknowledged. Repeating `/plan` requests planning again; `/allow auto` or the
+permission picker leaves Plan mode. If the task ends or the request is superseded first, the original
 command is returned for editing while the same session remains attached; it is
 never inserted into a different session. An already-running tool continues,
 but its current foreground wait is released when the command is entered.

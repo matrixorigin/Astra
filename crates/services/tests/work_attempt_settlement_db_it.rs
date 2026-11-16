@@ -508,7 +508,7 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn blocked_primary_settlement_does_not_start_a_successor() {
+async fn blocked_primary_settlement_continues_independent_work() {
     let pool = common::setup_pool().await;
     let owner_id = common::id("blocked-primary-owner");
     let work_id = common::id("work");
@@ -525,7 +525,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
             &branch_id,
             &session_id,
             &common::id("intent"),
-            "Do not advance past a blocked task.",
+            "Continue independent work when a task is blocked.",
         ))
         .await
         .expect("create Work");
@@ -571,6 +571,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
         })
         .await
         .expect("begin primary attempt");
+    let successor = WorkItemAttemptId::parse(common::id("successor")).unwrap();
     let result = service
         .record_and_advance_primary(
             &owner_id,
@@ -583,11 +584,15 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
                 blocker_kind: Some(WorkAttemptBlockerKind::DependencyBlocked),
                 unavailable_capabilities: Vec::new(),
             },
-            WorkItemAttemptId::parse(common::id("must-not-start")).unwrap(),
+            successor.clone(),
         )
         .await
         .expect("record blocked settlement");
-    assert_eq!(result.advance, PrimaryWorkAttemptAdvance::NeedsRecovery);
+    assert!(matches!(
+        result.advance,
+        PrimaryWorkAttemptAdvance::Assigned { ref attempt_id, ref item_id, .. }
+            if attempt_id == &successor && item_id.as_str() == task_b
+    ));
     let attempts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work_item_attempts WHERE owner_id = ? AND executor_run_id = ?",
     )
@@ -596,7 +601,24 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
     .fetch_one(pool.get())
     .await
     .expect("count attempts");
-    assert_eq!(attempts, 1, "blocked delivery must not start another task");
+    assert_eq!(attempts, 2, "only the independent task should start");
+    let finished = service
+        .record_and_advance_primary(
+            &owner_id,
+            successor.as_str(),
+            &run_id,
+            -1,
+            NewWorkAttemptSettlement {
+                outcome: WorkAttemptOutcome::Delivered,
+                summary: "Independent task delivered".into(),
+                blocker_kind: None,
+                unavailable_capabilities: Vec::new(),
+            },
+            WorkItemAttemptId::parse(common::id("unused")).unwrap(),
+        )
+        .await
+        .expect("settle independent task");
+    assert_eq!(finished.advance, PrimaryWorkAttemptAdvance::Blocked);
 }
 
 #[tokio::test]
