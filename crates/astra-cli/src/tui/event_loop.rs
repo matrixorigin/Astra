@@ -4871,23 +4871,6 @@ enum UserIntentProjection {
     Returned,
 }
 
-fn settle_open_root_recovery(
-    bottom_pane: &mut BottomPane,
-    intent: &bottom_pane::PendingUserIntent,
-    returned: bool,
-) {
-    let draft = bottom_pane
-        .take_open_root_recovery_draft(&intent.intent_id)
-        .or_else(|| intent.recovery_draft.clone());
-    if let Some(draft) = draft {
-        if returned {
-            bottom_pane.save_root_recovery_draft(&intent.intent_id, draft);
-        } else {
-            bottom_pane.keep_returned_root_edit(intent, draft);
-        }
-    }
-}
-
 /// Apply structured app events that update both the bottom-pane control
 /// surface and transcript projection. The result is an exact reducer ACK, not
 /// merely evidence that an event entered the TUI channel.
@@ -4920,7 +4903,7 @@ fn apply_tui_control_event(
                 bottom_pane.apply_user_intent(intent_id, *delivery, *status, content)
             {
                 if let Some(recovering) = recovering {
-                    settle_open_root_recovery(bottom_pane, &recovering, false);
+                    bottom_pane.update_root_guidance_view(&recovering.intent_id, *status);
                 }
                 chat_widget.commit_applied_user_intent(
                     intent.intent_id,
@@ -4951,7 +4934,7 @@ fn apply_tui_control_event(
                 .cloned();
             if bottom_pane.return_user_intent(intent_id, *status, content) {
                 if let Some(recovering) = recovering {
-                    settle_open_root_recovery(bottom_pane, &recovering, true);
+                    bottom_pane.update_root_guidance_view(&recovering.intent_id, *status);
                 }
                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Your guidance was not adopted; it remains available for editing.".to_string(),
@@ -6120,7 +6103,7 @@ fn drain_agent_workbench_outcomes(
                 if !resolved {
                     continue;
                 }
-                settle_open_root_recovery(bottom_pane, &intent, returned);
+                bottom_pane.update_root_guidance_view(&intent.intent_id, status);
                 if returned {
                     let preview = history_cell::recovered_guidance::guidance_preview(&intent.text);
                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
@@ -6337,7 +6320,7 @@ fn open_recoverable_guidance(
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
                         intent.intent_id.clone(),
-                        intent.recovery_text(),
+                        &intent.text,
                         intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote,
                         intent.root_scope(),
                     ),
@@ -8362,12 +8345,12 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::CopyUnconfirmedRootGuidance { intent_id, text } => {
-            if bottom_pane
-                .unconfirmed_root_guidance(Some(&intent_id))
-                .is_some()
-            {
+            if let Some(scope) = bottom_pane.root_guidance_copy_scope(&intent_id) {
                 let outcome_tx = backends.agent_workbench_tx.clone();
                 tokio::spawn(async move {
+                    if !scope.owner_can_view() {
+                        return;
+                    }
                     let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
                     let _ = outcome_tx
                         .send(AgentWorkbenchOutcome::Clipboard {
@@ -17744,11 +17727,10 @@ mod tests {
             assert!(pane.composer.is_empty());
         }
         pane.set_session_attachment(Some("session"), 2);
-        for _ in 0..2 {
-            assert!(pane.recover_returned_root_guidance());
-            assert_eq!(pane.composer.text(), "private edited");
-            pane.replace_composer_text("");
-        }
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "private");
+        pane.replace_composer_text("");
+        assert!(!pane.recover_returned_root_guidance());
         assert!(pane.unconfirmed_root_guidance(Some("root")).is_some());
         assert!(!pane.root_intent_is_visible("root"));
         pane.push_view(Box::new(
@@ -17766,10 +17748,8 @@ mod tests {
         ));
         assert!(pane.composer.is_empty());
         assert_eq!(
-            pane.unconfirmed_root_guidance(Some("root"))
-                .unwrap()
-                .recovery_text(),
-            "root private edited"
+            pane.unconfirmed_root_guidance(Some("root")).unwrap().text,
+            "root private"
         );
         assert!(old_child.can_view_draft(Some("session"), 2));
         assert!(!old_child.is_attached(Some("session"), 2));
@@ -24234,7 +24214,7 @@ mod tests {
             assert_eq!(next.intent_id, expected);
             open_recoverable_guidance(next, &backends, &mut pane);
         }
-        assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft edited"));
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft"));
         pane.set_session_attachment(Some("other"), 4);
         assert!(pane.next_recoverable_guidance("root").is_none());
     }
@@ -24380,53 +24360,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn closing_unknown_root_recovery_keeps_only_explicit_edits() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let _credentials = crate::tests::isolate_credentials();
-        set_root_recovery_credentials("root-close-owner");
-        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-            "default",
-            Some("root-close-owner"),
-        )
-        .unwrap();
-
-        for (key, should_keep) in [
-            (KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
-            (
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                true,
-            ),
-            (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT), false),
-        ] {
-            let scope = root_recovery_scope(Some("run"));
-            let mut pane = root_recovery_pane(scope.clone(), "original", false);
-            pane.push_view(Box::new(
-                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                    "guide".into(),
-                    "original",
-                    false,
-                    Some(scope),
-                ),
-            ));
-            pane.handle_paste(" edited");
-            let _ = pane.handle_key(key);
-            assert!(pane.composer.is_empty());
-            assert_eq!(
-                pane.unconfirmed_root_guidance(Some("guide"))
-                    .unwrap()
-                    .recovery_text(),
-                if should_keep {
-                    "original edited"
-                } else {
-                    "original"
-                }
-            );
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn root_recovery_edits_stay_scoped_through_detached_settlement() {
+    fn unknown_root_recovery_stays_read_only_and_scoped() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _credentials = crate::tests::isolate_credentials();
         set_root_recovery_credentials("root-scope-owner");
@@ -24447,78 +24381,26 @@ mod tests {
                         Some(scope),
                     ),
                 ));
-                pane.handle_paste(" edited");
+                pane.handle_paste(&"x".repeat(1024 * 1024));
+                assert!(render_bottom_pane_text(&pane, 120, 20).contains("Paste not inserted"));
+                pane.handle_key(KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE));
+                assert!(render_bottom_pane_text(&pane, 120, 20).contains("Input not inserted"));
                 if close_first {
                     pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 }
                 pane.set_session_attachment(Some("other"), 4);
                 assert!(pane.composer.is_empty());
                 assert!(!pane.has_active_view());
-                assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
                 assert!(pane.settle_detached_root_intent("guide", returned));
-                if !returned {
-                    assert!(!pane.settle_detached_root_intent("guide", false));
-                }
                 assert!(!pane.recover_returned_root_guidance());
                 pane.set_session_attachment(Some("session"), 5);
-                assert!(pane.recover_returned_root_guidance());
-                assert_eq!(pane.composer.text(), "original edited");
+                assert_eq!(pane.recover_returned_root_guidance(), returned);
+                if returned {
+                    assert_eq!(pane.composer.text(), "original");
+                }
                 assert!(!pane.recover_returned_root_guidance());
             }
         }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn root_recovery_keeps_cleared_draft_and_counts_edits_toward_budget() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let _credentials = crate::tests::isolate_credentials();
-        set_root_recovery_credentials("root-budget-owner");
-        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-            "default",
-            Some("root-budget-owner"),
-        )
-        .unwrap();
-        let scope = root_recovery_scope(Some("run"));
-        let mut pane = root_recovery_pane(scope.clone(), "original", false);
-        pane.push_view(Box::new(
-            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                "guide".into(),
-                "original",
-                false,
-                Some(scope.clone()),
-            ),
-        ));
-        pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(
-            pane.unconfirmed_root_guidance(Some("guide"))
-                .unwrap()
-                .recovery_draft
-                .as_deref(),
-            Some("")
-        );
-        pane.push_view(Box::new(
-            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                "guide".into(),
-                "",
-                false,
-                Some(scope),
-            ),
-        ));
-        pane.handle_paste(&"x".repeat(1024 * 1024));
-        pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(
-            pane.unconfirmed_root_guidance(Some("guide"))
-                .unwrap()
-                .recovery_text()
-                .len(),
-            1024 * 1024
-        );
-        assert_eq!(
-            pane.accept_turn_user_intent("turn", "later".into(), "next".into()),
-            Err(bottom_pane::UserIntentRejectReason::QueueFull)
-        );
     }
 
     #[serial_test::serial]
@@ -24569,7 +24451,8 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resolved_root_recovery_preserves_literal_and_command_drafts() {
+    async fn resolved_root_recovery_restores_only_the_returned_original() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _credentials = crate::tests::isolate_credentials();
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default",
@@ -24577,10 +24460,7 @@ mod tests {
         )
         .unwrap();
         let (backends, _rx) = root_recovery_backends("http://127.0.0.1:1");
-        for (command, expected) in [
-            (false, "//plan inspect edited"),
-            (true, "/plan inspect edited"),
-        ] {
+        for (command, expected) in [(false, "//plan inspect"), (true, "/plan inspect")] {
             for returned in [false, true] {
                 let mut pane =
                     root_recovery_pane(root_recovery_scope(None), "/plan inspect", command);
@@ -24590,6 +24470,17 @@ mod tests {
                     .clone();
                 open_recoverable_guidance(intent, &backends, &mut pane);
                 pane.handle_paste(" edited");
+                pane.root_guidance_check_notice(
+                    "guide",
+                    Some("Check failed. Alt+N next/check; no message resent."),
+                );
+                let screen = render_bottom_pane_text(&pane, 42, 12);
+                assert!(
+                    screen.contains("Paste not inserted") && screen.contains("Check failed"),
+                    "{screen}"
+                );
+                pane.mark_root_guidance_received("guide");
+                assert!(render_bottom_pane_text(&pane, 42, 12).contains("Paste not inserted"));
                 let status = if returned {
                     astra_turn_types::UserIntentStatus::Returned
                 } else {
@@ -24614,18 +24505,42 @@ mod tests {
                 };
                 let mut widget = chat_widget::ChatWidget::new("session");
                 apply_tui_control_event(&event, &mut pane, &mut widget, 3);
+                assert!(pane.has_active_view());
+                let screen = render_bottom_pane_text(&pane, 42, 12);
+                assert!(screen.contains("Paste not inserted"), "{screen}");
+                assert!(
+                    screen.contains(if returned { "not used" } else { "applied" }),
+                    "{screen}"
+                );
+                for key in [KeyCode::Char('x'), KeyCode::Enter] {
+                    assert!(matches!(
+                        pane.handle_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                        BottomPaneAction::Consumed
+                    ));
+                }
                 assert!(pane.composer.is_empty());
-                assert!(pane.recover_returned_root_guidance());
-                assert_eq!(pane.composer.text(), expected);
+                assert!(pane.root_guidance_copy_scope("guide").is_some());
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)),
+                    BottomPaneAction::ViewAction(BottomPaneViewAction::CopyUnconfirmedRootGuidance { text, .. })
+                        if text == "/plan inspect"
+                ));
+                pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(!pane.has_active_view());
+                assert_eq!(pane.recover_returned_root_guidance(), returned);
+                if returned {
+                    assert_eq!(pane.composer.text(), expected);
+                    pane.handle_paste(" edited");
+                    assert_eq!(pane.composer.text(), format!("{expected} edited"));
+                }
             }
         }
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn reopening_unknown_root_rechecks_original_run_and_preserves_edits() {
+    async fn reopening_unknown_root_rechecks_original_run_without_resending() {
         use wiremock::matchers::query_param;
-
         let _credentials = crate::tests::isolate_credentials();
         let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         set_root_recovery_credentials("root-recheck-owner");
@@ -24634,7 +24549,6 @@ mod tests {
             Some("root-recheck-owner"),
         )
         .unwrap();
-
         for (disposition, plan) in [("applied", false), ("returned", false), ("applied", true)] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -24678,16 +24592,20 @@ mod tests {
                 &FrameRequester::test_dummy(),
             );
             assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+            assert!(pane.has_active_view());
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert!(!pane.has_active_view());
             assert!(pane.composer.is_empty());
-            assert!(pane.recover_returned_root_guidance());
             assert_eq!(
-                pane.composer.text(),
-                if plan {
-                    "/plan inspect edited"
-                } else {
-                    "draft edited"
-                }
+                pane.recover_returned_root_guidance(),
+                disposition == "returned"
             );
+            if disposition == "returned" {
+                assert_eq!(pane.composer.text(), "draft");
+            }
             if disposition == "applied" {
                 let transcript = rendered_transcript_overlay(&widget, 80);
                 assert!(transcript.contains("Earlier message applied"));
@@ -24768,7 +24686,9 @@ mod tests {
             }
             assert!(widget.last_user_text().is_none());
             assert!(pane.unconfirmed_root_guidance(Some("other")).is_some());
-            assert!(render_bottom_pane_text(&pane, 100, 20).contains("second message edited"));
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            assert!(rendered.contains("second message"));
+            assert!(!rendered.contains("second message edited"));
         }
     }
 
@@ -25087,8 +25007,12 @@ mod tests {
         );
         assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
         assert!(pane.composer.is_empty());
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert!(pane.recover_returned_root_guidance());
-        assert_eq!(pane.composer.text(), "draft edited");
+        assert_eq!(pane.composer.text(), "draft");
         backends
             .agent_workbench_tx
             .send(AgentWorkbenchOutcome::RootGuideStatus {
@@ -25110,7 +25034,7 @@ mod tests {
             &FrameRequester::test_dummy(),
         );
         assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
-        assert_eq!(pane.composer.text(), "draft edited");
+        assert_eq!(pane.composer.text(), "draft");
         assert!(
             server
                 .received_requests()

@@ -1878,23 +1878,51 @@ const MAX_SUMMARY_TOOL_ERRORS: usize = 4;
 
 struct SummaryToolError<'a> {
     event: SideEvent,
-    run: Option<&'a str>,
-    error: Option<&'a str>,
+    identity: Option<&'a astra_turn_types::ToolInvocationIdentity>,
+    tool: Option<&'a str>,
+    disposition: Option<session_journal::ToolCallDisposition>,
+    reason: Option<&'a str>,
+    reported: Option<&'a str>,
     fallback: bool,
 }
 
 fn record_summary_tool_error<'a>(
     event: &'a session_journal::JournalEvent,
+    call: Option<&'a session_journal::ToolCallRecord>,
     error: Option<&'a String>,
     errors: &mut Vec<SummaryToolError<'a>>,
     omitted: &mut usize,
 ) {
     let run = producer_run_id(event);
     let fallback = event.event_type != JournalEventType::ToolCallError;
-    let error_key = error.map(String::as_str);
-    let index = run.and_then(|_| {
+    let identity = call.and_then(|call| super::journal_diff::call_key(event, call));
+    let tool = call
+        .map(|call| call.name.as_str())
+        .or(
+            match (event.tool_calls.as_deref(), event.tools_used.as_deref()) {
+                (None | Some([]), Some([tool])) => Some(tool.as_str()),
+                _ => None,
+            },
+        )
+        .filter(|tool| !tool.trim().is_empty());
+    let disposition = call.and_then(|call| call.disposition);
+    let reason = error.map(String::as_str);
+    let reported =
+        (!fallback && call.is_some() && matches!(event.tool_calls.as_deref(), Some([_])))
+            .then(|| {
+                event
+                    .error
+                    .as_deref()
+                    .filter(|error| !error.trim().is_empty())
+            })
+            .flatten();
+    let index = identity.and_then(|identity| {
         errors.iter().position(|saved| {
-            saved.event.turn == event.turn && saved.run == run && saved.error == error_key
+            saved.identity == Some(identity)
+                && saved.tool == tool
+                && saved.disposition == disposition
+                && saved.reason == reason
+                && (saved.fallback || fallback || saved.reported == reported)
         })
     });
     // An observation of a call and its separate error event are often the
@@ -1929,12 +1957,22 @@ fn record_summary_tool_error<'a>(
             detail: json!({
                 "message": error.map(|error| preview(Some(error), 160)),
                 "message_truncated": error.is_some_and(|error| error.trim().chars().nth(160).is_some()),
+                "reported_message": reported.filter(|reported| Some(*reported) != reason)
+                    .map(|reported| reported.trim().chars().take(160).collect::<String>()),
+                "reported_message_truncated": reported.filter(|reported| Some(*reported) != reason)
+                    .is_some_and(|reported| reported.trim().chars().nth(160).is_some()),
+                "tool": tool.map(|tool| tool.trim().chars().take(80).collect::<String>()),
+                "tool_truncated": tool.is_some_and(|tool| tool.trim().chars().nth(80).is_some()),
+                "disposition": disposition,
                 "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
                 "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
             }),
         },
-        run,
-        error: error_key,
+        identity,
+        tool,
+        disposition,
+        reason,
+        reported,
         fallback,
     });
 }
@@ -2113,6 +2151,28 @@ fn build_digest_with_owners(
         } else {
             None
         };
+        // Diagnostic observations do not require a completed root turn. A
+        // partial journal can retain a tool failure without proving which
+        // root or child attempt ultimately owns the round.
+        if matches!(focus, DigestFocus::Summary)
+            && (is_root_terminal(ev)
+                || (!is_child_producer(ev) && ev.event_type == JournalEventType::LlmRound))
+        {
+            for call in ev
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| is_effective_failure(call))
+            {
+                record_summary_tool_error(
+                    ev,
+                    Some(call),
+                    effective_error(call),
+                    &mut summary_tool_errors,
+                    &mut omitted_tool_error_observations,
+                );
+            }
+        }
         if let Some(failure_seq) = failure_seq {
             for call in ev
                 .tool_calls
@@ -2164,16 +2224,6 @@ fn build_digest_with_owners(
                     && key.is_none_or(|key| seen_root_guard_invocations.insert(key))
                 {
                     safety_guard_blocks += 1;
-                }
-                if matches!(focus, DigestFocus::Summary)
-                    && ev.event_type != JournalEventType::ToolCallError
-                {
-                    record_summary_tool_error(
-                        ev,
-                        effective_error(call),
-                        &mut summary_tool_errors,
-                        &mut omitted_tool_error_observations,
-                    );
                 }
                 if matches!(focus, DigestFocus::All) {
                     let error_preview = preview(Some(&error), 200);
@@ -2515,23 +2565,53 @@ fn build_digest_with_owners(
                         }),
                     });
                 } else {
-                    let error = ev
-                        .error
-                        .as_ref()
-                        .filter(|error| !error.trim().is_empty())
-                        .or_else(|| {
-                            ev.tool_calls
-                                .iter()
-                                .flatten()
-                                .filter(|call| is_effective_failure(call))
-                                .find_map(effective_error)
-                        });
-                    record_summary_tool_error(
-                        ev,
-                        error,
-                        &mut summary_tool_errors,
-                        &mut omitted_tool_error_observations,
-                    );
+                    let event_error = ev.error.as_ref().filter(|error| !error.trim().is_empty());
+                    match ev.tool_calls.as_deref() {
+                        Some([call]) => {
+                            let error = call
+                                .error
+                                .as_ref()
+                                .filter(|error| !error.trim().is_empty())
+                                .or(event_error)
+                                .or_else(|| effective_error(call));
+                            record_summary_tool_error(
+                                ev,
+                                Some(call),
+                                error,
+                                &mut summary_tool_errors,
+                                &mut omitted_tool_error_observations,
+                            );
+                        }
+                        Some(calls) if !calls.is_empty() => {
+                            let mut observed = false;
+                            for call in calls.iter().filter(|call| is_effective_failure(call)) {
+                                observed = true;
+                                record_summary_tool_error(
+                                    ev,
+                                    Some(call),
+                                    effective_error(call),
+                                    &mut summary_tool_errors,
+                                    &mut omitted_tool_error_observations,
+                                );
+                            }
+                            if event_error.is_some() || !observed {
+                                record_summary_tool_error(
+                                    ev,
+                                    None,
+                                    event_error,
+                                    &mut summary_tool_errors,
+                                    &mut omitted_tool_error_observations,
+                                );
+                            }
+                        }
+                        _ => record_summary_tool_error(
+                            ev,
+                            None,
+                            event_error,
+                            &mut summary_tool_errors,
+                            &mut omitted_tool_error_observations,
+                        ),
+                    }
                 }
             }
             JournalEventType::SessionStart => session_start_count += 1,

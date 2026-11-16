@@ -284,16 +284,19 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
-    /// Preserve edits made while an unknown main-message receipt is checked.
-    fn root_recovery_draft(&mut self, _intent_id: &str) -> Option<String> {
-        None
+    fn update_root_guidance_status(
+        &mut self,
+        _intent_id: &str,
+        _status: astra_turn_types::UserIntentStatus,
+    ) {
     }
 
-    fn root_recovery_draft_on_close(&mut self) -> Option<(String, String)> {
+    fn root_guidance_copy_scope(
+        &self,
+        _intent_id: &str,
+    ) -> Option<std::sync::Arc<super::RootIntentScope>> {
         None
     }
-
-    fn mark_root_guidance_received(&mut self, _intent_id: &str) {}
 
     fn root_guidance_check_notice(&mut self, _intent_id: &str, _message: Option<&str>) {}
 

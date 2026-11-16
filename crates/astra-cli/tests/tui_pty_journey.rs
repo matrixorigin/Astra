@@ -1737,7 +1737,7 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
-async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) {
+async fn check_unknown_root_message(disposition: &'static str, next_turn: bool, hold_lookup: bool) {
     use axum::{
         Json,
         extract::Path,
@@ -1746,6 +1746,8 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
     };
     let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+    let release_lookup = std::sync::Arc::new(tokio::sync::Notify::new());
+    let lookup_gate = release_lookup.clone();
     let routes = axum::Router::new()
         .route(
             "/chat/runs/{run_id}/intents",
@@ -1761,8 +1763,12 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
             "/chat/runs/{run_id}/intents/{intent_id}",
             get(move |Path((run, intent)): Path<(String, String)>| {
                 let checked = checked.clone();
+                let lookup_gate = lookup_gate.clone();
                 async move {
                     checked.send((run, intent)).unwrap();
+                    if hold_lookup {
+                        lookup_gate.notified().await;
+                    }
                     Json(disposition)
                 }
             }),
@@ -1836,6 +1842,57 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
         .unwrap();
     assert_eq!(run, "mock-run-agent-root");
     assert_eq!(intent, first["intent_id"].as_str().unwrap());
+    if hold_lookup {
+        astra.wait_for("read-only", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1b[200~");
+        astra.write(b"SHOULD_NOT_BE_INSERTED");
+        astra.write(b"\x1b[201~");
+        astra.wait_for("Paste not inserted", UI_TRANSITION_TIMEOUT);
+        release_lookup.notify_one();
+    }
+    astra.wait_for_screen(
+        "settled message remains in focus",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.contains("main conversation")
+                    && line.contains(if disposition == "returned" {
+                        "not used"
+                    } else {
+                        "applied"
+                    })
+            })
+        },
+    );
+    if hold_lookup {
+        // A non-bracketed paste may deliver several key events after the
+        // receipt. None may reach the composer or submit a partial message.
+        astra.write(b"TRAILING_INPUT_MUST_NOT_SEND\r");
+        astra.wait_for("Input not inserted", UI_TRANSITION_TIMEOUT);
+    }
+    astra.write(b"\x1b");
+    astra.wait_for_screen("recovery view closed", UI_TRANSITION_TIMEOUT, |screen| {
+        !screen
+            .lines()
+            .any(|line| line.contains("main conversation") && line.contains("read-only"))
+            && screen.contains(if disposition == "returned" {
+                "Unsent message"
+            } else {
+                "Earlier message applied"
+            })
+    });
+    if hold_lookup {
+        assert_eq!(
+            mock.received_requests().len(),
+            1,
+            "trailing input must not start a new turn"
+        );
+        assert!(
+            !astra
+                .current_screen()
+                .contains("TRAILING_INPUT_MUST_NOT_SEND")
+        );
+    }
     if disposition == "returned" {
         astra.wait_for("Earlier message was not used", UI_TRANSITION_TIMEOUT);
         astra.write(b"\x1bu");
@@ -1848,6 +1905,7 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
                     .any(|line| line.contains('›') && line.contains("What happened?"))
             },
         );
+        assert!(!astra.current_screen().contains("SHOULD_NOT_BE_INSERTED"));
     } else {
         // For a quiet next turn this must appear before its stream is released.
         astra.wait_for(
@@ -1896,14 +1954,20 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
     let _journey = pty_journey_lock().lock().await;
-    check_unknown_root_message("returned", false).await;
-    check_unknown_root_message("applied", false).await;
+    check_unknown_root_message("returned", false, false).await;
+    check_unknown_root_message("applied", false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_root_message_is_read_only_while_receipt_is_pending() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("returned", false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_root_receipt_is_visible_during_a_quiet_next_turn() {
     let _journey = pty_journey_lock().lock().await;
-    check_unknown_root_message("applied", true).await;
+    check_unknown_root_message("applied", true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
