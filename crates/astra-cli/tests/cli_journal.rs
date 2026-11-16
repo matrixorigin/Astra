@@ -2178,10 +2178,15 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     let mut conflicting = terminal.clone();
     conflicting["ts"] = json!("t3");
     conflicting["tokens_in"] = json!(200);
-    for top_level in [true, false] {
+    for source in ["event", "call", "result"] {
+        let mut observed_call = call.clone();
+        if source == "result" {
+            observed_call["error"] = Value::Null;
+            observed_call["result_preview"] = json!("permission denied opening report");
+        }
         let mut error = json!({"type":"tool_call_error","ts":"t1","session_id":sid,"turn":1,
-            "producer_scope":{"run_id":"run"},"tool_calls":[call]});
-        if top_level {
+            "producer_scope":{"run_id":"run"},"tool_calls":[observed_call]});
+        if source == "event" {
             error["error"] = json!("permission denied opening report");
         }
         std::fs::write(&path, format!("{error}\n{terminal}\n{conflicting}\n")).unwrap();
@@ -2199,12 +2204,85 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
                 .iter()
                 .any(|cause| {
                     cause["kind"] == "observed_tool_error"
+                        && cause["ts"] == "t1"
                         && cause["detail"]["run_id_preview"] == "run"
                         && cause["detail"]["message"] == "permission denied opening report"
                 })
         );
         assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
     }
+
+    // A separate ToolCallError may be missing from a partial journal. Both
+    // round and terminal observations must retain a bounded reason, whether
+    // or not the terminal itself has a conflicting projection.
+    for has_conflict in [false, true] {
+        for round_only in [false, true] {
+            let mut observed_terminal = terminal.clone();
+            let mut observed_conflict = conflicting.clone();
+            let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+                "round":0,"producer_scope":{"run_id":"run"},"tool_calls":[call]});
+            let mut lines = String::new();
+            if round_only {
+                observed_terminal["tool_calls"] = json!([]);
+                observed_conflict["tool_calls"] = json!([]);
+                lines.push_str(&format!("{round}\n"));
+            }
+            lines.push_str(&format!("{observed_terminal}\n"));
+            if has_conflict {
+                lines.push_str(&format!("{observed_conflict}\n"));
+            }
+            std::fs::write(&path, lines).unwrap();
+            let summary = run_journal(
+                root.path(),
+                &["digest", sid, "--format", "json", "--focus", "summary"],
+            );
+            assert!(summary.status.success(), "{summary:?}");
+            let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+            assert_eq!(value["aggregates"]["observed_root_tool_failures"], 1);
+            assert!(
+                value["other_errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cause| {
+                        cause["kind"] == "observed_tool_error"
+                            && cause["detail"]["message"] == "permission denied opening report"
+                    })
+            );
+            assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+        }
+    }
+
+    let calls: Vec<_> = (0..6)
+        .map(|n| {
+            json!({"name":"bash", "ok":false, "ms":1,
+            "disposition":"executed", "tool_call_id":format!("partial-{n}"),
+            "error":format!("failure {n}")})
+        })
+        .collect();
+    let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"run"},"tool_calls":calls});
+    let mut partial_terminal = terminal.clone();
+    partial_terminal["tool_calls"] = json!([]);
+    partial_terminal["tool_count"] = json!(6);
+    std::fs::write(&path, format!("{round}\n{partial_terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|e| e["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    assert!(causes.iter().any(|e| {
+        e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 2
+    }));
 
     // Ordinary attempts use the same bound; otherwise a long journal still
     // turns a summary into an unbounded per-call report.
@@ -2230,10 +2308,11 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
             .count(),
         4
     );
+    // The terminal contributes a ninth distinct observed error.
     assert!(
         causes
             .iter()
-            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 4)
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 5)
     );
     assert!(causes.iter().any(|e| e["detail"]["message"] == "failure 7"));
     assert!(!causes.iter().any(|e| e["detail"]["message"] == "failure 0"));
@@ -2310,9 +2389,10 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
             .iter()
             .all(|e| e["detail"]["run_id_preview"] == "run")
     );
+    // One repeated error and the terminal's separate failure were omitted.
     assert!(
         causes
             .iter()
-            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 1)
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 2)
     );
 }

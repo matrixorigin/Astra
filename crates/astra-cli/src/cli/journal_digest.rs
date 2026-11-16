@@ -723,17 +723,16 @@ impl std::fmt::Display for ErrorCategory {
 }
 
 /// Derive the best-available error text for a failed tool call.
-fn effective_error_text(c: &session_journal::ToolCallRecord) -> String {
-    if let Some(e) = c.error.as_deref()
-        && !e.trim().is_empty()
-    {
-        return e.to_string();
-    }
-    c.result_full
+fn effective_error(c: &session_journal::ToolCallRecord) -> Option<&String> {
+    c.error
         .as_ref()
+        .filter(|error| !error.trim().is_empty())
+        .or(c.result_full.as_ref())
         .or(c.result_preview.as_ref())
-        .cloned()
-        .unwrap_or_default()
+}
+
+fn effective_error_text(c: &session_journal::ToolCallRecord) -> String {
+    effective_error(c).cloned().unwrap_or_default()
 }
 
 /// Classify a tool failure error message into a coarse category.
@@ -1875,6 +1874,71 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     build_digest_with_owners(session_id, focus, &local_owner, account_owner.as_ref())
 }
 
+const MAX_SUMMARY_TOOL_ERRORS: usize = 4;
+
+struct SummaryToolError<'a> {
+    event: SideEvent,
+    run: Option<&'a str>,
+    error: Option<&'a str>,
+    fallback: bool,
+}
+
+fn record_summary_tool_error<'a>(
+    event: &'a session_journal::JournalEvent,
+    error: Option<&'a String>,
+    errors: &mut Vec<SummaryToolError<'a>>,
+    omitted: &mut usize,
+) {
+    let run = producer_run_id(event);
+    let fallback = event.event_type != JournalEventType::ToolCallError;
+    let error_key = error.map(String::as_str);
+    let index = run.and_then(|_| {
+        errors.iter().position(|saved| {
+            saved.event.turn == event.turn && saved.run == run && saved.error == error_key
+        })
+    });
+    // An observation of a call and its separate error event are often the
+    // same evidence. Prefer the latter without counting it as an omission.
+    if fallback {
+        if index.is_some_and(|index| !errors[index].fallback) {
+            return;
+        }
+        if index.is_none() && errors.len() == MAX_SUMMARY_TOOL_ERRORS {
+            *omitted += 1;
+            return;
+        }
+    }
+    if let Some(index) = index {
+        if !errors.remove(index).fallback {
+            *omitted += 1;
+        }
+    } else if errors.len() == MAX_SUMMARY_TOOL_ERRORS {
+        // Prefer a dedicated error event over a fallback call observation.
+        let index = errors.iter().position(|saved| saved.fallback).unwrap_or(0);
+        errors.remove(index);
+        *omitted += 1;
+    }
+    errors.push(SummaryToolError {
+        event: SideEvent {
+            ts: preview(Some(&event.ts), 32),
+            kind: "observed_tool_error".to_owned(),
+            turn: event.turn,
+            agentic_step: event.agentic_step,
+            producer_scope: None,
+            source: None,
+            detail: json!({
+                "message": error.map(|error| preview(Some(error), 160)),
+                "message_truncated": error.is_some_and(|error| error.trim().chars().nth(160).is_some()),
+                "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
+                "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
+            }),
+        },
+        run,
+        error: error_key,
+        fallback,
+    });
+}
+
 fn build_digest_with_owners(
     session_id: &str,
     focus: DigestFocus,
@@ -1908,9 +1972,7 @@ fn build_digest_with_owners(
     let mut other_errors = conflicting_round_requests;
     // Summary keeps a bounded set of tool error observations across both
     // ordinary and conflicting attempts. Full focus keeps the raw events.
-    const MAX_SUMMARY_TOOL_ERRORS: usize = 4;
-    let mut summary_tool_errors: Vec<SideEvent> = Vec::new();
-    let mut summary_tool_error_keys: Vec<(Option<u32>, Option<&str>, Option<&str>)> = Vec::new();
+    let mut summary_tool_errors = Vec::new();
     let mut omitted_tool_error_observations = 0usize;
 
     let source_incomplete = journal_lines_malformed > 0
@@ -2102,6 +2164,16 @@ fn build_digest_with_owners(
                     && key.is_none_or(|key| seen_root_guard_invocations.insert(key))
                 {
                     safety_guard_blocks += 1;
+                }
+                if matches!(focus, DigestFocus::Summary)
+                    && ev.event_type != JournalEventType::ToolCallError
+                {
+                    record_summary_tool_error(
+                        ev,
+                        effective_error(call),
+                        &mut summary_tool_errors,
+                        &mut omitted_tool_error_observations,
+                    );
                 }
                 if matches!(focus, DigestFocus::All) {
                     let error_preview = preview(Some(&error), 200);
@@ -2452,40 +2524,14 @@ fn build_digest_with_owners(
                                 .iter()
                                 .flatten()
                                 .filter(|call| is_effective_failure(call))
-                                .find_map(|call| {
-                                    call.error.as_ref().filter(|error| !error.trim().is_empty())
-                                })
+                                .find_map(effective_error)
                         });
-                    let run = producer_run_id(ev);
-                    let key = (ev.turn, run, error.map(String::as_str));
-                    if let Some(index) = run.and_then(|_| {
-                        summary_tool_error_keys
-                            .iter()
-                            .position(|saved| *saved == key)
-                    }) {
-                        summary_tool_errors.remove(index);
-                        summary_tool_error_keys.remove(index);
-                        omitted_tool_error_observations += 1;
-                    } else if summary_tool_errors.len() == MAX_SUMMARY_TOOL_ERRORS {
-                        summary_tool_errors.remove(0);
-                        summary_tool_error_keys.remove(0);
-                        omitted_tool_error_observations += 1;
-                    }
-                    summary_tool_error_keys.push(key);
-                    summary_tool_errors.push(SideEvent {
-                        ts: preview(Some(&ev.ts), 32),
-                        kind: "observed_tool_error".to_owned(),
-                        turn: ev.turn,
-                        agentic_step: ev.agentic_step,
-                        producer_scope: None,
-                        source: None,
-                        detail: json!({
-                            "message": error.map(|error| preview(Some(error), 160)),
-                            "message_truncated": error.is_some_and(|error| error.trim().chars().nth(160).is_some()),
-                            "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
-                            "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
-                        }),
-                    });
+                    record_summary_tool_error(
+                        ev,
+                        error,
+                        &mut summary_tool_errors,
+                        &mut omitted_tool_error_observations,
+                    );
                 }
             }
             JournalEventType::SessionStart => session_start_count += 1,
@@ -2561,8 +2607,9 @@ fn build_digest_with_owners(
         }
     }
 
+    other_errors.extend(summary_tool_errors.into_iter().map(|sample| sample.event));
     if omitted_tool_error_observations > 0 {
-        summary_tool_errors.push(SideEvent {
+        other_errors.push(SideEvent {
             ts: String::new(),
             kind: "tool_error_observations_omitted".to_owned(),
             turn: None,
@@ -2572,7 +2619,6 @@ fn build_digest_with_owners(
             detail: json!({"omitted": omitted_tool_error_observations}),
         });
     }
-    other_errors.extend(summary_tool_errors);
 
     // Candidate terminals do not contribute aggregate totals. Summary keeps
     // bounded terminal-level causes without copying per-call payloads.
