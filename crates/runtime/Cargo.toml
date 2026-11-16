@@ -102,7 +102,7 @@ tempfile = "3"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 tracing-opentelemetry.workspace = true
-rsa = "0.9"
+rsa = "0.10"
 jsonwebtoken.workspace = true
 astra-services = { workspace = true, features = ["e2e-hooks"] }
 astra-test-harness = { path = "../astra-test-harness" }
