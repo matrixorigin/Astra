@@ -141,9 +141,14 @@ Delegation-group events are not sub-runs. Child model-round token observations
 are reported separately from qualified terminal totals; neither they nor
 model-returned tool requests establish billing or tool execution. Digest tool
 totals carry their own coverage, and an unavailable supplemental journal is
-reported without discarding valid local evidence. Replayed terminal records are
-counted once; contradictory terminals for an attempt are excluded. A scalar
-execution count does not establish success, failure, or cache outcomes.
+reported without discarding valid local evidence. Replayed terminal records,
+including copies differing only in flush-loss annotations, are counted once.
+Contradictory terminals are excluded from aggregate accounting; their errors and
+identifiable tool facts remain available as partial observations. Conflicting
+rounds retain an agreed request count only when their producer scopes agree;
+disagreeing request counts remain available as conflicting observations, not
+executions. A scalar execution count does not establish success, failure, or
+cache outcomes.
 Raw terminal reports can overlap or contradict their outcome summaries; they
 are shown as reports, not as confirmed execution totals.
 Digest reports the validated ledger's failed-execution bucket separately from

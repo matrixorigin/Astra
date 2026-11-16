@@ -99,8 +99,34 @@ pub struct DelegationNode {
 /// whose metadata couldn't be parsed to fit the tree shape — counted,
 /// not errored, so a rogue line doesn't break the whole command.
 pub fn build_tree(session_id: &str) -> Result<(DelegationNode, u32, u32, Vec<String>), String> {
-    let (events, incomplete, errors) = journal_digest::read_journal_for_analysis(session_id)?;
-    let (root, total, skipped) = fold_events_with_coverage(session_id, &events, incomplete);
+    let (events, conflicting, incomplete, errors) =
+        journal_digest::read_journal_for_analysis(session_id)?;
+    let (mut root, mut total, mut skipped) =
+        fold_events_with_coverage(session_id, &events, incomplete, &conflicting);
+    if !conflicting.is_empty() {
+        root.tool_calls = super::journal_diff::confirmed_execution_evidence(&events, &conflicting)
+            .0
+            .min(u64::from(u32::MAX)) as u32;
+        root.tool_calls_complete = false;
+        let attempts: std::collections::HashSet<_> = conflicting
+            .iter()
+            .filter_map(|event| event.turn.zip(journal_digest::producer_run_id(event)))
+            .collect();
+        let unattributed = conflicting
+            .iter()
+            .filter(|event| {
+                event
+                    .turn
+                    .zip(journal_digest::producer_run_id(event))
+                    .is_none()
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
+        total = total
+            .saturating_add(attempts.len().min(u32::MAX as usize) as u32)
+            .saturating_add(unattributed);
+        skipped = skipped.saturating_add(unattributed);
+    }
     Ok((root, total, skipped, errors))
 }
 
@@ -108,8 +134,10 @@ pub(crate) fn fold_events_with_coverage(
     session_id: &str,
     events: &[JournalEvent],
     incomplete: bool,
+    conflicting: &[JournalEvent],
 ) -> (DelegationNode, u32, u32) {
-    let (mut root, total, skipped) = fold_events_into_tree(session_id, events);
+    let (mut root, total, skipped) =
+        fold_events_into_tree_with_roots(session_id, events, conflicting);
     if incomplete {
         // The inner fold already computed this floor when its own evidence was
         // incomplete. Only complete inner folds need it for a source failure.
@@ -136,9 +164,18 @@ fn mark_coverage_incomplete(node: &mut DelegationNode) {
 /// Pure fold: takes a session_id + event list, returns the tree.
 /// Exposed as pub(crate) so tests can drive it without touching
 /// the filesystem.
+#[cfg(test)]
 pub(crate) fn fold_events_into_tree(
     session_id: &str,
     events: &[JournalEvent],
+) -> (DelegationNode, u32, u32) {
+    fold_events_into_tree_with_roots(session_id, events, &[])
+}
+
+fn fold_events_into_tree_with_roots(
+    session_id: &str,
+    events: &[JournalEvent],
+    conflicting: &[JournalEvent],
 ) -> (DelegationNode, u32, u32) {
     use std::collections::HashMap;
 
@@ -364,24 +401,12 @@ pub(crate) fn fold_events_into_tree(
                     JournalEventType::LlmRound | JournalEventType::SessionStart
                 ) && !journal_digest::is_child_producer(event))
         })
-        .filter_map(|event| {
-            let scoped = event
-                .producer_scope
-                .as_ref()
-                .map(|scope| scope.run_id.as_str());
-            let recorded = event
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("run_id"))
-                .and_then(serde_json::Value::as_str);
-            if scoped
-                .zip(recorded)
-                .is_some_and(|(left, right)| left != right)
-            {
-                return None;
-            }
-            journal_digest::producer_run_id(event)
-        })
+        .chain(
+            conflicting
+                .iter()
+                .filter(|event| journal_digest::is_root_terminal(event)),
+        )
+        .filter_map(journal_digest::producer_run_id)
         .collect();
     let mut children = vec![Vec::new(); nodes.len()];
     let mut root_indices = Vec::new();
@@ -441,7 +466,7 @@ pub(crate) fn fold_events_into_tree(
         root.completion_tokens_complete = false;
         root.tool_calls_complete = false;
     }
-    let (floor, conflicts) = super::journal_diff::confirmed_execution_evidence(events);
+    let (floor, conflicts) = super::journal_diff::confirmed_execution_evidence(events, &[]);
     root.tool_calls_complete &= !conflicts;
     if !root.tool_calls_complete {
         root.tool_calls = floor.min(u64::from(u32::MAX)) as u32;

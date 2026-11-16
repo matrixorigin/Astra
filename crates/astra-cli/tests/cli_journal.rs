@@ -305,6 +305,362 @@ fn replayed_and_conflicting_terminals_never_inflate_analysis() {
         }
     }
 
+    // A flush annotation must not erase a retained failure or manufacture
+    // another attempt. Different terminal reports must retain both errors,
+    // without certifying incompatible outcomes for the same invocation.
+    let identity = json!({"user_id":"owner","session_id":sid,"run_id":"root-run",
+        "turn_chain_id":"chain","invocation_id":"a"});
+    let failed = json!({"name":"bash","ok":false,"ms":1,"tool_call_id":"a",
+        "invocation_identity":identity,"disposition":"executed","error":"compiler failed"});
+    let error = json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"error":"provider timed out","tool_calls":[failed]});
+    let mut annotated = error.clone();
+    annotated["metadata"] = json!({"partial":true});
+    let mut dropped = error.clone();
+    dropped["metadata"] = json!({"dropped_events_before":3});
+    for replay in [error.clone(), annotated, dropped] {
+        for (first, second) in [(&error, &replay), (&replay, &error)] {
+            std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+            let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+            assert_eq!(digest["conflicting_terminal_count"], 0, "replay={replay}");
+            assert_eq!(digest["aggregates"]["turn_error_count"], 1);
+            assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 1);
+            assert!(digest.to_string().contains("provider timed out"));
+            assert!(digest.to_string().contains("compiler failed"));
+        }
+    }
+    let mut malformed = error.clone();
+    malformed["metadata"] = json!({"partial":"true"});
+    std::fs::write(&path, format!("{error}\n{malformed}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["conflicting_terminal_count"], 1);
+    assert!(digest.to_string().contains("provider timed out"));
+
+    let mut invalid_scope = error.clone();
+    invalid_scope["metadata"] = json!({"run_id":"different-run"});
+    std::fs::write(&path, format!("{invalid_scope}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["conflicting_terminal_count"], 1);
+    assert!(digest.to_string().contains("provider timed out"));
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+    let mut conflicting_error = error.clone();
+    conflicting_error["error"] = json!("stream ended");
+    conflicting_error["tool_calls"][0]["disposition"] = json!("rejected");
+    conflicting_error["tool_calls"][0]["error"] = json!("access denied");
+    std::fs::write(&path, format!("{error}\n{conflicting_error}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["conflicting_terminal_count"], 1);
+    for evidence in [
+        "provider timed out",
+        "stream ended",
+        "compiler failed",
+        "access denied",
+    ] {
+        assert!(
+            digest.to_string().contains(evidence),
+            "missing {evidence}: {digest}"
+        );
+    }
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // Identical execution facts on conflicting terminals still witness one
+    // call; a later partial aggregate cannot prove five more distinct calls.
+    let mut second_failure = error.clone();
+    second_failure["error"] = json!("stream ended");
+    let mut independent = failed.clone();
+    independent["ok"] = json!(true);
+    independent["tool_call_id"] = json!("b");
+    independent["invocation_identity"]["run_id"] = json!("later-run");
+    independent["invocation_identity"]["invocation_id"] = json!("b");
+    independent.as_object_mut().unwrap().remove("error");
+    let later = json!({"type":"turn","ts":"t3","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"later-run"},"tool_count":5,
+        "tool_outcomes":{"requested":5,"executed":5,"succeeded":5,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[independent]});
+    std::fs::write(&path, format!("{error}\n{second_failure}\n{later}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 2);
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 2);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // Summary-only rejections can overlap anonymous executions. The
+    // identified independent-call control is exercised above.
+    let rejected_summary = json!({"requested":1,"executed":0,"succeeded":0,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0});
+    let rejection_a = json!({"type":"turn_error","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"tool_count":0,
+        "tool_outcomes":rejected_summary,"error":"one"});
+    let mut rejection_b = rejection_a.clone();
+    rejection_b["error"] = json!("two");
+    let anonymous_round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"root-run"},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed"}]});
+    std::fs::write(
+        &path,
+        format!("{anonymous_round}\n{rejection_a}\n{rejection_b}\n"),
+    )
+    .unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+    // A summary-only rejection can also overlap an identified execution.
+    let mut identified_round = anonymous_round.clone();
+    identified_round["tool_calls"][0]["tool_call_id"] = json!("a");
+    identified_round["tool_calls"][0]["invocation_identity"] = identity.clone();
+    std::fs::write(
+        &path,
+        format!("{identified_round}\n{rejection_a}\n{rejection_b}\n"),
+    )
+    .unwrap();
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+
+    // The same ambiguity exists without conflicting terminal copies.
+    std::fs::write(&path, format!("{identified_round}\n{rejection_a}\n")).unwrap();
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // A fully identified rejection does not erase a distinct execution.
+    let mut known_rejection_a = rejection_a.clone();
+    let mut rejected_call = failed.clone();
+    rejected_call["disposition"] = json!("rejected");
+    known_rejection_a["tool_calls"] = json!([rejected_call]);
+    let mut known_rejection_b = known_rejection_a.clone();
+    known_rejection_b["error"] = json!("two");
+    let independent_round = json!({"type":"llm_round","ts":"t3","session_id":sid,"turn":2,"round":0,
+        "producer_scope":{"run_id":"later-run"},"tool_calls":[independent]});
+    std::fs::write(
+        &path,
+        format!("{known_rejection_a}\n{known_rejection_b}\n{independent_round}\n"),
+    )
+    .unwrap();
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+
+    // A root ledger does not include a child callback's tool executions.
+    let child_identity = json!({"user_id":"owner","session_id":sid,"run_id":"child-run",
+        "turn_chain_id":"child-chain","invocation_id":"child-call"});
+    let child_call = json!({"name":"bash","ok":true,"ms":1,"tool_call_id":"child-call",
+        "invocation_identity":child_identity,"disposition":"executed"});
+    let child_callback = json!({"type":"sync_marker","ts":"t1","session_id":sid,
+        "producer_scope":{"run_id":"child-run"},"metadata":{"source":"child_agent"},
+        "tool_calls":[child_call]});
+    for terminals in [vec![&rejection_a], vec![&rejection_a, &rejection_b]] {
+        let mut journal = format!("{child_callback}\n");
+        for terminal in terminals {
+            journal.push_str(&format!("{terminal}\n"));
+        }
+        std::fs::write(&path, journal).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], 1);
+        assert_eq!(diff["a_tool_calls_executed"], 1);
+        assert_eq!(diff["a_tool_sequence_complete"], false);
+    }
+    let mut anonymous_child = child_callback.clone();
+    anonymous_child["tool_calls"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("invocation_identity");
+    std::fs::write(&path, format!("{anonymous_child}\n{rejection_a}\n")).unwrap();
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    // A rejection explicitly identifying that child call still contradicts it.
+    let mut explicit_child_rejection = rejection_a.clone();
+    let mut rejected_child = child_call.clone();
+    rejected_child["disposition"] = json!("rejected");
+    rejected_child["ok"] = json!(false);
+    explicit_child_rejection["tool_calls"] = json!([rejected_child]);
+    std::fs::write(
+        &path,
+        format!("{child_callback}\n{explicit_child_rejection}\n"),
+    )
+    .unwrap();
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_calls_executed"], 0);
+
+    // The round is still owned by the conflicted attempt, and its only
+    // failure is visible. Anonymous copies are not added across carriers.
+    let mut failed_round = anonymous_round.clone();
+    failed_round["tool_calls"][0]["ok"] = json!(false);
+    failed_round["tool_calls"][0]["error"] = json!("round failed");
+    std::fs::write(
+        &path,
+        format!("{failed_round}\n{rejection_a}\n{rejection_b}\n"),
+    )
+    .unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 1);
+    assert!(digest.to_string().contains("round failed"));
+    let mut anon_a = rejection_a.clone();
+    anon_a["tool_calls"] = failed_round["tool_calls"].clone();
+    let mut anon_b = anon_a.clone();
+    anon_b["error"] = json!("two");
+    std::fs::write(&path, format!("{anon_a}\n{anon_b}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 1);
+    anon_a["tool_calls"]
+        .as_array_mut()
+        .unwrap()
+        .push(failed_round["tool_calls"][0].clone());
+    std::fs::write(&path, format!("{anon_a}\n{anon_b}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 2);
+
+    // Conflicting round carriers replay anonymous facts without increasing
+    // the failure count; repetitions within one carrier remain distinct.
+    let mut failed_round_replay = failed_round.clone();
+    failed_round_replay["duration_ms"] = json!(101);
+    std::fs::write(
+        &path,
+        format!("{failed_round}\n{failed_round_replay}\n{rejection_a}\n"),
+    )
+    .unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 1);
+    assert_eq!(digest["failed_tool_calls"].as_array().unwrap().len(), 1);
+    let mut repeated = failed_round.clone();
+    repeated["tool_calls"]
+        .as_array_mut()
+        .unwrap()
+        .push(failed_round["tool_calls"][0].clone());
+    std::fs::write(
+        &path,
+        format!("{repeated}\n{failed_round_replay}\n{rejection_a}\n"),
+    )
+    .unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_failures"], 2);
+
+    // Conflicting attempts have no terminal row, so their failure details
+    // remain unsequenced diagnostic observations.
+    let mut later_a = anon_a.clone();
+    later_a["turn"] = json!(2);
+    later_a["producer_scope"]["run_id"] = json!("later-run");
+    later_a["ts"] = json!("t3");
+    later_a["tool_calls"][0]["error"] = json!("later failure");
+    later_a["tool_calls"].as_array_mut().unwrap().truncate(1);
+    let mut later_b = later_a.clone();
+    later_b["error"] = json!("later conflicting error");
+    std::fs::write(&path, format!("{anon_a}\n{anon_b}\n{later_a}\n{later_b}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert!(digest["other_errors"].to_string().contains("later failure"));
+    assert!(digest.get("failed_tool_calls").is_none());
+
+    // Candidate terminal identity anchors child topology, not its aggregates.
+    let child = json!({"type":"delegation_sub_run_started","ts":"t1","session_id":sid,
+        "metadata":{"delegation_id":"d","sub_run_id":"child-run","parent_run_id":"root-run",
+            "agent_id":"worker","status":"running","depth":1}});
+    std::fs::write(&path, format!("{child}\n{rejection_a}\n{rejection_b}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["children"][0]["id"], "child-run");
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+
+    let mut successful = error.clone();
+    successful["tool_calls"][0]["ok"] = json!(true);
+    successful["tool_calls"][0]["result_full"] = json!("successful secret output");
+    successful["tool_calls"][0]["args_preview"] = json!("sensitive args");
+    successful["tool_calls"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("error");
+    let mut successful_conflict = successful.clone();
+    successful_conflict["error"] = json!("stream ended");
+    std::fs::write(&path, format!("{successful}\n{successful_conflict}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert!(digest["other_errors"].to_string().contains("bash"));
+    let summary = parse(&["digest", sid, "--format", "json", "--focus", "summary"]);
+    assert!(!summary.to_string().contains("successful secret output"));
+    assert!(!summary.to_string().contains("sensitive args"));
+    assert_eq!(diff["a_tool_calls_executed"], 1);
+    assert_eq!(diff["a_tool_sequence"], json!(["bash"]));
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    let mut unscoped = invalid_scope.clone();
+    unscoped.as_object_mut().unwrap().remove("turn");
+    std::fs::write(&path, format!("{unscoped}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["total_events"], 1);
+    assert_eq!(tree["skipped_events"], 1);
+    assert_eq!(diff["a_event_counts"]["turn_error"], 1);
+    assert_eq!(diff["a_observation_incomplete"], true);
+
+    // A superseded provider response may report requests without per-call
+    // details. Different timings do not contradict an agreed request count.
+    let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"root-run"},"duration_ms":100,
+        "tool_calls_returned":3,
+        "metadata":{"source":"agentic_loop","finish_reason":"superseded_by_runtime_input"}});
+    let outcome = json!({"requested":3,"executed":0,"succeeded":0,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":3,"reused":0,"suppressed":0,"deferred":0});
+    let terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"root-run"},"tool_count":0,"tool_outcomes":outcome,"llm_rounds":1});
+    for duration in [100, 101] {
+        let mut replay = round.clone();
+        replay["duration_ms"] = json!(duration);
+        std::fs::write(&path, format!("{round}\n{replay}\n{terminal}\n")).unwrap();
+        let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+        assert_eq!(digest["conflicting_round_count"], u8::from(duration != 100));
+        assert_eq!(digest["aggregates"]["observed_root_tool_requests"], 3);
+        if duration != 100 {
+            assert!(
+                digest["turns"][0]["llm_round_details"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["duration_ms"].is_null())
+            );
+        }
+    }
+
+    // Conflicting producer identities are retained as raw observations, but
+    // cannot be attributed to this root or counted twice as its requests.
+    let mut wrong_scope = round.clone();
+    wrong_scope["metadata"]["run_id"] = json!("different-run");
+    let mut wrong_scope_replay = wrong_scope.clone();
+    wrong_scope_replay["duration_ms"] = json!(101);
+    std::fs::write(
+        &path,
+        format!("{wrong_scope}\n{wrong_scope_replay}\n{terminal}\n"),
+    )
+    .unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["aggregates"]["observed_root_tool_requests"], 0);
+    assert_eq!(digest["aggregates"]["root_tool_counts_complete"], false);
+    assert_eq!(digest["unattributed_root_round_count"], 0);
+    assert!(
+        digest["other_errors"]
+            .to_string()
+            .contains("conflicting_round_scope")
+    );
+    assert!(digest["other_errors"].to_string().contains("different-run"));
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    let mut inconsistent = round.clone();
+    inconsistent["tool_calls_returned"] = json!(4);
+    std::fs::write(&path, format!("{round}\n{inconsistent}\n{terminal}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(digest["conflicting_round_count"], 1);
+    assert_eq!(digest["aggregates"]["observed_root_tool_requests"], 0);
+    assert!(
+        digest["other_errors"]
+            .to_string()
+            .contains("\"observed_requests\":[3,4]")
+    );
+
     // Conflicting terminal reports for one attempt are removed before any
     // projection. An independently retained round can still witness a call.
     let call = json!({"name":"bash","ok":true,"ms":1,"tool_call_id":"a",

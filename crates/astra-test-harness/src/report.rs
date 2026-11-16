@@ -1186,6 +1186,15 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             get_u("compact_count"),
             get_u("stall_count"),
     ));
+    if let Some(conflicts) = json
+        .get("conflicting_terminal_count")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|count| *count > 0)
+    {
+        out.push_str(&format!(
+            "      conflicting_terminals={conflicts} (excluded from attempt totals)\n"
+        ));
+    }
     if !tools_complete
         && (get_u("reported_root_tool_calls") > 0 || get_u("observed_root_tool_failures") > 0)
     {
@@ -1202,16 +1211,29 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
         get_u("total_tokens_out"),
         get_u("total_duration_ms"),
     ));
+    let request_coverage = if !counts_complete
+        || json
+            .get("conflicting_round_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    {
+        " (partial; see coverage)"
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} observed_child_tool_requests={}\n",
+        "      subruns={} known_inclusive_tokens_in={} known_inclusive_tokens_out={} observed_child_tool_requests={}{}\n",
         get_u("subrun_count"),
         get_u("inclusive_total_tokens_in"),
         get_u("inclusive_total_tokens_out"),
         get_u("observed_child_tool_requests"),
+        request_coverage,
     ));
     out.push_str(&format!(
-        "      observed_root_tool_requests={} (not an execution count)\n",
-        get_u("observed_root_tool_requests")
+        "      observed_root_tool_requests={} (not an execution count){}\n",
+        get_u("observed_root_tool_requests"),
+        request_coverage
     ));
     out.push_str(&format!(
         "      avg_tokens_in={} avg_tokens_out={} avg_duration_ms={:.1}\n",
@@ -1769,6 +1791,12 @@ mod tests {
         digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
         let partial = render(&r, Format::Text, false);
         assert!(partial.contains("tool_calls=? tool_failures=?"));
+        assert!(
+            partial.contains(
+                "observed_root_tool_requests=0 (not an execution count) (partial; see coverage)"
+            ),
+            "{partial}"
+        );
         assert!(partial.contains("tool_reports: terminal_calls=14 ledger_failed_executions=2 observed_failures=2 (observations may overlap)"));
         assert!(!partial.contains("tool_calls=14"));
 
@@ -1802,6 +1830,24 @@ mod tests {
             0.into();
         let no_failure = render(&r, Format::Text, false);
         assert!(!no_failure.contains("tool_reports:"), "{no_failure}");
+        r.runs[0].digest.as_mut().unwrap().json["conflicting_terminal_count"] = 1.into();
+        let conflict = render(&r, Format::Text, false);
+        assert!(
+            conflict.contains("conflicting_terminals=1 (excluded from attempt totals)"),
+            "{conflict}"
+        );
+        r.runs[0].digest.as_mut().unwrap().json["conflicting_round_count"] = 1.into();
+        let conflict = render(&r, Format::Text, false);
+        assert!(
+            conflict.contains(
+                "observed_root_tool_requests=0 (not an execution count) (partial; see coverage)"
+            ),
+            "{conflict}"
+        );
+        assert!(
+            conflict.contains("observed_child_tool_requests=82 (partial; see coverage)"),
+            "{conflict}"
+        );
     }
 
     #[test]

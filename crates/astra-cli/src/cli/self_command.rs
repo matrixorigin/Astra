@@ -362,6 +362,11 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
                 .account
                 .as_ref()
                 .is_some_and(|account| account.malformed_records > 0);
+        let incomplete_observation =
+            crate::cli::journal_digest::has_incomplete_observation(&window.local.events)
+                || window.account.as_ref().is_some_and(|account| {
+                    crate::cli::journal_digest::has_incomplete_observation(&account.events)
+                });
         report.data_coverage.providers.insert(
             "local_journal".into(),
             ObservationProviderCoverage {
@@ -373,10 +378,11 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
                 .into(),
                 freshness_ms: None,
                 reason: Some(format!(
-                    "bounded observation; truncated={}; malformed={}; read_error={}",
+                    "bounded observation; truncated={}; malformed={}; read_error={}; incomplete_observation={incomplete_observation}; conflicting_terminals={}",
                     window.local.truncated,
                     window.local.malformed_records > 0,
-                    window.local_read_error
+                    window.local_read_error,
+                    window.conflicting_terminal_count
                 )),
             },
         );
@@ -399,6 +405,8 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
             || window.local_read_error
             || window.account_read_error
             || window.conflicting_round_count > 0
+            || window.conflicting_terminal_count > 0
+            || incomplete_observation
         {
             report.data_coverage.overall = "partial".into();
         }
@@ -635,15 +643,17 @@ async fn build_reflect_response(
 
 pub(super) fn bounded_execution_timing_summary(events: &[JournalEvent]) -> Option<String> {
     let rounds = super::journal_digest::unique_llm_rounds(events.iter());
-    let (round_count, slowest_round) =
-        rounds.fold((0usize, None::<u64>), |(count, slowest), event| {
+    let (round_count, slowest_round, incomplete_timing) = rounds.fold(
+        (0usize, None::<u64>, false),
+        |(count, slowest, partial), event| {
             let slowest = match (slowest, event.duration_ms) {
                 (Some(previous), Some(ms)) => Some(previous.max(ms)),
                 (None, Some(ms)) => Some(ms),
                 (previous, None) => previous,
             };
-            (count + 1, slowest)
-        });
+            (count + 1, slowest, partial || event.duration_ms.is_none())
+        },
+    );
     let slowest_span = events
         .iter()
         .filter(|event| event.event_type == JournalEventType::TraceSpan)
@@ -660,6 +670,9 @@ pub(super) fn bounded_execution_timing_summary(events: &[JournalEvent]) -> Optio
     let mut parts = vec![format!("bounded journal: {round_count} LLM round(s)")];
     if let Some(ms) = slowest_round {
         parts.push(format!("slowest reported round {ms}ms"));
+    }
+    if incomplete_timing {
+        parts.push("round timing partial".into());
     }
     if let Some((ms, name)) = slowest_span {
         parts.push(format!("longest span {} {ms}ms", truncate(name, 60)));

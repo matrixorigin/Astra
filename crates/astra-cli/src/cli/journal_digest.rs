@@ -794,11 +794,31 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
 }
 
 pub(super) fn producer_run_id(ev: &session_journal::JournalEvent) -> Option<&str> {
+    if producer_scope_conflicts(ev) {
+        return None;
+    }
     ev.producer_scope
         .as_ref()
         .map(|scope| scope.run_id.as_str())
         .or_else(|| ev.metadata.as_ref()?.get("run_id")?.as_str())
         .filter(|run| !run.trim().is_empty())
+}
+
+pub(super) fn producer_scope_conflicts(ev: &session_journal::JournalEvent) -> bool {
+    let scoped = ev
+        .producer_scope
+        .as_ref()
+        .map(|scope| scope.run_id.as_str())
+        .filter(|run| !run.trim().is_empty());
+    let recorded = ev
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("run_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|run| !run.trim().is_empty());
+    scoped
+        .zip(recorded)
+        .is_some_and(|(left, right)| left != right)
 }
 
 pub(super) fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
@@ -827,6 +847,9 @@ pub(super) fn has_child_observation(events: &[session_journal::JournalEvent]) ->
 }
 
 fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
+    if producer_scope_conflicts(ev) {
+        return None;
+    }
     let scope = ev
         .producer_scope
         .as_ref()
@@ -963,6 +986,17 @@ pub(crate) struct RootTerminalUsage {
 
 pub(crate) fn has_incomplete_observation(events: &[session_journal::JournalEvent]) -> bool {
     events.iter().any(|event| {
+        if matches!(
+            event.event_type,
+            JournalEventType::Turn
+                | JournalEventType::TurnError
+                | JournalEventType::LlmRound
+                | JournalEventType::ToolCallError
+                | JournalEventType::SyncMarker
+        ) && producer_scope_conflicts(event)
+        {
+            return true;
+        }
         let Some(metadata) = event.metadata.as_ref() else {
             return false;
         };
@@ -1112,6 +1146,7 @@ pub(crate) struct AttachedObservationWindow {
     pub account_read_error: bool,
     pub events: Vec<session_journal::JournalEvent>,
     pub conflicting_round_count: usize,
+    pub conflicting_terminal_count: usize,
 }
 
 impl AttachedObservationWindow {
@@ -1178,7 +1213,7 @@ fn read_attached_observation_window_with_owners(
         validate_session_events(&account.events, session_id)?;
     }
     let mut events = local.events.clone();
-    let conflicting_round_count = merge_attached_events(
+    let (conflicting_round_count, _) = merge_attached_events(
         &mut events,
         account
             .as_ref()
@@ -1186,6 +1221,9 @@ fn read_attached_observation_window_with_owners(
             .unwrap_or_default(),
         contributes_observation_detail,
     );
+    // Keep conflicting observations in the bounded reflect window, but do
+    // not count annotation-only replays as separate terminal events.
+    let (conflicting_terminal_count, _) = normalize_root_terminals(&mut events, true);
     Ok(AttachedObservationWindow {
         local,
         local_owner: local_owner.clone(),
@@ -1195,6 +1233,7 @@ fn read_attached_observation_window_with_owners(
         account_read_error,
         events,
         conflicting_round_count,
+        conflicting_terminal_count,
     })
 }
 
@@ -1204,11 +1243,7 @@ fn round_identity(
     if event.event_type != JournalEventType::LlmRound {
         return None;
     }
-    let run_id = event
-        .producer_scope
-        .as_ref()
-        .map(|scope| scope.run_id.as_str())
-        .or_else(|| event.metadata.as_ref()?.get("run_id")?.as_str())?;
+    let run_id = producer_run_id(event)?;
     Some((
         run_id.to_owned(),
         event.turn,
@@ -1227,6 +1262,7 @@ pub(super) fn unique_llm_rounds<'a>(
     let mut seen = std::collections::HashSet::new();
     events.filter(move |event| {
         event.event_type == JournalEventType::LlmRound
+            && !producer_scope_conflicts(event)
             && round_identity(event).is_none_or(|identity| seen.insert(identity))
     })
 }
@@ -1263,7 +1299,7 @@ fn merge_attached_events(
     events: &mut Vec<session_journal::JournalEvent>,
     supplemental: Vec<session_journal::JournalEvent>,
     include: fn(&JournalEventType) -> bool,
-) -> usize {
+) -> (usize, Vec<SideEvent>) {
     // Child callbacks are recorded by the Edge even when the primary journal
     // comes from another authorized owner. Preserve the actual observations;
     // an event's type alone does not establish whether it contains tool facts.
@@ -1275,10 +1311,46 @@ fn merge_attached_events(
                     .as_ref()
                     .is_some_and(|calls| !calls.is_empty()))
     };
-    let mut known_rounds = std::collections::BTreeMap::new();
+    type RoundScope<'a> = (
+        bool,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+    let mut known_rounds: std::collections::BTreeMap<_, (_, Option<u32>, RoundScope<'_>)> =
+        std::collections::BTreeMap::new();
     let mut conflicts = std::collections::BTreeSet::new();
+    fn compatible_scope<'a>(seen: &mut Option<&'a str>, incoming: Option<&'a str>) -> bool {
+        match (*seen, incoming) {
+            (Some(previous), Some(current)) => previous == current,
+            (None, Some(current)) => {
+                *seen = Some(current);
+                true
+            }
+            _ => true,
+        }
+    }
     for event in events.iter().chain(supplemental.iter()) {
         if let Some(identity) = round_identity(event) {
+            let metadata = event.metadata.as_ref();
+            let scope = (
+                is_child_producer(event),
+                event
+                    .producer_scope
+                    .as_ref()
+                    .and_then(|scope| scope.agent_id.as_deref()),
+                event
+                    .producer_scope
+                    .as_ref()
+                    .and_then(|scope| scope.parent_run_id.as_deref()),
+                metadata
+                    .and_then(|m| m.get("purpose"))
+                    .and_then(serde_json::Value::as_str),
+                metadata
+                    .and_then(|m| m.get("source"))
+                    .and_then(serde_json::Value::as_str),
+            );
             let facts = (
                 event.model.clone(),
                 llm_round_row(event),
@@ -1290,38 +1362,103 @@ fn merge_attached_events(
                     .producer_scope
                     .as_ref()
                     .and_then(|scope| scope.parent_run_id.clone()),
-                event
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("purpose"))
+                metadata
+                    .and_then(|m| m.get("purpose"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
             );
-            if let Some(previous) = known_rounds.insert(identity.clone(), facts.clone()) {
-                if previous != facts {
-                    conflicts.insert(identity);
+            if let Some((previous, count, seen)) = known_rounds.get_mut(&identity) {
+                if *previous != facts {
+                    conflicts.insert(identity.clone());
                 }
+                if *count != event.tool_calls_returned
+                    || seen.0 != scope.0
+                    || !compatible_scope(&mut seen.1, scope.1)
+                    || !compatible_scope(&mut seen.2, scope.2)
+                    || !compatible_scope(&mut seen.3, scope.3)
+                    || !compatible_scope(&mut seen.4, scope.4)
+                {
+                    *count = None;
+                }
+            } else {
+                known_rounds.insert(identity, (facts, event.tool_calls_returned, scope));
             }
         }
     }
+    let agreed_requests: std::collections::BTreeMap<_, _> = known_rounds
+        .into_iter()
+        .filter_map(|(identity, (_, count, _))| {
+            conflicts.contains(&identity).then_some((identity, count))
+        })
+        .collect();
+    // Keep the conflicting request observations available without adding
+    // their values or choosing one as the round's aggregate.
+    let mut request_conflicts = std::collections::BTreeMap::new();
+    if agreed_requests.values().any(Option::is_none) {
+        for event in events.iter().chain(supplemental.iter()) {
+            if let Some(identity) = round_identity(event)
+                && agreed_requests.get(&identity).is_some_and(Option::is_none)
+            {
+                let (_, values, scopes) = request_conflicts.entry(identity).or_insert_with(|| {
+                    (
+                        event.ts.clone(),
+                        std::collections::BTreeSet::new(),
+                        std::collections::BTreeSet::new(),
+                    )
+                });
+                values.insert(event.tool_calls_returned);
+                let scope = event.producer_scope.as_ref();
+                let metadata = event.metadata.as_ref();
+                scopes.insert((
+                    scope.and_then(|scope| scope.parent_run_id.as_deref()),
+                    scope.and_then(|scope| scope.agent_id.as_deref()),
+                    metadata
+                        .and_then(|m| m.get("source"))
+                        .and_then(serde_json::Value::as_str),
+                    metadata
+                        .and_then(|m| m.get("purpose"))
+                        .and_then(serde_json::Value::as_str),
+                ));
+            }
+        }
+    }
+    let request_observations = request_conflicts.into_iter().filter_map(
+        |((run, turn, local_turn, round), (ts, values, scopes))| {
+            (values.iter().any(Option::is_some) || scopes.len() > 1).then(|| SideEvent {
+                ts,
+                kind: "conflicting_round_requests".into(),
+                turn,
+                agentic_step: None,
+                producer_scope: None,
+                source: None,
+                detail: json!({"run_id": run, "local_turn": local_turn, "round": round,
+                    "observed_requests": values,
+                    "producer_scopes": scopes.into_iter().map(|(parent, agent, source, purpose)|
+                        json!({"parent_run_id": parent, "agent_id": agent, "source": source, "purpose": purpose})
+                    ).collect::<Vec<_>>(),
+                    "coverage": "conflicting observations; not executions"}),
+            })
+        },
+    ).collect();
     let mut seen_rounds: std::collections::BTreeMap<_, usize> = std::collections::BTreeMap::new();
     let mut seen_round_calls = std::collections::BTreeMap::new();
     let mut seen_exact = std::collections::BTreeSet::new();
-    let primary = std::mem::take(events);
+    let mut primary = std::mem::take(events);
+    primary.extend(supplemental.into_iter().filter(|event| includes(event)));
+    primary.sort_by(|left, right| left.ts.cmp(&right.ts));
     let mut merged: Vec<session_journal::JournalEvent> = Vec::new();
-    for mut event in primary
-        .into_iter()
-        .chain(supplemental.into_iter().filter(|event| includes(event)))
-    {
+    for mut event in primary {
         if let Some(identity) = round_identity(&event) {
             if conflicts.contains(&identity) {
-                // Conflicting telemetry is not usable for totals, but it can
-                // carry distinct tool evidence. Retain each producer scope and
-                // its calls without certifying the conflicting round metrics.
-                if event
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty())
+                // Keep one round even without call detail; a count agreed by
+                // every compatible carrier remains an observation, not an
+                // execution. Other carriers retain only scoped call facts.
+                let first = !seen_rounds.contains_key(&identity);
+                if first
+                    || event
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
                 {
                     event.model = None;
                     event.agentic_step = None;
@@ -1331,9 +1468,16 @@ fn merge_attached_events(
                     event.tokens_out = None;
                     event.cache_read_tokens = None;
                     event.cache_creation_tokens = None;
-                    event.tool_calls_returned = None;
+                    event.tool_calls_returned = if first {
+                        agreed_requests.get(&identity).copied().flatten()
+                    } else {
+                        None
+                    };
                     event.tool_count = None;
                     event.tool_outcomes = None;
+                    if first {
+                        seen_rounds.insert(identity, merged.len());
+                    }
                     merged.push(event);
                 }
                 continue;
@@ -1373,8 +1517,7 @@ fn merge_attached_events(
         }
     }
     *events = merged;
-    events.sort_by(|left, right| left.ts.cmp(&right.ts));
-    conflicts.len()
+    (conflicts.len(), request_observations)
 }
 
 struct LinkedDigestJournals {
@@ -1384,44 +1527,115 @@ struct LinkedDigestJournals {
     primary_path: String,
     supplemental_paths: Vec<String>,
     conflicting_round_count: usize,
+    conflicting_round_requests: Vec<SideEvent>,
     conflicting_terminal_count: usize,
+    conflicting_terminals: Vec<session_journal::JournalEvent>,
     source_coverage: Vec<JournalSourceCoverage>,
 }
 
-/// One attempt owns one terminal. Replayed records are harmless; conflicting
-/// terminals cannot be attributed without guessing, so exclude both.
-fn normalize_root_terminals(events: &mut Vec<session_journal::JournalEvent>) -> usize {
+/// Ignore only known flush annotations when comparing terminal replays.
+/// Coverage is captured from the source before this normalization.
+fn terminal_replay_signature(event: &session_journal::JournalEvent) -> Option<String> {
+    let needs_normalization = event
+        .metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|metadata| {
+            metadata.is_empty()
+                || metadata
+                    .get("partial")
+                    .is_some_and(serde_json::Value::is_boolean)
+                || metadata
+                    .get("dropped_events_before")
+                    .is_some_and(serde_json::Value::is_u64)
+        });
+    if !needs_normalization {
+        return serde_json::to_string(event).ok();
+    }
+    // Serialize both paths through JournalEvent so field order is identical.
+    let mut normalized = event.clone();
+    if let Some(metadata) = normalized
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if metadata
+            .get("partial")
+            .is_some_and(serde_json::Value::is_boolean)
+        {
+            metadata.remove("partial");
+        }
+        if metadata
+            .get("dropped_events_before")
+            .is_some_and(serde_json::Value::is_u64)
+        {
+            metadata.remove("dropped_events_before");
+        }
+        if metadata.is_empty() {
+            normalized.metadata = None;
+        }
+    }
+    serde_json::to_string(&normalized).ok()
+}
+
+/// One attempt owns one terminal. Keep conflicting candidates for diagnostics
+/// while excluding their aggregates from accounting.
+fn normalize_root_terminals(
+    events: &mut Vec<session_journal::JournalEvent>,
+    retain_conflicts: bool,
+) -> (usize, Vec<session_journal::JournalEvent>) {
     let mut first = std::collections::HashMap::new();
     let mut conflicts = std::collections::HashSet::new();
     for event in events.iter().filter(|event| is_root_terminal(event)) {
-        if let (Some(turn), Some(run), Ok(payload)) = (
-            event.turn,
-            producer_run_id(event),
-            serde_json::to_string(event),
-        ) {
+        if let (Some(turn), Some(run)) = (event.turn, producer_run_id(event))
+            && let Some(payload) = terminal_replay_signature(event)
+        {
             let key = (turn, run.to_owned());
-            if let Some(previous) = first.insert(key.clone(), payload.clone())
-                && previous != payload
-            {
-                conflicts.insert(key);
+            match first.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(payload);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &payload => {
+                    conflicts.insert(entry.key().clone());
+                }
+                _ => {}
             }
         }
     }
     let mut seen = std::collections::HashSet::new();
-    events.retain(|event| {
-        if !is_root_terminal(event) {
-            return true;
-        }
-        if let (Some(turn), Some(run)) = (event.turn, producer_run_id(event))
-            && conflicts.contains(&(turn, run.to_owned()))
-        {
-            return false;
-        }
-        serde_json::to_string(event)
+    let mut retained = Vec::with_capacity(events.len());
+    let mut conflicting = Vec::new();
+    let mut invalid_scope_count = 0;
+    let mut seen_conflicting = std::collections::HashSet::new();
+    for event in std::mem::take(events) {
+        let invalid_scope = producer_scope_conflicts(&event);
+        let conflicting_attempt = event
+            .turn
+            .zip(producer_run_id(&event))
+            .is_some_and(|(turn, run)| conflicts.contains(&(turn, run.to_owned())));
+        if !is_root_terminal(&event) {
+            retained.push(event);
+        } else if invalid_scope || conflicting_attempt {
+            if terminal_replay_signature(&event)
+                .map(|payload| seen_conflicting.insert(payload))
+                .unwrap_or(true)
+            {
+                invalid_scope_count += usize::from(invalid_scope);
+                if retain_conflicts {
+                    retained.push(event);
+                } else {
+                    conflicting.push(event);
+                }
+            }
+        } else if terminal_replay_signature(&event)
             .map(|payload| seen.insert(payload))
             .unwrap_or(true)
-    });
-    conflicts.len()
+        {
+            retained.push(event);
+        }
+    }
+    *events = retained;
+    (conflicts.len() + invalid_scope_count, conflicting)
 }
 
 fn source_coverage(
@@ -1584,9 +1798,10 @@ fn read_linked_digest_journals(
             })
             .unwrap_or_else(|| format!("session journal not found: {}", primary.path.display())));
     }
-    let conflicting_round_count =
+    let (conflicting_round_count, conflicting_round_requests) =
         merge_attached_events(&mut events, supplemental_events, include_supplemental);
-    let conflicting_terminal_count = normalize_root_terminals(&mut events);
+    let (conflicting_terminal_count, conflicting_terminals) =
+        normalize_root_terminals(&mut events, false);
     Ok(LinkedDigestJournals {
         events,
         non_empty,
@@ -1594,15 +1809,22 @@ fn read_linked_digest_journals(
         primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
         conflicting_round_count,
+        conflicting_round_requests,
         conflicting_terminal_count,
+        conflicting_terminals,
         source_coverage: coverage,
     })
 }
 
+type AnalysisJournal = (
+    Vec<session_journal::JournalEvent>,
+    Vec<session_journal::JournalEvent>,
+    bool,
+    Vec<String>,
+);
+
 /// Reuse the digest's authorized source join for other offline projections.
-pub(crate) fn read_journal_for_analysis(
-    session_id: &str,
-) -> Result<(Vec<session_journal::JournalEvent>, bool, Vec<String>), String> {
+pub(crate) fn read_journal_for_analysis(session_id: &str) -> Result<AnalysisJournal, String> {
     let (local, account) = crate::cli::cli_config::cli_utils::attached_journal_owners()?;
     read_journal_for_analysis_with_owners(session_id, &local, account.as_ref())
 }
@@ -1611,7 +1833,7 @@ fn read_journal_for_analysis_with_owners(
     session_id: &str,
     local: &astra_services::OwnerScope,
     account: Option<&astra_services::OwnerScope>,
-) -> Result<(Vec<session_journal::JournalEvent>, bool, Vec<String>), String> {
+) -> Result<AnalysisJournal, String> {
     let joined = read_linked_digest_journals(session_id, local, account, false, |kind| {
         contributes_runtime_digest_detail(kind)
             || matches!(
@@ -1639,7 +1861,12 @@ fn read_journal_for_analysis_with_owners(
                 .map(|error| format!("{}: {error}", source.path))
         })
         .collect();
-    Ok((joined.events, incomplete, errors))
+    Ok((
+        joined.events,
+        joined.conflicting_terminals,
+        incomplete,
+        errors,
+    ))
 }
 
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
@@ -1661,7 +1888,9 @@ fn build_digest_with_owners(
         primary_path: journal_file,
         supplemental_paths: supplemental_journal_files,
         conflicting_round_count,
+        conflicting_round_requests,
         conflicting_terminal_count,
+        conflicting_terminals,
         source_coverage: journal_source_coverage,
     } = read_linked_digest_journals(
         session_id,
@@ -1676,7 +1905,7 @@ fn build_digest_with_owners(
     let mut stalls = Vec::new();
     let mut interruptions = Vec::new();
     let mut turn_errors = Vec::new();
-    let mut other_errors = Vec::new();
+    let mut other_errors = conflicting_round_requests;
 
     let source_incomplete = journal_lines_malformed > 0
         || conflicting_round_count > 0
@@ -1757,21 +1986,53 @@ fn build_digest_with_owners(
 
     // A scope containing only a run ID can also be a child. Bind round and
     // error observations to a retained root attempt before labeling them root.
-    let root_attempts: std::collections::HashMap<_, _> = events
+    let mut root_attempts = std::collections::HashMap::new();
+    for (index, event) in events
         .iter()
         .filter(|event| is_root_terminal(event))
         .enumerate()
-        .filter_map(|(index, event)| {
-            event
-                .turn
-                .zip(producer_run_id(event))
-                .map(|attempt| (attempt, u32::try_from(index + 1).unwrap_or(u32::MAX)))
-        })
-        .collect();
+    {
+        if let Some(attempt) = event.turn.zip(producer_run_id(event)) {
+            root_attempts
+                .entry(attempt)
+                .or_insert(Some(u32::try_from(index + 1).unwrap_or(u32::MAX)));
+        }
+    }
+    // Conflicting attempts have an owner but no terminal row to index.
+    for event in &conflicting_terminals {
+        if let Some(attempt) = event.turn.zip(producer_run_id(event)) {
+            root_attempts.entry(attempt).or_insert(None);
+        }
+    }
+    // Only conflicting round carriers can repeat the same anonymous facts.
+    let mut seen_rounds = std::collections::HashSet::new();
+    let mut conflicting_rounds = std::collections::HashSet::new();
+    if conflicting_round_count > 0 {
+        for event in &events {
+            if let Some(round) = round_identity(event)
+                && !seen_rounds.insert(round.clone())
+            {
+                conflicting_rounds.insert(round);
+            }
+        }
+    }
+    let mut round_failures = std::collections::HashMap::new();
+    // A conflicting projection can replay an anonymous failure. Keep the
+    // greatest per-carrier multiplicity, not a sum of overlapping copies.
+    let mut anonymous_failures = std::collections::HashMap::new();
     let mut seq: u32 = 0;
-    for ev in &events {
+    for (index, ev) in events.iter().chain(&conflicting_terminals).enumerate() {
+        let candidate = index >= events.len();
+        let mut carrier_failures = std::collections::HashMap::new();
+        let mut carrier_round_failures = std::collections::HashMap::new();
         let failure_seq = if is_root_terminal(ev) {
-            Some(seq.saturating_add(1))
+            if candidate {
+                ev.turn
+                    .zip(producer_run_id(ev))
+                    .and_then(|attempt| root_attempts.get(&attempt).copied())
+            } else {
+                Some(Some(seq.saturating_add(1)))
+            }
         } else if !is_child_producer(ev)
             && matches!(
                 ev.event_type,
@@ -1792,6 +2053,41 @@ fn build_digest_with_owners(
                 .filter(|call| is_effective_failure(call))
             {
                 let key = super::journal_diff::call_key(ev, call);
+                if key.is_none()
+                    && !conflicting_rounds.is_empty()
+                    && let Some(round) = round_identity(ev)
+                    && conflicting_rounds.contains(&round)
+                    && let Ok(payload) = serde_json::to_string(call)
+                {
+                    let in_carrier = carrier_round_failures
+                        .entry(payload.clone())
+                        .or_insert(0usize);
+                    *in_carrier += 1;
+                    let seen = round_failures.entry((round, payload)).or_insert(0usize);
+                    if *in_carrier <= *seen {
+                        continue;
+                    }
+                    *seen = *in_carrier;
+                }
+                if !conflicting_terminals.is_empty()
+                    && key.is_none()
+                    && let Some((turn, run)) = ev.turn.zip(producer_run_id(ev))
+                    && let Ok(payload) = serde_json::to_string(call)
+                {
+                    let in_carrier = carrier_failures.entry(payload.clone()).or_insert(0usize);
+                    *in_carrier += 1;
+                    let seen = anonymous_failures
+                        .entry((turn, run, payload))
+                        .or_insert(0usize);
+                    if candidate && *in_carrier <= *seen {
+                        continue;
+                    }
+                    if candidate {
+                        *seen = *in_carrier;
+                    } else {
+                        *seen += 1;
+                    }
+                }
                 observed_root_tool_failures +=
                     u64::from(key.is_none_or(|key| seen_root_failed_invocations.insert(key)));
                 let error = effective_error_text(call);
@@ -1801,17 +2097,17 @@ fn build_digest_with_owners(
                 {
                     safety_guard_blocks += 1;
                 }
-                if matches!(focus, DigestFocus::All) {
-                    let error_preview = preview(Some(&error), 200);
-                    let first_detail = key.is_none_or(|key| {
-                        seen_root_failure_details.insert((
-                            key,
-                            call.name.as_str(),
-                            error_preview.clone(),
-                            call.args_preview.as_deref(),
-                        ))
-                    });
-                    if first_detail {
+                let error_preview = preview(Some(&error), 200);
+                let first_detail = key.is_none_or(|key| {
+                    seen_root_failure_details.insert((
+                        key,
+                        call.name.as_str(),
+                        error_preview.clone(),
+                        call.args_preview.as_deref(),
+                    ))
+                });
+                if let Some(failure_seq) = failure_seq {
+                    if matches!(focus, DigestFocus::All) && first_detail {
                         failed_tool_calls.push(FailedToolCall {
                             seq: failure_seq,
                             turn_id: ev.turn,
@@ -1821,8 +2117,25 @@ fn build_digest_with_owners(
                             args_preview: call.args_preview.clone(),
                         });
                     }
+                } else if !candidate && first_detail {
+                    // An owned failure remains diagnostic even when conflicting
+                    // terminals do not establish a turn row or its sequence.
+                    other_errors.push(SideEvent {
+                        ts: ev.ts.clone(),
+                        kind: "conflicting_attempt_tool_failure".into(),
+                        turn: ev.turn,
+                        agentic_step: ev.agentic_step,
+                        producer_scope: ev.producer_scope.clone(),
+                        source: None,
+                        detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
+                            "error": error_preview,
+                            "args_preview": matches!(focus, DigestFocus::All).then_some(call.args_preview.as_ref()).flatten()}),
+                    });
                 }
             }
+        }
+        if candidate {
+            continue;
         }
         let pending_rounds = if is_root_terminal(ev) {
             let rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
@@ -2125,7 +2438,24 @@ fn build_digest_with_owners(
             JournalEventType::SessionEnd => session_end_count += 1,
             JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
-                if let Some(identity) = subrun_identity(ev) {
+                if producer_scope_conflicts(ev) {
+                    observed_child_round_buckets_complete &= !is_child_producer(ev);
+                    other_errors.push(SideEvent {
+                        ts: ev.ts.clone(),
+                        kind: "conflicting_round_scope".into(),
+                        turn: ev.turn,
+                        agentic_step: ev.agentic_step,
+                        producer_scope: ev.producer_scope.clone(),
+                        source: None,
+                        detail: json!({
+                            "recorded_run_id": ev.metadata.as_ref().and_then(|m| m.get("run_id")),
+                            "round": ev.round,
+                            "tool_calls_returned": ev.tool_calls_returned,
+                            "duration_ms": ev.duration_ms,
+                            "coverage": "unattributed observation; not aggregate totals",
+                        }),
+                    });
+                } else if let Some(identity) = subrun_identity(ev) {
                     if round_identity(ev).is_some_and(|round| {
                         !seen_child_rounds.insert((
                             round,
@@ -2177,10 +2507,53 @@ fn build_digest_with_owners(
         }
     }
 
+    // Candidate terminals do not contribute aggregate totals. Keep their
+    // diagnostic call facts and errors even when they cannot be attributed.
+    for event in &conflicting_terminals {
+        let calls: Vec<_> = event
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| {
+                let error = is_effective_failure(call).then(|| {
+                    let error = effective_error_text(call);
+                    preview(Some(&error), 200)
+                });
+                let args = matches!(focus, DigestFocus::All)
+                    .then_some(call.args_preview.as_ref())
+                    .flatten();
+                json!({
+                    "tool": call.name,
+                    "tool_call_id": call.tool_call_id,
+                    "invocation_identity": call.invocation_identity,
+                    "disposition": call.effective_disposition(),
+                    "args_preview": args,
+                    "error": error,
+                })
+            })
+            .collect();
+        if event.error.is_some() || !calls.is_empty() {
+            other_errors.push(SideEvent {
+                ts: event.ts.clone(),
+                kind: "conflicting_terminal".into(),
+                turn: event.turn,
+                agentic_step: event.agentic_step,
+                producer_scope: event.producer_scope.clone(),
+                source: None,
+                detail: json!({
+                    "coverage": "conflicting terminal observations; not aggregate totals",
+                    "message": event.error,
+                    "tool_calls": calls,
+                }),
+            });
+        }
+    }
+
     let turn_count = turns_out.len();
     let (count_observations_complete, outcome_observations_complete) =
         root_tool_observation_coverage(&events);
-    let (_, execution_incomplete) = super::journal_diff::confirmed_execution_evidence(&events);
+    let (_, execution_incomplete) =
+        super::journal_diff::confirmed_execution_evidence(&events, &conflicting_terminals);
     let root_tool_coverage_consistent =
         saw_root_terminal && root_request_observations_consistent && !execution_incomplete;
     root_tool_totals_complete &= root_tool_coverage_consistent && outcome_observations_complete;
@@ -2457,9 +2830,14 @@ pub fn print_text(d: &JournalDigest) {
         );
     }
     stdout_println!(
-        "  observed_model_tool_requests: root={} children={} (not execution counts)",
+        "  observed_model_tool_requests: root={} children={} (not execution counts){}",
         a.observed_root_tool_requests,
-        a.observed_child_tool_requests
+        a.observed_child_tool_requests,
+        if !a.root_tool_counts_complete || d.conflicting_round_count > 0 {
+            " (partial; see conflicts/coverage)"
+        } else {
+            ""
+        }
     );
     stdout_println!(
         "  known_root_provider_input={} (fresh={} cache_read={} cache_write={})",
@@ -2719,7 +3097,7 @@ mod tests {
         second.tool_calls.as_mut().unwrap()[0].disposition =
             Some(astra_services::session_journal::ToolCallDisposition::Rejected);
         let mut events = vec![first.clone(), second];
-        let conflicts = super::merge_attached_events(&mut events, Vec::new(), |_| true);
+        let (conflicts, _) = super::merge_attached_events(&mut events, Vec::new(), |_| true);
         assert_eq!(conflicts, 1);
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -2736,10 +3114,67 @@ mod tests {
         assert!(summary.contains("1 LLM round(s)"), "{summary}");
         assert!(!summary.contains("slowest reported round"), "{summary}");
 
+        let mut without_calls = first.clone();
+        without_calls.tool_calls = None;
+        without_calls.tool_calls_returned = Some(3);
+        let mut other_timing = without_calls.clone();
+        other_timing.duration_ms = Some(80);
+        let mut rounds = vec![without_calls, other_timing];
+        assert_eq!(
+            super::merge_attached_events(&mut rounds, Vec::new(), |_| true).0,
+            1
+        );
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].tool_calls_returned, Some(3));
+        let summary =
+            super::super::self_command::bounded_execution_timing_summary(&rounds).unwrap();
+        assert!(summary.contains("1 LLM round(s)"), "{summary}");
+        assert!(!summary.contains("slowest reported round"), "{summary}");
+        assert!(summary.contains("round timing partial"), "{summary}");
+
+        // Equal request counts cannot be attributed to two different agents.
+        let first_agent: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type":"llm_round","ts":"t","session_id":"S","turn":1,"round":0,
+            "producer_scope":{"run_id":"run","parent_run_id":"parent","agent_id":"a"},
+            "duration_ms":40,"tool_calls_returned":3
+        }))
+        .unwrap();
+        let mut other_agent = first_agent.clone();
+        other_agent.producer_scope.as_mut().unwrap().agent_id = Some("b".into());
+        for (left, right) in [(&first_agent, &other_agent), (&other_agent, &first_agent)] {
+            let mut rounds = vec![left.clone(), right.clone()];
+            let (conflicts, observations) =
+                super::merge_attached_events(&mut rounds, Vec::new(), |_| true);
+            assert_eq!(conflicts, 1);
+            assert_eq!(rounds.len(), 1);
+            assert_eq!(rounds[0].tool_calls_returned, None);
+            let details = serde_json::to_string(&observations).unwrap();
+            assert!(
+                details.contains("\"agent_id\":\"a\"") && details.contains("\"agent_id\":\"b\""),
+                "{details}"
+            );
+        }
+
+        let mut invalid_scope = first.clone();
+        invalid_scope.metadata = Some(serde_json::json!({"run_id":"different-run"}));
+        // A spawn event's metadata run is the child, while its producer can
+        // be the parent; that is not a conflicting round identity.
+        let spawn: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type":"agent_spawned","ts":"t","producer_scope":{"run_id":"parent"},
+            "metadata":{"run_id":"child"}
+        }))
+        .unwrap();
+        assert!(!super::has_incomplete_observation(&[spawn]));
+        assert!(super::has_incomplete_observation(&[invalid_scope.clone()]));
+        assert!(
+            super::super::self_command::bounded_execution_timing_summary(&[invalid_scope])
+                .is_none()
+        );
+
         // Exact replay is one round and retains its qualified timing.
         let mut replay = vec![first.clone(), first];
         assert_eq!(
-            super::merge_attached_events(&mut replay, Vec::new(), |_| true),
+            super::merge_attached_events(&mut replay, Vec::new(), |_| true).0,
             0
         );
         assert_eq!(replay.len(), 1);
@@ -2747,6 +3182,32 @@ mod tests {
             super::super::self_command::bounded_execution_timing_summary(&replay).unwrap();
         assert!(summary.contains("1 LLM round(s)"), "{summary}");
         assert!(summary.contains("slowest reported round 40ms"), "{summary}");
+    }
+
+    #[test]
+    fn conflicting_terminals_keep_position_in_bounded_observation() {
+        use astra_services::session_journal::{JournalEvent, JournalEventType};
+        let parse = |value| serde_json::from_value::<JournalEvent>(value).unwrap();
+        let first = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
+            "producer_scope":{"run_id":"run"},"error":"one"}));
+        let span = parse(serde_json::json!({"type":"trace_span","ts":"t"}));
+        let second = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
+            "producer_scope":{"run_id":"run"},"error":"two"}));
+        let mut events = vec![first.clone(), span, second, first];
+        let (conflicts, moved) = super::normalize_root_terminals(&mut events, true);
+        assert_eq!(conflicts, 1);
+        assert!(moved.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| &event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                &JournalEventType::TurnError,
+                &JournalEventType::TraceSpan,
+                &JournalEventType::TurnError
+            ]
+        );
     }
 
     use super::{
@@ -3120,12 +3581,13 @@ mod tests {
         assert!(!digest.usage_coverage.root_terminal_buckets_complete);
         assert_eq!(digest.aggregates.avg_tokens_in, None);
         assert_eq!(digest.aggregates.total_tokens_in, 0);
-        let (events, incomplete, errors) =
+        let (events, conflicting, incomplete, errors) =
             super::read_journal_for_analysis_with_owners(sid, &local, Some(&account)).unwrap();
+        assert!(conflicting.is_empty());
         assert!(errors.is_empty());
         assert!(incomplete);
         let (tree, _, _) =
-            crate::cli::journal_tree::fold_events_with_coverage(sid, &events, incomplete);
+            crate::cli::journal_tree::fold_events_with_coverage(sid, &events, incomplete, &[]);
         assert!(tree.children.is_empty());
         assert_eq!(tree.unattached.len(), 1);
         assert_eq!(tree.unattached[0].prompt_tokens, 0);
@@ -3306,7 +3768,8 @@ mod tests {
             build_digest_with_owners(sid, DigestFocus::All, &local_owner, Some(&account_owner))
                 .expect("other facts remain readable");
         assert_eq!(conflicted.conflicting_round_count, 1);
-        assert!(conflicted.turns[0].llm_round_details.is_empty());
+        assert_eq!(conflicted.turns[0].llm_round_details.len(), 1);
+        assert_eq!(conflicted.turns[0].llm_round_details[0].tokens_in, None);
         fs::write(
             &account_path,
             format!(
@@ -3343,7 +3806,8 @@ mod tests {
         let local_conflict =
             build_digest_with_owners(sid, DigestFocus::All, &local_owner, None).unwrap();
         assert_eq!(local_conflict.conflicting_round_count, 1);
-        assert!(local_conflict.turns[0].llm_round_details.is_empty());
+        assert_eq!(local_conflict.turns[0].llm_round_details.len(), 1);
+        assert_eq!(local_conflict.turns[0].llm_round_details[0].tokens_in, None);
     }
 
     #[test]

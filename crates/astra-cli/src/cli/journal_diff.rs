@@ -92,10 +92,12 @@ pub struct TokenDeltas {
 /// io / parse failures on either session; structural differences are
 /// always returned as Ok.
 pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, String> {
-    let (a_events, a_incomplete, a_errors) = journal_digest::read_journal_for_analysis(a_session)
-        .map_err(|e| format!("{a_session}: {e}"))?;
-    let (b_events, b_incomplete, b_errors) = journal_digest::read_journal_for_analysis(b_session)
-        .map_err(|e| format!("{b_session}: {e}"))?;
+    let (a_events, a_conflicting, a_incomplete, a_errors) =
+        journal_digest::read_journal_for_analysis(a_session)
+            .map_err(|e| format!("{a_session}: {e}"))?;
+    let (b_events, b_conflicting, b_incomplete, b_errors) =
+        journal_digest::read_journal_for_analysis(b_session)
+            .map_err(|e| format!("{b_session}: {e}"))?;
     let mut diff = diff_events_with_coverage(
         a_session,
         b_session,
@@ -104,6 +106,20 @@ pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, Str
         a_incomplete,
         b_incomplete,
     );
+    if !a_conflicting.is_empty() {
+        diff.a_tool_calls_executed = confirmed_execution_evidence(&a_events, &a_conflicting).0;
+        add_conflicting_call_observations(&a_events, &a_conflicting, &mut diff.a_tool_sequence);
+        add_conflicting_terminal_counts(&mut diff.a_event_counts, &a_conflicting);
+    }
+    if !b_conflicting.is_empty() {
+        diff.b_tool_calls_executed = confirmed_execution_evidence(&b_events, &b_conflicting).0;
+        add_conflicting_call_observations(&b_events, &b_conflicting, &mut diff.b_tool_sequence);
+        add_conflicting_terminal_counts(&mut diff.b_event_counts, &b_conflicting);
+    }
+    if !a_conflicting.is_empty() || !b_conflicting.is_empty() {
+        (diff.only_in_a, diff.only_in_b, diff.count_deltas) =
+            event_count_differences(&diff.a_event_counts, &diff.b_event_counts);
+    }
     diff.a_source_errors = a_errors;
     diff.b_source_errors = b_errors;
     Ok(diff)
@@ -149,28 +165,7 @@ pub(crate) fn diff_events(
 ) -> JournalDiff {
     let a_counts = event_counts(a_events);
     let b_counts = event_counts(b_events);
-    let only_in_a: Vec<String> = a_counts
-        .keys()
-        .filter(|k| !b_counts.contains_key(*k))
-        .cloned()
-        .collect();
-    let only_in_b: Vec<String> = b_counts
-        .keys()
-        .filter(|k| !a_counts.contains_key(*k))
-        .cloned()
-        .collect();
-    let mut count_deltas = BTreeMap::new();
-    let mut all_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    all_keys.extend(a_counts.keys().map(String::as_str));
-    all_keys.extend(b_counts.keys().map(String::as_str));
-    for k in all_keys {
-        let a = a_counts.get(k).copied().unwrap_or(0) as i64;
-        let b = b_counts.get(k).copied().unwrap_or(0) as i64;
-        let d = b - a;
-        if d != 0 {
-            count_deltas.insert(k.to_string(), d);
-        }
-    }
+    let (only_in_a, only_in_b, count_deltas) = event_count_differences(&a_counts, &b_counts);
 
     let a_gap = journal_digest::has_incomplete_observation(a_events)
         || journal_digest::has_unmatched_root_rounds(a_events);
@@ -231,6 +226,78 @@ fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
         *count = count.saturating_add(1);
     }
     out
+}
+
+// Conflicting terminals cannot establish sequence completeness. Preserve
+// identifiable executed observations that are absent from the normal view.
+fn add_conflicting_call_observations(
+    events: &[JournalEvent],
+    conflicting: &[JournalEvent],
+    sequence: &mut Vec<String>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for (candidate, event) in events
+        .iter()
+        .map(|event| (false, event))
+        .chain(conflicting.iter().map(|event| (true, event)))
+    {
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| call.was_executed())
+        {
+            if let Some(key) = call_key(event, call)
+                && seen.insert(key)
+                && candidate
+            {
+                sequence.push(call.name.clone());
+            }
+        }
+    }
+}
+
+fn add_conflicting_terminal_counts(counts: &mut BTreeMap<String, u32>, events: &[JournalEvent]) {
+    let mut seen = std::collections::HashSet::new();
+    for event in events {
+        let kind = event_type_str(&event.event_type);
+        let unique = event
+            .turn
+            .zip(run_id_of(event))
+            .is_none_or(|(turn, run)| seen.insert((turn, run, kind.clone())));
+        if unique {
+            let count = counts.entry(kind).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+fn event_count_differences(
+    a: &BTreeMap<String, u32>,
+    b: &BTreeMap<String, u32>,
+) -> (Vec<String>, Vec<String>, BTreeMap<String, i64>) {
+    let only_in_a = a
+        .keys()
+        .filter(|kind| !b.contains_key(*kind))
+        .cloned()
+        .collect();
+    let only_in_b = b
+        .keys()
+        .filter(|kind| !a.contains_key(*kind))
+        .cloned()
+        .collect();
+    let mut all = std::collections::BTreeSet::new();
+    all.extend(a.keys());
+    all.extend(b.keys());
+    let mut deltas = BTreeMap::new();
+    for kind in all {
+        let delta = i64::from(b.get(kind).copied().unwrap_or(0))
+            - i64::from(a.get(kind).copied().unwrap_or(0));
+        if delta != 0 {
+            deltas.insert(kind.clone(), delta);
+        }
+    }
+    (only_in_a, only_in_b, deltas)
 }
 
 fn token_totals(events: &[JournalEvent], observation_incomplete: bool) -> TokenTotals {
@@ -323,6 +390,13 @@ impl<'a> TerminalIndex<'a> {
 }
 
 /// Per-call observations, including callback results with uncertain delivery.
+fn is_child_callback(event: &JournalEvent) -> bool {
+    event.event_type == JournalEventType::SyncMarker
+        && event.metadata.as_ref().is_some_and(|metadata| {
+            metadata.get("source").and_then(serde_json::Value::as_str) == Some("child_agent")
+        })
+}
+
 fn observed_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
     (!is_terminal(e))
         .then_some(e.tool_calls.as_ref())
@@ -338,6 +412,7 @@ type RoundCallIndex<'a> = HashMap<CallKey<'a>, (usize, usize)>;
 pub(super) fn call_key<'a>(event: &JournalEvent, call: &'a ToolCallRecord) -> Option<CallKey<'a>> {
     let identity = call.invocation_identity.as_ref()?;
     if event.session_id.as_deref() != Some(identity.session_id.as_str())
+        || journal_digest::producer_scope_conflicts(event)
         || call.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
         || (!is_terminal(event) && run_id_of(event).is_some_and(|run| run != identity.run_id))
     {
@@ -381,7 +456,10 @@ impl<'a> RejectionIds<'a> {
 /// Independently supported execution evidence can overlap. A definitive
 /// rejection and an execution for the same canonical invocation conflict;
 /// unknown and deferred observations may be refined by later execution.
-pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, bool) {
+pub(super) fn confirmed_execution_evidence(
+    events: &[JournalEvent],
+    conflicting_terminals: &[JournalEvent],
+) -> (u64, bool) {
     use astra_services::session_journal::ToolCallDisposition;
 
     let mut identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
@@ -393,9 +471,10 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
     let mut unscoped_rejection_ids = RejectionIds::default();
     let mut all_rejection_ids = RejectionIds::default();
     let mut unscoped_rejection = false;
+    let mut summary_rejection = false;
     let mut any_rejected = false;
     let mut any_unidentified = false;
-    for event in events {
+    for event in events.iter().chain(conflicting_terminals) {
         for call in event.tool_calls.iter().flatten() {
             let disposition = call.effective_disposition();
             if !matches!(
@@ -413,11 +492,7 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
                     .map(str::trim)
                     .filter(|id| !id.is_empty());
                 all_rejection_ids.insert(Some(call.name.as_str()), id, false);
-                let child_callback = event.event_type == JournalEventType::SyncMarker
-                    && event.metadata.as_ref().is_some_and(|metadata| {
-                        metadata.get("source").and_then(serde_json::Value::as_str)
-                            == Some("child_agent")
-                    });
+                let child_callback = is_child_callback(event);
                 if child_callback && call.invocation_identity.is_none() {
                     // This producer writes request IDs from one scoped callback
                     // batch even when account identity is unavailable.
@@ -488,9 +563,13 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
     }
 
     // A terminal ledger can report rejected requests without retaining
-    // their identities. An anonymous execution may be one of those requests.
-    if any_unidentified {
-        for event in events.iter().filter(|event| is_terminal(event)) {
+    // their identities. An execution may be one of those requests.
+    if any_unidentified || identities.values().any(|(executed, _)| *executed) {
+        for event in events
+            .iter()
+            .chain(conflicting_terminals)
+            .filter(|event| is_terminal(event))
+        {
             let Some(summary) = event
                 .tool_outcomes
                 .as_ref()
@@ -522,9 +601,7 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
             // several such rows may still be replays of the same request.
             let known_min = known.len().max(usize::from(has_anonymous));
             if known_min < summary.rejected as usize {
-                unscoped_rejection = true;
-                all_rejection_ids.insert(None, None, false);
-                unscoped_rejection_ids.insert(None, None, true);
+                summary_rejection = true;
             }
         }
     }
@@ -545,7 +622,7 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
     let mut affected_terminals = std::collections::HashSet::new();
     let mut anonymous_conflict_attempts = std::collections::HashSet::new();
     let mut unscoped_anonymous_conflict = false;
-    for (position, event) in events.iter().enumerate() {
+    for (position, event) in events.iter().chain(conflicting_terminals).enumerate() {
         let attempt = event
             .session_id
             .as_deref()
@@ -563,18 +640,22 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
                 .as_deref()
                 .map(str::trim)
                 .filter(|id| !id.is_empty());
-            let overlaps = if is_terminal(event) && key.is_none() {
-                // An anonymous terminal execution can also be a projection
-                // of an earlier run's rejected request.
-                all_rejection_ids.overlaps(&call.name, id, true)
-            } else {
-                unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
-                    || attempt
-                        .and_then(|((session, turn), run)| {
-                            rejected_attempts.get(&(session, turn, run))
-                        })
-                        .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
-            };
+            // Child callback tool calls are explicitly outside the root
+            // terminal's aggregate, but explicit rejection records can still
+            // contradict them by identity.
+            let overlaps = (summary_rejection && !is_child_callback(event))
+                || if is_terminal(event) && key.is_none() {
+                    // An anonymous terminal execution can also be a projection
+                    // of an earlier run's rejected request.
+                    all_rejection_ids.overlaps(&call.name, id, true)
+                } else {
+                    unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
+                        || attempt
+                            .and_then(|((session, turn), run)| {
+                                rejected_attempts.get(&(session, turn, run))
+                            })
+                            .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
+                };
             if overlaps {
                 if let Some(identity) = key {
                     disputed.insert(identity);
@@ -588,7 +669,8 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
             }
         }
     }
-    let has_conflict = !disputed.is_empty()
+    let has_conflict = !conflicting_terminals.is_empty()
+        || !disputed.is_empty()
         || !affected_terminals.is_empty()
         || !anonymous_conflict_attempts.is_empty()
         || unscoped_anonymous_conflict;
@@ -598,7 +680,7 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
     let mut affected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
     let mut unscoped_invalid = unscoped_anonymous_conflict;
     if has_conflict {
-        for (position, event) in events.iter().enumerate() {
+        for (position, event) in events.iter().chain(conflicting_terminals).enumerate() {
             for call in event.tool_calls.iter().flatten() {
                 let Some(identity) = call.invocation_identity.as_ref() else {
                     continue;
@@ -641,12 +723,11 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
         && (!(has_conflict || any_rejected)
             || (!unscoped_invalid
                 && !unscoped_rejection
-                && events.iter().any(|event| {
-                    let scoped_child_callback = event.event_type == JournalEventType::SyncMarker
-                        && event.metadata.as_ref().is_some_and(|metadata| {
-                            metadata.get("source").and_then(serde_json::Value::as_str)
-                                == Some("child_agent")
-                        });
+                && events.iter().chain(conflicting_terminals).any(|event| {
+                    let scoped_child_callback = is_child_callback(event);
+                    if summary_rejection && !scoped_child_callback {
+                        return false;
+                    }
                     if !matches!(
                         event.event_type,
                         JournalEventType::LlmRound | JournalEventType::ToolCallError
@@ -694,11 +775,48 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
                                 }
                         })
                 })));
+    // A retained terminal summary may include calls projected by a
+    // conflicting terminal. Do not promote that aggregate unless its
+    // detailed identities establish disjointness from those candidates.
+    let mut conflict_keys = std::collections::HashSet::new();
+    // A rejected summary without complete detail can overlap a later report.
+    let conflicting_summary_rejection = conflicting_terminals.iter().any(|event| {
+        event
+            .tool_outcomes
+            .as_ref()
+            .is_some_and(|summary| summary.is_consistent() && summary.rejected > 0)
+    });
+    let mut conflict_has_anonymous = conflicting_summary_rejection;
+    let mut conflict_has_calls = conflicting_summary_rejection;
+    for event in conflicting_terminals {
+        for call in event.tool_calls.iter().flatten() {
+            conflict_has_calls = true;
+            if let Some(key) = call_key(event, call) {
+                conflict_keys.insert(key);
+            } else {
+                conflict_has_anonymous = true;
+            }
+        }
+    }
     let terminal_floor = events
         .iter()
         .enumerate()
         .filter(|(position, event)| {
             is_terminal(event)
+                && (!conflict_has_calls
+                    || (!conflict_has_anonymous
+                        && event.tool_calls.as_ref().is_some_and(|calls| {
+                            let mut executed = std::collections::HashSet::new();
+                            calls.iter().all(|call| {
+                                call_key(event, call).is_some_and(|key| {
+                                    if call.was_executed() {
+                                        executed.insert(key);
+                                    }
+                                    !conflict_keys.contains(key)
+                                })
+                            }) && journal_digest::terminal_execution_count(event)
+                                == Some(executed.len() as u64)
+                        })))
                 && !unscoped_invalid
                 && !affected_terminals.contains(position)
                 && !(has_conflict && (event.turn.is_none() || run_id_of(event).is_none()))
@@ -729,7 +847,7 @@ pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, boo
 }
 
 pub(super) fn confirmed_execution_floor(events: &[JournalEvent]) -> u64 {
-    confirmed_execution_evidence(events).0
+    confirmed_execution_evidence(events, &[]).0
 }
 
 /// A matching round owns call order, independently of error persistence order.
@@ -954,7 +1072,7 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         .filter(|call| call.was_executed())
         .map(|call| call.name.clone())
         .collect();
-    let (floor, conflicts) = confirmed_execution_evidence(events);
+    let (floor, conflicts) = confirmed_execution_evidence(events, &[]);
     out.complete &= !conflicts;
     if !out.complete {
         out.executed = floor;
